@@ -8,17 +8,17 @@ use laminar_core::checkpoint::{
     CheckpointAttempt, CheckpointScope, ObjectStoreCheckpointStore, StateFrameKey,
 };
 use laminar_core::cluster::control::{
-    TopologyError, TopologyMigrationRoot, TopologyOperationId, TopologyRecoveryCut,
-    TopologyRecoveryInput, TopologyRestoreInput, TopologyVersion,
+    RecoveryAnnouncement, TopologyError, TopologyMigrationRoot, TopologyOperationId,
+    TopologyRecoveryCut, TopologyRecoveryInput, TopologyRestoreInput, TopologyVersion,
 };
 
 use super::{DbError, LaminarDB};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TopologyRestorePurpose {
     CutPreparation,
     MigrationInstallation,
     Recovery,
+    CoordinatedRecovery(Box<RecoveryAnnouncement>),
 }
 
 /// A source's preparation boundary. A sealed new-source cursor is never processing history.
@@ -73,6 +73,7 @@ pub struct PreparedTopologyRestore {
     pub(crate) input: TopologyRestoreInput,
     // A selected recovery image cannot use the original migration installation/Release path.
     recovery: Option<Box<TopologyRecoveryInput>>,
+    pub(super) recovery_start: Option<RecoveryAnnouncement>,
     recovered: crate::recovery_manager::RecoveredState,
     sources: BTreeMap<String, PreparedTopologySourcePosition>,
     restored_frames: usize,
@@ -107,29 +108,44 @@ impl std::fmt::Debug for PreparedTopologyRestore {
 impl PreparedTopologyRestore {
     pub(crate) fn into_runtime(
         self,
-    ) -> (
-        crate::operator_graph::OperatorGraph,
-        TopologyRuntimeMetadata,
-    ) {
+    ) -> Result<
+        (
+            crate::operator_graph::OperatorGraph,
+            TopologyRuntimeMetadata,
+        ),
+        DbError,
+    > {
         let Self {
             candidate,
             graph,
             input,
+            recovery,
+            recovery_start,
             recovered,
             sources,
             compiler,
             ..
         } = self;
+        let recovery = match (recovery, recovery_start) {
+            (Some(selection), Some(start)) => Some(TopologyRecoveryRuntime {
+                selection,
+                start,
+                released: false,
+            }),
+            (None, None) => None,
+            _ => return Err(TopologyError::Fenced.into()),
+        };
         drop(candidate);
-        (
+        Ok((
             graph,
             TopologyRuntimeMetadata {
                 input,
+                recovery,
                 recovered,
                 sources,
                 _compiler: compiler,
             },
-        )
+        ))
     }
 
     /// Whether this image was authorized from an irreversible target Commit. It remains private;
@@ -148,6 +164,16 @@ impl PreparedTopologyRestore {
 
     pub(super) fn belongs_to(&self, db: &LaminarDB) -> bool {
         self.recovery.is_none()
+            && self.recovery_start.is_none()
+            && Arc::ptr_eq(
+                tokio::sync::OwnedMutexGuard::mutex(&self.compiler),
+                &db.topology_validation_lock,
+            )
+    }
+
+    pub(crate) fn belongs_to_recovery(&self, db: &LaminarDB, start: &RecoveryAnnouncement) -> bool {
+        self.recovery_start.as_ref() == Some(start)
+            && self.recovery.is_some()
             && Arc::ptr_eq(
                 tokio::sync::OwnedMutexGuard::mutex(&self.compiler),
                 &db.topology_validation_lock,
@@ -201,8 +227,17 @@ impl PreparedTopologyRestore {
 }
 
 /// Control-path ownership of the exact root until the restored graph reaches runtime readiness.
+#[derive(Clone)]
+pub(crate) struct TopologyRecoveryRuntime {
+    pub(crate) selection: Box<TopologyRecoveryInput>,
+    pub(crate) start: RecoveryAnnouncement,
+    // Set only while consuming the exact durable coordinated Release against these live actors.
+    pub(crate) released: bool,
+}
+
 pub(crate) struct TopologyRuntimeMetadata {
     pub(crate) input: TopologyRestoreInput,
+    pub(crate) recovery: Option<TopologyRecoveryRuntime>,
     pub(crate) recovered: crate::recovery_manager::RecoveredState,
     pub(crate) sources: BTreeMap<String, PreparedTopologySourcePosition>,
     _compiler: tokio::sync::OwnedMutexGuard<()>,
@@ -254,8 +289,12 @@ impl LaminarDB {
         operation_id: TopologyOperationId,
         purpose: TopologyRestorePurpose,
     ) -> Result<PreparedTopologyRestore, DbError> {
-        let committed = purpose != TopologyRestorePurpose::CutPreparation;
-        self.ensure_topology_restore_available(committed)?;
+        let committed = !matches!(purpose, TopologyRestorePurpose::CutPreparation);
+        let recovery_start = match &purpose {
+            TopologyRestorePurpose::CoordinatedRecovery(start) => Some((**start).clone()),
+            _ => None,
+        };
+        self.ensure_topology_restore_purpose(&purpose)?;
         let compiler = Arc::clone(&self.topology_validation_lock)
             .try_lock_owned()
             .map_err(|_| TopologyError::PlanningBusy)?;
@@ -266,8 +305,15 @@ impl LaminarDB {
                     TopologyError::Protocol("restore requires the configured controller".into())
                 })?;
                 let recovery = if committed {
-                    let selection = controller.committed_topology_recovery_input(operation_id).await?;
-                    if purpose == TopologyRestorePurpose::MigrationInstallation
+                    let selection = if let Some(start) = &recovery_start {
+                        controller.topology_recovery_input(&start.round, super::recovery_runtime::start_epoch(start)?).await?
+                    } else {
+                        controller.committed_topology_recovery_input(operation_id).await?
+                    };
+                    if selection.migration().operation().operation_id != operation_id {
+                        return Err(TopologyError::Fenced.into());
+                    }
+                    if matches!(purpose, TopologyRestorePurpose::MigrationInstallation)
                         && selection.cut() != TopologyRecoveryCut::MigrationRoot {
                         return Err(TopologyError::Conflict(
                             "target checkpoint has committed; reconstruction requires coordinated target recovery".into(),
@@ -400,7 +446,11 @@ impl LaminarDB {
                 recovered.state_frames.clear();
                 let sources = prepare_source_positions_at_cut(&candidate, &input, recovery.as_deref()).await?;
                 let after = if let Some(selection) = &recovery {
-                    let fresh = controller.committed_topology_recovery_input(operation_id).await?;
+                    let fresh = if let Some(start) = &recovery_start {
+                        controller.topology_recovery_input(&start.round, super::recovery_runtime::start_epoch(start)?).await?
+                    } else {
+                        controller.committed_topology_recovery_input(operation_id).await?
+                    };
                     if !fresh.same_restore_requirements(selection) {
                         return Err(TopologyError::Fenced.into());
                     }
@@ -411,7 +461,7 @@ impl LaminarDB {
                 if !after.same_restore_requirements(&input) {
                     return Err(TopologyError::Fenced.into());
                 }
-                self.ensure_topology_restore_available(committed)?;
+                self.ensure_topology_restore_purpose(&purpose)?;
                 if self.catalog_manifest_inventory()? != local { return Err(TopologyError::Fenced.into()); }
                 if !committed {
                     self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline).await?;
@@ -419,7 +469,7 @@ impl LaminarDB {
                         return Err(TopologyError::Fenced.into());
                     }
                 }
-                let recovery = (purpose == TopologyRestorePurpose::Recovery).then_some(recovery).flatten();
+                let recovery = matches!(purpose, TopologyRestorePurpose::Recovery | TopologyRestorePurpose::CoordinatedRecovery(_)).then_some(recovery).flatten();
                 Ok::<_, DbError>((candidate, graph, input, recovery, recovered, sources, restored_frames))
             })
             .await
@@ -429,12 +479,27 @@ impl LaminarDB {
             graph,
             input,
             recovery,
+            recovery_start,
             recovered,
             sources,
             restored_frames,
             parent_retirement_observed: false,
             compiler,
         })
+    }
+
+    fn ensure_topology_restore_purpose(
+        &self,
+        purpose: &TopologyRestorePurpose,
+    ) -> Result<(), DbError> {
+        if let TopologyRestorePurpose::CoordinatedRecovery(start) = purpose {
+            self.ensure_topology_recovery_stopped(start)
+        } else {
+            self.ensure_topology_restore_available(!matches!(
+                purpose,
+                TopologyRestorePurpose::CutPreparation
+            ))
+        }
     }
 
     pub(super) fn ensure_topology_restore_available(&self, committed: bool) -> Result<(), DbError> {
@@ -479,7 +544,7 @@ pub(super) async fn prepare_source_positions(
     prepare_source_positions_at_cut(candidate, input, None).await
 }
 
-async fn prepare_source_positions_at_cut(
+pub(super) async fn prepare_source_positions_at_cut(
     candidate: &LaminarDB,
     input: &TopologyRestoreInput,
     recovery: Option<&TopologyRecoveryInput>,

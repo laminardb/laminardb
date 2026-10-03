@@ -867,12 +867,15 @@ async fn cluster_without_checkpoint_config_still_derives_graph_identity() {
 
     let identity = db
         .initialize_checkpointing(
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            crate::pipeline_identity::PipelineRegistrations::new(
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            ),
             RuntimeMode::Cluster,
             db.cluster_checkpoint_object_store(),
+            None,
         )
         .await
         .unwrap();

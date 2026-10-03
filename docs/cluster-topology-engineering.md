@@ -28,8 +28,9 @@ first target checkpoint. Exact-Commit transport preparation and local runtime
 installation with intake held are implemented. Current installation receipts,
 participant-complete durable Release and local application are now implemented.
 The existing DB-owned recovery supervisor now drives these migration phases.
-Automatic target runtime recovery and public submission remain unfinished.
-Runtime DDL stays fenced.
+Automatic target runtime recovery and cold cluster startup now use the existing
+recovery quorum with an exact target checkpoint or migration root. Public
+submission remains unfinished. Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
 authority append uses a create-only sequence object and the store's conditional
@@ -79,6 +80,11 @@ statuses omit the absent activation field. A receipt requires actual held actor,
 state and transport readiness. Every current owner/evidence process must certify
 protocol 5 before Release. Encoding 20 readers reject the upgrade; capability
 advertisements do not replace coordinated binary upgrade or actor retirement.
+Encoding 22 binds protocol-6 recovery rounds to the exact topology Commit and
+complete current process terms. Replacement runtimes receive new UUIDs and use
+the existing stopped/restored/Ready/Release quorum. Original Release evidence
+cannot authorize a replacement runtime. Earlier encodings retain their bytes;
+encoding 21 readers reject the upgrade.
 Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
@@ -956,10 +962,10 @@ that owner on a worker timer would permit overlapping lifecycle work. Repeated
 errors are logged only when their diagnostic changes.
 
 This driver does not authorize a replacement runtime after Active. The original
-Release UUID belongs to its installed generation. Automatic target recovery and
-whole-cluster startup remain the next prerequisite to public submission; a newer
-target checkpoint takes precedence during private recovery selection. Public SQL
-and startup guards remain. The local fixture validates phase ownership and actual
+Release UUID belongs to its installed generation. Coordinated recovery and cold
+startup now use a separately bound replacement round; a newer target checkpoint
+takes precedence during recovery selection. Public SQL remains guarded. The
+original local fixture validates phase ownership and actual
 held actors, not multi-process migration, transactional sinks or a restarted boot.
 
 ## Target checkpoint continuity and private recovery, 2026-10-03
@@ -996,12 +1002,38 @@ Verified encoded state is freed after decoding. Original root reconstruction rej
 once target progress exists. Selected recovery images cannot use the original
 migration installation/Release APIs.
 
-Automatic recovery Start/Release and whole-cluster startup are still guarded.
-They must bind this selection to the existing stopped/restored/release quorum;
-public SQL, removal/replacement and reference-aware reclamation remain unfinished.
-The focused fixture loads real aggregate/state/subscription codecs but supplies
-installation evidence as an authority fixture. It does not certify runtime recovery,
-replacement actor startup, brokers or real multi-process restart.
+The original private-selection fixture supplies installation evidence as an
+authority fixture. The subsequent coordinated recovery tests below exercise
+replacement actor startup and actual recovery Release. Public SQL,
+removal/replacement and reference-aware reclamation remain unfinished.
+
+## Coordinated target recovery and cold startup
+
+The existing recovery monitor binds its round to the exact immutable topology
+Commit and full current process roster before Prepare. After complete stopped
+receipts and definitive checkpoint/sink settlement, each participant selects the
+greatest target checkpoint or the original migration root. It reconstructs and
+starts the target with intake held, then certifies the new runtime UUID, exact
+selected cut, live actors, restored state, sink generation and receiver mesh.
+Ready and Release recheck that same binding. A first recovery Release also
+completes a pending topology activation atomically; recovery of an already Active
+target retains its original activation evidence.
+
+Cold startup replays the committed catalog through the existing isolated catalog
+compiler, retains the checkpoint namespace and queues the same recovery owner.
+It starts no actors before the coordinated round. Missing deployment identity
+fails closed, including through a cached decision store; reads cannot recreate it.
+Non-cluster recovery retains its existing lifecycle path. Large control futures
+are heap-pinned; control worker counts and the 4 MiB stack limit are unchanged.
+
+Six DB cases exercise actual actor replacement before first Release, after
+original Release, after a real target checkpoint, and during cold startup from
+both kinds of cut. They verify new runtime UUIDs, source positions, publication
+frontiers and aggregate progress from 30 to 45 to 60. Six authority cases cover
+complete replacement receipts, leader/process/assignment and stale-round fences.
+These controlled-connector tests do not certify broker delivery, a multi-process
+migration or comparative performance. Subscription readers and retention still
+need the explicit audited transition across historical pipeline identities.
 
 The [progress file](cluster-topology-migrations-progress.md) records commands,
 results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)

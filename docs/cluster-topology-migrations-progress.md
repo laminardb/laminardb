@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization/startup, private restore/retirement, atomic target Commit, held installation, participant-complete Release, DB-owned phase progress and exact target checkpoint/private recovery selection implemented; public runtime topology migration
+Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization/startup, private restore/retirement, atomic target Commit, held installation, participant-complete Release, DB-owned phase progress, exact target checkpoint selection, coordinated replacement runtime recovery and cold cluster startup implemented; public runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -926,13 +926,49 @@ authority format, scheduler or record-path work is added.
   This is private state/authority evidence. The fixture's Release does not certify
   live actors, brokers, public submission or multi-process target recovery.
 
+## Coordinated replacement recovery and cold startup, 2026-10-03
+
+- Continued clean from `fedf5d7eceae25937be6fc537fefcbd9cecff525` without
+  dependency changes. Authority encoding 22 and recovery protocol 6 bind the
+  existing recovery round to an exact topology Commit and full current process
+  terms, including participants that own no vnodes.
+- The existing monitor selects the target cut after complete stopped receipts and
+  checkpoint settlement. Replacement actors receive a new UUID and start held.
+  Actual state/source/sink/transport readiness is certified before restored/Ready
+  receipts and checked again before Release. A pending target's first Release and
+  the generic recovery terminal publish atomically. Already Active targets retain
+  their original activation evidence; it cannot authorize a replacement runtime.
+- Cold startup reconstructs the committed catalog without actors and queues the
+  same recovery owner. Greatest target progress takes precedence over its root.
+  Missing deployment identity fails without namespace creation, even through a
+  cached decision store. The non-cluster lifecycle path remains supported.
+- Initial tests exposed an omitted authority-format gate, large nested recovery
+  futures, a fixture missing its actual barrier transport, late fixture input and
+  a non-cluster recovery regression. Corrections preserve validators, heap-pin
+  control futures and retain the existing 4 MiB stack and runtime worker count.
+- Six new DB cases use actual source/sink/graph actors and coordinated Release.
+  The real checkpoint case restores aggregate 45, continues to 60, verifies
+  source cursors 6/94 then 9/97, and publishes a strict successor checkpoint.
+  Cold root and target-checkpoint cases use the same actor startup/release path.
+  Original Release for the cold checkpoint fixture remains authority fixture
+  evidence; no broker or multi-process migration certification is implied.
+- Six new authority cases cover current full-roster replacement receipts, original
+  Release rejection, stale rounds/terms and first activation through recovery.
+  A checkpoint reader regression test proves a deleted deployment identity is
+  not recreated. Validation and source identities are recorded in the
+  [coordinated recovery evidence](test-evidence/topology-coordinated-recovery-2026-10-03/README.md).
+- Final validation passes 4,446 tests: 1,103 core, 921 connectors, 2,066 DB and
+  356 server, with the same three ignored cases. All-target Clippy denies warnings;
+  minimal server, cluster/FFI, formatting and diff/source checks pass. Forty-two
+  Rust sources and the unchanged lockfile are frozen. Eight test threads retain
+  the unchanged one-second filesystem/listener deadlines and 4 MiB stacks.
+- The tests revealed a remaining strict subscription-reader/retention predecessor
+  check across the pipeline transition. It fails closed and pauses cleanup;
+  readers and retention must use exact audited roots before public submission.
+
 ## Remaining work
 
-1. Wire automatic target recovery, including a replacement process/runtime after
-   Release and whole-cluster startup. Exact target checkpoint/private root selection
-   is implemented; bind it to recovery Start and explicitly authorize through the existing
-   stopped/recovered/release quorum. Never borrow the original runtime UUID's Release.
-   Ordinary startup and parent recovery remain fenced after Commit.
+1. Subscription replay/retention across exact audited migration boundaries.
 2. Public SQL/atomic API, detached submission and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
 3. Removal/replacement contracts, reference-aware root retirement and bounded journal
@@ -976,6 +1012,8 @@ DB-owned phase progress and its checks are recorded in
 `docs/test-evidence/topology-driver-2026-10-03`.
 Target checkpoint continuity and private recovery selection are recorded in
 `docs/test-evidence/topology-target-recovery-2026-10-03`.
+Coordinated target recovery and cold startup are recorded in
+`docs/test-evidence/topology-coordinated-recovery-2026-10-03`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

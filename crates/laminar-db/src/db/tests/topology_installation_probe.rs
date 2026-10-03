@@ -66,7 +66,9 @@ impl RuntimeSource {
         if let Some(version) = self.assignment {
             self.checkpoint.bind_assignment_version(version);
         }
-        self.checkpoint.set_input_channels(vec![vec![1]])?;
+        if self.checkpoint.input_channels().is_none() {
+            self.checkpoint.set_input_channels(vec![vec![1]])?;
+        }
         Ok(())
     }
 
@@ -126,6 +128,10 @@ impl RuntimeSink {
 }
 
 pub(super) fn positioned(batch: RecordBatch, first: u64) -> SourceBatch {
+    positioned_in_channel(batch, first, &[1])
+}
+
+pub(super) fn positioned_in_channel(batch: RecordBatch, first: u64, channel: &[u8]) -> SourceBatch {
     let rows = batch.num_rows();
     let orders = (first..first + rows as u64)
         .map(u64::to_be_bytes)
@@ -133,7 +139,7 @@ pub(super) fn positioned(batch: RecordBatch, first: u64) -> SourceBatch {
     SourceBatch::positioned(
         batch,
         SourceRowPositions::try_new(
-            arrow::array::BinaryArray::from(vec![&[1_u8][..]; rows]),
+            arrow::array::BinaryArray::from(vec![channel; rows]),
             arrow::array::BinaryArray::from(
                 orders.iter().map(<[u8; 8]>::as_slice).collect::<Vec<_>>(),
             ),

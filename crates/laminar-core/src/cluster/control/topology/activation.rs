@@ -41,6 +41,10 @@ pub struct TopologyRelease {
 pub struct TopologyActivation {
     /// Current leader that owns this installation round.
     pub leader: LeaderProof,
+    /// Existing recovery round that owns a replacement held installation before first Release.
+    /// Original released rounds remain immutable; later recoveries use their own recovery terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_round: Option<crate::cluster::control::RecoveryRoundId>,
     /// Exact assignment, retaining the committed plan's owner map and stable participant IDs.
     pub assignment: CheckpointAssignmentFence,
     /// Complete sorted current owner/evidence process roster.
@@ -68,6 +72,11 @@ impl TopologyActivation {
 
     pub(crate) fn validate(&self, commit: u64, status: u64) -> Result<(), TopologyError> {
         if !self.leader.is_canonical()
+            || self.recovery_round.is_some_and(|round| {
+                round.generation == 0
+                    || round.nonce.is_nil()
+                    || round.driver.0 != self.leader.owner.node_id
+            })
             || !self.assignment.is_canonical()
             || self.authority_sequence <= commit
             || self.authority_sequence > status
@@ -206,7 +215,13 @@ impl TopologyAdmissionStatus {
             }
             Some(prior)
                 if prior.release.is_none()
-                    && prior.leader != next.leader
+                    && (prior.leader != next.leader
+                        || (next.recovery_round.is_some()
+                            && prior.recovery_round != next.recovery_round
+                            && prior.recovery_round.is_none_or(|prior| {
+                                next.recovery_round
+                                    .is_some_and(|next| next.generation > prior.generation)
+                            })))
                     && after.phase == TopologyAdmissionPhase::Activating
                     && next.authority_sequence == sequence
                     && next.installations.len() == 1
@@ -217,6 +232,7 @@ impl TopologyAdmissionStatus {
             }
             Some(prior)
                 if prior.leader == next.leader
+                    && prior.recovery_round == next.recovery_round
                     && prior.assignment == next.assignment
                     && prior.processes == next.processes
                     && prior.authority_sequence == next.authority_sequence

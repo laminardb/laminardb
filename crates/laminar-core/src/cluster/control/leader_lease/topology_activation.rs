@@ -57,6 +57,27 @@ impl LeaderLeaseStore {
             {
                 return Ok(false);
             }
+            if round.recovery_round.is_some() {
+                // This first Release shares a recovery terminal; only that exact round may open
+                // its replacement runtime. The ordinary installation API cannot borrow it.
+                return Ok(false);
+            }
+            if let Some(recovery) = head.recovery_release_head.as_ref().filter(|recovery| {
+                round
+                    .release
+                    .as_ref()
+                    .is_some_and(|release| recovery.sequence > release.authority_sequence)
+            }) {
+                let terminal = self
+                    .recovery_release_terminal_from(&head, recovery)
+                    .await
+                    .map_err(super::topology_admission::topology_checkpoint_error)?;
+                if terminal.round.topology_binding().is_some_and(|binding| {
+                    fresh.operation().commit.as_ref() == Some(binding.commit())
+                }) {
+                    return Ok(false);
+                }
+            }
             for process in &round.processes {
                 self.require_topology_process(processes, *process).await?;
             }
@@ -94,6 +115,52 @@ impl LeaderLeaseStore {
         runtime_id: Uuid,
         protocol_version: u16,
     ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        self.certify_topology_installation_for_round(
+            assignments,
+            processes,
+            input,
+            runtime_id,
+            protocol_version,
+            None,
+        )
+        .await
+    }
+
+    /// Certify a held replacement runtime under the existing exact stopped/restore round.
+    /// Before the first topology Release this collects a new full installation roster. An already
+    /// released topology retains its original roster and requires the recovery readiness terminal.
+    ///
+    /// # Errors
+    /// Rejects a different target/cut, process term, fault set, round or competing runtime UUID.
+    pub async fn certify_topology_recovery_installation(
+        &self,
+        assignments: &AssignmentSnapshotStore,
+        processes: &ProcessLeaseAuthority,
+        input: &TopologyRestoreInput,
+        runtime_id: Uuid,
+        round: &crate::cluster::control::RecoveryRound,
+        epoch: u64,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        self.certify_topology_installation_for_round(
+            assignments,
+            processes,
+            input,
+            runtime_id,
+            TOPOLOGY_INSTALLATION_PROTOCOL_VERSION,
+            Some((round, epoch)),
+        )
+        .await
+    }
+
+    async fn certify_topology_installation_for_round(
+        &self,
+        assignments: &AssignmentSnapshotStore,
+        processes: &ProcessLeaseAuthority,
+        input: &TopologyRestoreInput,
+        runtime_id: Uuid,
+        protocol_version: u16,
+        recovery: Option<(&crate::cluster::control::RecoveryRound, u64)>,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
         if protocol_version != TOPOLOGY_INSTALLATION_PROTOCOL_VERSION || runtime_id.is_nil() {
             return Err(TopologyError::Protocol(
                 "installation requires protocol five and an exact nonzero runtime identity".into(),
@@ -129,11 +196,42 @@ impl LeaderLeaseStore {
                     tokio::task::yield_now().await;
                     continue;
                 }
-                Self::require_topology_installation_authority(current, &fresh)?;
-                let same_round = operation
-                    .activation
-                    .as_ref()
-                    .filter(|round| round.leader == current.lease.proof());
+                if let Some((round, epoch)) = recovery {
+                    self.audit_recovery_topology_from(
+                        current,
+                        round,
+                        Some(epoch),
+                        Some((assignments, processes)),
+                    )
+                    .await
+                    .map_err(super::topology_admission::topology_checkpoint_error)?;
+                    let inventory = Self::recovery_fault_inventory_from(current);
+                    if round.topology_binding().is_none()
+                        || inventory.revision() != round.fault_revision()
+                        || inventory.faults() != round.faults
+                        || inventory.has_terminal_fault()
+                        || round.assignment_fence != *fresh.assignment()
+                        || fresh.current_leader().as_ref() != Some(&round.leader_proof)
+                        || round
+                            .topology_binding()
+                            .is_none_or(|binding| binding.processes() != fresh.processes())
+                        || current.active_checkpoint_artifacts.is_some()
+                        || current.artifact_cleanup.is_some()
+                        || current.assignment_drain_reservation.is_some()
+                        || current.assignment_handoff_pin.is_some()
+                    {
+                        return Err(TopologyError::Fenced);
+                    }
+                    if operation.phase == TopologyAdmissionPhase::Active {
+                        return Ok(operation.clone());
+                    }
+                } else {
+                    Self::require_topology_installation_authority(current, &fresh)?;
+                }
+                let same_round = operation.activation.as_ref().filter(|round| {
+                    round.leader == current.lease.proof()
+                        && round.recovery_round == recovery.map(|(round, _)| round.id)
+                });
                 if let Some(round) = same_round {
                     if round.assignment != *fresh.assignment()
                         || round.processes != fresh.processes()
@@ -166,9 +264,13 @@ impl LeaderLeaseStore {
                 let sequence = lease.seq;
                 let mut next = current.preserve_with_lease(lease);
                 next.version = next.version.max(TOPOLOGY_INSTALLATION_RECORD_VERSION);
+                if recovery.is_some() {
+                    next.version = next.version.max(super::TOPOLOGY_RECOVERY_RECORD_VERSION);
+                }
                 let operation = &mut next.topology_operations[index];
                 let mut round = same_round.cloned().unwrap_or_else(|| TopologyActivation {
                     leader: current.lease.proof(),
+                    recovery_round: recovery.map(|(round, _)| round.id),
                     assignment: fresh.assignment().clone(),
                     processes: fresh.processes().to_vec(),
                     authority_sequence: sequence,
@@ -436,6 +538,7 @@ impl LeaderLeaseStore {
                     }
                 || stored.commit != operation.commit
                 || installed.leader != round.leader
+                || installed.recovery_round != round.recovery_round
                 || installed.assignment != round.assignment
                 || installed.processes != round.processes
                 || installed.authority_sequence != round.authority_sequence

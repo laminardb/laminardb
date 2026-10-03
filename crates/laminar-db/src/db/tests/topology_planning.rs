@@ -241,6 +241,7 @@ struct Fixture {
     effects: Arc<AtomicUsize>,
     resolutions: Arc<AtomicUsize>,
     restore_validation: Arc<RestoreValidationControl>,
+    process_lease: Option<laminar_core::cluster::control::ProcessLease>,
 }
 
 impl Fixture {
@@ -386,6 +387,7 @@ impl Fixture {
             effects,
             resolutions,
             restore_validation,
+            process_lease: None,
         }
     }
 
@@ -530,7 +532,8 @@ async fn preparation_fixture_with_generation(
         .unwrap();
     authority.controller = controller;
     authority.lease_tx = lease_tx;
-    let fixture = Fixture::with_authority_and_generation(authority, stream_generation).await;
+    let mut fixture = Fixture::with_authority_and_generation(authority, stream_generation).await;
+    fixture.process_lease = Some(process);
     fixture.adopt().await;
     (fixture, AssignmentSnapshotStore::new(objects))
 }

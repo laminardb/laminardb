@@ -15,6 +15,7 @@ mod migration_root;
 mod planning;
 mod preparation;
 mod recovery;
+mod recovery_runtime;
 mod restore;
 mod retirement;
 mod target_preparation;
@@ -96,6 +97,9 @@ impl LaminarDB {
                             .iter()
                             .all(crate::sink_task::SinkTaskHandle::is_ready)
                 }) {
+                    Some(binding) if binding.recovery.is_some() => {
+                        self.recovered_topology_runtime_is_active(&binding).await?
+                    }
                     Some(binding) => store
                         .operation_status(commit.operation_id)
                         .await?

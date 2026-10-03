@@ -85,7 +85,13 @@ impl TopologyDriver {
             .installed_topology_runtime
             .lock()
             .as_ref()
-            .filter(|binding| binding.released_sequence.is_none())
+            .filter(|binding| {
+                binding.released_sequence.is_none()
+                    && binding
+                        .recovery
+                        .as_ref()
+                        .is_none_or(|recovery| !recovery.released)
+            })
             .map(|binding| binding.input.operation().operation_id);
         let retained = installed
             .or_else(|| {
@@ -284,6 +290,23 @@ impl TopologyDriver {
                 }
             }
             TopologyAdmissionPhase::Active => {
+                let recovered = db
+                    .installed_topology_runtime
+                    .lock()
+                    .clone()
+                    .filter(|binding| {
+                        binding.input.operation().operation_id == operation
+                            && binding.recovery.is_some()
+                    });
+                if let Some(binding) = recovered {
+                    if !db.recovered_topology_runtime_is_active(&binding).await? {
+                        self.request_recovery(db, controller);
+                        return Err(TopologyError::Fenced.into());
+                    }
+                    self.image = None;
+                    self.completed = Some((operation, status.status_sequence));
+                    return Ok(());
+                }
                 // Original Release only authorizes its exact runtime UUID. Never reconstruct a
                 // post-Release failure from the parent root or reuse another runtime's receipt.
                 db.apply_cluster_topology_release(operation).await?;

@@ -127,7 +127,12 @@ async fn topology_commit_atomically_publishes_target_and_exact_recoverable_root(
     assert!(
         matches!(status, crate::cluster::control::TopologyCatalogState::Versioned { committed: Some(ref stored), .. } if stored == decision)
     );
-    assert!(authority.recovery_admission_snapshot().await.is_err());
+    let target_admission = authority.recovery_admission_snapshot().await.unwrap();
+    assert_eq!(target_admission.topology_commit(), Some(decision));
+    assert!(!authority
+        .recovery_admission_is_current(&target_admission, &fixture.lease.proof())
+        .await
+        .unwrap());
     assert!(!authority
         .recovery_admission_is_current(&parent_admission, &fixture.lease.proof())
         .await

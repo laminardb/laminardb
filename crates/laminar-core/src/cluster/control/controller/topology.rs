@@ -219,6 +219,130 @@ impl ClusterController {
         Ok(input)
     }
 
+    /// Private state selection while an exact topology-bound recovery round owns the held plane.
+    /// The assignment certificate may be suspended during Prepare; its durable adoption, complete
+    /// frozen process terms and current owner map remain mandatory. This never authorizes actors.
+    ///
+    /// # Errors
+    /// Rejects another round/target/cut, obsolete leader/process/adoption or damaged evidence.
+    pub async fn topology_recovery_input(
+        &self,
+        round: &super::RecoveryRound,
+        epoch: u64,
+    ) -> Result<crate::cluster::control::TopologyRecoveryInput, TopologyError> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let binding = round.topology_binding().ok_or(TopologyError::Fenced)?;
+            if !self.is_recovering()
+                || self.is_draining()
+                || !self.recovery_round_contains_current_process(round)
+            {
+                return Err(TopologyError::Fenced);
+            }
+            self.audit_recovery_topology(round, Some(epoch))
+                .await
+                .map_err(|error| TopologyError::Conflict(error.to_string()))?;
+            let before = self
+                .try_live_local_process_authority_identity()
+                .map_err(|_| TopologyError::Fenced)?;
+            if !binding.processes().contains(&before) {
+                return Err(TopologyError::Fenced);
+            }
+            let authority = self
+                .checkpoint_authority()
+                .map_err(|error| TopologyError::Protocol(error.to_string()))?;
+            let input = authority
+                .committed_topology_recovery_input(
+                    self.snapshot.as_deref().ok_or(TopologyError::Fenced)?,
+                    self.process_lease_authority
+                        .get()
+                        .ok_or(TopologyError::Fenced)?,
+                    binding.commit().operation_id,
+                    before,
+                )
+                .await?;
+            let evidence = self
+                .read_local_process_authority_evidence()
+                .await
+                .map_err(|error| TopologyError::Conflict(error.to_string()))?;
+            if input.outcome().epoch != epoch
+                || input.migration().operation().commit.as_ref() != Some(binding.commit())
+                || input.migration().assignment() != &round.assignment_fence
+                || input.migration().processes() != binding.processes()
+                || input.migration().current_leader().as_ref() != Some(&round.leader_proof)
+                || evidence.participant != before.participant
+                || evidence.process_term != before.process_term
+                || !evidence
+                    .adopted_assignment
+                    .matches_fence(&round.assignment_fence)
+                || self
+                    .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
+                    .is_some_and(|fence| fence != round.assignment_fence)
+                || self.try_live_local_process_authority_identity().ok() != Some(before)
+                || !self.is_recovering()
+                || self.is_draining()
+            {
+                return Err(TopologyError::Fenced);
+            }
+            Ok(input)
+        })
+        .await
+        .map_err(|_| TopologyError::ReadTimedOut)?
+    }
+
+    /// Certify the actual held recovered runtime before its restore acknowledgement. An already
+    /// released original topology keeps its old receipt roster; the new recovery round owns output.
+    ///
+    /// # Errors
+    /// Rejects a noncurrent Start, dead process/adoption, changed cut or competing runtime receipt.
+    pub async fn certify_topology_recovery_installation(
+        &self,
+        start: &super::RecoveryAnnouncement,
+        input: &crate::cluster::control::TopologyRecoveryInput,
+        runtime_id: uuid::Uuid,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        let super::RecoverPhase::Start { epoch } = start.phase else {
+            return Err(TopologyError::Fenced);
+        };
+        if self
+            .observe_recover_control()
+            .await
+            .map_err(|error| TopologyError::Conflict(error.to_string()))?
+            .as_ref()
+            != Some(start)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        let fresh = self.topology_recovery_input(&start.round, epoch).await?;
+        if !fresh.same_restore_requirements(input) {
+            return Err(TopologyError::Fenced);
+        }
+        self.checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?
+            .certify_topology_recovery_installation(
+                self.snapshot.as_deref().ok_or(TopologyError::Fenced)?,
+                self.process_lease_authority
+                    .get()
+                    .ok_or(TopologyError::Fenced)?,
+                fresh.migration(),
+                runtime_id,
+                &start.round,
+                epoch,
+            )
+            .await?;
+        let after = self.topology_recovery_input(&start.round, epoch).await?;
+        if !after.same_restore_requirements(input)
+            || self
+                .observe_recover_control()
+                .await
+                .map_err(|error| TopologyError::Conflict(error.to_string()))?
+                .as_ref()
+                != Some(start)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(after.migration().operation().clone())
+    }
+
     async fn read_topology_restore_input(
         &self,
         operation_id: TopologyOperationId,

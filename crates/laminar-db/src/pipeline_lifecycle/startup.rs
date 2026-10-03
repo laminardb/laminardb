@@ -2,8 +2,8 @@
 use super::TopologyStartup;
 use super::{
     checked_pipeline_deadline, panic_message, publish_runtime_fault_state, required_recovery_scope,
-    Arc, CheckpointStorageScope, DbError, DbState, DeliveryGuarantee, FutureExt, HashMap,
-    LaminarDB, PipelineLifecycleAuthority, RuntimeMode, StartupAttempt, StartupDriverGuard,
+    Arc, CheckpointStorageScope, DbError, DbState, DeliveryGuarantee, FutureExt, LaminarDB,
+    PipelineLifecycleAuthority, RuntimeMode, StartupAttempt, StartupDriverGuard,
 };
 #[cfg(feature = "cluster")]
 use super::{report_cluster_terminal_halt, retire_cluster_compute_generation};
@@ -109,6 +109,44 @@ impl LaminarDB {
         self.ensure_terminal_halt_allows_start(PipelineLifecycleAuthority::CoordinatedRecovery)?;
         // RECOVERY: a durable Start is published only after cluster-wide artifact settlement.
         *self.startup_checkpoint_artifact_audit.lock() = None;
+        if !self.is_cluster_runtime() {
+            return self
+                .start_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
+                .await;
+        }
+        let controller = self
+            .cluster_controller
+            .lock()
+            .clone()
+            .ok_or_else(|| DbError::Checkpoint("recovery has no controller".into()))?;
+        let announcement = controller
+            .observe_recover_control()
+            .await
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        if let Some(start) = announcement.filter(|start| start.round.topology_binding().is_some()) {
+            let laminar_core::cluster::control::RecoverPhase::Start { epoch } = start.phase else {
+                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+            };
+            if *self.recover_target_epoch.lock() != Some(epoch) {
+                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+            }
+            if DbState::load(&self.state) == DbState::Running {
+                return Box::pin(self.certify_recovered_cluster_topology(&start)).await;
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+            let mut image = Box::pin(self.prepare_coordinated_topology_restore(&start)).await?;
+            tokio::time::timeout_at(
+                deadline,
+                self.prepare_coordinated_topology_transport(&mut image),
+            )
+            .await
+            .map_err(|_| laminar_core::cluster::control::TopologyError::Contended)??;
+            return Box::pin(self.start_with_runtime_image(
+                PipelineLifecycleAuthority::CoordinatedRecovery,
+                Some(TopologyStartup { image, deadline }),
+            ))
+            .await;
+        }
         self.start_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
             .await
     }
@@ -799,22 +837,14 @@ impl LaminarDB {
 
     pub(super) async fn initialize_checkpointing(
         &self,
-        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
-        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
-        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-        table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+        identity_registrations: crate::pipeline_identity::PipelineRegistrations<'_>,
         startup_runtime: RuntimeMode,
         injected_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
+        expected_deployment: Option<&str>,
     ) -> Result<Option<laminar_core::checkpoint::PipelineIdentity>, DbError> {
         let participant = self.checkpoint_participant();
         let bound_pipeline_identity =
             if self.config.checkpoint.is_some() || startup_runtime == RuntimeMode::Cluster {
-                let identity_registrations = crate::pipeline_identity::PipelineRegistrations::new(
-                    source_regs.values(),
-                    sink_regs.values(),
-                    stream_regs.values(),
-                    table_regs.values(),
-                );
                 let identity_context = crate::pipeline_identity::PipelineIdentityContext::new(
                     &self.config,
                     &self.catalog,
@@ -1006,11 +1036,26 @@ impl LaminarDB {
                     }
                 }
             };
-            let deployment_id = ds.load_or_create_deployment_id().await.map_err(|error| {
-                DbError::Checkpoint(format!(
+            let deployment_id = if let Some(expected) = expected_deployment {
+                ds.load_deployment_id()
+                    .await
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!("load committed deployment identity: {error}"))
+                    })?
+                    .filter(|actual| actual == expected)
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "committed topology requires its existing exact deployment identity"
+                                .into(),
+                        )
+                    })?
+            } else {
+                ds.load_or_create_deployment_id().await.map_err(|error| {
+                    DbError::Checkpoint(format!(
                     "load/create durable deployment identity before checkpoint startup: {error}"
                 ))
-            })?;
+                })?
+            };
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 

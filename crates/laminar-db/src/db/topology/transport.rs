@@ -3,7 +3,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use laminar_core::cluster::control::{TopologyError, TopologyVersion};
+use laminar_core::cluster::control::{TopologyError, TopologyRestoreInput, TopologyVersion};
 use laminar_core::shuffle::ShuffleTopologyFence;
 
 use super::{DbError, DbState, LaminarDB, PreparedTopologyRestore};
@@ -31,31 +31,99 @@ impl LaminarDB {
             )
             .into());
         }
+        self.prepare_topology_transport_image(image).await
+    }
+
+    pub(crate) async fn prepare_coordinated_topology_transport(
+        &self,
+        image: &mut PreparedTopologyRestore,
+    ) -> Result<(), DbError> {
+        let start = image.recovery_start.as_ref().ok_or(TopologyError::Fenced)?;
+        if !image.belongs_to_recovery(self, start) || !image.is_committed() {
+            return Err(TopologyError::Fenced.into());
+        }
+        self.prepare_topology_transport_image(image).await
+    }
+
+    fn ensure_topology_transport_available(
+        &self,
+        image: &PreparedTopologyRestore,
+    ) -> Result<(), DbError> {
+        if let Some(start) = &image.recovery_start {
+            self.ensure_topology_recovery_stopped(start)
+        } else {
+            self.ensure_topology_restore_available(true)
+        }
+    }
+
+    async fn topology_transport_input(
+        &self,
+        image: &mut PreparedTopologyRestore,
+    ) -> Result<TopologyRestoreInput, DbError> {
+        let controller = self
+            .cluster_controller
+            .lock()
+            .clone()
+            .ok_or(TopologyError::Fenced)?;
+        if let Some(start) = &image.recovery_start {
+            self.ensure_topology_recovery_stopped(start)?;
+            if controller
+                .observe_recover_control()
+                .await
+                .map_err(|error| TopologyError::Conflict(error.to_string()))?
+                .as_ref()
+                != Some(start)
+            {
+                return Err(TopologyError::Fenced.into());
+            }
+            let fresh = controller
+                .topology_recovery_input(&start.round, super::recovery_runtime::start_epoch(start)?)
+                .await?;
+            if image
+                .recovery_input()
+                .is_none_or(|selected| !fresh.same_restore_requirements(selected))
+            {
+                return Err(TopologyError::Fenced.into());
+            }
+            Ok(fresh.migration().clone())
+        } else {
+            Ok(controller
+                .committed_topology_restore_input(image.input.operation().operation_id)
+                .await?)
+        }
+    }
+
+    async fn prepare_topology_transport_image(
+        &self,
+        image: &mut PreparedTopologyRestore,
+    ) -> Result<(), DbError> {
         tokio::time::timeout(std::time::Duration::from_secs(45), async {
-            self.ensure_topology_restore_available(true)?;
+            self.ensure_topology_transport_available(image)?;
             let controller = self
                 .cluster_controller
                 .lock()
                 .clone()
                 .ok_or(TopologyError::Fenced)?;
-            let operation = image.input.operation().operation_id;
-            let before = controller
-                .committed_topology_restore_input(operation)
-                .await?;
+            let before = self.topology_transport_input(image).await?;
             if !before.same_restore_requirements(&image.input) {
                 return Err(TopologyError::Fenced.into());
             }
             if DbState::load(&self.state) == DbState::ShuttingDown {
                 self.stop_pipeline_for_topology_retirement().await?;
             }
-            drop(super::restore::prepare_source_positions(&image.candidate, &before).await?);
+            drop(
+                super::restore::prepare_source_positions_at_cut(
+                    &image.candidate,
+                    &before,
+                    image.recovery_input(),
+                )
+                .await?,
+            );
             let _assignment = self.assignment_adoption_lock.lock().await;
             let _execution = Arc::clone(&self.rotation_execution_fence)
                 .write_owned()
                 .await;
-            let fresh = controller
-                .committed_topology_restore_input(operation)
-                .await?;
+            let fresh = self.topology_transport_input(image).await?;
             if !fresh.same_restore_requirements(&before) {
                 return Err(TopologyError::Fenced.into());
             }
@@ -98,7 +166,7 @@ impl LaminarDB {
             // Synchronous local publication shares the process/fault/lifecycle transition fence.
             {
                 let _transition = self.cluster_authority_transition.lock();
-                self.ensure_topology_restore_available(true)?;
+                self.ensure_topology_transport_available(image)?;
                 if controller.try_live_local_process_authority_identity().ok()
                     != Some(fresh.process())
                     || controller.is_draining()
@@ -125,13 +193,11 @@ impl LaminarDB {
                     .install_topology_fence_pair(&receiver, parent, target)
                     .map_err(|error| TopologyError::Conflict(error.to_string()))?;
             }
-            let after = controller
-                .committed_topology_restore_input(operation)
-                .await?;
+            let after = self.topology_transport_input(image).await?;
             if !after.same_restore_requirements(&fresh) {
                 return Err(TopologyError::Fenced.into());
             }
-            self.ensure_topology_restore_available(true)?;
+            self.ensure_topology_transport_available(image)?;
             Ok(())
         })
         .await

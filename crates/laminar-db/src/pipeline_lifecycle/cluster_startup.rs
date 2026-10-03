@@ -85,6 +85,13 @@ impl LaminarDB {
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("cluster startup has no recovery controller".into())
         })?;
+        if self.coordinated_recovery_in_progress()
+            && self
+                .topology_cut_hold
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(ClusterStartupDisposition::RecoveryFenced);
+        }
         let registry =
             self.vnode_registry.lock().clone().ok_or_else(|| {
                 DbError::Checkpoint("cluster startup has no vnode assignment".into())

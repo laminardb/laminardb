@@ -3,6 +3,9 @@
 use super::*;
 use crate::cluster::control::{TopologyRecoveryCut, TopologyRecoveryInput};
 
+#[path = "topology_recovery_round_tests.rs"]
+mod rounds;
+
 async fn select(
     authority: &LeaderLeaseStore,
     fixture: &Fixture,
@@ -94,7 +97,15 @@ async fn topology_recovery_selection_uses_exact_root_before_first_target_checkpo
     assert_eq!(selection.migration(), &input);
     assert_eq!(authority.load_record().await.unwrap(), before);
     // Selection cannot authorize either the historical pipeline or a replacement runtime.
-    assert!(authority.recovery_admission_snapshot().await.is_err());
+    let admission = authority.recovery_admission_snapshot().await.unwrap();
+    assert_eq!(
+        admission.topology_commit(),
+        input.operation().commit.as_ref()
+    );
+    assert!(!authority
+        .recovery_admission_is_current(&admission, &fixture.lease.proof())
+        .await
+        .unwrap());
     assert!(!authority
         .authorize_topology_release(
             &fixture.assignments,

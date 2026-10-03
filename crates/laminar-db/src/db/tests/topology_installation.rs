@@ -9,6 +9,9 @@ mod activation;
 #[path = "topology_driver.rs"]
 mod driver;
 
+#[path = "topology_coordinated_recovery.rs"]
+mod recovery;
+
 fn enable_runtime(fixture: &Fixture) -> Arc<runtime_probe::InstallationProbe> {
     let probe = Arc::new(runtime_probe::InstallationProbe::default());
     *fixture.restore_validation.runtime.lock() = Some(Arc::clone(&probe));

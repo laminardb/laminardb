@@ -130,7 +130,15 @@ async fn topology_activation_requires_complete_current_roster_then_releases_exac
         .await
         .unwrap());
     // Release cannot make the historical parent a target recovery checkpoint.
-    assert!(authority.recovery_admission_snapshot().await.is_err());
+    let admission = authority.recovery_admission_snapshot().await.unwrap();
+    assert_eq!(
+        admission.topology_commit(),
+        input.operation().commit.as_ref()
+    );
+    assert!(!authority
+        .recovery_admission_is_current(&admission, &fixture.lease.proof())
+        .await
+        .unwrap());
 }
 
 #[tokio::test]
@@ -277,7 +285,15 @@ async fn topology_activation_release_allows_only_target_checkpoint_during_assign
         .await
         .unwrap());
     // Existing generic recovery cannot relabel the parent root even with target work in flight.
-    assert!(authority.recovery_admission_snapshot().await.is_err());
+    let admission = authority.recovery_admission_snapshot().await.unwrap();
+    assert_eq!(
+        admission.topology_commit(),
+        input.operation().commit.as_ref()
+    );
+    assert!(!authority
+        .recovery_admission_is_current(&admission, &fixture.lease.proof())
+        .await
+        .unwrap());
 }
 
 #[tokio::test]

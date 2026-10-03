@@ -1,0 +1,401 @@
+//! Authority boundaries only; runtime installation/readiness belongs to DB integration tests.
+
+use super::*;
+use crate::cluster::control::{
+    ProcessLeaseAuthority, RecoverPhase, RecoveryAnnouncement, RecoveryRound,
+};
+
+async fn recovery_round(
+    authority: &LeaderLeaseStore,
+    fixture: &Fixture,
+    input: &TopologyRestoreInput,
+    generation: u64,
+) -> RecoveryRound {
+    authority
+        .record_recovery_fault(
+            owner_recovery_fault_publisher(&fixture.lease.owner),
+            generation,
+        )
+        .await
+        .unwrap();
+    let faults = authority.recovery_fault_inventory().await.unwrap();
+    let round = RecoveryRound::new(
+        generation,
+        input.current_leader().unwrap(),
+        input.assignment().clone(),
+        Vec::new(),
+        faults.revision(),
+        faults.faults().to_vec(),
+    )
+    .unwrap();
+    let processes = topology_preparation::processes(authority);
+    let binding = authority
+        .recovery_topology_binding(&round, Some((&fixture.assignments, &processes)))
+        .await
+        .unwrap();
+    round.bind_topology(binding).unwrap()
+}
+
+async fn certify_recovered(
+    authority: &LeaderLeaseStore,
+    fixture: &Fixture,
+    round: &RecoveryRound,
+    process: LocalProcessAuthorityIdentity,
+    runtime: u128,
+    epoch: u64,
+) -> Result<TopologyAdmissionStatus, TopologyError> {
+    let input = reconstruct(authority, fixture, process).await?;
+    authority
+        .certify_topology_recovery_installation(
+            &fixture.assignments,
+            &topology_preparation::processes(authority),
+            &input,
+            Uuid::from_u128(runtime),
+            round,
+            epoch,
+        )
+        .await
+}
+
+fn terminal(round: &RecoveryRound, epoch: u64) -> RecoveryAnnouncement {
+    RecoveryAnnouncement {
+        round: round.clone(),
+        phase: RecoverPhase::ReleaseCommitted { epoch },
+    }
+}
+
+async fn publish(
+    authority: &LeaderLeaseStore,
+    fixture: &Fixture,
+    terminal: &RecoveryAnnouncement,
+) -> Result<RecordRecoveryReleaseCommitResult, ClusterCheckpointAuthorityError> {
+    let reference = authority.stage_recovery_release_terminal(terminal).await?;
+    authority
+        .record_recovery_release_commit_with_topology(
+            &terminal.round.leader_proof,
+            reference,
+            Some((
+                &fixture.assignments,
+                &topology_preparation::processes(authority),
+            )),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn topology_recovery_round_first_release_requires_every_replacement_runtime() {
+    let authority = store(30_000);
+    let (fixture, input) = committed(&authority).await;
+    let round = recovery_round(&authority, &fixture, &input, 1).await;
+    let released = terminal(&round, input.checkpoint().epoch);
+    let original = authority.load_record().await.unwrap().unwrap();
+    assert!(publish(&authority, &fixture, &released).await.is_err());
+    assert_eq!(authority.load_record().await.unwrap().unwrap(), original);
+    let first = certify_recovered(&authority, &fixture, &round, input.processes()[0], 100, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.activation.as_ref().unwrap().recovery_round,
+        Some(round.id)
+    );
+    assert!(publish(&authority, &fixture, &released).await.is_err());
+    for (index, process) in input.processes().iter().enumerate().skip(1) {
+        certify_recovered(
+            &authority,
+            &fixture,
+            &round,
+            *process,
+            100 + index as u128,
+            1,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        publish(&authority, &fixture, &released).await.unwrap(),
+        RecordRecoveryReleaseCommitResult::Created(_)
+    ));
+    let head = authority.load_record().await.unwrap().unwrap();
+    assert_eq!(head.version, TOPOLOGY_RECOVERY_RECORD_VERSION);
+    assert_eq!(
+        head.topology_operations[0].phase,
+        TopologyAdmissionPhase::Active
+    );
+    assert_eq!(
+        head.topology_operations[0].commit,
+        original.topology_operations[0].commit
+    );
+    assert_eq!(head.commit_head, original.commit_head);
+    assert_eq!(
+        head.topology_operations[0]
+            .activation
+            .as_ref()
+            .unwrap()
+            .release
+            .as_ref()
+            .unwrap()
+            .authority_sequence,
+        head.recovery_release_head.as_ref().unwrap().sequence
+    );
+    assert!(authority
+        .authorize_recovery_release_with_topology(
+            owner_recovery_fault_publisher(&fixture.lease.owner),
+            &released,
+            Some((
+                &fixture.assignments,
+                &topology_preparation::processes(&authority)
+            ))
+        )
+        .await
+        .unwrap());
+    let fresh = reconstruct(&authority, &fixture, input.process())
+        .await
+        .unwrap();
+    assert!(!authority
+        .authorize_topology_release(
+            &fixture.assignments,
+            &topology_preparation::processes(&authority),
+            &fresh,
+            Uuid::from_u128(100)
+        )
+        .await
+        .unwrap());
+    let snapshot = authority.recovery_admission_snapshot().await.unwrap();
+    assert!(authority
+        .recovery_admission_is_current(&snapshot, &round.leader_proof)
+        .await
+        .unwrap());
+    let mut downgraded = head;
+    downgraded.version = TOPOLOGY_INSTALLATION_RECORD_VERSION;
+    assert!(downgraded.validate().is_err());
+}
+
+#[tokio::test]
+async fn topology_recovery_round_active_root_keeps_original_release_and_fences_old_runtime() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let original = input.operation().clone();
+    let round = recovery_round(&authority, &fixture, &input, 1).await;
+    let released = terminal(&round, 1);
+    for (index, process) in input.processes().iter().enumerate() {
+        certify_recovered(
+            &authority,
+            &fixture,
+            &round,
+            *process,
+            500 + index as u128,
+            1,
+        )
+        .await
+        .unwrap();
+    }
+    publish(&authority, &fixture, &released).await.unwrap();
+    assert_eq!(
+        authority
+            .topology_operation_status(original.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    for runtime in [1, 500] {
+        assert!(!authority
+            .authorize_topology_release(
+                &fixture.assignments,
+                &topology_preparation::processes(&authority),
+                &input,
+                Uuid::from_u128(runtime)
+            )
+            .await
+            .unwrap());
+    }
+    assert!(authority
+        .authorize_recovery_release_with_topology(
+            owner_recovery_fault_publisher(&fixture.lease.owner),
+            &released,
+            Some((
+                &fixture.assignments,
+                &topology_preparation::processes(&authority)
+            ))
+        )
+        .await
+        .unwrap());
+    // A lost-response retry remains idempotent after ordinary target progress advances.
+    target_checkpoint(&authority, &fixture, &input, 2).await;
+    assert!(matches!(
+        publish(&authority, &fixture, &released).await.unwrap(),
+        RecordRecoveryReleaseCommitResult::Unchanged(_)
+    ));
+    assert!(authority
+        .authorize_recovery_release_with_topology(
+            owner_recovery_fault_publisher(&fixture.lease.owner),
+            &released,
+            Some((
+                &fixture.assignments,
+                &topology_preparation::processes(&authority)
+            ))
+        )
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn topology_recovery_round_supersedes_unreleased_installation_in_same_leader_term() {
+    let authority = store(30_000);
+    let (fixture, input) = committed(&authority).await;
+    certify(&authority, &fixture, &input, 1).await.unwrap();
+    let first = recovery_round(&authority, &fixture, &input, 1).await;
+    certify_recovered(&authority, &fixture, &first, input.processes()[0], 100, 1)
+        .await
+        .unwrap();
+    let second = recovery_round(&authority, &fixture, &input, 2).await;
+    assert!(
+        certify_recovered(&authority, &fixture, &first, input.processes()[1], 101, 1)
+            .await
+            .is_err()
+    );
+    for (index, process) in input.processes().iter().enumerate() {
+        certify_recovered(
+            &authority,
+            &fixture,
+            &second,
+            *process,
+            200 + index as u128,
+            1,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(matches!(
+        publish(&authority, &fixture, &terminal(&first, 1))
+            .await
+            .unwrap(),
+        RecordRecoveryReleaseCommitResult::FaultsChanged
+    ));
+    publish(&authority, &fixture, &terminal(&second, 1))
+        .await
+        .unwrap();
+    let status = authority
+        .topology_operation_status(input.operation().operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let activation = status.activation.unwrap();
+    assert_eq!(activation.recovery_round, Some(second.id));
+    assert!(activation
+        .installations
+        .iter()
+        .all(|receipt| receipt.runtime_id.as_u128() >= 200));
+}
+
+#[tokio::test]
+async fn topology_recovery_round_target_checkpoint_rejects_parent_cut_and_unbound_release() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    target_checkpoint(&authority, &fixture, &input, 2).await;
+    let round = recovery_round(&authority, &fixture, &input, 1).await;
+    let before = authority.load_record().await.unwrap();
+    assert!(publish(&authority, &fixture, &terminal(&round, 1))
+        .await
+        .is_err());
+    let unbound = round.clone().bind_topology(None).unwrap();
+    assert!(publish(&authority, &fixture, &terminal(&unbound, 2))
+        .await
+        .is_err());
+    assert_eq!(authority.load_record().await.unwrap(), before);
+    publish(&authority, &fixture, &terminal(&round, 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        select(&authority, &fixture, input.process())
+            .await
+            .unwrap()
+            .checkpoint()
+            .epoch,
+        2
+    );
+}
+
+#[tokio::test]
+async fn topology_recovery_round_never_infers_assignment_or_process_namespaces() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let round = recovery_round(&authority, &fixture, &input, 1).await;
+    let other_assignments =
+        AssignmentSnapshotStore::new(Arc::new(object_store::memory::InMemory::new()));
+    other_assignments
+        .save_if_absent(&fixture.assignments.load().await.unwrap().unwrap())
+        .await
+        .unwrap();
+    let other_processes = ProcessLeaseAuthority::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    for process in input.processes() {
+        assert!(matches!(
+            other_processes
+                .store_for(NodeId(process.participant.node_id))
+                .try_acquire(process.participant.boot_incarnation, 0)
+                .await
+                .unwrap(),
+            crate::cluster::control::ProcessLeaseOutcome::Acquired(_)
+        ));
+    }
+    // Distinct configured stores can prove the same exact frozen identities. Absent/wrong
+    // configured stores fail rather than falling back to the checkpoint authority's own storage.
+    authority
+        .audit_recovery_topology(
+            &round,
+            Some(1),
+            Some((&other_assignments, &other_processes)),
+        )
+        .await
+        .unwrap();
+    assert!(authority
+        .audit_recovery_topology(&round, Some(1), None)
+        .await
+        .is_err());
+    let empty = AssignmentSnapshotStore::new(Arc::new(object_store::memory::InMemory::new()));
+    assert!(authority
+        .audit_recovery_topology(&round, Some(1), Some((&empty, &other_processes)))
+        .await
+        .is_err());
+    let empty_processes = ProcessLeaseAuthority::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(authority
+        .audit_recovery_topology(
+            &round,
+            Some(1),
+            Some((&other_assignments, &empty_processes))
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn topology_recovery_round_malformed_binding_cannot_stage_a_terminal() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let round = recovery_round(&authority, &fixture, &input, 1).await;
+    let before = authority.load_record().await.unwrap();
+    for case in 0..4 {
+        let mut value = serde_json::to_value(terminal(&round, 1)).unwrap();
+        match case {
+            0 => value["round"]["topology"]["protocol_version"] = serde_json::json!(5),
+            1 => value["round"]["topology"]["processes"][0]["process_term"] = serde_json::json!(0),
+            2 => value["round"]["topology"]["processes"] = serde_json::json!([]),
+            3 => value["round"]["topology"]["commit"]["authority_sequence"] = serde_json::json!(0),
+            _ => unreachable!(),
+        }
+        let changed: RecoveryAnnouncement = serde_json::from_value(value).unwrap();
+        assert!(authority
+            .stage_recovery_release_terminal(&changed)
+            .await
+            .is_err());
+    }
+    assert_eq!(authority.load_record().await.unwrap(), before);
+}

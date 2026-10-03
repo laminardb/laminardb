@@ -52,6 +52,22 @@ impl LaminarDB {
         } {
             return Err(TopologyError::Fenced.into());
         }
+        if controller.is_recovering() {
+            return Err(TopologyError::Fenced.into());
+        }
+        self.validate_topology_transport_identity(input)?;
+        self.ensure_topology_runtime_held()
+    }
+
+    pub(crate) fn validate_topology_transport_identity(
+        &self,
+        input: &TopologyRestoreInput,
+    ) -> Result<(), DbError> {
+        let controller = self
+            .cluster_controller
+            .lock()
+            .clone()
+            .ok_or(TopologyError::Fenced)?;
         let target = ShuffleTopologyFence::from_manifest(
             input.descriptor().target_version,
             &input.plan().target_manifest,
@@ -86,11 +102,10 @@ impl LaminarDB {
             || receiver.active_assignment_digest() != Some(input.assignment().digest())
             || controller.try_live_local_process_authority_identity().ok() != Some(input.process())
             || controller.is_draining()
-            || controller.is_recovering()
         {
             return Err(TopologyError::Fenced.into());
         }
-        self.ensure_topology_runtime_held()
+        Ok(())
     }
 
     pub(crate) fn ensure_topology_installation_held(&self) -> Result<(), DbError> {

@@ -332,6 +332,8 @@ mod startup_preparation;
 #[cfg(feature = "cluster")]
 mod topology_installation;
 #[cfg(feature = "cluster")]
+mod topology_recovery_startup;
+#[cfg(feature = "cluster")]
 use topology_installation::TopologyStartup;
 #[cfg(feature = "cluster")]
 mod topology_planning;

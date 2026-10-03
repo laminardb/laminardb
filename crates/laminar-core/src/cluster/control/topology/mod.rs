@@ -45,7 +45,10 @@ pub use migration_root::{
 pub use preparation::{
     TopologyParticipantCertificate, TopologyPreparation, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
-pub use recovery::{TopologyRecoveryCut, TopologyRecoveryInput};
+pub use recovery::{
+    TopologyRecoveryBinding, TopologyRecoveryCut, TopologyRecoveryInput,
+    TOPOLOGY_RECOVERY_PROTOCOL_VERSION,
+};
 pub use restore::TopologyRestoreInput;
 pub use source_initialization::{TopologySourceInitialization, MAX_TOPOLOGY_SOURCE_CHANNELS};
 pub use target_preparation::{

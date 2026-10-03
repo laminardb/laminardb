@@ -11,6 +11,8 @@ target Commit and private reconstruction from its exact root before a target che
 Held runtime installation, current process readiness receipts, participant-complete
 Release and local activation are available through the internal library and driven
 by the existing DB-owned recovery supervisor for already admitted operations.
+Automatic target recovery and cold startup use that supervisor's existing
+stopped/restored/Ready/Release quorum with the exact selected target cut.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -35,6 +37,7 @@ and durable replay. There is no supported migration submission or activation rou
 | Certify an installed held runtime | DB library; live state, actors, sink acknowledgements and exact receiver mesh; protocol 5 |
 | Release the complete installed target | Leader DB library and supervisor; current full process roster; followers independently apply the same Release |
 | Drive an already admitted operation automatically | Existing DB-owned recovery supervisor; one private image; phase deadlines and coordinated fault handoff |
+| Recover a committed target or restart its cluster | Existing coordinated recovery; greatest exact target checkpoint or migration root; replacement UUID and full current roster required |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -171,8 +174,9 @@ directory or control namespace. Exact committed inventory replay remains mandato
 After an internal additive Commit, cold replay accepts the complete current inventory
 or the exact complete original adopted bootstrap. It reconstructs the committed
 target in both cases. Arbitrary subsets and changed definitions reject. Ordinary
-start remains fenced before automatic target recovery is integrated. An internal
-Release applies only to its certified runtime and cannot activate a replacement boot.
+start remains fenced until coordinated target recovery completes. An original
+Release applies only to its certified runtime; a replacement boot uses a new
+recovery round and runtime UUID.
 
 Adoption appends metadata without rewriting catalog or checkpoint bytes. A lost
 response/cancelled call may already have admitted the baseline. Read authoritative
@@ -403,7 +407,8 @@ lost before Commit, abort and recover the parent through coordinated recovery.
 Commit checks current authority and every required process;
 installation must obtain a valid target image, revalidate sealed cursors and wait
 for participant-complete Release. The internal installation/Release methods are
-described below and driven by the supervisor; automatic target recovery remains unfinished. LDB-6043 remains.
+described below and driven by the supervisor. Automatic target recovery is
+available through the existing recovery quorum. LDB-6043 remains.
 
 ## Commit and reconstruct internally
 
@@ -466,7 +471,7 @@ the same image or reconstruct from the immutable Commit. No manual gate opening,
 parent restart or output permission follows from success. Held runtime installation
 is available below. The internal certification/Release methods check current
 installation capability and actual receiver/state/sink readiness. Automatic
-orchestration/recovery remain unfinished. LDB-6043 remains.
+orchestration and target recovery use the existing supervisor. LDB-6043 remains.
 
 ## Sealed source startup contract
 
@@ -483,7 +488,7 @@ This boundary is not processed history and does not seed committed progress or
 acknowledge the skipped prefix. Reader polling remains held by the runtime gate.
 The contract is a tested installation prerequisite, not an operational migration
 command or permission to open intake. Held installation consumes this contract.
-Internal participant-complete Release is available; automatic target recovery remains unfinished;
+Internal participant-complete Release and coordinated target recovery are available;
 LDB-6043 remains. See the
 [source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md).
 
@@ -514,8 +519,8 @@ manual gate opening and runtime DDL remain fenced. Success grants no durable
 readiness receipt or output permission; certification and exact Release are separate.
 
 Current readiness collection, sink generation fencing and participant-complete
-Release are available through the internal methods below. Automatic target recovery
-and public submission remain unfinished. LDB-6043 remains. The
+Release and automatic target recovery are available through the internal methods
+below. Public submission remains unfinished. LDB-6043 remains. The
 [installation evidence](test-evidence/topology-installation-2026-10-03/README.md)
 records the local held-runtime cases and their limits.
 
@@ -584,8 +589,9 @@ The latest operation/progress hint is only an idle polling aid. Definitive statu
 and every phase action still audit the immutable evidence and current fences.
 An unapplied local Release or retained image takes precedence over a later
 request. There is no public submit route. Automatic target recovery after Active
-and whole-cluster startup remain unfinished; a new runtime cannot reuse the
-original Release receipt or restart from a parent cut after newer target progress.
+and cold cluster startup now bind a new runtime to a current coordinated recovery
+round. It cannot reuse the original Release receipt or restart from a parent cut
+after newer target progress.
 
 ## Errors and recovery
 
@@ -595,7 +601,9 @@ before the first target checkpoint. Its `recovery_input()` and `recovery_checkpo
 report state provenance; `parent_checkpoint()` retains the original root identity.
 The image has no actor/output permission and cannot use original installation or
 Release methods. The existing 45-second preparation, compiler and state/read bounds
-apply. Automatic recovery startup and public submission remain unavailable.
+apply. Automatic recovery startup uses the existing recovery owner; this private
+method alone still grants no actor or output permission. Public submission remains
+unavailable.
 
 `recover_committed_cluster_topology` is the original migration-installation path.
 After a target checkpoint commits it rejects reconstruction from the older root.
@@ -604,6 +612,14 @@ the private loader cannot silently rewind to initialization. A source added by t
 migration resumes from its target checkpoint cursor, rather than reevaluating latest
 or reusing its initial sealed position. Keep the durable operation and storage when
 recovery fails. No checkpoint namespace reset or local rollback is authorized.
+
+Cold startup prepares the durable target catalog with actors absent and intake
+held, then requests coordinated recovery. Every required participant must stop,
+restore the same selected cut, report actual replacement readiness and observe
+the same Release before intake opens. Authority encoding 22 and recovery protocol
+6 require a coordinated binary upgrade. Do not clear holds manually. A missing
+deployment identity is an error; neither cold startup nor checkpoint reads create
+a replacement identity for retained state.
 
 | Code | Meaning and response |
 | --- | --- |

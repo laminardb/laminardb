@@ -14,6 +14,7 @@ mod topology_cut;
 mod topology_migration_root;
 mod topology_preparation;
 mod topology_recovery;
+mod topology_recovery_round;
 mod topology_restore;
 mod topology_target_preparation;
 
@@ -76,6 +77,7 @@ const TOPOLOGY_SOURCE_ROOT_RECORD_VERSION: u32 = 18;
 const TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION: u32 = 19;
 const TOPOLOGY_COMMIT_RECORD_VERSION: u32 = 20;
 const TOPOLOGY_INSTALLATION_RECORD_VERSION: u32 = 21;
+const TOPOLOGY_RECOVERY_RECORD_VERSION: u32 = 22;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1350,6 +1352,7 @@ impl LeaderAuthorityRecord {
             && self.version != TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
             && self.version != TOPOLOGY_COMMIT_RECORD_VERSION
             && self.version != TOPOLOGY_INSTALLATION_RECORD_VERSION
+            && self.version != TOPOLOGY_RECOVERY_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
@@ -2223,6 +2226,16 @@ impl LeaderLeaseStore {
         clearer: RecoveryFaultPublisher,
         terminal: &RecoveryAnnouncement,
     ) -> Result<bool, ClusterCheckpointAuthorityError> {
+        self.authorize_recovery_release_with_topology(clearer, terminal, None)
+            .await
+    }
+
+    pub(crate) async fn authorize_recovery_release_with_topology(
+        &self,
+        clearer: RecoveryFaultPublisher,
+        terminal: &RecoveryAnnouncement,
+        context: Option<(&AssignmentSnapshotStore, &super::ProcessLeaseAuthority)>,
+    ) -> Result<bool, ClusterCheckpointAuthorityError> {
         clearer.validate().map_err(LeaseError::Invalid)?;
         let (_, terminal_reference) = encode_recovery_release_terminal(terminal)?;
         let reporter = NodeId(clearer.participant.node_id);
@@ -2231,7 +2244,15 @@ impl LeaderLeaseStore {
             .load_record()
             .await?
             .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-        current.reject_pending_topology_commit()?;
+        self.audit_topology_recovery_terminal(&current, terminal, context)
+            .await?;
+        if terminal.round.topology_binding().is_some()
+            && current
+                .committed_topology_operation()
+                .is_none_or(|operation| operation.phase != super::TopologyAdmissionPhase::Active)
+        {
+            return Ok(false);
+        }
         let Some(release_head) = current.recovery_release_head.as_ref() else {
             return Ok(false);
         };
@@ -2368,6 +2389,16 @@ impl LeaderLeaseStore {
         proof: &LeaderProof,
         reference: RecoveryReleaseTerminalRef,
     ) -> Result<RecordRecoveryReleaseCommitResult, ClusterCheckpointAuthorityError> {
+        self.record_recovery_release_commit_with_topology(proof, reference, None)
+            .await
+    }
+
+    pub(crate) async fn record_recovery_release_commit_with_topology(
+        &self,
+        proof: &LeaderProof,
+        reference: RecoveryReleaseTerminalRef,
+        context: Option<(&AssignmentSnapshotStore, &super::ProcessLeaseAuthority)>,
+    ) -> Result<RecordRecoveryReleaseCommitResult, ClusterCheckpointAuthorityError> {
         reference.validate()?;
         let terminal = self.load_recovery_release_terminal(&reference).await?;
         if &terminal.round.leader_proof != proof || !proof.is_canonical() {
@@ -2380,7 +2411,8 @@ impl LeaderLeaseStore {
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
             let current = &published.record;
-            current.reject_pending_topology_commit()?;
+            self.audit_topology_recovery_terminal(current, &terminal, context)
+                .await?;
             if let Some(winner) = current.recovery_release_head.as_ref() {
                 if winner.terminal == reference
                     || winner.terminal.generation() >= reference.generation()
@@ -2399,6 +2431,14 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
+            let RecoverPhase::ReleaseCommitted { epoch } = terminal.phase else {
+                return Err(DecisionError::Conflict(
+                    "recovery terminal must be a committed Release".into(),
+                )
+                .into());
+            };
+            self.audit_recovery_topology_from(current, &terminal.round, Some(epoch), context)
+                .await?;
             let fault_inventory = Self::recovery_fault_inventory_from(current);
             if fault_inventory.revision != terminal.round.fault_revision()
                 || fault_inventory.faults != terminal.round.faults
@@ -2423,6 +2463,10 @@ impl LeaderLeaseStore {
                 expires_at_ms: current.lease.expires_at_ms,
                 catalog_manifest: current.lease.catalog_manifest.clone(),
             });
+            if terminal.round.topology_binding().is_some() {
+                candidate.version = candidate.version.max(TOPOLOGY_RECOVERY_RECORD_VERSION);
+                Self::release_recovered_topology(&mut candidate, &terminal.round, sequence)?;
+            }
             // Only a process frozen into the stopped roster may consume this terminal. Covered
             // unavailable publishers remain fenced and conservatively republish if they return.
             candidate.recovery_fault_slots.retain(|slot| {
@@ -2532,13 +2576,18 @@ impl LeaderLeaseStore {
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            head.reject_pending_topology_commit()?;
+            if let Some(operation) = head.committed_topology_operation() {
+                self.audit_topology_operation(operation).await?;
+            }
             let Some(link) = head.recovery_release_head.clone() else {
                 return Ok(RecoveryAdmissionSnapshot {
                     committed_release: None,
                     fault_inventory: Self::recovery_fault_inventory_from(&head),
                     authority_sequence: head.lease.seq,
                     release_head: None,
+                    topology: head
+                        .committed_topology_operation()
+                        .and_then(|operation| operation.commit.clone()),
                 });
             };
             let terminal = self.recovery_release_terminal_from(&head, &link).await;
@@ -2546,17 +2595,20 @@ impl LeaderLeaseStore {
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            rechecked.reject_pending_topology_commit()?;
             if rechecked.lease.seq >= head.lease.seq
                 && rechecked.recovery_release_head == head.recovery_release_head
                 && rechecked.recovery_fault_revision == head.recovery_fault_revision
                 && rechecked.recovery_fault_slots == head.recovery_fault_slots
+                && rechecked.committed_topology_operation() == head.committed_topology_operation()
             {
                 return Ok(RecoveryAdmissionSnapshot {
                     committed_release: Some(terminal?),
                     fault_inventory: Self::recovery_fault_inventory_from(&rechecked),
                     authority_sequence: rechecked.lease.seq,
-                    release_head: rechecked.recovery_release_head,
+                    release_head: rechecked.recovery_release_head.clone(),
+                    topology: rechecked
+                        .committed_topology_operation()
+                        .and_then(|operation| operation.commit.clone()),
                 });
             }
             tokio::task::yield_now().await;
@@ -2577,10 +2629,21 @@ impl LeaderLeaseStore {
             .await?
             .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
         let inventory = Self::recovery_fault_inventory_from(&current);
-        Ok(!current
-            .topology_operations
-            .iter()
-            .any(super::topology::TopologyAdmissionStatus::has_target_commit)
+        let topology = current
+            .committed_topology_operation()
+            .and_then(|operation| operation.commit.as_ref());
+        let release_matches_topology = topology.is_none_or(|commit| {
+            current
+                .committed_topology_operation()
+                .is_some_and(|operation| operation.phase == super::TopologyAdmissionPhase::Active)
+                && snapshot
+                    .committed_release
+                    .as_ref()
+                    .and_then(|release| release.round.topology_binding())
+                    .is_some_and(|binding| binding.commit() == commit)
+        });
+        Ok(topology == snapshot.topology.as_ref()
+            && release_matches_topology
             && current.lease.matches_proof(leader_proof)
             && current.lease.seq >= snapshot.authority_sequence
             && current.recovery_release_head == snapshot.release_head

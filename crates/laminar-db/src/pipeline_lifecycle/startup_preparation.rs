@@ -20,7 +20,7 @@ impl LaminarDB {
 
     pub(super) async fn start_inner(
         &self,
-        #[cfg(feature = "cluster")] topology: Option<crate::db::PreparedTopologyRestore>,
+        #[cfg(feature = "cluster")] mut topology: Option<crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
         let runtime_shutdown = tokio_util::sync::CancellationToken::new();
         *self.runtime_shutdown.write() = runtime_shutdown.clone();
@@ -31,9 +31,12 @@ impl LaminarDB {
             return Err(DbError::Shutdown);
         }
         #[cfg(feature = "cluster")]
-        if let Some(input) = topology.as_ref().map(|image| &image.input) {
-            self.ensure_topology_installation_held()?;
-            self.validate_topology_installation(input).await?;
+        if let Some(image) = topology.as_mut() {
+            if image.recovery_input().is_none() {
+                self.ensure_topology_installation_held()?;
+            }
+            self.validate_topology_runtime_image(image).await?;
+            let input = &image.input;
             let identities = self.topology_definition_identities()?;
             if self.catalog_manifest_inventory()? != input.target().entries
                 || identities.pipeline != input.descriptor().target_pipeline
@@ -107,12 +110,26 @@ impl LaminarDB {
 
         let pipeline_identity = self
             .initialize_checkpointing(
-                &source_regs,
-                &sink_regs,
-                &stream_regs,
-                &table_regs,
+                crate::pipeline_identity::PipelineRegistrations::new(
+                    source_regs.values(),
+                    sink_regs.values(),
+                    stream_regs.values(),
+                    table_regs.values(),
+                ),
                 startup_runtime,
                 injected_cluster_checkpoint_store,
+                {
+                    #[cfg(feature = "cluster")]
+                    {
+                        topology
+                            .as_ref()
+                            .map(|image| image.input.descriptor().deployment_id.as_str())
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    {
+                        None
+                    }
+                },
             )
             .await?;
 

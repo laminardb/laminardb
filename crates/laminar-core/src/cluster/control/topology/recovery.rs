@@ -1,8 +1,71 @@
 //! Private recovery selection for an irreversible topology Commit.
 
-use super::TopologyRestoreInput;
+use super::{TopologyCommit, TopologyError, TopologyRestoreInput};
 use crate::checkpoint::CommittedCheckpointIndex;
 use crate::checkpoint_decision::CheckpointOutcome;
+
+/// Recovery rounds carrying a topology Commit require every exact participant to understand
+/// that binding. Older round decoders reject the additional field rather than recover a parent.
+pub const TOPOLOGY_RECOVERY_PROTOCOL_VERSION: u16 = 6;
+
+/// Immutable target of an existing coordinated recovery round. Its cut is selected only after
+/// the complete stopped quorum; binding the target earlier prevents a catalog/Prepare race.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologyRecoveryBinding {
+    protocol_version: u16,
+    commit: TopologyCommit,
+    processes: Vec<crate::cluster::control::LocalProcessAuthorityIdentity>,
+}
+
+impl TopologyRecoveryBinding {
+    pub(crate) fn new(
+        commit: TopologyCommit,
+        processes: Vec<crate::cluster::control::LocalProcessAuthorityIdentity>,
+    ) -> Result<Self, TopologyError> {
+        let binding = Self {
+            protocol_version: TOPOLOGY_RECOVERY_PROTOCOL_VERSION,
+            commit,
+            processes,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    /// Exact catalog decision this round must restore and release.
+    #[must_use]
+    pub const fn commit(&self) -> &TopologyCommit {
+        &self.commit
+    }
+
+    /// Complete current owner/evidence process terms frozen into this recovery round.
+    #[must_use]
+    pub fn processes(&self) -> &[crate::cluster::control::LocalProcessAuthorityIdentity] {
+        &self.processes
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), TopologyError> {
+        self.commit.validate()?;
+        if self.protocol_version != TOPOLOGY_RECOVERY_PROTOCOL_VERSION {
+            return Err(TopologyError::Protocol(
+                "topology-bound recovery requires protocol six".into(),
+            ));
+        }
+        if self.processes.is_empty()
+            || self.processes.len() > crate::checkpoint::MAX_CHECKPOINT_PARTICIPANTS
+            || self.processes.iter().any(|process| !process.is_canonical())
+            || self
+                .processes
+                .windows(2)
+                .any(|pair| pair[0].participant.node_id >= pair[1].participant.node_id)
+        {
+            return Err(TopologyError::Invalid(
+                "topology recovery process roster is not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Which exact durable cut supplies a committed target's private state image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,7 +6,7 @@ use crate::subscription::cluster::{ClusterSubscriptionOutputState, OutputWriterA
 use laminar_core::checkpoint::{ChannelProgress, CheckpointScope};
 use laminar_core::cluster::control::TopologyRecoveryCut;
 
-async fn checkpointed() -> (
+pub(super) async fn checkpointed() -> (
     Fixture,
     laminar_core::cluster::control::TopologyOperationId,
     CheckpointManifest,
@@ -232,7 +232,7 @@ async fn checkpointed() -> (
 
 #[tokio::test]
 async fn topology_recovery_image_restores_newer_aggregate_cursors_and_subscription_frontiers() {
-    let (fixture, operation, manifest) = checkpointed().await;
+    let (fixture, operation, manifest) = Box::pin(checkpointed()).await;
     let before = fixture.authority.lease_store.load().await.unwrap();
     assert!(fixture
         .db
@@ -291,7 +291,7 @@ async fn topology_recovery_image_restores_newer_aggregate_cursors_and_subscripti
 
 #[tokio::test]
 async fn topology_recovery_image_cannot_borrow_original_installation_or_release() {
-    let (fixture, operation, _) = checkpointed().await;
+    let (fixture, operation, _) = Box::pin(checkpointed()).await;
     let mut image = fixture
         .db
         .prepare_cluster_topology_recovery(operation)
@@ -318,7 +318,7 @@ async fn topology_recovery_image_cannot_borrow_original_installation_or_release(
 
 #[tokio::test]
 async fn topology_recovery_image_corrupt_target_state_never_loads_valid_parent_root() {
-    let (fixture, operation, manifest) = checkpointed().await;
+    let (fixture, operation, manifest) = Box::pin(checkpointed()).await;
     fixture
         .authority
         .checkpoint_store

@@ -536,7 +536,7 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         let (restored_graph, topology_metadata) = match topology {
             Some(image) => {
-                let (graph, metadata) = image.into_runtime();
+                let (graph, metadata) = image.into_runtime()?;
                 (Some(graph), Some(metadata))
             }
             None => (None, None),
@@ -764,13 +764,19 @@ impl LaminarDB {
         launch?;
         #[cfg(feature = "cluster")]
         if let Some(metadata) = topology_metadata {
-            self.validate_topology_installation(&metadata.input).await?;
-            self.ensure_topology_runtime_ready(&metadata.input).await?;
+            self.validate_topology_runtime_metadata(&metadata).await?;
+            self.ensure_topology_runtime_live(&metadata.input).await?;
+            if let Some(recovery) = &metadata.recovery {
+                self.ensure_topology_recovery_runtime_held(&recovery.start)?;
+            } else {
+                self.ensure_topology_runtime_held()?;
+            }
             *self.installed_topology_runtime.lock() = Some(crate::db::InstalledTopologyRuntime {
                 input: metadata.input,
                 runtime_id: uuid::Uuid::new_v4(),
                 shutdown: self.runtime_shutdown.read().clone(),
                 released_sequence: None,
+                recovery: metadata.recovery,
             });
         }
         #[cfg(feature = "cluster")]

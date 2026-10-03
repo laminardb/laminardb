@@ -16,6 +16,7 @@ pub(crate) struct InstalledTopologyRuntime {
     pub(crate) runtime_id: Uuid,
     pub(crate) shutdown: tokio_util::sync::CancellationToken,
     pub(crate) released_sequence: Option<u64>,
+    pub(crate) recovery: Option<super::restore::TopologyRecoveryRuntime>,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +35,31 @@ impl LaminarDB {
         deadline: tokio::time::Instant,
     ) -> Result<Option<crate::db::AssignmentAuthorityActivation>, DbError> {
         let binding = self.installed_topology_runtime.lock().clone();
+        if let Some(binding) = binding
+            .as_ref()
+            .filter(|binding| binding.recovery.is_some())
+        {
+            if binding.input.assignment() != fence
+                || !self.recovered_topology_runtime_is_active(binding).await?
+            {
+                return Err(TopologyError::Fenced.into());
+            }
+            let proof = controller
+                .audit_assignment_leader_authority(fence, None, deadline)
+                .await
+                .map_err(TopologyError::Conflict)?;
+            return Ok(Some(
+                self.open_assignment_intake_after_audit(
+                    controller,
+                    fence,
+                    None,
+                    proof.owner.node_id,
+                    revision,
+                    deadline,
+                )
+                .await?,
+            ));
+        }
         let Some(binding) = binding.filter(|binding| binding.released_sequence.is_some()) else {
             return Ok(None);
         };

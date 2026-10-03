@@ -84,6 +84,64 @@ impl CheckpointCoordinator {
         self.install_recovered_metadata(input.outcome(), input.checkpoint(), recovered)
     }
 
+    /// Install an already decoded target cut under the same stopped recovery round. Definitive
+    /// committed sink effects retain their original publication fence and complete before a new
+    /// target epoch is admitted. Historical parent manifests are never relabelled.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn install_topology_recovery_metadata(
+        &mut self,
+        selection: &laminar_core::cluster::control::TopologyRecoveryInput,
+        round: &laminar_core::cluster::control::RecoveryRound,
+        recovered: &RecoveredState,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let input = selection.migration();
+        let controller = self
+            .cluster_controller
+            .clone()
+            .ok_or_else(|| DbError::Checkpoint("target recovery has no controller".into()))?;
+        let fresh = controller
+            .topology_recovery_input(round, selection.outcome().epoch)
+            .await?;
+        if !fresh.same_restore_requirements(selection)
+            || &recovered.outcome != selection.outcome()
+            || &recovered.committed != selection.checkpoint()
+            || recovered.reassigned
+        {
+            return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+        }
+        if selection.cut() == laminar_core::cluster::control::TopologyRecoveryCut::MigrationRoot {
+            return self.install_topology_root_metadata(input, recovered);
+        }
+        if self.phase != CheckpointPhase::Idle
+            || !self.prepared.is_empty()
+            || self.last_committed_ref.is_some()
+            || self.expected_pipeline_identity()? != input.descriptor().target_pipeline
+            || self.expected_deployment_id()? != input.descriptor().deployment_id
+            || self.assignment_version != input.assignment().assignment_version
+            || self.owned_vnodes != input.owned_vnodes()
+            || self.store.participant_id() != input.process().participant.node_id
+            || recovered.committed.pipeline_identity != input.descriptor().target_pipeline
+            || recovered.committed.scope != CheckpointScope::Cluster
+        {
+            return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+        }
+        self.continue_recovered_sinks_until(
+            selection.outcome(),
+            selection.checkpoint(),
+            recovered,
+            deadline,
+        )
+        .await?;
+        let after = controller
+            .topology_recovery_input(round, selection.outcome().epoch)
+            .await?;
+        if !after.same_restore_requirements(selection) {
+            return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+        }
+        self.install_recovered_metadata(selection.outcome(), selection.checkpoint(), recovered)
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) fn set_recovery_graph_payload_limit(&mut self, bytes: usize) {
         debug_assert_ne!(bytes, 0);

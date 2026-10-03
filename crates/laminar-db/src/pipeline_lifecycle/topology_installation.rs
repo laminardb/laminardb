@@ -55,7 +55,7 @@ impl LaminarDB {
         mut graph: crate::operator_graph::OperatorGraph,
         metadata: &TopologyRuntimeMetadata,
     ) -> Result<PipelineRecoveryState, DbError> {
-        self.validate_topology_installation(&metadata.input).await?;
+        self.validate_topology_runtime_metadata(metadata).await?;
         if !self.connector_manager.lock().tables().is_empty() {
             return Err(TopologyError::Unsupported(
                 "migration runtime has no reference-table initialization mapping".into(),
@@ -76,10 +76,19 @@ impl LaminarDB {
         }
         {
             let mut coordinator = self.coordinator.lock().await;
-            coordinator
-                .as_mut()
-                .ok_or(TopologyError::Fenced)?
-                .install_topology_root_metadata(&metadata.input, &metadata.recovered)?;
+            let coordinator = coordinator.as_mut().ok_or(TopologyError::Fenced)?;
+            if let Some(recovery) = &metadata.recovery {
+                coordinator
+                    .install_topology_recovery_metadata(
+                        &recovery.selection,
+                        &recovery.start.round,
+                        &metadata.recovered,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                    )
+                    .await?;
+            } else {
+                coordinator.install_topology_root_metadata(&metadata.input, &metadata.recovered)?;
+            }
         }
         *self.last_recovery_epoch.lock() = Some(metadata.recovered.epoch());
         let mut progress: FxHashMap<String, FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>> =
@@ -151,8 +160,7 @@ impl LaminarDB {
             coordinator.bound_pipeline_identity()? == input.descriptor().target_pipeline
                 && (coordinator.last_committed_ref()
                     == input.outcome().committed_checkpoint.as_ref()
-                    || (input.operation().phase
-                        == laminar_core::cluster::control::TopologyAdmissionPhase::Active
+                    || (input.is_committed()
                         && coordinator
                             .last_committed_manifest()
                             .is_some_and(|manifest| {

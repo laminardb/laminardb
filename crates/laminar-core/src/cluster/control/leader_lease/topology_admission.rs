@@ -65,6 +65,16 @@ impl LeaderAuthorityRecord {
                 ));
             }
             previous = operation.admitted_sequence;
+            if operation
+                .activation
+                .as_ref()
+                .is_some_and(|activation| activation.recovery_round.is_some())
+                && self.version < TOPOLOGY_RECOVERY_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "topology-bound recovery requires authority format 22".into(),
+                ));
+            }
             if operation.activation.is_some() && self.version < TOPOLOGY_INSTALLATION_RECORD_VERSION
             {
                 return Err(LeaseError::Invalid(
