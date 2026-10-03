@@ -589,6 +589,22 @@ original Release receipt or restart from a parent cut after newer target progres
 
 ## Errors and recovery
 
+Internal private recovery now uses `prepare_cluster_topology_recovery(operation_id)`.
+It selects the greatest exact target checkpoint, or the authorized migration root
+before the first target checkpoint. Its `recovery_input()` and `recovery_checkpoint()`
+report state provenance; `parent_checkpoint()` retains the original root identity.
+The image has no actor/output permission and cannot use original installation or
+Release methods. The existing 45-second preparation, compiler and state/read bounds
+apply. Automatic recovery startup and public submission remain unavailable.
+
+`recover_committed_cluster_topology` is the original migration-installation path.
+After a target checkpoint commits it rejects reconstruction from the older root.
+A missing/corrupt newer checkpoint requires repair of that exact retained evidence;
+the private loader cannot silently rewind to initialization. A source added by the
+migration resumes from its target checkpoint cursor, rather than reevaluating latest
+or reusing its initial sealed position. Keep the durable operation and storage when
+recovery fails. No checkpoint namespace reset or local rollback is authorized.
+
 | Code | Meaning and response |
 | --- | --- |
 | `LDB-6043` | Runtime topology migration is unavailable; use the existing inventory |

@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization/startup, private restore/retirement, atomic target Commit, held installation, participant-complete Release and DB-owned phase progress implemented; public runtime topology migration
+Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization/startup, private restore/retirement, atomic target Commit, held installation, participant-complete Release, DB-owned phase progress and exact target checkpoint/private recovery selection implemented; public runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -887,11 +887,50 @@ selection remain unchanged.
   migration/restart, transactional migration or comparative performance is run.
   See the [driver evidence](test-evidence/topology-driver-2026-10-03/README.md).
 
+## Completed increment (2026-10-03, target checkpoint/private recovery)
+
+Started clean at `482b20334c6e01aa00e394795719f094020cd325`. No dependency,
+authority format, scheduler or record-path work is added.
+
+- The first target checkpoint can extend the exact historical parent root only
+  through its audited Commit/complete Release and descriptor. Pipeline identities,
+  deployment, source inventories, owner map/ABI and watermarks remain explicit.
+  All ordinary predecessor checks retain strict identity equality.
+- First-target subscription continuity verifies the sealed parent certificate and
+  frontier and compares through its exact target certificate. Historical bytes,
+  hashes and sequence identities remain unchanged.
+- An opaque current-authority recovery input selects the greatest target Commit,
+  otherwise the original root. Damaged/foreign newer evidence never falls back.
+  Commit/leader/process/assignment rechecks, cancellation and a 15-second budget
+  retain private-only authority, including for replacement boots.
+- A single private image reuses the compiler/checkpoint/operator machinery. Target
+  state uses its own strict identity; cursor/watermark/subscription progress comes
+  from that cut. Added sources resume target checkpoint progress. Missing cursors
+  cannot borrow initial latest positions. Encoded buffers are freed after decode.
+- Original root installation preparation rejects after target progress commits.
+  Selected recovery images cannot borrow the original installation/Release path.
+  The coordinated recovery Start/Release and whole-cluster startup remain guarded.
+- The initial focused test exposed the missing first-target predecessor contract;
+  it failed before publishing an invalid checkpoint. Two later fixture failures
+  retained the real monotonic process-lease TTL and the requirement for stored
+  subscription segments. The corrected fixtures meet those existing contracts.
+- All 11 new focused cases pass. The final suite passes 4,433 tests: 1,096 core,
+  921 connectors, 2,060 DB and 356 server, with the same three ignored cases.
+  The private state oracle captures aggregate 45 after the original root's 30,
+  restores the target checkpoint and produces 60 after further input. It verifies
+  target source cursors, watermark 100 and actual subscription output frontiers.
+  All-target Clippy denies warnings; minimal server, cluster/FFI, formatting and
+  diff/source checks pass. Nineteen Rust source hashes and Cargo.lock remain frozen
+  through final verification and staging. See the
+  [target recovery evidence](test-evidence/topology-target-recovery-2026-10-03/README.md).
+  This is private state/authority evidence. The fixture's Release does not certify
+  live actors, brokers, public submission or multi-process target recovery.
+
 ## Remaining work
 
 1. Wire automatic target recovery, including a replacement process/runtime after
-   Release and whole-cluster startup. Select a newer exact target checkpoint when
-   present; otherwise explicitly authorize the migration root through the existing
+   Release and whole-cluster startup. Exact target checkpoint/private root selection
+   is implemented; bind it to recovery Start and explicitly authorize through the existing
    stopped/recovered/release quorum. Never borrow the original runtime UUID's Release.
    Ordinary startup and parent recovery remain fenced after Commit.
 2. Public SQL/atomic API, detached submission and leader routing. Topology/operation
@@ -935,6 +974,8 @@ Current runtime certification, sink generation and Release checks are recorded i
 `docs/test-evidence/topology-activation-2026-10-03`.
 DB-owned phase progress and its checks are recorded in
 `docs/test-evidence/topology-driver-2026-10-03`.
+Target checkpoint continuity and private recovery selection are recorded in
+`docs/test-evidence/topology-target-recovery-2026-10-03`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

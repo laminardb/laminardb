@@ -185,6 +185,40 @@ impl ClusterController {
         self.read_topology_restore_input(operation_id, true).await
     }
 
+    /// Select exact target recovery progress using this controller's live process adoption.
+    /// A target checkpoint takes precedence over the retained root. This grants no actor or
+    /// output permission; replacement runtimes still require the coordinated recovery quorum.
+    ///
+    /// # Errors
+    /// Rejects stale local adoption, changed target/assignment and damaged selected evidence.
+    pub async fn committed_topology_recovery_input(
+        &self,
+        operation_id: TopologyOperationId,
+    ) -> Result<crate::cluster::control::TopologyRecoveryInput, TopologyError> {
+        let before = self
+            .try_live_local_process_authority_identity()
+            .map_err(|_| TopologyError::Fenced)?;
+        if self.is_draining() {
+            return Err(TopologyError::Fenced);
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?;
+        let assignments = self.snapshot.as_ref().ok_or_else(|| {
+            TopologyError::Protocol("recovery has no assignment authority".into())
+        })?;
+        let processes = self
+            .process_lease_authority
+            .get()
+            .ok_or_else(|| TopologyError::Protocol("recovery has no process authority".into()))?;
+        let input = authority
+            .committed_topology_recovery_input(assignments, processes, operation_id, before)
+            .await?;
+        self.require_topology_restore_adoption(input.migration(), before, true)
+            .await?;
+        Ok(input)
+    }
+
     async fn read_topology_restore_input(
         &self,
         operation_id: TopologyOperationId,
@@ -216,6 +250,17 @@ impl ClusterController {
                 .topology_restore_input(assignments, processes, operation_id, before)
                 .await?
         };
+        self.require_topology_restore_adoption(&input, before, committed)
+            .await?;
+        Ok(input)
+    }
+
+    async fn require_topology_restore_adoption(
+        &self,
+        input: &crate::cluster::control::TopologyRestoreInput,
+        before: super::LocalProcessAuthorityIdentity,
+        committed: bool,
+    ) -> Result<(), TopologyError> {
         let evidence = self
             .read_local_process_authority_evidence()
             .await
@@ -235,7 +280,7 @@ impl ClusterController {
         {
             return Err(TopologyError::Fenced);
         }
-        Ok(input)
+        Ok(())
     }
 
     /// Commit the exact privately restored target after runtime-owned parent retirement.

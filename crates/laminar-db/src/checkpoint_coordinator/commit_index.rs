@@ -422,7 +422,7 @@ impl CheckpointCoordinator {
         not(feature = "cluster"),
         allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)
     )]
-    pub(super) async fn build_validated_committed_index_until(
+    pub(crate) async fn build_validated_committed_index_until(
         &self,
         attempt: CheckpointAttempt,
         scope: CheckpointScope,
@@ -444,13 +444,7 @@ impl CheckpointCoordinator {
         )?;
         #[cfg(feature = "cluster")]
         let subscription_validation = self
-            .validate_subscription_continuity_until(
-                attempt,
-                assignment_fence.as_ref(),
-                predecessor.as_ref(),
-                manifests,
-                deadline,
-            )
+            .validate_subscription_continuity_until(&index, manifests, deadline)
             .await;
         #[cfg(feature = "cluster")]
         if let Err(error) = &subscription_validation {

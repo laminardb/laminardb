@@ -958,9 +958,50 @@ errors are logged only when their diagnostic changes.
 This driver does not authorize a replacement runtime after Active. The original
 Release UUID belongs to its installed generation. Automatic target recovery and
 whole-cluster startup remain the next prerequisite to public submission; a newer
-target checkpoint must take precedence over the old migration root. Public SQL
+target checkpoint takes precedence during private recovery selection. Public SQL
 and startup guards remain. The local fixture validates phase ownership and actual
 held actors, not multi-process migration, transactional sinks or a restarted boot.
+
+## Target checkpoint continuity and private recovery, 2026-10-03
+
+The first checkpoint under the released target retains the exact historical root
+as its predecessor. Ordinary index continuity still requires the same pipeline
+identity and source inventory. A distinct authority check permits that one edge
+only through its retained, audited topology Commit, complete Release, descriptor
+and root. It verifies both original identities, deployment, owner map/ABI, complete
+source inventories and continuing source watermarks. No historical index or
+manifest is rewritten. Subsequent target checkpoints use ordinary continuity.
+
+Subscription continuity uses the same audited edge. The predecessor certificate
+and exclusive frontier must equal the sealed parent mapping. An in-memory
+comparison view uses its exact target certificate while preserving sequences;
+stored bytes and digests remain historical. The normal certificate/sequence check
+then validates the first target range. This adds control-path artifact checks only.
+
+`committed_topology_recovery_input` selects the greatest current target Commit
+index, or the original root if no target checkpoint has committed. Missing, damaged,
+foreign or ownership-incompatible newer evidence fails; it never falls back to an
+older root. Full process/assignment/leader and Commit-head rechecks share a 15-second
+budget. A concurrent newer Commit requires fresh selection. Replacement boots may
+select the same state with the unchanged owner map and stable participant roster.
+Selection grants private reads, never original runtime Release permission.
+
+`prepare_cluster_topology_recovery` reuses the one compiler permit, isolated catalog,
+strict checkpoint reader and existing target operator codecs. A target checkpoint
+uses its target identity directly; the parent mapping applies only to a root.
+Source cursors, watermarks and subscription exclusive frontiers come from the same
+selected cut. Every target source requires its committed cursor, including sources
+added by the migration; missing progress cannot reuse initial latest positions.
+Verified encoded state is freed after decoding. Original root reconstruction rejects
+once target progress exists. Selected recovery images cannot use the original
+migration installation/Release APIs.
+
+Automatic recovery Start/Release and whole-cluster startup are still guarded.
+They must bind this selection to the existing stopped/restored/release quorum;
+public SQL, removal/replacement and reference-aware reclamation remain unfinished.
+The focused fixture loads real aggregate/state/subscription codecs but supplies
+installation evidence as an authority fixture. It does not certify runtime recovery,
+replacement actor startup, brokers or real multi-process restart.
 
 The [progress file](cluster-topology-migrations-progress.md) records commands,
 results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)

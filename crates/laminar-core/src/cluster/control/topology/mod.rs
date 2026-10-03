@@ -13,10 +13,12 @@ use crate::error_codes;
 
 mod activation;
 mod admission;
+mod checkpoint_continuity;
 mod commit;
 mod compatibility;
 mod migration_root;
 mod preparation;
+mod recovery;
 mod restore;
 mod source_initialization;
 mod target_preparation;
@@ -43,6 +45,7 @@ pub use migration_root::{
 pub use preparation::{
     TopologyParticipantCertificate, TopologyPreparation, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
+pub use recovery::{TopologyRecoveryCut, TopologyRecoveryInput};
 pub use restore::TopologyRestoreInput;
 pub use source_initialization::{TopologySourceInitialization, MAX_TOPOLOGY_SOURCE_CHANNELS};
 pub use target_preparation::{

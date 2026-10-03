@@ -8,11 +8,18 @@ use laminar_core::checkpoint::{
     CheckpointAttempt, CheckpointScope, ObjectStoreCheckpointStore, StateFrameKey,
 };
 use laminar_core::cluster::control::{
-    TopologyError, TopologyMigrationRoot, TopologyOperationId, TopologyRestoreInput,
-    TopologyVersion,
+    TopologyError, TopologyMigrationRoot, TopologyOperationId, TopologyRecoveryCut,
+    TopologyRecoveryInput, TopologyRestoreInput, TopologyVersion,
 };
 
 use super::{DbError, LaminarDB};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TopologyRestorePurpose {
+    CutPreparation,
+    MigrationInstallation,
+    Recovery,
+}
 
 /// A source's preparation boundary. A sealed new-source cursor is never processing history.
 #[derive(Debug)]
@@ -64,6 +71,8 @@ pub struct PreparedTopologyRestore {
     pub(crate) candidate: LaminarDB,
     pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) input: TopologyRestoreInput,
+    // A selected recovery image cannot use the original migration installation/Release path.
+    recovery: Option<Box<TopologyRecoveryInput>>,
     recovered: crate::recovery_manager::RecoveredState,
     sources: BTreeMap<String, PreparedTopologySourcePosition>,
     restored_frames: usize,
@@ -78,6 +87,10 @@ impl std::fmt::Debug for PreparedTopologyRestore {
             .field("operation", &self.input.operation().operation_id)
             .field("target_version", &self.target_version())
             .field("restored_frames", &self.restored_frames)
+            .field(
+                "recovery_cut",
+                &self.recovery.as_ref().map(|input| input.cut()),
+            )
             .field(
                 "parent_retirement_observed",
                 &self.parent_retirement_observed,
@@ -134,10 +147,11 @@ impl PreparedTopologyRestore {
     }
 
     pub(super) fn belongs_to(&self, db: &LaminarDB) -> bool {
-        Arc::ptr_eq(
-            tokio::sync::OwnedMutexGuard::mutex(&self.compiler),
-            &db.topology_validation_lock,
-        )
+        self.recovery.is_none()
+            && Arc::ptr_eq(
+                tokio::sync::OwnedMutexGuard::mutex(&self.compiler),
+                &db.topology_validation_lock,
+            )
     }
 
     /// Target version of this private image; Commit does not activate it.
@@ -169,6 +183,19 @@ impl PreparedTopologyRestore {
     /// decoding; no historical checkpoint is relabelled as target processing history.
     #[must_use]
     pub const fn parent_checkpoint(&self) -> &laminar_core::checkpoint::CommittedCheckpointIndex {
+        self.input.checkpoint()
+    }
+
+    /// Selected private recovery authority, absent for original migration installation images.
+    /// This never authorizes reuse of the original runtime's installation receipt or Release.
+    #[must_use]
+    pub fn recovery_input(&self) -> Option<&TopologyRecoveryInput> {
+        self.recovery.as_deref()
+    }
+
+    /// Exact cut supplying this image, with its original parent or target pipeline identity.
+    #[must_use]
+    pub const fn recovery_checkpoint(&self) -> &laminar_core::checkpoint::CommittedCheckpointIndex {
         &self.recovered.committed
     }
 }
@@ -199,7 +226,7 @@ impl LaminarDB {
         &self,
         operation_id: TopologyOperationId,
     ) -> Result<PreparedTopologyRestore, DbError> {
-        self.prepare_topology_restore_image(operation_id, false)
+        self.prepare_topology_restore_image(operation_id, TopologyRestorePurpose::CutPreparation)
             .await
     }
 
@@ -215,31 +242,46 @@ impl LaminarDB {
         &self,
         operation_id: TopologyOperationId,
     ) -> Result<PreparedTopologyRestore, DbError> {
-        self.prepare_topology_restore_image(operation_id, true)
-            .await
+        self.prepare_topology_restore_image(
+            operation_id,
+            TopologyRestorePurpose::MigrationInstallation,
+        )
+        .await
     }
 
-    async fn prepare_topology_restore_image(
+    pub(super) async fn prepare_topology_restore_image(
         &self,
         operation_id: TopologyOperationId,
-        committed: bool,
+        purpose: TopologyRestorePurpose,
     ) -> Result<PreparedTopologyRestore, DbError> {
+        let committed = purpose != TopologyRestorePurpose::CutPreparation;
         self.ensure_topology_restore_available(committed)?;
         let compiler = Arc::clone(&self.topology_validation_lock)
             .try_lock_owned()
             .map_err(|_| TopologyError::PlanningBusy)?;
         // Keep the permit outside the timed future so cancellation drops partial state first.
-        let (candidate, graph, input, recovered, sources, restored_frames) =
+        let (candidate, graph, input, recovery, recovered, sources, restored_frames) =
             tokio::time::timeout(std::time::Duration::from_secs(45), async {
                 let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
                     TopologyError::Protocol("restore requires the configured controller".into())
                 })?;
-                let input = if committed {
-                    let input = controller.committed_topology_restore_input(operation_id).await?;
+                let recovery = if committed {
+                    let selection = controller.committed_topology_recovery_input(operation_id).await?;
+                    if purpose == TopologyRestorePurpose::MigrationInstallation
+                        && selection.cut() != TopologyRecoveryCut::MigrationRoot {
+                        return Err(TopologyError::Conflict(
+                            "target checkpoint has committed; reconstruction requires coordinated target recovery".into(),
+                        ).into());
+                    }
                     if super::DbState::load(&self.state) == super::DbState::ShuttingDown {
                         self.stop_pipeline_for_topology_retirement().await?;
                     }
-                    input
+                    Some(Box::new(selection))
+                } else {
+                    None
+                };
+                let input = if let Some(selection) = &recovery {
+                    selection.migration().clone()
                 } else {
                     controller.topology_restore_input(operation_id).await?
                 };
@@ -336,17 +378,33 @@ impl LaminarDB {
                         self.config.checkpoint.as_ref().and_then(|c| c.max_node_data_bytes)
                             .unwrap_or(laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES),
                     )?;
-                let mut recovered = crate::recovery_manager::RecoveryManager::new(
-                    &store, &input.descriptor().parent_pipeline,
+                let selected_pipeline = recovery.as_ref().map_or(
+                    &input.descriptor().parent_pipeline, |selection| &selection.checkpoint().pipeline_identity,
+                );
+                let reader = crate::recovery_manager::RecoveryManager::new(
+                    &store, selected_pipeline,
                     &input.descriptor().deployment_id, CheckpointScope::Cluster,
-                ).recover_topology_root(&input, budget).await?;
+                );
+                let mut recovered = if let Some(selection) = &recovery {
+                    reader.recover_topology_selection(selection, budget).await?
+                } else {
+                    reader.recover_topology_root(&input, budget).await?
+                };
                 let (graph, restored_frames) = restore_local_frames(graph, &recovered, &input)?;
-                validate_subscription_frontiers(&graph, &input)?;
+                if recovery.as_ref().is_some_and(|selection| selection.cut() == TopologyRecoveryCut::TargetCheckpoint) {
+                    super::recovery::validate_target_subscription_frontiers(&graph, &recovered, &input)?;
+                } else {
+                    validate_subscription_frontiers(&graph, &input)?;
+                }
                 // Release verified encoded buffers immediately after decoding, before broker I/O.
                 recovered.state_frames.clear();
-                let sources = prepare_source_positions(&candidate, &input).await?;
-                let after = if committed {
-                    controller.committed_topology_restore_input(operation_id).await?
+                let sources = prepare_source_positions_at_cut(&candidate, &input, recovery.as_deref()).await?;
+                let after = if let Some(selection) = &recovery {
+                    let fresh = controller.committed_topology_recovery_input(operation_id).await?;
+                    if !fresh.same_restore_requirements(selection) {
+                        return Err(TopologyError::Fenced.into());
+                    }
+                    fresh.migration().clone()
                 } else {
                     controller.topology_restore_input(operation_id).await?
                 };
@@ -361,7 +419,8 @@ impl LaminarDB {
                         return Err(TopologyError::Fenced.into());
                     }
                 }
-                Ok::<_, DbError>((candidate, graph, input, recovered, sources, restored_frames))
+                let recovery = (purpose == TopologyRestorePurpose::Recovery).then_some(recovery).flatten();
+                Ok::<_, DbError>((candidate, graph, input, recovery, recovered, sources, restored_frames))
             })
             .await
             .map_err(|_| TopologyError::Contended)??;
@@ -369,6 +428,7 @@ impl LaminarDB {
             candidate,
             graph,
             input,
+            recovery,
             recovered,
             sources,
             restored_frames,
@@ -416,6 +476,15 @@ pub(super) async fn prepare_source_positions(
     candidate: &LaminarDB,
     input: &TopologyRestoreInput,
 ) -> Result<BTreeMap<String, PreparedTopologySourcePosition>, DbError> {
+    prepare_source_positions_at_cut(candidate, input, None).await
+}
+
+async fn prepare_source_positions_at_cut(
+    candidate: &LaminarDB,
+    input: &TopologyRestoreInput,
+    recovery: Option<&TopologyRecoveryInput>,
+) -> Result<BTreeMap<String, PreparedTopologySourcePosition>, DbError> {
+    let cut = recovery.map_or_else(|| input.checkpoint(), TopologyRecoveryInput::checkpoint);
     let registrations = candidate.connector_manager.lock().sources().clone();
     let mut sources = BTreeMap::new();
     for name in candidate.catalog.list_sources() {
@@ -424,22 +493,31 @@ pub(super) async fn prepare_source_positions(
             .ok_or_else(|| TopologyError::Invalid("restore source has no connector".into()))?;
         let config = candidate.build_registered_source_config(&name, registration)?;
         let mut connector = candidate.connector_registry.create_source(&config, None)?;
-        let position = if let Some(checkpoint) = input.checkpoint().source_offsets.get(&name) {
+        let position = if let Some(checkpoint) = cut.source_offsets.get(&name) {
             let scoped = connector.contract(&config)?.topology
                 == laminar_connectors::connector::SourceTopology::Splittable;
             crate::pipeline_lifecycle::validate_source_recovery_assignment(
                 &name,
                 scoped,
                 Some(checkpoint),
-                std::num::NonZeroU64::new(input.plan().assignment.assignment_version),
+                cut.assignment_fence.as_ref().and_then(|assignment| {
+                    std::num::NonZeroU64::new(assignment.assignment_version)
+                }),
             )?;
             PreparedTopologySourcePosition::Preserved {
-                attempt: CheckpointAttempt::canonical(input.checkpoint().epoch),
+                attempt: CheckpointAttempt::canonical(cut.epoch),
                 checkpoint: crate::checkpoint_coordinator::connector_to_source_checkpoint(
                     checkpoint,
                 ),
             }
         } else {
+            if recovery
+                .is_some_and(|selection| selection.cut() == TopologyRecoveryCut::TargetCheckpoint)
+            {
+                return Err(TopologyError::Invalid(format!(
+                    "target checkpoint has no committed progress for source '{name}'; root initialization cannot replace it",
+                )).into());
+            }
             let initialization = input
                 .root()
                 .source_initializations

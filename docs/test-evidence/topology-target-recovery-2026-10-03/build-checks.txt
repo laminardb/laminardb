@@ -1,0 +1,19 @@
+Environment: CARGO_BUILD_JOBS=1
+
+Command: cargo clippy --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings
+Exit code: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 55.50s
+
+Command: cargo check --locked -p laminar-server --no-default-features
+Exit code: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.63s
+
+Command: cargo check --locked -p laminar-db --no-default-features --features cluster,ffi
+Exit code: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 04s
+
+Commands: cargo +nightly fmt --all -- --check; git diff --check; source identity verification
+Exit codes: 0
+VERIFIED_SOURCES=19; MODE=verify; CARGO_LOCK_UNCHANGED=true
+
+Frozen identities were also checked against the staged and committed Git objects. No dependency or durable format changed.

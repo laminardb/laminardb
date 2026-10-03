@@ -3,6 +3,9 @@
 use super::*;
 use crate::cluster::control::TOPOLOGY_INSTALLATION_PROTOCOL_VERSION;
 
+#[path = "topology_recovery_tests.rs"]
+mod recovery;
+
 async fn committed(authority: &LeaderLeaseStore) -> (Fixture, TopologyRestoreInput) {
     let (fixture, input) = prepared(authority).await;
     commit(authority, &fixture, &input).await.unwrap();

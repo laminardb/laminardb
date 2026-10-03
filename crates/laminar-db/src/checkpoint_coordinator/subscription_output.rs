@@ -90,7 +90,7 @@ impl CheckpointCoordinator {
         );
     }
 
-    pub(super) async fn prepare_subscription_output_until(
+    pub(crate) async fn prepare_subscription_output_until(
         &self,
         attempt: CheckpointAttempt,
         assignment: Option<&CheckpointAssignmentFence>,
@@ -221,12 +221,13 @@ impl CheckpointCoordinator {
 
     pub(super) async fn validate_subscription_continuity_until(
         &self,
-        attempt: CheckpointAttempt,
-        assignment: Option<&CheckpointAssignmentFence>,
-        predecessor: Option<&CommittedCheckpointRef>,
+        index: &CommittedCheckpointIndex,
         manifests: &[(CheckpointManifest, bytes::Bytes)],
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        let attempt = CheckpointAttempt::new(index.epoch, index.checkpoint_id);
+        let assignment = index.assignment_fence.as_ref();
+        let predecessor = index.predecessor.as_ref();
         let current = merged_subscription_outputs(attempt, assignment, manifests)?;
         if current.is_empty() {
             return Ok(());
@@ -239,7 +240,7 @@ impl CheckpointCoordinator {
                         "subscription predecessor validation requires a decision store".into(),
                     )
                 })?;
-                let index = tokio::time::timeout_at(
+                let parent = tokio::time::timeout_at(
                     deadline,
                     decisions.load_committed_checkpoint(reference),
                 )
@@ -254,7 +255,7 @@ impl CheckpointCoordinator {
                 })?;
                 let predecessor_manifests = tokio::time::timeout_at(
                     deadline,
-                    super::retention::load_index_manifests(self.store.as_ref(), &index),
+                    super::retention::load_index_manifests(self.store.as_ref(), &parent),
                 )
                 .await
                 .map_err(|_| {
@@ -262,14 +263,63 @@ impl CheckpointCoordinator {
                         "subscription predecessor participant read timed out".into(),
                     )
                 })??;
-                merged_subscription_outputs(
-                    CheckpointAttempt::new(index.epoch, index.checkpoint_id),
-                    index.assignment_fence.as_ref(),
+                let root = if let Some(controller) = &self.cluster_controller {
+                    let authority = controller
+                        .checkpoint_authority()
+                        .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+                    tokio::time::timeout_at(
+                        deadline,
+                        authority.validate_cluster_checkpoint_predecessor(index, &parent),
+                    )
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(
+                            "subscription topology continuity audit timed out".into(),
+                        )
+                    })?
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))?
+                } else {
+                    index
+                        .validate_predecessor_index(&parent)
+                        .map_err(DbError::Checkpoint)?;
+                    None
+                };
+                let mut outputs = merged_subscription_outputs(
+                    CheckpointAttempt::new(parent.epoch, parent.checkpoint_id),
+                    parent.assignment_fence.as_ref(),
                     &predecessor_manifests
                         .into_iter()
                         .map(|manifest| (manifest, bytes::Bytes::new()))
                         .collect::<Vec<_>>(),
-                )?
+                )?;
+                if let Some(root) = root {
+                    for output in &mut outputs {
+                        let mapping = root
+                            .subscriptions
+                            .iter()
+                            .find(|mapping| {
+                                mapping.parent_certificate.stream_generation
+                                    == output.manifest.stream_generation
+                            })
+                            .ok_or_else(|| {
+                                DbError::Checkpoint(
+                                    "parent subscription has no sealed topology mapping".into(),
+                                )
+                            })?;
+                        if output.manifest.distribution_certificate != mapping.parent_certificate
+                            || output.manifest.frontiers != mapping.frontiers
+                        {
+                            return Err(DbError::Checkpoint(
+                                "parent subscription differs from the exact migration root".into(),
+                            ));
+                        }
+                        // An audited comparison view only; stored manifests, digests and sequences
+                        // retain their historical parent identity and are never rewritten.
+                        output.manifest.distribution_certificate =
+                            mapping.target_certificate.clone();
+                    }
+                }
+                outputs
             }
         };
         for checkpoint in &current {

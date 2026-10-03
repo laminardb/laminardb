@@ -14,6 +14,7 @@ mod installation;
 mod migration_root;
 mod planning;
 mod preparation;
+mod recovery;
 mod restore;
 mod retirement;
 mod target_preparation;

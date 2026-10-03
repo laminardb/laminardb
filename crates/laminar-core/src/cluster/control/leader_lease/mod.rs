@@ -7,11 +7,13 @@ mod subscription_replay;
 mod topology;
 mod topology_activation;
 mod topology_admission;
+mod topology_checkpoint;
 mod topology_commit;
 mod topology_committed_restore;
 mod topology_cut;
 mod topology_migration_root;
 mod topology_preparation;
+mod topology_recovery;
 mod topology_restore;
 mod topology_target_preparation;
 
@@ -4956,9 +4958,8 @@ impl LeaderLeaseStore {
                 (commit_index, expected_predecessor.as_ref())
             {
                 let predecessor = decisions.load_committed_checkpoint(predecessor_ref).await?;
-                index
-                    .validate_predecessor_index(&predecessor)
-                    .map_err(DecisionError::Conflict)?;
+                self.validate_checkpoint_predecessor_from(current, index, &predecessor)
+                    .await?;
             }
 
             let base_sequence = current.lease.seq;

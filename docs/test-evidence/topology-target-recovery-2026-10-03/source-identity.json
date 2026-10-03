@@ -1,0 +1,119 @@
+{
+  "starting_commit": "482b20334c6e01aa00e394795719f094020cd325",
+  "original_baseline": "5d81ba9b18d80343373ecfaec4793df8c5caccf1",
+  "branch": "feature/cluster-topology-migrations",
+  "starting_working_tree_clean": true,
+  "frozen_at_utc": "2026-10-03T12:43:05.406999+00:00",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "packages": [
+    "laminar-core",
+    "laminar-connectors",
+    "laminar-db",
+    "laminar-server"
+  ],
+  "features": [
+    "cluster",
+    "aws",
+    "kafka"
+  ],
+  "changed_sources": [
+    {
+      "path": "crates/laminar-core/src/checkpoint/committed_checkpoint/mod.rs",
+      "sha256": "705a6f6c2996960da6e780fb55f6bca018162227c5ffe431920af4db602615a2",
+      "normalized_sha256": "705a6f6c2996960da6e780fb55f6bca018162227c5ffe431920af4db602615a2"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/controller/topology.rs",
+      "sha256": "e4e6ee64606372059dba5e79b752e5eba4b37231f29e66fa718c846b5c0e6060",
+      "normalized_sha256": "e4e6ee64606372059dba5e79b752e5eba4b37231f29e66fa718c846b5c0e6060"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/mod.rs",
+      "sha256": "abfb1f81efd15e3a7ccf263dd1d8a59d2ae2379ca0d0442613ee5c08e43a16ce",
+      "normalized_sha256": "abfb1f81efd15e3a7ccf263dd1d8a59d2ae2379ca0d0442613ee5c08e43a16ce"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_activation_tests.rs",
+      "sha256": "565fd1619198f310bc322d016742551e4c44d87319b284d60f6e183240c0f294",
+      "normalized_sha256": "565fd1619198f310bc322d016742551e4c44d87319b284d60f6e183240c0f294"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_checkpoint.rs",
+      "sha256": "2234d3fcf8e3299b4190807432fc2167d9f03af7b8ae2d44c5a9028245ee420e",
+      "normalized_sha256": "2234d3fcf8e3299b4190807432fc2167d9f03af7b8ae2d44c5a9028245ee420e"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery.rs",
+      "sha256": "55e0ee27aa8c8ca7f8ebec070f91aa746f275ef6a3598f598105a36298194cb3",
+      "normalized_sha256": "55e0ee27aa8c8ca7f8ebec070f91aa746f275ef6a3598f598105a36298194cb3"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_tests.rs",
+      "sha256": "15e08ebe3e94053d84597c5534022a599082355445136162dea8df12501d7fec",
+      "normalized_sha256": "15e08ebe3e94053d84597c5534022a599082355445136162dea8df12501d7fec"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/mod.rs",
+      "sha256": "90441857f9a04caa1ca4bd3fd4c3ea2562be84e23669682d2f565970bea8b710",
+      "normalized_sha256": "90441857f9a04caa1ca4bd3fd4c3ea2562be84e23669682d2f565970bea8b710"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/topology/checkpoint_continuity.rs",
+      "sha256": "47b64299420fde9922c22e9638b2c590479fbc670df9c367562e6d239503217c",
+      "normalized_sha256": "47b64299420fde9922c22e9638b2c590479fbc670df9c367562e6d239503217c"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/topology/mod.rs",
+      "sha256": "cfd34328562a0b983422904404a8215ed76d23699aba3bca6fd0213dbc8fce9e",
+      "normalized_sha256": "cfd34328562a0b983422904404a8215ed76d23699aba3bca6fd0213dbc8fce9e"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/topology/recovery.rs",
+      "sha256": "e85b129356618f7bb3b41c6ef0c554ba47c57e633290fa6b179154aedc9a9fdd",
+      "normalized_sha256": "e85b129356618f7bb3b41c6ef0c554ba47c57e633290fa6b179154aedc9a9fdd"
+    },
+    {
+      "path": "crates/laminar-db/src/checkpoint_coordinator/commit_index.rs",
+      "sha256": "0f9d9a1175118d5d0be01ddc0a9da2a2d89e422138951b62794a06853baaf9c2",
+      "normalized_sha256": "0f9d9a1175118d5d0be01ddc0a9da2a2d89e422138951b62794a06853baaf9c2"
+    },
+    {
+      "path": "crates/laminar-db/src/checkpoint_coordinator/subscription_output.rs",
+      "sha256": "b0db5954da60409cc070292f12e3c800929d29740dcbec577fdfae99153a67ab",
+      "normalized_sha256": "b0db5954da60409cc070292f12e3c800929d29740dcbec577fdfae99153a67ab"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_commit.rs",
+      "sha256": "34425cf51991e52482907e0052e1a451bdb9f7e656d3b470a3602ddf73c122c5",
+      "normalized_sha256": "34425cf51991e52482907e0052e1a451bdb9f7e656d3b470a3602ddf73c122c5"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_recovery.rs",
+      "sha256": "56a563d698ecd27fab0cf6dc78bb8c51243fe815ae50a907628ecfafe2c0a35b",
+      "normalized_sha256": "56a563d698ecd27fab0cf6dc78bb8c51243fe815ae50a907628ecfafe2c0a35b"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology.rs",
+      "sha256": "370e1fad05350017616713a18419bbb903704fc1a39e237dc0adbcb7e0b53e1d",
+      "normalized_sha256": "370e1fad05350017616713a18419bbb903704fc1a39e237dc0adbcb7e0b53e1d"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/recovery.rs",
+      "sha256": "22084922574b2f91adf07d70b3a40477c532e59bb810573e165b2d7d21e75b39",
+      "normalized_sha256": "22084922574b2f91adf07d70b3a40477c532e59bb810573e165b2d7d21e75b39"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/restore.rs",
+      "sha256": "1b72eeb06cd7f2e39f8c177e6847dbd1c139ede6b15679e90e59eae12501a67f",
+      "normalized_sha256": "1b72eeb06cd7f2e39f8c177e6847dbd1c139ede6b15679e90e59eae12501a67f"
+    },
+    {
+      "path": "crates/laminar-db/src/recovery_manager/mod.rs",
+      "sha256": "b0e780fa1fcf26c17ebe9d4f26480c4f7c9e6111fe45bef4f073e8db3421e968",
+      "normalized_sha256": "b0e780fa1fcf26c17ebe9d4f26480c4f7c9e6111fe45bef4f073e8db3421e968"
+    }
+  ],
+  "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+  "identity_scope": "Tested working-tree Rust bytes and Cargo.lock; normalized hashes allow Git line-ending normalization. No production binary or performance identity is implied."
+}

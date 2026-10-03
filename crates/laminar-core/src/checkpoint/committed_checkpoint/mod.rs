@@ -421,6 +421,13 @@ impl CommittedCheckpointIndex {
         {
             return Err("committed checkpoint predecessor breaks recovery continuity".into());
         }
+        self.validate_predecessor_watermarks(predecessor)
+    }
+
+    pub(crate) fn validate_predecessor_watermarks(
+        &self,
+        predecessor: &CommittedCheckpointIndex,
+    ) -> Result<(), String> {
         if self.version == COMMITTED_CHECKPOINT_INDEX_VERSION {
             let mut expected = predecessor
                 .effective_source_watermarks()?

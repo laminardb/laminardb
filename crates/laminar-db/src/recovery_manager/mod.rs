@@ -235,6 +235,52 @@ impl<'a> RecoveryManager<'a> {
         .await
     }
 
+    /// Load the authority-selected target checkpoint or explicitly mapped migration root.
+    /// Target checkpoint state uses the ordinary strict target identity and manifest validation;
+    /// it never passes through the parent's migration mapping. This does not authorize actors.
+    ///
+    /// # Errors
+    /// Rejects a foreign reader/process, divergent selected identity, missing/corrupt artifacts
+    /// and managed-state limits. A failed target checkpoint read never falls back to the root.
+    #[cfg(feature = "cluster")]
+    pub async fn recover_topology_selection(
+        &self,
+        input: &laminar_core::cluster::control::TopologyRecoveryInput,
+        max_graph_payload_bytes: usize,
+    ) -> Result<RecoveredState, DbError> {
+        use laminar_core::cluster::control::TopologyRecoveryCut;
+
+        if input.cut() == TopologyRecoveryCut::MigrationRoot {
+            return self
+                .recover_topology_root(input.migration(), max_graph_payload_bytes)
+                .await;
+        }
+        if self.store.participant_id() != input.migration().process().participant.node_id
+            || self.pipeline_identity != input.migration().descriptor().target_pipeline
+            || self.deployment_id != input.migration().descriptor().deployment_id
+            || self.scope != CheckpointScope::Cluster
+        {
+            return Err(checkpoint_error(
+                "target checkpoint reader differs from its selected target/process authority",
+            ));
+        }
+        let assignment = input.checkpoint().assignment_fence.clone().ok_or_else(|| {
+            checkpoint_error("selected target checkpoint has no assignment certificate")
+        })?;
+        // Selection proved the same owner map. Private reads retain the cut's historical boots
+        // and assignment; a later installation must use the current recovery round's identities.
+        self.recover_committed_for_target(
+            input.outcome(),
+            input.checkpoint(),
+            Some(ClusterRecoveryTarget {
+                assignment,
+                owned_vnodes: input.migration().owned_vnodes().to_vec(),
+                max_graph_payload_bytes,
+            }),
+        )
+        .await
+    }
+
     /// Bind recovery to one runtime topology, deployment, and outcome domain.
     #[must_use]
     pub fn new(
