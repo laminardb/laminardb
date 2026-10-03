@@ -258,6 +258,12 @@ impl LaminarDB {
             }
             #[cfg(feature = "cluster")]
             PipelineLifecycleAuthority::TopologyRetirement => std::time::Duration::from_secs(45),
+            #[cfg(feature = "cluster")]
+            PipelineLifecycleAuthority::TopologyInstallation => {
+                return Err(DbError::InvalidOperation(
+                    "topology installation authority is confined to held startup".into(),
+                ));
+            }
         };
         let deadline = checked_pipeline_deadline(stop_timeout, "pipeline stop")?;
         let first_stop = loop {

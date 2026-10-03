@@ -24,7 +24,9 @@ implemented. Exact-root parent retirement now observes existing actor/connector
 owners while retaining the runtime and namespace fences. Exact-process target
 preparation receipts now record those observations in the same authority log.
 Explicit private reconstruction after Commit is implemented, including before the
-first target checkpoint. Installation/activation and Release remain unfinished.
+first target checkpoint. Exact-Commit transport preparation and local runtime
+installation with intake held are implemented. Participant-complete activation,
+Release and automatic target runtime recovery remain unfinished.
 Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
@@ -748,6 +750,65 @@ records validation and its limits. Runtime catalog/coordinator/sink installation
 current participant readiness and automatic post-Commit recovery remain unfinished;
 LDB-6043 remains.
 
+## Held committed runtime installation, 2026-10-03
+
+`install_committed_cluster_topology(image)` reuses transport preparation and the
+existing sticky startup attempt, detached driver, catalog replay, source/sink
+preparation and compute watcher. It consumes one DB-owned committed image, with no
+caller-supplied root or readiness flag. The schema-only candidate is dropped and
+the decoded graph moves into the ordinary runtime; the compiler permit stays owned
+until the handoff finishes. State is neither copied nor decoded again.
+
+The startup claim accepts an observed retired parent or a Created DB with no
+unresolved owners. Current full-roster Commit, assignment, process/adoption,
+source cursor availability and exact transport generation are revalidated. Catalog
+inventory, target pipeline identity and execution environment must equal the
+certified descriptor. Assignment adoption remains locked through preparation and
+graph-ready publication. The unchanged catalog handles, incarnations and restored
+subscription sequence/frontier mappings feed the existing target callback.
+
+The target coordinator retains the immutable parent outcome, committed index and
+manifest as its historical predecessor. It does not relabel them, allocate a
+target checkpoint or acknowledge source history. Its next capture requires full
+vnode state when that predecessor's pipeline differs from the bound target; later
+target checkpoints resume the ordinary incremental policy. Source startup converts
+the image's positions to exact Resume or Initialized requests and preflights every
+source before opening target sinks. Reference tables without a migration mapping
+reject. Initial external sink epochs stay deferred.
+
+Sources service controls, sinks are owned and the compute loop reports local
+readiness while intake remains gated. The existing installed vnode marker binds
+the exact target pipeline and assignment. The final check observes coordinator,
+graph, watcher, source and sink ownership and revalidates shared authority. A local
+Running state is not a durable installation receipt or active topology. The
+operation stays Committed, locally active version remains absent and ordinary start
+or `set_source_gate(false)` cannot authorize intake.
+
+One cooperative 45-second deadline spans transport and owned startup. The startup
+owner outlives caller cancellation; cleanup uses existing bounded terminal joins.
+The compute watcher is registered before any readiness wait, and failed-start
+cleanup joins it before retiring graph claims and connector owners. A timeout keeps
+unresolved handles fenced. Commit and checkpoint namespace ownership survive
+installation failure; retry reconstructs the same root without resolving latest.
+No framework, authority encoding, dependency or per-record work is introduced.
+
+| Boundary | Result |
+| --- | --- |
+| Caller disconnects after claim | Existing startup owner continues with the same deadline and sticky result |
+| Unsupported sealed-source startup | Reject before target sink I/O; preserve Commit and holds |
+| Source start fails or installation deadline expires | Observe terminal cleanup, retain namespace/Commit and reconstruct for retry |
+| Process authority is lost during startup | Reject local readiness; retire/retain existing owners with intake held |
+| Local installation succeeds | Running control loop, no target epoch admission, receipt, Release or active version |
+| Created DB has no target checkpoint | Install from the exact committed migration root and historical parent |
+
+The [installation evidence](test-evidence/topology-installation-2026-10-03/README.md)
+uses real aggregate codecs, callback routing and owned connector actors. A test-only
+gate opening observes preserved state plus post-cut rows; it is not production
+Release. The fixture has one configured process identity and controlled source/sink
+I/O. Participant-complete capabilities/readiness, stale sink completion fencing,
+automatic recovery and the real multi-process migration/performance oracle remain
+unfinished. LDB-6043 remains.
+
 ## Required next integration
 
 1. Integrate candidate planning with a DB-owned migration worker and its existing
@@ -760,16 +821,17 @@ LDB-6043 remains.
    exact process/assignment roster; receipts alone cannot grant target output.
 4. Drive the implemented atomic target Commit and private post-Commit root
    reconstruction from owned migration work; both remain internal library paths.
-5. Drive the implemented exact-Commit transport preparation and install the runtime
-   catalog/coordinator, source and sink actors before participant-complete Release.
+5. Drive the implemented exact-Commit transport and held runtime installation
+   before participant-complete Release.
    Certify current installation capabilities/readiness and fence stale sink completions;
    graph/shuffle generation fences and atomic sealed source startup exist. Wire
    target-only post-Commit runtime recovery.
 6. Wire public SQL and atomic multi-object submission, expected parent,
    payload-bound idempotency and detached durable ownership. Local dry run exists;
    it does not advance admission. Do not reuse bootstrap.
-7. Consume staged subscription identity/frontier mappings during target install
-   and replay. Whole-graph hashes differ on additions; skipping their check is unsafe.
+7. Preserve the implemented root subscription identity/frontier mappings through
+   automatic target recovery and public submission. Whole-graph hashes differ on
+   additions; skipping their check is unsafe.
 8. Wire reconstruction into automatic target runtime recovery and run the stateful
    multi-process migration/restart oracle and fault matrix. Durable target catalog
    precedence and exact original-bootstrap assertions are implemented.
@@ -802,5 +864,7 @@ The [transport preparation evidence](test-evidence/topology-transport-2026-10-02
 records real gRPC generation changes and held exact-Commit DB preparation.
 The [source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md)
 records sealed numeric Kafka startup, retry/acknowledgement checks and owned held actors.
+The [installation evidence](test-evidence/topology-installation-2026-10-03/README.md)
+records exact-root target runtime handoff with intake held and its failure/retry boundaries.
 These results do not certify target migration
 or production latency.

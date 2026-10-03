@@ -18,12 +18,26 @@ impl LaminarDB {
         Ok(config)
     }
 
-    pub(super) async fn start_inner(&self) -> Result<(), DbError> {
+    pub(super) async fn start_inner(
+        &self,
+        #[cfg(feature = "cluster")] topology: Option<crate::db::PreparedTopologyRestore>,
+    ) -> Result<(), DbError> {
         let runtime_shutdown = tokio_util::sync::CancellationToken::new();
         *self.runtime_shutdown.write() = runtime_shutdown.clone();
         if self.is_closed() {
             runtime_shutdown.cancel();
             return Err(DbError::Shutdown);
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(input) = topology.as_ref().map(|image| &image.input) {
+            self.validate_topology_installation(input).await?;
+            let identities = self.topology_definition_identities()?;
+            if self.catalog_manifest_inventory()? != input.target().entries
+                || identities.pipeline != input.descriptor().target_pipeline
+                || identities.environment_sha256 != input.descriptor().environment_sha256
+            {
+                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+            }
         }
 
         let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
@@ -119,7 +133,10 @@ impl LaminarDB {
             );
         }
 
-        if has_external || !stream_regs.is_empty() {
+        let install_runtime = has_external || !stream_regs.is_empty();
+        #[cfg(feature = "cluster")]
+        let install_runtime = install_runtime || topology.is_some();
+        if install_runtime {
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),
@@ -138,6 +155,8 @@ impl LaminarDB {
                 temporal_source_roles,
                 ordered_interval_admissions,
                 runtime_shutdown,
+                #[cfg(feature = "cluster")]
+                topology,
             )
             .await?;
         } else {

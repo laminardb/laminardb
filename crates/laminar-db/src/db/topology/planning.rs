@@ -267,7 +267,7 @@ impl LaminarDB {
         Ok(candidate)
     }
 
-    pub(super) fn topology_definition_identities(
+    pub(crate) fn topology_definition_identities(
         &self,
     ) -> Result<PipelineCompatibilityIdentities, DbError> {
         let vnode_count = self.checkpoint_key_groups().into();

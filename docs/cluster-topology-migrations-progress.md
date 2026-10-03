@@ -772,6 +772,47 @@ selection remain unchanged.
   connector runtime suites and optimized multi-process migration/performance
   scenarios are not rerun. The isolated broker fixture is removed after its test.
 
+## Held committed runtime installation, 2026-10-03
+
+- Continuation starts clean at `53e63fad8b83e84076d045d6ede11242127a538c`.
+  `install_committed_cluster_topology(image)` now consumes the exact committed
+  private image through the existing detached startup owner. It reobserves parent
+  retirement and current Commit/assignment/process authority, prepares transport,
+  replays the exact target catalog and transfers the already decoded graph.
+- The live catalog and checkpoint coordinator bind the certified target identity
+  and environment. The coordinator retains the historical parent checkpoint and
+  outcome unchanged; the first target checkpoint must capture full vnode state.
+  Preserved source/stream handles, incarnations and subscription frontiers survive.
+  Source actors use exact Resume/Initialized positions. Unsupported sealed starts
+  reject before target sink I/O. Reference tables without an initialization mapping
+  remain unsupported.
+- The source/sink actors and compute control loop can become locally Running while
+  intake/cut stay held. Target sink epoch admission is deferred. Success publishes
+  no readiness receipt, Release or locally active version. Ordinary start, manual
+  gate opening and runtime DDL remain fenced. No protocol, dependency, scheduler,
+  general framework or per-record work is added.
+- The existing startup owner continues after caller cancellation. One cooperative
+  45-second budget spans transport, lifecycle/catalog replay and runtime preparation;
+  bounded terminal cleanup can extend the call. Compute watcher ownership is stored
+  before waiting for readiness, so dropped startup futures cannot orphan compute.
+  Failed startup joins/retains existing owners and keeps Commit, cut and namespace
+  ownership. A reconstructed root can retry after observed cleanup.
+- Tests exercise actual restored aggregate execution and target callback/sink
+  wiring, held actors, cancellation, failed-start retry, unsupported source startup,
+  process loss, the owned deadline and Created-DB installation before a target
+  checkpoint. The local test gate opening is a codec/runtime oracle, not Release.
+  The Created DB retains the fixture's configured process identity, not a full
+  multi-process restart. Validation is recorded in the
+  [installation evidence](test-evidence/topology-installation-2026-10-03/README.md).
+- All eight focused cases pass. The selected four-package suite passes 4,393
+  tests: 1,078 core, 921 connectors, 2,038 DB and 356 server, with the same three
+  ignored cases. The 19 changed Rust source hashes and Cargo.lock remain frozen
+  through final verification and staging. All-target Clippy with warnings denied,
+  minimal server, cluster/FFI, formatting and working/staged diff checks pass.
+  No broker or optimized multi-process/performance
+  scenario is rerun; the current harness does not drive held runtime installation
+  and Release.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -784,10 +825,10 @@ selection remain unchanged.
    Old checkpoint binding, quiescence, root pinning, source initialization and
    private state/cursor preparation exist.
 3. Drive implemented atomic Commit/private reconstruction from owned migration work;
-   drive exact-Commit transport preparation, install the runtime catalog/coordinator
-   and source/sink actors, fence stale sink completions, and certify current capabilities
-   and actual readiness for participant-complete Release. Graph/shuffle generation
-   fencing and atomic sealed source startup exist. Wire automatic post-Commit runtime
+   drive implemented exact-Commit transport and held runtime installation, fence
+   stale sink completions, and certify current capabilities and actual readiness
+   for participant-complete Release. Graph/shuffle generation fencing, root-backed
+   runtime state and atomic sealed source startup exist. Wire automatic post-Commit runtime
    recovery; ordinary startup stays held.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
@@ -823,6 +864,8 @@ Committed transport preparation checks are recorded in
 `docs/test-evidence/topology-transport-2026-10-02`.
 Atomic sealed source startup checks are recorded in
 `docs/test-evidence/topology-source-start-2026-10-02`.
+Held committed runtime installation checks are recorded in
+`docs/test-evidence/topology-installation-2026-10-03`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

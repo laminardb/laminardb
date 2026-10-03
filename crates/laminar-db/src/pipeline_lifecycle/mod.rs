@@ -93,6 +93,8 @@ enum PipelineLifecycleAuthority {
     CoordinatedRecovery,
     #[cfg(feature = "cluster")]
     TopologyRetirement,
+    #[cfg(feature = "cluster")]
+    TopologyInstallation,
 }
 
 #[derive(Clone, Copy)]
@@ -327,6 +329,10 @@ mod sink_preparation;
 mod source_contracts;
 mod startup;
 mod startup_preparation;
+#[cfg(feature = "cluster")]
+mod topology_installation;
+#[cfg(feature = "cluster")]
+use topology_installation::TopologyStartup;
 #[cfg(feature = "cluster")]
 mod topology_planning;
 #[cfg(feature = "cluster")]

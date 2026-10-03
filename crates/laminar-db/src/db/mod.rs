@@ -15,6 +15,8 @@ pub(crate) use assignment_authority::{
     audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
 };
 #[cfg(feature = "cluster")]
+pub(crate) use topology::TopologyRuntimeMetadata;
+#[cfg(feature = "cluster")]
 pub use topology::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,

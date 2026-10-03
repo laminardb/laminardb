@@ -24,12 +24,17 @@ struct RestoreValidationControl {
     block: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    runtime: parking_lot::Mutex<Option<Arc<runtime_probe::InstallationProbe>>>,
 }
+
+#[path = "topology_installation_probe.rs"]
+mod runtime_probe;
 
 struct PlanningSource(
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
     Arc<RestoreValidationControl>,
+    Option<runtime_probe::RuntimeSource>,
 );
 
 #[path = "topology_restore.rs"]
@@ -42,6 +47,44 @@ fn forbidden_effect(effects: &AtomicUsize) -> ConnectorError {
 
 #[async_trait]
 impl SourceConnector for PlanningSource {
+    fn supports_initialized_start(&self) -> bool {
+        self.3
+            .as_ref()
+            .is_some_and(|runtime| !runtime.probe.reject_initialized.load(Ordering::Acquire))
+    }
+
+    fn set_vnode_assignment(
+        &mut self,
+        name: &str,
+        registry: Arc<VnodeRegistry>,
+        _: NodeId,
+    ) -> Result<(), ConnectorError> {
+        let runtime = self.3.as_mut().ok_or_else(|| forbidden_effect(&self.0))?;
+        runtime.name = name.to_owned();
+        runtime.assignment = std::num::NonZeroU64::new(registry.assignment_version());
+        Ok(())
+    }
+
+    fn drive_control_plane(&mut self) {
+        if let Some(runtime) = self.3.as_mut() {
+            runtime.probe.controls.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    async fn notify_epoch_committed(
+        &mut self,
+        epoch: u64,
+        _: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        if let Some(runtime) = self.3.as_ref() {
+            runtime
+                .probe
+                .acknowledgements
+                .lock()
+                .push((runtime.name.clone(), epoch));
+        }
+        Ok(())
+    }
     async fn validate_initial_position(
         &mut self,
         config: &ConnectorConfig,
@@ -105,17 +148,30 @@ impl SourceConnector for PlanningSource {
         )
     }
 
-    async fn start(&mut self, _: SourceStart) -> Result<(), ConnectorError> {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        if let Some(runtime) = self.3.as_mut() {
+            return runtime.start(request).await;
+        }
         Err(forbidden_effect(&self.0))
     }
     async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+        if let Some(runtime) = self.3.as_mut() {
+            return runtime.poll();
+        }
         Err(forbidden_effect(&self.0))
     }
     fn checkpoint(&self) -> SourceCheckpoint {
+        if let Some(runtime) = self.3.as_ref() {
+            return runtime.checkpoint.clone();
+        }
         self.0.fetch_add(1, Ordering::SeqCst);
         SourceCheckpoint::new()
     }
     async fn close(&mut self) -> Result<(), ConnectorError> {
+        if let Some(runtime) = self.3.as_ref() {
+            runtime.probe.source_closes.fetch_add(1, Ordering::AcqRel);
+            return Ok(());
+        }
         Err(forbidden_effect(&self.0))
     }
     async fn discover_schema(&mut self, _: &HashMap<String, String>) -> Result<(), ConnectorError> {
@@ -123,7 +179,7 @@ impl SourceConnector for PlanningSource {
     }
 }
 
-struct PlanningSink(Arc<AtomicUsize>);
+struct PlanningSink(Arc<AtomicUsize>, Option<runtime_probe::RuntimeSink>);
 
 #[async_trait]
 impl SinkConnector for PlanningSink {
@@ -148,16 +204,30 @@ impl SinkConnector for PlanningSink {
         };
         Ok(SinkContract::new(consistency, topology, input))
     }
-    async fn open(&mut self, _: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if let Some(runtime) = self.1.as_mut() {
+            return runtime.open(config);
+        }
         Err(forbidden_effect(&self.0))
     }
-    async fn write_batch(&mut self, _: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        if let Some(runtime) = self.1.as_ref() {
+            return runtime.write(batch);
+        }
         Err(forbidden_effect(&self.0))
     }
     async fn begin_epoch(&mut self, _: u64) -> Result<(), ConnectorError> {
+        if let Some(runtime) = self.1.as_ref() {
+            runtime.probe.sink_epochs.fetch_add(1, Ordering::AcqRel);
+            return Ok(());
+        }
         Err(forbidden_effect(&self.0))
     }
     async fn close(&mut self) -> Result<(), ConnectorError> {
+        if let Some(runtime) = self.1.as_ref() {
+            runtime.probe.sink_closes.fetch_add(1, Ordering::AcqRel);
+            return Ok(());
+        }
         Err(forbidden_effect(&self.0))
     }
     fn suggested_write_timeout(&self) -> Duration {
@@ -243,58 +313,70 @@ impl Fixture {
             .await
             .unwrap(),
         );
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&authority.controller))
-            .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
-            .catalog_manifest_store(Arc::clone(&authority.manifest_store))
-            .shuffle_sender(Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                1, process,
-            )))
-            .shuffle_receiver(receiver)
-            .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, NodeId(1))))
-            .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
-            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-                interval_ms: None,
-                ..Default::default()
-            })
-            .register_connector(move |registry| {
-                let source_effects = Arc::clone(&factory_effects);
-                let source_resolutions = Arc::clone(&factory_resolutions);
-                let source_validation = Arc::clone(&factory_validation);
-                registry.register_source(
-                    "planning-source",
-                    ConnectorInfo {
-                        name: "planning-source".into(),
-                        display_name: "planning source".into(),
-                        version: "1".into(),
-                        is_source: true,
-                        is_sink: false,
-                        config_keys: vec![],
-                    },
-                    Arc::new(move |_| {
-                        Ok(Box::new(PlanningSource(
-                            Arc::clone(&source_effects),
-                            Arc::clone(&source_resolutions),
-                            Arc::clone(&source_validation),
-                        )))
-                    }),
-                )?;
-                registry.register_sink(
-                    "planning-sink",
-                    ConnectorInfo {
-                        name: "planning-sink".into(),
-                        display_name: "planning sink".into(),
-                        version: "1".into(),
-                        is_source: false,
-                        is_sink: true,
-                        config_keys: vec![],
-                    },
-                    Arc::new(move |_, _| Ok(Box::new(PlanningSink(Arc::clone(&factory_effects))))),
-                )
-            })
-            .build()
-            .await
-            .unwrap();
+        let db =
+            LaminarDB::builder()
+                .cluster_controller(Arc::clone(&authority.controller))
+                .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
+                .catalog_manifest_store(Arc::clone(&authority.manifest_store))
+                .shuffle_sender(Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                    1, process,
+                )))
+                .shuffle_receiver(receiver)
+                .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, NodeId(1))))
+                .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+                .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                    interval_ms: None,
+                    ..Default::default()
+                })
+                .register_connector(move |registry| {
+                    let source_effects = Arc::clone(&factory_effects);
+                    let source_resolutions = Arc::clone(&factory_resolutions);
+                    let source_validation = Arc::clone(&factory_validation);
+                    let sink_validation = Arc::clone(&factory_validation);
+                    registry.register_source(
+                        "planning-source",
+                        ConnectorInfo {
+                            name: "planning-source".into(),
+                            display_name: "planning source".into(),
+                            version: "1".into(),
+                            is_source: true,
+                            is_sink: false,
+                            config_keys: vec![],
+                        },
+                        Arc::new(move |_| {
+                            Ok(Box::new(PlanningSource(
+                                Arc::clone(&source_effects),
+                                Arc::clone(&source_resolutions),
+                                Arc::clone(&source_validation),
+                                source_validation.runtime.lock().as_ref().map(|probe| {
+                                    runtime_probe::RuntimeSource::new(Arc::clone(probe))
+                                }),
+                            )))
+                        }),
+                    )?;
+                    registry.register_sink(
+                        "planning-sink",
+                        ConnectorInfo {
+                            name: "planning-sink".into(),
+                            display_name: "planning sink".into(),
+                            version: "1".into(),
+                            is_source: false,
+                            is_sink: true,
+                            config_keys: vec![],
+                        },
+                        Arc::new(move |_, _| {
+                            Ok(Box::new(PlanningSink(
+                                Arc::clone(&factory_effects),
+                                sink_validation.runtime.lock().as_ref().map(|probe| {
+                                    runtime_probe::RuntimeSink::new(Arc::clone(probe))
+                                }),
+                            )))
+                        }),
+                    )
+                })
+                .build()
+                .await
+                .unwrap();
         db.execute_cluster_bootstrap_batch(&bootstrap)
             .await
             .unwrap();

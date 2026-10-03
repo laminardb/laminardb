@@ -297,13 +297,16 @@ impl LaminarDB {
                 "pipeline {operation} is fenced by the held topology cut; use coordinated recovery to resume an aborted operation"
             )));
         }
-        if authority == PipelineLifecycleAuthority::TopologyRetirement
-            && (!self.is_cluster_runtime()
-                || !topology_held
-                || !self.source_gate.load(std::sync::atomic::Ordering::Acquire))
+        if matches!(
+            authority,
+            PipelineLifecycleAuthority::TopologyRetirement
+                | PipelineLifecycleAuthority::TopologyInstallation
+        ) && (!self.is_cluster_runtime()
+            || !topology_held
+            || !self.source_gate.load(std::sync::atomic::Ordering::Acquire))
         {
             return Err(DbError::InvalidOperation(
-                "topology retirement requires the held old-topology intake boundary".into(),
+                "topology lifecycle handoff requires the held intake boundary".into(),
             ));
         }
         Ok(())

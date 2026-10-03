@@ -3,6 +3,9 @@
 use super::*;
 use laminar_core::shuffle::ShuffleTopologyFence;
 
+#[path = "topology_installation.rs"]
+mod installation;
+
 #[tokio::test]
 async fn topology_start_db_exact_committed_root_produces_distinct_preserved_and_initialized_requests(
 ) {

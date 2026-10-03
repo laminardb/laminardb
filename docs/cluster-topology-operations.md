@@ -455,9 +455,9 @@ This method leaves the operation Committed, target image private, catalog/coordi
 unchanged and source/sink actors unstarted. Intake/cut and the parent's namespace
 stay held. Cancellation after local publication retains the target binding; retry
 the same image or reconstruct from the immutable Commit. No manual gate opening,
-parent restart or output permission follows from success. Runtime installation and
-participant-complete Release, including current installation capability and actual
-receiver/state/sink readiness, remain unfinished. LDB-6043 remains.
+parent restart or output permission follows from success. Held runtime installation
+is available below. Participant-complete Release, including current installation
+capability and actual receiver/state/sink readiness, remains unfinished. LDB-6043 remains.
 
 ## Sealed source startup contract
 
@@ -473,10 +473,42 @@ Other built-ins and custom sources without the capability reject before startup.
 This boundary is not processed history and does not seed committed progress or
 acknowledge the skipped prefix. Reader polling remains held by the runtime gate.
 The contract is a tested installation prerequisite, not an operational migration
-command, target readiness or permission to open intake. Runtime installation,
-participant-complete Release and automatic target recovery remain unfinished;
+command or permission to open intake. Held installation consumes this contract.
+Participant-complete Release and automatic target recovery remain unfinished;
 LDB-6043 remains. See the
 [source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md).
+
+## Install a committed runtime with intake held
+
+The internal library method
+`LaminarDB::install_committed_cluster_topology(image)` consumes an image from
+`recover_committed_cluster_topology(operation_id)` or the retained Commit path.
+It reobserves parent terminal cleanup, audits current Commit/process/assignment
+authority, prepares the exact shuffle generation and installs the target catalog,
+restored graph, checkpoint coordinator and source/sink actors. There is no HTTP or
+SQL installation command and no automatic migration worker in this increment.
+
+The existing startup owner continues after caller cancellation. One cooperative
+45-second budget covers transport and runtime preparation, followed by bounded
+terminal cleanup if needed. Inspect the owned startup result and shared operation
+status after an uncertain response. A failed installation retains Commit, the cut
+and namespace ownership; reconstruct the exact root for retry after cleanup.
+Missing/corrupt state or expired cursors remain committed recovery failures. Never
+replace preserved state with a cold start or resolve a new latest boundary.
+
+Success means a local Running control loop with intake held. Sources service
+controls without polling or acknowledgements, and initial target sink epochs stay
+deferred. The historical parent checkpoint remains unchanged under its original
+identity; the first target checkpoint requires full vnode state. The operation
+remains Committed and the locally active version remains absent. Public startup,
+manual gate opening and runtime DDL remain fenced until the complete Release path
+exists. Success grants no durable readiness receipt or output permission.
+
+Current participant capability/readiness collection, stale sink completion fencing,
+participant-complete Release, automatic target recovery and public submission
+remain unfinished. LDB-6043 remains. The
+[installation evidence](test-evidence/topology-installation-2026-10-03/README.md)
+records the local held-runtime cases and their limits.
 
 ## Errors and recovery
 

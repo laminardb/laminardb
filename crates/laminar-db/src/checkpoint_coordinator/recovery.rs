@@ -52,6 +52,38 @@ pub(super) fn recovery_sink_fence(
 }
 
 impl CheckpointCoordinator {
+    /// Carry the exact historical predecessor into a newly bound target coordinator. This never
+    /// relabels its manifest/index, admits an epoch, reconciles effects or restores arbitrary state.
+    /// The caller owns the held startup and the already decoded, authority-audited root image.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_topology_root_metadata(
+        &mut self,
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+        recovered: &RecoveredState,
+    ) -> Result<(), DbError> {
+        if !input.is_committed()
+            || self.phase != CheckpointPhase::Idle
+            || !self.prepared.is_empty()
+            || self.last_committed_ref.is_some()
+            || self.expected_pipeline_identity()? != input.descriptor().target_pipeline
+            || self.expected_deployment_id()? != input.descriptor().deployment_id
+            || self.assignment_version != input.assignment().assignment_version
+            || self.owned_vnodes != input.owned_vnodes()
+            || self.store.participant_id() != input.process().participant.node_id
+            || recovered.reassigned
+            || &recovered.outcome != input.outcome()
+            || &recovered.committed != input.checkpoint()
+            || recovered.committed.pipeline_identity != input.descriptor().parent_pipeline
+            || recovered.committed.scope != CheckpointScope::Cluster
+            || self.cluster_controller.as_ref().is_none_or(|controller| {
+                controller.try_live_local_process_authority_identity().ok() != Some(input.process())
+            })
+        {
+            return Err(DbError::Checkpoint("target coordinator requires the exact committed migration-root predecessor and current ownership".into()));
+        }
+        self.install_recovered_metadata(input.outcome(), input.checkpoint(), recovered)
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) fn set_recovery_graph_payload_limit(&mut self, bytes: usize) {
         debug_assert_ne!(bytes, 0);

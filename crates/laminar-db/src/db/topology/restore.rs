@@ -63,7 +63,7 @@ impl PreparedTopologySourcePosition {
 pub struct PreparedTopologyRestore {
     pub(crate) candidate: LaminarDB,
     pub(crate) graph: crate::operator_graph::OperatorGraph,
-    pub(super) input: TopologyRestoreInput,
+    pub(crate) input: TopologyRestoreInput,
     recovered: crate::recovery_manager::RecoveredState,
     sources: BTreeMap<String, PreparedTopologySourcePosition>,
     restored_frames: usize,
@@ -92,6 +92,33 @@ impl std::fmt::Debug for PreparedTopologyRestore {
 }
 
 impl PreparedTopologyRestore {
+    pub(crate) fn into_runtime(
+        self,
+    ) -> (
+        crate::operator_graph::OperatorGraph,
+        TopologyRuntimeMetadata,
+    ) {
+        let Self {
+            candidate,
+            graph,
+            input,
+            recovered,
+            sources,
+            compiler,
+            ..
+        } = self;
+        drop(candidate);
+        (
+            graph,
+            TopologyRuntimeMetadata {
+                input,
+                recovered,
+                sources,
+                _compiler: compiler,
+            },
+        )
+    }
+
     /// Whether this image was authorized from an irreversible target Commit. It remains private;
     /// receivers, state installation, sinks and participant-complete Release are still required.
     #[must_use]
@@ -144,6 +171,14 @@ impl PreparedTopologyRestore {
     pub const fn parent_checkpoint(&self) -> &laminar_core::checkpoint::CommittedCheckpointIndex {
         &self.recovered.committed
     }
+}
+
+/// Control-path ownership of the exact root until the restored graph reaches runtime readiness.
+pub(crate) struct TopologyRuntimeMetadata {
+    pub(crate) input: TopologyRestoreInput,
+    pub(crate) recovered: crate::recovery_manager::RecoveredState,
+    pub(crate) sources: BTreeMap<String, PreparedTopologySourcePosition>,
+    _compiler: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl LaminarDB {

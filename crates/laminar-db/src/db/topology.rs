@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use super::{DbError, DbState, LaminarDB};
 
 mod commit;
+mod installation;
 mod migration_root;
 mod planning;
 mod preparation;
@@ -19,6 +20,7 @@ pub use planning::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
 };
+pub(crate) use restore::TopologyRuntimeMetadata;
 pub use restore::{PreparedTopologyRestore, PreparedTopologySourcePosition};
 
 /// Durable catalog version and this process's independently observed runtime activation.

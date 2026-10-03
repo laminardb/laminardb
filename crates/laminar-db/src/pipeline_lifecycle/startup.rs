@@ -1,3 +1,5 @@
+#[cfg(feature = "cluster")]
+use super::TopologyStartup;
 use super::{
     checked_pipeline_deadline, panic_message, publish_runtime_fault_state, required_recovery_scope,
     Arc, CheckpointStorageScope, DbError, DbState, DeliveryGuarantee, FutureExt, HashMap,
@@ -146,6 +148,35 @@ impl LaminarDB {
                 }
             }
         }
+        self.start_with_runtime_image(
+            authority,
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn start_with_topology_image(
+        self: &Arc<Self>,
+        image: crate::db::PreparedTopologyRestore,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        self.start_with_runtime_image(
+            PipelineLifecycleAuthority::TopologyInstallation,
+            Some(TopologyStartup { image, deadline }),
+        )
+        .await
+    }
+
+    async fn start_with_runtime_image(
+        self: &Arc<Self>,
+        authority: PipelineLifecycleAuthority,
+        #[cfg(feature = "cluster")] mut topology: Option<TopologyStartup>,
+    ) -> Result<(), DbError> {
+        if self.is_closed() {
+            return Err(DbError::Shutdown);
+        }
         self.connector_registry.freeze();
         let runtime = self.control_runtime.handle()?;
         let attempt = {
@@ -178,12 +209,23 @@ impl LaminarDB {
                                 .into(),
                         ));
                     }
-                    DbState::ShuttingDown => {
+                    DbState::ShuttingDown
+                        if {
+                            #[cfg(feature = "cluster")]
+                            {
+                                authority != PipelineLifecycleAuthority::TopologyInstallation
+                            }
+                            #[cfg(not(feature = "cluster"))]
+                            {
+                                true
+                            }
+                        } =>
+                    {
                         return Err(DbError::InvalidOperation(
                             "cannot start pipeline: shutdown/stop in progress".into(),
                         ));
                     }
-                    claimed @ (DbState::Created | DbState::Faulted) => {
+                    claimed @ (DbState::Created | DbState::Faulted | DbState::ShuttingDown) => {
                         // A compute fault publishes the cluster recovery fence before Faulted.
                         // Re-read that fence after observing the state so a public restart cannot
                         // slip through the fence-before-state publication window.
@@ -192,6 +234,19 @@ impl LaminarDB {
                         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
                         #[cfg(not(feature = "cluster"))]
                         Self::ensure_pipeline_lifecycle_authorized(authority, "start");
+                        #[cfg(feature = "cluster")]
+                        if authority == PipelineLifecycleAuthority::TopologyInstallation
+                            && (topology.is_none()
+                                || !matches!(claimed, DbState::Created | DbState::ShuttingDown)
+                                || self.last_fault.lock().is_some()
+                                || !self.owned_source_tasks.lock().is_empty()
+                                || !self.owned_sink_handles.lock().is_empty()
+                                || !self.owned_connector_task_fences.lock().is_empty())
+                        {
+                            return Err(
+                                laminar_core::cluster::control::TopologyError::Fenced.into()
+                            );
+                        }
                         let attempt = Arc::new(StartupAttempt::new());
                         // Publish ownership before Starting so stop/shutdown can always find the
                         // exact attempt they must await.
@@ -201,6 +256,8 @@ impl LaminarDB {
                         let driver_attempt = Arc::clone(&attempt);
                         let emergency_attempt = Arc::clone(&attempt);
                         let driver_runtime = runtime.clone();
+                        #[cfg(feature = "cluster")]
+                        let driver_topology = topology.take();
                         let startup_thread = match std::thread::Builder::new()
                             .name("laminar-start".into())
                             .spawn(move || {
@@ -213,6 +270,8 @@ impl LaminarDB {
                                             driver_attempt,
                                             claimed == DbState::Faulted,
                                             authority,
+                                            #[cfg(feature = "cluster")]
+                                            driver_topology,
                                         ));
                                     }));
                                 if result.is_err() && !emergency_attempt.is_complete() {
@@ -239,6 +298,12 @@ impl LaminarDB {
                         {
                             let _ = start_tx.send(false);
                             *owned = None;
+                            #[cfg(feature = "cluster")]
+                            if authority == PipelineLifecycleAuthority::TopologyInstallation {
+                                return Err(
+                                    laminar_core::cluster::control::TopologyError::Fenced.into()
+                                );
+                            }
                             continue;
                         }
                         if start_tx.send(true).is_err() {
@@ -260,12 +325,16 @@ impl LaminarDB {
         attempt: Arc<StartupAttempt>,
         starting_from_fault: bool,
         authority: PipelineLifecycleAuthority,
+        #[cfg(feature = "cluster")] topology: Option<TopologyStartup>,
     ) {
         let terminal = StartupDriverGuard::new(&self, Arc::clone(&attempt));
-        let result =
-            std::panic::AssertUnwindSafe(Box::pin(self.run_claimed_start(starting_from_fault)))
-                .catch_unwind()
-                .await;
+        let result = std::panic::AssertUnwindSafe(Box::pin(self.run_claimed_start(
+            starting_from_fault,
+            #[cfg(feature = "cluster")]
+            topology,
+        )))
+        .catch_unwind()
+        .await;
         let result = match result {
             Ok(result) => result,
             Err(panic) => {
@@ -294,6 +363,41 @@ impl LaminarDB {
                     ))),
                 }
             }
+        };
+        let result = if result.is_err() && DbState::load(&self.state) == DbState::Starting {
+            match self.cleanup_failed_start().await {
+                Ok(()) => {
+                    if result
+                        .as_ref()
+                        .err()
+                        .is_some_and(DbError::requires_pipeline_halt)
+                    {
+                        DbState::Faulted.store(&self.state);
+                    } else {
+                        let _ = DbState::compare_exchange(
+                            DbState::Starting,
+                            DbState::Created,
+                            &self.state,
+                        );
+                    }
+                    result
+                }
+                Err(error) => {
+                    DbState::Faulted.store(&self.state);
+                    if result
+                        .as_ref()
+                        .err()
+                        .is_some_and(DbError::requires_pipeline_halt)
+                    {
+                        tracing::error!(cleanup_error = %error, "cleanup also failed after a permanent startup error");
+                        result
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        } else {
+            result
         };
         let result = self.normalize_start_result_for_terminal_latch(result);
         self.terminalize_start_attempt_if_needed(authority, &result)
@@ -393,11 +497,37 @@ impl LaminarDB {
         );
     }
 
-    pub(super) async fn run_claimed_start(&self, starting_from_fault: bool) -> Result<(), DbError> {
+    pub(super) async fn run_claimed_start(
+        &self,
+        starting_from_fault: bool,
+        #[cfg(feature = "cluster")] topology: Option<TopologyStartup>,
+    ) -> Result<(), DbError> {
         const FAULT_RESTART_QUIESCE_TIMEOUT: std::time::Duration =
             std::time::Duration::from_secs(10);
-        let _topology = self.topology_ddl_lock.write().await;
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        #[cfg(feature = "cluster")]
+        let deadline = topology.as_ref().map(|startup| startup.deadline);
+        #[cfg(not(feature = "cluster"))]
+        let deadline: Option<tokio::time::Instant> = None;
+        let _topology = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.topology_ddl_lock.write())
+                .await
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "topology installation exceeded its lifecycle deadline".into(),
+                    )
+                })?,
+            None => self.topology_ddl_lock.write().await,
+        };
+        let _lifecycle = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+                .await
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "topology installation exceeded its lifecycle deadline".into(),
+                    )
+                })?,
+            None => self.lifecycle_lock.lock().await,
+        };
         self.ensure_catalog_cleanup_unfenced("pipeline start")?;
         if DbState::load(&self.state) != DbState::Starting {
             return Err(DbError::Pipeline(
@@ -407,6 +537,10 @@ impl LaminarDB {
 
         let generation_quiesce_deadline =
             tokio::time::Instant::now() + FAULT_RESTART_QUIESCE_TIMEOUT;
+        self.runtime_shutdown.read().cancel();
+        self.shutdown_signal.notify_one();
+        self.join_runtime_watcher_until(generation_quiesce_deadline)
+            .await?;
         if let Err(error) = self
             .quiesce_connector_generation_until(generation_quiesce_deadline)
             .await
@@ -442,7 +576,21 @@ impl LaminarDB {
         }
 
         #[cfg(feature = "cluster")]
-        if let Err(error) = self.restore_catalog_from_manifest().await {
+        let catalog_restore = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, self.restore_catalog_from_manifest())
+                    .await
+                    .map_err(|_| {
+                        DbError::Pipeline(
+                            "topology catalog replay exceeded the installation deadline".into(),
+                        )
+                    })
+                    .and_then(|result| result)
+            }
+            None => self.restore_catalog_from_manifest().await,
+        };
+        #[cfg(feature = "cluster")]
+        if let Err(error) = catalog_restore {
             if let Err(cleanup_error) =
                 self.ensure_catalog_cleanup_unfenced("catalog bootstrap rollback")
             {
@@ -493,7 +641,22 @@ impl LaminarDB {
             () = std::future::ready(()) => {}
         }
 
-        match self.start_inner().await {
+        let start = Box::pin(self.start_inner(
+            #[cfg(feature = "cluster")]
+            topology.map(|startup| startup.image),
+        ));
+        #[cfg(feature = "cluster")]
+        let result = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, start)
+                .await
+                .map_err(|_| laminar_core::cluster::control::TopologyError::Contended.into())
+                .and_then(|result| result)
+        } else {
+            start.await
+        };
+        #[cfg(not(feature = "cluster"))]
+        let result = start.await;
+        match result {
             Ok(()) => {
                 // CAS, not store: don't clobber a Faulted set by the watcher if the compute thread
                 // already panicked during startup. Losing that CAS is a failed start, not success.
