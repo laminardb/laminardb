@@ -16,12 +16,13 @@ pub(crate) use assignment_authority::{
 };
 #[cfg(feature = "cluster")]
 pub use topology::{
-    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
-    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+    ClusterTopologyAdoptionRequest, ClusterTopologyRequest, ClusterTopologyStatus,
+    PreparedTopologyRestore, PreparedTopologySourcePosition,
 };
 #[cfg(feature = "cluster")]
 pub use topology::{
-    ClusterTopologyStatus, PreparedTopologyRestore, PreparedTopologySourcePosition,
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
 };
 #[cfg(feature = "cluster")]
 pub(crate) use topology::{InstalledTopologyRuntime, TopologyRuntimeMetadata};
@@ -2653,6 +2654,8 @@ impl LaminarDB {
         Ok(Some(ExecuteResult::Ddl(DdlInfo {
             statement_type: statement_type.to_string(),
             object_name: name,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: false,
         })))
     }
@@ -4510,6 +4513,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE LOOKUP TABLE".to_string(),
             object_name: info.name,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -4940,6 +4945,16 @@ impl LaminarDB {
             self.ensure_catalog_cleanup_unfenced("database mutation")?;
         }
         if is_topology_ddl(statement) {
+            #[cfg(feature = "cluster")]
+            if self.is_cluster_runtime()
+                && DbState::load(&self.state) == DbState::Running
+                && !catalog_manifest_replay_active()
+                && !catalog_bootstrap_active()
+            {
+                // Admission plans its private catalog under the read lock. Do not take the
+                // direct-mutation write lock or invoke the startup bootstrap exception here.
+                return Box::pin(self.submit_cluster_topology_sql(sql, statement)).await;
+            }
             let _topology_ddl = self.topology_ddl_lock.write().await;
             self.ensure_catalog_cleanup_unfenced("database mutation")?;
             #[cfg(feature = "cluster")]
@@ -5076,6 +5091,8 @@ impl LaminarDB {
                     return Ok(ExecuteResult::Ddl(DdlInfo {
                         statement_type: "CREATE LOOKUP TABLE".into(),
                         object_name: name,
+                        #[cfg(feature = "cluster")]
+                        topology_operation: None,
                         applied: false,
                     }));
                 };
@@ -5187,6 +5204,8 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "CHECKPOINT".to_string(),
                     object_name: format!("checkpoint_{}", result.checkpoint_id),
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                     applied: true,
                 }))
             }
@@ -5672,6 +5691,8 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DDL".to_string(),
                     object_name: info.name,
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                     applied: true,
                 }))
             }
@@ -5679,6 +5700,8 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DDL".to_string(),
                     object_name: info.name,
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                     applied: true,
                 }))
             }

@@ -1,4 +1,4 @@
-//! Read-only durable topology status. Runtime DDL remains guarded until cutover is implemented.
+//! Durable topology status, admission and exact committed runtime lifecycle.
 
 use laminar_core::cluster::control::{
     TopologyAdmissionStatus, TopologyCatalogState, TopologyOperationId, TopologyVersion,
@@ -10,6 +10,7 @@ use super::{DbError, DbState, LaminarDB};
 mod activation;
 mod commit;
 pub(crate) use activation::InstalledTopologyRuntime;
+mod forwarding;
 mod installation;
 mod migration_root;
 mod planning;
@@ -18,6 +19,8 @@ mod recovery;
 mod recovery_runtime;
 mod restore;
 mod retirement;
+mod submission;
+pub use submission::{ClusterTopologyAdoptionRequest, ClusterTopologyRequest};
 mod target_preparation;
 mod transport;
 pub use planning::{

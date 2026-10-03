@@ -173,6 +173,83 @@ pub(super) async fn prepare_all(
 }
 
 #[tokio::test]
+async fn public_topology_plan_requires_complete_protocol_before_cut_and_gates_old_formats() {
+    let authority = store(30_000);
+    let (lease, assignments, mut plan, target) = fixture(&authority).await;
+    plan.protocol_version = TOPOLOGY_SUBMISSION_PROTOCOL_VERSION;
+    let admitted = authority
+        .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
+        .await
+        .unwrap();
+    assert_eq!(
+        authority.load_record().await.unwrap().unwrap().version,
+        TOPOLOGY_SUBMISSION_RECORD_VERSION
+    );
+    let inventory = checkpoint_artifact_inventory(&authority, &plan.assignment, 1).await;
+    assert!(authority
+        .begin_topology_checkpoint_cut(
+            &lease.proof(),
+            &assignments,
+            &processes(&authority),
+            admitted.operation_id,
+            &admitted.plan,
+            inventory.clone()
+        )
+        .await
+        .is_err());
+    let descriptor = authority
+        .load_topology_compatibility(plan.compatibility.as_ref().unwrap())
+        .await
+        .unwrap();
+    let process = identity(&authority, plan.assignment.participants[0]).await;
+    assert!(authority
+        .certify_topology_participant(
+            &assignments,
+            &processes(&authority),
+            plan.operation_id,
+            &admitted.plan,
+            process,
+            TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+            &descriptor
+        )
+        .await
+        .is_err());
+    let complete = authority
+        .certify_topology_participant(
+            &assignments,
+            &processes(&authority),
+            plan.operation_id,
+            &admitted.plan,
+            process,
+            TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
+            &descriptor,
+        )
+        .await
+        .unwrap();
+    assert!(complete
+        .preparation
+        .as_ref()
+        .unwrap()
+        .complete_sequence
+        .is_some());
+    let mut head = authority.load_record().await.unwrap().unwrap();
+    head.version = TOPOLOGY_RECOVERY_RECORD_VERSION;
+    assert!(head.validate().is_err());
+    let cut = authority
+        .begin_topology_checkpoint_cut(
+            &lease.proof(),
+            &assignments,
+            &processes(&authority),
+            admitted.operation_id,
+            &admitted.plan,
+            inventory,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cut.phase, TopologyAdmissionPhase::Quiescing);
+}
+
+#[tokio::test]
 async fn complete_roster_is_required_and_certificates_survive_reopen_and_abort() {
     let authority = store(30_000);
     let (lease, assignments, mut plan, target) = fixture(&authority).await;

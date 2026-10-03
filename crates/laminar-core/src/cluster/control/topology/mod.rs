@@ -44,6 +44,7 @@ pub use migration_root::{
 };
 pub use preparation::{
     TopologyParticipantCertificate, TopologyPreparation, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
 };
 pub use recovery::{
     TopologyRecoveryBinding, TopologyRecoveryCut, TopologyRecoveryInput,

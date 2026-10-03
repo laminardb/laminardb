@@ -50,6 +50,17 @@ impl LeaderAuthorityRecord {
         let mut planned = 0;
         let mut previous = 0;
         for operation in &self.topology_operations {
+            if operation.preparation.as_ref().is_some_and(|preparation| {
+                preparation.certificates.iter().any(|certificate| {
+                    certificate.protocol_version
+                        == super::super::topology::TOPOLOGY_SUBMISSION_PROTOCOL_VERSION
+                })
+            }) && self.version < TOPOLOGY_SUBMISSION_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "complete topology capability requires authority format 23".into(),
+                ));
+            }
             operation
                 .validate(self.lease.seq)
                 .map_err(|e| LeaseError::Invalid(e.to_string()))?;
@@ -441,6 +452,13 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| {
                     LeaseError::Invalid("topology operation authority anchor is missing".into())
                 })?;
+            if plan.protocol_version == super::super::topology::TOPOLOGY_SUBMISSION_PROTOCOL_VERSION
+                && record.version < TOPOLOGY_SUBMISSION_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "public topology plan is missing its authority format 23 gate".into(),
+                ));
+            }
             let anchored = record
                 .topology_operations
                 .iter()
@@ -700,11 +718,17 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| TopologyError::Invalid("authority sequence exhausted".into()))?;
             let sequence = lease.seq;
             let mut next = current.preserve_with_lease(lease);
-            next.version = next.version.max(if plan.compatibility.is_some() {
-                TOPOLOGY_PREPARATION_RECORD_VERSION
-            } else {
-                TOPOLOGY_ADMISSION_RECORD_VERSION
-            });
+            next.version = next.version.max(
+                if plan.protocol_version
+                    == super::super::topology::TOPOLOGY_SUBMISSION_PROTOCOL_VERSION
+                {
+                    TOPOLOGY_SUBMISSION_RECORD_VERSION
+                } else if plan.compatibility.is_some() {
+                    TOPOLOGY_PREPARATION_RECORD_VERSION
+                } else {
+                    TOPOLOGY_ADMISSION_RECORD_VERSION
+                },
+            );
             let operation = TopologyAdmissionStatus {
                 operation_id: plan.operation_id,
                 plan: reference.clone(),

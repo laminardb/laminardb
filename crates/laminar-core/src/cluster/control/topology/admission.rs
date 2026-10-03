@@ -41,13 +41,15 @@ impl TopologyAdmissionPlan {
     pub(crate) fn validate(&self) -> Result<(), TopologyError> {
         if !matches!(
             self.protocol_version,
-            TOPOLOGY_PROTOCOL_VERSION | super::TOPOLOGY_PREPARATION_PROTOCOL_VERSION
+            TOPOLOGY_PROTOCOL_VERSION
+                | super::TOPOLOGY_PREPARATION_PROTOCOL_VERSION
+                | super::TOPOLOGY_SUBMISSION_PROTOCOL_VERSION
         ) {
             return Err(TopologyError::Protocol(
                 "unsupported admission protocol".into(),
             ));
         }
-        if self.protocol_version == super::TOPOLOGY_PREPARATION_PROTOCOL_VERSION {
+        if self.protocol_version != TOPOLOGY_PROTOCOL_VERSION {
             self.compatibility
                 .as_ref()
                 .ok_or_else(|| {

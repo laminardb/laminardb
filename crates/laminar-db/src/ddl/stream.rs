@@ -171,6 +171,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE STREAM".to_string(),
                 object_name: name_str,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         };
@@ -207,6 +209,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE STREAM".to_string(),
             object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }

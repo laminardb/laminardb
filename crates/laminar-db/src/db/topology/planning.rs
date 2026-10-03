@@ -50,6 +50,16 @@ impl LaminarDB {
         expected_parent: TopologyVersion,
         statements: &[String],
     ) -> Result<ClusterTopologyValidation, DbError> {
+        self.plan_cluster_topology_change(expected_parent, statements)
+            .await
+            .map(|(report, _)| report)
+    }
+
+    pub(super) async fn plan_cluster_topology_change(
+        &self,
+        expected_parent: TopologyVersion,
+        statements: &[String],
+    ) -> Result<(ClusterTopologyValidation, CatalogManifest), DbError> {
         validate_request_bounds(statements)?;
         if !self.is_cluster_runtime() {
             return Err(TopologyError::Unsupported(
@@ -63,7 +73,7 @@ impl LaminarDB {
             .map_err(|_| TopologyError::PlanningBusy)?;
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            self.validate_topology_candidate(expected_parent, statements),
+            Box::pin(self.validate_topology_candidate(expected_parent, statements)),
         )
         .await
         .map_err(|_| TopologyError::PlanningTimedOut)?
@@ -73,7 +83,7 @@ impl LaminarDB {
         &self,
         expected_parent: TopologyVersion,
         statements: &[String],
-    ) -> Result<ClusterTopologyValidation, DbError> {
+    ) -> Result<(ClusterTopologyValidation, CatalogManifest), DbError> {
         let _catalog_read = self.topology_ddl_lock.read().await;
         self.ensure_validation_catalog_available()?;
         let store = self.catalog_manifest_store.lock().clone().ok_or_else(|| {
@@ -218,7 +228,7 @@ impl LaminarDB {
         };
         report.compatibility_sha256 = report.descriptor_digest()?;
         report.validate_catalogs(&parent, &target)?;
-        Ok(report)
+        Ok((report, target))
     }
 
     fn ensure_validation_catalog_available(&self) -> Result<(), DbError> {
@@ -310,7 +320,7 @@ impl LaminarDB {
     }
 }
 
-fn validate_request_bounds(statements: &[String]) -> Result<(), DbError> {
+pub(super) fn validate_request_bounds(statements: &[String]) -> Result<(), DbError> {
     if statements.is_empty() || statements.len() > MAX_VALIDATION_STATEMENTS {
         return Err(TopologyError::Invalid(
             "validation requires 1..=64 individual CREATE statements".into(),

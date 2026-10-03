@@ -94,6 +94,15 @@ pub enum DbError {
     #[cfg(feature = "cluster")]
     Topology(#[from] laminar_core::cluster::control::TopologyError),
 
+    /// SQL-generated request identity retained when submission has an uncertain outcome.
+    #[cfg(feature = "cluster")]
+    TopologySubmission {
+        /// UUID to use for definitive status reads and retries.
+        operation_id: laminar_core::cluster::control::TopologyOperationId,
+        /// Original typed failure, preserving its registry code and source chain.
+        source: Box<Self>,
+    },
+
     /// SQL parse error (from streaming parser)
     SqlParse(#[from] laminar_sql::parser::ParseError),
 
@@ -284,6 +293,8 @@ impl DbError {
             Self::Subscription(error) => error.code(),
             #[cfg(feature = "cluster")]
             Self::Topology(error) => error.code(),
+            #[cfg(feature = "cluster")]
+            Self::TopologySubmission { source, .. } => source.code(),
             Self::Shutdown => error_codes::SHUTDOWN,
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
@@ -424,6 +435,10 @@ impl std::fmt::Display for DbError {
             Self::Subscription(error) => write!(f, "[{}] {error}", self.code()),
             #[cfg(feature = "cluster")]
             Self::Topology(error) => write!(f, "{error}"),
+            #[cfg(feature = "cluster")]
+            Self::TopologySubmission { operation_id, source } => write!(f,
+                "{source}; topology operation {} may be admitted; query status and retry the same identity",
+                operation_id.get()),
             Self::SqlParse(e) => write!(f, "SQL parse error: {e}"),
             Self::Shutdown => write!(f, "[{}] Database is shut down", self.code()),
             Self::Checkpoint(msg) => {

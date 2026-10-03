@@ -139,6 +139,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE SOURCE".to_string(),
                 object_name: source_name,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         };
@@ -226,6 +228,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE SOURCE".to_string(),
             object_name: name.clone(),
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -504,6 +508,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE SINK".to_string(),
                 object_name: name,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         };
@@ -605,6 +611,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE SINK".to_string(),
             object_name: name,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }

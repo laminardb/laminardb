@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 /// Candidate preparation requires this exact protocol on every frozen process.
 pub const TOPOLOGY_PREPARATION_PROTOCOL_VERSION: u16 = 2;
 
+/// Complete public migration support, including exact-target installation and recovery.
+/// Every frozen process must certify this plan protocol before the parent cut begins.
+pub const TOPOLOGY_SUBMISSION_PROTOCOL_VERSION: u16 = 6;
+
 /// One process's independently compiled candidate, bound to its first immutable authority append.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,11 +60,19 @@ impl TopologyAdmissionStatus {
                 certificate.participant.node_id == 0
                     || certificate.participant.boot_incarnation.is_nil()
                     || certificate.process_term == 0
-                    || certificate.protocol_version != TOPOLOGY_PREPARATION_PROTOCOL_VERSION
+                    || !matches!(
+                        certificate.protocol_version,
+                        TOPOLOGY_PREPARATION_PROTOCOL_VERSION
+                            | TOPOLOGY_SUBMISSION_PROTOCOL_VERSION
+                    )
                     || certificate.authority_sequence <= self.admitted_sequence
                     || certificate.authority_sequence > self.status_sequence
                     || certificate.authority_sequence > head
             })
+            || !preparation
+                .certificates
+                .windows(2)
+                .all(|pair| pair[0].protocol_version == pair[1].protocol_version)
             || preparation.complete_sequence.is_some_and(|sequence| {
                 preparation
                     .certificates

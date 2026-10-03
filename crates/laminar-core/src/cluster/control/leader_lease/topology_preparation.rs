@@ -11,6 +11,7 @@ use crate::cluster::control::topology::{
     ClusterTopologyValidation, TopologyAdmissionPhase, TopologyAdmissionPlan,
     TopologyAdmissionStatus, TopologyCompatibilityRef, TopologyError, TopologyOperationId,
     TopologyParticipantCertificate, TopologyPlanRef, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
 };
 use crate::cluster::control::{LocalProcessAuthorityIdentity, ProcessLeaseAuthority};
 
@@ -207,7 +208,10 @@ impl LeaderLeaseStore {
         protocol_version: u16,
         compiled: &ClusterTopologyValidation,
     ) -> Result<TopologyAdmissionStatus, TopologyError> {
-        if protocol_version != TOPOLOGY_PREPARATION_PROTOCOL_VERSION {
+        if !matches!(
+            protocol_version,
+            TOPOLOGY_PREPARATION_PROTOCOL_VERSION | TOPOLOGY_SUBMISSION_PROTOCOL_VERSION
+        ) {
             return Err(TopologyError::Protocol(
                 "participant lacks the exact preparation protocol".into(),
             ));
@@ -364,9 +368,11 @@ impl LeaderLeaseStore {
             .as_ref()
             .ok_or_else(|| TopologyError::Invalid("missing preparation".into()))?;
         if preparation.certificates.iter().any(|cert| {
-            plan.assignment
-                .participant_incarnation(cert.participant.node_id)
-                != Some(cert.participant.boot_incarnation)
+            cert.protocol_version != plan.protocol_version
+                || plan
+                    .assignment
+                    .participant_incarnation(cert.participant.node_id)
+                    != Some(cert.participant.boot_incarnation)
         }) || preparation.complete_sequence.is_some()
             != (preparation.certificates.len() == plan.assignment.participants.len())
             || operation.cut.as_ref().is_some_and(|cut| {

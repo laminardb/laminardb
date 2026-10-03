@@ -602,7 +602,7 @@ impl ClusterController {
                 operation_id,
                 expected_plan,
                 before,
-                crate::cluster::control::topology::TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+                plan.protocol_version,
                 compiled,
             )
             .await?;

@@ -5,6 +5,7 @@ use laminar_connectors::connector::{SourcePosition, SourceRowPositions};
 
 #[derive(Default)]
 pub(super) struct InstallationProbe {
+    pub allow_parent_initial: std::sync::atomic::AtomicBool,
     pub reject_initialized: std::sync::atomic::AtomicBool,
     pub fail_start: std::sync::atomic::AtomicBool,
     pub block_start: std::sync::atomic::AtomicBool,
@@ -58,9 +59,19 @@ impl RuntimeSource {
             SourcePosition::Resume { checkpoint, .. }
             | SourcePosition::Initialized { checkpoint } => checkpoint,
             SourcePosition::Initial => {
-                return Err(ConnectorError::ConfigurationError(
-                    "target must use its exact sealed cut".into(),
-                ))
+                if self.name != "trades" || !self.probe.allow_parent_initial.load(Ordering::Acquire)
+                {
+                    return Err(ConnectorError::ConfigurationError(
+                        "target must use its exact sealed cut".into(),
+                    ));
+                }
+                let mut checkpoint = SourceCheckpoint::with_offsets(HashMap::from([(
+                    "old.cursor".into(),
+                    "0".into(),
+                )]));
+                checkpoint.set_metadata("connector", "planning-source");
+                checkpoint.set_input_channels(vec![vec![1]])?;
+                checkpoint
             }
         };
         if let Some(version) = self.assignment {

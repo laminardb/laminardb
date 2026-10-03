@@ -126,14 +126,37 @@ async fn topology_activation_runtime_certification_keeps_intake_held_and_release
         refreshed.installed && refreshed.intake_open,
         "Release remains the admission proof before the first target checkpoint"
     );
-    // This local fixture has controlled ALO connectors; public SQL remains guarded.
-    assert!(fixture
-        .db
-        .execute("CREATE STREAM still_guarded AS SELECT * FROM trades")
+    // Controlled installation has no running migration driver. Public admission fails before
+    // changing the live inventory or durable authority.
+    let inventory = fixture.db.catalog_manifest_inventory().unwrap();
+    let sequence = fixture
+        .authority
+        .lease_store
+        .load()
         .await
-        .unwrap_err()
-        .to_string()
-        .contains("LDB-6043"));
+        .unwrap()
+        .unwrap()
+        .seq;
+    assert!(matches!(
+        fixture
+            .db
+            .execute("CREATE STREAM still_guarded AS SELECT * FROM trades")
+            .await,
+        Err(DbError::Topology(TopologyError::Conflict(message)))
+            if message.contains("live checkpoint/recovery coordinator")
+    ));
+    assert_eq!(fixture.db.catalog_manifest_inventory().unwrap(), inventory);
+    assert_eq!(
+        fixture
+            .authority
+            .lease_store
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .seq,
+        sequence
+    );
     fixture.db.shutdown().await.unwrap();
 }
 

@@ -53,6 +53,10 @@ struct SqlResponse {
     /// when the result is complete.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
+    /// Durable admission receipt; its phase distinguishes Commit from actual target Release.
+    #[cfg(feature = "cluster")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topology_operation: Option<Box<laminar_core::cluster::control::TopologyAdmissionStatus>>,
 }
 
 /// Trim `batches` to at most `cap` rows, returning the trimmed batches and
@@ -104,6 +108,8 @@ pub(super) async fn execute_sql(
                     rows_affected: None,
                     data: None,
                     truncated: false,
+                    #[cfg(feature = "cluster")]
+                    topology_operation: info.topology_operation,
                 },
                 ExecuteResult::RowsAffected(n) => SqlResponse {
                     result_type: "rows_affected".to_string(),
@@ -111,6 +117,8 @@ pub(super) async fn execute_sql(
                     rows_affected: Some(n),
                     data: None,
                     truncated: false,
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                 },
                 ExecuteResult::Metadata(batch) => {
                     let data = match batches_to_json_raw(&[batch]) {
@@ -129,6 +137,8 @@ pub(super) async fn execute_sql(
                         rows_affected: None,
                         data: Some(data),
                         truncated: false,
+                        #[cfg(feature = "cluster")]
+                        topology_operation: None,
                     }
                 }
                 ExecuteResult::Query(mut handle) => {
@@ -165,12 +175,30 @@ pub(super) async fn execute_sql(
                         rows_affected: None,
                         data: raw_data,
                         truncated: over_cap || timed_out,
+                        #[cfg(feature = "cluster")]
+                        topology_operation: None,
                     }
                 }
             };
-            Json(resp).into_response()
+            let status = StatusCode::OK;
+            #[cfg(feature = "cluster")]
+            let status = if resp.topology_operation.is_some() {
+                StatusCode::ACCEPTED
+            } else {
+                status
+            };
+            (status, Json(resp)).into_response()
         }
-        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            #[cfg(feature = "cluster")]
+            if matches!(
+                &e,
+                laminar_db::DbError::Topology(_) | laminar_db::DbError::TopologySubmission { .. }
+            ) {
+                return super::topology_submission::topology_write_error(e);
+            }
+            error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
     }
 }
 

@@ -41,6 +41,8 @@ use tracing::instrument::WithSubscriber as _;
 #[cfg(all(feature = "cluster", feature = "kafka"))]
 mod topology_planning;
 
+mod topology_submission;
+
 #[cfg(feature = "cluster")]
 #[derive(Clone, Default)]
 struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);

@@ -38,6 +38,7 @@ use super::topology::{
     cluster_topology, cluster_topology_operation, prepare_cluster_topology,
     validate_cluster_topology,
 };
+use super::topology_submission::{adopt_cluster_topology, submit_cluster_topology};
 use super::ws::ws_upgrade;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -70,6 +71,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/api/v1/cluster/topology", get(cluster_topology))
+        .route(
+            "/api/v1/cluster/topology/operations",
+            post(submit_cluster_topology).layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),
+        )
+        .route(
+            "/api/v1/cluster/topology/adopt",
+            post(adopt_cluster_topology).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
         .route(
             "/api/v1/cluster/topology/validate",
             post(validate_cluster_topology).layer(axum::extract::DefaultBodyLimit::max(512 * 1024)),

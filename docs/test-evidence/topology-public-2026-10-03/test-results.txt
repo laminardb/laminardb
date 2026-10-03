@@ -1,0 +1,31 @@
+topology-public-final-focused-raw.txt
+test result: ok. 12 passed; 0 failed; 2 ignored; 0 measured; 909 filtered out; finished in 3.02s
+test cluster::control::leader_lease::tests::topology_preparation::public_topology_plan_requires_complete_protocol_before_cut_and_gates_old_formats ... ok
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 971 filtered out; finished in 31.49s
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_transport::installation::submission::topology_public_admission_is_atomic_and_retries_terminal_payload_before_compiling ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_transport::installation::submission::topology_public_competing_requests_and_expired_forwarding_never_admit_two_parents ... ok
+test db::topology::forwarding::tests::topology_forwarding_preserves_authorization_identity_payload_and_remaining_budget ... ok
+test db::topology::forwarding::tests::topology_forwarding_keeps_typed_fences_and_rejects_response_bounds_and_redirects ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_transport::installation::submission::topology_public_atomic_then_sql_migration_preserves_actual_aggregate_and_progress ... ok
+test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 1950 filtered out; finished in 21.16s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test http::tests::topology_submission::topology_uncertain_sql_errors_preserve_the_queryable_operation_identity ... ok
+test http::tests::topology_submission::topology_writes_require_console_authorization_and_report_noncluster ... ok
+test http::tests::topology_submission::topology_writes_reject_malformed_identity_unknown_fields_and_oversized_bodies ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 353 filtered out; finished in 1.68s
+
+topology-public-suite-raw.txt
+test result: ok. 921 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 46.87s
+test cluster::control::leader_lease::tests::topology_preparation::public_topology_plan_requires_complete_protocol_before_cut_and_gates_old_formats ... ok
+test result: ok. 1104 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.17s
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_transport::installation::submission::topology_public_admission_is_atomic_and_retries_terminal_payload_before_compiling ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_transport::installation::submission::topology_public_competing_requests_and_expired_forwarding_never_admit_two_parents ... ok
+test db::topology::forwarding::tests::topology_forwarding_keeps_typed_fences_and_rejects_response_bounds_and_redirects ... ok
+test db::topology::forwarding::tests::topology_forwarding_preserves_authorization_identity_payload_and_remaining_budget ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_transport::installation::submission::topology_public_atomic_then_sql_migration_preserves_actual_aggregate_and_progress ... ok
+test result: ok. 2075 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 23.74s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test http::tests::topology_submission::topology_uncertain_sql_errors_preserve_the_queryable_operation_identity ... ok
+test http::tests::topology_submission::topology_writes_reject_malformed_identity_unknown_fields_and_oversized_bodies ... ok
+test http::tests::topology_submission::topology_writes_require_console_authorization_and_report_noncluster ... ok
+test result: ok. 359 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.13s

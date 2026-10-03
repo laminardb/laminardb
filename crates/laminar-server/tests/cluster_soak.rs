@@ -96,6 +96,9 @@ mod topology_adoption;
 #[path = "cluster_soak/topology_cut.rs"]
 mod topology_cut;
 #[cfg(feature = "kafka")]
+#[path = "cluster_soak/topology_migration.rs"]
+mod topology_migration;
+#[cfg(feature = "kafka")]
 mod workload_qualification;
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -2427,7 +2430,8 @@ impl Node {
         let mut response = String::new();
         stream.read_to_string(&mut response).ok()?;
         let (headers, body) = response.split_once("\r\n\r\n")?;
-        if !headers.lines().next()?.contains(" 200 ") {
+        let status = headers.lines().next()?;
+        if !status.contains(" 200 ") && !status.contains(" 202 ") {
             return None;
         }
         Some(body.to_owned())
@@ -13750,6 +13754,7 @@ fn three_node_alo_legacy_topology_adoption_restart_soak() {
         None,
         true,
         false,
+        false,
     );
 }
 
@@ -13762,6 +13767,21 @@ fn three_node_alo_topology_cut_abort_restart_soak() {
         false,
         None,
         true,
+        true,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "spawns 3 real Kafka/S3 processes; public additive migrations, paused-input oracle, hard kills and full namespace restart"]
+#[cfg(all(feature = "kafka", feature = "aws"))]
+fn three_node_alo_public_topology_migration_restart_soak() {
+    run_three_node_join_kill9_soak_with_adoption(
+        JoinDelivery::AtLeastOnce,
+        false,
+        None,
+        true,
+        false,
         true,
     );
 }
@@ -13799,6 +13819,7 @@ fn run_three_node_join_kill9_soak(
         forced_fault_role,
         false,
         false,
+        false,
     );
 }
 
@@ -13809,6 +13830,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
     forced_fault_role: Option<&str>,
     adopt_legacy: bool,
     prepare_topology_cut: bool,
+    migrate_topology: bool,
 ) {
     let delivery_label = delivery.label();
     let executable = Arc::new(
@@ -14157,8 +14179,13 @@ fn run_three_node_join_kill9_soak_with_adoption(
         cluster_metric(&nodes, "laminardb_events_ingested_total"),
         commit_oracle.committed_offset_sum().unwrap_or(0)
     );
-    let adopted_topology = adopt_legacy
-        .then(|| topology_adoption::adopt_inventory(&checkpoint_url, &mut nodes, recovery_ceiling));
+    let adopted_topology = adopt_legacy.then(|| {
+        if migrate_topology {
+            topology_migration::adopt_inventory(&checkpoint_url, &mut nodes)
+        } else {
+            topology_adoption::adopt_inventory(&checkpoint_url, &mut nodes, recovery_ceiling)
+        }
+    });
     exact_timing_evidence.capture_nodes_unbound(
         &nodes,
         Instant::now() + Duration::from_secs(10),
@@ -14209,6 +14236,30 @@ fn run_three_node_join_kill9_soak_with_adoption(
         latest_checkpoint,
     );
     observe_live_core_window_state(&nodes, &mut window_state_high_water);
+    let mut migration_probe = migrate_topology.then(|| {
+        let (probe, checkpoint) = topology_migration::exercise(
+            &checkpoint_url,
+            &brokers,
+            &mut nodes,
+            recovery_ceiling,
+            &log_dir,
+        );
+        assert!(checkpoint.checkpoint_id > latest_checkpoint.checkpoint_id);
+        latest_checkpoint = checkpoint;
+        local_convergence = wait_for_local_assignment_convergence(
+            &mut nodes,
+            &all_live_nodes,
+            Instant::now() + recovery_ceiling,
+            "local assignment after public topology migrations",
+        );
+        exact_timing_evidence.capture_nodes_bound(
+            &nodes,
+            &local_convergence,
+            Instant::now() + Duration::from_secs(10),
+            "public topology migrations",
+        );
+        probe
+    });
     let mut explicit_fault_evidence = None;
     if let Some(role) = fault_role.as_deref() {
         assert_no_unsolicited_cold_start_recovery(&nodes);
@@ -14666,7 +14717,11 @@ fn run_three_node_join_kill9_soak_with_adoption(
                     )
                 });
         }
-        topology_adoption::restart_all(&mut nodes, baseline, recovery_ceiling);
+        if let Some(probe) = migration_probe.as_mut() {
+            probe.restart_all(&mut nodes, recovery_ceiling);
+        } else {
+            topology_adoption::restart_all(&mut nodes, baseline, recovery_ceiling);
+        }
         if let Some(cut) = old_cut.as_ref() {
             topology_cut::assert_aborted_after_restart(
                 &checkpoint_url,

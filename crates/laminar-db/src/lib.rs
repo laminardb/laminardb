@@ -195,11 +195,14 @@ pub use subscription::cluster::benchmark::{
 pub use db::{ClusterStartupDisposition, SnapshotAdoption};
 #[cfg(feature = "cluster")]
 pub use db::{
+    ClusterTopologyAdoptionRequest, ClusterTopologyRequest, ClusterTopologyStatus,
+    PreparedTopologyRestore, PreparedTopologySourcePosition,
+};
+#[cfg(feature = "cluster")]
+pub use db::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
 };
-#[cfg(feature = "cluster")]
-pub use db::{ClusterTopologyStatus, PreparedTopologyRestore, PreparedTopologySourcePosition};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

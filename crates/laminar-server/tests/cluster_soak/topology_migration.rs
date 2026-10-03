@@ -1,0 +1,441 @@
+//! Public migration inside the existing independent stateful Kafka/S3 soak.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use laminar_core::cluster::control::{
+    CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, LegacyTopologyBaseline,
+    TopologyAdmissionPhase, TopologyAdmissionStatus, TopologyCatalogState, TopologyOperationId,
+    TopologyVersion,
+};
+use object_store::ObjectStoreExt;
+
+use super::{topology_adoption, wait_for, DurableCheckpointStatus, KafkaOutputOracle, Node};
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+pub(super) fn adopt_inventory(namespace: &str, nodes: &mut [Node]) -> LegacyTopologyBaseline {
+    let objects = topology_adoption::objects_for_namespace(namespace);
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
+    let catalog = CatalogManifestStore::new(Arc::clone(&authority));
+    let runtime = runtime();
+    let baseline = runtime.block_on(async {
+        let TopologyCatalogState::LegacySealed { manifest } =
+            catalog.topology_state().await.unwrap()
+        else {
+            panic!("fresh soak must adopt its exact original sealed inventory");
+        };
+        let path = object_store::path::Path::from(format!(
+            "control/catalog-manifest/v1/{}.json",
+            manifest.sha256
+        ));
+        let before = objects.get(&path).await.unwrap().bytes().await.unwrap();
+        let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
+            .load_deployment_id()
+            .await
+            .unwrap()
+            .unwrap();
+        let request = laminar_db::ClusterTopologyAdoptionRequest {
+            operation_id: uuid::Uuid::new_v4().try_into().unwrap(),
+            expected_manifest: manifest.clone(),
+            expected_deployment_id: deployment.clone(),
+            coordinated_upgrade_complete: true,
+        };
+        let body = serde_json::to_string(&request).unwrap();
+        let response = nodes[0]
+            .http_request(
+                "POST",
+                "/api/v1/cluster/topology/adopt",
+                Some(&body),
+                Duration::from_secs(45),
+            )
+            .expect("public explicit adoption must return its receipt");
+        let baseline: LegacyTopologyBaseline = serde_json::from_str(&response).unwrap();
+        assert_eq!(baseline.manifest, manifest);
+        assert_eq!(baseline.deployment_id, deployment);
+        let retry: LegacyTopologyBaseline = serde_json::from_str(
+            &nodes[1]
+                .http_request(
+                    "POST",
+                    "/api/v1/cluster/topology/adopt",
+                    Some(&body),
+                    Duration::from_secs(45),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(baseline, retry);
+        assert_eq!(
+            objects.get(&path).await.unwrap().bytes().await.unwrap(),
+            before
+        );
+        baseline
+    });
+    eprintln!(
+        "soak: public exact-inventory adoption {} at sequence {}",
+        baseline.operation_id.get(),
+        baseline.authority_sequence
+    );
+    baseline
+}
+
+pub(super) struct MigrationProbe {
+    authority: Arc<LeaderLeaseStore>,
+    runtime: tokio::runtime::Runtime,
+    brokers: String,
+    input_topic: String,
+    output: KafkaOutputOracle,
+    expected: BTreeSet<(u64, u64)>,
+    operations: Vec<TopologyOperationId>,
+    evidence_dir: std::path::PathBuf,
+}
+
+impl MigrationProbe {
+    fn status(&self, operation: TopologyOperationId) -> TopologyAdmissionStatus {
+        self.runtime
+            .block_on(self.authority.topology_operation_status(operation))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn submit(
+        &self,
+        node: &Node,
+        request: &laminar_db::ClusterTopologyRequest,
+    ) -> TopologyAdmissionStatus {
+        let body = serde_json::to_string(request).unwrap();
+        let response = node.http_request(
+            "POST",
+            "/api/v1/cluster/topology/operations",
+            Some(&body),
+            Duration::from_secs(45),
+        );
+        let operation = if let Some(response) = response {
+            serde_json::from_str(&response).unwrap()
+        } else {
+            // A disconnected request may already have been admitted; consult its exact UUID.
+            self.status(request.operation_id)
+        };
+        assert_eq!(operation.operation_id, request.operation_id);
+        operation
+    }
+
+    fn wait_active(
+        &self,
+        nodes: &mut [Node],
+        operation: TopologyOperationId,
+        version: u64,
+        ceiling: Duration,
+    ) {
+        wait_for("full-roster public topology Release", ceiling, || {
+            for node in nodes.iter_mut() {
+                node.assert_running();
+            }
+            let status = self.status(operation);
+            assert!(
+                !matches!(status.phase, TopologyAdmissionPhase::Aborted { .. }),
+                "public migration aborted: {status:?}"
+            );
+            status.phase == TopologyAdmissionPhase::Active
+                && nodes.iter().all(|node| {
+                    node.http_get("/api/v1/cluster/topology")
+                        .is_some_and(|body| {
+                            let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                            value["committed_version"].as_u64() == Some(version)
+                                && value["locally_active_version"].as_u64() == Some(version)
+                                && node.is_ready()
+                        })
+                })
+        });
+        let status = self.status(operation);
+        assert_eq!(
+            status.activation.as_ref().unwrap().processes.len(),
+            nodes.len()
+        );
+        assert!(status.activation.as_ref().unwrap().installation_complete());
+        std::fs::write(
+            self.evidence_dir
+                .join(format!("public-topology-{version}-active.json")),
+            serde_json::to_vec_pretty(&status).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn produce(&mut self, first: u64) -> Instant {
+        let started = Instant::now();
+        self.runtime.block_on(async {
+            use rdkafka::producer::{FutureProducer, FutureRecord};
+            let producer: FutureProducer = rdkafka::ClientConfig::new()
+                .set("bootstrap.servers", &self.brokers)
+                .set("message.timeout.ms", "5000")
+                .create()
+                .unwrap();
+            for partition in 0..3 {
+                let id = first + u64::try_from(partition).unwrap();
+                let payload = format!(r#"{{"id":{id},"value":{id}}}"#);
+                producer
+                    .send(
+                        FutureRecord::to(&self.input_topic)
+                            .partition(partition)
+                            .key("topology-oracle")
+                            .payload(&payload),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap();
+                self.expected.insert((id, id));
+            }
+        });
+        started
+    }
+
+    fn wait_output(&mut self, nodes: &mut [Node], ceiling: Duration) {
+        let mut boundary = vec![0; 3];
+        wait_for("every deterministic new-pipeline output", ceiling, || {
+            for node in nodes.iter_mut() {
+                node.assert_running();
+            }
+            self.output.drain(&self.expected, &mut boundary);
+            self.output.is_complete(&self.expected)
+        });
+    }
+
+    fn checkpoint(&self, ceiling: Duration, version: u64) -> DurableCheckpointStatus {
+        let mut checkpoint = None;
+        wait_for(
+            "checkpoint under the exact committed target",
+            ceiling,
+            || {
+                let Some(outcome) = self
+                    .runtime
+                    .block_on(self.authority.highest_cluster_committed_outcome())
+                    .unwrap()
+                else {
+                    return false;
+                };
+                let index =
+                    self.runtime
+                        .block_on(self.authority.load_committed_checkpoint(
+                            outcome.committed_checkpoint.as_ref().unwrap(),
+                        ))
+                        .unwrap();
+                let (_, _, _, descriptor) = self
+                    .runtime
+                    .block_on(
+                        self.authority
+                            .topology_preparation_input(*self.operations.last().unwrap()),
+                    )
+                    .unwrap();
+                if descriptor.target_version.get() != version
+                    || index.pipeline_identity != descriptor.target_pipeline
+                {
+                    return false;
+                }
+                assert!(index.source_offsets.contains_key("topology_live_source"));
+                let progress = &index.source_offsets["topology_live_source"].offsets;
+                let required_next = 1 + self.expected.len() / 3;
+                if !(0..3).all(|partition| {
+                    let consumed = progress
+                        .get(&format!("{}:{partition}", self.input_topic))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .and_then(|value| value.checked_add(1));
+                    let initial = progress
+                        .get(&format!(
+                            "@laminar.kafka.next.v1:{}:{partition}",
+                            self.input_topic
+                        ))
+                        .and_then(|value| value.parse::<usize>().ok());
+                    consumed
+                        .or(initial)
+                        .is_some_and(|next| next >= required_next)
+                }) {
+                    return false;
+                }
+                checkpoint = Some(DurableCheckpointStatus {
+                    checkpoint_id: index.checkpoint_id,
+                    epoch: index.epoch,
+                });
+                true
+            },
+        );
+        checkpoint.unwrap()
+    }
+
+    pub(super) fn restart_all(&mut self, nodes: &mut [Node], ceiling: Duration) {
+        let before = self.checkpoint(ceiling, 3);
+        let started = Instant::now();
+        for node in nodes.iter_mut() {
+            node.disarm_checkpoint_kill();
+            node.kill9();
+        }
+        for node in nodes.iter_mut() {
+            let executable = node.verify_executable_for_spawn();
+            node.spawn(executable);
+        }
+        self.wait_active(nodes, *self.operations.last().unwrap(), 3, ceiling);
+        wait_for(
+            "full membership after committed-target restart",
+            ceiling,
+            || super::has_full_membership(nodes),
+        );
+        self.produce(300);
+        self.wait_output(nodes, ceiling);
+        let after = self.checkpoint(ceiling, 3);
+        assert!(after.checkpoint_id > before.checkpoint_id && after.epoch > before.epoch);
+        let report = serde_json::json!({"full_restart_to_output_ms": started.elapsed().as_millis(),
+            "expected_new_pipeline_pairs": self.expected, "observed_new_pipeline_pairs": self.output.seen,
+            "allowed_at_least_once_duplicates": self.output.duplicates});
+        std::fs::write(
+            self.evidence_dir.join("public-topology-restart.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        eprintln!("soak: reconstructed topology 3 using original bootstrap, retained epochs {} -> {}, new pipeline {} exact logical pairs, {} allowed replay duplicates, freshness {:?}",
+            before.epoch, after.epoch, self.expected.len(), self.output.duplicates, started.elapsed());
+    }
+}
+
+pub(super) fn exercise(
+    namespace: &str,
+    brokers: &str,
+    nodes: &mut [Node],
+    ceiling: Duration,
+    evidence_dir: &Path,
+) -> (MigrationProbe, DurableCheckpointStatus) {
+    let id = uuid::Uuid::new_v4();
+    let input_topic = format!("topology-live-input-{id}");
+    let output_topic = format!("topology-live-output-{id}");
+    super::kafka_create_topic(brokers, &input_topic, 3);
+    super::kafka_create_topic(brokers, &output_topic, 3);
+    let mut probe = MigrationProbe {
+        authority: Arc::new(LeaderLeaseStore::new(
+            topology_adoption::objects_for_namespace(namespace),
+            30_000,
+        )),
+        runtime: runtime(),
+        brokers: brokers.into(),
+        input_topic,
+        output: KafkaOutputOracle::new(brokers, &output_topic, 3),
+        expected: BTreeSet::new(),
+        operations: Vec::new(),
+        evidence_dir: evidence_dir.to_owned(),
+    };
+    // Historical records are deliberately excluded by once-resolved latest activation.
+    probe.produce(0);
+    probe.expected.clear();
+    let request = laminar_db::ClusterTopologyRequest {
+        operation_id: uuid::Uuid::new_v4().try_into().unwrap(), expected_parent_version: TopologyVersion::LEGACY_BASELINE,
+        statements: vec![
+            format!("CREATE SOURCE topology_live_source (id BIGINT NOT NULL, value BIGINT NOT NULL) FROM KAFKA ('bootstrap.servers' = '{brokers}', 'group.id' = 'topology-live-{id}', 'topic' = '{}', 'startup.mode' = 'latest')", probe.input_topic),
+            "CREATE STREAM topology_live_stream AS SELECT id AS left_id, value AS right_id FROM topology_live_source".into(),
+            format!("CREATE SINK topology_live_sink FROM topology_live_stream INTO KAFKA ('bootstrap.servers' = '{brokers}', 'topic' = '{output_topic}')"),
+        ],
+    };
+    let started = Instant::now();
+    probe.submit(&nodes[1], &request);
+    probe.operations.push(request.operation_id);
+    probe.wait_active(nodes, request.operation_id, 2, ceiling);
+    let activation = started.elapsed();
+    let root = probe
+        .runtime
+        .block_on(
+            probe
+                .authority
+                .topology_migration_root(request.operation_id),
+        )
+        .unwrap()
+        .unwrap();
+    for partition in 0..3 {
+        assert_eq!(
+            root.source_initializations[0].checkpoint.offsets
+                [&format!("@laminar.kafka.next.v1:{}:{partition}", probe.input_topic)],
+            "1"
+        );
+    }
+    probe.produce(100);
+    probe.wait_output(nodes, ceiling);
+    let first = probe.checkpoint(ceiling, 2);
+    assert_eq!(
+        probe.submit(&nodes[2], &request).phase,
+        TopologyAdmissionPhase::Active
+    );
+
+    let sql = "CREATE STREAM topology_live_downstream AS SELECT join_key, match_count, max_right_id FROM soak_join_aggregate";
+    let body = serde_json::json!({"sql":sql}).to_string();
+    let response = nodes[0]
+        .http_request("POST", "/api/v1/sql", Some(&body), Duration::from_secs(45))
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["result_type"], "TOPOLOGY MIGRATION");
+    let admitted: TopologyAdmissionStatus =
+        serde_json::from_value(response["topology_operation"].clone()).unwrap();
+    probe.operations.push(admitted.operation_id);
+    // Reuse the existing checkpoint gate to pause at a proven fully prepared parent checkpoint.
+    // Arm after admission so ordinary checkpoints cannot take this gate ahead of the migration.
+    for node in nodes.iter() {
+        node.arm_checkpoint_kill("leader");
+    }
+    wait_for("migration's exact old-cut checkpoint gate", ceiling, || {
+        let status = probe.status(admitted.operation_id);
+        assert!(
+            !matches!(status.phase, TopologyAdmissionPhase::Aborted { .. }),
+            "{status:?}"
+        );
+        status.cut.as_ref().is_some_and(|cut| {
+            nodes.iter().any(|node| {
+                node.checkpoint_gate_path.as_ref().is_some_and(|path| {
+                    std::fs::read_to_string(path.with_extension("ready"))
+                        .ok()
+                        .is_some_and(|value| {
+                            value
+                                .split_ascii_whitespace()
+                                .nth(1)
+                                .and_then(|value| value.parse::<u64>().ok())
+                                == Some(cut.inventory.attempt.checkpoint_id)
+                        })
+                })
+            })
+        })
+    });
+    let input_started = probe.produce(200);
+    let held = Instant::now();
+    while held.elapsed() < Duration::from_secs(2) {
+        let mut boundary = vec![0; 3];
+        probe.output.drain(&probe.expected, &mut boundary);
+        assert!(
+            !probe.output.seen.iter().any(|(left, _)| *left >= 200),
+            "paused intake exposed post-cut input"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let explicit_hold = held.elapsed();
+    for node in nodes.iter() {
+        node.disarm_checkpoint_kill();
+    }
+    probe.wait_active(nodes, admitted.operation_id, 3, ceiling);
+    probe.wait_output(nodes, ceiling);
+    let visible = input_started.elapsed();
+    assert!(visible >= Duration::from_secs(2));
+    let second = probe.checkpoint(ceiling, 3);
+    assert!(second.checkpoint_id > first.checkpoint_id && second.epoch > first.epoch);
+    let report = serde_json::json!({"independent_activation_ms": activation.as_millis(),
+        "explicit_test_cut_hold_ms": explicit_hold.as_millis(),
+        "consumer_visible_latency_including_cut_pause_ms": visible.as_millis(),
+        "new_pipeline_expected_pairs": probe.expected, "new_pipeline_observed_pairs": probe.output.seen,
+        "target_checkpoint_epochs": [first.epoch, second.epoch], "root_encoded_len": probe.status(request.operation_id).migration_root.unwrap().root.encoded_len});
+    std::fs::write(
+        evidence_dir.join("public-topology-observations.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    eprintln!("soak: public topology 1 -> 2 -> 3, independent latest source and downstream existing aggregate, exact pairs {}, target epochs {} -> {}, additive activation {:?}, consumer-visible {:?} including explicit two-second cut hold",
+        probe.expected.len(), first.epoch, second.epoch, activation, visible);
+    (probe, second)
+}
