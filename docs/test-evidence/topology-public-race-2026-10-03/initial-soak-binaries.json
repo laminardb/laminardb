@@ -1,0 +1,14 @@
+{
+  "head": "d7297d653f8b97a205ab1f52f268d3072ffa325c",
+  "server_path": "C:\\Users\\sujit\\.codex\\worktrees\\9929\\laminardb\\target\\topology-evidence\\laminardb-public-stock.exe",
+  "server_sha256": "f702ac7071954e30c32eee9262081dd99a772b79cc95c0dfcfd94e90f06771a4",
+  "server_length": 172107776,
+  "main_stack_reserve_bytes": 1048576,
+  "main_stack_commit_bytes": 4096,
+  "harness_path": "C:\\Users\\sujit\\.codex\\worktrees\\9929\\laminardb\\target\\soak\\deps\\cluster_soak-cffb0c4e0bb057e5.exe",
+  "harness_sha256": "1938f23e30a4115ee57ba8e83a592c2237a21fccb36b67221391fcc1d7870dd5",
+  "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+  "profile": "soak",
+  "features": "cluster,aws,kafka",
+  "binary_modified": false
+}

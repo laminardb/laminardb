@@ -212,7 +212,7 @@ async fn checkpoint_winning_the_admission_race_keeps_the_old_graph_authoritative
     raw.release.add_permits(1);
     assert!(matches!(
         submit.await.unwrap(),
-        Err(TopologyError::Conflict(_))
+        Err(TopologyError::Contended)
     ));
     let head = authority.load_record().await.unwrap().unwrap();
     assert!(head.topology_operations.is_empty());

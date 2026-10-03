@@ -94,7 +94,15 @@ pin old state, and the journal rejects new identities at 64 retained operations.
 - The existing stateful three-process soak now includes public explicit adoption,
   two migrations, a proven checkpoint gate with pause-inclusive consumer timing,
   an independent new-pipeline oracle and full restart with original configuration.
-  Its optimized build/run results are pending; older cut/abort soaks cannot certify it.
+  Its optimized build passes; successful process qualification remains pending.
+  Older cut/abort soaks cannot certify it.
+- The optimized stock server built successfully and booted three Kafka/S3 processes.
+  Public legacy adoption succeeded. The migration request raced reserved checkpoint
+  49 and returned 409 without admission. Checkpoint/cleanup contention now retries
+  the same compiled plan under the original 45-second deadline. The cleanup-wait
+  regression and all 278 focused topology tests pass; all-target Clippy passes.
+  The repaired-server process rerun remains pending. See
+  [contention evidence](test-evidence/topology-public-race-2026-10-03/README.md).
 
 ## Next work, in order
 

@@ -656,17 +656,20 @@ impl LeaderLeaseStore {
                 .iter()
                 .any(TopologyAdmissionStatus::blocks_admission)
                 || current.assignment_drain_reservation.is_some()
-                || current.active_checkpoint_artifacts.is_some()
                 || current.assignment_handoff_pin.is_some()
-                || current.artifact_cleanup.is_some()
                 || current.recovery_fault_slots.iter().any(|slot| {
                     slot.active || slot.disposition == RecoveryFaultDisposition::Terminal
                 })
             {
                 return Err(TopologyError::Conflict(
-                    "checkpoint, recovery, assignment or another topology operation is unresolved"
-                        .into(),
+                    "recovery, assignment or another topology operation is unresolved".into(),
                 ));
+            }
+            // A periodic checkpoint or its serialized cleanup can finish without changing the
+            // expected parent. Keep its reservation authoritative; the public caller can retry
+            // this same immutable plan within its original deadline.
+            if current.active_checkpoint_artifacts.is_some() || current.artifact_cleanup.is_some() {
+                return Err(TopologyError::Contended);
             }
             let assignment = assignments
                 .load()

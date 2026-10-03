@@ -299,6 +299,94 @@ async fn topology_public_admission_is_atomic_and_retries_terminal_payload_before
 }
 
 #[tokio::test]
+async fn topology_public_submission_waits_for_definitive_checkpoint_cleanup() {
+    use laminar_core::checkpoint::CheckpointAttempt;
+    use laminar_core::checkpoint_decision::{CheckpointArtifactInventory, CheckpointVerdict};
+
+    let (fixture, assignments) = Box::pin(preparation_fixture()).await;
+    let _receiver = metadata_coordinator(&fixture);
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: CheckpointDecisionStore::new(Arc::clone(
+            &fixture.authority.checkpoint_store,
+        ))
+        .load_deployment_id()
+        .await
+        .unwrap()
+        .unwrap(),
+        pipeline_identity: fixture
+            .db
+            .topology_definition_identities()
+            .unwrap()
+            .pipeline,
+        attempt: CheckpointAttempt::canonical(1),
+        assignment_fence: Some(
+            assignments
+                .load()
+                .await
+                .unwrap()
+                .unwrap()
+                .assignment_fence()
+                .unwrap(),
+        ),
+        sink_artifact_intent_protocol: true,
+    };
+    let proof = fixture.authority.lease.proof();
+    fixture
+        .authority
+        .lease_store
+        .begin_cluster_checkpoint_artifacts(&proof, inventory.clone())
+        .await
+        .unwrap();
+    let request = request(1305, independent_pipeline());
+    let mut submission = Box::pin(
+        fixture
+            .db
+            .submit_cluster_topology_forwarded(&request, Duration::from_secs(5)),
+    );
+    tokio::select! {
+        result = &mut submission => panic!("checkpoint reservation was bypassed or reported as a parent conflict: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(150)) => {}
+    }
+    assert!(fixture
+        .authority
+        .lease_store
+        .topology_operation_status(request.operation_id)
+        .await
+        .unwrap()
+        .is_none());
+    fixture
+        .authority
+        .lease_store
+        .record_cluster_outcome(
+            &proof,
+            1,
+            1,
+            inventory.assignment_fence.clone().unwrap(),
+            CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .unwrap();
+    // A durable Abort alone is insufficient: exact admitted artifacts remain protected.
+    tokio::select! {
+        result = &mut submission => panic!("unreconciled checkpoint artifacts were bypassed: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    fixture
+        .authority
+        .lease_store
+        .finish_cluster_checkpoint_artifact_cleanup(&proof, &inventory)
+        .await
+        .unwrap();
+    let admitted = submission.await.unwrap();
+    assert_eq!(admitted.operation_id, request.operation_id);
+    assert_eq!(admitted.phase, TopologyAdmissionPhase::Planned);
+    assert_eq!(fixture.effects.load(Ordering::Acquire), 0);
+    fixture.db.recovery_monitor.lock().take().unwrap().abort();
+    fixture.db.shutdown.store(true, Ordering::Release);
+}
+
+#[tokio::test]
 async fn topology_public_competing_requests_and_expired_forwarding_never_admit_two_parents() {
     let (fixture, _) = Box::pin(preparation_fixture()).await;
     let _receiver = metadata_coordinator(&fixture);

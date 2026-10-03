@@ -2432,6 +2432,13 @@ impl Node {
         let (headers, body) = response.split_once("\r\n\r\n")?;
         let status = headers.lines().next()?;
         if !status.contains(" 200 ") && !status.contains(" 202 ") {
+            if method == "POST" {
+                eprintln!(
+                    "soak: node{} {method} {path} returned {status}: {}",
+                    self.id,
+                    body.chars().take(4096).collect::<String>()
+                );
+            }
             return None;
         }
         Some(body.to_owned())

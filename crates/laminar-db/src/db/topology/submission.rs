@@ -195,15 +195,28 @@ impl LaminarDB {
                     assignment,
                     compatibility: Some(compatibility),
                 };
-                self.ensure_topology_submission_available()?;
-                if !controller.proof_is_live(&proof)
-                    || controller.try_live_local_process_authority_identity().ok() != Some(before)
-                {
-                    return Err(TopologyError::Fenced.into());
-                }
-                let admitted = authority
-                    .admit_topology_plan(&proof, assignments, &plan, &target)
-                    .await?;
+                let admitted = loop {
+                    self.ensure_topology_submission_available()?;
+                    if !controller.proof_is_live(&proof)
+                        || controller.try_live_local_process_authority_identity().ok()
+                            != Some(before)
+                    {
+                        return Err(TopologyError::Fenced.into());
+                    }
+                    match authority
+                        .admit_topology_plan(&proof, assignments, &plan, &target)
+                        .await
+                    {
+                        Ok(admitted) => break admitted,
+                        Err(TopologyError::Contended) => {
+                            // Do not rebuild or change the operation UUID after checkpoint/CAS
+                            // contention. The outer timeout bounds this control-path retry, and
+                            // authority rereads resolve a lost successful append response.
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
                 tracing::info!(operation = %request.operation_id.get(), phase = ?admitted.phase,
                 "admitted durable topology request; coordinator owns further progress");
                 Ok(admitted)

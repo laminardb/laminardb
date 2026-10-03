@@ -73,7 +73,7 @@ Ordinary supported `CREATE SOURCE`, `CREATE STREAM` and `CREATE SINK` on a runni
 
 For retry control, prefer the array API. Retry the same UUID, exact statement bytes and parent version. Identical retries return the original status, including an abort or a completed older operation, before compilation. Changed payload reuse fails. After an uncertain SQL response, query its generated UUID; do not repeat SQL blindly with a new operation.
 
-Console authorization and existing serving fences apply to every route. Diagnostic-read credentials cannot authorize topology reads or writes. JSON rejects unknown fields, nil operation IDs and zero versions. Submission has a 45-second total deadline; validation has one compiler, 30 seconds, 1..64 statements, 256 KiB of SQL, 256 catalog objects and a 1 MiB descriptor. JSON bodies are capped at 512 KiB for submission/validation and 16 KiB for adoption. Forwarded receipts are capped at 1 MiB and redirects are disabled.
+Console authorization and existing serving fences apply to every route. Diagnostic-read credentials cannot authorize topology reads or writes. JSON rejects unknown fields, nil operation IDs and zero versions. Submission has a 45-second total deadline, including bounded retries while a periodic checkpoint or its artifact cleanup finishes. These retries preserve the compiled candidate and request identity. Validation has one compiler, 30 seconds, 1..64 statements, 256 KiB of SQL, 256 catalog objects and a 1 MiB descriptor. JSON bodies are capped at 512 KiB for submission/validation and 16 KiB for adoption. Forwarded receipts are capped at 1 MiB and redirects are disabled.
 
 ## Observe progress and recover
 

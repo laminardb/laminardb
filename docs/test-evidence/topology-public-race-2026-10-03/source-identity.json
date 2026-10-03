@@ -1,0 +1,33 @@
+{
+  "parent_commit": "d7297d653f8b97a205ab1f52f268d3072ffa325c",
+  "working_tree_clean": false,
+  "files": [
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission.rs",
+      "sha256": "90ab150ab0ea536d2b4787ee534a7a57ff506d833eb01323864e437ee0b0b850",
+      "normalized_sha256": "90ab150ab0ea536d2b4787ee534a7a57ff506d833eb01323864e437ee0b0b850"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission_tests.rs",
+      "sha256": "0d7a12ab83a98ac1c00984f55679d8d2b6cbf1e054a7cc2f0dd9822581cccecd",
+      "normalized_sha256": "0d7a12ab83a98ac1c00984f55679d8d2b6cbf1e054a7cc2f0dd9822581cccecd"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_submission.rs",
+      "sha256": "8b2dcffdb39ba400d82df27936a9dffc5b3cf06db82985694915130b4afe118f",
+      "normalized_sha256": "8b2dcffdb39ba400d82df27936a9dffc5b3cf06db82985694915130b4afe118f"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/submission.rs",
+      "sha256": "322c45425e015395276bcc1a82585c0855d33bc7919d632d95c6db060332fb54",
+      "normalized_sha256": "322c45425e015395276bcc1a82585c0855d33bc7919d632d95c6db060332fb54"
+    },
+    {
+      "path": "crates/laminar-server/tests/cluster_soak.rs",
+      "sha256": "add7abc996c0e38ea0aa00e7ca4e2ca05abf32846f6770e4dbc882ce7f6c5ce4",
+      "normalized_sha256": "add7abc996c0e38ea0aa00e7ca4e2ca05abf32846f6770e4dbc882ce7f6c5ce4"
+    }
+  ],
+  "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+  "qualification_scope": "278 focused topology tests and all-target Clippy pass. Process rerun and final executable identity remain pending."
+}
