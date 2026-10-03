@@ -57,6 +57,49 @@ async fn drain(assignments: &AssignmentSnapshotStore, lease: &LeaderLease) -> As
 }
 
 #[tokio::test]
+async fn topology_driver_hint_tracks_progress_but_damaged_plan_never_grants_authority() {
+    let authority = store(30_000);
+    assert!(authority
+        .latest_topology_operation_hint()
+        .await
+        .unwrap()
+        .is_none());
+    let (lease, assignments, plan, target) = fixture(&authority).await;
+    let admitted = authority
+        .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
+        .await
+        .unwrap();
+    assert_eq!(
+        authority.latest_topology_operation_hint().await.unwrap(),
+        Some((plan.operation_id, admitted.status_sequence))
+    );
+    let aborted = authority
+        .abort_topology_plan(&lease.proof(), plan.operation_id, &admitted.plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        authority.latest_topology_operation_hint().await.unwrap(),
+        Some((plan.operation_id, aborted.status_sequence))
+    );
+    authority
+        .store
+        .delete(&OsPath::from(format!(
+            "control/topology-plans/v1/{}.json",
+            admitted.plan.sha256
+        )))
+        .await
+        .unwrap();
+    assert_eq!(
+        authority.latest_topology_operation_hint().await.unwrap(),
+        Some((plan.operation_id, aborted.status_sequence))
+    );
+    assert!(authority
+        .topology_operation_status(plan.operation_id)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn admission_retry_and_abort_keep_the_original_payload_and_catalog() {
     let authority = store(30_000);
     let (lease, assignments, plan, target) = fixture(&authority).await;

@@ -27,7 +27,8 @@ Explicit private reconstruction after Commit is implemented, including before th
 first target checkpoint. Exact-Commit transport preparation and local runtime
 installation with intake held are implemented. Current installation receipts,
 participant-complete durable Release and local application are now implemented.
-Automatic migration ownership and target runtime recovery remain unfinished.
+The existing DB-owned recovery supervisor now drives these migration phases.
+Automatic target runtime recovery and public submission remain unfinished.
 Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
@@ -895,29 +896,71 @@ remains until those paths are complete.
 
 ## Required next integration
 
-1. Integrate candidate planning with a DB-owned migration worker and its existing
-   manual checkpoint owner. The old-cut binding, capture and hold are implemented;
-   detached submission/target-stage ownership remain unfinished.
-2. Drive the implemented exact-process certification path from detached submission;
-   explicit local preparation is available, but automatic collection remains unfinished.
-3. Drive private restore, observed retirement and the implemented durable target
-   preparation receipts from owned migration work. At Commit, revalidate the full
-   exact process/assignment roster; receipts alone cannot grant target output.
-4. Drive the implemented atomic target Commit and private post-Commit root
-   reconstruction from owned migration work; both remain internal library paths.
-5. Drive the implemented exact-Commit transport, held runtime installation,
-   current readiness receipts and participant-complete Release from owned migration
-   work. Sink generation fencing and local Release application are implemented.
-   Wire target-only post-Commit runtime recovery.
-6. Wire public SQL and atomic multi-object submission, expected parent,
+1. Wire target-only post-Commit recovery through the existing stopped/recovered/
+   release quorum. A replacement process/runtime needs new runtime evidence and
+   recovery authority; an original installation receipt cannot authorize it. Use a
+   newer exact target checkpoint when present and explicitly authorize the migration
+   root otherwise, preserving original historical checkpoint identity.
+2. Wire public SQL and atomic multi-object submission, expected parent,
    payload-bound idempotency and detached durable ownership. Local dry run exists;
    it does not advance admission. Do not reuse bootstrap.
-7. Preserve the implemented root subscription identity/frontier mappings through
+3. Preserve the implemented root subscription identity/frontier mappings through
    automatic target recovery and public submission. Whole-graph hashes differ on
    additions; skipping their check is unsafe.
-8. Wire reconstruction into automatic target runtime recovery and run the stateful
-   multi-process migration/restart oracle and fault matrix. Durable target catalog
+4. Run the stateful multi-process migration/restart oracle and fault matrix. Durable target catalog
    precedence and exact original-bootstrap assertions are implemented.
+
+## Database-owned migration phase progress, 2026-10-03
+
+The existing recovery monitor drives already admitted operations on every node.
+Its long-lived future owns one `TopologyDriver` and at most one private restored
+image, which retains the existing compiler permit. Private graph operators are
+Send rather than Sync, so this sole owner remains outside shared monitor
+observations. The monitor future is pinned once per generation to avoid large
+stack moves. The one private image and active restore/phase futures also use the
+heap after the first debug test exposed a stack overflow at CI's unchanged 4 MiB
+setting. These allocations occur only on the control path; no record-path
+allocation or additional scheduler is introduced.
+
+Each healthy poll performs one phase action using the existing fenced methods.
+Participants independently compile before the leader invokes the manual
+checkpoint route. Checkpoint tails supply the application receipts while the
+worker waits in Quiescing. The leader stages the root; every process privately
+restores, observes retirement and certifies protocol four. Complete preparation
+permits Commit. Each process then installs its held runtime, certifies protocol
+five and observes the complete Release before applying it locally. A follower
+updates its retained image from the already published Commit without publishing
+another decision. All authority/process/assignment/actor checks remain in the
+phase methods.
+
+The idle head hint is only `(operation UUID, status sequence)`, under the existing
+15-second read bound. It grants no permission and does not audit immutable blobs.
+Every phase uses the definitive audited status and existing authority methods.
+Completed local operations can skip repeated root/descriptor reads. A locally
+held image or unapplied installed Release takes precedence over a newer journal
+entry, so a lagging node finishes its own boundary first.
+
+Local faults, recovery, drain, shutdown and process fencing discard the private
+image before recovery acquires the compiler slot. A definitive pre-Commit abort
+with a held cut queues the existing coordinated-recovery request. Dropping an
+image never clears the hold. The same retired, still-held parent may reconstruct
+its private image after monitor loss; current exact-root/process/assignment
+checks still apply. An installation failure observes cleanup and retries the
+immutable committed root without resolving source initialization again.
+
+The phase methods retain their existing 15/30/45-second budgets and CAS bounds.
+If an audited phase makes no durable progress for 180 seconds, the driver releases
+private preparation and requests coordinated recovery. A manual checkpoint
+already owning an exact attempt still waits for its terminal cleanup; abandoning
+that owner on a worker timer would permit overlapping lifecycle work. Repeated
+errors are logged only when their diagnostic changes.
+
+This driver does not authorize a replacement runtime after Active. The original
+Release UUID belongs to its installed generation. Automatic target recovery and
+whole-cluster startup remain the next prerequisite to public submission; a newer
+target checkpoint must take precedence over the old migration root. Public SQL
+and startup guards remain. The local fixture validates phase ownership and actual
+held actors, not multi-process migration, transactional sinks or a restarted boot.
 
 The [progress file](cluster-topology-migrations-progress.md) records commands,
 results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)

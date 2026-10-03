@@ -81,6 +81,9 @@ fn checked_recovery_deadline(timeout: Duration) -> Option<tokio::time::Instant> 
 }
 
 mod local_faults;
+mod topology;
+#[cfg(test)]
+pub(crate) use topology::TopologyDriver;
 
 use local_faults::{flush_pending_local_fault, local_fault_disposition, request_fresh_local_fault};
 pub(crate) use local_faults::{
@@ -95,10 +98,13 @@ pub(crate) fn spawn_monitor(db: &Arc<LaminarDB>, runtime: &Handle) -> tokio::tas
     let weak = Arc::downgrade(db);
     runtime.spawn(async move {
         loop {
-            let outcome =
+            // The sole private graph owner enlarges this control future. Pin it once per monitor
+            // generation, avoiding repeated large stack moves without any record-path allocation.
+            let outcome = Box::pin(
                 std::panic::AssertUnwindSafe(RecoveryMonitor::default().run(Weak::clone(&weak)))
-                    .catch_unwind()
-                    .await;
+                    .catch_unwind(),
+            )
+            .await;
             if outcome.is_ok() {
                 return;
             }
@@ -224,6 +230,9 @@ enum PrepareOwnership {
 
 impl RecoveryMonitor {
     async fn run(mut self, weak: Weak<LaminarDB>) {
+        // Private operators are Send but not Sync. Keep their sole owner in this supervisor's
+        // future, outside the shared monitor observations used across existing recovery awaits.
+        let mut topology = topology::TopologyDriver::default();
         let mut poll = tokio::time::interval(POLL_INTERVAL);
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -270,12 +279,17 @@ impl RecoveryMonitor {
             }
             let local_pending = local_fault.into_iter().collect::<Vec<_>>();
             self.hold_for_visible_or_queued_fault(&db, &controller, &local_pending);
+            topology.pause_if_fenced(&db, &controller);
             self.observe(&db, &controller, local_fault).await;
+            // Observing a new remote Prepare/Start can install the recovery latch during this
+            // await. Release private preparation immediately before any later driver action.
+            topology.pause_if_fenced(&db, &controller);
             let leader = controller.is_leader();
             if leader != std::mem::replace(&mut self.monitor_gates.0, leader) {
                 tracing::warn!(leader, "recovery monitor leadership gate changed");
             }
             if !leader {
+                topology.drive(&db, &controller).await;
                 continue;
             }
             let inventory = match self.fault_inventory(&controller).await {
@@ -416,7 +430,10 @@ impl RecoveryMonitor {
                     _ => {}
                 },
             }
-            if !pending.is_empty() {
+            if pending.is_empty() {
+                topology.drive(&db, &controller).await;
+            } else {
+                topology.pause_if_fenced(&db, &controller);
                 // A stopped-Prepare handoff re-drives a fenced round now; a new round waits one
                 // poll for the fault set to settle.
                 if required_prepare_fence.is_some()

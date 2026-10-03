@@ -3,7 +3,7 @@
 use super::*;
 use laminar_core::cluster::control::TopologyAdmissionPhase;
 
-async fn installed() -> (
+pub(super) async fn installed() -> (
     Fixture,
     laminar_core::cluster::control::TopologyAdmissionStatus,
     Arc<runtime_probe::InstallationProbe>,

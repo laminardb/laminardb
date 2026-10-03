@@ -1,0 +1,74 @@
+{
+  "starting_commit": "02202d7910d3d85da6e1946c2c0097e4f2df4c77",
+  "original_baseline": "5d81ba9b18d80343373ecfaec4793df8c5caccf1",
+  "branch": "feature/cluster-topology-migrations",
+  "starting_working_tree_clean": true,
+  "frozen_at_utc": "2026-10-03T11:02:18.498655+00:00",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "packages": [
+    "laminar-core",
+    "laminar-connectors",
+    "laminar-db",
+    "laminar-server"
+  ],
+  "features": [
+    "cluster",
+    "aws",
+    "kafka"
+  ],
+  "changed_sources": [
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission.rs",
+      "sha256": "3bc093a03f5612ffb58296d062adc3b2b984f66d63ab290cda6442eef203495c",
+      "normalized_sha256": "3bc093a03f5612ffb58296d062adc3b2b984f66d63ab290cda6442eef203495c"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission_tests.rs",
+      "sha256": "b76b13fbb0e41eae54327a54c2ef0e5412766e624ffce810dc891ac5a8c398b0",
+      "normalized_sha256": "b76b13fbb0e41eae54327a54c2ef0e5412766e624ffce810dc891ac5a8c398b0"
+    },
+    {
+      "path": "crates/laminar-db/src/coordinated_recovery/mod.rs",
+      "sha256": "da79455fc494bdd1ef8fe2c46a31bfc53abf0bf46a7fabde5f768eb53814599a",
+      "normalized_sha256": "dd121872fb351afbdaf7ed38c509c6dba6cb23fdf63bb363583a84eaa6a060d6"
+    },
+    {
+      "path": "crates/laminar-db/src/coordinated_recovery/topology.rs",
+      "sha256": "92442782b3ddbec75019bbf3963944fb3544894286102caf38d9ef5f019bcd20",
+      "normalized_sha256": "92442782b3ddbec75019bbf3963944fb3544894286102caf38d9ef5f019bcd20"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_activation.rs",
+      "sha256": "a05beb1fcbaf283055c326330dba31e8fee3a2d717b5fd36e2b1ebd25590c6b8",
+      "normalized_sha256": "a05beb1fcbaf283055c326330dba31e8fee3a2d717b5fd36e2b1ebd25590c6b8"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_driver.rs",
+      "sha256": "4b631c0136e5032b7f8cbeb380de69d8dd34b94e30ad5fd5f07ad9602e0f3a1d",
+      "normalized_sha256": "4b631c0136e5032b7f8cbeb380de69d8dd34b94e30ad5fd5f07ad9602e0f3a1d"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_installation.rs",
+      "sha256": "6ec0925e43b12fcf80b101ac4b4c941abab3a125679eac4403e97f873c255e2f",
+      "normalized_sha256": "6ec0925e43b12fcf80b101ac4b4c941abab3a125679eac4403e97f873c255e2f"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/commit.rs",
+      "sha256": "4fb37cfd4b5ebe0138f03f342430156de108ace7954832fd6eb7f6a92da82097",
+      "normalized_sha256": "4fb37cfd4b5ebe0138f03f342430156de108ace7954832fd6eb7f6a92da82097"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/restore.rs",
+      "sha256": "41b771bc52b5aca61279ff787626f323779fcde57fded7de09824d1ffc1b2455",
+      "normalized_sha256": "41b771bc52b5aca61279ff787626f323779fcde57fded7de09824d1ffc1b2455"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/retirement.rs",
+      "sha256": "83b095095cc5bccc3659034d6fc4c74c5601d5b9209134d225791751a203baca",
+      "normalized_sha256": "83b095095cc5bccc3659034d6fc4c74c5601d5b9209134d225791751a203baca"
+    }
+  ],
+  "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+  "identity_scope": "Tested working-tree Rust bytes and Cargo.lock; normalized hashes allow Git line-ending normalization. No production binary or performance identity is implied."
+}

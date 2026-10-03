@@ -94,7 +94,7 @@ impl LaminarDB {
         Ok(())
     }
 
-    fn ensure_topology_retirement_available(&self) -> Result<(), DbError> {
+    pub(super) fn ensure_topology_retirement_available(&self) -> Result<(), DbError> {
         if self.is_closed() {
             return Err(DbError::Shutdown);
         }

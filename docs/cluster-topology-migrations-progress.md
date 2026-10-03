@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization/startup, private restore/retirement, atomic target Commit with private post-Commit reconstruction and committed graph/shuffle fences implemented; runtime topology migration
+Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization/startup, private restore/retirement, atomic target Commit, held installation, participant-complete Release and DB-owned phase progress implemented; public runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -851,27 +851,54 @@ selection remain unchanged.
   source hashes and Cargo.lock are frozen through final verification and staging.
   No broker, real migration/restart, soak or comparative performance run is repeated.
 
+## Database-owned phase driver, 2026-10-03
+
+- Continuation starts clean at `02202d7910d3d85da6e1946c2c0097e4f2df4c77`.
+  The existing recovery monitor now drives admitted topology operations on every
+  node. Its long-lived future owns one private target image and the existing
+  compiler permit, independently of API/status observers. No additional scheduler,
+  queue, dependency, authority encoding or generic workflow framework is added.
+- Healthy polls independently compile, use the existing checkpoint owner, wait
+  for exact cut application, stage the root, privately restore, observe retirement,
+  certify protocol four, commit the complete target, install held actors, certify
+  protocol five and apply participant-complete Release. Follower images observe
+  the existing Commit. Original Release still cannot authorize a replacement runtime.
+- Local faults/recovery/drain/process fences drop private preparation before later
+  recovery actions. An aborted held cut requests coordinated parent recovery;
+  dropping an image cannot open intake. A still-held retired parent can reconstruct
+  its private image after monitor loss. Failed installation observes cleanup and
+  retries the same immutable root and sealed source positions. A phase stalled
+  for 180 seconds requests coordinated recovery; exact checkpoint owners retain
+  their terminal cleanup obligations.
+- The latest UUID/status sequence is a bounded polling hint, never authority.
+  Every phase uses audited status and the existing current-authority methods.
+  Held local boundaries take precedence over a later request. Idle polling does
+  not clone the installed manifest/root. The first debug run exposed a stack
+  overflow; heap ownership of the large image/active control futures fixes it with
+  the repository's 4 MiB test and two-worker control stacks unchanged.
+- All nine focused cases pass. The final selected suite passes 4,422 tests:
+  1,088 core, 921 connectors, 2,057 DB and 356 server, with the same three ignored
+  cases. The local runtime oracle preserves 30 plus three future rows of value 5
+  as 45, and verifies monitor/installation progress after observer cancellation.
+  All-target Clippy with warnings denied, minimal server, cluster/FFI, formatting
+  and diff/source checks pass. Ten changed Rust source hashes and Cargo.lock remain
+  frozen through final verification and staging.
+  This is one-process controlled ALO evidence. No broker, real multi-process
+  migration/restart, transactional migration or comparative performance is run.
+  See the [driver evidence](test-evidence/topology-driver-2026-10-03/README.md).
+
 ## Remaining work
 
-1. Integrate the implemented participant certification path with detached submission
-   and automatic collection. Core protocol-2 admission binds the candidate report;
-   each local preparation API independently compiles and durably certifies it.
-   The manual checkpoint path requires the full frozen roster before a new cut;
-   no worker stages or commits a target.
-2. Drive the implemented private restore, observed parent retirement and durable
-   target preparation receipts from owned migration work, and collect the full roster.
-   Old checkpoint binding, quiescence, root pinning, source initialization and
-   private state/cursor preparation exist.
-3. Drive implemented atomic Commit/private reconstruction from owned migration work;
-   drive implemented exact-Commit transport, held runtime installation, readiness
-   receipts and participant-complete Release. Stale sink completion fencing, local
-   Release application, graph/shuffle fencing, root-backed runtime state and atomic
-   sealed source startup exist. Wire automatic post-Commit runtime
-   recovery; ordinary startup stays held.
-4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
+1. Wire automatic target recovery, including a replacement process/runtime after
+   Release and whole-cluster startup. Select a newer exact target checkpoint when
+   present; otherwise explicitly authorize the migration root through the existing
+   stopped/recovered/release quorum. Never borrow the original runtime UUID's Release.
+   Ordinary startup and parent recovery remain fenced after Commit.
+2. Public SQL/atomic API, detached submission and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
-5. Removal/replacement contracts, fault matrix and existing soak extensions.
-6. Real multi-process stateful migration/restart oracle and comparative resource,
+3. Removal/replacement contracts, reference-aware root retirement and bounded journal
+   reclamation, fault matrix and existing soak extensions.
+4. Real multi-process stateful migration/restart oracle and comparative resource,
    steady-state and pause-inclusive performance measurements.
 
 Do not remove LDB-6043 or route runtime DDL through bootstrap while these runtime
@@ -906,6 +933,8 @@ Held committed runtime installation checks are recorded in
 `docs/test-evidence/topology-installation-2026-10-03`.
 Current runtime certification, sink generation and Release checks are recorded in
 `docs/test-evidence/topology-activation-2026-10-03`.
+DB-owned phase progress and its checks are recorded in
+`docs/test-evidence/topology-driver-2026-10-03`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

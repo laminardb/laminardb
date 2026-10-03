@@ -482,7 +482,29 @@ impl LeaderLeaseStore {
         self.audit_topology_activation(operation).await
     }
 
-    /// Read the definitive, payload-bound pre-cut request status without allocating identities.
+    /// Read the latest request identity and its durable progress sequence for an idle worker.
+    ///
+    /// This bounded head observation is only a polling hint. It does not audit referenced blobs
+    /// or authorize any phase, actor, output or gate change. Workers must read the definitive
+    /// status and use the existing fenced phase methods before doing work.
+    ///
+    /// # Errors
+    /// Rejects malformed authority or a read exceeding 15 seconds.
+    pub async fn latest_topology_operation_hint(
+        &self,
+    ) -> Result<Option<(TopologyOperationId, u64)>, TopologyError> {
+        tokio::time::timeout(CONTROL_TIMEOUT, async {
+            Ok(self.load_record().await?.and_then(|head| {
+                head.topology_operations
+                    .last()
+                    .map(|operation| (operation.operation_id, operation.status_sequence))
+            }))
+        })
+        .await
+        .map_err(|_| TopologyError::ReadTimedOut)?
+    }
+
+    /// Read the definitive, payload-bound request status without allocating identities.
     ///
     /// # Errors
     /// Rejects missing/corrupt referenced evidence or a read that exceeds 15 seconds.

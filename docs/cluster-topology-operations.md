@@ -9,7 +9,8 @@ restore preparation and observed parent retirement are available through the DB
 library after root publication. The internal DB/core path now supports irreversible
 target Commit and private reconstruction from its exact root before a target checkpoint.
 Held runtime installation, current process readiness receipts, participant-complete
-Release and local activation are available through the internal library.
+Release and local activation are available through the internal library and driven
+by the existing DB-owned recovery supervisor for already admitted operations.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -20,7 +21,7 @@ and durable replay. There is no supported migration submission or activation rou
 | Read durable topology and local activation status | Implemented |
 | Read an admitted migration request's durable status | Implemented, console authorization |
 | Dry-run an additive candidate against an adopted parent | Local compile and compatibility descriptor; no durable admission |
-| Reserve/abort a candidate | Core library primitives; no public submit route or target worker |
+| Reserve/abort a candidate | Core library primitives; DB-owned phase driver; no public submit route |
 | Certify an already admitted candidate on this process | Local preparation API; complete frozen roster required before a new cut |
 | Prepare and hold an exact old-topology cut | Existing manual checkpoint path after participant-complete internal admission/preparation; no target activation |
 | Stage exact-cut state/progress/subscription requirements | DB/core library, held cut and complete current roster; no target restore/output authority |
@@ -32,7 +33,8 @@ and durable replay. There is no supported migration submission or activation rou
 | Reconstruct the committed target before its first checkpoint | DB library; explicit root, strict parent manifest/state checks and current process/adoption; private image only |
 | Atomically start a new source from its sealed cursor | Internal connector/runtime prerequisite; explicit Kafka inventory with guaranteed delivery; intake still requires coordinated Release |
 | Certify an installed held runtime | DB library; live state, actors, sink acknowledgements and exact receiver mesh; protocol 5 |
-| Release the complete installed target | Leader DB library; current full process roster; followers independently apply the same Release |
+| Release the complete installed target | Leader DB library and supervisor; current full process roster; followers independently apply the same Release |
+| Drive an already admitted operation automatically | Existing DB-owned recovery supervisor; one private image; phase deadlines and coordinated fault handoff |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -213,9 +215,9 @@ complete durable compilation agreement. It does not mean that the candidate is
 installed, old actors retired or the target active. Committed catalog version
 remains 1 and locally active version is null while intake is held.
 
-There is no target worker in this checkpoint. If testing the internal cut path,
-use coordinated recovery or restart on the same namespace to resume the original
-topology. A new leader/recovery fault aborts the uncommitted candidate and retains
+The DB-owned supervisor drives the target after the exact old-cut quorum completes.
+A definitive pre-Commit abort requires coordinated recovery on the same namespace
+to resume the original topology. A new leader/recovery fault aborts the uncommitted candidate and retains
 the old checkpoint Commit. Recovery must reconcile prepared sink outcomes before
 release; it cannot rewind a committed checkpoint or treat a timeout as an Abort.
 Explicit abort alone does not reopen intake. The real-process cut/abort test uses
@@ -336,8 +338,8 @@ installation and participant-complete Release remain required. LDB-6043 stays in
 ## Retire the held parent internally
 
 `LaminarDB::retire_cluster_topology_parent(&mut image)` accepts only an image
-prepared by that same database. There is no HTTP retirement route or automatic
-migration worker. The call checks the exact root, old checkpoint, admitting leader,
+prepared by that same database. There is no HTTP retirement route. The supervisor
+uses this method and checks the exact root, old checkpoint, admitting leader,
 complete current preparation roster, process and assignment before stopping the
 parent and after observing its termination.
 
@@ -373,7 +375,7 @@ on retry, and publishes one exact participant/boot/process-term receipt through
 the configured controller. The caller cannot supply its own receipt or termination
 flag. The total cooperative budget is 45 seconds, including the authority append;
 the core append allows 16 CAS attempts within 15 seconds. There is no HTTP route
-or automatic worker for this call.
+for this call; the existing supervisor invokes it after private restore.
 
 Historical protocol-3 receipts use authority format 19. This build's DB receipt
 API certifies protocol 4 and writes format 20, supporting target Commit and explicit
@@ -401,7 +403,7 @@ lost before Commit, abort and recover the parent through coordinated recovery.
 Commit checks current authority and every required process;
 installation must obtain a valid target image, revalidate sealed cursors and wait
 for participant-complete Release. The internal installation/Release methods are
-described below; automatic orchestration/recovery remain unfinished. LDB-6043 remains.
+described below and driven by the supervisor; automatic target recovery remains unfinished. LDB-6043 remains.
 
 ## Commit and reconstruct internally
 
@@ -493,7 +495,7 @@ The internal library method
 It reobserves parent terminal cleanup, audits current Commit/process/assignment
 authority, prepares the exact shuffle generation and installs the target catalog,
 restored graph, checkpoint coordinator and source/sink actors. There is no HTTP or
-SQL installation command and no automatic migration worker in this increment.
+SQL installation command. The existing supervisor owns automatic phase progress.
 
 The existing startup owner continues after caller cancellation. One cooperative
 45-second budget covers transport and runtime preparation, followed by bounded
@@ -508,8 +510,8 @@ controls without polling or acknowledgements, and initial target sink epochs sta
 deferred. The historical parent checkpoint remains unchanged under its original
 identity; the first target checkpoint requires full vnode state. The operation
 remains Committed and the locally active version remains absent. Public startup,
-manual gate opening and runtime DDL remain fenced until the complete Release path
-exists. Success grants no durable readiness receipt or output permission.
+manual gate opening and runtime DDL remain fenced. Success grants no durable
+readiness receipt or output permission; certification and exact Release are separate.
 
 Current readiness collection, sink generation fencing and participant-complete
 Release are available through the internal methods below. Automatic target recovery
@@ -533,8 +535,8 @@ participant-complete Release, reconciles/admit sink epochs and opens local intak
 last. Followers invoke `apply_cluster_topology_release(operation_id)` for the
 same durable decision and their own exact runtime receipt. Each method uses the
 existing DB control owner and a 45-second cooperative budget; caller disconnect
-does not cancel that owner. There is no HTTP/SQL activation command or automatic
-migration worker yet.
+does not cancel that owner. The existing supervisor drives these methods;
+there is no HTTP/SQL activation command.
 
 Operation phase `activating` means installation collection with intake held.
 `active` means durable Release, independently of a process's application result.
@@ -557,6 +559,33 @@ no parent identity bypass is enabled. Controlled local tests preserve aggregate
 state and future-only additions, but do not certify transactional sink migration,
 automatic recovery, public migration or real multi-process restart. See the
 [activation evidence](test-evidence/topology-activation-2026-10-03/README.md).
+
+## Automatic progress for an internal admitted operation
+
+`enable_coordinated_recovery()` starts the existing DB-owned supervisor once;
+the server already enables it for a running cluster. Every participant drives
+one local migration phase per healthy poll. The current leader uses the existing
+manual checkpoint route, stages the immutable root, commits a fully prepared
+target and publishes a fully installed Release. Followers independently compile,
+restore, retire, install and apply that same decision. The supervisor retains at
+most one private target image and its compiler permit, and continues after a
+status observer disconnects.
+
+Runtime faults, recovery, drain, shutdown and process fencing release private
+preparation for the existing recovery owner. An aborted held cut requests
+coordinated parent recovery; dropping the image never resumes intake. A retired,
+still-held parent can reconstruct its private image after monitor loss. Failed
+atomic installation observes cleanup and retries the same committed root with
+the same sealed cursors. A phase with no durable progress for 180 seconds requests
+coordinated recovery. Exact checkpoint attempts still finish their existing
+terminal cleanup before another lifecycle transition.
+
+The latest operation/progress hint is only an idle polling aid. Definitive status
+and every phase action still audit the immutable evidence and current fences.
+An unapplied local Release or retained image takes precedence over a later
+request. There is no public submit route. Automatic target recovery after Active
+and whole-cluster startup remain unfinished; a new runtime cannot reuse the
+original Release receipt or restart from a parent cut after newer target progress.
 
 ## Errors and recovery
 

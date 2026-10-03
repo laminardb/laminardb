@@ -1,8 +1,6 @@
 //! Commit owns no actors; private reconstruction is available before any target checkpoint.
 
-use laminar_core::cluster::control::{
-    TopologyAdmissionPhase, TopologyAdmissionStatus, TopologyError,
-};
+use laminar_core::cluster::control::{TopologyAdmissionStatus, TopologyError};
 
 use super::{DbError, LaminarDB, PreparedTopologyRestore};
 
@@ -17,7 +15,8 @@ impl LaminarDB {
     ///
     /// # Errors
     /// Rejects foreign/stale images, incomplete participant capabilities, local faults or unresolved
-    /// authority. Installation/Release are not implemented and runtime DDL remains guarded.
+    /// authority. Commit alone grants no installation or output permission; runtime DDL remains
+    /// guarded until automatic target recovery is certified.
     pub async fn commit_cluster_topology_target(
         &self,
         image: &mut PreparedTopologyRestore,
@@ -36,7 +35,7 @@ impl LaminarDB {
                 .cluster_topology_operation_status(image.input.operation().operation_id)
                 .await?
                 .ok_or_else(|| TopologyError::Conflict("unknown topology operation".into()))?;
-            if status.phase != TopologyAdmissionPhase::Committed {
+            if status.commit.is_none() {
                 self.certify_cluster_topology_target_preparation(image)
                     .await?;
                 // The retained image's cursor observation may have aged while peers prepared.

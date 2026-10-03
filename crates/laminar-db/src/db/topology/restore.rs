@@ -379,6 +379,11 @@ impl LaminarDB {
 
     pub(super) fn ensure_topology_restore_available(&self, committed: bool) -> Result<(), DbError> {
         if !committed {
+            if super::DbState::load(&self.state) == super::DbState::ShuttingDown {
+                // A monitor restart may drop its private image after observed parent retirement.
+                // The exact held parent/root still permit private reconstruction, never intake.
+                return self.ensure_topology_retirement_available();
+            }
             return self.ensure_topology_root_available();
         }
         if self.is_closed() {
