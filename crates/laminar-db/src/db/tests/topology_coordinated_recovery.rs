@@ -135,6 +135,58 @@ async fn held_start(
 }
 
 #[tokio::test]
+async fn topology_coordinated_recovery_keeps_loss_unrepaired_until_release() {
+    let (fixture, committed, probe) = activation::installed().await;
+    let original = fixture
+        .db
+        .release_installed_cluster_topology(committed.operation_id)
+        .await
+        .unwrap();
+    let receiver = fixture.db.shuffle_receiver.lock().clone().unwrap();
+    let losses = receiver.delivery_loss_incidents();
+    let repaired = receiver.recovered_delivery_loss_incidents();
+    assert_eq!(repaired.load(Ordering::Acquire), 0);
+    losses.fetch_add(1, Ordering::AcqRel);
+    probe.block_start.store(true, Ordering::Release);
+    request_recovery(&fixture);
+    wait_until(|| probe.starts.lock().len() > 2).await;
+    assert!(fixture.db.cluster_intake_fenced());
+    assert!(receiver.has_unrecovered_delivery_loss());
+    assert_eq!(repaired.load(Ordering::Acquire), 0);
+    assert!(probe.output.lock().is_empty());
+    assert_eq!(probe.sink_epochs.load(Ordering::Acquire), 0);
+    let start = fixture
+        .authority
+        .controller
+        .observe_recover_control()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(start.phase, RecoverPhase::Start { .. }));
+    assert_eq!(receiver.recovery_gen(), start.round.id.generation);
+    probe.block_start.store(false, Ordering::Release);
+    probe.start_release.notify_one();
+    released(&fixture).await;
+    assert_eq!(
+        repaired.load(Ordering::Acquire),
+        losses.load(Ordering::Acquire)
+    );
+    assert!(!receiver.has_unrecovered_delivery_loss());
+    assert_eq!(
+        fixture
+            .db
+            .cluster_topology_operation_status(committed.operation_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    enqueue(&probe, 3, 91, &[1]);
+    outputs(&probe, 45).await;
+    fixture.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn topology_coordinated_recovery_completes_first_release_with_real_held_actors() {
     let (fixture, committed, probe) = activation::installed().await;
     probe.block_start.store(true, Ordering::Release);

@@ -189,9 +189,17 @@ impl LaminarDB {
                 image.graph.bind_cluster_topology_fence(target)?;
                 self.source_gate.store(true, Ordering::Release);
                 self.topology_cut_hold.store(true, Ordering::Release);
-                sender
-                    .install_topology_fence_pair(&receiver, parent, target)
-                    .map_err(|error| TopologyError::Conflict(error.to_string()))?;
+                if let Some(start) = &image.recovery_start {
+                    sender.install_topology_fence_pair_for_recovery(
+                        &receiver,
+                        parent,
+                        target,
+                        start.round.id.generation,
+                    )
+                } else {
+                    sender.install_topology_fence_pair(&receiver, parent, target)
+                }
+                .map_err(|error| TopologyError::Conflict(error.to_string()))?;
             }
             let after = self.topology_transport_input(image).await?;
             if !after.same_restore_requirements(&fresh) {

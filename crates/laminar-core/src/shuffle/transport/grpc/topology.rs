@@ -44,6 +44,40 @@ impl ShuffleSender {
         expected: Option<ShuffleTopologyFence>,
         target: ShuffleTopologyFence,
     ) -> io::Result<bool> {
+        self.install_topology_fence_pair_inner(receiver, expected, target, None)
+    }
+
+    /// Install held transport for an exact authorized coordinated recovery Start.
+    /// The trusted caller must prove the stopped roster, selected cut and current generation.
+    /// Loss covered by that generation's prepared cutoff may remain pending during installation;
+    /// this does not forgive it or authorize input/output. Only recovery completion promotes the
+    /// repair floor. Later loss and an exhausted incident counter still reject installation.
+    ///
+    /// # Errors
+    /// Rejects a zero/stale generation or any ordinary process, assignment and topology mismatch.
+    pub fn install_topology_fence_pair_for_recovery(
+        &self,
+        receiver: &ShuffleReceiver,
+        expected: Option<ShuffleTopologyFence>,
+        target: ShuffleTopologyFence,
+        generation: u64,
+    ) -> io::Result<bool> {
+        if generation == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "topology recovery installation requires a nonzero generation",
+            ));
+        }
+        self.install_topology_fence_pair_inner(receiver, expected, target, Some(generation))
+    }
+
+    fn install_topology_fence_pair_inner(
+        &self,
+        receiver: &ShuffleReceiver,
+        expected: Option<ShuffleTopologyFence>,
+        target: ShuffleTopologyFence,
+        recovery: Option<u64>,
+    ) -> io::Result<bool> {
         let mut sender_assignment = self.assignment.write();
         let mut receiver_assignment = receiver.assignment.write();
         self.process_lease.require_live_io()?;
@@ -66,7 +100,12 @@ impl ShuffleSender {
                 != receiver.recovery_gen.load(Ordering::Acquire)
             || self.scope_cancel.read().is_cancelled()
             || receiver.scope_cancel.read().is_cancelled()
-            || receiver.has_unrecovered_delivery_loss()
+            || recovery.is_some_and(|generation| {
+                receiver.recovery_gen.load(Ordering::Acquire) != generation
+            })
+            || (receiver.has_unrecovered_delivery_loss()
+                && recovery
+                    .is_none_or(|generation| !receiver.delivery.recovery_covers_loss(generation)))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

@@ -316,6 +316,100 @@ async fn topology_transport_unrepaired_loss_blocks_generation_installation() {
 }
 
 #[tokio::test]
+async fn topology_transport_recovery_install_retains_loss_until_exact_completion() {
+    let (first, _local, second, remote) = fabrics().await;
+    first.burn_seq_for_test(2);
+    first
+        .send_to(
+            2,
+            &ShuffleMessage::checkpointed("stage".into(), 0, one_row(10)),
+        )
+        .await
+        .unwrap();
+    receive(&remote).await;
+    assert!(remote.has_unrecovered_delivery_loss());
+    second.set_recovery_gen(1);
+    remote.set_recovery_gen(1);
+    for generation in [0, 2] {
+        assert!(second
+            .install_topology_fence_pair_for_recovery(&remote, None, target(), generation)
+            .is_err());
+    }
+    assert!(second
+        .install_topology_fence_pair(&remote, None, target())
+        .is_err());
+    assert_eq!(second.topology_version(), 0);
+    assert!(second
+        .install_topology_fence_pair_for_recovery(&remote, None, target(), 1)
+        .unwrap());
+    assert!(remote.has_unrecovered_delivery_loss());
+    assert_eq!(
+        remote
+            .recovered_delivery_loss_incidents()
+            .load(Ordering::Acquire),
+        0
+    );
+    assert!(!second
+        .install_topology_fence_pair_for_recovery(&remote, None, target(), 1)
+        .unwrap());
+    assert!(!remote.complete_recovery(2));
+    assert!(remote.has_unrecovered_delivery_loss());
+    assert!(remote.complete_recovery(1));
+    assert!(!remote.has_unrecovered_delivery_loss());
+    assert_eq!(
+        remote
+            .recovered_delivery_loss_incidents()
+            .load(Ordering::Acquire),
+        1
+    );
+}
+
+#[tokio::test]
+async fn topology_transport_recovery_install_rejects_late_loss_and_poisoned_counter() {
+    for poisoned in [false, true] {
+        let (_first, _local, second, remote) = fabrics().await;
+        let incidents = remote.delivery_loss_incidents();
+        incidents.store(if poisoned { u64::MAX } else { 1 }, Ordering::Release);
+        second.set_recovery_gen(1);
+        remote.set_recovery_gen(1);
+        if !poisoned {
+            incidents.fetch_add(1, Ordering::AcqRel);
+        }
+        assert!(second
+            .install_topology_fence_pair_for_recovery(&remote, None, target(), 1)
+            .is_err());
+        assert_eq!(second.topology_version(), 0);
+        assert_eq!(remote.topology_version(), 0);
+        assert_eq!(
+            remote
+                .recovered_delivery_loss_incidents()
+                .load(Ordering::Acquire),
+            0
+        );
+        if poisoned {
+            assert!(remote.complete_recovery(1));
+            assert!(remote.has_unrecovered_delivery_loss());
+            assert!(second
+                .install_topology_fence_pair_for_recovery(&remote, None, target(), 1)
+                .is_err());
+        } else {
+            second.set_recovery_gen(2);
+            remote.set_recovery_gen(2);
+            assert!(second
+                .install_topology_fence_pair_for_recovery(&remote, None, target(), 1)
+                .is_err());
+            assert!(second
+                .install_topology_fence_pair_for_recovery(&remote, None, target(), 2)
+                .unwrap());
+            assert!(remote.has_unrecovered_delivery_loss());
+            assert!(!remote.complete_recovery(1));
+            assert!(remote.complete_recovery(2));
+            assert!(!remote.has_unrecovered_delivery_loss());
+        }
+    }
+}
+
+#[tokio::test]
 async fn topology_transport_old_handshake_token_cannot_open_a_target_stream() {
     use super::super::shuffle_v1::shuffle_transport_client::ShuffleTransportClient;
     use super::super::shuffle_v1::{shuffle_frame, HandshakeRequest, Hello, ShuffleFrame};

@@ -4482,6 +4482,17 @@ mod grpc {
         }
 
         /// Promote only the cutoff captured for this exact recovery generation.
+        /// Check a pending cutoff without promoting the repair floor or resetting loss evidence.
+        /// Transport may be installed held during restore; later incidents still require a round.
+        fn recovery_covers_loss(&self, gen: u64) -> bool {
+            let pending = self.pending_recovery.lock();
+            let incidents = self.delivery_loss_incidents.load(Ordering::Acquire);
+            incidents != u64::MAX
+                && pending
+                    .is_some_and(|(generation, cutoff)| generation == gen && incidents <= cutoff)
+        }
+
+        /// Promote only the cutoff captured for this exact recovery generation.
         fn complete_recovery(&self, gen: u64) -> bool {
             let mut pending = self.pending_recovery.lock();
             if self.completed_recovery_gen.load(Ordering::Acquire) == gen {
