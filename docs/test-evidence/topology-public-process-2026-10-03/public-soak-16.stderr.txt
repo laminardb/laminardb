@@ -1,0 +1,137 @@
+soak: laminardb executable origin=prebuilt-override path=\\?\C:\Users\sujit\.codex\worktrees\9929\laminardb\target\topology-evidence\laminardb-portable-installation-stock-soak.exe sha256=54e3a3d2ddb2927bfbc664c8ef522d84c0809b0d2d89664dcc3d193ac8c392e0 bytes=172130304
+soak: PROFILE mode=cluster delivery=ALO seconds=5 checkpoint_ms=500 checkpoint_timeout_ms=30000 checkpoint_slo_mode=observe hot_path_slo_mode=observe join_interval_ms=100 rps=400 keys=4096 zipf_milli=1200 kills=3 min_live_state_bytes=0 kafka_sink_linger_ms=0
+soak: node logs in C:\Users\sujit\.codex\worktrees\9929\laminardb\target\tmp\soak-548536-1791087728261756100
+soak: node0 generation=1 pid=592732 executable_sha256=54e3a3d2ddb2927bfbc664c8ef522d84c0809b0d2d89664dcc3d193ac8c392e0
+soak: node1 generation=1 pid=596604 executable_sha256=54e3a3d2ddb2927bfbc664c8ef522d84c0809b0d2d89664dcc3d193ac8c392e0
+soak: node2 generation=1 pid=596484 executable_sha256=54e3a3d2ddb2927bfbc664c8ef522d84c0809b0d2d89664dcc3d193ac8c392e0
+soak: cluster up, checkpoint 1 epoch 1, ingested=30563, Kafka committed offset sum=14867
+soak: public exact-inventory adoption a81c55f9-8490-48b4-983b-be33ab0f1ced at sequence 8
+soak: three-node ALO pre-fault temporal history observed idle temporal inputs and committed checkpoint 36 epoch 36
+soak: three-node ALO temporal right history is durable before fault injection
+
+thread 'three_node_alo_public_topology_migration_restart_soak' (596864) panicked at crates\laminar-server\tests\cluster_soak.rs:15362:17:
+failed to create Kafka topic "topology-live-input-4fbda995-c58a-4d94-9174-0e873694e9c6": InvalidPartitions (Broker: Invalid number of partitions)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--- node0 log tail:
+  2026-10-04T04:23:06.383953Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:06.392172Z  INFO laminar_db::pipeline_callback: follower checkpoint committed epoch=36
+  2026-10-04T04:23:06.547659Z  INFO laminar_db::pipeline_callback: follower deferring checkpoint alignment until source barriers flow through checkpoint_id=37 epoch=37
+  2026-10-04T04:23:06.573404Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=37 epoch=37 sources_total=8 elapsed=25.6285ms
+  2026-10-04T04:23:06.573517Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=37 epoch=37 elapsed=25.7426ms
+  2026-10-04T04:23:06.573566Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=37 epoch=37
+  2026-10-04T04:23:06.613096Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:06.638489Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:06.647644Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=37 epoch=37 waves=4 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=74.0777ms
+  2026-10-04T04:23:06.647795Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=37 epoch=37 role="follower" phase="final_sink_fence" elapsed=115.2002ms
+  2026-10-04T04:23:06.651379Z  INFO laminardb::http::router: GET /api/v1/cluster/checkpoints -> 200 OK (0ms)
+  2026-10-04T04:23:06.668202Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:06.684609Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:06.939261Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:07.193786Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:07.448099Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:07.701838Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:07.723817Z  INFO laminar_db::pipeline_callback: follower checkpoint committed epoch=37
+  2026-10-04T04:23:07.733416Z  INFO laminar_db::pipeline_callback: follower deferring checkpoint alignment until source barriers flow through checkpoint_id=38 epoch=38
+  2026-10-04T04:23:07.754671Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=38 epoch=38 sources_total=8 elapsed=21.1912ms
+  2026-10-04T04:23:07.754793Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=38 epoch=38 elapsed=21.3154ms
+  2026-10-04T04:23:07.754823Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=38 epoch=38
+  2026-10-04T04:23:07.784698Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=38 epoch=38 waves=3 saw_local_activity=false saw_peer_activity=true saw_graph_staging=false elapsed=29.8741ms
+  2026-10-04T04:23:07.784874Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=38 epoch=38 role="follower" phase="final_sink_fence" elapsed=224.889ms
+  2026-10-04T04:23:07.957010Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.211985Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.466254Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:08.592107Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:08.710784Z  INFO laminar_db::pipeline_callback: follower checkpoint committed epoch=38
+  2026-10-04T04:23:08.721243Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:08.739815Z  INFO laminardb::http::router: GET /api/v1/cluster/checkpoints -> 200 OK (0ms)
+  2026-10-04T04:23:08.740161Z  INFO laminar_db::pipeline_callback: follower deferring checkpoint alignment until source barriers flow through checkpoint_id=39 epoch=39
+  2026-10-04T04:23:08.749899Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.759108Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=39 epoch=39 sources_total=8 elapsed=18.8539ms
+  2026-10-04T04:23:08.759203Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=39 epoch=39 elapsed=18.9507ms
+  2026-10-04T04:23:08.759242Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=39 epoch=39
+  2026-10-04T04:23:08.764700Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.781427Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.795411Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=39 epoch=39 waves=4 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=36.1674ms
+  2026-10-04T04:23:08.795570Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=39 epoch=39 role="follower" phase="final_sink_fence" elapsed=182.9305ms
+--- node1 log tail:
+  2026-10-04T04:23:04.852322Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:05.301071Z  INFO laminar_db::pipeline_callback: follower checkpoint committed epoch=35
+  2026-10-04T04:23:05.365183Z  INFO laminar_db::pipeline_callback: follower deferring checkpoint alignment until source barriers flow through checkpoint_id=36 epoch=36
+  2026-10-04T04:23:05.385642Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=36 epoch=36 sources_total=8 elapsed=20.3914ms
+  2026-10-04T04:23:05.385715Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=36 epoch=36 elapsed=20.4654ms
+  2026-10-04T04:23:05.385740Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=36 epoch=36
+  2026-10-04T04:23:05.405586Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=36 epoch=36 waves=3 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=19.8449ms
+  2026-10-04T04:23:05.405731Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=36 epoch=36 role="follower" phase="final_sink_fence" elapsed=442.3206ms
+  2026-10-04T04:23:06.391878Z  INFO laminar_db::pipeline_callback: follower checkpoint committed epoch=36
+  2026-10-04T04:23:06.547619Z  INFO laminar_db::pipeline_callback: follower deferring checkpoint alignment until source barriers flow through checkpoint_id=37 epoch=37
+  2026-10-04T04:23:06.572388Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=37 epoch=37 sources_total=8 elapsed=24.6123ms
+  2026-10-04T04:23:06.572486Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=37 epoch=37 elapsed=24.7126ms
+  2026-10-04T04:23:06.572516Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=37 epoch=37
+  2026-10-04T04:23:06.618653Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:06.642320Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:06.647426Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=37 epoch=37 waves=4 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=74.9097ms
+  2026-10-04T04:23:06.647564Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=37 epoch=37 role="follower" phase="final_sink_fence" elapsed=115.3189ms
+  2026-10-04T04:23:06.654940Z  INFO laminardb::http::router: GET /api/v1/cluster/checkpoints -> 200 OK (0ms)
+  2026-10-04T04:23:06.673842Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:07.473686Z  INFO laminar_db::pipeline_callback: follower checkpoint committed epoch=37
+  2026-10-04T04:23:07.568868Z  INFO laminar_db::pipeline_callback: follower deferring checkpoint alignment until source barriers flow through checkpoint_id=38 epoch=38
+  2026-10-04T04:23:07.597303Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=38 epoch=38 sources_total=8 elapsed=28.3613ms
+  2026-10-04T04:23:07.597396Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=38 epoch=38 elapsed=28.4557ms
+  2026-10-04T04:23:07.597420Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=38 epoch=38
+  2026-10-04T04:23:07.785249Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=38 epoch=38 waves=3 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=187.829ms
+  2026-10-04T04:23:07.795370Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=38 epoch=38 role="follower" phase="final_sink_fence" elapsed=235.4163ms
+  2026-10-04T04:23:08.597045Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:08.624928Z  INFO laminar_db::pipeline_callback: follower checkpoint committed epoch=38
+  2026-10-04T04:23:08.638585Z  INFO laminar_db::pipeline_callback: follower deferring checkpoint alignment until source barriers flow through checkpoint_id=39 epoch=39
+  2026-10-04T04:23:08.664045Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=39 epoch=39 sources_total=8 elapsed=25.3959ms
+  2026-10-04T04:23:08.664101Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=39 epoch=39 elapsed=25.4522ms
+  2026-10-04T04:23:08.664119Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=39 epoch=39
+  2026-10-04T04:23:08.725394Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.742777Z  INFO laminardb::http::router: GET /api/v1/cluster/checkpoints -> 200 OK (0ms)
+  2026-10-04T04:23:08.753899Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.769321Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.786628Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.795471Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=39 epoch=39 waves=4 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=131.3517ms
+  2026-10-04T04:23:08.800308Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=39 epoch=39 role="follower" phase="final_sink_fence" elapsed=187.5658ms
+  2026-10-04T04:23:09.238955Z  WARN laminar_core::shuffle::transport::grpc: shuffle stream broke peer_addr=127.0.0.1:64759 error=code: 'Unknown error', message: "transport error", source: tonic::transport::Error(Transport, hyper::Error(Io, Kind(ConnectionReset)))
+--- node2 log tail:
+  2026-10-04T04:23:05.407512Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=36 epoch=36 role="leader" phase="final_sink_fence" elapsed=496.2302ms
+  2026-10-04T04:23:06.359111Z  INFO laminar_db::checkpoint_coordinator::subscription_output: published committed cluster subscription output epoch=36 checkpoint_id=36 partitions=576 segments=64 frames=9634 rows=286380 bytes=9404523
+  2026-10-04T04:23:06.360583Z  INFO laminar_db::pipeline::callback: checkpoint completed checkpoint_id=36 epoch=36
+  2026-10-04T04:23:06.429402Z  INFO laminar_db::pipeline::streaming_coordinator::checkpoint_admission: checkpoint attempt reserved checkpoint_id=37 epoch=37
+  2026-10-04T04:23:06.625411Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:06.627460Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=37 epoch=37 sources_total=8 elapsed=217.0049ms
+  2026-10-04T04:23:06.627527Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=37 epoch=37 elapsed=217.073ms
+  2026-10-04T04:23:06.627550Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=37 epoch=37
+  2026-10-04T04:23:06.645849Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:06.648812Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=37 epoch=37 waves=4 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=21.2614ms
+  2026-10-04T04:23:06.658799Z  INFO laminardb::http::router: GET /api/v1/cluster/checkpoints -> 200 OK (0ms)
+  2026-10-04T04:23:06.666962Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=37 epoch=37 role="leader" phase="final_sink_fence" elapsed=256.5064ms
+  2026-10-04T04:23:06.678960Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:07.123226Z  INFO laminar_db::checkpoint_coordinator::subscription_output: completed cluster subscription output cleanup retained_bytes=9404523 orphan_objects_scanned=115 orphan_objects_deleted=0 orphan_bytes_deleted=0 orphan_bytes_remaining=0
+  2026-10-04T04:23:07.438031Z  INFO laminar_db::checkpoint_coordinator::subscription_output: published committed cluster subscription output epoch=37 checkpoint_id=37 partitions=576 segments=64 frames=8767 rows=264369 bytes=8595932
+  2026-10-04T04:23:07.439777Z  INFO laminar_db::pipeline::callback: checkpoint completed checkpoint_id=37 epoch=37
+  2026-10-04T04:23:07.503654Z  INFO laminar_db::pipeline::streaming_coordinator::checkpoint_admission: checkpoint attempt reserved checkpoint_id=38 epoch=38
+  2026-10-04T04:23:07.569891Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=38 epoch=38 sources_total=8 elapsed=85.5169ms
+  2026-10-04T04:23:07.569964Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=38 epoch=38 elapsed=85.5904ms
+  2026-10-04T04:23:07.569982Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=38 epoch=38
+  2026-10-04T04:23:07.782992Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=38 epoch=38 waves=3 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=213.0075ms
+  2026-10-04T04:23:07.795346Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=38 epoch=38 role="leader" phase="final_sink_fence" elapsed=310.9709ms
+  2026-10-04T04:23:08.136228Z  INFO laminar_db::checkpoint_coordinator::subscription_output: completed cluster subscription output cleanup retained_bytes=8595932 orphan_objects_scanned=114 orphan_objects_deleted=0 orphan_bytes_deleted=0 orphan_bytes_remaining=0
+  2026-10-04T04:23:08.541196Z  INFO laminar_db::checkpoint_coordinator::subscription_output: published committed cluster subscription output epoch=38 checkpoint_id=38 partitions=576 segments=64 frames=7909 rows=241912 bytes=7775960
+  2026-10-04T04:23:08.543287Z  INFO laminar_db::pipeline::callback: checkpoint completed checkpoint_id=38 epoch=38
+  2026-10-04T04:23:08.565220Z  INFO laminar_db::pipeline::streaming_coordinator::checkpoint_admission: checkpoint attempt reserved checkpoint_id=39 epoch=39
+  2026-10-04T04:23:08.601447Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T04:23:08.654679Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint source barriers fully aligned checkpoint_id=39 epoch=39 sources_total=8 elapsed=102.3596ms
+  2026-10-04T04:23:08.654742Z  INFO laminar_db::pipeline::streaming_coordinator::barrier_handling: checkpoint pre-capture graph drain completed checkpoint_id=39 epoch=39 elapsed=102.4233ms
+  2026-10-04T04:23:08.654759Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush started checkpoint_id=39 epoch=39
+  2026-10-04T04:23:08.730295Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.745592Z  INFO laminardb::http::router: GET /api/v1/cluster/checkpoints -> 200 OK (0ms)
+  2026-10-04T04:23:08.759129Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.775527Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.791629Z  INFO laminardb::http::router: GET /metrics -> 200 OK (1ms)
+  2026-10-04T04:23:08.795499Z  INFO laminar_db::pipeline_callback: checkpoint distributed shuffle fixed-point flush completed checkpoint_id=39 epoch=39 waves=4 saw_local_activity=true saw_peer_activity=true saw_graph_staging=true elapsed=140.7391ms
+  2026-10-04T04:23:08.880370Z  INFO laminar_db::pipeline_callback: checkpoint barrier phase completed checkpoint_id=39 epoch=39 role="leader" phase="final_sink_fence" elapsed=328.0499ms
+  2026-10-04T04:23:09.239319Z  WARN laminar_core::shuffle::transport::grpc: shuffle stream broke peer_addr=127.0.0.1:64759 error=code: 'Unknown error', message: "transport error", source: tonic::transport::Error(Transport, hyper::Error(Io, Kind(ConnectionReset)))
+  2026-10-04T04:23:09.318787Z  INFO laminar_db::checkpoint_coordinator::subscription_output: completed cluster subscription output cleanup retained_bytes=7775960 orphan_objects_scanned=123 orphan_objects_deleted=0 orphan_bytes_deleted=0 orphan_bytes_remaining=0
+  2026-10-04T04:23:09.381816Z  WARN laminar_core::shuffle::transport::grpc: shuffle stream broke peer_addr=127.0.0.1:64764 error=code: 'Unknown error', message: "transport error", source: tonic::transport::Error(Transport, hyper::Error(Io, Kind(ConnectionReset)))

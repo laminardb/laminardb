@@ -765,7 +765,14 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         if let Some(metadata) = topology_metadata {
             self.validate_topology_runtime_metadata(&metadata).await?;
-            self.ensure_topology_runtime_live(&metadata.input).await?;
+            self.ensure_topology_runtime_live(
+                &metadata.input,
+                metadata
+                    .recovery
+                    .as_ref()
+                    .map(|recovery| recovery.selection.as_ref()),
+            )
+            .await?;
             if let Some(recovery) = &metadata.recovery {
                 self.ensure_topology_recovery_runtime_held(&recovery.start)?;
             } else {

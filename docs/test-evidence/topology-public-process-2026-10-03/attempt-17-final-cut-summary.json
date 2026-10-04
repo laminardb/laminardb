@@ -1,0 +1,76 @@
+{
+  "run_id": "595380-1791087891925836500",
+  "reference": {
+    "epoch": 38,
+    "checkpoint_id": 38,
+    "sha256": "895f046e4934d43117c307499c5e749336a6bcffe4619e358763b1f4e2addf63",
+    "len": 60383
+  },
+  "verified_sha256": "895f046e4934d43117c307499c5e749336a6bcffe4619e358763b1f4e2addf63",
+  "verified_encoded_length": 60383,
+  "assignment": {
+    "assignment_digest": [
+      4,
+      129,
+      37,
+      184,
+      28,
+      193,
+      137,
+      119,
+      42,
+      153,
+      19,
+      91,
+      95,
+      41,
+      14,
+      107,
+      74,
+      116,
+      175,
+      189,
+      101,
+      148,
+      200,
+      56,
+      194,
+      6,
+      158,
+      183,
+      203,
+      130,
+      105,
+      203
+    ],
+    "assignment_version": 2,
+    "participants": [
+      {
+        "boot_incarnation": "120f2456-09fa-44c7-81ad-3201c85d300e",
+        "node_id": 12632117528189947522
+      },
+      {
+        "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3",
+        "node_id": 15506916534570490772
+      },
+      {
+        "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948",
+        "node_id": 16059159448129433833
+      }
+    ],
+    "partitioning_abi_version": 2,
+    "vnode_count": 64
+  },
+  "pipeline_identity": {
+    "canonical_version": 7,
+    "sha256": "bd9cbda601bdca7e903157a21d520b756219fe7d948c2f0cec88442105ca5888"
+  },
+  "reassignment_portable": true,
+  "predecessor": {
+    "checkpoint_id": 37,
+    "epoch": 37,
+    "len": 60383,
+    "sha256": "adfd845d0a0551b63c9f60f291410baf8b3d6eb5e01bbe0cd30ab0aebf6b62eb"
+  },
+  "scope": "Exact final checkpoint bytes verified against the durable Commit head; historical bytes unchanged."
+}

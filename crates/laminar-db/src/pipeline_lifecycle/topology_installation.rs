@@ -1,6 +1,6 @@
 //! Install the previously decoded root through the ordinary source/sink/runtime handoff.
 
-use laminar_core::cluster::control::{TopologyError, TopologyRestoreInput};
+use laminar_core::cluster::control::{TopologyError, TopologyRecoveryInput, TopologyRestoreInput};
 use laminar_core::shuffle::ShuffleTopologyFence;
 
 use super::{
@@ -146,25 +146,43 @@ impl LaminarDB {
         &self,
         input: &TopologyRestoreInput,
     ) -> Result<(), DbError> {
-        self.ensure_topology_runtime_live(input).await?;
+        self.ensure_topology_runtime_live(input, None).await?;
         self.ensure_topology_runtime_held()
     }
 
     pub(crate) async fn ensure_topology_runtime_live(
         &self,
         input: &TopologyRestoreInput,
+        recovery: Option<&TopologyRecoveryInput>,
     ) -> Result<(), DbError> {
+        let selected_outcome = match recovery {
+            Some(selection) if selection.migration().same_installed_generation(input) => {
+                selection.outcome()
+            }
+            Some(_) => return Err(TopologyError::Fenced.into()),
+            None => input.outcome(),
+        };
+        let selected_ref = selected_outcome
+            .committed_checkpoint
+            .as_ref()
+            .ok_or(TopologyError::Fenced)?;
         let coordinator_matches = {
             let coordinator = self.coordinator.lock().await;
             let coordinator = coordinator.as_ref().ok_or(TopologyError::Fenced)?;
             coordinator.bound_pipeline_identity()? == input.descriptor().target_pipeline
-                && (coordinator.last_committed_ref()
-                    == input.outcome().committed_checkpoint.as_ref()
+                && (coordinator.last_committed_ref() == Some(selected_ref)
                     || (input.is_committed()
                         && coordinator
                             .last_committed_manifest()
                             .is_some_and(|manifest| {
                                 manifest.pipeline_identity == input.descriptor().target_pipeline
+                                    && manifest.assignment_fence.as_ref()
+                                        == Some(input.assignment())
+                                    && manifest.epoch > selected_ref.epoch
+                                    && coordinator.last_committed_ref().is_some_and(|reference| {
+                                        reference.epoch == manifest.epoch
+                                            && reference.checkpoint_id == manifest.checkpoint_id
+                                    })
                             })))
         };
         let graph_matches = self

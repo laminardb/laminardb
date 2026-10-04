@@ -1,0 +1,99 @@
+{
+  "allowed_at_least_once_duplicates": 0,
+  "consumer_visible_latency": {
+    "p50_ms": 361.55510000000004,
+    "p95_ms": 18444.0801,
+    "p99_ms": 18444.0801,
+    "quantile_method": "nearest rank",
+    "sample_count": 9,
+    "samples_ms": [
+      104.2638,
+      104.2638,
+      104.2638,
+      18444.0801,
+      18444.0801,
+      18444.0801,
+      361.55510000000004,
+      361.55510000000004,
+      361.55510000000004
+    ],
+    "scope": "Small deterministic new-pipeline oracle; includes producer creation, sending, cut hold, recovery and consumer observation. Separate from the existing steady-state soak latency sample."
+  },
+  "expected_new_pipeline_pairs": [
+    [
+      100,
+      100
+    ],
+    [
+      101,
+      101
+    ],
+    [
+      102,
+      102
+    ],
+    [
+      200,
+      200
+    ],
+    [
+      201,
+      201
+    ],
+    [
+      202,
+      202
+    ],
+    [
+      300,
+      300
+    ],
+    [
+      301,
+      301
+    ],
+    [
+      302,
+      302
+    ]
+  ],
+  "full_restart_to_output_ms": 48421,
+  "observed_new_pipeline_pairs": [
+    [
+      100,
+      100
+    ],
+    [
+      101,
+      101
+    ],
+    [
+      102,
+      102
+    ],
+    [
+      200,
+      200
+    ],
+    [
+      201,
+      201
+    ],
+    [
+      202,
+      202
+    ],
+    [
+      300,
+      300
+    ],
+    [
+      301,
+      301
+    ],
+    [
+      302,
+      302
+    ]
+  ]
+}

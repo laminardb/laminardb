@@ -71,7 +71,7 @@ impl LaminarDB {
             &fresh,
             binding.released_sequence.ok_or(TopologyError::Fenced)?,
         )?;
-        self.ensure_topology_runtime_live(&fresh).await?;
+        self.ensure_topology_runtime_live(&fresh, None).await?;
         if fresh.assignment() != fence
             || !controller
                 .authorize_topology_release(&fresh, binding.runtime_id)
@@ -223,7 +223,7 @@ impl LaminarDB {
                 return Err(TopologyError::Fenced.into());
             }
             self.ensure_released_topology_runtime(&binding, &controller)?;
-            self.ensure_topology_runtime_live(&fresh).await?;
+            self.ensure_topology_runtime_live(&fresh, None).await?;
             return Ok(fresh.operation().clone());
         }
         self.validate_topology_installation(&fresh).await?;

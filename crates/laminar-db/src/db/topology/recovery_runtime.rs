@@ -45,7 +45,8 @@ impl LaminarDB {
             return Ok(false);
         }
         self.validate_topology_transport_identity(&binding.input)?;
-        self.ensure_topology_runtime_live(&binding.input).await?;
+        self.ensure_topology_runtime_live(&binding.input, Some(&recovery.selection))
+            .await?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         let snapshot = controller
             .read_recovery_admission_snapshot()
@@ -269,7 +270,8 @@ impl LaminarDB {
             .ok_or(TopologyError::Fenced)?;
         self.validate_topology_recovery_installation(&binding.input, &recovery.selection, start)
             .await?;
-        self.ensure_topology_runtime_live(&binding.input).await?;
+        self.ensure_topology_runtime_live(&binding.input, Some(&recovery.selection))
+            .await?;
         if binding.shutdown.is_cancelled() {
             return Err(TopologyError::Fenced.into());
         }
@@ -281,7 +283,8 @@ impl LaminarDB {
         controller
             .certify_topology_recovery_installation(start, &recovery.selection, binding.runtime_id)
             .await?;
-        self.ensure_topology_runtime_live(&binding.input).await?;
+        self.ensure_topology_runtime_live(&binding.input, Some(&recovery.selection))
+            .await?;
         self.ensure_topology_recovery_runtime_held(start)
     }
 
@@ -311,7 +314,8 @@ impl LaminarDB {
             &recovery.start,
         )
         .await?;
-        self.ensure_topology_runtime_live(&binding.input).await
+        self.ensure_topology_runtime_live(&binding.input, Some(&recovery.selection))
+            .await
     }
 
     pub(crate) fn record_recovered_topology_release(

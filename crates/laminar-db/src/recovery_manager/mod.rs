@@ -61,6 +61,60 @@ pub struct RecoveredState {
 }
 
 impl RecoveredState {
+    /// Validate topology recovery under the same complete owner map and stable participant ids.
+    /// Historical assignment bytes remain immutable; only a portable older cut may bootstrap
+    /// the exact current vnode set. This grants neither sink continuation nor intake Release.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn validate_topology_assignment(
+        &self,
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+    ) -> Result<(), DbError> {
+        use laminar_core::cluster::control::TopologyError;
+
+        let predecessor = self
+            .committed
+            .assignment_fence
+            .as_ref()
+            .ok_or(TopologyError::Fenced)?;
+        let target = input.assignment();
+        let owner_ids = self
+            .predecessor_owners
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        let owns_same_vnodes = self
+            .predecessor_owners
+            .iter()
+            .enumerate()
+            .filter(|(_, owner)| owner.0 == input.process().participant.node_id)
+            .map(|(vnode, _)| u32::try_from(vnode))
+            .eq(input.owned_vnodes().iter().copied().map(Ok));
+        if !predecessor.is_canonical()
+            || !target.is_canonical()
+            || !predecessor.matches_owner_map(&owner_ids)
+            || predecessor.assignment_version > target.assignment_version
+            || self.reassigned != (predecessor.assignment_version < target.assignment_version)
+            || (!self.reassigned && predecessor != target)
+            || (self.reassigned && !self.committed.reassignment_portable)
+            || predecessor.assignment_digest != target.assignment_digest
+            || predecessor.vnode_count != target.vnode_count
+            || predecessor.partitioning_abi_version != target.partitioning_abi_version
+            || !predecessor
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .eq(target
+                    .participants
+                    .iter()
+                    .map(|participant| participant.node_id))
+            || self.target_vnodes != input.owned_vnodes()
+            || !owns_same_vnodes
+        {
+            return Err(TopologyError::Fenced.into());
+        }
+        Ok(())
+    }
+
     /// Recovered epoch.
     #[must_use]
     pub const fn epoch(&self) -> u64 {

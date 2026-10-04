@@ -103,6 +103,15 @@ managed-state budget before publication. An identical assignment still uses
 strict ordinary restore. This handles process replacement within the existing
 topology contract and grants no survivor rescaling authority.
 
+Coordinator installation applies the same complete-owner check to the exact
+selected root or target checkpoint. A portable bootstrap retains its committed
+reference and source/time progress, while discarding the historical local
+manifest from incremental capture. The next checkpoint captures state under the
+current assignment. Runtime readiness explicitly checks the selected recovery
+reference; an absent historical local manifest cannot make a restored target
+look uninstalled. Subsequent checkpoints must bind the same target pipeline and
+current assignment and advance beyond that selected cut.
+
 Cold startup accepts the complete current catalog or the exact complete original adopted bootstrap as an assertion. Durable target authority takes precedence over that original bootstrap. Arbitrary subsets and changed definitions reject. The target catalog is reconstructed, namespace ownership retained and the same coordinated recovery owner queued before actors can publish.
 
 Missing deployment identity is an error, including through a cached decision store. Reads never recreate it. Source cursors for every target source come from the selected checkpoint; recovery cannot re-resolve latest or reuse an old initializer when target progress exists. Checkpoint allocation and publication frontiers continue monotonically.

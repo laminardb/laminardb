@@ -1,0 +1,1163 @@
+# HELP laminardb_batches_total Batches processed
+# TYPE laminardb_batches_total counter
+laminardb_batches_total{pipeline="soak_join",instance="HomePC1"} 583
+# HELP laminardb_checkpoint_aligned_resume_wait_seconds Cluster-shuffle pause waiting for the global Aligned release
+# TYPE laminardb_checkpoint_aligned_resume_wait_seconds histogram
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 2
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.002"} 2
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.004"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.008"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.016"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.032"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.064"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.128"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.256"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.512"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.024"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.048"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="4.096"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="8.192"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="16.384"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="32.768"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 3
+laminardb_checkpoint_aligned_resume_wait_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.0029805
+laminardb_checkpoint_aligned_resume_wait_seconds_count{pipeline="soak_join",instance="HomePC1"} 3
+# HELP laminardb_checkpoint_barrier_local_duration_seconds Local paused barrier work (sink fence + shuffle align + state capture + tail handoff)
+# TYPE laminardb_checkpoint_barrier_local_duration_seconds histogram
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 0
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.002"} 0
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.004"} 0
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.008"} 0
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.016"} 0
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.032"} 0
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.064"} 1
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.128"} 1
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.256"} 2
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.512"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.024"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.048"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="4.096"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="8.192"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="16.384"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="32.768"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 3
+laminardb_checkpoint_barrier_local_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.6020747
+laminardb_checkpoint_barrier_local_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 3
+# HELP laminardb_checkpoint_duration_seconds Checkpoint cycle duration
+# TYPE laminardb_checkpoint_duration_seconds histogram
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.01"} 0
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.02"} 0
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.04"} 0
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.08"} 0
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.16"} 0
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.32"} 0
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.64"} 0
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.28"} 2
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.56"} 3
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="5.12"} 4
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="10.24"} 4
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="20.48"} 4
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="40.96"} 4
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="81.92"} 4
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="163.84"} 4
+laminardb_checkpoint_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 4
+laminardb_checkpoint_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 7.2943866
+laminardb_checkpoint_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 4
+# HELP laminardb_checkpoint_epoch Current checkpoint epoch
+# TYPE laminardb_checkpoint_epoch gauge
+laminardb_checkpoint_epoch{pipeline="soak_join",instance="HomePC1"} 39
+# HELP laminardb_checkpoint_pipeline_stall_duration_seconds Pipeline stall per checkpoint barrier (align + capture + resume gate)
+# TYPE laminardb_checkpoint_pipeline_stall_duration_seconds histogram
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 0
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.002"} 0
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.004"} 0
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.008"} 0
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.016"} 0
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.032"} 0
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.064"} 1
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.128"} 1
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.256"} 2
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.512"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.024"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.048"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="4.096"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="8.192"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="16.384"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="32.768"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 3
+laminardb_checkpoint_pipeline_stall_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.6051002
+laminardb_checkpoint_pipeline_stall_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 3
+# HELP laminardb_checkpoint_size_bytes Last checkpoint size
+# TYPE laminardb_checkpoint_size_bytes gauge
+laminardb_checkpoint_size_bytes{pipeline="soak_join",instance="HomePC1"} 7465085
+# HELP laminardb_checkpoint_state_capture_duration_seconds Synchronous mutable checkpoint-state capture duration
+# TYPE laminardb_checkpoint_state_capture_duration_seconds histogram
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 0
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.002"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.004"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.008"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.016"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.032"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.064"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.128"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.256"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.512"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.024"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.048"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="4.096"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="8.192"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="16.384"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="32.768"} 3
+laminardb_checkpoint_state_capture_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 3
+laminardb_checkpoint_state_capture_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.004563
+laminardb_checkpoint_state_capture_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 3
+# HELP laminardb_checkpoints_completed_total Completed checkpoints
+# TYPE laminardb_checkpoints_completed_total counter
+laminardb_checkpoints_completed_total{pipeline="soak_join",instance="HomePC1"} 3
+# HELP laminardb_checkpoints_failed_total Failed checkpoints
+# TYPE laminardb_checkpoints_failed_total counter
+laminardb_checkpoints_failed_total{pipeline="soak_join",instance="HomePC1"} 1
+# HELP laminardb_cluster_subscription_active_readers Committed cluster subscription readers attached to this process
+# TYPE laminardb_cluster_subscription_active_readers gauge
+laminardb_cluster_subscription_active_readers{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_bytes_committed_total Encoded output bytes made visible by authoritative checkpoint commits
+# TYPE laminardb_cluster_subscription_bytes_committed_total counter
+laminardb_cluster_subscription_bytes_committed_total{pipeline="soak_join",instance="HomePC1"} 20709028
+# HELP laminardb_cluster_subscription_checkpoint_prepare_seconds Subscription output encoding and upload duration during checkpoint preparation
+# TYPE laminardb_cluster_subscription_checkpoint_prepare_seconds histogram
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.002"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.004"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.008"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.016"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.032"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.064"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.128"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.256"} 0
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.512"} 1
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.024"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.048"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="4.096"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="8.192"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="16.384"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="32.768"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="65.536"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="131.072"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 3
+laminardb_cluster_subscription_checkpoint_prepare_seconds_sum{pipeline="soak_join",instance="HomePC1"} 1.3891337
+laminardb_cluster_subscription_checkpoint_prepare_seconds_count{pipeline="soak_join",instance="HomePC1"} 3
+# HELP laminardb_cluster_subscription_commit_visibility_seconds Authoritative checkpoint Commit publication duration before local visibility
+# TYPE laminardb_cluster_subscription_commit_visibility_seconds histogram
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 0
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.002"} 0
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.004"} 0
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.008"} 0
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.016"} 0
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.032"} 0
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.064"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.128"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.256"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.512"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.024"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.048"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="4.096"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="8.192"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="16.384"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="32.768"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="65.536"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="131.072"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 3
+laminardb_cluster_subscription_commit_visibility_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.1125525
+laminardb_cluster_subscription_commit_visibility_seconds_count{pipeline="soak_join",instance="HomePC1"} 3
+# HELP laminardb_cluster_subscription_frames_committed_total Output frames made visible by authoritative checkpoint commits
+# TYPE laminardb_cluster_subscription_frames_committed_total counter
+laminardb_cluster_subscription_frames_committed_total{pipeline="soak_join",instance="HomePC1"} 17015
+# HELP laminardb_cluster_subscription_gateway_lag_disconnects_total Readers disconnected after exhausting bounded gateway lag allowance
+# TYPE laminardb_cluster_subscription_gateway_lag_disconnects_total counter
+laminardb_cluster_subscription_gateway_lag_disconnects_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_gateway_manifest_refresh_seconds Gateway committed-index refresh duration
+# TYPE laminardb_cluster_subscription_gateway_manifest_refresh_seconds histogram
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.002"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.004"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.008"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.016"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.032"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.064"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.128"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.256"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.512"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.024"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.048"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="4.096"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="8.192"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="16.384"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="32.768"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="65.536"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="131.072"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0
+laminardb_cluster_subscription_gateway_manifest_refresh_seconds_count{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_integrity_failures_total Committed-output manifest or segment integrity failures
+# TYPE laminardb_cluster_subscription_integrity_failures_total counter
+laminardb_cluster_subscription_integrity_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_manifest_failures_total Committed-output manifest construction, loading, or validation failures
+# TYPE laminardb_cluster_subscription_manifest_failures_total counter
+laminardb_cluster_subscription_manifest_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_open_failures_total Failed committed cluster subscription open attempts
+# TYPE laminardb_cluster_subscription_open_failures_total counter
+laminardb_cluster_subscription_open_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_open_total Committed cluster subscription open attempts
+# TYPE laminardb_cluster_subscription_open_total counter
+laminardb_cluster_subscription_open_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_orphan_bytes Grace-held unreachable output bytes found by the latest orphan scan
+# TYPE laminardb_cluster_subscription_orphan_bytes gauge
+laminardb_cluster_subscription_orphan_bytes{pipeline="soak_join",instance="HomePC1"} 119052237
+# HELP laminardb_cluster_subscription_pending_bytes In-memory committed-output bytes awaiting checkpoint disposition
+# TYPE laminardb_cluster_subscription_pending_bytes gauge
+laminardb_cluster_subscription_pending_bytes{pipeline="soak_join",instance="HomePC1"} 4948224
+# HELP laminardb_cluster_subscription_replay_bytes_total Encoded bytes read during committed subscription replay
+# TYPE laminardb_cluster_subscription_replay_bytes_total counter
+laminardb_cluster_subscription_replay_bytes_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_replay_frames_total Frames read during committed subscription replay
+# TYPE laminardb_cluster_subscription_replay_frames_total counter
+laminardb_cluster_subscription_replay_frames_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_replay_pruned_total Replay opens rejected because their epoch was pruned
+# TYPE laminardb_cluster_subscription_replay_pruned_total counter
+laminardb_cluster_subscription_replay_pruned_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_retained_bytes Bytes reachable from the retained committed output-log suffix
+# TYPE laminardb_cluster_subscription_retained_bytes gauge
+laminardb_cluster_subscription_retained_bytes{pipeline="soak_join",instance="HomePC1"} 9453113
+# HELP laminardb_cluster_subscription_rows_committed_total Output rows made visible by authoritative checkpoint commits
+# TYPE laminardb_cluster_subscription_rows_committed_total counter
+laminardb_cluster_subscription_rows_committed_total{pipeline="soak_join",instance="HomePC1"} 828283
+# HELP laminardb_cluster_subscription_segment_write_failures_total Immutable committed-output segment writes that failed
+# TYPE laminardb_cluster_subscription_segment_write_failures_total counter
+laminardb_cluster_subscription_segment_write_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_segments_written_total Immutable committed-output segments written by this process
+# TYPE laminardb_cluster_subscription_segments_written_total counter
+laminardb_cluster_subscription_segments_written_total{pipeline="soak_join",instance="HomePC1"} 63
+# HELP laminardb_cluster_subscription_sequence_gaps_total Partition sequence continuity failures detected by writers or readers
+# TYPE laminardb_cluster_subscription_sequence_gaps_total counter
+laminardb_cluster_subscription_sequence_gaps_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cluster_subscription_stale_writer_rejections_total Fenced committed-output writer attempts rejected by this process
+# TYPE laminardb_cluster_subscription_stale_writer_rejections_total counter
+laminardb_cluster_subscription_stale_writer_rejections_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_coordinated_recoveries_total Leader-coordinated global restart-to-epoch rounds applied by this node
+# TYPE laminardb_coordinated_recoveries_total counter
+laminardb_coordinated_recoveries_total{pipeline="soak_join",instance="HomePC1"} 1
+# HELP laminardb_coordinated_recovery_failures_total Leader-coordinated recovery rounds abandoned (self-restore failed or quorum timed out)
+# TYPE laminardb_coordinated_recovery_failures_total counter
+laminardb_coordinated_recovery_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cycle_duration_seconds Normal processing-cycle duration (excludes checkpoint graph drains)
+# TYPE laminardb_cycle_duration_seconds histogram
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000001"} 0
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000005"} 0
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000001"} 0
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000005"} 0
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00001"} 0
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00005"} 0
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0001"} 486
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0005"} 1166
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 1406
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.005"} 1453
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.01"} 1456
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.05"} 1468
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.1"} 1468
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.5"} 1468
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1"} 1468
+laminardb_cycle_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_cycle_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.755805499999999
+laminardb_cycle_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 1468
+# HELP laminardb_cycle_execute_duration_seconds SQL operator-graph execution within successful normal processing cycles
+# TYPE laminardb_cycle_execute_duration_seconds histogram
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000001"} 0
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000005"} 0
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000001"} 0
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000005"} 0
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00001"} 0
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00005"} 0
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0001"} 531
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0005"} 1183
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 1415
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.005"} 1467
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.01"} 1468
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.05"} 1468
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.1"} 1468
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.5"} 1468
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1"} 1468
+laminardb_cycle_execute_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_cycle_execute_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.44217559999999956
+laminardb_cycle_execute_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 1468
+# HELP laminardb_cycle_output_store_duration_seconds Materialized-view and subscription-stream publication within successful normal processing cycles
+# TYPE laminardb_cycle_output_store_duration_seconds histogram
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000001"} 139
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000005"} 719
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000001"} 975
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000005"} 1424
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00001"} 1464
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00005"} 1467
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0001"} 1467
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0005"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.005"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.01"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.05"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.1"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.5"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1"} 1468
+laminardb_cycle_output_store_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_cycle_output_store_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.001967499999999995
+laminardb_cycle_output_store_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 1468
+# HELP laminardb_cycle_sink_enqueue_duration_seconds Sink publication preparation and command admission within successful normal processing cycles
+# TYPE laminardb_cycle_sink_enqueue_duration_seconds histogram
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000001"} 0
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0000005"} 0
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000001"} 0
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.000005"} 779
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00001"} 1136
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.00005"} 1450
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0001"} 1450
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.0005"} 1451
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.001"} 1452
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.005"} 1454
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.01"} 1456
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.05"} 1468
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.1"} 1468
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.5"} 1468
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1"} 1468
+laminardb_cycle_sink_enqueue_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_cycle_sink_enqueue_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0.29967029999999983
+laminardb_cycle_sink_enqueue_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 1468
+# HELP laminardb_cycles_backpressured_total Cycles skipped by backpressure
+# TYPE laminardb_cycles_backpressured_total counter
+laminardb_cycles_backpressured_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_cycles_total Normal processing cycles completed (excludes checkpoint graph drains)
+# TYPE laminardb_cycles_total counter
+laminardb_cycles_total{pipeline="soak_join",instance="HomePC1"} 1468
+# HELP laminardb_events_dropped_total Events dropped
+# TYPE laminardb_events_dropped_total counter
+laminardb_events_dropped_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_events_emitted_total Events emitted to streams
+# TYPE laminardb_events_emitted_total counter
+laminardb_events_emitted_total{pipeline="soak_join",instance="HomePC1"} 1227756
+# HELP laminardb_events_ingested_total Events ingested from sources
+# TYPE laminardb_events_ingested_total counter
+laminardb_events_ingested_total{pipeline="soak_join",instance="HomePC1"} 11186
+# HELP laminardb_events_null_timestamp_total Source rows dropped because the event-time column was null
+# TYPE laminardb_events_null_timestamp_total counter
+laminardb_events_null_timestamp_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_input_buf_bytes Per-stream input buffer bytes
+# TYPE laminardb_input_buf_bytes gauge
+laminardb_input_buf_bytes{stream="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="join_left",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="join_right",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_join",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_join_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_full",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_inner",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_left",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_right",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_temporal",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_temporal_load",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_temporal_probe",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_window_hop",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_window_session",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="soak_window_tumble",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="topology_live_downstream",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="topology_live_source",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_input_buf_bytes{stream="topology_live_stream",pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_bytes_written_total Bytes written to Kafka
+# TYPE laminardb_kafka_sink_bytes_written_total counter
+laminardb_kafka_sink_bytes_written_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_dlq_records_total Records routed to DLQ
+# TYPE laminardb_kafka_sink_dlq_records_total counter
+laminardb_kafka_sink_dlq_records_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_errors_total Kafka sink errors
+# TYPE laminardb_kafka_sink_errors_total counter
+laminardb_kafka_sink_errors_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_produce_latency_count Produce latency samples
+# TYPE laminardb_kafka_sink_produce_latency_count counter
+laminardb_kafka_sink_produce_latency_count{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_produce_latency_max_us Max produce delivery latency (us)
+# TYPE laminardb_kafka_sink_produce_latency_max_us gauge
+laminardb_kafka_sink_produce_latency_max_us{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_produce_latency_sum_us Sum of produce latencies (us)
+# TYPE laminardb_kafka_sink_produce_latency_sum_us counter
+laminardb_kafka_sink_produce_latency_sum_us{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_records_written_total Records written to Kafka
+# TYPE laminardb_kafka_sink_records_written_total counter
+laminardb_kafka_sink_records_written_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_sink_serialization_errors_total Serialization errors
+# TYPE laminardb_kafka_sink_serialization_errors_total counter
+laminardb_kafka_sink_serialization_errors_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_batches_polled_total Total batches polled from Kafka
+# TYPE laminardb_kafka_source_batches_polled_total counter
+laminardb_kafka_source_batches_polled_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_bytes_polled_total Total bytes polled from Kafka
+# TYPE laminardb_kafka_source_bytes_polled_total counter
+laminardb_kafka_source_bytes_polled_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_commit_failures_total Kafka broker progress commit failures
+# TYPE laminardb_kafka_source_commit_failures_total counter
+laminardb_kafka_source_commit_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_commits_total Total offset commits to Kafka
+# TYPE laminardb_kafka_source_commits_total counter
+laminardb_kafka_source_commits_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_errors_total Total Kafka consumer errors
+# TYPE laminardb_kafka_source_errors_total counter
+laminardb_kafka_source_errors_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_rebalances_total Total consumer group rebalances
+# TYPE laminardb_kafka_source_rebalances_total counter
+laminardb_kafka_source_rebalances_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_records_polled_total Total records polled from Kafka
+# TYPE laminardb_kafka_source_records_polled_total counter
+laminardb_kafka_source_records_polled_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_sr_discovery_failures_total Schema Registry discovery failures
+# TYPE laminardb_kafka_source_sr_discovery_failures_total counter
+laminardb_kafka_source_sr_discovery_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_sr_discovery_successes_total Schema Registry discovery successes
+# TYPE laminardb_kafka_source_sr_discovery_successes_total counter
+laminardb_kafka_source_sr_discovery_successes_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_kafka_source_sr_discovery_timeouts_total Schema Registry discovery timeouts
+# TYPE laminardb_kafka_source_sr_discovery_timeouts_total counter
+laminardb_kafka_source_sr_discovery_timeouts_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_managed_state_accounted_bytes Operator-reported retained-state charge; current aggregate values are lower bounds between checkpoint/lifecycle reconciliation and exclude hash buckets, nested/shared payloads, allocator overhead, and RSS
+# TYPE laminardb_managed_state_accounted_bytes gauge
+laminardb_managed_state_accounted_bytes{operator="soak_join",phase="live",pipeline="soak_join",instance="HomePC1"} 2281788
+laminardb_managed_state_accounted_bytes{operator="soak_join",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_join",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_join_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 430900
+laminardb_managed_state_accounted_bytes{operator="soak_join_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_join_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_full",phase="live",pipeline="soak_join",instance="HomePC1"} 18114
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_full",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_full",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_full_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 3590
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_full_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_full_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_inner",phase="live",pipeline="soak_join",instance="HomePC1"} 17856
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_inner",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_inner",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_inner_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 3590
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_inner_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_inner_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left",phase="live",pipeline="soak_join",instance="HomePC1"} 17985
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 3590
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_anti",phase="live",pipeline="soak_join",instance="HomePC1"} 16773
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_anti",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_anti",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_anti_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 1600
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_anti_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_anti_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_semi",phase="live",pipeline="soak_join",instance="HomePC1"} 16773
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_semi",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_semi",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_semi_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 1600
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_semi_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_left_semi_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right",phase="live",pipeline="soak_join",instance="HomePC1"} 17985
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 1600
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_anti",phase="live",pipeline="soak_join",instance="HomePC1"} 16773
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_anti",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_anti",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_anti_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 1600
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_anti_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_anti_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_semi",phase="live",pipeline="soak_join",instance="HomePC1"} 16773
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_semi",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_semi",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_semi_aggregate",phase="live",pipeline="soak_join",instance="HomePC1"} 1600
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_semi_aggregate",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_matrix_right_semi_aggregate",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_temporal",phase="live",pipeline="soak_join",instance="HomePC1"} 20013
+laminardb_managed_state_accounted_bytes{operator="soak_temporal",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_temporal",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_temporal_load",phase="live",pipeline="soak_join",instance="HomePC1"} 16223976
+laminardb_managed_state_accounted_bytes{operator="soak_temporal_load",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_temporal_load",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_temporal_probe",phase="live",pipeline="soak_join",instance="HomePC1"} 23278
+laminardb_managed_state_accounted_bytes{operator="soak_temporal_probe",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_temporal_probe",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_window_hop",phase="live",pipeline="soak_join",instance="HomePC1"} 3724
+laminardb_managed_state_accounted_bytes{operator="soak_window_hop",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_window_hop",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_window_session",phase="live",pipeline="soak_join",instance="HomePC1"} 3362
+laminardb_managed_state_accounted_bytes{operator="soak_window_session",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_window_session",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_window_tumble",phase="live",pipeline="soak_join",instance="HomePC1"} 2938
+laminardb_managed_state_accounted_bytes{operator="soak_window_tumble",phase="prepared",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_managed_state_accounted_bytes{operator="soak_window_tumble",phase="retired",pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_mv_bytes_stored Approximate MV bytes stored
+# TYPE laminardb_mv_bytes_stored gauge
+laminardb_mv_bytes_stored{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_mv_updates_total Materialized view updates
+# TYPE laminardb_mv_updates_total counter
+laminardb_mv_updates_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_operator_process_duration_seconds Operator processing duration by catalog operator and execution mode
+# TYPE laminardb_operator_process_duration_seconds histogram
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0001"} 643
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0004"} 688
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0016"} 703
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0064"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0256"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.1024"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.4096"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="1.6384"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="6.5536"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="26.2144"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="+Inf"} 706
+laminardb_operator_process_duration_seconds_sum{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1"} 0.04654499999999995
+laminardb_operator_process_duration_seconds_count{mode="checkpoint_drain",operator="soak_join",pipeline="soak_join",instance="HomePC1"} 706
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 445
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 643
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 713
+laminardb_operator_process_duration_seconds_sum{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1"} 0.10175250000000007
+laminardb_operator_process_duration_seconds_count{mode="checkpoint_drain",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0001"} 190
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0004"} 197
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0016"} 204
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0064"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0256"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.1024"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.4096"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="1.6384"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="6.5536"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="26.2144"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="+Inf"} 207
+laminardb_operator_process_duration_seconds_sum{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1"} 0.02182089999999999
+laminardb_operator_process_duration_seconds_count{mode="checkpoint_drain",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1"} 207
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0001"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0004"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0016"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0064"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0256"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.1024"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.4096"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="1.6384"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="6.5536"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="26.2144"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="+Inf"} 713
+laminardb_operator_process_duration_seconds_sum{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1"} 0.0010627000000000008
+laminardb_operator_process_duration_seconds_count{mode="checkpoint_drain",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1"} 713
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1"} 0.00022790000000000315
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="__positioned_source::temporal_left",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1"} 0.00024390000000000316
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="__positioned_source::temporal_load_left",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1"} 0.0002233000000000032
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="__positioned_source::temporal_load_right",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1"} 0.00021680000000000324
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="__positioned_source::temporal_right",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1"} 0.000820299999999998
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="join_left",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1"} 0.0003021000000000042
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="join_right",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1343
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1439
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1466
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1"} 0.07538310000000002
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_join",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1168
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1289
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1"} 0.13352860000000008
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_join_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1"} 0.003131699999999998
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_full",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1"} 0.0011553999999999983
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1"} 0.0021082999999999996
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_inner",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1"} 0.0008313999999999983
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1"} 0.0019488999999999995
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_left",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1"} 0.000773299999999998
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1"} 0.0020059
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 0.0007707999999999978
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1"} 0.001862499999999999
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 0.000707599999999999
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1"} 0.00023720000000000333
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1"} 0.00022010000000000343
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1"} 0.0019213999999999972
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_right",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1"} 0.0006951999999999976
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1"} 0.0018458999999999982
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 0.0006859999999999992
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1"} 0.001811299999999999
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 0.0006501999999999995
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1"} 0.0028634000000000034
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_temporal",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1441
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1454
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1463
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1"} 0.03929350000000017
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_temporal_load",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1"} 0.0011550999999999994
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_temporal_probe",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1"} 0.002853600000000001
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_window_hop",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1"} 0.0010012999999999984
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_window_session",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1"} 0.0008324999999999977
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="soak_window_tumble",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1467
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1"} 0.0015508999999999974
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="topology_live_downstream",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1"} 0.00022280000000000317
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="topology_live_source",pipeline="soak_join",instance="HomePC1"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="0.0001"} 1467
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="0.0004"} 1467
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="0.0016"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="0.0064"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="0.0256"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="0.1024"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="0.4096"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="1.6384"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="6.5536"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="26.2144"} 1468
+laminardb_operator_process_duration_seconds_bucket{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1",le="+Inf"} 1468
+laminardb_operator_process_duration_seconds_sum{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1"} 0.002620199999999989
+laminardb_operator_process_duration_seconds_count{mode="normal",operator="topology_live_stream",pipeline="soak_join",instance="HomePC1"} 1468
+# HELP laminardb_pipeline_cycle_errors_total Fatal cycle errors dropped-and-continued under at-least-once delivery
+# TYPE laminardb_pipeline_cycle_errors_total counter
+laminardb_pipeline_cycle_errors_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_pipeline_faults_total Compute-thread crashes that faulted the pipeline
+# TYPE laminardb_pipeline_faults_total counter
+laminardb_pipeline_faults_total{pipeline="soak_join",instance="HomePC1"} 1
+# HELP laminardb_pipeline_restarts_total Automatic recover-from-checkpoint restarts after a pipeline fault
+# TYPE laminardb_pipeline_restarts_total counter
+laminardb_pipeline_restarts_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_pipeline_watermark Global pipeline watermark
+# TYPE laminardb_pipeline_watermark gauge
+laminardb_pipeline_watermark{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_placement_blast_radius_ratio Largest single domain's share of all vnodes (0-1); state affected if it fails
+# TYPE laminardb_placement_blast_radius_ratio gauge
+laminardb_placement_blast_radius_ratio{pipeline="soak_join",instance="HomePC1"} 1
+# HELP laminardb_placement_vnodes_per_domain Vnodes owned per failure domain (cluster mode)
+# TYPE laminardb_placement_vnodes_per_domain gauge
+laminardb_placement_vnodes_per_domain{domain="unknown",pipeline="soak_join",instance="HomePC1"} 64
+# HELP laminardb_queries_cached_plan_total Queries using cached logical plan
+# TYPE laminardb_queries_cached_plan_total counter
+laminardb_queries_cached_plan_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_queries_compiled_total Queries using compiled PhysicalExpr
+# TYPE laminardb_queries_compiled_total counter
+laminardb_queries_compiled_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_reload_total Config reload count
+# TYPE laminardb_reload_total counter
+laminardb_reload_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_shuffle_delivery_loss_incidents_total Cross-node shuffle delivery-loss incidents (fences the epoch, forces replay)
+# TYPE laminardb_shuffle_delivery_loss_incidents_total counter
+laminardb_shuffle_delivery_loss_incidents_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_sink_precommit_duration_seconds Sink pre-commit latency
+# TYPE laminardb_sink_precommit_duration_seconds histogram
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.005"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.01"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.02"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.04"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.08"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.16"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.32"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="0.64"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="1.28"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="2.56"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="5.12"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="10.24"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="20.48"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="40.96"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="81.92"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="163.84"} 0
+laminardb_sink_precommit_duration_seconds_bucket{pipeline="soak_join",instance="HomePC1",le="+Inf"} 0
+laminardb_sink_precommit_duration_seconds_sum{pipeline="soak_join",instance="HomePC1"} 0
+laminardb_sink_precommit_duration_seconds_count{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_sink_task_channel_closed_total Sink task channel closed
+# TYPE laminardb_sink_task_channel_closed_total counter
+laminardb_sink_task_channel_closed_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_sink_write_failures_total Sink write errors
+# TYPE laminardb_sink_write_failures_total counter
+laminardb_sink_write_failures_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_sink_write_timeouts_total Sink write timeouts
+# TYPE laminardb_sink_write_timeouts_total counter
+laminardb_sink_write_timeouts_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_source_idle 1 if source idle (excluded from watermark min)
+# TYPE laminardb_source_idle gauge
+laminardb_source_idle{source="join_left",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_source_idle{source="join_right",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_source_idle{source="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1"} 1
+laminardb_source_idle{source="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1"} 1
+laminardb_source_idle{source="temporal_left",pipeline="soak_join",instance="HomePC1"} 1
+laminardb_source_idle{source="temporal_load_left",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_source_idle{source="temporal_load_right",pipeline="soak_join",instance="HomePC1"} 0
+laminardb_source_idle{source="temporal_right",pipeline="soak_join",instance="HomePC1"} 1
+# HELP laminardb_source_watermark_ms Per-source watermark (epoch-ms)
+# TYPE laminardb_source_watermark_ms gauge
+laminardb_source_watermark_ms{source="join_left",pipeline="soak_join",instance="HomePC1"} 1791088058539
+laminardb_source_watermark_ms{source="join_right",pipeline="soak_join",instance="HomePC1"} 1791088058552
+laminardb_source_watermark_ms{source="temporal_load_left",pipeline="soak_join",instance="HomePC1"} 1791088058544
+laminardb_source_watermark_ms{source="temporal_load_right",pipeline="soak_join",instance="HomePC1"} 1791088058539
+# HELP laminardb_stream_watermark_ms Per-stream watermark (epoch-ms)
+# TYPE laminardb_stream_watermark_ms gauge
+laminardb_stream_watermark_ms{stream="join_left",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="join_right",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="soak_join",pipeline="soak_join",instance="HomePC1"} 1791088058392
+laminardb_stream_watermark_ms{stream="soak_join_aggregate",pipeline="soak_join",instance="HomePC1"} 1791088058392
+laminardb_stream_watermark_ms{stream="soak_matrix_full",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_full_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_inner",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_inner_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_left",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_left_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_left_anti",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_left_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_left_semi",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_left_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_lhs",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="soak_matrix_rhs",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="soak_matrix_right",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_right_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432161
+laminardb_stream_watermark_ms{stream="soak_matrix_right_anti",pipeline="soak_join",instance="HomePC1"} 1791091432261
+laminardb_stream_watermark_ms{stream="soak_matrix_right_anti_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432261
+laminardb_stream_watermark_ms{stream="soak_matrix_right_semi",pipeline="soak_join",instance="HomePC1"} 1791091432261
+laminardb_stream_watermark_ms{stream="soak_matrix_right_semi_aggregate",pipeline="soak_join",instance="HomePC1"} 1791091432261
+laminardb_stream_watermark_ms{stream="soak_temporal",pipeline="soak_join",instance="HomePC1"} 1791091438910
+laminardb_stream_watermark_ms{stream="soak_temporal_load",pipeline="soak_join",instance="HomePC1"} 1791088056799
+laminardb_stream_watermark_ms{stream="soak_temporal_probe",pipeline="soak_join",instance="HomePC1"} 1791091434910
+laminardb_stream_watermark_ms{stream="soak_window_hop",pipeline="soak_join",instance="HomePC1"} 1791091432261
+laminardb_stream_watermark_ms{stream="soak_window_session",pipeline="soak_join",instance="HomePC1"} 1791091432261
+laminardb_stream_watermark_ms{stream="soak_window_tumble",pipeline="soak_join",instance="HomePC1"} 1791091432261
+laminardb_stream_watermark_ms{stream="temporal_left",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="temporal_load_left",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="temporal_load_right",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="temporal_right",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="topology_live_downstream",pipeline="soak_join",instance="HomePC1"} 1791088058392
+laminardb_stream_watermark_ms{stream="topology_live_source",pipeline="soak_join",instance="HomePC1"} 1791088057699
+laminardb_stream_watermark_ms{stream="topology_live_stream",pipeline="soak_join",instance="HomePC1"} 1791088057699
+# HELP laminardb_temporal_filter_buffered Rows buffered by retracting temporal-filter operators
+# TYPE laminardb_temporal_filter_buffered gauge
+laminardb_temporal_filter_buffered{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_temporal_filter_dropped_total Rows dropped un-emitted by temporal-filter operators
+# TYPE laminardb_temporal_filter_dropped_total counter
+laminardb_temporal_filter_dropped_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_temporal_filter_inserts_total Z-set inserts emitted by temporal-filter operators
+# TYPE laminardb_temporal_filter_inserts_total counter
+laminardb_temporal_filter_inserts_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_temporal_filter_retracts_total Z-set retractions emitted by temporal-filter operators
+# TYPE laminardb_temporal_filter_retracts_total counter
+laminardb_temporal_filter_retracts_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_uptime_seconds Server uptime in seconds
+# TYPE laminardb_uptime_seconds gauge
+laminardb_uptime_seconds{pipeline="soak_join",instance="HomePC1"} 122
+# HELP laminardb_window_late_dropped_total Window assignments dropped past allowed_lateness
+# TYPE laminardb_window_late_dropped_total counter
+laminardb_window_late_dropped_total{pipeline="soak_join",instance="HomePC1"} 0
+# HELP laminardb_ws_connections Active WebSocket connections
+# TYPE laminardb_ws_connections gauge
+laminardb_ws_connections{pipeline="soak_join",instance="HomePC1"} 0

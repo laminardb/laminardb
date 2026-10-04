@@ -1,0 +1,46 @@
+{
+  "recorded_utc": "2026-10-04T04:30:12.726087+00:00",
+  "run_id": "595380-1791087891925836500",
+  "test": "three_node_alo_public_topology_migration_restart_soak",
+  "test_exit_code": 101,
+  "test_elapsed_seconds": 261.5,
+  "requested_kills": 3,
+  "compiler_idle": true,
+  "server_sha256": "54e3a3d2ddb2927bfbc664c8ef522d84c0809b0d2d89664dcc3d193ac8c392e0",
+  "harness_sha256": "cbdf3983b4f0b7c14eeb9e7d56a02d22010476098722f2a132a06375ad11d113",
+  "max_sampled_combined_rss_bytes": 617013248,
+  "copied_phase_evidence": [
+    {
+      "file": "attempt-17-public-topology-2-active.json",
+      "sha256": "e24e62c8ae90d52bb8b717ec8ada9afb50b0c8aaf3e0c9d7a5852c3e2bedffa5"
+    },
+    {
+      "file": "attempt-17-public-topology-2-submission-phase-observations.json",
+      "sha256": "e187c9a8f97985e3478c3c756602faf6e5a66fc86a0110d7f24498ca1b4c80f3"
+    },
+    {
+      "file": "attempt-17-public-topology-3-active.json",
+      "sha256": "4b12f9c7da9a104fa515f84197a553e79cd36bc5f7aacd644e11f140de2863f8"
+    },
+    {
+      "file": "attempt-17-public-topology-3-kill-1-phase-observations.json",
+      "sha256": "3fd9cadff4bc8e1fe747b512cc872c2e9a21a402ce3f49019f9c96eb4f8988c2"
+    },
+    {
+      "file": "attempt-17-public-topology-3-submission-phase-observations.json",
+      "sha256": "b68243bdf2f417fbbf8c18db414bc3715f30b80340ec951d8bf39c80481c42ee"
+    },
+    {
+      "file": "attempt-17-public-topology-kill-1.json",
+      "sha256": "a5f26cba605acc605d7d55869ffbaa5b7d04ba017a51f5c5eace395700b7726b"
+    },
+    {
+      "file": "attempt-17-public-topology-observations.json",
+      "sha256": "76b9a0b1c625bc07994ed50aa824754939bef109df9feb9b03f6ca16978c73eb"
+    }
+  ],
+  "passing_final_oracles": false,
+  "allocation_events": null,
+  "queue_depth": null,
+  "scope": "Original public topology harness and its unchanged final stateful, sink and sequence oracles. Failures remain failures; completed zero-kill cold recovery and repeated kills are separately identified."
+}

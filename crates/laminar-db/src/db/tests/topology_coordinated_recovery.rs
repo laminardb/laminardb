@@ -465,6 +465,135 @@ async fn topology_coordinated_recovery_cold_target_checkpoint_keeps_exact_newer_
 }
 
 #[tokio::test]
+async fn topology_coordinated_recovery_older_assignment_installs_exact_root_and_target_cut() {
+    diagnostics();
+    for target_checkpoint in [false, true] {
+        let (fixture, operation) = if target_checkpoint {
+            let (fixture, operation, _) =
+                Box::pin(super::super::super::recovery::checkpointed()).await;
+            (fixture, operation)
+        } else {
+            let (fixture, committed) = committed_fixture().await;
+            (fixture, committed.operation_id)
+        };
+        super::super::super::recovery::advance_decode_assignment(&fixture, operation).await;
+        let selected = fixture
+            .authority
+            .controller
+            .committed_topology_recovery_input(operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            selected
+                .checkpoint()
+                .assignment_fence
+                .as_ref()
+                .unwrap()
+                .assignment_version,
+            1
+        );
+        assert_eq!(selected.migration().assignment().assignment_version, 2);
+        fixture
+            .authority
+            .controller
+            .start_leased_barrier_server(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                fixture.process_lease.as_ref().unwrap(),
+            )
+            .await
+            .unwrap();
+        let probe = enable_runtime(&fixture);
+        fixture.db.fence_coordinated_recovery_lifecycle();
+        fixture.authority.controller.set_recovering(true);
+        fixture
+            .db
+            .stop_pipeline_for_coordinated_recovery()
+            .await
+            .unwrap();
+        assert!(fixture
+            .db
+            .prepare_committed_cluster_topology_startup()
+            .await
+            .unwrap());
+        assert!(probe.starts.lock().is_empty());
+        assert!(probe.output.lock().is_empty());
+        probe.block_start.store(true, Ordering::Release);
+        fixture.db.enable_coordinated_recovery().unwrap();
+        held_start(&fixture, &probe, 0).await;
+        enqueue(
+            &probe,
+            if target_checkpoint { 6 } else { 3 },
+            if target_checkpoint { 94 } else { 91 },
+            if target_checkpoint { &[2] } else { &[1] },
+        );
+        released(&fixture).await;
+        outputs(&probe, if target_checkpoint { 60 } else { 45 }).await;
+        let binding = fixture
+            .db
+            .installed_topology_runtime
+            .lock()
+            .clone()
+            .unwrap();
+        let recovery = binding.recovery.as_ref().unwrap();
+        assert_eq!(recovery.selection.checkpoint(), selected.checkpoint());
+        assert_eq!(recovery.selection.outcome(), selected.outcome());
+        assert_eq!(binding.input.assignment().assignment_version, 2);
+        fixture
+            .db
+            .ensure_topology_runtime_live(&binding.input, Some(&recovery.selection))
+            .await
+            .unwrap();
+        if target_checkpoint {
+            assert!(fixture
+                .db
+                .ensure_topology_runtime_live(&binding.input, None)
+                .await
+                .is_err());
+        }
+        {
+            let coordinator = fixture.db.coordinator.lock().await;
+            let coordinator = coordinator.as_ref().unwrap();
+            assert_eq!(
+                coordinator.last_committed_ref(),
+                selected.outcome().committed_checkpoint.as_ref()
+            );
+            assert!(
+                coordinator.last_committed_manifest().is_none(),
+                "historical participant manifests must not be relabelled as the new assignment"
+            );
+        }
+        assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 1);
+        fixture.db.checkpoint().await.unwrap();
+        let next = fixture
+            .authority
+            .controller
+            .committed_topology_recovery_input(operation)
+            .await
+            .unwrap();
+        assert!(next.checkpoint().epoch > selected.checkpoint().epoch);
+        assert_eq!(
+            next.checkpoint().predecessor.as_ref(),
+            selected.outcome().committed_checkpoint.as_ref()
+        );
+        assert_eq!(
+            next.checkpoint()
+                .assignment_fence
+                .as_ref()
+                .unwrap()
+                .assignment_version,
+            2
+        );
+        fixture
+            .db
+            .ensure_topology_runtime_live(&binding.input, Some(&recovery.selection))
+            .await
+            .unwrap();
+        fixture.db.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn topology_coordinated_recovery_cold_missing_deployment_never_recreates_identity() {
     let (fixture, committed) = committed_fixture().await;
     let probe = enable_runtime(&fixture);

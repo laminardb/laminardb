@@ -70,7 +70,6 @@ impl CheckpointCoordinator {
             || self.assignment_version != input.assignment().assignment_version
             || self.owned_vnodes != input.owned_vnodes()
             || self.store.participant_id() != input.process().participant.node_id
-            || recovered.reassigned
             || &recovered.outcome != input.outcome()
             || &recovered.committed != input.checkpoint()
             || recovered.committed.pipeline_identity != input.descriptor().parent_pipeline
@@ -81,6 +80,7 @@ impl CheckpointCoordinator {
         {
             return Err(DbError::Checkpoint("target coordinator requires the exact committed migration-root predecessor and current ownership".into()));
         }
+        recovered.validate_topology_assignment(input)?;
         self.install_recovered_metadata(input.outcome(), input.checkpoint(), recovered)
     }
 
@@ -106,7 +106,6 @@ impl CheckpointCoordinator {
         if !fresh.same_restore_requirements(selection)
             || &recovered.outcome != selection.outcome()
             || &recovered.committed != selection.checkpoint()
-            || recovered.reassigned
         {
             return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
         }
@@ -126,6 +125,7 @@ impl CheckpointCoordinator {
         {
             return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
         }
+        recovered.validate_topology_assignment(input)?;
         self.continue_recovered_sinks_until(
             selection.outcome(),
             selection.checkpoint(),

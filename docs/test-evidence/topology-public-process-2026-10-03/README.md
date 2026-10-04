@@ -1,5 +1,50 @@
 # Public three-process migration qualification
 
+Attempt 15 passes public adoption, both additive migrations, a complete cold
+restart with the original bootstrap, and all independent final stateful, sink
+and sequence oracles. The stock server is `54e3a3d2...`; its exact frozen nine-source
+identity, unchanged Cargo.lock/profile and Windows PE stack are recorded in
+`public-soak-15-binary-identity.json`. The retained harness is `cbdf3983...`, with
+unchanged final oracles and production library dependencies at `4cfcb2cd`.
+
+The run passed after 280.45 seconds with idle compilers and zero extra kills.
+Target epochs advanced through 18 and 22 before the whole restart. Every cold
+replacement used the same node slot and acquired a new process identity.
+Recovery consumed a fresh full-roster Release and produced nine expected new
+logical pairs; cold restart to fresh output took 48,421 ms. The original Active
+receipts remained immutable. Final authority and checkpoint bytes were verified
+against their exact SHA-256 and encoded lengths by the read-only collector.
+
+The second cut's consumer delay includes the deliberate two-second checkpoint
+hold: nine observations yield nearest-rank p50 361.56 ms and p95/p99 18,444.08 ms.
+Sampled combined server RSS peaked at 749,150,208 bytes. These small observations
+are not a production latency distribution. Allocations and queue depth were not
+profiled. `portable-installation-verification-summary.json` binds 284 focused and
+4,471 full tests, three existing ignored tests, Clippy with warnings denied, the
+minimal server check and the stock build. The 42-test fault index records the
+deterministic library boundaries separately from native process failures.
+
+Attempt 16 failed before topology submission or injected kills: creation of its
+new input topic exceeded the retained Kafka fixture's 1,000-partition limit.
+The raw broker rejection and verified adjustment to 2,000 are recorded in
+`attempt-16-fixture-capacity.json`. The task-owned fixture retains its 4 GiB,
+one-shard configuration, all historical topics and its original volume. The
+failed result is retained; a retry uses the same server and harness.
+
+Attempt 17 passed both public migrations and the first leader replacement,
+resuming target checkpoint 36 after 43.86 seconds. The second injected follower
+failure triggered automatic assignment recovery to two survivors while the
+replacement boot was arriving. Final authority sequence 334 retains that
+assignment-3 handoff pin and exact checkpoint-38 reference. The topology recovery
+owner-completeness check correctly refused the reduced map; the existing
+90-second Release ceiling expired and the test failed after 261.50 seconds.
+The third kill, final cold restart and final stateful/sink/sequence oracles were
+not reached. This identifies assignment admission as the next repair, rather
+than granting survivor rescaling through a recovery identity bypass.
+
+Earlier attempts below describe the independently observed defects and their
+repair history; their failures remain part of the evidence.
+
 Attempt 09 completed public adoption and both additive migrations on the existing
 Kafka/S3 stateful soak. It failed after killing the leader, before replacement or
 full restart. This is partial evidence, not a passing end-to-end qualification.

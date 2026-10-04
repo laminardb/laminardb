@@ -388,23 +388,90 @@ async fn topology_recovery_image_corrupt_target_state_never_loads_valid_parent_r
     assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
 }
 
-async fn advance_decode_assignment(fixture: &Fixture) {
-    use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
+pub(super) async fn advance_decode_assignment(
+    fixture: &Fixture,
+    operation: laminar_core::cluster::control::TopologyOperationId,
+) {
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, AssignmentSnapshotStore, RotateOutcome,
+    };
 
-    // The storage-only fixture preserves the complete owner map and process roster. Native
-    // cold-restart tests separately exercise fenced process takeover and assignment decisions.
+    // Preserve the complete owner map and process roster through an authority-settled drain
+    // Commit. The actor recovery monitor audits this successor edge; a storage-only version
+    // increment would correctly lose Prepare ownership before selecting a checkpoint.
+    let input = fixture
+        .authority
+        .controller
+        .committed_topology_restore_input(operation)
+        .await
+        .unwrap();
+    if input.operation().phase != laminar_core::cluster::control::TopologyAdmissionPhase::Active {
+        fixture
+            .authority
+            .controller
+            .certify_topology_installation(&input, uuid::Uuid::from_u128(808))
+            .await
+            .unwrap();
+        let fresh = fixture
+            .authority
+            .controller
+            .committed_topology_restore_input(operation)
+            .await
+            .unwrap();
+        fixture
+            .authority
+            .controller
+            .release_topology_target(&fresh)
+            .await
+            .unwrap();
+    }
     let assignments = AssignmentSnapshotStore::new(Arc::clone(&fixture.authority.checkpoint_store));
     let prior = assignments.load().await.unwrap().unwrap();
-    let next = prior
-        .next_for_participants(prior.vnodes.clone(), prior.participants.clone())
+    let proof = fixture.authority.controller.capture_leader_proof().unwrap();
+    let draining = prior
+        .next_draining(
+            prior.vnodes.clone(),
+            prior.participants.clone(),
+            proof.clone(),
+        )
         .unwrap();
     assert!(matches!(
         assignments
-            .save_if_version(&next, prior.version)
+            .save_if_version(&draining, prior.version)
             .await
             .unwrap(),
         RotateOutcome::Rotated
     ));
+    let checkpoint = fixture
+        .authority
+        .lease_store
+        .highest_cluster_committed_outcome()
+        .await
+        .unwrap()
+        .unwrap()
+        .committed_checkpoint
+        .unwrap();
+    let decision = AssignmentDrainDecision::commit(
+        draining.drain_transition.as_ref().unwrap(),
+        proof.clone(),
+        checkpoint,
+    )
+    .unwrap();
+    fixture
+        .authority
+        .lease_store
+        .record_assignment_drain_decision(&proof, decision)
+        .await
+        .unwrap();
+    let next = draining.committed_target().unwrap();
+    assignments.finalize_drain(&draining, &next).await.unwrap();
+    crate::rebalance::audit_assignment_snapshot_authority(
+        &assignments,
+        Some(&fixture.authority.controller),
+        &next,
+    )
+    .await
+    .unwrap();
     let fence = next.assignment_fence().unwrap();
     let registry = fixture.db.vnode_registry.lock().clone().unwrap();
     let owners = registry.versioned_snapshot().owners().to_vec();
@@ -455,7 +522,7 @@ async fn topology_recovery_older_assignment_uses_checkpoint_bootstrap_without_re
             let (fixture, committed) = committed_fixture().await;
             (fixture, committed.operation_id)
         };
-        advance_decode_assignment(&fixture).await;
+        advance_decode_assignment(&fixture, operation).await;
         let selected = fixture
             .authority
             .controller
@@ -492,6 +559,50 @@ async fn topology_recovery_older_assignment_uses_checkpoint_bootstrap_without_re
         );
         assert_eq!(recovered.committed, *selected.checkpoint());
         assert_eq!(recovered.target_vnodes, selected.migration().owned_vnodes());
+        recovered
+            .validate_topology_assignment(selected.migration())
+            .unwrap();
+        for case in 0..7 {
+            let mut incompatible = recovered.clone();
+            match case {
+                0 => incompatible.reassigned = false,
+                1 => incompatible.committed.reassignment_portable = false,
+                2 => incompatible.predecessor_owners[0] = NodeId(2),
+                3 => {
+                    incompatible.target_vnodes.pop();
+                }
+                4 => {
+                    incompatible
+                        .committed
+                        .assignment_fence
+                        .as_mut()
+                        .unwrap()
+                        .assignment_version = 3;
+                }
+                5 => {
+                    incompatible
+                        .committed
+                        .assignment_fence
+                        .as_mut()
+                        .unwrap()
+                        .participants[0]
+                        .node_id = 2;
+                }
+                6 => {
+                    incompatible
+                        .committed
+                        .assignment_fence
+                        .as_mut()
+                        .unwrap()
+                        .assignment_digest[0] ^= 0xff;
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                incompatible.validate_topology_assignment(selected.migration()),
+                Err(DbError::Topology(TopologyError::Fenced))
+            ));
+        }
         let mut image = fixture
             .db
             .prepare_cluster_topology_recovery(operation)

@@ -1,0 +1,329 @@
+{
+  "operation_id": "81c092de-aaf0-4ad4-bd0f-a1efc919461c",
+  "plan": {
+    "sha256": "de9d304df1de0907fa24159805ce38a337d5ee4ea8224ae5635ea1921147b3c0",
+    "encoded_len": 1010
+  },
+  "admitted_by": {
+    "owner": {
+      "node_id": 12632117528189947522,
+      "boot_id": "44ce15a5-48c3-4406-8463-2cbea6d01fb2",
+      "process_term": 1
+    },
+    "fencing_token": 2
+  },
+  "admitted_sequence": 175,
+  "status_sequence": 204,
+  "state": {
+    "phase": "active"
+  },
+  "cut": {
+    "inventory": {
+      "deployment_id": "01a10528-8946-7266-b364-5c1f403c4b1a",
+      "pipeline_identity": {
+        "canonical_version": 7,
+        "sha256": "08b381a98b2c76b378926da97fcee3f461bbba617a4d49c9aa24c5590ffad08f"
+      },
+      "attempt": {
+        "epoch": 27,
+        "checkpoint_id": 27
+      },
+      "assignment_fence": {
+        "assignment_version": 1,
+        "partitioning_abi_version": 2,
+        "vnode_count": 64,
+        "assignment_digest": [
+          4,
+          129,
+          37,
+          184,
+          28,
+          193,
+          137,
+          119,
+          42,
+          153,
+          19,
+          91,
+          95,
+          41,
+          14,
+          107,
+          74,
+          116,
+          175,
+          189,
+          101,
+          148,
+          200,
+          56,
+          194,
+          6,
+          158,
+          183,
+          203,
+          130,
+          105,
+          203
+        ],
+        "participants": [
+          {
+            "node_id": 12632117528189947522,
+            "boot_incarnation": "44ce15a5-48c3-4406-8463-2cbea6d01fb2"
+          },
+          {
+            "node_id": 15506916534570490772,
+            "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3"
+          },
+          {
+            "node_id": 16059159448129433833,
+            "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948"
+          }
+        ]
+      }
+    },
+    "bound_sequence": 181,
+    "committed": {
+      "checkpoint": {
+        "epoch": 27,
+        "checkpoint_id": 27,
+        "sha256": "f434884679a9f72e9d4a885160c0cc939df266f8247bc1e3efadf77fb08685b2",
+        "len": 58875
+      },
+      "authority_sequence": 183
+    },
+    "completed_participants": [
+      {
+        "node_id": 12632117528189947522,
+        "boot_incarnation": "44ce15a5-48c3-4406-8463-2cbea6d01fb2"
+      },
+      {
+        "node_id": 15506916534570490772,
+        "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3"
+      },
+      {
+        "node_id": 16059159448129433833,
+        "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948"
+      }
+    ]
+  },
+  "preparation": {
+    "compatibility": {
+      "sha256": "478f9f1745a3518159f47187239b886fe7378ebef0832d96c23914394c89fafc",
+      "encoded_len": 23593
+    },
+    "certificates": [
+      {
+        "participant": {
+          "node_id": 12632117528189947522,
+          "boot_incarnation": "44ce15a5-48c3-4406-8463-2cbea6d01fb2"
+        },
+        "process_term": 1,
+        "protocol_version": 6,
+        "authority_sequence": 180
+      },
+      {
+        "participant": {
+          "node_id": 15506916534570490772,
+          "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3"
+        },
+        "process_term": 1,
+        "protocol_version": 6,
+        "authority_sequence": 178
+      },
+      {
+        "participant": {
+          "node_id": 16059159448129433833,
+          "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948"
+        },
+        "process_term": 1,
+        "protocol_version": 6,
+        "authority_sequence": 179
+      }
+    ],
+    "complete_sequence": 180
+  },
+  "migration_root": {
+    "root": {
+      "sha256": "28a613192293a8f4a4b5540f2f408149c30f0294849076a0d5e48eb769b6b788",
+      "encoded_len": 51760
+    },
+    "authority_sequence": 189
+  },
+  "target_preparations": [
+    {
+      "participant": {
+        "node_id": 12632117528189947522,
+        "boot_incarnation": "44ce15a5-48c3-4406-8463-2cbea6d01fb2"
+      },
+      "process_term": 1,
+      "protocol_version": 4,
+      "authority_sequence": 191
+    },
+    {
+      "participant": {
+        "node_id": 15506916534570490772,
+        "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3"
+      },
+      "process_term": 1,
+      "protocol_version": 4,
+      "authority_sequence": 193
+    },
+    {
+      "participant": {
+        "node_id": 16059159448129433833,
+        "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948"
+      },
+      "process_term": 1,
+      "protocol_version": 4,
+      "authority_sequence": 194
+    }
+  ],
+  "commit": {
+    "protocol_version": 4,
+    "operation_id": "81c092de-aaf0-4ad4-bd0f-a1efc919461c",
+    "parent_version": 1,
+    "parent_manifest": {
+      "version": 1,
+      "sha256": "747c1b2c510b3e6a84d1955b3e2505df1c4bcebe2f22c402ef7448133fa94a40",
+      "encoded_len": 18119,
+      "entry_count": 47
+    },
+    "topology_version": 2,
+    "manifest": {
+      "version": 1,
+      "sha256": "047a3b3c050830977c3f2f506bae02acd181e84e00a91dbea6f0382766f7bc10",
+      "encoded_len": 18894,
+      "entry_count": 50
+    },
+    "authority_sequence": 195
+  },
+  "activation": {
+    "leader": {
+      "owner": {
+        "node_id": 12632117528189947522,
+        "boot_id": "44ce15a5-48c3-4406-8463-2cbea6d01fb2",
+        "process_term": 1
+      },
+      "fencing_token": 2
+    },
+    "assignment": {
+      "assignment_version": 1,
+      "partitioning_abi_version": 2,
+      "vnode_count": 64,
+      "assignment_digest": [
+        4,
+        129,
+        37,
+        184,
+        28,
+        193,
+        137,
+        119,
+        42,
+        153,
+        19,
+        91,
+        95,
+        41,
+        14,
+        107,
+        74,
+        116,
+        175,
+        189,
+        101,
+        148,
+        200,
+        56,
+        194,
+        6,
+        158,
+        183,
+        203,
+        130,
+        105,
+        203
+      ],
+      "participants": [
+        {
+          "node_id": 12632117528189947522,
+          "boot_incarnation": "44ce15a5-48c3-4406-8463-2cbea6d01fb2"
+        },
+        {
+          "node_id": 15506916534570490772,
+          "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3"
+        },
+        {
+          "node_id": 16059159448129433833,
+          "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948"
+        }
+      ]
+    },
+    "processes": [
+      {
+        "participant": {
+          "node_id": 12632117528189947522,
+          "boot_incarnation": "44ce15a5-48c3-4406-8463-2cbea6d01fb2"
+        },
+        "process_term": 1
+      },
+      {
+        "participant": {
+          "node_id": 15506916534570490772,
+          "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3"
+        },
+        "process_term": 1
+      },
+      {
+        "participant": {
+          "node_id": 16059159448129433833,
+          "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948"
+        },
+        "process_term": 1
+      }
+    ],
+    "authority_sequence": 198,
+    "installations": [
+      {
+        "process": {
+          "participant": {
+            "node_id": 12632117528189947522,
+            "boot_incarnation": "44ce15a5-48c3-4406-8463-2cbea6d01fb2"
+          },
+          "process_term": 1
+        },
+        "runtime_id": "6380a8bb-ae0a-494c-a278-276476eb01b6",
+        "protocol_version": 5,
+        "authority_sequence": 198
+      },
+      {
+        "process": {
+          "participant": {
+            "node_id": 15506916534570490772,
+            "boot_incarnation": "7e0fbf52-8de9-44c4-8a53-0b60c1fb04a3"
+          },
+          "process_term": 1
+        },
+        "runtime_id": "e95d3429-953e-4233-bbe0-80173a562bef",
+        "protocol_version": 5,
+        "authority_sequence": 201
+      },
+      {
+        "process": {
+          "participant": {
+            "node_id": 16059159448129433833,
+            "boot_incarnation": "d4194950-2b26-4167-b87a-d21daf81f948"
+          },
+          "process_term": 1
+        },
+        "runtime_id": "5f51d933-ec99-4f97-b984-d60de549ee8a",
+        "protocol_version": 5,
+        "authority_sequence": 202
+      }
+    ],
+    "release": {
+      "authority_sequence": 204
+    }
+  }
+}

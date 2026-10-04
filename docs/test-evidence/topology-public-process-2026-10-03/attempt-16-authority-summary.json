@@ -1,0 +1,18 @@
+{
+  "run_id": "548536-1791087728261756100",
+  "head": {
+    "version": 1,
+    "sequence": 247,
+    "nonce": "0f5056bb-595d-4fa0-9aec-7f12873cdc1f"
+  },
+  "authority_record_sha256": "9c9688302d6c2b6becb179af145563d8b4efb4bd245f135a48ca552e3797a819",
+  "commit_head": {
+    "sequence": 242,
+    "epoch": 38,
+    "checkpoint_id": 38
+  },
+  "assignment_handoff_pin": null,
+  "recovery_release_head": null,
+  "recovery_request": null,
+  "topology_operations": null
+}

@@ -1,0 +1,33 @@
+{
+  "run_id": "595380-1791087891925836500",
+  "classes": {
+    "other": {
+      "objects": 32,
+      "bytes": 19125
+    },
+    "committed_indexes": {
+      "objects": 13,
+      "bytes": 720077
+    },
+    "control_authority": {
+      "objects": 248,
+      "bytes": 967013
+    },
+    "state_objects": {
+      "objects": 45,
+      "bytes": 196699595
+    },
+    "participant_manifests": {
+      "objects": 39,
+      "bytes": 7902238
+    },
+    "subscription_or_output_metadata_and_segments": {
+      "objects": 832,
+      "bytes": 128505350
+    }
+  },
+  "objects": 1209,
+  "encoded_bytes": 334813398,
+  "raw_listing_sha256": "d13476b31ad2ea2dfae2fcc8ac4b2dd47467a8e9427ea983e0e26266bb0ece82",
+  "scope": "Read-only final run-namespace endpoint, including persisted orphans; no reachability/deletion authority or growth-rate claim."
+}
