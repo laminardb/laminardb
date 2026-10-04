@@ -12,6 +12,23 @@ mod subscriptions;
 #[path = "topology_stateful.rs"]
 mod stateful;
 
+fn future_input(
+    value: i64,
+    first: u64,
+    timestamp_us: i64,
+) -> rustc_hash::FxHashMap<Arc<str>, Vec<RecordBatch>> {
+    let mut input = positioned_input(value, first);
+    let batch = &mut input.get_mut("trades").unwrap()[0];
+    let mut columns = batch.columns().to_vec();
+    columns[1] = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+        timestamp_us,
+        timestamp_us + 1000,
+        timestamp_us + 2000,
+    ]));
+    *batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
+    input
+}
+
 pub(super) async fn checkpointed() -> (
     Fixture,
     laminar_core::cluster::control::TopologyOperationId,
@@ -88,7 +105,7 @@ async fn checkpointed_with_additions(
     let before = image.graph.capture_subscription_frontiers().unwrap();
     let output = image
         .graph
-        .execute_cycle(&positioned_input(5, 3), 100, None)
+        .execute_cycle(&future_input(5, 3, 150_000), 100, None)
         .await
         .unwrap();
     assert_eq!(total(&output["totals"]), 45);

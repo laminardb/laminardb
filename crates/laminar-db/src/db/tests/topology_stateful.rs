@@ -2,17 +2,6 @@
 
 use super::*;
 
-fn future_input(value: i64, first: u64) -> rustc_hash::FxHashMap<Arc<str>, Vec<RecordBatch>> {
-    let mut input = positioned_input(value, first);
-    let batch = &mut input.get_mut("trades").unwrap()[0];
-    let mut columns = batch.columns().to_vec();
-    columns[1] = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-        200_000, 201_000, 202_000,
-    ]));
-    *batch = RecordBatch::try_new(batch.schema(), columns).unwrap();
-    input
-}
-
 #[tokio::test]
 async fn topology_stateful_root_starts_empty_and_preserves_existing_state_across_commit_loss() {
     let (fixture, staged) = restorable_fixture_with_additions(stateful_additions()).await;
@@ -50,7 +39,7 @@ async fn topology_stateful_root_starts_empty_and_preserves_existing_state_across
         assert_eq!(image.restored_frame_count(), 9);
         let output = image
             .graph
-            .execute_cycle(&future_input(5, 3), i64::MIN, None)
+            .execute_cycle(&future_input(5, 3, 200_000), i64::MIN, None)
             .await
             .unwrap();
         assert_eq!(total(&output["totals"]), 45);
@@ -136,7 +125,7 @@ async fn topology_stateful_target_checkpoint_restores_new_state_and_sequences_wi
     }
     let output = image
         .graph
-        .execute_cycle(&future_input(7, 6), 100, None)
+        .execute_cycle(&future_input(7, 6, 200_000), 100, None)
         .await
         .unwrap();
     assert_eq!(total(&output["totals"]), 66);
@@ -182,7 +171,7 @@ async fn topology_stateful_joins_use_only_post_cut_rows_and_preserve_their_check
         .prepare_cluster_topology_recovery(operation)
         .await
         .unwrap();
-    let right = future_input(7, 91).remove("trades").unwrap();
+    let right = future_input(7, 91, 200_000).remove("trades").unwrap();
     let right = rustc_hash::FxHashMap::from_iter([(Arc::from("added_source"), right)]);
     let output = image.graph.execute_cycle(&right, 100, None).await.unwrap();
     let joined = &output["new_join"];
@@ -208,7 +197,7 @@ async fn topology_stateful_joins_use_only_post_cut_rows_and_preserve_their_check
     image.graph.commit_prepared_subscription_outputs();
     image
         .graph
-        .execute_cycle(&future_input(9, 6), 100, None)
+        .execute_cycle(&future_input(9, 6, 200_000), 100, None)
         .await
         .unwrap();
     image.graph.take_prepared_subscription_outputs();
@@ -346,7 +335,7 @@ async fn topology_stateful_root_recovers_under_a_new_assignment_incarnation() {
     assert_eq!(image.input.assignment().assignment_version, 2);
     let output = image
         .graph
-        .execute_cycle(&future_input(5, 3), i64::MIN, None)
+        .execute_cycle(&future_input(5, 3, 200_000), i64::MIN, None)
         .await
         .unwrap();
     assert_eq!(total(&output["totals"]), 45);
