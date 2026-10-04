@@ -165,18 +165,36 @@ impl MigrationProbe {
         request: &laminar_db::ClusterTopologyRequest,
     ) -> TopologyAdmissionStatus {
         let body = serde_json::to_string(request).unwrap();
-        let response = node.http_request(
-            "POST",
-            "/api/v1/cluster/topology/operations",
-            Some(&body),
-            Duration::from_secs(45),
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut admitted = None;
+        wait_for(
+            "durable public topology admission receipt",
+            Duration::from_secs(120),
+            || {
+                let response = node.http_request(
+                    "POST",
+                    "/api/v1/cluster/topology/operations",
+                    Some(&body),
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(45)),
+                );
+                // A disconnected request may have committed or may still be unreserved. Read the
+                // exact UUID and retry the same payload while checkpoints contend for admission.
+                admitted = response
+                    .map(|body| serde_json::from_str(&body).unwrap())
+                    .or_else(|| {
+                        self.runtime
+                            .block_on(
+                                self.authority
+                                    .topology_operation_status(request.operation_id),
+                            )
+                            .unwrap()
+                    });
+                admitted.is_some()
+            },
         );
-        let operation = if let Some(response) = response {
-            serde_json::from_str(&response).unwrap()
-        } else {
-            // A disconnected request may already have been admitted; consult its exact UUID.
-            self.status(request.operation_id)
-        };
+        let operation = admitted.unwrap();
         assert_eq!(operation.operation_id, request.operation_id);
         operation
     }
