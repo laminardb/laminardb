@@ -17,8 +17,17 @@ async fn restorable_fixture() -> (
     Fixture,
     laminar_core::cluster::control::TopologyAdmissionStatus,
 ) {
+    restorable_fixture_with_additions(Vec::new()).await
+}
+
+async fn restorable_fixture_with_additions(
+    additions: Vec<laminar_core::cluster::control::CatalogManifestEntry>,
+) -> (
+    Fixture,
+    laminar_core::cluster::control::TopologyAdmissionStatus,
+) {
     let (fixture, assignments) = preparation_fixture_with_generation(7).await;
-    let entries = independent_pipeline()
+    let mut entries: Vec<_> = independent_pipeline()
         .into_iter()
         .zip([
             (
@@ -43,6 +52,7 @@ async fn restorable_fixture() -> (
             },
         )
         .collect();
+    entries.extend(additions);
     let admitted = admit_preparation_entries(&fixture, &assignments, entries).await;
     fixture
         .db
@@ -304,7 +314,9 @@ fn input(value: i64) -> rustc_hash::FxHashMap<Arc<str>, Vec<RecordBatch>> {
         crate::temporal_test_source::schema(),
         vec![
             Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),
-            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![1, 2, 3])),
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                1000, 2000, 3000,
+            ])),
             Arc::new(arrow::array::Int64Array::from(vec![value; 3])),
         ],
     )
@@ -337,6 +349,24 @@ fn total(batches: &[RecordBatch]) -> i64 {
                 .sum::<i64>()
         })
         .sum()
+}
+
+fn positioned_input(value: i64, first: u64) -> rustc_hash::FxHashMap<Arc<str>, Vec<RecordBatch>> {
+    use laminar_connectors::connector::{
+        schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
+        SourceRowPositionCapability,
+    };
+    let batch = input(value)["trades"][0].clone();
+    let positioned = schema_with_source_row_positions(&batch.schema()).unwrap();
+    let mutations = schema_with_source_mutations_and_row_positions(&batch.schema()).unwrap();
+    let batch = runtime_probe::positioned(batch, first)
+        .into_records_with_metadata(
+            SourceRowPositionCapability::OrderedDeterministic,
+            &positioned,
+            &mutations,
+        )
+        .unwrap();
+    rustc_hash::FxHashMap::from_iter([(Arc::from("trades"), vec![batch])])
 }
 
 #[tokio::test]

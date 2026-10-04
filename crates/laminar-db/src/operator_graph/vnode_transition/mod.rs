@@ -199,6 +199,7 @@ impl OperatorGraph {
             transition.pending.acquired_vnodes(),
             transition.pending.state_frames(),
             ManagedVnodeTransitionMode::Live,
+            &[],
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -227,11 +228,28 @@ impl OperatorGraph {
     }
 
     pub(crate) fn restore_reassigned_vnode_state(
+        self,
+        predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        predecessor_owners: &[laminar_core::state::NodeId],
+        target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        state_frames: &[RecoveredStateFrame],
+    ) -> Result<(Self, usize), DbError> {
+        self.restore_reassigned_vnode_state_inner(
+            predecessor,
+            predecessor_owners,
+            target,
+            state_frames,
+            &[],
+        )
+    }
+
+    pub(super) fn restore_reassigned_vnode_state_inner(
         mut self,
         predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
         predecessor_owners: &[laminar_core::state::NodeId],
         target: &laminar_core::checkpoint::CheckpointAssignmentFence,
         state_frames: &[RecoveredStateFrame],
+        empty_at_cut: &[&str],
     ) -> Result<(Self, usize), DbError> {
         if !self.whole_restore_open {
             return Err(DbError::Checkpoint(
@@ -285,6 +303,7 @@ impl OperatorGraph {
             &acquired,
             state_frames,
             ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners },
+            empty_at_cut,
         )?;
         if let Err(error) = authority.revalidate_for_publication() {
             self.abort_and_finish_managed_operators(&prepared);
@@ -313,6 +332,7 @@ impl OperatorGraph {
             &[],
             &[],
             ManagedVnodeTransitionMode::Live,
+            &[],
         ) {
             Ok(prepared) => prepared,
             Err(error) => {

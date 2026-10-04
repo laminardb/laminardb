@@ -4,9 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use laminar_core::checkpoint::{
-    CheckpointAttempt, CheckpointScope, ObjectStoreCheckpointStore, StateFrameKey,
-};
+use laminar_core::checkpoint::{CheckpointAttempt, CheckpointScope, ObjectStoreCheckpointStore};
 use laminar_core::cluster::control::{
     RecoveryAnnouncement, TopologyError, TopologyMigrationRoot, TopologyOperationId,
     TopologyRecoveryCut, TopologyRecoveryInput, TopologyRestoreInput, TopologyVersion,
@@ -368,7 +366,6 @@ impl LaminarDB {
                         "restore candidate differs from the certified target environment".into(),
                     ).into());
                 }
-                bind_preserved_subscriptions(&candidate, &input)?;
                 let mut scope = crate::operator::sql_query::ClusterShuffleConfig {
                     registry: self.vnode_registry.lock().clone().ok_or(TopologyError::Fenced)?,
                     sender: self.shuffle_sender.lock().clone().ok_or(TopologyError::Fenced)?,
@@ -436,7 +433,7 @@ impl LaminarDB {
                 } else {
                     reader.recover_topology_root(&input, budget).await?
                 };
-                let (graph, restored_frames) = restore_local_frames(graph, &recovered, &input)?;
+                let (graph, restored_frames) = graph.restore_topology_state_frames(&recovered, &input)?;
                 if recovery.as_ref().is_some_and(|selection| selection.cut() == TopologyRecoveryCut::TargetCheckpoint) {
                     super::recovery::validate_target_subscription_frontiers(&graph, &recovered, &input)?;
                 } else {
@@ -609,91 +606,88 @@ pub(super) async fn prepare_source_positions_at_cut(
     Ok(sources)
 }
 
-fn bind_preserved_subscriptions(
-    candidate: &LaminarDB,
-    input: &TopologyRestoreInput,
-) -> Result<(), DbError> {
-    let mut streams = candidate.connector_manager.lock().streams().clone();
-    for subscription in &input.root().subscriptions {
-        let certificate = &subscription.target_certificate;
-        let stream = streams.get_mut(&certificate.stream_id).ok_or_else(|| {
-            TopologyError::Invalid("preserved subscription has no target stream".into())
-        })?;
-        if stream.subscription_output.is_none()
-            || stream.catalog_generation != certificate.catalog_generation
-        {
-            return Err(TopologyError::Invalid(
-                "preserved subscription has a different target incarnation".into(),
-            )
-            .into());
-        }
-        stream.subscription_certificate = Some(certificate.clone());
-    }
-    if streams.values().any(|stream| {
-        stream.subscription_output.is_some() && stream.subscription_certificate.is_none()
-    }) {
-        return Err(TopologyError::Unsupported(
-            "new subscription output has no initialization contract".into(),
-        )
-        .into());
-    }
-    candidate
-        .connector_manager
-        .lock()
-        .install_stream_subscription_certificates(&streams)
-}
-
-fn restore_local_frames(
-    graph: crate::operator_graph::OperatorGraph,
-    recovered: &crate::recovery_manager::RecoveredState,
-    input: &TopologyRestoreInput,
-) -> Result<(crate::operator_graph::OperatorGraph, usize), DbError> {
-    let mut whole = Vec::new();
-    let mut vnodes = Vec::new();
-    recovered.validate_topology_assignment(input)?;
-    if recovered.reassigned {
-        let predecessor = recovered
-            .committed
-            .assignment_fence
-            .as_ref()
-            .ok_or(TopologyError::Fenced)?;
-        let target = input.assignment();
-        // The authority-selected cut retains its historical assignment. Reuse ordinary
-        // checkpoint bootstrap to audit portable whole/vnode state against that predecessor
-        // and publish it under the exact current transport. This permits no survivor rescale.
-        return graph.restore_reassigned_vnode_state(
-            predecessor,
-            &recovered.predecessor_owners,
-            target,
-            &recovered.state_frames,
-        );
-    }
-    for frame in &recovered.state_frames {
-        if frame.participant_id != input.process().participant.node_id {
-            return Err(TopologyError::Fenced.into());
-        }
-        match &frame.key {
-            StateFrameKey::OperatorWhole { operator_id } => {
-                whole.push((graph_name(operator_id)?, frame.payload.clone()));
+impl LaminarDB {
+    pub(crate) fn bind_topology_subscriptions(
+        &self,
+        streams: &mut std::collections::HashMap<
+            String,
+            crate::connector_manager::StreamRegistration,
+        >,
+        input: &TopologyRestoreInput,
+        schemas: &std::collections::HashMap<String, arrow_schema::SchemaRef>,
+    ) -> Result<(), DbError> {
+        for subscription in &input.root().subscriptions {
+            let certificate = &subscription.target_certificate;
+            let stream = streams.get_mut(&certificate.stream_id).ok_or_else(|| {
+                TopologyError::Invalid("preserved subscription has no target stream".into())
+            })?;
+            if stream.subscription_output.is_none()
+                || stream.catalog_generation != certificate.catalog_generation
+            {
+                return Err(TopologyError::Invalid(
+                    "preserved subscription has a different target incarnation".into(),
+                )
+                .into());
             }
-            StateFrameKey::Vnode { operator_id, vnode } => vnodes.push((
-                graph_name(operator_id)?,
-                u32::from(*vnode),
-                frame.payload.clone(),
-            )),
+            stream.subscription_certificate = Some(certificate.clone());
         }
+        for stream in streams
+            .values_mut()
+            .filter(|stream| stream.subscription_certificate.is_none())
+        {
+            let Some(output) = &stream.subscription_output else {
+                continue;
+            };
+            let object = input
+                .descriptor()
+                .objects
+                .iter()
+                .find(|object| object.name == stream.name)
+                .ok_or_else(|| {
+                    TopologyError::Invalid("new subscription has no descriptor".into())
+                })?;
+            if object.initialization
+                != super::planning::TopologyInitialization::EmptyManagedStateAtCut
+                || object.catalog_generation != stream.catalog_generation
+                || input
+                    .root()
+                    .future_only_objects
+                    .binary_search(&stream.name)
+                    .is_err()
+            {
+                return Err(TopologyError::Invalid(
+                    "new subscription has no empty-state cut contract".into(),
+                )
+                .into());
+            }
+            let schema = schemas.get(&stream.name).ok_or_else(|| {
+                TopologyError::Invalid("new subscription has no resolved schema".into())
+            })?;
+            let schema_fingerprint =
+                crate::pipeline_identity::subscription_schema_fingerprint(schema)?;
+            if object.schema_sha256.as_deref() != Some(schema_fingerprint.to_hex().as_str()) {
+                return Err(TopologyError::Invalid(
+                    "new subscription schema differs from its descriptor".into(),
+                )
+                .into());
+            }
+            stream.subscription_certificate = Some(
+                output.bind(
+                    uuid::Uuid::parse_str(&input.descriptor().deployment_id)
+                        .map_err(|error| TopologyError::Invalid(error.to_string()))?,
+                    stream.catalog_generation,
+                    &stream.name,
+                    schema_fingerprint,
+                    stream.subscription_retention_bytes,
+                    input.descriptor().target_pipeline.clone(),
+                    self.checkpoint_key_groups(),
+                )?,
+            );
+        }
+        self.connector_manager
+            .lock()
+            .install_stream_subscription_certificates(streams)
     }
-    graph.restore_topology_state_frames(&whole, &vnodes, input)
-}
-
-fn graph_name(operator_id: &str) -> Result<String, DbError> {
-    operator_id
-        .strip_prefix("graph:")
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            TopologyError::Unsupported("migration restore has no non-graph state mapping".into())
-                .into()
-        })
 }
 
 fn validate_subscription_frontiers(
@@ -701,13 +695,38 @@ fn validate_subscription_frontiers(
     input: &TopologyRestoreInput,
 ) -> Result<(), DbError> {
     let captures = graph.capture_subscription_frontiers()?;
-    if captures.len() != input.root().subscriptions.len() {
-        return Err(TopologyError::Invalid(
-            "restored subscription roster differs from the root".into(),
-        )
-        .into());
-    }
-    for (capture, mapping) in captures.iter().zip(&input.root().subscriptions) {
+    let mut preserved = 0;
+    for capture in &captures {
+        let Some(mapping) =
+            input.root().subscriptions.iter().find(|mapping| {
+                mapping.target_certificate.stream_id == capture.certificate.stream_id
+            })
+        else {
+            let initialized = input.descriptor().objects.iter().any(|object| {
+                object.name == capture.certificate.stream_id
+                    && object.initialization
+                        == super::planning::TopologyInitialization::EmptyManagedStateAtCut
+                    && object.catalog_generation == capture.certificate.catalog_generation
+                    && input
+                        .root()
+                        .future_only_objects
+                        .binary_search(&object.name)
+                        .is_ok()
+            });
+            if !initialized
+                || capture.certificate.pipeline_identity != input.descriptor().target_pipeline
+                || capture.frontiers.iter().any(|frontier| {
+                    frontier.through_sequence != laminar_core::checkpoint::PartitionSequence::FIRST
+                })
+            {
+                return Err(TopologyError::Invalid(
+                    "new subscription did not initialize at its first sequence".into(),
+                )
+                .into());
+            }
+            continue;
+        };
+        preserved += 1;
         let expected = mapping
             .frontiers
             .iter()
@@ -726,6 +745,12 @@ fn validate_subscription_frontiers(
             )
             .into());
         }
+    }
+    if preserved != input.root().subscriptions.len() {
+        return Err(TopologyError::Invalid(
+            "restored subscription roster differs from the root".into(),
+        )
+        .into());
     }
     Ok(())
 }

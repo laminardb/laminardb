@@ -607,6 +607,72 @@ async fn topology_root_rejects_unresolved_sources_and_wrong_subscription_contrac
 }
 
 #[tokio::test]
+async fn topology_root_new_managed_state_requires_explicit_initialization_and_keeps_parent_state_required(
+) {
+    let authority = store(30_000);
+    let fixture = fixture(&authority).await;
+    let mut descriptor = fixture.descriptor.clone();
+    let added = descriptor
+        .objects
+        .iter_mut()
+        .find(|object| object.name == "later")
+        .unwrap();
+    added.managed_state_contract = Some("sql_aggregate_v1".into());
+    descriptor.compatibility_sha256 = descriptor.descriptor_digest().unwrap();
+    assert!(descriptor.encode_and_reference().is_err());
+    assert!(TopologyMigrationRoot::build(
+        &fixture.operation,
+        &descriptor,
+        &fixture.index,
+        &fixture.manifests
+    )
+    .is_err());
+    descriptor
+        .objects
+        .iter_mut()
+        .find(|object| object.name == "later")
+        .unwrap()
+        .initialization = TopologyInitialization::EmptyManagedStateAtCut;
+    descriptor.compatibility_sha256 = descriptor.descriptor_digest().unwrap();
+    descriptor.encode_and_reference().unwrap();
+    let root = TopologyMigrationRoot::build(
+        &fixture.operation,
+        &descriptor,
+        &fixture.index,
+        &fixture.manifests,
+    )
+    .unwrap();
+    assert_eq!(root.future_only_objects, ["later"]);
+    let mut manifests = fixture.manifests.clone();
+    let mut index = fixture.index.clone();
+    for (manifest, participant) in manifests.iter_mut().zip(&mut index.participants) {
+        manifest.state_frames.retain(|frame| !matches!(&frame.key, StateFrameKey::Vnode { operator_id, .. } if operator_id == "graph:totals"));
+        manifest.node_data.object_length = 0;
+        manifest.node_data.sha256 = format!("{:x}", Sha256::digest([]));
+        *participant = CommittedParticipantRef::from_manifest(
+            manifest,
+            &checkpoint_manifest_bytes(manifest).unwrap(),
+        )
+        .unwrap();
+    }
+    let mut operation = fixture.operation.clone();
+    operation
+        .cut
+        .as_mut()
+        .unwrap()
+        .committed
+        .as_mut()
+        .unwrap()
+        .checkpoint = index.encode_and_reference().unwrap().1;
+    let error =
+        TopologyMigrationRoot::build(&operation, &descriptor, &index, &manifests).unwrap_err();
+    assert!(
+        error.to_string().contains("cold start is forbidden"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn topology_root_lost_write_response_uses_one_append_and_reads_no_state_payloads() {
     let (raw, authority) = ambiguous_once_at(30_000, lease_path(11));
     let fixture = fixture(&authority).await;

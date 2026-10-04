@@ -386,6 +386,20 @@ impl OperatorGraph {
         indices
     }
 
+    fn prepare_transition_frames<'a>(
+        &mut self,
+        state_frames: &'a [RecoveredStateFrame],
+        empty_at_cut: &[&str],
+    ) -> Result<(usize, Vec<usize>, Vec<ProjectedTransitionFrames<'a>>), DbError> {
+        let payload_bytes = self.transition_payload_bytes(state_frames)?;
+        self.validate_transition_state_budget(payload_bytes, "vnode transition staged payload")?;
+        let mut node_indices = self.canonical_managed_operator_indices();
+        node_indices.retain(|&index| !empty_at_cut.contains(&self.nodes[index].name.as_ref()));
+        let projected = self.project_transition_frames(&node_indices, state_frames)?;
+        Ok((payload_bytes, node_indices, projected))
+    }
+
+    #[allow(clippy::too_many_arguments)] // The cut and empty additions belong to one restore transaction.
     pub(super) fn prepare_managed_operators(
         &mut self,
         predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -394,11 +408,10 @@ impl OperatorGraph {
         acquired: &[u32],
         state_frames: &[RecoveredStateFrame],
         mode: ManagedVnodeTransitionMode<'_>,
+        empty_at_cut: &[&str],
     ) -> Result<PreparedManagedOperators, DbError> {
-        let payload_bytes = self.transition_payload_bytes(state_frames)?;
-        self.validate_transition_state_budget(payload_bytes, "vnode transition staged payload")?;
-        let node_indices = self.canonical_managed_operator_indices();
-        let projected = self.project_transition_frames(&node_indices, state_frames)?;
+        let (payload_bytes, node_indices, projected) =
+            self.prepare_transition_frames(state_frames, empty_at_cut)?;
         let mut attempted = Vec::new();
         for (node_idx, frames) in node_indices.into_iter().zip(projected) {
             let contract = self.nodes[node_idx]

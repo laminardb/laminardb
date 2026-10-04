@@ -160,9 +160,13 @@ impl TopologyMigrationRoot {
                     });
                 }
                 ClusterTopologyObjectTransition::AddFutureOnly => {
-                    if object.managed_state_contract.is_some() {
+                    if object.managed_state_contract.is_some()
+                        && object.initialization
+                            != super::TopologyInitialization::EmptyManagedStateAtCut
+                    {
                         return Err(TopologyError::Unsupported(
-                            "new managed state has no initialization contract".into(),
+                            "new managed state requires an explicit empty-state cut contract"
+                                .into(),
                         ));
                     }
                     future.push(object.name.clone());
@@ -270,11 +274,10 @@ impl TopologyMigrationRoot {
                 }
             }
         }
-        for object in descriptor
-            .objects
-            .iter()
-            .filter(|o| o.managed_state_contract.is_some())
-        {
+        for object in descriptor.objects.iter().filter(|o| {
+            o.transition == ClusterTopologyObjectTransition::Preserve
+                && o.managed_state_contract.is_some()
+        }) {
             if !manifests.iter().any(|m| {
                 m.state_frames.iter().any(|frame| {
                     matches!(&frame.key, StateFrameKey::Vnode { operator_id, .. }

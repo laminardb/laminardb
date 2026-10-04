@@ -34,8 +34,9 @@ impl LaminarDB {
     /// Compile an additive topology candidate separately from the active graph.
     ///
     /// Each array entry is exactly one typed CREATE. The parent must be explicitly versioned.
-    /// Supports local validation of replayable sources, stateless downstream streams and durable
-    /// sinks while proving unchanged managed definitions remain compatible. No source is opened
+    /// Supports replayable sources, supported managed/stateless streams and durable sinks while
+    /// proving unchanged definitions remain compatible. New managed state starts empty at the cut;
+    /// input that can retract an unavailable prefix is rejected. No source is opened
     /// or polled, no sink is opened or published, and no authority/checkpoint ID is written.
     /// A successful response does not authorize SQL submission, restore or target activation.
     ///
@@ -43,7 +44,7 @@ impl LaminarDB {
     /// descriptor and a 30 second end-to-end deadline bound control-path resource use.
     ///
     /// # Errors
-    /// Rejects parent conflicts, non-additive/new-stateful operations, uncertified execution or
+    /// Rejects parent conflicts, non-additive operations, uncertified execution or
     /// connector contracts, divergent local definitions, malformed input and exceeded bounds.
     pub async fn validate_cluster_topology_change(
         &self,
@@ -475,17 +476,12 @@ pub(super) fn describe_catalog(
             ))
             .into());
         }
-        if !preserved
-            && operator.is_some_and(|capability| {
-                capability.state_class != OperatorStateClass::Stateless
-                    || capability.managed_state.is_some()
-            })
-        {
-            return Err(TopologyError::Unsupported(format!("new stream '{name}' retains state; an explicit new-state initialization contract is required, and empty state cannot imply historical completeness")).into());
-        }
         let state_contract = operator
             .and_then(|capability| capability.managed_state)
             .map(state_contract_name);
+        if !preserved {
+            validate_future_state_inputs(name, operator, &dependencies, &objects, graph)?;
+        }
         let identity = compatibility_digest(&(
             "laminardb-topology-object-mapping-v1",
             name,
@@ -513,6 +509,8 @@ pub(super) fn describe_catalog(
                     TopologyInitialization::PreserveExactCut
                 } else if entry.kind == CatalogObjectKind::Source {
                     TopologyInitialization::ResolveSourcePositionsOnce
+                } else if state_contract.is_some() {
+                    TopologyInitialization::EmptyManagedStateAtCut
                 } else {
                     TopologyInitialization::FutureOnlyAtCut
                 },
@@ -525,6 +523,55 @@ pub(super) fn describe_catalog(
         );
     }
     Ok(objects)
+}
+
+fn validate_future_state_inputs(
+    name: &str,
+    operator: Option<&crate::operator::capability::OperatorCapability>,
+    dependencies: &[String],
+    objects: &BTreeMap<String, ClusterTopologyObjectPlan>,
+    graph: &PlannedTopologyGraph,
+) -> Result<(), DbError> {
+    if operator.is_some_and(|capability| match capability.state_class {
+        OperatorStateClass::Stateless => capability.managed_state.is_some(),
+        OperatorStateClass::VnodeKeyed | OperatorStateClass::GlobalSingleton => {
+            capability.managed_state.is_none()
+        }
+        _ => true,
+    }) {
+        return Err(TopologyError::Unsupported(format!(
+            "new stream '{name}' has no supported empty managed-state initialization contract"
+        ))
+        .into());
+    }
+    if operator.is_none_or(|capability| capability.managed_state.is_none()) {
+        return Ok(());
+    }
+    let mut pending: Vec<_> = dependencies.iter().map(String::as_str).collect();
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(dependency) = pending.pop() {
+        if !visited.insert(dependency) {
+            continue;
+        }
+        let object = objects.get(dependency).ok_or_else(|| {
+            TopologyError::Invalid("new managed state has an unresolved input".into())
+        })?;
+        if graph.source_input_modes.get(dependency)
+            == Some(&laminar_connectors::connector::SourceInputMode::FullChangelog)
+            || (object.transition == ClusterTopologyObjectTransition::Preserve
+                && graph.schemas.get(dependency).is_some_and(|schema| {
+                    schema
+                        .field_with_name(laminar_core::changelog::WEIGHT_COLUMN)
+                        .is_ok()
+                }))
+        {
+            return Err(TopologyError::Unsupported(format!(
+                "new managed stream '{name}' consumes changelog '{dependency}' without a cut baseline; empty state cannot apply retractions from before the cut"
+            )).into());
+        }
+        pending.extend(object.dependencies.iter().map(String::as_str));
+    }
+    Ok(())
 }
 
 const fn state_contract_name(contract: ManagedStateContract) -> &'static str {

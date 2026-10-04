@@ -22,6 +22,7 @@ pub(crate) struct PlannedTopologyGraph {
     pub(crate) operators: BTreeMap<String, OperatorCapability>,
     pub(crate) schemas: BTreeMap<String, arrow_schema::SchemaRef>,
     pub(crate) connector_sha256: BTreeMap<String, String>,
+    pub(crate) source_input_modes: BTreeMap<String, SourceInputMode>,
 }
 
 impl LaminarDB {
@@ -66,7 +67,7 @@ impl LaminarDB {
             )
             .into());
         }
-        let (sources, sinks, streams, tables) = {
+        let (sources, sinks, mut streams, tables) = {
             let manager = self.connector_manager.lock();
             (
                 manager.sources().clone(),
@@ -99,6 +100,7 @@ impl LaminarDB {
         )
         .await?;
         let mut connector_sha256 = BTreeMap::new();
+        let mut source_input_modes = BTreeMap::new();
         let mut schemas: BTreeMap<_, _> = resolved
             .schemas
             .iter()
@@ -161,6 +163,7 @@ impl LaminarDB {
                     connector.cancellation_policy(),
                 ))?,
             );
+            source_input_modes.insert(name.clone(), contract.input_mode);
             schemas.insert(name, Arc::clone(&source.schema));
         }
         let mut sink_names: Vec<_> = sinks.keys().collect();
@@ -238,7 +241,10 @@ impl LaminarDB {
                 ))?,
             );
         }
-        let mut graph = if let Some((input, scope)) = restore {
+        if let Some((input, _)) = &restore {
+            self.bind_topology_subscriptions(&mut streams, input, &resolved.schemas)?;
+        }
+        let graph = if let Some((input, scope)) = restore {
             self.build_topology_restore_operator_graph(
                 &streams,
                 &tables,
@@ -256,7 +262,25 @@ impl LaminarDB {
                 None,
             )?
         };
-        for (name, schema) in &resolved.schemas {
+        self.initialize_topology_graph(
+            graph,
+            &resolved.schemas,
+            schemas,
+            connector_sha256,
+            source_input_modes,
+        )
+        .await
+    }
+
+    async fn initialize_topology_graph(
+        &self,
+        mut graph: crate::operator_graph::OperatorGraph,
+        stream_schemas: &std::collections::HashMap<String, arrow_schema::SchemaRef>,
+        schemas: BTreeMap<String, arrow_schema::SchemaRef>,
+        connector_sha256: BTreeMap<String, String>,
+        source_input_modes: BTreeMap<String, SourceInputMode>,
+    ) -> Result<(PlannedTopologyGraph, crate::operator_graph::OperatorGraph), DbError> {
+        for (name, schema) in stream_schemas {
             graph.register_intermediate_schema(name, schema);
         }
         let budget = self
@@ -279,6 +303,7 @@ impl LaminarDB {
                 operators: graph.topology_operator_contracts()?,
                 schemas,
                 connector_sha256,
+                source_input_modes,
             },
             graph,
         ))

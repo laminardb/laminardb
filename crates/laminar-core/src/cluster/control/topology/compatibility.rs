@@ -34,6 +34,9 @@ pub enum TopologyInitialization {
     PreserveExactCut,
     /// Process only target-generation input after the cut, without historical replay or backfill.
     FutureOnlyAtCut,
+    /// Initialize new managed state empty at the exact cut; consume only subsequent input.
+    /// This never authorizes resetting a preserved operator or a target checkpoint image.
+    EmptyManagedStateAtCut,
     /// Resolve concrete latest source/partition positions once at the cut and persist before commit.
     ResolveSourcePositionsOnce,
 }
@@ -268,6 +271,9 @@ impl ClusterTopologyValidation {
                 (_, CatalogObjectKind::Source) => {
                     TopologyInitialization::ResolveSourcePositionsOnce
                 }
+                (_, CatalogObjectKind::Stream) if object.managed_state_contract.is_some() => {
+                    TopologyInitialization::EmptyManagedStateAtCut
+                }
                 _ => TopologyInitialization::FutureOnlyAtCut,
             };
             if object.name.is_empty()
@@ -296,7 +302,6 @@ impl ClusterTopologyValidation {
                         contract.is_empty()
                             || contract.len() > 128
                             || object.kind != CatalogObjectKind::Stream
-                            || object.transition != ClusterTopologyObjectTransition::Preserve
                     })
             {
                 return Err(TopologyError::Invalid(

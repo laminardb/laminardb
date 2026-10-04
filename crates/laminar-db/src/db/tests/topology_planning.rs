@@ -35,6 +35,7 @@ struct PlanningSource(
     Arc<AtomicUsize>,
     Arc<RestoreValidationControl>,
     Option<runtime_probe::RuntimeSource>,
+    bool,
 );
 
 #[path = "topology_restore.rs"]
@@ -128,7 +129,17 @@ impl SourceConnector for PlanningSource {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        crate::temporal_test_source::schema()
+        let schema = crate::temporal_test_source::schema();
+        if !self.4 {
+            return schema;
+        }
+        let mut fields = schema.fields().to_vec();
+        fields.push(Arc::new(arrow_schema::Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            arrow_schema::DataType::Int64,
+            false,
+        )));
+        Arc::new(arrow_schema::Schema::new(fields))
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
@@ -142,10 +153,13 @@ impl SourceConnector for PlanningSource {
         } else {
             SourceConsistency::Replayable
         };
-        Ok(
-            SourceContract::new(consistency, topology, SourceInputMode::AppendOnly)
-                .with_row_positions(SourceRowPositionCapability::OrderedDeterministic),
-        )
+        let input = if config.get("input") == Some("changelog") {
+            SourceInputMode::FullChangelog
+        } else {
+            SourceInputMode::AppendOnly
+        };
+        Ok(SourceContract::new(consistency, topology, input)
+            .with_row_positions(SourceRowPositionCapability::OrderedDeterministic))
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -314,31 +328,33 @@ impl Fixture {
             .await
             .unwrap(),
         );
-        let db =
-            LaminarDB::builder()
-                .cluster_controller(Arc::clone(&authority.controller))
-                .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
-                .catalog_manifest_store(Arc::clone(&authority.manifest_store))
-                .shuffle_sender(Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                    1, process,
-                )))
-                .shuffle_receiver(receiver)
-                .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, NodeId(1))))
-                .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
-                .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-                    interval_ms: None,
-                    ..Default::default()
-                })
-                .register_connector(move |registry| {
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&authority.controller))
+            .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
+            .catalog_manifest_store(Arc::clone(&authority.manifest_store))
+            .shuffle_sender(Arc::new(laminar_core::shuffle::ShuffleSender::new(
+                1, process,
+            )))
+            .shuffle_receiver(receiver)
+            .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, NodeId(1))))
+            .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+            .temporal_join_idle_history_retention(Duration::from_secs(60))
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: None,
+                ..Default::default()
+            })
+            .register_connector(move |registry| {
+                let sink_validation = Arc::clone(&factory_validation);
+                for (name, changelog) in [("planning-source", false), ("planning-changelog", true)]
+                {
                     let source_effects = Arc::clone(&factory_effects);
                     let source_resolutions = Arc::clone(&factory_resolutions);
                     let source_validation = Arc::clone(&factory_validation);
-                    let sink_validation = Arc::clone(&factory_validation);
                     registry.register_source(
-                        "planning-source",
+                        name,
                         ConnectorInfo {
-                            name: "planning-source".into(),
-                            display_name: "planning source".into(),
+                            name: name.into(),
+                            display_name: name.into(),
                             version: "1".into(),
                             is_source: true,
                             is_sink: false,
@@ -352,32 +368,36 @@ impl Fixture {
                                 source_validation.runtime.lock().as_ref().map(|probe| {
                                     runtime_probe::RuntimeSource::new(Arc::clone(probe))
                                 }),
+                                changelog,
                             )))
                         }),
                     )?;
-                    registry.register_sink(
-                        "planning-sink",
-                        ConnectorInfo {
-                            name: "planning-sink".into(),
-                            display_name: "planning sink".into(),
-                            version: "1".into(),
-                            is_source: false,
-                            is_sink: true,
-                            config_keys: vec![],
-                        },
-                        Arc::new(move |_, _| {
-                            Ok(Box::new(PlanningSink(
-                                Arc::clone(&factory_effects),
-                                sink_validation.runtime.lock().as_ref().map(|probe| {
-                                    runtime_probe::RuntimeSink::new(Arc::clone(probe))
-                                }),
-                            )))
-                        }),
-                    )
-                })
-                .build()
-                .await
-                .unwrap();
+                }
+                registry.register_sink(
+                    "planning-sink",
+                    ConnectorInfo {
+                        name: "planning-sink".into(),
+                        display_name: "planning sink".into(),
+                        version: "1".into(),
+                        is_source: false,
+                        is_sink: true,
+                        config_keys: vec![],
+                    },
+                    Arc::new(move |_, _| {
+                        Ok(Box::new(PlanningSink(
+                            Arc::clone(&factory_effects),
+                            sink_validation
+                                .runtime
+                                .lock()
+                                .as_ref()
+                                .map(|probe| runtime_probe::RuntimeSink::new(Arc::clone(probe))),
+                        )))
+                    }),
+                )
+            })
+            .build()
+            .await
+            .unwrap();
         db.execute_cluster_bootstrap_batch(&bootstrap)
             .await
             .unwrap();
@@ -937,11 +957,66 @@ fn source_ddl(name: &str, options: &str) -> String {
 
 fn independent_pipeline() -> Vec<String> {
     vec![
-        source_ddl("added_source", "'topic' = 'new', 'start' = 'latest'"),
+        source_ddl("added_source", "'topic' = 'new', 'start' = 'latest'").replacen(
+            "id BIGINT NOT NULL",
+            "id BIGINT PRIMARY KEY",
+            1,
+        ),
         "CREATE STREAM added_stream AS SELECT id, value FROM added_source WHERE value > 0".into(),
         "CREATE SINK added_sink FROM added_stream INTO \"planning-sink\" ('topic' = 'new-output')"
             .into(),
     ]
+}
+
+fn stateful_additions() -> Vec<laminar_core::cluster::control::CatalogManifestEntry> {
+    [
+        ("new_total", "CREATE STREAM new_total AS SELECT id, SUM(value) AS total FROM trades GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')"),
+        ("new_global", "CREATE STREAM new_global AS SELECT SUM(value) AS total FROM trades"),
+        ("new_tumble", "CREATE STREAM new_tumble AS SELECT id, TUMBLE(ts, INTERVAL '1' SECOND) AS bucket, SUM(value) AS total FROM trades GROUP BY id, TUMBLE(ts, INTERVAL '1' SECOND) EMIT ON WINDOW CLOSE"),
+        ("new_hop", "CREATE STREAM new_hop AS SELECT id, HOP(ts, INTERVAL '1' SECOND, INTERVAL '2' SECOND) AS bucket, SUM(value) AS total FROM trades GROUP BY id, HOP(ts, INTERVAL '1' SECOND, INTERVAL '2' SECOND) EMIT ON WINDOW CLOSE"),
+        ("new_session", "CREATE STREAM new_session AS SELECT id, SESSION(ts, INTERVAL '1' SECOND) AS bucket, SUM(value) AS total FROM trades GROUP BY id, SESSION(ts, INTERVAL '1' SECOND) EMIT ON WINDOW CLOSE"),
+        ("new_join", "CREATE STREAM new_join AS SELECT l.id AS id, l.value AS left_value, r.value AS right_value FROM trades l JOIN added_source r ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"),
+        ("new_temporal", "CREATE STREAM new_temporal AS SELECT l.id AS id, r.value AS right_value FROM trades l LEFT JOIN added_source FOR SYSTEM_TIME AS OF l.ts AS r ON l.id = r.id"),
+    ].into_iter().map(|(name, ddl)| laminar_core::cluster::control::CatalogManifestEntry {
+        canonical_name: name.into(), kind: laminar_core::cluster::control::CatalogObjectKind::Stream,
+        catalog_generation: 1, ddl: ddl.into(),
+    }).collect()
+}
+
+#[tokio::test]
+async fn topology_validation_certifies_new_managed_state_at_a_future_only_cut_without_effects() {
+    let fixture = Fixture::new().await;
+    fixture.adopt().await;
+    let mut statements = independent_pipeline();
+    statements.extend(stateful_additions().into_iter().map(|entry| entry.ddl));
+    let report = fixture.validate(&statements).await.unwrap();
+    for (name, codec) in [
+        ("new_total", "sql_aggregate_v1"),
+        ("new_global", "sql_aggregate_v1"),
+        ("new_tumble", "core_window_v1"),
+        ("new_hop", "core_window_v1"),
+        ("new_session", "core_window_v1"),
+        ("new_join", "bounded_interval_join_v3"),
+        ("new_temporal", "temporal_join_v1"),
+    ] {
+        let object = report
+            .objects
+            .iter()
+            .find(|object| object.name == name)
+            .unwrap();
+        assert_eq!(
+            object.transition,
+            ClusterTopologyObjectTransition::AddFutureOnly
+        );
+        assert_eq!(
+            object.initialization,
+            TopologyInitialization::EmptyManagedStateAtCut
+        );
+        assert_eq!(object.managed_state_contract.as_deref(), Some(codec));
+    }
+    assert_eq!(report, fixture.validate(&statements).await.unwrap());
+    assert_eq!(fixture.db.catalog_manifest_inventory().unwrap().len(), 3);
+    fixture.assert_no_effects();
 }
 
 async fn object_paths(objects: &dyn ObjectStore) -> Vec<String> {
@@ -1140,7 +1215,8 @@ async fn topology_validation_rejects_legacy_conflicting_parent_and_changed_resol
 }
 
 #[tokio::test]
-async fn topology_validation_rejects_replacements_removals_and_new_state_before_live_mutation() {
+async fn topology_validation_rejects_replacements_removals_and_unsupported_state_before_live_mutation(
+) {
     let fixture = Fixture::new().await;
     fixture.adopt().await;
     let original = fixture.db.catalog_manifest_inventory().unwrap();
@@ -1148,7 +1224,8 @@ async fn topology_validation_rejects_replacements_removals_and_new_state_before_
         "CREATE OR REPLACE STREAM totals AS SELECT id, COUNT(*) AS total FROM trades GROUP BY id",
         "CREATE STREAM IF NOT EXISTS totals AS SELECT * FROM trades",
         "DROP STREAM totals",
-        "CREATE STREAM new_state AS SELECT id, SUM(value) AS total FROM trades GROUP BY id",
+        "CREATE STREAM new_state AS SELECT id, ROW_NUMBER() OVER (ORDER BY ts) AS n FROM trades",
+        "CREATE STREAM unseeded_retractions AS SELECT id, SUM(total) AS total FROM totals GROUP BY id",
         "CREATE MATERIALIZED VIEW new_mv AS SELECT * FROM trades",
         "CREATE SOURCE plain_ingress (id BIGINT)",
         "CREATE STREAM bad_schema AS SELECT missing_column FROM trades",
@@ -1180,6 +1257,28 @@ async fn topology_validation_reuses_cluster_source_sink_and_changelog_admission(
         assert!(result.is_err(), "unsafe candidate was accepted: {sql}");
         fixture.assert_no_effects();
     }
+}
+
+#[tokio::test]
+async fn topology_stateful_rejects_changelog_input_that_could_retract_the_unavailable_prefix() {
+    let fixture = Fixture::new().await;
+    fixture.adopt().await;
+    let statements = vec![
+        source_ddl("weighted", "'input' = 'changelog'")
+            .replace("\"planning-source\"", "\"planning-changelog\"")
+            .replace(
+                "value BIGINT NOT NULL, WATERMARK",
+                "value BIGINT NOT NULL, __weight BIGINT NOT NULL, WATERMARK",
+            ),
+        "CREATE STREAM unseeded_join AS SELECT l.id AS id, l.value AS left_value, r.value AS right_value FROM trades l JOIN weighted r ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND".into(),
+    ];
+    let error = fixture.validate(&statements).await.unwrap_err();
+    assert!(
+        error.to_string().contains("without a cut baseline"),
+        "{error}"
+    );
+    assert_eq!(fixture.db.catalog_manifest_inventory().unwrap().len(), 3);
+    fixture.assert_no_effects();
 }
 
 #[tokio::test]

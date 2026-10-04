@@ -102,10 +102,11 @@ location. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip
 
 ### Change a running cluster's topology
 
-Cluster SQL supports additive stateless pipelines and compatible downstream streams or
-sinks. Migrations pause at a checkpoint, preserve existing progress and process future
-input. They return an asynchronous receipt; processing resumes when all required nodes
-are ready. Stateful changes, removal, replacement and membership changes remain unsupported.
+Cluster SQL supports additive pipelines, including supported aggregates, windows and joins.
+Migrations pause at a checkpoint and preserve existing progress; new stateful operators
+start empty and process future input. They return an asynchronous receipt and resume when
+all required nodes are ready. Removal, replacement, incompatible state/input changes and
+membership changes remain unsupported.
 See the [server REST API](crates/laminar-server/README.md#rest-api) for topology endpoints.
 
 ## Production tuning

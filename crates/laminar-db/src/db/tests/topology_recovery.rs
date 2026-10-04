@@ -9,6 +9,9 @@ use laminar_core::cluster::control::TopologyRecoveryCut;
 #[path = "topology_subscription_replay.rs"]
 mod subscriptions;
 
+#[path = "topology_stateful.rs"]
+mod stateful;
+
 pub(super) async fn checkpointed() -> (
     Fixture,
     laminar_core::cluster::control::TopologyOperationId,
@@ -26,7 +29,19 @@ pub(super) async fn checkpointed_with_reader(
     CheckpointManifest,
     Option<crate::subscription::cluster::ClusterSubscriptionReader>,
 ) {
-    let (fixture, committed) = committed_fixture().await;
+    Box::pin(checkpointed_with_additions(attach_reader, Vec::new())).await
+}
+
+async fn checkpointed_with_additions(
+    attach_reader: bool,
+    additions: Vec<laminar_core::cluster::control::CatalogManifestEntry>,
+) -> (
+    Fixture,
+    laminar_core::cluster::control::TopologyOperationId,
+    CheckpointManifest,
+    Option<crate::subscription::cluster::ClusterSubscriptionReader>,
+) {
+    let (fixture, committed) = committed_fixture_with_additions(additions).await;
     let mut image = fixture
         .db
         .recover_committed_cluster_topology(committed.operation_id)
@@ -73,7 +88,7 @@ pub(super) async fn checkpointed_with_reader(
     let before = image.graph.capture_subscription_frontiers().unwrap();
     let output = image
         .graph
-        .execute_cycle(&super::input(5), 100, None)
+        .execute_cycle(&positioned_input(5, 3), 100, None)
         .await
         .unwrap();
     assert_eq!(total(&output["totals"]), 45);

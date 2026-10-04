@@ -11,6 +11,130 @@ fn diagnostics() {
         .try_init();
 }
 
+#[tokio::test]
+async fn topology_stateful_runtime_waits_for_release_and_cold_recovers_the_target_checkpoint() {
+    diagnostics();
+    let mut additions = stateful_additions();
+    additions.push(laminar_core::cluster::control::CatalogManifestEntry {
+        canonical_name: "new_result_sink".into(),
+        kind: laminar_core::cluster::control::CatalogObjectKind::Sink,
+        catalog_generation: 1,
+        ddl: "CREATE SINK new_result_sink FROM new_total INTO \"planning-sink\" ('topic' = 'state-output')".into(),
+    });
+    let (fixture, committed) = committed_fixture_with_additions(additions).await;
+    let _namespace = namespace_lock(&fixture.db);
+    fixture
+        .authority
+        .controller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            fixture.process_lease.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    let image = fixture
+        .db
+        .recover_committed_cluster_topology(committed.operation_id)
+        .await
+        .unwrap();
+    let probe = enable_runtime(&fixture);
+    fixture
+        .db
+        .install_committed_cluster_topology(image)
+        .await
+        .unwrap();
+    let generation = fixture.db.connector_manager.lock().streams()["new_total"]
+        .subscription_certificate
+        .as_ref()
+        .unwrap()
+        .stream_generation;
+    enqueue(&probe, 3, 91, &[1]);
+    assert!(fixture.db.cluster_intake_fenced());
+    assert!(probe.output.lock().is_empty());
+    fixture
+        .db
+        .release_installed_cluster_topology(committed.operation_id)
+        .await
+        .unwrap();
+    outputs(&probe, 45).await;
+    wait_until(|| {
+        probe
+            .output
+            .lock()
+            .iter()
+            .any(|(topic, _)| topic == "state-output")
+    })
+    .await;
+    let state_output = || {
+        total(
+            &probe
+                .output
+                .lock()
+                .iter()
+                .filter(|(topic, _)| topic == "state-output")
+                .map(|(_, batch)| batch.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(state_output(), 15);
+    fixture.db.checkpoint().await.unwrap();
+    let selected = fixture
+        .authority
+        .controller
+        .committed_topology_recovery_input(committed.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(selected.cut(), TopologyRecoveryCut::TargetCheckpoint);
+    fixture.db.fence_coordinated_recovery_lifecycle();
+    fixture.authority.controller.set_recovering(true);
+    fixture
+        .db
+        .stop_pipeline_for_coordinated_recovery()
+        .await
+        .unwrap();
+    assert!(fixture
+        .db
+        .prepare_committed_cluster_topology_startup()
+        .await
+        .unwrap());
+    probe.output.lock().clear();
+    probe.block_start.store(true, Ordering::Release);
+    fixture.db.enable_coordinated_recovery().unwrap();
+    held_start(&fixture, &probe, 2).await;
+    enqueue(&probe, 6, 94, &[1]);
+    released(&fixture).await;
+    outputs(&probe, 60).await;
+    wait_until(|| {
+        probe
+            .output
+            .lock()
+            .iter()
+            .any(|(topic, _)| topic == "state-output")
+    })
+    .await;
+    assert_eq!(state_output(), 30);
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["new_total"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        generation
+    );
+    let binding = fixture
+        .db
+        .installed_topology_runtime
+        .lock()
+        .clone()
+        .unwrap();
+    assert_eq!(
+        binding.recovery.as_ref().unwrap().selection.checkpoint(),
+        selected.checkpoint()
+    );
+    fixture.db.shutdown().await.unwrap();
+}
+
 fn request_recovery(fixture: &Fixture) {
     diagnostics();
     fixture.db.set_source_gate(true);
@@ -53,7 +177,7 @@ fn future_batch(value: i64) -> RecordBatch {
     let batch = input(value)["trades"][0].clone();
     let mut columns = batch.columns().to_vec();
     columns[1] = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-        200_001, 200_002, 200_003,
+        200_000, 201_000, 202_000,
     ]));
     RecordBatch::try_new(batch.schema(), columns).unwrap()
 }

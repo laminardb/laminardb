@@ -14,7 +14,16 @@ async fn committed_fixture() -> (
     Fixture,
     laminar_core::cluster::control::TopologyAdmissionStatus,
 ) {
-    let (fixture, staged) = restorable_fixture().await;
+    committed_fixture_with_additions(Vec::new()).await
+}
+
+async fn committed_fixture_with_additions(
+    additions: Vec<laminar_core::cluster::control::CatalogManifestEntry>,
+) -> (
+    Fixture,
+    laminar_core::cluster::control::TopologyAdmissionStatus,
+) {
+    let (fixture, staged) = restorable_fixture_with_additions(additions).await;
     let mut image = fixture
         .db
         .prepare_cluster_topology_restore(staged.operation_id)
