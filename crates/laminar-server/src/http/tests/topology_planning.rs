@@ -192,6 +192,26 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
         plan,
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
     );
+    let response = validate(
+        app.clone(),
+        &token,
+        serde_json::json!({"expected_parent_version": 1, "statements": ["CREATE STREAM new_state AS SELECT id, SUM(value) FROM trades GROUP BY id"]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let managed_plan: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let added = managed_plan["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["name"] == "new_state")
+        .unwrap();
+    assert_eq!(added["transition"], "add_future_only");
+    assert_eq!(added["initialization"], "empty_managed_state_at_cut");
+    assert_eq!(added["managed_state_contract"], "sql_aggregate_v1");
     for (request, expected) in [
         (
             serde_json::json!({"expected_parent_version": 2, "statements": additions}),
@@ -206,7 +226,7 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
             StatusCode::BAD_REQUEST,
         ),
         (
-            serde_json::json!({"expected_parent_version": 1, "statements": ["CREATE STREAM new_state AS SELECT id, SUM(value) FROM trades GROUP BY id"]}),
+            serde_json::json!({"expected_parent_version": 1, "statements": ["CREATE STREAM unsupported AS SELECT id, ROW_NUMBER() OVER (PARTITION BY id ORDER BY value) AS rn FROM trades"]}),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (
