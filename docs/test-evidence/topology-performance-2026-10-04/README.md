@@ -35,6 +35,33 @@ guarantee or statistical claim is inferred from the average difference.
 
 ## Process comparison status
 
+The second matched pair qualifies the `5f270ef4...` complete-map admission
+server against the same `72a4ae46...` original and `cbdf3983...` harness. Both
+stock-profile runs pass all final oracles, with compilers idle, 60 steady seconds,
+zero kills, and the same retained 4 GiB/one-shard Kafka and S3 fixtures. Both use
+the fixture's 2,000-partition limit established after attempt 16; the first pair
+used 1,000. No topic, volume or checkpoint namespace was deleted.
+
+| Second pair observation | Original | Modified |
+| --- | ---: | ---: |
+| Whole scenario elapsed, s | 210.01 | 201.24 |
+| Paced producer logical IDs/s | 400.0 | 400.0 |
+| Graph-cycle p50 bucket bound, all nodes, ms | 0.5 | 0.5 |
+| Graph-cycle p95 bucket bound, nodes 0/1/2, ms | 1 / 1 / 1 | 1 / 1 / 5 |
+| Graph-cycle p99 bucket bound, all nodes, ms | 5 | 5 |
+| Full-run sampled combined RSS, bytes | 837,165,056 | 719,101,952 |
+| Final stored endpoint, bytes | 84,501,429 | 97,532,712 |
+
+This is a single matched pair under paced offered load, not a throughput capacity
+test. Graph-cycle bucket bounds exclude the producer-to-consumer path and do not
+establish statistical equivalence. Scenario duration, differing cycle counts and
+artifact endpoints do not prove a speedup, memory budget or retained growth rate.
+The public migration run separately includes the processing hold and Release.
+Allocation events and queue item counts were not measured. Windows WPR/xperf
+are installed, but heap tracing is disabled and this shell lacks administrator
+rights; `allocation-observation-environment.json` records that read-only check.
+Buffer bytes and managed-state charges remain distinct gauges.
+
 The original three-process steady scenario passed its final stateful, sink and
 independent oracles in 228.05 seconds, using the retained corrected harness,
 60 requested steady seconds, zero kills, 12 Kafka partitions, 400 offered

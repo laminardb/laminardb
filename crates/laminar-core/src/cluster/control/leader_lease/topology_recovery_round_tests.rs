@@ -421,12 +421,72 @@ async fn topology_recovery_round_preserves_exact_handoff_pin_until_new_target_ch
         panic!("replacement process");
     };
     let before = fixture.assignments.load().await.unwrap().unwrap();
+    let process_fence = ProcessLeaseFence::new(prior, replacement.clone()).unwrap();
+    // A failed owner must be replaced in its original slot. Even with a valid takeover,
+    // admission must not strand the committed topology on a reduced or redistributed map.
+    for remove_owner in [true, false] {
+        let mut owners = before.vnodes.clone();
+        for owner in owners.values_mut() {
+            *owner = if remove_owner || owner.0 == 2 {
+                NodeId(1)
+            } else {
+                NodeId(2)
+            };
+        }
+        let mut roster = before.participants.clone();
+        if remove_owner {
+            roster.retain(|participant| participant.node_id != 2);
+        } else {
+            roster[1].boot_incarnation = replacement.owner;
+        }
+        let unsupported = before.next_for_participants(owners, roster).unwrap();
+        let proposal = fixture
+            .assignments
+            .stage_recovery_proposal(&unsupported)
+            .await
+            .unwrap();
+        let proof = input.current_leader().unwrap();
+        let decision = AssignmentRecoveryDecision::new(
+            before.assignment_fence().unwrap(),
+            unsupported.assignment_fence().unwrap(),
+            proposal,
+            vec![process_fence.clone()],
+            checkpoint.clone(),
+            proof.clone(),
+        )
+        .unwrap();
+        let authority_before = authority.load_record().await.unwrap();
+        assert!(
+            authority
+                .record_assignment_recovery_decision(&proof, decision)
+                .await
+                .is_err(),
+            "committed topology must reject survivor rescaling before authority admission"
+        );
+        assert_eq!(authority.load_record().await.unwrap(), authority_before);
+        assert_eq!(
+            fixture.assignments.load().await.unwrap(),
+            Some(before.clone())
+        );
+        assert!(fixture
+            .assignments
+            .load_version(before.version + 1)
+            .await
+            .unwrap()
+            .is_none());
+    }
     let mut roster = before.participants.clone();
     roster[1].boot_incarnation = replacement.owner;
     let assignment = before
         .next_for_participants(before.vnodes.clone(), roster)
         .unwrap();
     let target = assignment.assignment_fence().unwrap();
+    let authority_before = authority.load_record().await.unwrap();
+    authority
+        .validate_topology_assignment_proposal(&target)
+        .await
+        .unwrap();
+    assert_eq!(authority.load_record().await.unwrap(), authority_before);
     let proposal = fixture
         .assignments
         .stage_recovery_proposal(&assignment)
@@ -437,7 +497,7 @@ async fn topology_recovery_round_preserves_exact_handoff_pin_until_new_target_ch
         before.assignment_fence().unwrap(),
         target.clone(),
         proposal,
-        vec![ProcessLeaseFence::new(prior, replacement).unwrap()],
+        vec![process_fence],
         checkpoint.clone(),
         proof.clone(),
     )

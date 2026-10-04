@@ -85,6 +85,15 @@ progress. The existing survivor-rescaling soak exercises a separate membership
 contract. A reduced assignment is not evidence for topology Release; the partial
 process run rejected it and stayed fenced.
 
+Assignment drain reservation and failure-recovery admission now also audit the
+committed topology's immutable plan and require that complete owner map. This
+prevents automatic rebalance from publishing a survivor map that target recovery
+cannot use. Recovery performs the same bounded, read-only check before closing
+local authority or fencing predecessor processes. The authority append rechecks
+it against its exact head; preflight alone grants no assignment or process
+authority. Complete-map replacement still validates takeover proofs, current
+leases, the exact portable checkpoint and a fresh recovery Release.
+
 An assignment-recovery handoff pin protects the exact selected restore cut until
 the replacement assignment commits its first target checkpoint. Recovery
 Start/install/Release may retain that pin only when its complete assignment fence
@@ -157,12 +166,12 @@ Compiler ownership precedes the catalog read lock during isolated validation. Pu
 
 The linked evidence folders record the original baseline, tested source hashes, unchanged Cargo.lock, features, exact commands/results and each fixture's scope. Existing control/graph/sink/source tests cover malformed artifacts, stale evidence, lost responses, cancellation, checkpoint races and replacement release. Stored-segment tests cover reconnect identity and cleanup corruption.
 
-The [boundary-test index](test-evidence/topology-public-process-2026-10-03/portable-bootstrap-fault-coverage.json)
-binds 40 existing authority and owned-runtime fault regressions to the passing
-4,470-test run. It covers lost responses, cancellation, stale leaders, failed
+The [boundary-test index](test-evidence/topology-public-process-2026-10-03/owner-map-fault-coverage.json)
+binds 43 existing authority and owned-runtime fault regressions to the passing
+4,472-test run. It covers lost responses, cancellation, stale leaders, failed
 installation and held replacement Release at their stated boundaries. It does
 not claim that native processes were killed at every migration phase.
 
-The public migration soak extends the existing real three-process Kafka/S3 stateful harness. It adds an independent latest-source pipeline, SQL downstream stream, deterministic paused-input/output checks, post-migration hard kills and full target restart with the original bootstrap. Its consumer-visible timing starts before producing records during a held prepared cut, including the explicit test hold and subsequent Release. Existing independent join/window/aggregate oracles remain required. It must pass before it is cited as real-process migration evidence.
+The public migration soak extends the existing real three-process Kafka/S3 stateful harness. It adds an independent latest-source pipeline, SQL downstream stream, deterministic paused-input/output checks, post-migration hard kills and full target restart with the original bootstrap. Its consumer-visible timing starts before producing records during a held prepared cut, including the explicit test hold and subsequent Release. Attempt 15 passes both migrations, the whole cold restart and the independent join/window/aggregate oracles. Attempt 17 exposed survivor-map assignment admission after its second kill; qualification of the complete-map admission repair is recorded separately in [process evidence](test-evidence/topology-public-process-2026-10-03/README.md).
 
 Safe removals/replacements require their own descriptor/projection and incarnation contracts. Root consumption, journal reclamation, the remaining fault matrix and matched baseline/current steady-state and pause-inclusive performance measurements remain tracked work. Local timings are observations of their stated workload/environment, not production guarantees.

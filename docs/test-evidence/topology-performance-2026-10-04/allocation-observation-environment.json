@@ -1,0 +1,12 @@
+{
+  "recorded_utc": "2026-10-04T05:25:00Z",
+  "platform": "Windows MSVC",
+  "wpr_path": "C:/WINDOWS/system32/wpr.exe",
+  "xperf_path": "C:/Program Files (x86)/Windows Kits/10/Windows Performance Toolkit/xperf.exe",
+  "wpr_status": "WPR is not recording",
+  "owned_executable_heap_tracing_enabled": false,
+  "current_shell_is_administrator": false,
+  "allocation_events_measured": false,
+  "queue_depth_measured": false,
+  "scope": "Read-only profiler availability and process-specific heap tracing configuration checks. Native heap tracing requires an elevated Windows tracing session. Existing production metrics expose buffered bytes and managed-state charges, rather than queue item counts. No profiler or machine configuration was modified."
+}

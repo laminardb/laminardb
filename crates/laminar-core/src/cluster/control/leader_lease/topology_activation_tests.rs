@@ -297,6 +297,55 @@ async fn topology_activation_release_allows_only_target_checkpoint_during_assign
 }
 
 #[tokio::test]
+async fn topology_activation_rejects_owner_map_changes_before_drain_reservation() {
+    let authority = store(30_000);
+    let (fixture, input) = committed(&authority).await;
+    let input = install_all(&authority, &fixture, &input).await;
+    release(&authority, &fixture, &input).await.unwrap();
+    let current = fixture.assignments.load().await.unwrap().unwrap();
+    let proof = input.current_leader().unwrap();
+    for remove_owner in [true, false] {
+        let mut owners = current.vnodes.clone();
+        for owner in owners.values_mut() {
+            *owner = if remove_owner || owner.0 == 2 {
+                NodeId(1)
+            } else {
+                NodeId(2)
+            };
+        }
+        let mut roster = current.participants.clone();
+        if remove_owner {
+            roster.retain(|participant| participant.node_id != 2);
+        }
+        let proposal = current
+            .next_draining(owners, roster, proof.clone())
+            .unwrap();
+        let before = authority.load_record().await.unwrap();
+        assert!(authority
+            .validate_topology_assignment_proposal(
+                &proposal.drain_transition.as_ref().unwrap().target,
+            )
+            .await
+            .is_err());
+        assert!(authority
+            .publish_assignment_drain(&proof, &fixture.assignments, &proposal)
+            .await
+            .is_err());
+        assert_eq!(authority.load_record().await.unwrap(), before);
+        assert_eq!(
+            fixture.assignments.load().await.unwrap(),
+            Some(current.clone())
+        );
+        assert!(fixture
+            .assignments
+            .load_version(current.version + 1)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[tokio::test]
 async fn topology_activation_cancelled_successful_release_is_authoritative() {
     let (raw, authority) = delayed_ambiguous_response_once_at(30_000, lease_path(17));
     let (fixture, input) = committed(&authority).await;

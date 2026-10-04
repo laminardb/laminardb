@@ -5389,6 +5389,15 @@ impl LeaderLeaseStore {
                 };
             }
             current.reject_topology_preparation()?;
+            let target = match &decision {
+                AuthorityAssignmentDecision::Recovery(recovery) => &recovery.target,
+                AuthorityAssignmentDecision::Drain(drain) => match drain.verdict {
+                    AssignmentDrainVerdict::Commit => &drain.transition.target,
+                    AssignmentDrainVerdict::Abort => &drain.transition.predecessor,
+                },
+            };
+            self.validate_topology_assignment_proposal_from(current, target)
+                .await?;
             current.validate_reserved_assignment_decision(&decision)?;
             if let (Some(reservation), AuthorityAssignmentDecision::Drain(_)) =
                 (&current.assignment_drain_reservation, &decision)

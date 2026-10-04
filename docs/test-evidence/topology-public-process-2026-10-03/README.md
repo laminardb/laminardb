@@ -1,5 +1,28 @@
 # Public three-process migration qualification
 
+Attempt 18 passes the complete-owner-map admission repair, both public additive
+migrations, three hard kills (one leader and two followers), the final whole
+original-bootstrap cold restart, and every independent final stateful, sink and
+sequence oracle. It finishes in 423.53 s. The stock server is `5f270ef4...`, bound
+to base `b8f38a02` plus six frozen sources in
+`public-soak-18-binary-identity.json`; the retained harness remains `cbdf3983...`.
+No compiler ran during this qualification or the following matched steady pair.
+
+The replacements reach full-roster Release and target checkpoints 35/41/48 in
+41.57/33.15/36.52 s. The final cold restart reaches fresh output in 70.51 s,
+within the unchanged 90-second deadline. It produces nine expected new-pipeline
+pairs with zero observed allowed replay duplicates. The read-only collector
+verifies final checkpoint 118 by exact length and SHA-256, along with authority.
+Original Active receipts remain immutable. No storage or topic was reset.
+
+Sampled combined RSS peaks at 844,259,328 bytes. Nine consumer observations,
+including the deliberate 2.020 s cut hold, yield nearest-rank p50 351.02 ms and
+p95/p99 18,835.13 ms. These are small correctness-oracle observations. The
+`owner-map-verification-summary.json` and 43-test boundary index bind the two
+meaningful failing admission regressions, 285 focused and 4,472 full passing
+tests, Clippy, the minimal server check and the stock build. Historical failed
+runs and their distinct source scopes remain below.
+
 Attempt 15 passes public adoption, both additive migrations, a complete cold
 restart with the original bootstrap, and all independent final stateful, sink
 and sequence oracles. The stock server is `54e3a3d2...`; its exact frozen nine-source

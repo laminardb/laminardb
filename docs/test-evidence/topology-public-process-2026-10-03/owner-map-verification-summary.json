@@ -1,0 +1,262 @@
+{
+  "recorded_utc": "2026-10-04T05:26:24.412887+00:00",
+  "source_identity": {
+    "recorded_utc": "2026-10-04T05:01:59.374126+00:00",
+    "base_commit": "b8f38a0253d5d89d16dcc451febd786f35b963fd",
+    "changed_sources": [
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/assignment_drain.rs",
+        "sha256": "a6ecd6e70a8ffa70a096ccb5207f2bc7aed70b25dbbc664a8425c371068460e8",
+        "normalized_sha256": "a6ecd6e70a8ffa70a096ccb5207f2bc7aed70b25dbbc664a8425c371068460e8"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/mod.rs",
+        "sha256": "ed06080006b31ab864620e276953ebc86b7ed98f380b403784f6bf61a80ae991",
+        "normalized_sha256": "ed06080006b31ab864620e276953ebc86b7ed98f380b403784f6bf61a80ae991"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_activation_tests.rs",
+        "sha256": "0df8be2467ea6507376b43fb0c01e289b2d643d1aed456ef3365d1fab615642d",
+        "normalized_sha256": "0df8be2467ea6507376b43fb0c01e289b2d643d1aed456ef3365d1fab615642d"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round.rs",
+        "sha256": "c1a4c8639438ee15c34021a0165c56f25a0f3e8ae9dec9de4f56a8654054a53e",
+        "normalized_sha256": "c1a4c8639438ee15c34021a0165c56f25a0f3e8ae9dec9de4f56a8654054a53e"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round_tests.rs",
+        "sha256": "6761a910674ad9311c93a5d0c5723cc00146cbd4702a0f04d4524e4be59cbcf3",
+        "normalized_sha256": "6761a910674ad9311c93a5d0c5723cc00146cbd4702a0f04d4524e4be59cbcf3"
+      },
+      {
+        "path": "crates/laminar-db/src/rebalance/mod.rs",
+        "sha256": "b4645e3bcca866981cc706faaeab2358ee0a827d7517557df5943d240bd5987a",
+        "normalized_sha256": "b4645e3bcca866981cc706faaeab2358ee0a827d7517557df5943d240bd5987a"
+      }
+    ],
+    "protobuf_sources": [
+      {
+        "path": "crates/laminar-core/build.rs",
+        "sha256": "789c1a66b34f9b10008d9e6d233d895bdbaa8a175bba12c388764dd6c7d6f34e",
+        "normalized_sha256": "0d5f520caabb350aa246861ff7ced38779b1c735c38b9b9ed2abca9e3990a694"
+      },
+      {
+        "path": "crates/laminar-core/proto/shuffle.proto",
+        "sha256": "34ee91c0abdaeecd5caeee1b01d917737822922f3e31c25aa3124dc5ad8abd9a",
+        "normalized_sha256": "e7bc5d27a64632e0bb8fb110da4dc026b5eb031c7d4c55585f8b6c4f0e812a68"
+      },
+      {
+        "path": "crates/laminar-core/proto/barrier.proto",
+        "sha256": "657f6183ae817ea53cc8acb6e89d77c186fe8dc09dd81dad998af7a421765b74",
+        "normalized_sha256": "3287aee88a54a3f39e09beaf101761cfd3dca8c70184d52e7f895bd78d7f6e29"
+      }
+    ],
+    "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+    "build_command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+    "scope": "Exact complete-owner-map admission check for drain and failure recovery, with read-only preflight before process fencing. No wire, durable format, dependency or record-path changes. Native qualification is separate."
+  },
+  "red_test_source_identity": {
+    "base_commit": "b8f38a0253d5d89d16dcc451febd786f35b963fd",
+    "changed_test_sources": [
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_activation_tests.rs",
+        "sha256": "8de0e0326a0b4b65ef9d1bfe7b806a27334ad2860e6b95f64da3c2c69d73b105"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round_tests.rs",
+        "sha256": "0d933b3ebaa30d6f239118b6ec4d3e13e139bd3913d18e7e147529fc6b0c589b"
+      }
+    ]
+  },
+  "commands": [
+    {
+      "phase": "drain_red",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_activation_rejects_owner_map_changes_before_drain_reservation -- --test-threads=1 --nocapture",
+      "exit_code": 101,
+      "raw_log_path": "target/topology-evidence/topology-owner-map-reservation-red-raw.txt",
+      "raw_log_sha256": "034fc08e51e113bcf66fbaa44b6020f7e3f05f66ceab0c81f53049acdf74e482",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.01
+        },
+        {
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.15
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 21s\r"
+      ]
+    },
+    {
+      "phase": "recovery_red",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_recovery_round_preserves_exact_handoff_pin_until_new_target_checkpoint -- --test-threads=1 --nocapture",
+      "exit_code": 101,
+      "raw_log_path": "target/topology-evidence/topology-owner-map-recovery-red-raw.txt",
+      "raw_log_sha256": "50ee813754dee932ebaea5321159cc0528fa3d531e0fc80fbaa19a9f47f90a98",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "test_elapsed_seconds": 30.19
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.94s\r"
+      ]
+    },
+    {
+      "phase": "focused",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_ -- --test-threads=8",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-owner-map-admission-green-raw.txt",
+      "raw_log_sha256": "0b4f0dbdcc7e16980e86505acacf8d7b0deca323156d91fd7845296e31f3d8a1",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 12,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 3.13
+        },
+        {
+          "result": "ok",
+          "passed": 137,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 31.42
+        },
+        {
+          "result": "ok",
+          "passed": 130,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 22.79
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.14
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 13m 47s\r"
+      ]
+    },
+    {
+      "phase": "full",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins -- --test-threads=8",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-owner-map-full-raw.txt",
+      "raw_log_sha256": "e6c2b9065879359c233a8daeb4daaeb65bfc6ef28976c58442efa3e525e8b70c",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 921,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 46.78
+        },
+        {
+          "result": "ok",
+          "passed": 1108,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 32.33
+        },
+        {
+          "result": "ok",
+          "passed": 2084,
+          "failed": 0,
+          "ignored": 1,
+          "test_elapsed_seconds": 24.39
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "ok",
+          "passed": 359,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 6.13
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.68s\r"
+      ]
+    },
+    {
+      "phase": "clippy",
+      "command": "cargo clippy --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-owner-map-clippy-raw.txt",
+      "raw_log_sha256": "d4c551fdded0778ed06c03cea1dc4f60188633ddbe1c873dcb6866800a5dde3d",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 41s\r"
+      ]
+    },
+    {
+      "phase": "minimal",
+      "command": "cargo check --locked -p laminar-server --no-default-features",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-owner-map-minimal-raw.txt",
+      "raw_log_sha256": "690457e9a06a371a0f8a3d61a121d34c1ec752eb8e88650ac1e2d3fffd7cfea8",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.33s\r"
+      ]
+    },
+    {
+      "phase": "stock_build",
+      "command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-owner-map-stock-soak-build-raw.txt",
+      "raw_log_sha256": "e3a86588132dd1741e2e926929f58647e66450efabeb1e0910d3474e853c89d4",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `soak` profile [optimized] target(s) in 24m 03s\r"
+      ]
+    }
+  ],
+  "red_scope": "Base b8 production and the exact two test sources recorded before the repair. Additional public preflight assertions were added after these failing reservation/decision assertions. Both failures exercised durable authority admission, rather than fixture setup.",
+  "green_scope": "Six frozen Rust sources. Complete-map preflight rejects changes before process fencing; reservation and decision append recheck the audited committed topology. Invalid proposals preserve the authority/assignment heads, while a same-slot takeover completes recovery Release and the next exact checkpoint.",
+  "environment": {
+    "cargo_build_jobs": 1,
+    "rust_min_stack_bytes": 4194304,
+    "locked_dependencies": true,
+    "unsafe_or_profile_changes": false
+  },
+  "scope": "Focused verification followed by fail-fast full tests, Clippy, minimal check and stock build. Binary identity and native process qualification are recorded separately."
+}

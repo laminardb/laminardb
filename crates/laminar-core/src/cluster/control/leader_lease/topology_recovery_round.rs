@@ -6,11 +6,83 @@ use super::{
 };
 use crate::checkpoint::CheckpointScope;
 use crate::cluster::control::{
-    AssignmentSnapshotStore, LocalProcessAuthorityIdentity, ProcessLeaseAuthority,
-    RecoveryAnnouncement, RecoveryRound, TopologyRecoveryBinding,
+    AssignmentSnapshotStore, CheckpointAssignmentFence, LocalProcessAuthorityIdentity,
+    ProcessLeaseAuthority, RecoveryAnnouncement, RecoveryRound, TopologyRecoveryBinding,
 };
 
 impl LeaderLeaseStore {
+    /// Check placement compatibility before fencing processes for an assignment proposal.
+    /// This is read-only preflight; the shared assignment append rechecks the same constraint.
+    /// An irreversible topology Commit currently supports replacement in the same node slots,
+    /// with its complete vnode map, rather than membership changes or state redistribution.
+    ///
+    /// # Errors
+    /// Rejects a pending topology, changed placement, corrupt evidence or a bounded read failure.
+    pub async fn validate_topology_assignment_proposal(
+        &self,
+        proposal: &CheckpointAssignmentFence,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        tokio::time::timeout(CONTROL_TIMEOUT, async {
+            let before = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            self.validate_topology_assignment_proposal_from(&before, proposal)
+                .await?;
+            let after = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            after.reject_topology_preparation()?;
+            if before.lease.proof() != after.lease.proof()
+                || before.committed_topology_identity() != after.committed_topology_identity()
+            {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| DecisionError::Conflict("topology assignment preflight timed out".into()))?
+    }
+
+    pub(super) async fn validate_topology_assignment_proposal_from(
+        &self,
+        current: &LeaderAuthorityRecord,
+        proposal: &CheckpointAssignmentFence,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        current.reject_topology_preparation()?;
+        if !proposal.is_canonical() {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        let Some(operation) = current.committed_topology_operation() else {
+            return Ok(());
+        };
+        self.audit_topology_operation(operation).await?;
+        let plan = self
+            .load_topology_plan(&operation.plan)
+            .await
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        if proposal.assignment_version < plan.assignment.assignment_version
+            || proposal.assignment_digest != plan.assignment.assignment_digest
+            || proposal.vnode_count != plan.assignment.vnode_count
+            || proposal.partitioning_abi_version != plan.assignment.partitioning_abi_version
+            || !proposal
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .eq(plan
+                    .assignment
+                    .participants
+                    .iter()
+                    .map(|participant| participant.node_id))
+        {
+            return Err(DecisionError::Conflict(
+                "committed topology requires the unchanged complete owner map; replace failed processes in their original node slots".into()
+            ).into());
+        }
+        Ok(())
+    }
+
     pub(crate) async fn recovery_topology_binding(
         &self,
         round: &RecoveryRound,

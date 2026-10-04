@@ -3168,6 +3168,18 @@ fn authorize_recovery_successor<'a>(
             .assignment_fence()
             .map_err(|error| error.to_string())?;
         let deadline = controller.process_fencing_deadline(operation_timeout)?;
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        // A committed topology cannot restore on a survivor map. Wait for complete-slot
+        // replacement before closing authority or taking over any predecessor process lease.
+        tokio::time::timeout_at(
+            deadline,
+            authority.validate_topology_assignment_proposal(&target),
+        )
+        .await
+        .map_err(|_| "topology assignment preflight exceeded the fencing deadline".to_string())?
+        .map_err(|error| error.to_string())?;
         let removed = replaced_predecessor_processes(&predecessor, &target);
         let process_fences =
             close_local_assignment_authority(db, controller, &target, &removed, deadline).await?;
@@ -3207,9 +3219,6 @@ fn authorize_recovery_successor<'a>(
             }
         }
 
-        let authority = controller
-            .checkpoint_authority()
-            .map_err(|error| error.to_string())?;
         let committed_head =
             tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
                 .await

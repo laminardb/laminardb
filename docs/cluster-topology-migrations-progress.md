@@ -2,8 +2,9 @@
 
 Public additive SQL/API submission passes the selected regression suite, actual
 actor/checkpoint tests and the three-process Kafka/S3 migration/full-restart
-oracle. Additional injected-failure qualification exposed a rebalance defect. Safe removals,
-root/journal reclamation and current matched performance evidence remain
+oracle, including three injected failures. Complete-map admission fixes the
+observed rebalance defect. Post-Commit boot admission, safe removals and
+root/journal reclamation remain
 unfinished. The complete requested scope has not yet been met.
 
 ## Baseline and current validation
@@ -17,11 +18,11 @@ unfinished. The complete requested scope has not yet been met.
   include Arrow 58.4.0, DataFusion 53.1.0, sqlparser 0.61.0, object_store 0.13.2,
   tokio 1.53.1 and tonic 0.14.6. No AGENTS.md applies.
 - The latest full four-package `cluster,aws,kafka` library/binary suite passes
-  4,471 tests: core 1,107, connectors 921, DB 2,084, server 359; three existing
-  tests remain ignored. The focused topology suite passes 284 tests, including
+  4,472 tests: core 1,108, connectors 921, DB 2,084, server 359; three existing
+  tests remain ignored. The focused topology suite passes 285 tests, including
   older-assignment root/target actor recovery and a subsequent checkpoint.
-  Eight test threads and 4 MiB stacks retain existing deadlines. Nine Rust
-  sources are frozen against `f4c7e3de`; formatting and diff checks pass.
+  Eight test threads and 4 MiB stacks retain existing deadlines. Six Rust
+  sources are frozen against `b8f38a02`; formatting and diff checks pass.
   All-target Clippy with warnings denied and the minimal-server check pass.
   Earlier cluster/FFI checks passed; default connector feature suites are not run.
 - Earlier [public evidence](test-evidence/topology-public-2026-10-03/README.md) binds 37
@@ -100,6 +101,25 @@ pin old state, and the journal rejects new identities at 64 retained operations.
   aggregate continuation (45/60), incompatible-owner rejection and a new
   current-assignment checkpoint. Two earlier fixture attempts failed before
   selection and are excluded from the production regression claim.
+- Local commit `b8f38a02` records that repair and its passing three-process cold
+  restart. The next six-source increment adds complete-owner-map validation to
+  assignment drain reservation and failure-recovery admission, plus read-only
+  preflight before process fencing. Two meaningful authority regressions failed
+  before the repair (0.15 s drain, 30.19 s recovery); the focused suite now passes
+  285 tests. Rejected proposals leave authority and assignment heads unchanged;
+  same-slot takeover still reaches Release and the next exact target checkpoint.
+  The full suite passes 4,472 tests (three existing ignored); all-target Clippy
+  and the minimal server check pass. The stock server build passed in 24m 03s;
+  retained server SHA-256 is
+  `5f270ef4789f1b2be15e7571109a528ef2521ace82c93179dccb9282bde56459`,
+  with the unchanged soak profile and 1 MiB Windows main stack. Native attempt
+  18 passes both public migrations, three injected failures and the final whole
+  original-bootstrap restart, with all independent final oracles, in 423.53 s.
+  Replacements reached full-roster Release/checkpoint in 41.57/33.15/36.52 s;
+  the cold restart reached fresh output in 70.51 s. The unchanged 90-second
+  ceiling passed. Pause-inclusive consumer p95/p99 were 18,835.13 ms over nine
+  observations; sampled combined server RSS peaked at 844,259,328 bytes.
+  Exact final checkpoint 118 bytes/hash and durable authority were verified.
 - Focused verification passes 284 tests; the full selected suite passes 4,471
   (three ignored). All-target Clippy denies warnings and passes; the minimal
   server and formatting checks pass. Sources are frozen against `f4c7e3de` and
@@ -123,8 +143,8 @@ pin old state, and the journal rejects new identities at 64 retained operations.
 - Existing deterministic fault evidence covers lost responses, cancellation,
   leader/process replacement, every durable migration phase, owned actor startup,
   target-cut selection and cleanup races. The
-  [42-test boundary index](test-evidence/topology-public-process-2026-10-03/portable-installation-fault-coverage.json)
-  binds the current 4,471-test run. It is neither a new fault framework nor a
+  [43-test boundary index](test-evidence/topology-public-process-2026-10-03/owner-map-fault-coverage.json)
+  binds the current 4,472-test run. It is neither a new fault framework nor a
   claim of native kills at every phase.
 - Three alternating original/modified stock queue trials average 6.05832/6.02855
   microseconds per 32-batch burst (-0.49145% point estimate). The matched first
@@ -133,7 +153,14 @@ pin old state, and the journal rejects new identities at 64 retained operations.
   1 to 5 ms; all p99 bounds were 5 ms. Full-run RSS peaks were 932,233,216 and
   805,085,184 bytes. The modified server was the earlier `f9a05d5f...` build;
   the current recovery repair is outside those process measurements. Allocation
-  events and queue depth were unavailable. See
+  events and queue depth were unavailable. The second matched pair uses the
+  newly qualified `5f270ef4...` server and passes all final oracles in
+  210.01/201.24 s. Both producers acknowledge 400 paced IDs/s. All p50 bounds
+  are 0.5 ms and p99 bounds 5 ms; current node 2's p95 is 5 ms versus the
+  original's 1 ms. RSS peaks are 837,165,056/719,101,952 bytes. Stored endpoints
+  contain 84,501,429/97,532,712 bytes; they are neither capacity nor growth-rate
+  claims. Windows heap profiling tools exist, but this shell lacks administrator
+  rights and tracing is disabled. No machine configuration was changed. See
   [performance evidence](test-evidence/topology-performance-2026-10-04/README.md).
 
 Full passing and failed-run source/binary identities, raw measurements, exact authority and
@@ -144,11 +171,9 @@ no storage reset or external deletion was used.
 
 ## Next work, in order
 
-1. Prevent assignment admission from rescaling an Active committed topology;
-   preserve current process fencing and allow complete-map replacement only.
-   Repeat the three-kill native run plus another complete original-bootstrap
-   restart. Preserve the full roster and 90-second Release ceiling and retain the independent
-   stateful, sink and sequence oracles and pause-inclusive consumer observations.
+1. Close the remaining admission gap for fresh process boots after Commit and
+   before the first target checkpoint, including partial installation. Preserve
+   pre-Commit exclusion, the complete map, process fences and full-roster Release.
 2. Implement only removals whose stop, sink-settlement and state contracts prove
    safety. Removal also needs retired-incarnation and replay evidence; the current
    additive descriptor cannot supply it. Preserve unsupported transformation
@@ -157,8 +182,8 @@ no storage reset or external deletion was used.
    horizon make it unnecessary. Preserve root audit metadata and reuse serialized
    cleanup reservations. Release alone cannot consume a root. Add bounded journal
    retirement without forgetting idempotency or replay continuity.
-4. Repeat matched original/current steady process measurements with idle compilers
-   and the newly qualified server. Keep preparation, pause, checkpoint, restore,
+4. Keep any subsequent repair outside the recorded second matched pair's source
+   scope until requalified. Keep preparation, pause, checkpoint, restore,
    activation and recovery-to-freshness measurements distinct.
 5. Update verified operator examples, the support matrix and final handoff. Additional
    failure qualification, removals and root/journal retirement remain unfinished;

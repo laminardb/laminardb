@@ -70,6 +70,8 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
+            self.validate_topology_assignment_proposal_from(current, &transition.target)
+                .await?;
             if let Some(reservation) = &current.assignment_drain_reservation {
                 if reservation.proposal != reference || &reservation.transition != transition {
                     return Err(DecisionError::Conflict(
