@@ -46,6 +46,108 @@ async fn topology_removal_cold_bootstrap_asserts_original_config_without_recreat
     }
 }
 
+#[tokio::test]
+async fn topology_reset_cold_bootstrap_uses_new_incarnation_before_the_first_target_checkpoint() {
+    let (fixture, staged) = restorable_fixture_with_statements(vec![
+        "DROP SINK existing_sink".into(), "DROP STREAM totals".into(),
+        "CREATE STREAM totals AS SELECT id, COUNT(*) AS total FROM trades GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
+        "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'changed-output')".into(),
+    ]).await;
+    let original = fixture
+        .db
+        .catalog_manifest_inventory()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.ddl.clone())
+        .collect::<Vec<_>>();
+    let mut image = fixture
+        .db
+        .prepare_cluster_topology_restore(staged.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(image.restored_frame_count(), 0);
+    assert!(image.root().subscriptions.is_empty());
+    let committed = fixture
+        .db
+        .commit_cluster_topology_target(&mut image)
+        .await
+        .unwrap();
+    drop(image);
+    let old_definition = fixture
+        .db
+        .connector_manager
+        .lock()
+        .get_ddl("totals")
+        .unwrap()
+        .to_owned();
+    let uncertified_definition = old_definition.replace("SUM(value)", "MAX(value)");
+    fixture
+        .db
+        .connector_manager
+        .lock()
+        .store_ddl("totals", &uncertified_definition);
+    assert!(matches!(
+        fixture.db.restore_catalog_from_manifest().await,
+        Err(DbError::Topology(TopologyError::Conflict(_)))
+    ));
+    assert_eq!(
+        fixture.db.connector_manager.lock().get_ddl("totals"),
+        Some(uncertified_definition.as_str())
+    );
+    fixture
+        .db
+        .connector_manager
+        .lock()
+        .store_ddl("totals", &old_definition);
+    let fresh = Fixture::with_authority(TestCatalogAuthority {
+        checkpoint_store: Arc::clone(&fixture.authority.checkpoint_store),
+        manifest_store: Arc::clone(&fixture.authority.manifest_store),
+        lease_store: Arc::clone(&fixture.authority.lease_store),
+        controller: Arc::clone(&fixture.authority.controller),
+        lease_tx: fixture.authority.lease_tx.clone(),
+        lease: fixture.authority.lease.clone(),
+    })
+    .await;
+    let results = fresh
+        .db
+        .execute_cluster_bootstrap_batch(&original)
+        .await
+        .unwrap();
+    assert!(results
+        .iter()
+        .all(|result| matches!(result, ExecuteResult::Ddl(info) if !info.applied)));
+    let inventory = fresh.db.catalog_manifest_inventory().unwrap();
+    assert_eq!(inventory[1].catalog_generation, 8);
+    assert!(inventory[1].ddl.contains("COUNT(*)"));
+    let authorization = fresh
+        .authority
+        .controller
+        .committed_topology_restore_input(committed.operation_id)
+        .await
+        .unwrap();
+    fresh
+        .db
+        .install_shuffle_assignment_fence(authorization.assignment())
+        .unwrap();
+    let mut recovered = fresh
+        .db
+        .recover_committed_cluster_topology(committed.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(recovered.restored_frame_count(), 0);
+    recovered.graph.set_query_budget_ns(u64::MAX);
+    let output = recovered
+        .graph
+        .execute_cycle(&input(5), i64::MIN, None)
+        .await
+        .unwrap();
+    assert_eq!(total(&output["totals"]), 3);
+    assert_eq!(fresh.effects.load(Ordering::Acquire), 0);
+    assert_eq!(fresh.resolutions.load(Ordering::Acquire), 0);
+    fresh.db.shutdown().await.unwrap();
+    fixture.db.shutdown().await.unwrap();
+}
+
 async fn assert_removal_cold_bootstrap(drop_count: usize) {
     let statements = [
         "DROP SINK existing_sink",

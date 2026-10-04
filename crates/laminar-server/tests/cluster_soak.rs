@@ -13781,7 +13781,7 @@ fn three_node_alo_topology_cut_abort_restart_soak() {
 }
 
 #[test]
-#[ignore = "spawns 3 real Kafka/S3 processes; public additive migrations, paused-input oracle, hard kills and full namespace restart"]
+#[ignore = "spawns 3 real Kafka/S3 processes; public additions/replacement/reset, paused-input oracle, hard kills and full namespace restart"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
 fn three_node_alo_public_topology_migration_restart_soak() {
     run_three_node_join_kill9_soak_with_adoption(

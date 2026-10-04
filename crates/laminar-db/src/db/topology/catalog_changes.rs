@@ -1,6 +1,6 @@
 //! Apply supported DDL to an isolated catalog, retaining an exact request and parent inventory.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use laminar_core::cluster::control::{
     CatalogManifest, CatalogManifestStore, CatalogObjectKind, TopologyCatalogState, TopologyError,
@@ -21,9 +21,9 @@ pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError>
         .pop()
         .ok_or_else(|| TopologyError::Invalid("empty validation entry".into()))?;
     let allowed = match &statement {
-        StreamingStatement::CreateSource(create) => !create.or_replace,
-        StreamingStatement::CreateSink(create) => !create.or_replace,
-        StreamingStatement::CreateStream { or_replace, .. } => !or_replace,
+        StreamingStatement::CreateSource(_)
+        | StreamingStatement::CreateSink(_)
+        | StreamingStatement::CreateStream { .. } => true,
         StreamingStatement::DropSource { cascade, .. }
         | StreamingStatement::DropStream { cascade, .. }
         | StreamingStatement::DropSink { cascade, .. } => !cascade,
@@ -31,7 +31,7 @@ pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError>
     };
     if !allowed {
         return Err(TopologyError::Unsupported(
-            "topology validation supports CREATE/DROP SOURCE/STREAM/SINK without CASCADE; replacement and reset require separate contracts".into(),
+            "topology validation supports CREATE, CREATE OR REPLACE and DROP SOURCE/STREAM/SINK without CASCADE".into(),
         )
         .into());
     }
@@ -73,9 +73,17 @@ pub(super) async fn apply_statement(
     statement: &StreamingStatement,
     name: &str,
 ) -> Result<(), DbError> {
+    let ddl = create_definition(sql, statement)?;
+    let mut create = statement.clone();
+    match &mut create {
+        StreamingStatement::CreateSource(create) => create.or_replace = false,
+        StreamingStatement::CreateSink(create) => create.or_replace = false,
+        StreamingStatement::CreateStream { or_replace, .. } => *or_replace = false,
+        _ => {}
+    }
     // The exception belongs to this unstarted catalog. Active runtime DDL uses admission.
     let result = super::super::CATALOG_MANIFEST_REPLAY
-        .scope((), candidate.execute_parsed_single(sql, statement))
+        .scope((), candidate.execute_parsed_single(&ddl, &create))
         .await?;
     if !matches!(result, crate::handle::ExecuteResult::Ddl(ref info) if info.applied && info.object_name == name)
     {
@@ -91,26 +99,28 @@ pub(super) async fn apply_catalog_changes(
     candidate: &LaminarDB,
     parent: &CatalogManifest,
     statements: &[String],
-    retired_names: &BTreeSet<String>,
+    retired_generations: &BTreeMap<String, u64>,
 ) -> Result<CatalogManifest, DbError> {
     let mut entries = parent.entries.clone();
     let mut changed = BTreeSet::new();
+    let mut dropped = BTreeSet::new();
+    let mut created = BTreeSet::new();
     let mut new_objects = 0;
     for sql in statements {
         let statement = parse_one_change(sql)?;
         let (name, kind, operation) = statement_identity(candidate, sql, &statement)?;
-        if !changed.insert(name.clone()) {
-            return Err(TopologyError::Unsupported(format!(
-                "'{name}' changes more than once; replacement and drop/recreate require a new incarnation contract"
-            ))
-            .into());
-        }
         if matches!(
             statement,
             StreamingStatement::DropSource { .. }
                 | StreamingStatement::DropStream { .. }
                 | StreamingStatement::DropSink { .. }
         ) {
+            if !changed.insert(name.clone()) {
+                return Err(TopologyError::Unsupported(format!(
+                    "'{name}' may be dropped only once, before its optional recreation"
+                ))
+                .into());
+            }
             let index = entries
                 .iter()
                 .position(|entry| entry.canonical_name == name && entry.kind == kind)
@@ -121,35 +131,103 @@ pub(super) async fn apply_catalog_changes(
                 })?;
             apply_statement(candidate, sql, &statement, &name).await?;
             entries.remove(index);
+            dropped.insert(name);
             continue;
         }
-        if parent
-            .entries
-            .iter()
-            .any(|entry| entry.canonical_name == name)
-            || retired_names.contains(&name)
-        {
+        if !created.insert(name.clone()) {
             return Err(TopologyError::Unsupported(format!(
-                "'{name}' already exists or was retired; replacement and drop/recreate require a new incarnation contract, even with IF NOT EXISTS"
+                "'{name}' may be created or replaced only once in one migration"
             ))
             .into());
         }
-        new_objects += 1;
-        if parent.entries.len() + new_objects > super::planning::MAX_VALIDATION_OBJECTS {
-            return Err(TopologyError::Unsupported(
-                "candidate exceeds the 256 object mapping bound".into(),
-            )
-            .into());
+        let replacing = is_replacement(&statement);
+        if let Some(index) = entries
+            .iter()
+            .position(|entry| entry.canonical_name == name)
+        {
+            if !replacing || !changed.insert(name.clone()) || entries[index].kind != kind {
+                return Err(TopologyError::Unsupported(format!(
+                    "'{name}' already exists; use CREATE OR REPLACE to preserve compatible state, or ordered DROP/CREATE for an explicit future-only reset"
+                )).into());
+            }
+            // This private catalog has no actors. The final compiler must prove preservation,
+            // including every dependent's unchanged contract, before any admission can occur.
+            candidate.rollback_catalog_create(&name, kind, "isolated topology replacement")?;
+            apply_statement(candidate, sql, &statement, &name).await?;
+            entries[index].ddl = create_definition(sql, &statement)?;
+        } else {
+            changed.insert(name.clone());
+            let previous_generation = parent
+                .entries
+                .iter()
+                .find(|entry| entry.canonical_name == name)
+                .map(|entry| entry.catalog_generation)
+                .or_else(|| retired_generations.get(&name).copied());
+            let generation = previous_generation.map_or(Ok(1), |generation| {
+                generation
+                    .checked_add(1)
+                    .ok_or_else(|| TopologyError::Invalid("catalog incarnation exhausted".into()))
+            })?;
+            if dropped.contains(&name)
+                && parent
+                    .entries
+                    .iter()
+                    .any(|entry| entry.canonical_name == name && entry.kind != kind)
+            {
+                return Err(TopologyError::Unsupported(
+                    "recreation must retain the catalog kind".into(),
+                )
+                .into());
+            }
+            new_objects += 1;
+            if parent.entries.len() + new_objects > super::planning::MAX_VALIDATION_OBJECTS {
+                return Err(TopologyError::Unsupported(
+                    "candidate exceeds the 256 object mapping bound".into(),
+                )
+                .into());
+            }
+            apply_statement(candidate, sql, &statement, &name).await?;
+            entries.push(laminar_core::cluster::control::CatalogManifestEntry {
+                canonical_name: name,
+                kind,
+                catalog_generation: generation,
+                ddl: create_definition(sql, &statement)?,
+            });
         }
-        apply_statement(candidate, sql, &statement, &name).await?;
-        entries.push(laminar_core::cluster::control::CatalogManifestEntry {
-            canonical_name: name,
-            kind,
-            catalog_generation: 1,
-            ddl: sql.clone(),
-        });
     }
-    CatalogManifest::new(entries).map_err(|error| TopologyError::from(error).into())
+    let target = CatalogManifest::new(entries).map_err(TopologyError::from)?;
+    candidate.reconcile_catalog_manifest_inventory(&target)?;
+    Ok(target)
+}
+
+pub(super) fn is_replacement(statement: &StreamingStatement) -> bool {
+    match statement {
+        StreamingStatement::CreateSource(create) => create.or_replace,
+        StreamingStatement::CreateSink(create) => create.or_replace,
+        StreamingStatement::CreateStream { or_replace, .. } => *or_replace,
+        _ => false,
+    }
+}
+
+fn create_definition(sql: &str, statement: &StreamingStatement) -> Result<String, DbError> {
+    if !is_replacement(statement) {
+        return Ok(sql.to_owned());
+    }
+    // Comments were rejected by typed DDL validation. Retain the exact definition suffix so
+    // cold replay executes CREATE without invoking local OR REPLACE mutation semantics.
+    let mut suffix = sql.trim_start();
+    for keyword in ["CREATE", "OR", "REPLACE"] {
+        let boundary = suffix.find(char::is_whitespace).ok_or_else(|| {
+            TopologyError::Invalid("replacement has an invalid CREATE prefix".into())
+        })?;
+        if !suffix[..boundary].eq_ignore_ascii_case(keyword) {
+            return Err(
+                TopologyError::Invalid("replacement has an invalid CREATE prefix".into()).into(),
+            );
+        }
+        suffix = suffix[boundary..].trim_start();
+    }
+    Ok(format!("CREATE {suffix}"))
 }
 
 pub(in crate::db) fn validate_manifest_ddl(manifest: &CatalogManifest) -> Result<(), DbError> {
@@ -208,33 +286,41 @@ pub(in crate::db) fn validate_manifest_ddl(manifest: &CatalogManifest) -> Result
 }
 
 impl LaminarDB {
-    pub(in crate::db) async fn reconcile_retired_catalog_objects(
+    pub(in crate::db) async fn reconcile_superseded_catalog_objects(
         &self,
         manifest: &CatalogManifest,
         store: &CatalogManifestStore,
         topology: &TopologyCatalogState,
     ) -> Result<(), DbError> {
-        let extras: Vec<_> = self
+        let superseded: Vec<_> = self
             .catalog_manifest_inventory()?
             .into_iter()
-            .filter(|local| {
-                !manifest
-                    .entries
-                    .iter()
-                    .any(|entry| entry.canonical_name == local.canonical_name)
-            })
+            .filter(|local| !manifest.entries.iter().any(|entry| entry == local))
             .collect();
-        if extras.is_empty() {
+        if superseded.is_empty() {
             return Ok(());
         }
         let retired = store.retired_topology_names().await?;
-        if extras.iter().any(|entry| {
+        let parent = store
+            .parent_topology_catalog(&manifest.reference().map_err(TopologyError::from)?)
+            .await?;
+        if superseded.iter().any(|entry| {
             !matches!(
                 entry.kind,
                 CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink
-            ) || !retired.contains(&entry.canonical_name)
+            ) || if manifest
+                .entries
+                .iter()
+                .any(|target| target.canonical_name == entry.canonical_name)
+            {
+                !parent
+                    .as_ref()
+                    .is_some_and(|parent| parent.entries.contains(entry))
+            } else {
+                !retired.contains(&entry.canonical_name)
+            }
         }) {
-            return Err(TopologyError::Conflict("local inventory has an object outside the committed catalog without certified retirement".into()).into());
+            return Err(TopologyError::Conflict("local inventory conflicts with catalog manifest without a certified parent replacement or retirement".into()).into());
         }
         let (current, current_topology) = store
             .load_with_topology()
@@ -254,12 +340,12 @@ impl LaminarDB {
             return Err(TopologyError::Fenced.into());
         }
         // The manifest is in dependency order; retire dependents before their inputs.
-        for entry in extras.into_iter().rev() {
+        for entry in superseded.into_iter().rev() {
             self.require_catalog_kind(&entry.canonical_name, entry.kind, false)?;
             self.rollback_catalog_create(
                 &entry.canonical_name,
                 entry.kind,
-                "committed topology retirement",
+                "committed topology replacement or retirement",
             )?;
         }
         Ok(())

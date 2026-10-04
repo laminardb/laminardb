@@ -110,7 +110,7 @@ impl LaminarDB {
     ) -> Result<Vec<laminar_core::cluster::control::CatalogManifestEntry>, DbError> {
         self.connector_manager
             .lock()
-            .apply_stream_catalog_generations(&manifest.entries)?;
+            .apply_catalog_generations(&manifest.entries)?;
         self.catalog_manifest_inventory()
     }
 

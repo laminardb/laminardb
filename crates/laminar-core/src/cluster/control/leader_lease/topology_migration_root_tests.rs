@@ -26,6 +26,7 @@ enum FixtureChange {
     NewSources,
     RemoveSink,
     RemovePipeline,
+    ResetPipeline,
 }
 
 struct Fixture {
@@ -141,6 +142,10 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         target.entries.retain(|entry| {
             matches!(change, FixtureChange::RemoveSink) && entry.canonical_name != "totals_sink"
         });
+    } else if matches!(change, FixtureChange::ResetPipeline) {
+        for entry in &mut target.entries {
+            entry.catalog_generation += 1;
+        }
     } else {
         target
             .entries
@@ -163,7 +168,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         }
     }
     let mut descriptor = ClusterTopologyValidation {
-        validation_format_version: 2,
+        validation_format_version: 3,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
         parent_version: TopologyVersion::LEGACY_BASELINE,
@@ -177,12 +182,17 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         },
         environment_sha256: "3".repeat(64),
         compatibility_sha256: String::new(),
-        statements: if matches!(change, FixtureChange::RemovePipeline) {
-            vec![
+        statements: if matches!(
+            change,
+            FixtureChange::RemovePipeline | FixtureChange::ResetPipeline
+        ) {
+            let mut statements = vec![
                 "DROP SINK totals_sink".into(),
                 "DROP STREAM totals".into(),
                 "DROP SOURCE events".into(),
-            ]
+            ];
+            statements.extend(target.entries.iter().map(|entry| entry.ddl.clone()));
+            statements
         } else if matches!(change, FixtureChange::RemoveSink) {
             vec!["DROP SINK totals_sink".into()]
         } else {
@@ -195,43 +205,46 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
             .entries
             .iter()
             .chain(target.entries.iter().filter(|entry| {
-                !parent
-                    .entries
-                    .iter()
-                    .any(|old| old.canonical_name == entry.canonical_name)
+                !parent.entries.iter().any(|old| {
+                    old.canonical_name == entry.canonical_name
+                        && old.catalog_generation == entry.catalog_generation
+                })
             }))
             .enumerate()
             .map(|(index, e)| ClusterTopologyObjectPlan {
                 name: e.canonical_name.clone(),
                 kind: e.kind,
                 catalog_generation: e.catalog_generation,
-                transition: if !target
-                    .entries
-                    .iter()
-                    .any(|entry| entry.canonical_name == e.canonical_name)
-                {
+                transition: if !target.entries.iter().any(|entry| {
+                    entry.canonical_name == e.canonical_name
+                        && entry.catalog_generation == e.catalog_generation
+                }) {
                     ClusterTopologyObjectTransition::Remove
                 } else if index < parent.entries.len() {
                     ClusterTopologyObjectTransition::Preserve
                 } else {
                     ClusterTopologyObjectTransition::AddFutureOnly
                 },
-                initialization: if !target
-                    .entries
-                    .iter()
-                    .any(|entry| entry.canonical_name == e.canonical_name)
-                {
+                initialization: if !target.entries.iter().any(|entry| {
+                    entry.canonical_name == e.canonical_name
+                        && entry.catalog_generation == e.catalog_generation
+                }) {
                     TopologyInitialization::RetireAtCut
                 } else if index < parent.entries.len() {
                     TopologyInitialization::PreserveExactCut
                 } else if e.kind == CatalogObjectKind::Source {
                     TopologyInitialization::ResolveSourcePositionsOnce
+                } else if e.canonical_name == "totals" {
+                    TopologyInitialization::EmptyManagedStateAtCut
                 } else {
                     TopologyInitialization::FutureOnlyAtCut
                 },
                 definition_sha256: digest(1),
                 compatibility_sha256: digest(2),
-                dependencies: if matches!(change, FixtureChange::RemovePipeline) {
+                dependencies: if matches!(
+                    change,
+                    FixtureChange::RemovePipeline | FixtureChange::ResetPipeline
+                ) {
                     match e.kind {
                         CatalogObjectKind::Stream => vec!["events".into()],
                         CatalogObjectKind::Sink => vec!["totals".into()],
@@ -256,7 +269,9 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
             TopologyActivationRequirement::InstalledTargetRelease,
         ],
     };
-    descriptor.objects.sort_by(|a, b| a.name.cmp(&b.name));
+    descriptor
+        .objects
+        .sort_by(|a, b| (&a.name, a.catalog_generation).cmp(&(&b.name, b.catalog_generation)));
     descriptor.compatibility_sha256 = descriptor.descriptor_digest().unwrap();
     let plan = TopologyAdmissionPlan {
         protocol_version: TOPOLOGY_PREPARATION_PROTOCOL_VERSION,

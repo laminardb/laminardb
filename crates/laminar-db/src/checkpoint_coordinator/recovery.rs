@@ -81,7 +81,16 @@ impl CheckpointCoordinator {
             return Err(DbError::Checkpoint("target coordinator requires the exact committed migration-root predecessor and current ownership".into()));
         }
         recovered.validate_topology_assignment(input)?;
-        self.install_recovered_metadata(input.outcome(), input.checkpoint(), recovered)
+        self.install_recovered_metadata(input.outcome(), input.checkpoint(), recovered)?;
+        if let Some((_, watermarks)) = self.last_committed_source_watermarks.as_mut() {
+            watermarks.retain(|name, _| {
+                input.root().preserved_objects.iter().any(|object| {
+                    object.kind == laminar_core::cluster::control::CatalogObjectKind::Source
+                        && &object.name == name
+                })
+            });
+        }
+        Ok(())
     }
 
     /// Install an already decoded target cut under the same stopped recovery round. Definitive

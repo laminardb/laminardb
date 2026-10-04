@@ -291,6 +291,19 @@ impl CatalogManifestStore {
         self.authority.catalog_with_topology().await
     }
 
+    /// Load the exact parent catalog while checking the current committed inventory.
+    ///
+    /// # Errors
+    /// Rejects changed authority, invalid retained evidence or the bounded read deadline.
+    pub async fn parent_topology_catalog(
+        &self,
+        expected_current: &CatalogManifestRef,
+    ) -> Result<Option<CatalogManifest>, super::topology::TopologyError> {
+        self.authority
+            .parent_topology_catalog(expected_current)
+            .await
+    }
+
     /// Load the complete adopted startup catalog while checking the exact current inventory.
     /// Removed objects remain startup assertions and are never recreated.
     ///
@@ -305,7 +318,7 @@ impl CatalogManifestStore {
             .await
     }
 
-    /// Read sink names retired by the bounded, retained committed topology journal.
+    /// Read object names retired by the bounded, retained committed topology journal.
     ///
     /// # Errors
     /// Rejects invalid retained evidence, changed committed authority or the read deadline.
@@ -313,6 +326,16 @@ impl CatalogManifestStore {
         &self,
     ) -> Result<std::collections::BTreeSet<String>, super::topology::TopologyError> {
         self.authority.retired_topology_names().await
+    }
+
+    /// Read the latest retired incarnation of each name for safe future-only recreation.
+    ///
+    /// # Errors
+    /// Rejects invalid retained evidence, changed committed authority or the read deadline.
+    pub async fn retired_topology_generations(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, u64>, super::topology::TopologyError> {
+        self.authority.retired_topology_generations().await
     }
 
     /// Explicitly adopt a sealed legacy inventory without changing the processing graph.

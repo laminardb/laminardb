@@ -20,7 +20,7 @@ pub enum TopologyValidationScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClusterTopologyObjectTransition {
-    /// Same incarnation, definition, dependency closure, schema and managed-state contract.
+    /// Same incarnation, schema and state contract; any replacement is compiler-certified.
     Preserve,
     /// New object, activated at an explicitly persisted future-only boundary.
     AddFutureOnly,
@@ -71,7 +71,7 @@ pub struct ClusterTopologyObjectPlan {
     pub name: String,
     /// Typed catalog namespace owner.
     pub kind: CatalogObjectKind,
-    /// Incarnation retained from the parent, or one for a never-before-created additive name.
+    /// Incarnation retained from the parent or newly allocated for future-only activation.
     pub catalog_generation: u64,
     /// Supported local classification.
     pub transition: ClusterTopologyObjectTransition,
@@ -118,7 +118,8 @@ pub struct ClusterTopologyValidation {
     /// Exact submitted DDL, including removals absent from the target inventory. Binds retries
     /// and participant compilation to the same ordered payload.
     pub statements: Vec<String>,
-    /// Parent/target union, including retired objects, with explicit cut requirements.
+    /// Parent/target union sorted by name and generation. Explicit reset has two mappings:
+    /// retirement of the parent incarnation and future-only activation of its successor.
     pub objects: Vec<ClusterTopologyObjectPlan>,
     /// A processing pause is required for the implemented old-topology cut contract.
     pub requires_processing_pause: bool,
@@ -164,7 +165,7 @@ impl ClusterTopologyValidation {
     /// Returns a typed encoding failure; this never writes authority.
     pub fn descriptor_digest(&self) -> Result<String, TopologyError> {
         let bytes = serde_json::to_vec(&(
-            "laminardb-topology-compatibility-v2",
+            "laminardb-topology-compatibility-v3",
             self.validation_format_version,
             &self.deployment_id,
             self.parent_version,
@@ -207,23 +208,28 @@ impl ClusterTopologyValidation {
                 .iter()
                 .find(|target| target.canonical_name == entry.canonical_name)
             {
-                Some(target) if target == entry => {
-                    retained.push(entry.clone());
+                Some(target) if target.kind == entry.kind
+                    && target.catalog_generation == entry.catalog_generation => {
+                    retained.push(target.clone());
                     ClusterTopologyObjectTransition::Preserve
                 }
-                None if matches!(
+                replacement if matches!(
                     entry.kind,
                     CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink
-                ) =>
+                ) && replacement.is_none_or(|new| new.kind == entry.kind
+                    && Some(new.catalog_generation) == entry.catalog_generation.checked_add(1)) =>
                 {
                     ClusterTopologyObjectTransition::Remove
                 }
                 _ => return Err(TopologyError::Invalid(
-                    "target changes a preserved definition or removes an unsupported catalog kind"
+                    "target changes an incarnation without an explicit retirement/successor mapping"
                         .into(),
                 )),
             };
-            expected.insert(entry.canonical_name.as_str(), (entry, transition));
+            expected.insert(
+                (entry.canonical_name.as_str(), entry.catalog_generation),
+                (entry, transition),
+            );
         }
         if !target.entries.starts_with(&retained) {
             return Err(TopologyError::Invalid(
@@ -232,7 +238,7 @@ impl ClusterTopologyValidation {
         }
         for entry in &target.entries {
             expected
-                .entry(entry.canonical_name.as_str())
+                .entry((entry.canonical_name.as_str(), entry.catalog_generation))
                 .or_insert((entry, ClusterTopologyObjectTransition::AddFutureOnly));
         }
         if expected.len() != self.objects.len() {
@@ -241,9 +247,13 @@ impl ClusterTopologyValidation {
             ));
         }
         for object in &self.objects {
-            let (entry, transition) = expected.get(object.name.as_str()).ok_or_else(|| {
-                TopologyError::Invalid("compatibility object is absent from both catalogs".into())
-            })?;
+            let (entry, transition) = expected
+                .get(&(object.name.as_str(), object.catalog_generation))
+                .ok_or_else(|| {
+                    TopologyError::Invalid(
+                        "compatibility object is absent from both catalogs".into(),
+                    )
+                })?;
             if object.kind != entry.kind
                 || object.catalog_generation != entry.catalog_generation
                 || object.transition != *transition
@@ -271,7 +281,7 @@ impl ClusterTopologyValidation {
             .statements
             .iter()
             .try_fold(0_usize, |total, sql| total.checked_add(sql.len()));
-        if self.validation_format_version != 2
+        if self.validation_format_version != 3
             || deployment.is_nil()
             || deployment.to_string() != self.deployment_id
             || self.parent_version.successor()? != self.target_version
@@ -286,10 +296,10 @@ impl ClusterTopologyValidation {
             || sql_bytes.is_none_or(|bytes| bytes > 256 * 1024)
             || self.objects.is_empty()
             || self.objects.len() > 256
-            || !self
-                .objects
-                .windows(2)
-                .all(|pair| pair[0].name < pair[1].name)
+            || !self.objects.windows(2).all(|pair| {
+                (&pair[0].name, pair[0].catalog_generation)
+                    < (&pair[1].name, pair[1].catalog_generation)
+            })
             || !self.requires_processing_pause
             || self.required_before_activation
                 != [
@@ -341,14 +351,15 @@ impl ClusterTopologyValidation {
                 || !object.dependencies.windows(2).all(|pair| pair[0] < pair[1])
                 || object.dependencies.iter().any(|name| {
                     name == &object.name
-                        || self
-                            .objects
-                            .binary_search_by(|obj| obj.name.cmp(name))
-                            .map_or(true, |index| {
-                                object.transition != ClusterTopologyObjectTransition::Remove
-                                    && self.objects[index].transition
-                                        == ClusterTopologyObjectTransition::Remove
-                            })
+                        || !self.objects.iter().any(|dependency| {
+                            &dependency.name == name
+                                && if object.transition == ClusterTopologyObjectTransition::Remove {
+                                    dependency.transition
+                                        != ClusterTopologyObjectTransition::AddFutureOnly
+                                } else {
+                                    dependency.transition != ClusterTopologyObjectTransition::Remove
+                                }
+                        })
                 })
                 || object
                     .managed_state_contract

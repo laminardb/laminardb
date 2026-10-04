@@ -430,11 +430,19 @@ impl CommittedCheckpointIndex {
         &self,
         predecessor: &CommittedCheckpointIndex,
     ) -> Result<(), String> {
+        self.validate_source_watermark_continuity(predecessor, &self.source_names)
+    }
+
+    pub(crate) fn validate_source_watermark_continuity(
+        &self,
+        predecessor: &CommittedCheckpointIndex,
+        inherited_sources: &[String],
+    ) -> Result<(), String> {
         if self.version == COMMITTED_CHECKPOINT_INDEX_VERSION {
             let mut expected = predecessor
                 .effective_source_watermarks()?
                 .into_iter()
-                .filter(|(source, _)| self.source_names.binary_search(source).is_ok())
+                .filter(|(source, _)| inherited_sources.binary_search(source).is_ok())
                 .collect::<BTreeMap<_, _>>();
             for (source, frontier) in channel_progress_frontiers_by_source(&self.channel_progress)?
             {

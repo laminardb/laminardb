@@ -35,7 +35,10 @@ pub(super) fn position(
     let source = descriptor
         .objects
         .iter()
-        .find(|o| o.name == "added_source")
+        .find(|o| {
+            o.kind == CatalogObjectKind::Source
+                && o.transition == ClusterTopologyObjectTransition::AddFutureOnly
+        })
         .unwrap();
     TopologySourceInitialization {
         name: source.name.clone(),
@@ -392,6 +395,72 @@ fn topology_initialization_preserves_previous_format_one_root_bytes() {
         "1b7e162e94f225017df72848d4e7fe1e7bd50be500abc77e86e888af37cf0f81"
     );
     assert_eq!(reference.encoded_len, 50_338);
+}
+
+#[tokio::test]
+async fn topology_reset_seals_new_source_generation_and_excludes_retired_state_and_watermarks() {
+    let authority = store(30_000);
+    let fixture = fixture_with_changes(&authority, FixtureChange::ResetPipeline).await;
+    let cursor = position(&fixture.descriptor, 91);
+    let status = fixture
+        .initialized(&authority, |_, _| async { Ok(vec![cursor.clone()]) })
+        .await
+        .unwrap();
+    let root = authority
+        .topology_migration_root(status.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(root.preserved_objects.is_empty());
+    assert!(root.subscriptions.is_empty());
+    assert_eq!(
+        root.future_only_objects,
+        ["events", "totals", "totals_sink"]
+    );
+    assert_eq!(root.source_initializations[0].catalog_generation, 2);
+    root.validate_restore_cut(
+        &status,
+        &fixture.descriptor,
+        &fixture.index,
+        &fixture.manifests,
+    )
+    .unwrap();
+    let mut target = fixture.index.clone();
+    target.pipeline_identity = fixture.descriptor.target_pipeline.clone();
+    target.epoch += 1;
+    target.checkpoint_id += 1;
+    target.predecessor = Some(root.cut.checkpoint.clone());
+    for channel in &mut target.channel_progress {
+        channel.watermark = Some(0);
+    }
+    target.source_watermarks.insert("events".into(), 0);
+    target.checkpoint_watermark = Some(0);
+    root.validate_target_checkpoint_predecessor(&fixture.descriptor, &target, &fixture.index)
+        .unwrap();
+    let mut forged = root.clone();
+    forged.source_initializations[0].catalog_generation = 1;
+    assert!(forged
+        .validate_restore_cut(
+            &status,
+            &fixture.descriptor,
+            &fixture.index,
+            &fixture.manifests
+        )
+        .is_err());
+    let plan = authority.load_topology_plan(&status.plan).await.unwrap();
+    let parent = authority
+        .load_catalog_manifest(&plan.parent_manifest)
+        .await
+        .unwrap();
+    let mut catalog = authority
+        .load_catalog_manifest(&plan.target_manifest)
+        .await
+        .unwrap();
+    catalog.entries[1].catalog_generation = 7;
+    let mut descriptor = fixture.descriptor.clone();
+    descriptor.target_manifest = catalog.reference().unwrap();
+    descriptor.compatibility_sha256 = descriptor.descriptor_digest().unwrap();
+    assert!(descriptor.validate_catalogs(&parent, &catalog).is_err());
 }
 
 #[tokio::test]

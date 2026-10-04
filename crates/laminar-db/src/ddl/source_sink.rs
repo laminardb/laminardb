@@ -214,6 +214,7 @@ impl LaminarDB {
             if let Some(ct) = resolved.connector_type {
                 let mut mgr = self.connector_manager.lock();
                 mgr.register_source(crate::connector_manager::SourceRegistration {
+                    catalog_generation: 1,
                     name: name.clone(),
                     connector_type: Some(ct),
                     connector_options: resolved.connector_options,
@@ -327,6 +328,7 @@ impl LaminarDB {
 
         let contract = if let Some(resolved) = resolved {
             let registration = crate::connector_manager::SourceRegistration {
+                catalog_generation: 1,
                 name: source_name.to_string(),
                 connector_type: resolved.connector_type.clone(),
                 connector_options: resolved.connector_options.clone(),
@@ -547,6 +549,7 @@ impl LaminarDB {
 
         let candidate = if let Some(resolved) = resolved {
             crate::connector_manager::SinkRegistration {
+                catalog_generation: 1,
                 name: name.clone(),
                 input: input.clone(),
                 query_inputs: query_inputs.clone(),
@@ -558,6 +561,7 @@ impl LaminarDB {
             }
         } else {
             crate::connector_manager::SinkRegistration {
+                catalog_generation: 1,
                 name: name.clone(),
                 input: input.clone(),
                 query_inputs,

@@ -1830,6 +1830,7 @@ async fn persisted_temporal_preflight_requires_direct_event_time_sources() {
             .unwrap();
     }
     let source = |name: &str, mode: &str| crate::connector_manager::SourceRegistration {
+        catalog_generation: 1,
         name: name.into(),
         connector_type: Some(crate::temporal_test_source::CONNECTOR_NAME.into()),
         connector_options: HashMap::from([("mode".into(), mode.into())]),

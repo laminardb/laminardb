@@ -84,8 +84,14 @@ impl TopologyMigrationRoot {
                     .into(),
             ));
         }
+        let inherited_sources = self
+            .preserved_objects
+            .iter()
+            .filter(|object| object.kind == CatalogObjectKind::Source)
+            .map(|object| object.name.clone())
+            .collect::<Vec<_>>();
         target
-            .validate_predecessor_watermarks(parent)
+            .validate_source_watermark_continuity(parent, &inherited_sources)
             .map_err(TopologyError::Invalid)
     }
 }

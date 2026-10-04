@@ -331,6 +331,11 @@ fn select_topology_state_frames<'a>(
             .find(|object| {
                 object.kind == CatalogObjectKind::Stream
                     && operator_id.strip_prefix("graph:") == Some(object.name.as_str())
+                    && if parent_cut {
+                        object.transition != ClusterTopologyObjectTransition::AddFutureOnly
+                    } else {
+                        object.transition != ClusterTopologyObjectTransition::Remove
+                    }
             })
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
@@ -338,11 +343,6 @@ fn select_topology_state_frames<'a>(
                 ))
             })?;
         if object.transition == ClusterTopologyObjectTransition::Remove {
-            if !parent_cut {
-                return Err(DbError::Checkpoint(format!(
-                    "target checkpoint contains retired operator '{operator_id}'"
-                )));
-            }
             // The root and recovery reader already verified the complete historical cut and
             // these bytes. Only a certified retirement permits omitting a parent frame.
             continue;

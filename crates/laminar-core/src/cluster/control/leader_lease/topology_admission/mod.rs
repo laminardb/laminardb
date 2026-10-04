@@ -678,20 +678,8 @@ impl LeaderLeaseStore {
                 "removal requires an explicit certified compatibility mapping".into(),
             ));
         }
-        let retired = self
-            .retired_names_from_operations(&current.topology_operations)
+        self.validate_recreated_catalog_names(plan, parent, target, &current.topology_operations)
             .await?;
-        if target.entries.iter().any(|entry| {
-            !parent
-                .entries
-                .iter()
-                .any(|old| old.canonical_name == entry.canonical_name)
-                && retired.contains(&entry.canonical_name)
-        }) {
-            return Err(TopologyError::Unsupported(
-                "target reuses a retired name without a new incarnation contract".into(),
-            ));
-        }
         Ok(())
     }
 

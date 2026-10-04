@@ -91,12 +91,13 @@ impl SourceConnector for PlanningSource {
         config: &ConnectorConfig,
         checkpoint: &SourceCheckpoint,
     ) -> Result<(), ConnectorError> {
-        if config.get("laminar.source.name") == Some("added_source")
+        if config.get("topic") == Some("new")
+            && config.get("start") == Some("latest")
             && checkpoint
                 .offsets()
                 .get("partition-0-next")
-                .map(String::as_str)
-                == Some("91")
+                .and_then(|next| next.parse::<u64>().ok())
+                .is_some_and(|next| next >= 91)
             && checkpoint.assignment_version().is_none()
         {
             self.2.entered.notify_one();
@@ -112,10 +113,7 @@ impl SourceConnector for PlanningSource {
         &mut self,
         config: &ConnectorConfig,
     ) -> Result<SourceCheckpoint, ConnectorError> {
-        if config.get("laminar.source.name") != Some("added_source")
-            || config.get("topic") != Some("new")
-            || config.get("start") != Some("latest")
-        {
+        if config.get("topic") != Some("new") || config.get("start") != Some("latest") {
             return Err(forbidden_effect(&self.0));
         }
         let next = 91 + self.1.fetch_add(1, Ordering::SeqCst);
@@ -1222,7 +1220,7 @@ async fn topology_validation_rejects_legacy_conflicting_parent_and_changed_resol
 }
 
 #[tokio::test]
-async fn topology_validation_rejects_replacements_removals_and_unsupported_state_before_live_mutation(
+async fn topology_validation_rejects_implicit_reset_unsafe_removal_and_unsupported_state_before_live_mutation(
 ) {
     let fixture = Fixture::new().await;
     fixture.adopt().await;
@@ -1244,6 +1242,74 @@ async fn topology_validation_rejects_replacements_removals_and_unsupported_state
         assert_eq!(original, fixture.db.catalog_manifest_inventory().unwrap());
         fixture.assert_no_effects();
     }
+}
+
+#[tokio::test]
+async fn topology_explicit_reset_maps_both_incarnations_and_preserves_the_live_parent() {
+    let (fixture, _) = preparation_fixture_with_generation(7).await;
+    DbState::Created.store(&fixture.db.state);
+    let parent = fixture.db.catalog_manifest_inventory().unwrap();
+    let before = fixture.authority.lease_store.load().await.unwrap();
+    for query in [
+        "SELECT id, SUM(value) AS total FROM trades GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')",
+        "SELECT value, SUM(id) AS total FROM trades GROUP BY value EMIT CHANGES WITH ('retain_history' = '4mb')",
+        "SELECT id, SUM(value) AS total FROM trades GROUP BY id, TUMBLE(ts, INTERVAL '2' SECOND) EMIT FINAL",
+    ] {
+        let statements = vec!["DROP SINK existing_sink".into(), "DROP STREAM totals".into(),
+            format!("CREATE STREAM totals AS {query}"),
+            "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'changed-output')".into()];
+        let (report, target) = fixture.db.plan_cluster_topology_change(TopologyVersion::LEGACY_BASELINE, &statements).await.unwrap();
+        assert_eq!(report.statements, statements);
+        assert_eq!(target.entries[1].catalog_generation, 8);
+        assert_eq!(target.entries[2].catalog_generation, 2);
+        let mappings = report.objects.iter().filter(|object| object.name == "totals").collect::<Vec<_>>();
+        assert_eq!(mappings.len(), 2);
+        assert_eq!((mappings[0].catalog_generation, mappings[0].transition), (7, ClusterTopologyObjectTransition::Remove));
+        assert_eq!((mappings[1].catalog_generation, mappings[1].transition), (8, ClusterTopologyObjectTransition::AddFutureOnly));
+        assert_eq!(mappings[1].initialization, TopologyInitialization::EmptyManagedStateAtCut);
+        assert_ne!(report.parent_pipeline, report.target_pipeline);
+        report.validate_catalogs(&laminar_core::cluster::control::CatalogManifest::new(parent.clone()).unwrap(), &target).unwrap();
+        let mut omitted = report.clone();
+        omitted.objects.retain(|object| !(object.name == "totals" && object.transition == ClusterTopologyObjectTransition::Remove));
+        omitted.compatibility_sha256 = omitted.descriptor_digest().unwrap();
+        assert!(omitted.validate_catalogs(&laminar_core::cluster::control::CatalogManifest::new(parent.clone()).unwrap(), &target).is_err());
+    }
+    let statements = vec![
+        "DROP SINK existing_sink".into(),
+        "DROP STREAM totals".into(),
+        "DROP SOURCE trades".into(),
+        source_ddl("trades", "'topic' = 'new', 'start' = 'latest'").replace(
+            "value BIGINT NOT NULL",
+            "value BIGINT NOT NULL, extra BIGINT",
+        ),
+        parent[1].ddl.clone(),
+        parent[2].ddl.clone(),
+    ];
+    let report = fixture.validate(&statements).await.unwrap();
+    assert_eq!(
+        report
+            .objects
+            .iter()
+            .filter(|object| object.transition == ClusterTopologyObjectTransition::Remove)
+            .count(),
+        3
+    );
+    let source = report
+        .objects
+        .iter()
+        .find(|object| {
+            object.name == "trades"
+                && object.transition == ClusterTopologyObjectTransition::AddFutureOnly
+        })
+        .unwrap();
+    assert_eq!(source.catalog_generation, 2);
+    assert_eq!(
+        source.initialization,
+        TopologyInitialization::ResolveSourcePositionsOnce
+    );
+    assert_eq!(fixture.db.catalog_manifest_inventory().unwrap(), parent);
+    assert_eq!(fixture.authority.lease_store.load().await.unwrap(), before);
+    fixture.assert_no_effects();
 }
 
 #[tokio::test]
@@ -1465,17 +1531,6 @@ mod removal {
                 "DROP SINK existing_sink".into(),
                 "DROP STREAM totals /* hidden */".into(),
             ],
-            vec![
-                "DROP SINK existing_sink".into(),
-                "DROP STREAM totals".into(),
-                inventory[1].ddl.clone(),
-            ],
-            vec![
-                "DROP SINK existing_sink".into(),
-                "DROP STREAM totals".into(),
-                "DROP SOURCE trades".into(),
-                inventory[0].ddl.clone(),
-            ],
         ] {
             assert!(
                 fixture.validate(&statements).await.is_err(),
@@ -1534,10 +1589,6 @@ mod removal {
         for statements in [
             vec!["DROP SINK IF EXISTS missing".into()],
             vec!["DROP SINK existing_sink CASCADE".into()],
-            vec![
-                "DROP SINK existing_sink".into(),
-                parent.entries[2].ddl.clone(),
-            ],
             vec![
                 "DROP SINK existing_sink".into(),
                 "DROP SINK existing_sink".into(),

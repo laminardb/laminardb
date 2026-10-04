@@ -12,6 +12,7 @@ use crate::error::DbError;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SourceRegistration {
+    pub catalog_generation: u64,
     pub name: String,
     pub connector_type: Option<String>,
     pub connector_options: HashMap<String, String>,
@@ -21,6 +22,7 @@ pub(crate) struct SourceRegistration {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SinkRegistration {
+    pub catalog_generation: u64,
     pub name: String,
     pub input: String,
     pub query_inputs: Vec<String>,
@@ -252,7 +254,14 @@ impl ConnectorManager {
                     let generation = self
                         .streams
                         .get(name)
-                        .map_or(1, |stream| stream.catalog_generation);
+                        .map(|stream| stream.catalog_generation)
+                        .or_else(|| {
+                            self.sources
+                                .get(name)
+                                .map(|source| source.catalog_generation)
+                        })
+                        .or_else(|| self.sinks.get(name).map(|sink| sink.catalog_generation))
+                        .unwrap_or(1);
                     (name.clone(), ddl.clone(), generation)
                 })
             })
@@ -271,24 +280,58 @@ impl ConnectorManager {
         self.streams.insert(reg.name.clone(), reg);
     }
 
-    /// Apply authoritative stream generations after complete manifest replay.
+    /// Bind the complete replayed inventory to its authoritative order and incarnations.
     #[cfg(feature = "cluster")]
-    pub(crate) fn apply_stream_catalog_generations(
+    pub(crate) fn apply_catalog_generations(
         &mut self,
         entries: &[laminar_core::cluster::control::CatalogManifestEntry],
     ) -> Result<(), DbError> {
+        if entries.len() != self.ddl_store.len()
+            || entries
+                .iter()
+                .any(|entry| self.get_ddl(&entry.canonical_name) != Some(entry.ddl.as_str()))
+        {
+            return Err(DbError::Checkpoint(
+                "replayed definitions differ from the complete catalog manifest".into(),
+            ));
+        }
         for entry in entries {
-            if entry.kind != laminar_core::catalog::CatalogObjectKind::Stream {
+            use laminar_core::catalog::CatalogObjectKind;
+            // Programmatic sources live in the catalog bridge rather than connector registrations.
+            // They have only the original incarnation and remain outside migration admission.
+            if entry.kind == CatalogObjectKind::Source
+                && entry.catalog_generation == 1
+                && !self.sources.contains_key(&entry.canonical_name)
+            {
                 continue;
             }
-            let stream = self.streams.get_mut(&entry.canonical_name).ok_or_else(|| {
+            let generation = match entry.kind {
+                CatalogObjectKind::Source => self
+                    .sources
+                    .get_mut(&entry.canonical_name)
+                    .map(|source| &mut source.catalog_generation),
+                CatalogObjectKind::Sink => self
+                    .sinks
+                    .get_mut(&entry.canonical_name)
+                    .map(|sink| &mut sink.catalog_generation),
+                CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView => self
+                    .streams
+                    .get_mut(&entry.canonical_name)
+                    .map(|stream| &mut stream.catalog_generation),
+                CatalogObjectKind::Table | CatalogObjectKind::LookupTable => continue,
+            }
+            .ok_or_else(|| {
                 DbError::Checkpoint(format!(
-                    "catalog manifest stream '{}' was not registered during replay",
+                    "catalog manifest object '{}' was not registered during replay",
                     entry.canonical_name
                 ))
             })?;
-            stream.catalog_generation = entry.catalog_generation;
+            *generation = entry.catalog_generation;
         }
+        self.ddl_order = entries
+            .iter()
+            .map(|entry| entry.canonical_name.clone())
+            .collect();
         Ok(())
     }
 

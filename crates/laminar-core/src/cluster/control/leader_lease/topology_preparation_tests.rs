@@ -60,7 +60,7 @@ pub(super) async fn fixture(
         .collect::<Vec<_>>();
     objects.sort_by(|left, right| left.name.cmp(&right.name));
     let mut descriptor = ClusterTopologyValidation {
-        validation_format_version: 2,
+        validation_format_version: 3,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment,
         parent_version: plan.expected_parent,

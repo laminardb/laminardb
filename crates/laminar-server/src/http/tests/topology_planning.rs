@@ -227,6 +227,12 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
             "DROP STREAM totals",
             "DROP SOURCE trades",
         ],
+        vec![
+            "DROP SINK totals_sink",
+            "DROP STREAM totals",
+            "CREATE STREAM totals AS SELECT value, SUM(id) AS total FROM trades GROUP BY value WITH ('retain_history' = '4mb')",
+            "CREATE SINK totals_sink FROM totals INTO KAFKA ('bootstrap.servers' = '127.0.0.1:1', 'topic' = 'changed-output')",
+        ],
     ] {
         let response = validate(
             app.clone(),
@@ -234,10 +240,11 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
             serde_json::json!({"expected_parent_version": 1, "statements": statements}),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
+        assert_eq!(status, StatusCode::OK, "statements: {statements:?}; response: {}", String::from_utf8_lossy(&bytes));
         let removal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(removal["statements"], serde_json::json!(statements));
         let removed = removal["objects"]
@@ -246,7 +253,7 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
             .iter()
             .filter(|object| object["transition"] == "remove")
             .collect::<Vec<_>>();
-        assert_eq!(removed.len(), statements.len());
+        assert_eq!(removed.len(), statements.iter().filter(|sql| sql.starts_with("DROP")).count());
         assert!(removed
             .iter()
             .all(|object| object["initialization"] == "retire_at_cut"));

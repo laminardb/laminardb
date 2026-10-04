@@ -1038,7 +1038,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         .collect::<Vec<_>>();
     objects.sort_by(|left, right| left.name.cmp(&right.name));
     let mut descriptor = ClusterTopologyValidation {
-        validation_format_version: 2,
+        validation_format_version: 3,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
         parent_version: TopologyVersion::LEGACY_BASELINE,

@@ -238,8 +238,17 @@ async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery(
             .stream_generation,
         certificate.stream_generation
     );
-    let recreate = fixture.db.validate_cluster_topology_change(TopologyVersion::new(2).unwrap(), &["CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')".into()]).await.unwrap_err();
-    assert!(recreate.to_string().contains("retired"), "{recreate}");
+    let recreate = fixture.db.validate_cluster_topology_change(TopologyVersion::new(2).unwrap(), &["CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')".into()]).await.unwrap();
+    let reincarnated = recreate
+        .objects
+        .iter()
+        .find(|object| object.name == "existing_sink")
+        .unwrap();
+    assert_eq!(reincarnated.catalog_generation, 2);
+    assert_eq!(
+        reincarnated.transition,
+        crate::ClusterTopologyObjectTransition::AddFutureOnly
+    );
     let result = Box::pin(fixture.db.execute("DROP SINK kept_sink"))
         .await
         .unwrap();
@@ -809,17 +818,25 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
             .stream_generation,
         certificate.stream_generation
     );
-    for ddl in &baseline[..2] {
-        let error = fixture
-            .db
-            .validate_cluster_topology_change(
-                TopologyVersion::new(3).unwrap(),
-                std::slice::from_ref(ddl),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("retired"), "{error}");
-    }
+    let recreated_source = fixture
+        .db
+        .validate_cluster_topology_change(TopologyVersion::new(3).unwrap(), &baseline[..1])
+        .await
+        .unwrap();
+    assert_eq!(
+        recreated_source
+            .objects
+            .iter()
+            .find(|object| object.name == "trades")
+            .unwrap()
+            .catalog_generation,
+        2
+    );
+    assert!(fixture
+        .db
+        .validate_cluster_topology_change(TopologyVersion::new(3).unwrap(), &baseline[1..2])
+        .await
+        .is_err());
     assert!(Box::pin(fixture.db.execute("DROP SOURCE added_source"))
         .await
         .is_err());
@@ -854,5 +871,314 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
     assert!(latest_index(&fixture).await.source_names.is_empty());
     assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 1);
+    probe.input.lock().remove("trades");
+    probe.output.lock().clear();
+    let recreation = ClusterTopologyRequest {
+        operation_id: uuid::Uuid::from_u128(1504).try_into().unwrap(),
+        expected_parent_version: TopologyVersion::new(5).unwrap(),
+        statements: vec![
+            source_ddl("trades", "'topic' = 'new', 'start' = 'latest'"),
+            baseline[1].clone(),
+            baseline[2].clone(),
+        ],
+    };
+    Box::pin(fixture.db.submit_cluster_topology_change(&recreation))
+        .await
+        .unwrap();
+    active(&fixture, recreation.operation_id).await;
+    assert!(fixture
+        .db
+        .catalog_manifest_inventory()
+        .unwrap()
+        .iter()
+        .all(|entry| entry.catalog_generation == 2));
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(5)["trades"][0].clone(),
+            92,
+        )]),
+    );
+    wait_until(|| sink_total(&probe) == 15).await;
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    let recreated_checkpoint = latest_index(&fixture).await;
+    assert_eq!(
+        recreated_checkpoint.source_offsets["trades"].offsets["partition-0-next"],
+        "95"
+    );
+    assert!(!recreated_checkpoint.source_offsets["trades"]
+        .offsets
+        .contains_key("old.cursor"));
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+    Box::pin(fixture.db.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
+async fn topology_compatible_stateless_replacement_preserves_managed_state_and_source_progress() {
+    let (fixture, probe) = running_parent().await;
+    let addition = request(
+        1601,
+        vec!["CREATE STREAM projected AS SELECT id, value AS total FROM trades".into()],
+    );
+    Box::pin(fixture.db.submit_cluster_topology_change(&addition))
+        .await
+        .unwrap();
+    active(&fixture, addition.operation_id).await;
+    let before = fixture.db.connector_manager.lock().streams()["totals"]
+        .subscription_certificate
+        .clone()
+        .unwrap();
+    let replacement = ClusterTopologyRequest { operation_id: uuid::Uuid::from_u128(1602).try_into().unwrap(), expected_parent_version: TopologyVersion::new(2).unwrap(), statements: vec![
+        "CREATE OR REPLACE STREAM projected AS SELECT id, value * 2 AS total FROM trades".into(),
+        "CREATE SINK projected_sink FROM projected INTO \"planning-sink\" ('topic' = 'projected-output')".into(),
+    ] };
+    let report = fixture
+        .db
+        .validate_cluster_topology_change(
+            replacement.expected_parent_version,
+            &replacement.statements,
+        )
+        .await
+        .unwrap();
+    let projected = report
+        .objects
+        .iter()
+        .find(|object| object.name == "projected")
+        .unwrap();
+    assert_eq!(
+        projected.transition,
+        crate::ClusterTopologyObjectTransition::Preserve
+    );
+    assert_eq!(projected.catalog_generation, 1);
+    probe.output.lock().clear();
+    Box::pin(fixture.db.submit_cluster_topology_change(&replacement))
+        .await
+        .unwrap();
+    active(&fixture, replacement.operation_id).await;
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(5)["trades"][0].clone(),
+            3,
+        )]),
+    );
+    wait_until(|| sink_total(&probe) == 45).await;
+    wait_until(|| {
+        total(
+            &probe
+                .output
+                .lock()
+                .iter()
+                .filter(|(topic, _)| topic == "projected-output")
+                .map(|(_, batch)| batch.clone())
+                .collect::<Vec<_>>(),
+        ) == 30
+    })
+    .await;
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    assert_eq!(
+        latest_index(&fixture).await.source_offsets["trades"].offsets["old.cursor"],
+        "6"
+    );
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["totals"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        before.stream_generation
+    );
+    assert_eq!(fixture.resolutions.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.effects.load(Ordering::Acquire), 0);
+    Box::pin(fixture.db.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
+async fn topology_pipeline_reset_separates_incarnations_and_recovers_future_input_without_resetting_survivors(
+) {
+    let (fixture, probe) = running_parent().await;
+    let mut additions = independent_pipeline();
+    additions.extend([
+        "CREATE STREAM surviving_total AS SELECT id, SUM(value) AS total FROM added_source GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
+        "CREATE SINK surviving_sink FROM surviving_total INTO \"planning-sink\" ('topic' = 'surviving-output')".into(),
+    ]);
+    let addition = request(1611, additions);
+    Box::pin(fixture.db.submit_cluster_topology_change(&addition))
+        .await
+        .unwrap();
+    active(&fixture, addition.operation_id).await;
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(5)["trades"][0].clone(),
+            91,
+        )]),
+    );
+    let surviving_total = || {
+        total(
+            &probe
+                .output
+                .lock()
+                .iter()
+                .filter(|(topic, _)| topic == "surviving-output")
+                .map(|(_, batch)| batch.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    wait_until(|| surviving_total() == 15).await;
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    let old_certificate = fixture.db.connector_manager.lock().streams()["totals"]
+        .subscription_certificate
+        .clone()
+        .unwrap();
+    let survivor = fixture.db.connector_manager.lock().streams()["surviving_total"]
+        .subscription_certificate
+        .clone()
+        .unwrap();
+    let reset = ClusterTopologyRequest { operation_id: uuid::Uuid::from_u128(1612).try_into().unwrap(), expected_parent_version: TopologyVersion::new(2).unwrap(), statements: vec![
+        "DROP SINK existing_sink".into(), "DROP STREAM totals".into(), "DROP SOURCE trades".into(),
+        source_ddl("trades", "'topic' = 'new', 'start' = 'latest'"),
+        "CREATE STREAM totals AS SELECT value, SUM(id) AS total FROM trades GROUP BY value EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
+        "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'reset-output')".into(),
+    ] };
+    probe.output.lock().clear();
+    Box::pin(fixture.db.submit_cluster_topology_change(&reset))
+        .await
+        .unwrap();
+    active(&fixture, reset.operation_id).await;
+    let input = fixture
+        .authority
+        .controller
+        .committed_topology_restore_input(reset.operation_id)
+        .await
+        .unwrap();
+    assert!(input
+        .root()
+        .subscriptions
+        .iter()
+        .all(|mapping| mapping.parent_certificate.stream_id != "totals"));
+    assert_eq!(
+        input.checkpoint().source_offsets["trades"].offsets["old.cursor"],
+        "3"
+    );
+    assert_eq!(
+        input.root().source_initializations[0].checkpoint.offsets["partition-0-next"],
+        "92"
+    );
+    let reset_certificate = fixture.db.connector_manager.lock().streams()["totals"]
+        .subscription_certificate
+        .clone()
+        .unwrap();
+    assert_eq!(reset_certificate.catalog_generation, 2);
+    assert_ne!(
+        reset_certificate.stream_generation,
+        old_certificate.stream_generation
+    );
+    for name in ["trades", "totals", "existing_sink"] {
+        assert_eq!(
+            fixture
+                .db
+                .catalog_manifest_inventory()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.canonical_name == name)
+                .unwrap()
+                .catalog_generation,
+            2
+        );
+    }
+    assert!(probe.starts.lock().iter().rev().find(|(name, _)| name == "trades").is_some_and(|(_, position)| matches!(position, laminar_connectors::connector::SourcePosition::Initialized { checkpoint } if checkpoint.get_offset("old.cursor").is_none() && checkpoint.get_offset("partition-0-next") == Some("92"))));
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            super::input(5)["trades"][0].clone(),
+            92,
+        )]),
+    );
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            super::input(7)["trades"][0].clone(),
+            94,
+        )]),
+    );
+    let reset_total = || {
+        total(
+            &probe
+                .output
+                .lock()
+                .iter()
+                .filter(|(topic, _)| topic == "reset-output")
+                .map(|(_, batch)| batch.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    wait_until(|| reset_total() == 3 && surviving_total() == 36).await;
+    assert!(probe
+        .output
+        .lock()
+        .iter()
+        .all(|(topic, _)| topic != "old-output"));
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    let selected = latest_index(&fixture).await;
+    assert_eq!(
+        selected.source_offsets["trades"].offsets["partition-0-next"],
+        "95"
+    );
+    assert!(!selected.source_offsets["trades"]
+        .offsets
+        .contains_key("old.cursor"));
+    fixture.db.fence_coordinated_recovery_lifecycle();
+    fixture.authority.controller.set_recovering(true);
+    fixture
+        .db
+        .stop_pipeline_for_coordinated_recovery()
+        .await
+        .unwrap();
+    assert!(fixture
+        .db
+        .prepare_committed_cluster_topology_startup()
+        .await
+        .unwrap());
+    probe.output.lock().clear();
+    probe.block_start.store(true, Ordering::Release);
+    let prior_starts = probe.starts.lock().len();
+    fixture.db.enable_coordinated_recovery().unwrap();
+    super::recovery::held_start(&fixture, &probe, prior_starts).await;
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            super::input(5)["trades"][0].clone(),
+            95,
+        )]),
+    );
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            super::input(9)["trades"][0].clone(),
+            97,
+        )]),
+    );
+    super::recovery::released(&fixture).await;
+    wait_until(|| reset_total() == 6 && surviving_total() == 63).await;
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["totals"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        reset_certificate.stream_generation
+    );
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["surviving_total"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        survivor.stream_generation
+    );
+    assert_eq!(fixture.resolutions.load(Ordering::Acquire), 2);
+    assert_eq!(fixture.effects.load(Ordering::Acquire), 0);
     Box::pin(fixture.db.shutdown()).await.unwrap();
 }

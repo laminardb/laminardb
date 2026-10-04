@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use laminar_core::cluster::control::topology::ClusterTopologyObjectTransition;
 use laminar_core::cluster::control::{
     CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, LegacyTopologyBaseline,
     RecoverPhase, RecoveryAnnouncement, TopologyAdmissionPhase, TopologyAdmissionStatus,
@@ -377,14 +378,16 @@ impl MigrationProbe {
         round: u32,
     ) {
         let operation = *self.operations.last().unwrap();
-        let before = self.status(operation).activation.unwrap();
+        let status = self.status(operation);
+        let version = status.commit.unwrap().topology_version.get();
+        let before = status.activation.unwrap();
         let prior_recovery = self.recovery_release();
         let executable = nodes[victim].verify_executable_for_spawn();
         nodes[victim].spawn(executable);
         self.wait_active(
             nodes,
             operation,
-            3,
+            version,
             ceiling,
             started,
             &format!("kill-{round}"),
@@ -442,7 +445,14 @@ impl MigrationProbe {
     }
 
     pub(super) fn restart_all(&mut self, nodes: &mut [Node], ceiling: Duration) {
-        let before = self.checkpoint(ceiling, 3);
+        let operation = *self.operations.last().unwrap();
+        let version = self
+            .status(operation)
+            .commit
+            .unwrap()
+            .topology_version
+            .get();
+        let before = self.checkpoint(ceiling, version);
         let started = Instant::now();
         for node in nodes.iter_mut() {
             node.disarm_checkpoint_kill();
@@ -452,22 +462,15 @@ impl MigrationProbe {
             let executable = node.verify_executable_for_spawn();
             node.spawn(executable);
         }
-        self.wait_active(
-            nodes,
-            *self.operations.last().unwrap(),
-            3,
-            ceiling,
-            started,
-            "full-restart",
-        );
+        self.wait_active(nodes, operation, version, ceiling, started, "full-restart");
         wait_for(
             "full membership after committed-target restart",
             ceiling,
             || super::has_full_membership(nodes),
         );
-        self.produce(300);
+        self.produce(500);
         self.wait_output(nodes, ceiling);
-        let after = self.checkpoint(ceiling, 3);
+        let after = self.checkpoint(ceiling, version);
         assert!(after.checkpoint_id > before.checkpoint_id && after.epoch > before.epoch);
         let report = serde_json::json!({"full_restart_to_output_ms": started.elapsed().as_millis(),
             "expected_new_pipeline_pairs": self.expected, "observed_new_pipeline_pairs": self.output.seen,
@@ -478,7 +481,7 @@ impl MigrationProbe {
             serde_json::to_vec_pretty(&report).unwrap(),
         )
         .unwrap();
-        eprintln!("soak: reconstructed topology 3 using original bootstrap, retained epochs {} -> {}, new pipeline {} exact logical pairs, {} allowed replay duplicates, freshness {:?}",
+        eprintln!("soak: reconstructed topology {version} using original bootstrap, retained epochs {} -> {}, new pipeline {} exact logical pairs, {} allowed replay duplicates, freshness {:?}",
             before.epoch, after.epoch, self.expected.len(), self.output.duplicates, started.elapsed());
     }
 }
@@ -638,5 +641,148 @@ pub(super) fn exercise(
     .unwrap();
     eprintln!("soak: public topology 1 -> 2 -> 3, independent latest source and downstream existing aggregate, exact pairs {}, target epochs {} -> {}, additive activation {:?}, consumer-visible {:?} including explicit two-second cut hold",
         probe.expected.len(), first.epoch, second.epoch, activation, visible);
-    (probe, second)
+    let reset_checkpoint = exercise_replacement_and_reset(&mut probe, nodes, &request, ceiling);
+    assert!(reset_checkpoint.epoch > second.epoch);
+    (probe, reset_checkpoint)
+}
+
+fn exercise_replacement_and_reset(
+    probe: &mut MigrationProbe,
+    nodes: &mut [Node],
+    original: &laminar_db::ClusterTopologyRequest,
+    ceiling: Duration,
+) -> DurableCheckpointStatus {
+    let replacement = laminar_db::ClusterTopologyRequest {
+        operation_id: uuid::Uuid::new_v4().try_into().unwrap(),
+        expected_parent_version: TopologyVersion::new(3).unwrap(),
+        statements: vec![
+            "DROP SINK topology_live_sink".into(),
+            "CREATE OR REPLACE STREAM topology_live_stream AS SELECT id AS left_id, value AS right_id FROM topology_live_source WHERE id > 0".into(),
+            original.statements[2].clone(),
+            "CREATE STREAM topology_live_state AS SELECT id, SUM(value) AS total FROM topology_live_source GROUP BY id".into(),
+        ],
+    };
+    let started = Instant::now();
+    probe.submit(&nodes[0], &replacement);
+    probe.operations.push(replacement.operation_id);
+    probe.wait_active(
+        nodes,
+        replacement.operation_id,
+        4,
+        ceiling,
+        started,
+        "replacement",
+    );
+    let (_, _, _, descriptor) = probe
+        .runtime
+        .block_on(
+            probe
+                .authority
+                .topology_preparation_input(replacement.operation_id),
+        )
+        .unwrap();
+    let stream = descriptor
+        .objects
+        .iter()
+        .find(|object| object.name == "topology_live_stream")
+        .unwrap();
+    assert_eq!(stream.catalog_generation, 1);
+    assert_eq!(stream.transition, ClusterTopologyObjectTransition::Preserve);
+    probe.produce(300);
+    probe.wait_output(nodes, ceiling);
+    let replaced_checkpoint = probe.checkpoint(ceiling, 4);
+
+    let reset = laminar_db::ClusterTopologyRequest {
+        operation_id: uuid::Uuid::new_v4().try_into().unwrap(),
+        expected_parent_version: TopologyVersion::new(4).unwrap(),
+        statements: vec![
+            "DROP SINK topology_live_sink".into(),
+            "DROP STREAM topology_live_state".into(),
+            "DROP STREAM topology_live_stream".into(),
+            "DROP SOURCE topology_live_source".into(),
+            original.statements[0].replace("value BIGINT NOT NULL)", "value BIGINT NOT NULL, extra BIGINT)")
+                .replace("'group.id' = 'topology-live-", "'group.id' = 'topology-reset-"),
+            "CREATE STREAM topology_live_stream AS SELECT value AS left_id, SUM(id) AS right_id FROM topology_live_source GROUP BY value".into(),
+            "CREATE STREAM topology_live_state AS SELECT value, COUNT(*) AS total FROM topology_live_source GROUP BY value".into(),
+            original.statements[2].clone(),
+        ],
+    };
+    let started = Instant::now();
+    probe.submit(&nodes[1], &reset);
+    probe.operations.push(reset.operation_id);
+    probe.wait_active(nodes, reset.operation_id, 5, ceiling, started, "reset");
+    let root = probe
+        .runtime
+        .block_on(probe.authority.topology_migration_root(reset.operation_id))
+        .unwrap()
+        .unwrap();
+    let initialized = root
+        .source_initializations
+        .iter()
+        .find(|source| source.name == "topology_live_source")
+        .unwrap();
+    assert_eq!(initialized.catalog_generation, 2);
+    for partition in 0..3 {
+        assert_eq!(
+            initialized.checkpoint.offsets
+                [&format!("@laminar.kafka.next.v1:{}:{partition}", probe.input_topic)],
+            "4"
+        );
+    }
+    assert!(!root
+        .preserved_objects
+        .iter()
+        .any(|object| object.name.starts_with("topology_live_")
+            && object.name != "topology_live_downstream"));
+    let (_, _, _, reset_descriptor) = probe
+        .runtime
+        .block_on(
+            probe
+                .authority
+                .topology_preparation_input(reset.operation_id),
+        )
+        .unwrap();
+    for name in [
+        "topology_live_source",
+        "topology_live_stream",
+        "topology_live_state",
+        "topology_live_sink",
+    ] {
+        let generations = reset_descriptor
+            .objects
+            .iter()
+            .filter(|object| object.name == name)
+            .map(|object| (object.catalog_generation, object.transition))
+            .collect::<Vec<_>>();
+        let parent_generation = if name == "topology_live_sink" { 2 } else { 1 };
+        assert_eq!(
+            generations,
+            vec![
+                (parent_generation, ClusterTopologyObjectTransition::Remove),
+                (
+                    parent_generation + 1,
+                    ClusterTopologyObjectTransition::AddFutureOnly
+                ),
+            ]
+        );
+    }
+    probe.produce(400);
+    probe.wait_output(nodes, ceiling);
+    let reset_checkpoint = probe.checkpoint(ceiling, 5);
+    assert!(reset_checkpoint.epoch > replaced_checkpoint.epoch);
+    std::fs::write(
+        probe.evidence_dir.join("public-topology-reset.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "replacement_descriptor": descriptor,
+            "reset_descriptor": reset_descriptor,
+            "reset_root": root,
+            "target_checkpoint_epochs": [replaced_checkpoint.epoch, reset_checkpoint.epoch],
+            "expected_pairs": probe.expected, "observed_pairs": probe.output.seen,
+            "consumer_visible_latency": probe.visible_latency_evidence(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!("soak: compatible replacement at topology 4; explicit source/schema/key/state reset at topology 5; original stateful oracle preserved; {} exact logical pairs", probe.expected.len());
+    reset_checkpoint
 }

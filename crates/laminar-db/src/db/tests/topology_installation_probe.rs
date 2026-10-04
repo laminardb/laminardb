@@ -92,7 +92,7 @@ impl RuntimeSource {
             .get_mut(&self.name)
             .and_then(std::collections::VecDeque::pop_front);
         Ok(batch.map(|batch| {
-            let key = if self.name == "trades" {
+            let key = if self.checkpoint.get_offset("old.cursor").is_some() {
                 "old.cursor"
             } else {
                 "partition-0-next"

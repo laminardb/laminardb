@@ -19,7 +19,7 @@ use crate::pipeline_identity::{
 };
 use crate::pipeline_lifecycle::PlannedTopologyGraph;
 
-const VALIDATION_FORMAT_VERSION: u16 = 2;
+const VALIDATION_FORMAT_VERSION: u16 = 3;
 pub(super) const MAX_VALIDATION_OBJECTS: usize = 256;
 const MAX_VALIDATION_STATEMENTS: usize = 64;
 const MAX_VALIDATION_SQL_BYTES: usize = 256 * 1024;
@@ -32,8 +32,9 @@ pub use laminar_core::cluster::control::topology::{
 impl LaminarDB {
     /// Compile a topology candidate separately from the active graph.
     ///
-    /// Each entry is one typed CREATE or DROP SOURCE/STREAM/SINK without CASCADE.
-    /// Drop dependents before their inputs. The parent is versioned.
+    /// Each entry is one typed CREATE, CREATE OR REPLACE or DROP SOURCE/STREAM/SINK without CASCADE.
+    /// Replacement preserves compatible state by default. Ordered DROP/CREATE explicitly resets
+    /// the affected objects to future-only input under new incarnations; reset dependents first.
     /// Supports replayable sources, supported managed/stateless streams and durable sinks while
     /// proving unchanged definitions remain compatible. New managed state starts empty at the cut;
     /// input that can retract an unavailable prefix is rejected. No source is opened
@@ -147,14 +148,14 @@ impl LaminarDB {
             &parent,
         )?;
         drop(parent_graph);
-        let retired = store.retired_topology_names().await?;
+        let retired = store.retired_topology_generations().await?;
         let target = super::catalog_changes::apply_catalog_changes(
             &candidate, &parent, statements, &retired,
         )
         .await?;
         let target_identities = candidate.topology_definition_identities()?;
         let target_graph = candidate.plan_topology_graph().await?;
-        let mut objects = describe_catalog(
+        let objects = describe_catalog(
             &candidate,
             &target,
             &target_identities,
@@ -167,20 +168,7 @@ impl LaminarDB {
             )
             .into());
         }
-        for (name, previous) in &parent_objects {
-            match objects.get(name) {
-                Some(current) if current == previous => {}
-                None => {
-                    let mut removed = previous.clone();
-                    removed.transition = ClusterTopologyObjectTransition::Remove;
-                    removed.initialization = TopologyInitialization::RetireAtCut;
-                    objects.insert(name.clone(), removed);
-                }
-                _ => return Err(TopologyError::Unsupported(format!(
-                    "preserved object '{name}' changed its resolved state, schema, connector or dependency contract"
-                )).into()),
-            }
-        }
+        let objects = classify_object_transitions(&parent_objects, objects, statements)?;
         // No stale response can masquerade as validation against a newer parent. Normal lease
         // renewals/checkpoints do not invalidate a read-only plan; the exact catalog must match.
         if store.topology_state().await? != state
@@ -193,7 +181,6 @@ impl LaminarDB {
             .await?;
         let target_version = expected_parent.successor()?;
         let target_manifest = target.reference().map_err(TopologyError::from)?;
-        let objects: Vec<_> = objects.into_values().collect();
         let mut report = ClusterTopologyValidation {
             validation_format_version: VALIDATION_FORMAT_VERSION,
             scope: TopologyValidationScope::LocalCandidatePlan,
@@ -357,60 +344,12 @@ pub(super) fn describe_catalog(
     let mut objects = BTreeMap::<String, ClusterTopologyObjectPlan>::new();
     for entry in &manifest.entries {
         let name = &entry.canonical_name;
-        let preserved = parent
-            .entries
-            .iter()
-            .any(|entry| &entry.canonical_name == name);
-        let mut dependencies = match entry.kind {
-            CatalogObjectKind::Source => Vec::new(),
-            CatalogObjectKind::Sink => vec![manager
-                .sinks()
-                .get(name)
-                .ok_or_else(|| {
-                    TopologyError::Invalid(format!("sink '{name}' has no registration"))
-                })?
-                .input
-                .clone()],
-            CatalogObjectKind::Stream => {
-                let stream = manager.streams().get(name).ok_or_else(|| {
-                    TopologyError::Invalid(format!("stream '{name}' has no registration"))
-                })?;
-                let mut references =
-                    crate::sql_analysis::extract_table_references(&stream.query_sql);
-                for join in stream.join_config.iter().flatten() {
-                    match join {
-                        laminar_sql::translator::JoinOperatorConfig::StreamStream(config) => {
-                            references.insert(config.left_table.clone());
-                            references.insert(config.right_table.clone());
-                        }
-                        laminar_sql::translator::JoinOperatorConfig::Temporal(config) => {
-                            references.insert(config.left_table.clone());
-                            references.insert(config.right_table.clone());
-                        }
-                        laminar_sql::translator::JoinOperatorConfig::Lookup(_) => {
-                            return Err(TopologyError::Unsupported(format!(
-                                "stream '{name}' has an unmapped join dependency contract"
-                            ))
-                            .into())
-                        }
-                    }
-                }
-                if references.is_empty() {
-                    return Err(TopologyError::Unsupported(format!(
-                        "stream '{name}' has no explicit input activation boundary"
-                    ))
-                    .into());
-                }
-                references.into_iter().collect()
-            }
-            _ => {
-                return Err(TopologyError::Unsupported(format!(
-                    "'{name}' has an unsupported catalog kind for topology validation"
-                ))
-                .into())
-            }
-        };
-        dependencies.sort_unstable();
+        let preserved = parent.entries.iter().any(|old| {
+            &old.canonical_name == name
+                && old.kind == entry.kind
+                && old.catalog_generation == entry.catalog_generation
+        });
+        let dependencies = catalog_dependencies(&manager, entry)?;
         let dependency_evidence: Vec<_> = dependencies.iter().map(|dependency| {
             objects.get(dependency).map(|object| (&object.name, object.catalog_generation, &object.compatibility_sha256)).ok_or_else(|| TopologyError::Invalid(format!("'{name}' depends on '{dependency}' outside dependency-safe creation order")))
         }).collect::<Result<_, _>>()?;
@@ -485,6 +424,122 @@ pub(super) fn describe_catalog(
         );
     }
     Ok(objects)
+}
+
+fn catalog_dependencies(
+    manager: &crate::connector_manager::ConnectorManager,
+    entry: &CatalogManifestEntry,
+) -> Result<Vec<String>, DbError> {
+    let name = &entry.canonical_name;
+    let mut dependencies = match entry.kind {
+        CatalogObjectKind::Source => Vec::new(),
+        CatalogObjectKind::Sink => vec![manager
+            .sinks()
+            .get(name)
+            .ok_or_else(|| TopologyError::Invalid(format!("sink '{name}' has no registration")))?
+            .input
+            .clone()],
+        CatalogObjectKind::Stream => {
+            let stream = manager.streams().get(name).ok_or_else(|| {
+                TopologyError::Invalid(format!("stream '{name}' has no registration"))
+            })?;
+            let mut references = crate::sql_analysis::extract_table_references(&stream.query_sql);
+            for join in stream.join_config.iter().flatten() {
+                match join {
+                    laminar_sql::translator::JoinOperatorConfig::StreamStream(config) => {
+                        references.insert(config.left_table.clone());
+                        references.insert(config.right_table.clone());
+                    }
+                    laminar_sql::translator::JoinOperatorConfig::Temporal(config) => {
+                        references.insert(config.left_table.clone());
+                        references.insert(config.right_table.clone());
+                    }
+                    laminar_sql::translator::JoinOperatorConfig::Lookup(_) => {
+                        return Err(TopologyError::Unsupported(format!(
+                            "stream '{name}' has an unmapped join dependency contract"
+                        ))
+                        .into())
+                    }
+                }
+            }
+            if references.is_empty() {
+                return Err(TopologyError::Unsupported(format!(
+                    "stream '{name}' has no explicit input activation boundary"
+                ))
+                .into());
+            }
+            references.into_iter().collect()
+        }
+        _ => {
+            return Err(TopologyError::Unsupported(format!(
+                "'{name}' has an unsupported catalog kind for topology validation"
+            ))
+            .into())
+        }
+    };
+    dependencies.sort_unstable();
+    Ok(dependencies)
+}
+
+fn classify_object_transitions(
+    parent: &BTreeMap<String, ClusterTopologyObjectPlan>,
+    target: BTreeMap<String, ClusterTopologyObjectPlan>,
+    statements: &[String],
+) -> Result<Vec<ClusterTopologyObjectPlan>, DbError> {
+    let replacements = statements
+        .iter()
+        .filter_map(|sql| match super::catalog_changes::parse_one_change(sql) {
+            Ok(statement) if super::catalog_changes::is_replacement(&statement) => Some(
+                super::super::catalog_create_identity(&statement).and_then(|identity| {
+                    identity.map(|(name, _, _)| name).ok_or_else(|| {
+                        TopologyError::Invalid("replacement has no typed identity".into()).into()
+                    })
+                }),
+            ),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<std::collections::BTreeSet<_>, DbError>>()?;
+    let mut retired = Vec::new();
+    for (name, previous) in parent {
+        match target.get(name) {
+            Some(current) if current == previous => {}
+            Some(current) if current.transition == ClusterTopologyObjectTransition::Preserve => {
+                // A stateless query can change future computation with an unchanged schema and
+                // dependency closure. Managed state and connectors require the exact definition.
+                let compatible = replacements.contains(name)
+                    && previous.kind == CatalogObjectKind::Stream
+                    && previous.managed_state_contract.is_none()
+                    && current.managed_state_contract.is_none()
+                    && current.schema_sha256 == previous.schema_sha256
+                    && current.dependencies == previous.dependencies
+                    && current.dependencies.iter().all(|dependency| {
+                        parent
+                            .get(dependency)
+                            .zip(target.get(dependency))
+                            .is_some_and(|(old, new)| {
+                                old.compatibility_sha256 == new.compatibility_sha256
+                            })
+                    });
+                if !compatible {
+                    return Err(TopologyError::Unsupported(format!(
+                        "preserved object '{name}' changed its resolved state, schema, connector or dependency contract; explicitly DROP/CREATE it and its affected dependents for a future-only reset"
+                    )).into());
+                }
+            }
+            _ => {
+                let mut removed = previous.clone();
+                removed.transition = ClusterTopologyObjectTransition::Remove;
+                removed.initialization = TopologyInitialization::RetireAtCut;
+                retired.push(removed);
+            }
+        }
+    }
+    retired.extend(target.into_values());
+    retired.sort_unstable_by(|left, right| {
+        (&left.name, left.catalog_generation).cmp(&(&right.name, right.catalog_generation))
+    });
+    Ok(retired)
 }
 
 fn validate_future_state_inputs(

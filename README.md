@@ -102,12 +102,11 @@ location. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip
 
 ### Change a running cluster's topology
 
-Cluster SQL supports adding pipelines and dropping sources, streams or sinks without CASCADE.
-Drop dependents before their inputs.
-Migrations pause at a checkpoint and preserve existing progress; new stateful operators
-start empty and process future input. They return an asynchronous receipt and resume when
-all required nodes are ready. Replacement, retired-name reuse,
-incompatible state/input changes and membership changes remain unsupported.
+Cluster migrations support adding, dropping and replacing sources, streams or sinks.
+Progress is preserved by default; reset incompatible objects with ordered DROP/CREATE
+in one migration request, dropping dependents first. New or reset state processes future input.
+Migrations pause at a checkpoint and return an asynchronous receipt. All required nodes
+must be ready to resume; node IDs and the complete vnode owner map must stay unchanged.
 See the [server REST API](crates/laminar-server/README.md#rest-api) for topology endpoints.
 
 ## Production tuning

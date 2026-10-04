@@ -551,7 +551,16 @@ pub(super) async fn prepare_source_positions_at_cut(
             .ok_or_else(|| TopologyError::Invalid("restore source has no connector".into()))?;
         let config = candidate.build_registered_source_config(&name, registration)?;
         let mut connector = candidate.connector_registry.create_source(&config, None)?;
-        let position = if let Some(checkpoint) = cut.source_offsets.get(&name) {
+        let target_cut = cut.pipeline_identity == input.descriptor().target_pipeline;
+        let preserved = input.root().preserved_objects.iter().any(|object| {
+            object.kind == laminar_core::cluster::control::CatalogObjectKind::Source
+                && object.name == name
+        });
+        let position = if let Some(checkpoint) = cut
+            .source_offsets
+            .get(&name)
+            .filter(|_| target_cut || preserved)
+        {
             let scoped = connector.contract(&config)?.topology
                 == laminar_connectors::connector::SourceTopology::Splittable;
             crate::pipeline_lifecycle::validate_source_recovery_assignment(
@@ -638,7 +647,10 @@ impl LaminarDB {
                 .descriptor()
                 .objects
                 .iter()
-                .find(|object| object.name == stream.name)
+                .find(|object| {
+                    object.name == stream.name
+                        && object.transition != super::ClusterTopologyObjectTransition::Remove
+                })
                 .ok_or_else(|| {
                     TopologyError::Invalid("new subscription has no descriptor".into())
                 })?;
