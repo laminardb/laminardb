@@ -207,8 +207,7 @@ including remote AI — runs normally.
 `POST /api/v1/sql` returns at most 1000 result rows (and stops after a 5s collection budget). When the result is larger, the JSON response sets `"truncated": true` and `data` holds the first 1000 rows; the field is omitted when the result is complete. Use SUBSCRIBE (pgwire/WebSocket) to stream unbounded results.
 
 Supported cluster DDL returns an asynchronous migration receipt. See the main
-README's [topology configuration and recovery guidance](../../README.md#change-a-running-clusters-topology)
-for supported changes, adoption, submission and retry procedures.
+README's [topology support and limits](../../README.md#change-a-running-clusters-topology).
 
 ## Postgres Wire Protocol
 

@@ -102,71 +102,11 @@ location. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip
 
 ### Change a running cluster's topology
 
-A running cluster can add an independent source → stateless stream → sink pipeline,
-or a compatible stateless downstream stream or sink. Changes pause processing at a
-committed checkpoint and preserve unchanged state, source positions and output progress.
-New objects process future input; they do not backfill history. New Kafka sources with
-explicit topics can use `earliest` or `latest`; their numeric starting positions are
-resolved once and persisted. Connector and delivery-mode restrictions still apply.
-
-Removal, replacement, DROP/recreate, new stateful operators and changes to keys, schemas,
-windows or source/sink semantics remain unsupported. This mechanism also requires the
-same complete vnode owner map and stable node IDs; it does not remove failed members or
-rescale surviving nodes.
-
-For an existing legacy catalog, stop every old process and upgrade all nodes together,
-keeping the configuration, deployment identity and checkpoint namespace. After normal
-recovery, read `GET /api/v1/cluster/topology` and explicitly adopt its exact catalog:
-
-```http
-POST /api/v1/cluster/topology/adopt
-Authorization: Bearer <console-token>
-Content-Type: application/json
-
-{
-  "operation_id": "00000000-0000-0000-0000-000000000501",
-  "expected_manifest": <complete catalog.manifest object from status>,
-  "expected_deployment_id": "<UUID from checkpoint-deployment/identity.json>",
-  "coordinated_upgrade_complete": true
-}
-```
-
-Mixed binary operation is unsupported. Adoption preserves existing catalog bytes and
-checkpoints. Do not edit authority objects or reset storage to upgrade.
-
-Use `POST /api/v1/cluster/topology/validate` with `expected_parent_version` and
-`statements` for an effect-free dry-run. For one atomic change, submit the same fields
-and a caller-generated nonzero UUID to `POST /api/v1/cluster/topology/operations`:
-
-```json
-{
-  "operation_id": "00000000-0000-0000-0000-000000000502",
-  "expected_parent_version": 1,
-  "statements": [
-    "CREATE STREAM future_projection AS SELECT id, value FROM trades WHERE value > 0"
-  ]
-}
-```
-
-All routes require the configured console bearer. HTTP 202 acknowledges admission;
-the cluster's recovery coordinator continues the operation after the caller disconnects.
-Normal `POST /api/v1/sql` also submits supported DDL and returns a `TOPOLOGY MIGRATION`
-receipt. Semicolon-separated SQL statements remain sequential; use the array API for
-related objects that must change atomically.
-
-Poll `GET /api/v1/cluster/topology/operations/{operation_id}`. After an uncertain
-response, retry the same UUID, exact statements and parent version. For SQL, use the
-UUID in the receipt or `x-laminar-topology-operation-id` header instead of blindly
-resubmitting. Status separates `committed_version` from each node's
-`locally_active_version`: output remains held until every required process is ready
-and applies Release. After Commit, recover the target rather than rolling it back.
-
-Replace a failed process in its original node slot using the same durable namespace
-and configuration. A full restart can use the complete current inventory or the exact
-complete original adopted bootstrap; durable target authority takes precedence.
-Recovery uses the greatest exact target checkpoint, or its authorized migration root
-before the first target checkpoint. Missing participants and corrupt artifacts keep
-the cluster fenced.
+Cluster SQL supports additive stateless pipelines and compatible downstream streams or
+sinks. Migrations pause at a checkpoint, preserve existing progress and process future
+input. They return an asynchronous receipt; processing resumes when all required nodes
+are ready. Stateful changes, removal, replacement and membership changes remain unsupported.
+See the [server REST API](crates/laminar-server/README.md#rest-api) for topology endpoints.
 
 ## Production tuning
 
@@ -175,16 +115,9 @@ persistent checkpoints, authentication, and network security. Measure peak proce
 normal load, bursts, and recovery; individual engine limits do not cap total process memory.
 Choose checkpoint frequency and container resources from those measurements.
 
-For topology migrations, also measure the processing pause and peak memory during target
-restoration. Monitor operation status, checkpoint progress and every node's readiness;
-an admitted or committed operation alone does not mean processing has resumed.
-
-Budget checkpoint storage for retained migration roots, including their state and output
-objects. Routine cleanup can reclaim old target checkpoints but cannot reclaim those
-roots or the operation journal; new operation IDs are rejected at 64 retained operations.
-Do not delete authority or root objects to bypass this limit. Cleanup retains artifacts
-if its state preflight exceeds 8192 objects, 4 GiB or 15 seconds, or if root/target manifest
-metadata exceeds 16 MiB. These are safety bounds, not configurable memory limits.
+For topology migrations, measure pause duration and peak restore memory, and budget storage
+for retained migration roots. The current limit is 64 retained operations; do not delete
+authority or root objects to bypass it.
 
 The [server tuning guide](crates/laminar-server/README.md#memory-limits-and-production-tuning)
 and [site guide](https://laminardb.io/docs/#production-tuning) cover memory limits, monitoring,
