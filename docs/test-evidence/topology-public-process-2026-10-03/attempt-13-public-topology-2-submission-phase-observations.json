@@ -1,0 +1,112 @@
+{
+  "observations": [
+    {
+      "elapsed_since_submission_or_restart_ms": 1806,
+      "phase": {
+        "phase": "planned"
+      },
+      "status_sequence": 211
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 2860,
+      "phase": {
+        "phase": "preparing"
+      },
+      "status_sequence": 214
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 3129,
+      "phase": {
+        "phase": "preparing"
+      },
+      "status_sequence": 217
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 3931,
+      "phase": {
+        "phase": "quiescing"
+      },
+      "status_sequence": 218
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 6082,
+      "phase": {
+        "phase": "quiescing"
+      },
+      "status_sequence": 223
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 6352,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 224
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 7437,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 226
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 9124,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 228
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 9401,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 229
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 9677,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 230
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 11060,
+      "phase": {
+        "phase": "committed"
+      },
+      "status_sequence": 231
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 13300,
+      "phase": {
+        "phase": "activating"
+      },
+      "status_sequence": 234
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 14158,
+      "phase": {
+        "phase": "activating"
+      },
+      "status_sequence": 235
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 17302,
+      "phase": {
+        "phase": "activating"
+      },
+      "status_sequence": 238
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 18730,
+      "phase": {
+        "phase": "active"
+      },
+      "status_sequence": 239
+    }
+  ],
+  "operation_id": "b41dac7e-0ba4-48ba-947a-f321435856a0",
+  "scope": "First observed durable status after public submission or restart; polling and IO delay are included. Unobserved transitions have no inferred duration.",
+  "trigger": "submission"
+}

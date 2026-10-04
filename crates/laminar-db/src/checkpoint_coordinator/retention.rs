@@ -230,6 +230,7 @@ pub(super) async fn load_protected_checkpoint(
         .await
         .map_err(|error| DbError::Checkpoint(format!("load retained checkpoint index: {error}")))?;
     let manifests = load_index_manifests(store, &index).await?;
+    super::retention_state::validate_retained_state(store, &manifests).await?;
     let live = live_chunk_inventory(&manifests);
     Ok(ProtectedCheckpoint { index, live })
 }

@@ -90,6 +90,14 @@ Console authorization and existing serving fences apply to every route. Diagnost
 
 A persisted manifest alone never reports local activation. Missing participants remain required; they are not removed to manufacture Release. Checkpoint epochs continue monotonically. After Commit, a replacement process uses a new runtime UUID and coordinated recovery round; it cannot consume an original runtime's Release.
 
+Committed-target recovery currently requires the same complete vnode owner map and
+stable node IDs. Replace a failed process in its original node slot with the same
+durable namespace and configuration. Recovery revalidates its new boot identity
+and process term. Survivor rescaling and cluster membership removal are outside
+this topology contract; a reduced owner map cannot activate the committed target.
+An already Active operation keeps its original immutable Release evidence while
+the replacement uses a fresh recovery Release.
+
 Restart with the same durable namespace and either the complete current inventory or the exact complete original adopted bootstrap. Durable target authority takes precedence over that original bootstrap. Changed definitions and arbitrary subsets reject. Recovery selects the greatest target checkpoint, or the exact authorized migration root before the first target checkpoint, and rechecks state/source availability and full readiness before intake Release.
 
 Timeout or absent acknowledgement is not proof that a durable write or sink commit failed. Query status and retry the same identity. Pre-Commit leader/process failure follows the existing abort/recovery path. After Commit, preserve target authority and recover it. A reversal is another checked forward migration.
@@ -101,6 +109,12 @@ Errors preserve registry codes: 400 malformed/bounded request; 409 stale parent,
 Unchanged streams retain incarnation and output sequence identities. Reader reconnect crosses pipeline identities only through exact released roots while keeping all schema/query/distribution/changelog/retention contracts strict. Dropped/recreated identity reuse is prohibited. AS OF EPOCH remains an existing replay boundary, not durable named-consumer acknowledgement storage.
 
 Cleanup audits checkpoint predecessor edges and exact horizon references. Missing/corrupt roots stop deletion. This checkpoint retains migration roots and their old state pins conservatively, and its journal rejects admission at 64 retained operation identities. Root consumption and journal reclamation remain outstanding work; Release alone is insufficient retirement authority.
+
+Cluster cleanup also verifies the protected checkpoint's complete state-object
+lengths and hashes before publishing its cleanup cursor. Missing or corrupt
+owned/incremental state, conflicting references, or exceeded object/read budgets
+stop that cleanup. The current state preflight accepts at most 8192 objects and
+4 GiB in total within a 15-second read deadline; these are control-path bounds.
 
 ## Qualification
 

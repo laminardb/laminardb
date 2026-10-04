@@ -129,6 +129,11 @@ impl LeaderLeaseStore {
             if !Self::recovery_topology_matches(&after, round)
                 || head.commit_head != after.commit_head
                 || head.committed_topology_operation() != after.committed_topology_operation()
+                || (epoch.is_some()
+                    && (head.assignment_handoff_pin != after.assignment_handoff_pin
+                        || head.active_checkpoint_artifacts != after.active_checkpoint_artifacts
+                        || head.artifact_cleanup != after.artifact_cleanup
+                        || head.assignment_drain_reservation != after.assignment_drain_reservation))
             {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
@@ -215,7 +220,6 @@ impl LeaderLeaseStore {
         if head.active_checkpoint_artifacts.is_some()
             || head.artifact_cleanup.is_some()
             || head.assignment_drain_reservation.is_some()
-            || head.assignment_handoff_pin.is_some()
         {
             return Err(DecisionError::Conflict("topology recovery Start/install/Release requires settled checkpoint, cleanup and assignment authority".into()).into());
         }
@@ -287,6 +291,18 @@ impl LeaderLeaseStore {
         {
             return Err(DecisionError::Conflict(
                 "recovery cut is neither the exact migration root nor target checkpoint progress"
+                    .into(),
+            )
+            .into());
+        }
+        // Recovery's handoff pin keeps this exact cut alive until the first checkpoint from
+        // the replacement assignment. Waiting for it to disappear would prevent that runtime
+        // from ever starting. Retain the pin and accept only its exact target and payload.
+        if head.assignment_handoff_pin.as_ref().is_some_and(|pin| {
+            pin.target != fence || outcome.committed_checkpoint.as_ref() != Some(&pin.checkpoint)
+        }) {
+            return Err(DecisionError::Conflict(
+                "topology recovery handoff pin differs from its exact assignment or selected checkpoint"
                     .into(),
             )
             .into());

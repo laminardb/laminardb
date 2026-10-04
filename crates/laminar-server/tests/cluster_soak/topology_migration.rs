@@ -1,14 +1,14 @@
 //! Public migration inside the existing independent stateful Kafka/S3 soak.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use laminar_core::cluster::control::{
     CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, LegacyTopologyBaseline,
-    TopologyAdmissionPhase, TopologyAdmissionStatus, TopologyCatalogState, TopologyOperationId,
-    TopologyVersion,
+    RecoverPhase, RecoveryAnnouncement, TopologyAdmissionPhase, TopologyAdmissionStatus,
+    TopologyCatalogState, TopologyOperationId, TopologyVersion,
 };
 use object_store::ObjectStoreExt;
 
@@ -87,17 +87,70 @@ pub(super) fn adopt_inventory(namespace: &str, nodes: &mut [Node]) -> LegacyTopo
 }
 
 pub(super) struct MigrationProbe {
+    objects: Arc<dyn object_store::ObjectStore>,
     authority: Arc<LeaderLeaseStore>,
     runtime: tokio::runtime::Runtime,
     brokers: String,
     input_topic: String,
     output: KafkaOutputOracle,
     expected: BTreeSet<(u64, u64)>,
+    input_started: BTreeMap<(u64, u64), Instant>,
+    visible_latencies_ms: Vec<f64>,
     operations: Vec<TopologyOperationId>,
     evidence_dir: std::path::PathBuf,
 }
 
 impl MigrationProbe {
+    fn recovery_release(&self) -> Option<(u64, RecoveryAnnouncement)> {
+        use object_store::path::Path as ObjectPath;
+        use sha2::{Digest as _, Sha256};
+
+        self.runtime.block_on(async {
+            for _ in 0..4 {
+                let pointer_bytes = self.objects.get(&ObjectPath::from("control/leader-lease-head/v1.json"))
+                    .await.unwrap().bytes().await.unwrap();
+                assert!(pointer_bytes.len() <= 128);
+                let pointer: serde_json::Value = serde_json::from_slice(&pointer_bytes).unwrap();
+                let sequence = pointer["sequence"].as_u64().unwrap();
+                let record = self.objects.get(&ObjectPath::from(format!("control/leader-lease/v{sequence:016}.json")))
+                    .await.unwrap().bytes().await.unwrap();
+                assert!(record.len() <= 256 * 1024);
+                let record: serde_json::Value = serde_json::from_slice(&record).unwrap();
+                let link = &record["recovery_release_head"];
+                if link.is_null() {
+                    return None;
+                }
+                let reference = &link["terminal"];
+                let generation = reference["release"]["generation"].as_u64().unwrap();
+                let digest = reference["sha256"].as_str().unwrap();
+                let terminal = self.objects.get(&ObjectPath::from(format!(
+                    "control/recovery-release-terminals/v2/generation={generation:020}/sha256={digest}.json"
+                ))).await.unwrap().bytes().await.unwrap();
+                assert_eq!(terminal.len() as u64, reference["encoded_len"].as_u64().unwrap());
+                assert_eq!(format!("{:x}", Sha256::digest(&terminal)), digest);
+                let terminal: RecoveryAnnouncement = serde_json::from_slice(&terminal).unwrap();
+                assert!(matches!(terminal.phase, RecoverPhase::ReleaseCommitted { .. }));
+                assert_eq!(terminal.round.id.generation, generation);
+                let next = self.objects.get(&ObjectPath::from("control/leader-lease-head/v1.json"))
+                    .await.unwrap().bytes().await.unwrap();
+                if next == pointer_bytes {
+                    return Some((link["sequence"].as_u64().unwrap(), terminal));
+                }
+                assert!(next.len() <= 128);
+                let next: serde_json::Value = serde_json::from_slice(&next).unwrap();
+                let next_sequence = next["sequence"].as_u64().unwrap();
+                let next_record = self.objects.get(&ObjectPath::from(format!("control/leader-lease/v{next_sequence:016}.json")))
+                    .await.unwrap().bytes().await.unwrap();
+                assert!(next_record.len() <= 256 * 1024);
+                let next_record: serde_json::Value = serde_json::from_slice(&next_record).unwrap();
+                if next_record["recovery_release_head"] == *link {
+                    return Some((link["sequence"].as_u64().unwrap(), terminal));
+                }
+            }
+            panic!("authority changed during every bounded recovery Release observation");
+        })
+    }
+
     fn status(&self, operation: TopologyOperationId) -> TopologyAdmissionStatus {
         self.runtime
             .block_on(self.authority.topology_operation_status(operation))
@@ -133,12 +186,24 @@ impl MigrationProbe {
         operation: TopologyOperationId,
         version: u64,
         ceiling: Duration,
+        started: Instant,
+        trigger: &str,
     ) {
+        let mut observations = Vec::new();
+        let mut last_sequence = None;
         wait_for("full-roster public topology Release", ceiling, || {
             for node in nodes.iter_mut() {
                 node.assert_running();
             }
             let status = self.status(operation);
+            if last_sequence != Some(status.status_sequence) {
+                observations.push(serde_json::json!({
+                    "elapsed_since_submission_or_restart_ms": started.elapsed().as_millis(),
+                    "status_sequence": status.status_sequence,
+                    "phase": status.phase,
+                }));
+                last_sequence = Some(status.status_sequence);
+            }
             assert!(
                 !matches!(status.phase, TopologyAdmissionPhase::Aborted { .. }),
                 "public migration aborted: {status:?}"
@@ -160,6 +225,16 @@ impl MigrationProbe {
             nodes.len()
         );
         assert!(status.activation.as_ref().unwrap().installation_complete());
+        std::fs::write(
+            self.evidence_dir
+                .join(format!("public-topology-{version}-{trigger}-phase-observations.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "scope": "First observed durable status after public submission or restart; polling and IO delay are included. Unobserved transitions have no inferred duration.",
+                "operation_id": operation,
+                "trigger": trigger,
+                "observations": observations,
+            })).unwrap(),
+        ).unwrap();
         std::fs::write(
             self.evidence_dir
                 .join(format!("public-topology-{version}-active.json")),
@@ -191,6 +266,7 @@ impl MigrationProbe {
                     .await
                     .unwrap();
                 self.expected.insert((id, id));
+                self.input_started.insert((id, id), started);
             }
         });
         started
@@ -203,8 +279,32 @@ impl MigrationProbe {
                 node.assert_running();
             }
             self.output.drain(&self.expected, &mut boundary);
+            let observed = Instant::now();
+            for pair in &self.output.seen {
+                if let Some(sent) = self.input_started.remove(pair) {
+                    self.visible_latencies_ms
+                        .push(observed.duration_since(sent).as_secs_f64() * 1000.0);
+                }
+            }
             self.output.is_complete(&self.expected)
         });
+    }
+
+    fn visible_latency_evidence(&self) -> serde_json::Value {
+        let mut sorted = self.visible_latencies_ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        let percentile = |percentage: usize| {
+            sorted
+                .get((sorted.len() * percentage).div_ceil(100).saturating_sub(1))
+                .copied()
+        };
+        serde_json::json!({
+            "scope": "Small deterministic new-pipeline oracle; includes producer creation, sending, cut hold, recovery and consumer observation. Separate from the existing steady-state soak latency sample.",
+            "samples_ms": self.visible_latencies_ms,
+            "sample_count": sorted.len(),
+            "quantile_method": "nearest rank",
+            "p50_ms": percentile(50), "p95_ms": percentile(95), "p99_ms": percentile(99),
+        })
     }
 
     fn checkpoint(&self, ceiling: Duration, version: u64) -> DurableCheckpointStatus {
@@ -268,6 +368,79 @@ impl MigrationProbe {
         checkpoint.unwrap()
     }
 
+    pub(super) fn recover_replaced_process(
+        &self,
+        nodes: &mut [Node],
+        victim: usize,
+        ceiling: Duration,
+        started: Instant,
+        round: u32,
+    ) {
+        let operation = *self.operations.last().unwrap();
+        let before = self.status(operation).activation.unwrap();
+        let prior_recovery = self.recovery_release();
+        let executable = nodes[victim].verify_executable_for_spawn();
+        nodes[victim].spawn(executable);
+        self.wait_active(
+            nodes,
+            operation,
+            3,
+            ceiling,
+            started,
+            &format!("kill-{round}"),
+        );
+        wait_for("full roster after process replacement", ceiling, || {
+            super::has_full_membership(nodes)
+        });
+        let after = self.status(operation).activation.unwrap();
+        assert_eq!(
+            after, before,
+            "recovery rewrote the original immutable Release"
+        );
+        let recovered = self
+            .recovery_release()
+            .expect("ready target requires a durable recovery Release");
+        assert_ne!(
+            prior_recovery.as_ref().map(|(_, release)| release.round.id),
+            Some(recovered.1.round.id)
+        );
+        let binding = recovered.1.round.topology_binding().unwrap();
+        assert_eq!(
+            binding.commit(),
+            self.status(operation).commit.as_ref().unwrap()
+        );
+        assert_eq!(binding.processes().len(), nodes.len());
+        assert_eq!(
+            recovered
+                .1
+                .round
+                .assignment_fence
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .collect::<Vec<_>>(),
+            before
+                .assignment
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .collect::<Vec<_>>()
+        );
+        let report = serde_json::json!({
+            "scope": "Replacement of the killed process with the complete original owner map; no survivor resharding is certified.",
+            "victim": victim, "round": round,
+            "kill_to_full_target_release_ms": started.elapsed().as_millis(),
+            "original_activation": before, "prior_recovery_release": prior_recovery,
+            "recovered_release": recovered,
+        });
+        std::fs::write(
+            self.evidence_dir
+                .join(format!("public-topology-kill-{round}.json")),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+
     pub(super) fn restart_all(&mut self, nodes: &mut [Node], ceiling: Duration) {
         let before = self.checkpoint(ceiling, 3);
         let started = Instant::now();
@@ -279,7 +452,14 @@ impl MigrationProbe {
             let executable = node.verify_executable_for_spawn();
             node.spawn(executable);
         }
-        self.wait_active(nodes, *self.operations.last().unwrap(), 3, ceiling);
+        self.wait_active(
+            nodes,
+            *self.operations.last().unwrap(),
+            3,
+            ceiling,
+            started,
+            "full-restart",
+        );
         wait_for(
             "full membership after committed-target restart",
             ceiling,
@@ -291,7 +471,8 @@ impl MigrationProbe {
         assert!(after.checkpoint_id > before.checkpoint_id && after.epoch > before.epoch);
         let report = serde_json::json!({"full_restart_to_output_ms": started.elapsed().as_millis(),
             "expected_new_pipeline_pairs": self.expected, "observed_new_pipeline_pairs": self.output.seen,
-            "allowed_at_least_once_duplicates": self.output.duplicates});
+            "allowed_at_least_once_duplicates": self.output.duplicates,
+            "consumer_visible_latency": self.visible_latency_evidence()});
         std::fs::write(
             self.evidence_dir.join("public-topology-restart.json"),
             serde_json::to_vec_pretty(&report).unwrap(),
@@ -315,6 +496,7 @@ pub(super) fn exercise(
     super::kafka_create_topic(brokers, &input_topic, 3);
     super::kafka_create_topic(brokers, &output_topic, 3);
     let mut probe = MigrationProbe {
+        objects: topology_adoption::objects_for_namespace(namespace),
         authority: Arc::new(LeaderLeaseStore::new(
             topology_adoption::objects_for_namespace(namespace),
             30_000,
@@ -324,12 +506,15 @@ pub(super) fn exercise(
         input_topic,
         output: KafkaOutputOracle::new(brokers, &output_topic, 3),
         expected: BTreeSet::new(),
+        input_started: BTreeMap::new(),
+        visible_latencies_ms: Vec::new(),
         operations: Vec::new(),
         evidence_dir: evidence_dir.to_owned(),
     };
     // Historical records are deliberately excluded by once-resolved latest activation.
     probe.produce(0);
     probe.expected.clear();
+    probe.input_started.clear();
     let request = laminar_db::ClusterTopologyRequest {
         operation_id: uuid::Uuid::new_v4().try_into().unwrap(), expected_parent_version: TopologyVersion::LEGACY_BASELINE,
         statements: vec![
@@ -341,7 +526,14 @@ pub(super) fn exercise(
     let started = Instant::now();
     probe.submit(&nodes[1], &request);
     probe.operations.push(request.operation_id);
-    probe.wait_active(nodes, request.operation_id, 2, ceiling);
+    probe.wait_active(
+        nodes,
+        request.operation_id,
+        2,
+        ceiling,
+        started,
+        "submission",
+    );
     let activation = started.elapsed();
     let root = probe
         .runtime
@@ -369,6 +561,7 @@ pub(super) fn exercise(
 
     let sql = "CREATE STREAM topology_live_downstream AS SELECT join_key, match_count, max_right_id FROM soak_join_aggregate";
     let body = serde_json::json!({"sql":sql}).to_string();
+    let downstream_started = Instant::now();
     let response = nodes[0]
         .http_request("POST", "/api/v1/sql", Some(&body), Duration::from_secs(45))
         .unwrap();
@@ -419,7 +612,14 @@ pub(super) fn exercise(
     for node in nodes.iter() {
         node.disarm_checkpoint_kill();
     }
-    probe.wait_active(nodes, admitted.operation_id, 3, ceiling);
+    probe.wait_active(
+        nodes,
+        admitted.operation_id,
+        3,
+        ceiling,
+        downstream_started,
+        "submission",
+    );
     probe.wait_output(nodes, ceiling);
     let visible = input_started.elapsed();
     assert!(visible >= Duration::from_secs(2));
@@ -429,7 +629,8 @@ pub(super) fn exercise(
         "explicit_test_cut_hold_ms": explicit_hold.as_millis(),
         "consumer_visible_latency_including_cut_pause_ms": visible.as_millis(),
         "new_pipeline_expected_pairs": probe.expected, "new_pipeline_observed_pairs": probe.output.seen,
-        "target_checkpoint_epochs": [first.epoch, second.epoch], "root_encoded_len": probe.status(request.operation_id).migration_root.unwrap().root.encoded_len});
+        "target_checkpoint_epochs": [first.epoch, second.epoch], "root_encoded_len": probe.status(request.operation_id).migration_root.unwrap().root.encoded_len,
+        "consumer_visible_latency": probe.visible_latency_evidence()});
     std::fs::write(
         evidence_dir.join("public-topology-observations.json"),
         serde_json::to_vec_pretty(&report).unwrap(),

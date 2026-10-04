@@ -1,0 +1,141 @@
+soak: laminardb executable origin=prebuilt-override path=\\?\C:\Users\sujit\.codex\worktrees\9929\laminardb\target\topology-evidence\laminardb-handoff-retained-state-qualified-soak.exe sha256=f9a05d5f600cb0ce5f6a96d2e2ed97cd3c88d75f2381bcfc392c437544e5089d bytes=172128768
+soak: PROFILE mode=cluster delivery=ALO seconds=5 checkpoint_ms=500 checkpoint_timeout_ms=30000 checkpoint_slo_mode=observe hot_path_slo_mode=observe join_interval_ms=100 rps=400 keys=4096 zipf_milli=1200 kills=0 min_live_state_bytes=0 kafka_sink_linger_ms=0
+soak: node logs in C:\Users\sujit\.codex\worktrees\9929\laminardb\target\tmp\soak-576636-1791078946966558900
+soak: node0 generation=1 pid=573240 executable_sha256=f9a05d5f600cb0ce5f6a96d2e2ed97cd3c88d75f2381bcfc392c437544e5089d
+soak: node1 generation=1 pid=570476 executable_sha256=f9a05d5f600cb0ce5f6a96d2e2ed97cd3c88d75f2381bcfc392c437544e5089d
+soak: node2 generation=1 pid=574148 executable_sha256=f9a05d5f600cb0ce5f6a96d2e2ed97cd3c88d75f2381bcfc392c437544e5089d
+soak: cluster up, checkpoint 3 epoch 3, ingested=18254, Kafka committed offset sum=8225
+soak: public exact-inventory adoption a9617979-bb21-4c18-a262-ead8edaa26f2 at sequence 20
+soak: three-node ALO pre-fault temporal history observed idle temporal inputs and committed checkpoint 28 epoch 28
+soak: three-node ALO temporal right history is durable before fault injection
+soak: public topology 1 -> 2 -> 3, independent latest source and downstream existing aggregate, exact pairs 6, target epochs 36 -> 42, additive activation 20.8986536s, consumer-visible 18.5267396s including explicit two-second cut hold
+soak: node0 generation=2 pid=579672 executable_sha256=f9a05d5f600cb0ce5f6a96d2e2ed97cd3c88d75f2381bcfc392c437544e5089d
+soak: node1 generation=2 pid=579932 executable_sha256=f9a05d5f600cb0ce5f6a96d2e2ed97cd3c88d75f2381bcfc392c437544e5089d
+soak: node2 generation=2 pid=580356 executable_sha256=f9a05d5f600cb0ce5f6a96d2e2ed97cd3c88d75f2381bcfc392c437544e5089d
+
+thread 'three_node_alo_public_topology_migration_restart_soak' (574184) panicked at crates\laminar-server\tests\cluster_soak.rs:11406:5:
+soak: timed out after 90s waiting for: full-roster public topology Release
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--- node0 log tail:
+  2026-10-04T01:59:01.799044Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:01.799447Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:01.879821Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=7 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:02.059491Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:02.082029Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=8
+  2026-10-04T01:59:02.342539Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:02.424661Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:02.624587Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:02.906532Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:03.187453Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:03.468087Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:03.753476Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:04.037763Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:04.162196Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:04.319650Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:04.604645Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:04.886924Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:05.170789Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:05.457065Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:05.742508Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:05.849523Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:05.850134Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:05.850701Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:05.933363Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:06.027899Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:06.032915Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:06.313281Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:06.601059Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:06.820474Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:06.821078Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:06.821635Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:06.889601Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:06.908347Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:07.147928Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6062] topology operation was fenced by current leader authority
+  2026-10-04T01:59:07.175871Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:07.464439Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:07.757485Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:08.009838Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:08.044660Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T01:59:08.082397Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=9
+--- node1 log tail:
+  2026-10-04T01:58:56.718137Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:58:56.806776Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=6 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:58:56.965755Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:58:57.684678Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:58:57.685306Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:58:57.685883Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:58:57.770796Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=6 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:58:57.982056Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=7
+  2026-10-04T01:58:58.694678Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:58:59.667728Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:58:59.668324Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:58:59.668881Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:58:59.769524Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=7 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:00.684810Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:00.722640Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:00.723122Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:00.723525Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:00.814339Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=7 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:01.683978Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:01.684588Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:01.685144Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:01.769467Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=7 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:02.428056Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:02.970866Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=8
+  2026-10-04T01:59:04.166068Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:05.729697Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:05.730150Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:05.730573Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:05.820468Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:06.037267Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:06.716338Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:06.716760Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:06.717131Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:06.808029Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:07.774442Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:07.774953Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:07.775474Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:07.865216Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:08.003867Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=9
+  2026-10-04T01:59:08.014569Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+--- node2 log tail:
+  2026-10-04T01:59:01.368364Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:01.462265Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=7 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:01.462332Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=7 attempt=3
+  2026-10-04T01:59:01.462346Z ERROR laminar_db::coordinated_recovery: leader self-restore failed; abandoning round gen=7
+  2026-10-04T01:59:01.462354Z ERROR laminar_db::coordinated_recovery: recovery restore quorum failed gen=7 quorum=TimedOut
+  2026-10-04T01:59:01.504217Z ERROR laminar_db::coordinated_recovery: holding intake shut and requesting a fresh recovery round gen=7 restore_quorum=false
+  2026-10-04T01:59:01.537271Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=9
+  2026-10-04T01:59:01.554674Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=9
+  2026-10-04T01:59:01.983269Z  WARN laminar_db::coordinated_recovery: leader announced recovery prepare gen=8
+  2026-10-04T01:59:01.983597Z  WARN laminar_db::coordinated_recovery: leader Prepare quiesced gen=8
+  2026-10-04T01:59:02.431370Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:03.787412Z  WARN laminar_db::coordinated_recovery: leader stop quorum reached gen=8
+  2026-10-04T01:59:04.168624Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:04.361270Z  WARN laminar_db::coordinated_recovery: leader target selected gen=8
+  2026-10-04T01:59:04.550484Z  WARN laminar_db::coordinated_recovery: leader announced recovery start target_epoch=42 checkpoint_id=42 participants=3 gen=8
+  2026-10-04T01:59:05.233424Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:05.233962Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:05.234495Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:05.323328Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:05.323410Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=8 attempt=1
+  2026-10-04T01:59:06.040744Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:06.120691Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:06.121267Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:06.121878Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:06.216282Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:06.216353Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=8 attempt=2
+  2026-10-04T01:59:06.995473Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T01:59:06.996119Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T01:59:06.996722Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T01:59:07.095725Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=8 terminal=false error=[LDB-6001] Checkpoint error: [LDB-6029] operator 'soak_join' restore failed: [LDB-6001] Checkpoint error: interval join [soak_join] archived cluster checkpoint identity is invalid
+  2026-10-04T01:59:07.095810Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=8 attempt=3
+  2026-10-04T01:59:07.095824Z ERROR laminar_db::coordinated_recovery: leader self-restore failed; abandoning round gen=8
+  2026-10-04T01:59:07.095833Z ERROR laminar_db::coordinated_recovery: recovery restore quorum failed gen=8 quorum=TimedOut
+  2026-10-04T01:59:07.142528Z ERROR laminar_db::coordinated_recovery: holding intake shut and requesting a fresh recovery round gen=8 restore_quorum=false
+  2026-10-04T01:59:07.178819Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=10
+  2026-10-04T01:59:07.196962Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=10
+  2026-10-04T01:59:07.651343Z  WARN laminar_db::coordinated_recovery: leader announced recovery prepare gen=9
+  2026-10-04T01:59:07.651613Z  WARN laminar_db::coordinated_recovery: leader Prepare quiesced gen=9
+  2026-10-04T01:59:08.019281Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T01:59:08.198076Z  WARN laminar_db::coordinated_recovery: leader stop quorum reached gen=9

@@ -218,7 +218,6 @@ impl LeaderLeaseStore {
                         || current.active_checkpoint_artifacts.is_some()
                         || current.artifact_cleanup.is_some()
                         || current.assignment_drain_reservation.is_some()
-                        || current.assignment_handoff_pin.is_some()
                     {
                         return Err(TopologyError::Fenced);
                     }

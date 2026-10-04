@@ -1,0 +1,1 @@
+[{"Type":"volume","Name":"0a3dda4e93d6605cd0ed7cd01d1af36621f013141d076f0e47f8c5d972735c55","Source":"0a3dda4e93d6605cd0ed7cd01d1af36621f013141d076f0e47f8c5d972735c55","Destination":"/var/lib/redpanda/data","Driver":"local","Mode":"rw","RW":true,"Propagation":""}]

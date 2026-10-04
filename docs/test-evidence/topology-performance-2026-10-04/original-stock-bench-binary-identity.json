@@ -1,0 +1,19 @@
+{
+  "recorded_utc": "2026-10-04T00:11:50.529899+00:00",
+  "baseline_commit": "5d81ba9b18d80343373ecfaec4793df8c5caccf1",
+  "source_identity": "original-baseline-source-identity.json",
+  "verified_source_files": 1177,
+  "features": [
+    "cluster"
+  ],
+  "profile": "unmodified stock bench, inheriting release ThinLTO and one codegen unit",
+  "cargo_lock_normalized_sha256": "42655f37bbc9a4a69d5dcc5956c029c19e2d598fe6b8a4758f44ce7e12633f5b",
+  "build_command": "cargo bench --locked -p laminar-core --no-default-features --features cluster --bench streaming_bench --no-run",
+  "binary": {
+    "path": "target/topology-evidence/streaming-bench-original-stock.exe",
+    "sha256": "9ca8dad40c67c5c01c0879aea465671ce076b80e4cb52d1e8ba42c4213e5b670",
+    "encoded_len": 4369408,
+    "unmodified_copy": true
+  },
+  "scope": "Fresh successful source-verified build; no new benchmark samples have been taken yet."
+}

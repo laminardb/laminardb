@@ -78,6 +78,21 @@ After Commit, rollback is forbidden. Recovery selects the greatest exact target 
 
 Coordinated recovery binds the exact immutable Commit, full current process roster and new recovery round. After complete stopped receipts and artifact/sink settlement, participants independently reconstruct the same selected cut and start held actors. Ready/Release certify actual sources, state, sink generation and receiver mesh. A first recovery Release can atomically complete pending topology activation. Recovering an already Active target retains its original immutable activation evidence while using a new replacement runtime/round.
 
+This recovery contract preserves the complete vnode owner map and stable node IDs;
+only process incarnations and certified assignment versions may advance. The
+public topology soak replaces a failed process before requiring full-roster
+progress. The existing survivor-rescaling soak exercises a separate membership
+contract. A reduced assignment is not evidence for topology Release; the partial
+process run rejected it and stayed fenced.
+
+An assignment-recovery handoff pin protects the exact selected restore cut until
+the replacement assignment commits its first target checkpoint. Recovery
+Start/install/Release may retain that pin only when its complete assignment fence
+and full checkpoint reference equal the audited current assignment and selected
+greatest checkpoint. The pin is rechecked after control I/O and remains present
+through Release. A differing pin, unsettled checkpoint, cleanup cursor or drain
+reservation still fences recovery; Release itself does not retire restore state.
+
 Cold startup accepts the complete current catalog or the exact complete original adopted bootstrap as an assertion. Durable target authority takes precedence over that original bootstrap. Arbitrary subsets and changed definitions reject. The target catalog is reconstructed, namespace ownership retained and the same coordinated recovery owner queued before actors can publish.
 
 Missing deployment identity is an error, including through a cached decision store. Reads never recreate it. Source cursors for every target source come from the selected checkpoint; recovery cannot re-resolve latest or reuse an old initializer when target progress exists. Checkpoint allocation and publication frontiers continue monotonically.
@@ -93,6 +108,15 @@ Old prepared sink effects settle against their durable logical checkpoint identi
 Unchanged subscription certificates retain generation, schema, query, distribution, changelog, event-time and retention contracts. A reader crosses a historical pipeline boundary only through exact released roots and complete certificate equality for the mapped incarnation. Historical segment bindings remain unchanged. Audits occur at checkpoint boundaries and cache the selected certificate; there is no per-row remote audit. Reconnect and AS OF EPOCH retain existing no-silent-gap and bounded-consumer semantics, without inventing named-consumer acknowledgement storage.
 
 Retention uses those exact predecessor edges and historical certificates. A cleanup horizon is checked by its full encoded reference, digest and length. Missing/corrupt roots or changed horizons stop deletion before output/state loss. Migration roots/state pins are still retained conservatively after Release; consumption and bounded topology-journal reclamation remain outstanding. The 64-operation bound fails closed rather than forgetting idempotency history.
+
+Protected-cut artifact preflight verifies complete owned and incremental state
+objects by length and SHA-256 before cluster cleanup publishes its floor/cursor.
+Reads use 256 KiB ranges, at most eight concurrent objects, an 8192-object/4 GiB
+aggregate bound and a 15-second state-read deadline. Duplicate references must
+agree exactly; empty objects must still exist. This verifies stored bytes rather
+than decoding every state codec. Existing local retention publishes its floor
+before protected-cut loading and retains that ordering. Cleanup rechecks topology
+and assignment-handoff references after preflight before its conditional append.
 
 ## Ordering and failure matrix
 

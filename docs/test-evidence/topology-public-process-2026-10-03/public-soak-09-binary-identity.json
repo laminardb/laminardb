@@ -1,0 +1,51 @@
+{
+  "recorded_utc": "2026-10-03T22:23:05.528369+00:00",
+  "source_identity": {
+    "commit": "4cfcb2cd60e864c96d714db822751d87092a3e81",
+    "frozen_at_utc": "2026-10-03T21:53:52.210728+00:00",
+    "profile": "soak",
+    "features": [
+      "cluster",
+      "aws",
+      "kafka"
+    ],
+    "packages": [
+      "laminar-core",
+      "laminar-connectors",
+      "laminar-db",
+      "laminar-server"
+    ],
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+    "changed_sources": [
+      {
+        "path": "crates/laminar-server/tests/cluster_soak/topology_migration.rs",
+        "sha256": "6c2173a2acebd01d6e50507cdd871104a0399784dd192f0dd71b3d1a52c0a037",
+        "normalized_sha256": "6c2173a2acebd01d6e50507cdd871104a0399784dd192f0dd71b3d1a52c0a037"
+      }
+    ],
+    "scope": "Production sources equal the commit; the test-only changes add observed phase timing and pause-inclusive consumer samples. No production stack modifications or PE changes."
+  },
+  "binaries": [
+    {
+      "role": "server",
+      "path": "target/topology-evidence/laminardb-public-qualified-soak.exe",
+      "sha256": "12d238460d10c1ab2667725b3533eebd19a6fa54a80ecab6872d242b2b7a36eb",
+      "encoded_len": 172109824,
+      "pe_main_stack_reserve_bytes": 1048576,
+      "pe_main_stack_commit_bytes": 4096,
+      "profile": "soak",
+      "unmodified_copy": true
+    },
+    {
+      "role": "harness",
+      "path": "target/topology-evidence/cluster-soak-public-qualified.exe",
+      "sha256": "82ccbc0873b9565cff97b698a0d6646c48d87f2f6f1db5dce459b7a97ffaed74",
+      "encoded_len": 31347712,
+      "pe_main_stack_reserve_bytes": 1048576,
+      "pe_main_stack_commit_bytes": 4096,
+      "profile": "soak",
+      "unmodified_copy": true
+    }
+  ]
+}

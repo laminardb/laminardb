@@ -73,14 +73,19 @@ impl LeaderAuthorityRecord {
     }
 
     pub(super) fn topology_cut_blocks_cleanup(&self, protected: &CommittedCheckpointRef) -> bool {
-        self.topology_operations
-            .iter()
-            // Release is not retirement of the migration root. Its parent state can still be
-            // needed before a target checkpoint and by recovery/replay references afterward.
-            // Keep this pin until an explicit root-consumption/retirement protocol exists.
-            .filter(|operation| operation.blocks_admission() || operation.has_target_commit())
-            .filter_map(|operation| operation.cut.as_ref()?.committed.as_ref())
-            .any(|commit| protected.epoch > commit.checkpoint.epoch)
+        self.topology_operations.iter().any(|operation| {
+            if operation.blocks_admission() {
+                // Planned/Preparing reserve the parent before any cut has been recorded.
+                return true;
+            }
+            // Release alone cannot retire state required by recovery or replay.
+            operation.has_target_commit()
+                && operation
+                    .cut
+                    .as_ref()
+                    .and_then(|cut| cut.committed.as_ref())
+                    .is_some_and(|commit| protected.epoch > commit.checkpoint.epoch)
+        })
     }
 }
 

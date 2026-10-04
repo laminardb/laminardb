@@ -21,6 +21,7 @@ mod protocol;
 mod recovery;
 mod request;
 mod retention;
+mod retention_state;
 mod sink_artifact_intents;
 mod sink_commit;
 pub(crate) mod sink_epoch_admission;

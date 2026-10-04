@@ -1,0 +1,91 @@
+{
+  "observations": [
+    {
+      "elapsed_since_submission_or_restart_ms": 5721,
+      "phase": {
+        "phase": "quiescing"
+      },
+      "status_sequence": 193
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 5994,
+      "phase": {
+        "phase": "quiescing"
+      },
+      "status_sequence": 198
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 6264,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 200
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 6810,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 201
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 8748,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 203
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 9026,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 204
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 9302,
+      "phase": {
+        "phase": "cut_prepared"
+      },
+      "status_sequence": 205
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 10568,
+      "phase": {
+        "phase": "committed"
+      },
+      "status_sequence": 207
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 13364,
+      "phase": {
+        "phase": "activating"
+      },
+      "status_sequence": 209
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 14539,
+      "phase": {
+        "phase": "activating"
+      },
+      "status_sequence": 211
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 15671,
+      "phase": {
+        "phase": "activating"
+      },
+      "status_sequence": 212
+    },
+    {
+      "elapsed_since_submission_or_restart_ms": 16807,
+      "phase": {
+        "phase": "active"
+      },
+      "status_sequence": 214
+    }
+  ],
+  "operation_id": "0f686a9d-989b-4a74-a7ec-ba51fee445de",
+  "scope": "First observed durable status after public submission or restart; polling and IO delay are included. Unobserved transitions have no inferred duration.",
+  "trigger": "submission"
+}

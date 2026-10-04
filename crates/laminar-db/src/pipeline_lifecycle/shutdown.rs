@@ -284,6 +284,21 @@ impl LaminarDB {
                                     "topology retirement lost the held parent runtime".into(),
                                 ));
                             }
+                            #[cfg(feature = "cluster")]
+                            if authority == PipelineLifecycleAuthority::CoordinatedRecovery {
+                                // Cold target recovery has not started actors, but its token and
+                                // any retained startup/connector ownership must still be retired
+                                // through the same observed teardown before reporting stopped.
+                                match DbState::compare_exchange(
+                                    DbState::Created,
+                                    DbState::ShuttingDown,
+                                    &self.state,
+                                ) {
+                                    Ok(_) => break true,
+                                    Err(DbState::Stopped) => {}
+                                    Err(_) => continue,
+                                }
+                            }
                             drop(owned);
                             return Ok(());
                         }

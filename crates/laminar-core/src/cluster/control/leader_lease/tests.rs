@@ -7775,3 +7775,104 @@ mod topology_preparation;
 
 #[path = "topology_migration_root_tests.rs"]
 mod topology_migration_root;
+
+#[tokio::test]
+async fn topology_cleanup_planned_without_cut_retains_artifacts() {
+    let authority = Arc::new(store(30_000));
+    let (lease, assignments, plan, target) = topology_admission::fixture(&authority).await;
+    let proof = lease.proof();
+    let mut protected = None;
+    for id in 1..=3 {
+        let RecordOutcomeResult::Created(outcome) =
+            record_commit(&authority, &proof, &plan.assignment, id, id).await
+        else {
+            panic!("fixture checkpoint must commit");
+        };
+        protected = outcome.committed_checkpoint;
+    }
+    let admitted = authority
+        .admit_topology_plan(&proof, &assignments, &plan, &target)
+        .await
+        .unwrap();
+    assert!(admitted.cut.is_none());
+    assert!(authority
+        .begin_cluster_artifact_cleanup(&proof, protected.unwrap(), |_| async {
+            Err("Planned migration must block cleanup before artifact preflight".into())
+        })
+        .await
+        .unwrap()
+        .is_none());
+    assert!(authority
+        .cluster_artifact_cleanup()
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        authority
+            .cluster_outcome_retention_boundary()
+            .await
+            .unwrap()
+            .artifact_before_epoch,
+        0
+    );
+}
+
+#[tokio::test]
+async fn topology_cleanup_admission_during_preflight_retains_floor() {
+    let authority = Arc::new(store(30_000));
+    let (lease, assignments, plan, target) = topology_admission::fixture(&authority).await;
+    let proof = lease.proof();
+    let mut protected = None;
+    for id in 1..=3 {
+        let RecordOutcomeResult::Created(outcome) =
+            record_commit(&authority, &proof, &plan.assignment, id, id).await
+        else {
+            panic!("fixture checkpoint must commit");
+        };
+        protected = outcome.committed_checkpoint;
+    }
+    let validating_authority = Arc::clone(&authority);
+    let assignments = Arc::new(assignments);
+    let validating_proof = proof.clone();
+    let validating_plan = plan.clone();
+    let cleanup = authority
+        .begin_cluster_artifact_cleanup(&proof, protected.unwrap(), move |_| {
+            let authority = Arc::clone(&validating_authority);
+            let assignments = Arc::clone(&assignments);
+            let proof = validating_proof.clone();
+            let plan = validating_plan.clone();
+            let target = target.clone();
+            async move {
+                authority
+                    .admit_topology_plan(&proof, &assignments, &plan, &target)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+    assert!(cleanup.is_none());
+    assert!(authority
+        .cluster_artifact_cleanup()
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        authority
+            .cluster_outcome_retention_boundary()
+            .await
+            .unwrap()
+            .artifact_before_epoch,
+        0
+    );
+    assert_eq!(
+        authority
+            .topology_operation_status(plan.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        crate::cluster::control::TopologyAdmissionPhase::Planned
+    );
+}

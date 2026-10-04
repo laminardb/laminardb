@@ -14116,7 +14116,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
             fault_trigger_path: fault_role
                 .as_ref()
                 .map(|_| dir.path().join(format!("fault-node-{id}.trigger"))),
-            checkpoint_gate_path: (max_kills > 0)
+            checkpoint_gate_path: (max_kills > 0 || migrate_topology)
                 .then(|| dir.path().join(format!("checkpoint-node-{id}.arm"))),
         })
         .collect();
@@ -14497,6 +14497,65 @@ fn run_three_node_join_kill9_soak_with_adoption(
         }
         kills += 1;
         eprintln!("soak round {round}: kill -9 delivered to {victim_role} node {victim}");
+        if let Some(probe) = migration_probe.as_ref() {
+            // Topology recovery currently certifies a complete unchanged owner map. Replace the
+            // failed process before asking for progress; the ordinary soak below also exercises
+            // survivor resharding, which remains outside this topology contract.
+            probe.recover_replaced_process(
+                &mut nodes,
+                victim,
+                remaining_progress_window(failover_deadline, "topology process replacement"),
+                failover_started,
+                round,
+            );
+            latest_checkpoint = assert_progress(
+                &mut nodes,
+                Some(&mut producer),
+                Some(&commit_oracle),
+                remaining_progress_window(failover_deadline, "topology process replacement"),
+                "target progress after process replacement",
+                Some(latest_checkpoint),
+            );
+            let replaced = wait_for_local_assignment_convergence(
+                &mut nodes,
+                &all_live_nodes,
+                failover_deadline,
+                "topology replacement local assignment",
+            );
+            assert_eq!(
+                replaced.snapshot.vnodes, local_convergence.snapshot.vnodes,
+                "topology replacement changed the certified owner map"
+            );
+            let current = &replaced.evidence_by_node[&victim];
+            assert_eq!(
+                current.participant.node_id,
+                previous_victim_evidence.participant.node_id
+            );
+            assert_ne!(
+                current.participant.boot_incarnation,
+                previous_victim_evidence.participant.boot_incarnation
+            );
+            assert!(current.process_term > previous_victim_evidence.process_term);
+            exact_timing_evidence.capture_nodes_bound(
+                &nodes,
+                &replaced,
+                Instant::now() + Duration::from_secs(10),
+                &format!("topology kill-{round} replacement"),
+            );
+            let elapsed = assert_recovery_within(
+                failover_started,
+                recovery_ceiling,
+                "kill-9 to full target Release and durable stateful progress",
+            );
+            eprintln!("soak round {round}: replaced {victim_role} node {victim}, full target Release and checkpoint {} epoch {} in {elapsed:?}", latest_checkpoint.checkpoint_id, latest_checkpoint.epoch);
+            local_convergence = replaced;
+            observe_live_join_state(
+                &nodes,
+                &mut live_state_high_water,
+                &mut temporal_state_high_water,
+            );
+            continue;
+        }
         latest_checkpoint = assert_progress(
             &mut nodes,
             Some(&mut producer),

@@ -16,12 +16,14 @@ requested definition of done has not yet been met.
 - Windows MSVC, rustc/cargo 1.98.0, unchanged Cargo.lock. Locked dependencies
   include Arrow 58.4.0, DataFusion 53.1.0, sqlparser 0.61.0, object_store 0.13.2,
   tokio 1.53.1 and tonic 0.14.6. No AGENTS.md applies.
-- The final four-package `cluster,aws,kafka` library/binary suite passes 4,459
-  tests: core 1,104, connectors 921, DB 2,075, server 359; three existing tests
-  remain ignored. Eight test threads and 4 MiB stacks retain existing deadlines.
+- The latest full four-package `cluster,aws,kafka` library/binary suite passes
+  4,467 tests: core 1,107, connectors 921, DB 2,080, server 359; three existing
+  tests remain ignored. Two later retention cases pass in the separate final
+  focused run and are not included in that full-suite total. Eight test threads
+  and 4 MiB stacks retain existing deadlines.
   All-target Clippy denies warnings; minimal server, cluster/FFI, formatting,
   diff and frozen-source checks pass. Default connector feature suites are not run.
-- [Public evidence](test-evidence/topology-public-2026-10-03/README.md) binds 37
+- Earlier [public evidence](test-evidence/topology-public-2026-10-03/README.md) binds 37
   changed Rust sources and Cargo.lock. No binary/performance identity is implied
   by those unit-test hashes.
 
@@ -101,8 +103,74 @@ pin old state, and the journal rejects new identities at 64 retained operations.
   49 and returned 409 without admission. Checkpoint/cleanup contention now retries
   the same compiled plan under the original 45-second deadline. The cleanup-wait
   regression and all 278 focused topology tests pass; all-target Clippy passes.
-  The repaired-server process rerun remains pending. See
+  The repaired stock server subsequently completed both public migrations,
+  exact target checkpoints and the consumer boundary on three processes. That
+  run failed when the original kill loop attempted a two-survivor rescale before
+  replacing the killed leader; complete topology recovery requires the unchanged
+  owner map. A test-only full-roster replacement branch is being built. Full
+  restart and final stateful/sink/sequence qualification remain pending. See
   [contention evidence](test-evidence/topology-public-race-2026-10-03/README.md).
+  Partial process outcomes, identities, phase and pause-inclusive observations
+  are in [process evidence](test-evidence/topology-public-process-2026-10-03/README.md).
+- The corrected optimized harness linked with stock settings. An initial rerun
+  hit the owned broker's partition-memory limit; raising its allocation to 4 GiB
+  retained the exact volume and 112 topic definitions. The zero-kill cold-restart
+  run then passed both public migrations and target checkpoints 52/55, but failed
+  because recovery's Created stop returned without closing its runtime token.
+  Recovery now uses observed teardown in that state; public stop behavior is
+  unchanged. Its owned-task/drain regression passes in the focused library suite:
+  298 tests passed and two were ignored across Core, connectors and DB. This
+  command does not exercise server binary tests. The subsequent full selected
+  suites passed 4,463 tests with three ignored, including 359 server tests.
+  The repaired stock optimized server build completed with unchanged ThinLTO and
+  one codegen unit. Attempt 12 passed both migrations, target checkpoints 27/33
+  and all three cold-process replacements. Observed Created teardown and source
+  settlement now succeed. Recovery then deadlocked on its exact assignment-handoff
+  pin: Start required no pin, but pin retirement requires a new target checkpoint.
+  No cold-restart success is claimed. The authority retained the full fresh roster
+  and exact checkpoint 33, and the existing 90-second Release deadline expired.
+  Recovery now accepts only a pin whose complete assignment and checkpoint
+  reference equal the selected cut, retains that pin through Release, and rechecks
+  pin/checkpoint/cleanup authority after I/O. A regression reproduced the guard
+  failure; its full-suite rerun passed 4,464 tests with three ignored, including
+  the real assignment-recovery pin regression. Native qualification still requires
+  the new optimized executable. The earlier 4,463 passing tests precede this fix.
+- Two deterministic cleanup regressions reproduce unsafe preflight around a
+  Planned migration. The fix blocks cleanup before a cut exists and rechecks
+  topology/handoff references before cursor publication. All-target Clippy passes
+  with both fixes. Root-state consumption and journal reclamation remain separate
+  unfinished work; this fix removes no recovery/replay pin.
+
+- Retention protected-cut preflight now verifies every owned and referenced state
+  object by complete SHA-256, using 256 KiB reads, eight concurrent requests,
+  an 8192-object/4 GiB bound and a 15-second read deadline. Missing/corrupt state
+  reproduced the old acceptance defect; its matrix, duplicate/bounds and stalled
+  read tests pass in the 4,467-test full suite (three ignored). All-target Clippy
+  denies warnings and passes. The later empty-object/final-range cases passed
+  in the final focused retention run; the minimal server build also passes.
+  This does not consume any migration root or change the
+  64-operation journal bound. Native qualification and matched measurements remain
+  pending; no complete definition-of-done claim is made.
+
+- Fresh original/modified stock queue benchmarks completed three alternating
+  100-sample trials each with idle compilers: average trial slopes were 6.05832
+  and 6.02855 µs per admitted/consumed 32-batch burst (−0.49145% point estimate).
+  This is shared Arrow queue cost, not production throughput or consumer latency.
+  The original stock three-process steady scenario passed all final oracles in
+  228.05 seconds, at 400.0 paced logical IDs/s; graph-cycle bucket upper bounds
+  were p50 0.5 ms, p95 1 ms, p99 5 ms. Full-run sampled combined RSS was
+  932,233,216 bytes. The matched current server run remains pending while its
+  frozen 14-source stock optimized build runs. That build subsequently completed
+  in 23m 53s, with unchanged ThinLTO/one-CGU settings and the retained server hash
+  `f9a05d5f…`. Attempt 13 passed both migrations and exact target checkpoints
+  36/42, then failed cold restore because the interval join decoder saw archived
+  assignment 1 under current assignment 2. Recovery Start now succeeds, but no
+  replacement Release or final oracle is claimed. The matched current steady
+  run passed all final oracles in 229.53 seconds at the same paced 400.0 IDs/s;
+  combined sampled RSS peaked at 805,085,184 bytes. All current p99 graph-cycle
+  bounds remained 5 ms, while one node's p95 bound rose from 1 ms to 5 ms.
+  Exact identities, raw samples and
+  scope are in [performance evidence](test-evidence/topology-performance-2026-10-04/README.md).
 
 ## Next work, in order
 

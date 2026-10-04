@@ -1,0 +1,140 @@
+# Public three-process migration qualification
+
+Attempt 09 completed public adoption and both additive migrations on the existing
+Kafka/S3 stateful soak. It failed after killing the leader, before replacement or
+full restart. This is partial evidence, not a passing end-to-end qualification.
+
+The server uses production commit `4cfcb2cd60e864c96d714db822751d87092a3e81`,
+unchanged stock optimized `soak` profile and Windows PE stack settings. The harness
+adds test-only consumer latency and observed-phase measurements. Exact source,
+Cargo.lock and executable identities are in `public-soak-09-binary-identity.json`.
+
+```powershell
+$env:CARGO_BUILD_JOBS = '1'
+cargo test --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --test cluster_soak --no-run
+```
+
+The build passed. The run used three native server processes, owned MinIO and
+Redpanda fixtures, 12 original Kafka partitions, 400 offered records/second,
+4,096 keys, Zipf 1.2, 500 ms checkpoints and at-least-once delivery. Both existing
+checkpoint and latency SLO modes were `observe`; no production SLO is inferred.
+
+The exact existing sealed inventory was adopted without changing its bytes or
+deployment identity. An independent latest-source pipeline committed topology 2
+and released all three installed processes. Ordinary SQL then attached a
+stateless stream to an existing aggregate, committed topology 3, and released
+the complete roster. Target checkpoints advanced from epoch 23 to 26. The six
+expected new-pipeline logical pairs appeared; historical records were excluded.
+
+The independent activation took 26,473 ms. A proven checkpoint gate held the
+second cut for 2,023 ms. The following three records became consumer-visible
+after 15,014 ms, including that hold and Release. Six deterministic observations
+are retained; their nearest-rank p50/p95/p99 are 111.236/15,014.340/15,014.340 ms.
+This small oracle is not a steady-state or production latency distribution.
+Observed durable status transitions include polling and I/O delay; missing
+transitions have no inferred duration.
+
+The leader was killed in checkpoint 28's final sink fence. The original soak
+then requested progress on two survivors before restarting the victim. The
+committed topology requires the complete unchanged owner map, and recovery
+rejected that reduced assignment. The test timed out at the existing 90-second
+recovery ceiling and exited 101 after 205.96 seconds. Full restart and the final
+independent stateful/sink/sequence oracles were not reached. The failed run did
+not roll back either committed topology or manufacture a smaller Release.
+
+The subsequent harness correction replaces the killed process before requiring
+progress, asserts a new boot/process term and the unchanged complete owner map,
+and checks a fresh durable recovery Release. An already Active operation retains
+its original immutable activation evidence. Ordinary survivor-rescaling tests
+remain separate. Its standard optimized build completed in 32m 45s; its hash and
+source binding are in `public-soak-10-binary-identity.json`.
+
+Attempt 10 stopped before server startup because the 1 GiB broker rejected new
+partitions at its memory limit (532 requested total against a 524-replica limit).
+Only the owned broker was restarted with 4 GiB; its exact data volume and all 112
+topic definitions were verified unchanged. No topic, authority or checkpoint
+namespace was reset. Subsequent comparison runs use the same fixture allocation.
+
+Attempt 11 used the corrected harness with zero injected kills to isolate full
+cold restart. Both public migrations passed, reaching target epochs 52 and 55;
+independent activation took 16,880 ms and pause-inclusive observation took
+16,456 ms with a 2,023 ms explicit hold. These are correctness observations under
+concurrent compilation, not a compiler-idle performance comparison.
+
+All three replacement processes replayed the original configuration. The cold
+recovery driver then repeatedly rejected source-drain settlement: the new DB was
+Created with a live runtime token, and recovery stop returned early without
+observed teardown. The existing 90-second Release deadline expired; the test
+failed after 181.47 seconds. Original target Commit/activation evidence remains
+immutable at authority sequence 437; no recovery Release was manufactured. Final
+stateful/sink/sequence oracles were not reached. A narrow recovery-owned Created
+teardown fix and an owned-task/drain regression are being verified; no passing
+cold-restart qualification is claimed yet.
+
+The narrow Created recovery fix uses the existing cancellation and observed
+teardown owner. Its regression installs a task that waits for runtime cancellation,
+then verifies the task was observed before the exact stopped-source settlement.
+Two additional red-to-green authority tests reproduce cleanup before a Planned
+cut exists and admission during artifact preflight. The fixes retain all existing
+root/state/replay pins. The focused `--lib topology` run passed 298 tests with two
+ignored (connectors 12, Core 144, DB 142). This command excludes server binary
+tests. All-target Clippy passed with warnings denied. The subsequent full
+`--lib --bins` run passed 4,463 tests (connectors 921, Core 1,106, DB 2,077,
+server 359) with three ignored. Native restart qualification for the repaired
+executable remains pending.
+
+Attempt 12 used that repaired stock server (`cfb9b732…`) and the same corrected
+stock harness (`cbdf3983…`) with zero injected kills and idle compilers. Both
+public migrations completed, reaching exact target epochs 27 and 33. All three
+cold replacement processes used the original bootstrap and acquired new boot
+identities/process terms. Observed Created teardown and source-drain settlement
+succeeded. Recovery then blocked Start because the assignment-handoff pin was
+still present, although that pin cannot retire until the recovered assignment
+produces its first target checkpoint. The test failed after 204.60 seconds at the
+unchanged 90-second Release ceiling; final stateful/sink/sequence oracles were
+not reached. This is a second independently observed recovery defect, not a
+passing full-restart qualification.
+
+Final authority sequence 323 retained the exact checkpoint-33 reference and full
+three-process assignment-2 handoff pin, with no active checkpoint artifacts,
+cleanup cursor or drain reservation. The two original Active operation receipts
+remained immutable; no fresh recovery Release was published. The checked-in
+attempt-12 authority summary and binary identity bind those observations.
+Activation was observed at 22,584 ms, the deliberate checkpoint hold was 2,022 ms,
+and the three paused input pairs were first consumed after 16,599 ms. The six
+consumer samples yield nearest-rank p50 608.90 ms and p95/p99 16,599.49 ms. These
+small correctness-oracle samples do not establish a production latency budget.
+The sampled combined server RSS maximum was 563,736,576 bytes across both process
+generations; allocation events were not profiled.
+
+The subsequent handoff fix accepts a pin only after auditing the exact current
+assignment and complete selected checkpoint reference. It preserves the pin
+through installation/Release and preserves the original Active receipt. A
+regression rejects altered assignment and checkpoint pins, exercises the real
+process takeover and assignment-recovery decision, then requires the next exact
+target checkpoint to retire the pin. The original guard failed that regression
+after 30.21 seconds. The subsequent full suite passed 4,464 tests, and the
+retained-state extension passed 4,467 tests with three ignored. All-target Clippy
+and the minimal server check passed; the final focused retention run also passed
+the later empty-object and final-range cases. Qualification of the newly built
+native executable is still pending. No blanket handoff, fingerprint or ownership
+bypass was added.
+
+Attempt 13 used the frozen 14-source repair and retained stock executable
+`f9a05d5f…`, built in 23m 53s. With zero injected kills and idle compilers, both
+public migrations reached exact target checkpoints 36 and 42 and all six new
+pipeline pairs matched. All three cold replacements acquired fresh process
+identities. Recovery passed the exact handoff-pin Start guard, then failed while
+decoding the interval join's archived assignment-1 state against live assignment
+2. Intake stayed held, the original Active receipts stayed immutable, and no
+replacement Release was published. The existing 90-second deadline expired;
+the test failed after 203.32s and did not reach the final stateful/sink/sequence
+oracles. The final authority summary binds sequence 341 and exact checkpoint 42.
+This identifies the next repair; it does not qualify full cold restart.
+
+The sampled combined server working-set maximum was 566,935,552 bytes; per-process
+observed peak working sets were 173,953,024, 191,991,808 and 243,068,928 bytes.
+The resource JSON retains sampling intervals, private bytes and available
+input-buffer/managed-state gauges. Allocation events were not profiled and are
+reported as unavailable. Raw node/build logs remain under ignored
+`target/topology-evidence` and `target/tmp/soak-532300-1791066190126809200`.

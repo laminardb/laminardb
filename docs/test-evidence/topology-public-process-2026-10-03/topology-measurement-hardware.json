@@ -1,0 +1,31 @@
+{
+  "captured_utc": "2026-10-03T23:06:40.7547945Z",
+  "processor": [
+    {
+      "Name": "AMD Ryzen 9 7900X 12-Core Processor            ",
+      "NumberOfCores": 12,
+      "NumberOfLogicalProcessors": 24,
+      "MaxClockSpeed": 4701
+    }
+  ],
+  "memory": [
+    {
+      "TotalPhysicalMemory": 33396600832
+    }
+  ],
+  "operating_system": [
+    {
+      "Caption": "Microsoft Windows 11 Pro",
+      "Version": "10.0.26200",
+      "BuildNumber": "26200",
+      "OSArchitecture": "64-bit"
+    }
+  ],
+  "feature_set": [
+    "cluster",
+    "aws",
+    "kafka"
+  ],
+  "profile": "unmodified stock soak",
+  "measurement_note": "Build and correctness qualification are separate from compiler-idle matched measurements."
+}

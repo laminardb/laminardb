@@ -1,0 +1,48 @@
+{
+  "recorded_utc": "2026-10-04T01:33:40.373720+00:00",
+  "revision": "original",
+  "commit": "5d81ba9b18d80343373ecfaec4793df8c5caccf1",
+  "run_id": "567384-1791077103911013500",
+  "test": "three_node_alo_join_kill9_soak",
+  "test_exit_code": 0,
+  "test_elapsed_seconds": 228.05,
+  "requested_steady_seconds": 60,
+  "kills": 0,
+  "compiler_idle": true,
+  "server_binary_sha256": "72a4ae46e0343c569dfcf89a7741f6e951bae195699204995df70bfab1ae29a9",
+  "harness_binary_sha256": "cbdf3983b4f0b7c14eeb9e7d56a02d22010476098722f2a132a06375ad11d113",
+  "producer": {
+    "acknowledged_logical_ids": 75380,
+    "producer_elapsed_seconds": 188.5,
+    "acknowledged_logical_ids_per_second": 400.0,
+    "offered_logical_ids_per_second": 400,
+    "scope": "Paced offered-load acknowledgement across startup/probes/steady input; not peak server capacity."
+  },
+  "hot_cycle_percentiles": [
+    {
+      "node": 0,
+      "p50_bucket_upper_ms": 0.5,
+      "p95_bucket_upper_ms": 1.0,
+      "p99_bucket_upper_ms": 5.0,
+      "cycles": 80271
+    },
+    {
+      "node": 1,
+      "p50_bucket_upper_ms": 0.5,
+      "p95_bucket_upper_ms": 1.0,
+      "p99_bucket_upper_ms": 5.0,
+      "cycles": 86673
+    },
+    {
+      "node": 2,
+      "p50_bucket_upper_ms": 0.5,
+      "p95_bucket_upper_ms": 1.0,
+      "p99_bucket_upper_ms": 5.0,
+      "cycles": 45630
+    }
+  ],
+  "max_sampled_combined_rss_bytes": 932233216,
+  "allocation_events": null,
+  "queue_depth": null,
+  "scope": "Existing three-process stateful ALO scenario, compiler idle. All final stateful/sink/oracle assertions passed. Hot percentiles are graph-cycle histogram bucket upper bounds, not producer-to-consumer latency. Full-run RSS includes preparation/probes beyond the requested steady interval. A matched modified server result is pending."
+}

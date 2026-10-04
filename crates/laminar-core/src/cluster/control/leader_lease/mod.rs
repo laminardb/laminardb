@@ -6379,6 +6379,8 @@ impl LeaderLeaseStore {
                 || rechecked.record.commit_head != current.commit_head
                 || rechecked.record.outcome_floor != current.outcome_floor
                 || rechecked.record.artifact_cleanup != current.artifact_cleanup
+                || rechecked.record.assignment_handoff_pin != current.assignment_handoff_pin
+                || rechecked.record.topology_operations != current.topology_operations
             {
                 tokio::task::yield_now().await;
                 continue;

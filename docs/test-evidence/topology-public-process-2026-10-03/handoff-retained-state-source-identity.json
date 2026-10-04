@@ -1,0 +1,79 @@
+{
+  "recorded_utc": "2026-10-04T01:12:07.490185+00:00",
+  "base_commit": "4cfcb2cd60e864c96d714db822751d87092a3e81",
+  "changed_sources": [
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/mod.rs",
+      "sha256": "c541a0d3e34e79c70b28f3551ee68fc5aec2a60504e16e0ba25f3a1e011e696e",
+      "normalized_sha256": "c541a0d3e34e79c70b28f3551ee68fc5aec2a60504e16e0ba25f3a1e011e696e"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/tests.rs",
+      "sha256": "ae17a550097040f2881c4a60232c17698231ac88f3a7a0ecf2be212e528e0348",
+      "normalized_sha256": "ae17a550097040f2881c4a60232c17698231ac88f3a7a0ecf2be212e528e0348"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_activation.rs",
+      "sha256": "4b029f6328a42bb525aa2441bfcfc286d0d2a26cc70e1e02423603ac93858257",
+      "normalized_sha256": "4b029f6328a42bb525aa2441bfcfc286d0d2a26cc70e1e02423603ac93858257"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_cut.rs",
+      "sha256": "25a5125b916119f120fa110bc512ccb71d26dcce05cda02d044ea29772216809",
+      "normalized_sha256": "25a5125b916119f120fa110bc512ccb71d26dcce05cda02d044ea29772216809"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round.rs",
+      "sha256": "d457d738f36e26ca5a3de2a5573e0364198175f4df1c5edb736ae9d0e8b4c10d",
+      "normalized_sha256": "d457d738f36e26ca5a3de2a5573e0364198175f4df1c5edb736ae9d0e8b4c10d"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round_tests.rs",
+      "sha256": "5c6d5dc2fdec86c1897aabce0e1b0d2f9905969461e59a77c635b6cccda9d25a",
+      "normalized_sha256": "5c6d5dc2fdec86c1897aabce0e1b0d2f9905969461e59a77c635b6cccda9d25a"
+    },
+    {
+      "path": "crates/laminar-db/src/checkpoint_coordinator/artifact_tests.rs",
+      "sha256": "215948eebed39f17d687e669662fc729d5d27b108c96b0037bed4dc7cf186bf9",
+      "normalized_sha256": "215948eebed39f17d687e669662fc729d5d27b108c96b0037bed4dc7cf186bf9"
+    },
+    {
+      "path": "crates/laminar-db/src/checkpoint_coordinator/mod.rs",
+      "sha256": "f12bd633943a3cc989349a54c3767c2b69a8f4a7c69c821cce827bdabfbb5da8",
+      "normalized_sha256": "74bb2d476d5e99b9c9eb156c979c9647f656dba6df2bdec7c8307f5cfc6daa11"
+    },
+    {
+      "path": "crates/laminar-db/src/checkpoint_coordinator/retention.rs",
+      "sha256": "21bdf442a5b5250e7c5b01fe1dfd9f69835ce67cb3a120282489e8059345aff6",
+      "normalized_sha256": "49020344612855da7a8ff4da3ca15c43ef71da3e07694497c37b88629d2bbef2"
+    },
+    {
+      "path": "crates/laminar-db/src/checkpoint_coordinator/retention_state.rs",
+      "sha256": "d77553caf653237977eed807a92bc6a21f78ec22b7b6a260db8013022e98975e",
+      "normalized_sha256": "d77553caf653237977eed807a92bc6a21f78ec22b7b6a260db8013022e98975e"
+    },
+    {
+      "path": "crates/laminar-db/src/pipeline_lifecycle/shutdown.rs",
+      "sha256": "95118534d10c147d2c9c054bff9597ba8441b6c4c15ccf2adcb245b155686728",
+      "normalized_sha256": "95118534d10c147d2c9c054bff9597ba8441b6c4c15ccf2adcb245b155686728"
+    },
+    {
+      "path": "crates/laminar-db/src/rebalance/tests.rs",
+      "sha256": "f3124f64dfd21c8da06d94c783992ee1be0d3605bc26e932a35f2a6e240c7207",
+      "normalized_sha256": "f3124f64dfd21c8da06d94c783992ee1be0d3605bc26e932a35f2a6e240c7207"
+    },
+    {
+      "path": "crates/laminar-server/tests/cluster_soak.rs",
+      "sha256": "92548a16f30ac9c6e0730e0700e354716a0bdae941b014a5ef2cd9c4a1c9a9ab",
+      "normalized_sha256": "92548a16f30ac9c6e0730e0700e354716a0bdae941b014a5ef2cd9c4a1c9a9ab"
+    },
+    {
+      "path": "crates/laminar-server/tests/cluster_soak/topology_migration.rs",
+      "sha256": "1c932a11860191fd6f8c74531305398658c16cd93dba95a401a24eb8c59d5bea",
+      "normalized_sha256": "1c932a11860191fd6f8c74531305398658c16cd93dba95a401a24eb8c59d5bea"
+    }
+  ],
+  "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+  "build_command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+  "scope": "Frozen exact handoff-pin recovery, observed Created teardown, cleanup/admission race fixes, protected state-object preflight and full-roster test harness. Native qualification remains pending."
+}
