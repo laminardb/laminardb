@@ -188,14 +188,13 @@ impl WebSocketSource {
                                 () = tokio::time::sleep(delay) => continue,
                                 _ = shutdown_rx.changed() => break,
                             }
-                        } else {
-                            publish_terminal(
-                                &terminal_error,
-                                &data_ready,
-                                format!("connection failed, no more retries: {e}"),
-                            );
-                            break;
                         }
+                        publish_terminal(
+                            &terminal_error,
+                            &data_ready,
+                            format!("connection failed, no more retries: {e}"),
+                        );
+                        break;
                     }
                 };
 
@@ -219,14 +218,13 @@ impl WebSocketSource {
                                 () = tokio::time::sleep(delay) => continue,
                                 _ = shutdown_rx.changed() => break 'outer,
                             }
-                        } else {
-                            publish_terminal(
-                                &terminal_error,
-                                &data_ready,
-                                format!("subscription failed, no more retries: {e}"),
-                            );
-                            break 'outer;
                         }
+                        publish_terminal(
+                            &terminal_error,
+                            &data_ready,
+                            format!("subscription failed, no more retries: {e}"),
+                        );
+                        break 'outer;
                     }
                     debug!("subscription message sent");
                 }
