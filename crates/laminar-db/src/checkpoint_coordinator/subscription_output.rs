@@ -297,31 +297,7 @@ impl CheckpointCoordinator {
                         .collect::<Vec<_>>(),
                 )?;
                 if let Some(root) = root {
-                    for output in &mut outputs {
-                        let mapping = root
-                            .subscriptions
-                            .iter()
-                            .find(|mapping| {
-                                mapping.parent_certificate.stream_generation
-                                    == output.manifest.stream_generation
-                            })
-                            .ok_or_else(|| {
-                                DbError::Checkpoint(
-                                    "parent subscription has no sealed topology mapping".into(),
-                                )
-                            })?;
-                        if output.manifest.distribution_certificate != mapping.parent_certificate
-                            || output.manifest.frontiers != mapping.frontiers
-                        {
-                            return Err(DbError::Checkpoint(
-                                "parent subscription differs from the exact migration root".into(),
-                            ));
-                        }
-                        // An audited comparison view only; stored manifests, digests and sequences
-                        // retain their historical parent identity and are never rewritten.
-                        output.manifest.distribution_certificate =
-                            mapping.target_certificate.clone();
-                    }
+                    map_topology_subscription_predecessors(&root, &mut outputs, &current)?;
                 }
                 outputs
             }
@@ -339,6 +315,54 @@ impl CheckpointCoordinator {
         }
         Ok(())
     }
+}
+
+fn map_topology_subscription_predecessors(
+    root: &laminar_core::cluster::control::TopologyMigrationRoot,
+    outputs: &mut Vec<MergedSubscriptionCheckpoint>,
+    current: &[MergedSubscriptionCheckpoint],
+) -> Result<(), DbError> {
+    if current.iter().any(|output| {
+        let name = &output.manifest.distribution_certificate.stream_id;
+        !root.preserved_objects.iter().any(|object| {
+            object.kind == laminar_core::cluster::control::CatalogObjectKind::Stream
+                && &object.name == name
+        }) && root.future_only_objects.binary_search(name).is_err()
+    }) {
+        return Err(DbError::Checkpoint(
+            "target subscription has no certified topology object".into(),
+        ));
+    }
+    // The audited root accounts for every parent stream. Retired subscriptions
+    // retain their historical output, but have no target continuity mapping.
+    outputs.retain(|output| {
+        root.preserved_objects.iter().any(|object| {
+            object.kind == laminar_core::cluster::control::CatalogObjectKind::Stream
+                && object.name == output.manifest.distribution_certificate.stream_id
+        })
+    });
+    for output in outputs.iter_mut() {
+        let mapping = root
+            .subscriptions
+            .iter()
+            .find(|mapping| {
+                mapping.parent_certificate.stream_generation == output.manifest.stream_generation
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint("parent subscription has no sealed topology mapping".into())
+            })?;
+        if output.manifest.distribution_certificate != mapping.parent_certificate
+            || output.manifest.frontiers != mapping.frontiers
+        {
+            return Err(DbError::Checkpoint(
+                "parent subscription differs from the exact migration root".into(),
+            ));
+        }
+        // An audited comparison view only; stored manifests, digests and sequences
+        // retain their historical parent identity and are never rewritten.
+        output.manifest.distribution_certificate = mapping.target_certificate.clone();
+    }
+    Ok(())
 }
 
 pub(super) async fn cluster_subscription_retention_reference(

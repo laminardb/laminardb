@@ -24,12 +24,14 @@ pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError>
         StreamingStatement::CreateSource(create) => !create.or_replace,
         StreamingStatement::CreateSink(create) => !create.or_replace,
         StreamingStatement::CreateStream { or_replace, .. } => !or_replace,
-        StreamingStatement::DropSink { cascade, .. } => !cascade,
+        StreamingStatement::DropSource { cascade, .. }
+        | StreamingStatement::DropStream { cascade, .. }
+        | StreamingStatement::DropSink { cascade, .. } => !cascade,
         _ => false,
     };
     if !allowed {
         return Err(TopologyError::Unsupported(
-            "topology validation supports CREATE SOURCE/STREAM/SINK and DROP SINK without CASCADE; source/stream removal, replacement and reset require separate contracts".into(),
+            "topology validation supports CREATE/DROP SOURCE/STREAM/SINK without CASCADE; replacement and reset require separate contracts".into(),
         )
         .into());
     }
@@ -41,18 +43,26 @@ pub(super) fn statement_identity(
     sql: &str,
     statement: &StreamingStatement,
 ) -> Result<(String, CatalogObjectKind, &'static str), DbError> {
-    if let StreamingStatement::DropSink { name, cascade, .. } = statement {
-        if *cascade || crate::db::catalog_ddl_contains_comment(sql)? {
+    let drop = match statement {
+        StreamingStatement::DropSource { name, .. } => {
+            Some((name, CatalogObjectKind::Source, "DROP SOURCE"))
+        }
+        StreamingStatement::DropStream { name, .. } => {
+            Some((name, CatalogObjectKind::Stream, "DROP STREAM"))
+        }
+        StreamingStatement::DropSink { name, .. } => {
+            Some((name, CatalogObjectKind::Sink, "DROP SINK"))
+        }
+        _ => None,
+    };
+    if let Some((name, kind, operation)) = drop {
+        if crate::db::catalog_ddl_contains_comment(sql)? {
             return Err(TopologyError::Unsupported(
-                "DROP SINK requires one typed statement without CASCADE or SQL comments".into(),
+                "DROP requires one typed statement without SQL comments".into(),
             )
             .into());
         }
-        return Ok((
-            crate::db::canonical_object_name(name)?,
-            CatalogObjectKind::Sink,
-            "DROP SINK",
-        ));
+        return Ok((crate::db::canonical_object_name(name)?, kind, operation));
     }
     super::super::validate_cluster_catalog_create(candidate, sql, statement)
 }
@@ -88,20 +98,25 @@ pub(super) async fn apply_catalog_changes(
     let mut new_objects = 0;
     for sql in statements {
         let statement = parse_one_change(sql)?;
-        let (name, kind, _) = statement_identity(candidate, sql, &statement)?;
+        let (name, kind, operation) = statement_identity(candidate, sql, &statement)?;
         if !changed.insert(name.clone()) {
             return Err(TopologyError::Unsupported(format!(
                 "'{name}' changes more than once; replacement and drop/recreate require a new incarnation contract"
             ))
             .into());
         }
-        if matches!(statement, StreamingStatement::DropSink { .. }) {
+        if matches!(
+            statement,
+            StreamingStatement::DropSource { .. }
+                | StreamingStatement::DropStream { .. }
+                | StreamingStatement::DropSink { .. }
+        ) {
             let index = entries
                 .iter()
                 .position(|entry| entry.canonical_name == name && entry.kind == kind)
                 .ok_or_else(|| {
                     TopologyError::Unsupported(format!(
-                        "DROP SINK '{name}' requires an existing parent sink; a missing name cannot establish a migration cut"
+                        "{operation} '{name}' requires an existing parent object of the same kind; a missing name cannot establish a migration cut"
                     ))
                 })?;
             apply_statement(candidate, sql, &statement, &name).await?;
@@ -193,7 +208,7 @@ pub(in crate::db) fn validate_manifest_ddl(manifest: &CatalogManifest) -> Result
 }
 
 impl LaminarDB {
-    pub(in crate::db) async fn reconcile_retired_catalog_sinks(
+    pub(in crate::db) async fn reconcile_retired_catalog_objects(
         &self,
         manifest: &CatalogManifest,
         store: &CatalogManifestStore,
@@ -214,9 +229,12 @@ impl LaminarDB {
         }
         let retired = store.retired_topology_names().await?;
         if extras.iter().any(|entry| {
-            entry.kind != CatalogObjectKind::Sink || !retired.contains(&entry.canonical_name)
+            !matches!(
+                entry.kind,
+                CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink
+            ) || !retired.contains(&entry.canonical_name)
         }) {
-            return Err(TopologyError::Conflict("local inventory has an object outside the committed catalog without certified sink retirement".into()).into());
+            return Err(TopologyError::Conflict("local inventory has an object outside the committed catalog without certified retirement".into()).into());
         }
         let (current, current_topology) = store
             .load_with_topology()
@@ -235,12 +253,13 @@ impl LaminarDB {
         {
             return Err(TopologyError::Fenced.into());
         }
-        for entry in extras {
-            self.require_catalog_kind(&entry.canonical_name, CatalogObjectKind::Sink, false)?;
+        // The manifest is in dependency order; retire dependents before their inputs.
+        for entry in extras.into_iter().rev() {
+            self.require_catalog_kind(&entry.canonical_name, entry.kind, false)?;
             self.rollback_catalog_create(
                 &entry.canonical_name,
-                CatalogObjectKind::Sink,
-                "committed sink retirement",
+                entry.kind,
+                "committed topology retirement",
             )?;
         }
         Ok(())

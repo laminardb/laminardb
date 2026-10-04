@@ -67,8 +67,7 @@ async fn latest_index(fixture: &Fixture) -> laminar_core::checkpoint::CommittedC
         .unwrap()
 }
 
-#[tokio::test]
-async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery() {
+async fn running_parent() -> (Fixture, Arc<runtime_probe::InstallationProbe>) {
     let (fixture, _) = Box::pin(preparation_fixture()).await;
     let probe = enable_runtime(&fixture);
     probe.allow_parent_initial.store(true, Ordering::Release);
@@ -101,6 +100,12 @@ async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery(
     );
     wait_until(|| sink_total(&probe) == 30).await;
     assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    (fixture, probe)
+}
+
+#[tokio::test]
+async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery() {
+    let (fixture, probe) = running_parent().await;
     let certificate = fixture.db.connector_manager.lock().streams()["totals"]
         .subscription_certificate
         .clone()
@@ -616,4 +621,238 @@ async fn topology_public_competing_requests_and_expired_forwarding_never_admit_t
         .is_none());
     fixture.db.recovery_monitor.lock().take().unwrap().abort();
     fixture.db.shutdown.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+async fn topology_source_and_managed_stream_removal_preserves_survivors_through_cold_recovery() {
+    let (fixture, probe) = running_parent().await;
+    let mut additions = independent_pipeline();
+    additions.extend([
+        "CREATE STREAM surviving_total AS SELECT id, SUM(value) AS total FROM added_source GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
+        "CREATE SINK surviving_sink FROM surviving_total INTO \"planning-sink\" ('topic' = 'surviving-output')".into(),
+    ]);
+    let addition = request(1501, additions);
+    Box::pin(fixture.db.submit_cluster_topology_change(&addition))
+        .await
+        .unwrap();
+    active(&fixture, addition.operation_id).await;
+    let surviving_total = || {
+        total(
+            &probe
+                .output
+                .lock()
+                .iter()
+                .filter(|(topic, _)| topic == "surviving-output")
+                .map(|(_, batch)| batch.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(5)["trades"][0].clone(),
+            91,
+        )]),
+    );
+    wait_until(|| surviving_total() == 15).await;
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    let certificate = fixture.db.connector_manager.lock().streams()["surviving_total"]
+        .subscription_certificate
+        .clone()
+        .unwrap();
+    let mut removal = request(
+        1502,
+        vec![
+            "DROP SINK existing_sink".into(),
+            "DROP STREAM totals".into(),
+            "DROP SOURCE trades".into(),
+        ],
+    );
+    removal.expected_parent_version = TopologyVersion::new(2).unwrap();
+    Box::pin(fixture.db.submit_cluster_topology_change(&removal))
+        .await
+        .unwrap();
+    active(&fixture, removal.operation_id).await;
+    assert_eq!(fixture.db.catalog.list_sources(), ["added_source"]);
+    assert!(!fixture
+        .db
+        .connector_manager
+        .lock()
+        .streams()
+        .contains_key("totals"));
+    assert!(!fixture.db.subscription_registry.contains_name("totals"));
+    assert_eq!(probe.source_closes.load(Ordering::Acquire), 3);
+    assert_eq!(
+        probe
+            .starts
+            .lock()
+            .iter()
+            .filter(|(name, _)| name == "trades")
+            .count(),
+        2
+    );
+    let selected = fixture
+        .authority
+        .controller
+        .committed_topology_restore_input(removal.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.checkpoint().source_names,
+        ["added_source", "trades"]
+    );
+    assert_eq!(
+        selected.checkpoint().source_offsets["trades"].offsets["old.cursor"],
+        "3"
+    );
+    assert!(selected
+        .root()
+        .subscriptions
+        .iter()
+        .all(|mapping| mapping.parent_certificate.stream_id != "totals"));
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["surviving_total"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        certificate.stream_generation
+    );
+    probe.output.lock().clear();
+    // Input queued for a retired connector is never polled by the target generation.
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(100)["trades"][0].clone(),
+            3,
+        )]),
+    );
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(7)["trades"][0].clone(),
+            94,
+        )]),
+    );
+    wait_until(|| surviving_total() == 36).await;
+    assert_eq!(probe.input.lock()["trades"].len(), 1);
+    assert!(probe
+        .output
+        .lock()
+        .iter()
+        .all(|(topic, _)| topic != "old-output"));
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    let target = latest_index(&fixture).await;
+    assert_eq!(target.source_names, ["added_source"]);
+    assert_eq!(
+        target.source_offsets["added_source"].offsets["partition-0-next"],
+        "97"
+    );
+    assert!(target
+        .channel_progress
+        .iter()
+        .all(|channel| channel.source_name == "added_source"));
+    assert!(!target.source_watermarks.contains_key("trades"));
+    let original = selected
+        .parent()
+        .entries
+        .iter()
+        .map(|entry| entry.ddl.clone())
+        .collect::<Vec<_>>();
+    fixture.db.fence_coordinated_recovery_lifecycle();
+    fixture.authority.controller.set_recovering(true);
+    fixture
+        .db
+        .stop_pipeline_for_coordinated_recovery()
+        .await
+        .unwrap();
+    assert!(fixture
+        .db
+        .prepare_committed_cluster_topology_startup()
+        .await
+        .unwrap());
+    // Recovery keeps catalog assertions fenced until installation and Release settle.
+    let baseline = original[..3].to_vec();
+    assert!(fixture
+        .db
+        .execute_cluster_bootstrap_batch(&baseline)
+        .await
+        .is_err());
+    probe.output.lock().clear();
+    probe.block_start.store(true, Ordering::Release);
+    let prior_starts = probe.starts.lock().len();
+    fixture.db.enable_coordinated_recovery().unwrap();
+    super::recovery::held_start(&fixture, &probe, prior_starts).await;
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(9)["trades"][0].clone(),
+            97,
+        )]),
+    );
+    super::recovery::released(&fixture).await;
+    wait_until(|| surviving_total() == 63).await;
+    assert_eq!(
+        probe
+            .starts
+            .lock()
+            .iter()
+            .filter(|(name, _)| name == "trades")
+            .count(),
+        2
+    );
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["surviving_total"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        certificate.stream_generation
+    );
+    for ddl in &baseline[..2] {
+        let error = fixture
+            .db
+            .validate_cluster_topology_change(
+                TopologyVersion::new(3).unwrap(),
+                std::slice::from_ref(ddl),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retired"), "{error}");
+    }
+    assert!(Box::pin(fixture.db.execute("DROP SOURCE added_source"))
+        .await
+        .is_err());
+    let mut retire_dependents = request(
+        1503,
+        vec![
+            "DROP SINK added_sink".into(),
+            "DROP STREAM added_stream".into(),
+            "DROP SINK surviving_sink".into(),
+            "DROP STREAM surviving_total".into(),
+        ],
+    );
+    retire_dependents.expected_parent_version = TopologyVersion::new(3).unwrap();
+    Box::pin(
+        fixture
+            .db
+            .submit_cluster_topology_change(&retire_dependents),
+    )
+    .await
+    .unwrap();
+    active(&fixture, retire_dependents.operation_id).await;
+    let ExecuteResult::Ddl(info) = Box::pin(fixture.db.execute("DROP SOURCE added_source"))
+        .await
+        .unwrap()
+    else {
+        panic!("SQL must return a durable source removal receipt");
+    };
+    assert!(!info.applied);
+    active(&fixture, info.topology_operation.unwrap().operation_id).await;
+    assert!(fixture.db.catalog_manifest_inventory().unwrap().is_empty());
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    assert!(latest_index(&fixture).await.source_names.is_empty());
+    assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 1);
+    Box::pin(fixture.db.shutdown()).await.unwrap();
 }

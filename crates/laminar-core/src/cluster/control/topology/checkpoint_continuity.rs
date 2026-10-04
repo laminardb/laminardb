@@ -1,6 +1,9 @@
 //! The only explicit parent-to-target checkpoint continuity boundary.
 
-use super::{ClusterTopologyValidation, TopologyError, TopologyMigrationRoot};
+use super::{
+    ClusterTopologyObjectTransition, ClusterTopologyValidation, TopologyError,
+    TopologyMigrationRoot,
+};
 use crate::checkpoint::{CheckpointScope, CommittedCheckpointIndex};
 use crate::cluster::control::CatalogObjectKind;
 
@@ -34,13 +37,19 @@ impl TopologyMigrationRoot {
         let sources = descriptor
             .objects
             .iter()
-            .filter(|object| object.kind == CatalogObjectKind::Source)
+            .filter(|object| {
+                object.kind == CatalogObjectKind::Source
+                    && object.transition != ClusterTopologyObjectTransition::Remove
+            })
             .map(|object| object.name.clone())
             .collect::<Vec<_>>();
-        let preserved_sources = self
-            .preserved_objects
+        let parent_sources = descriptor
+            .objects
             .iter()
-            .filter(|object| object.kind == CatalogObjectKind::Source)
+            .filter(|object| {
+                object.kind == CatalogObjectKind::Source
+                    && object.transition != ClusterTopologyObjectTransition::AddFutureOnly
+            })
             .map(|object| object.name.clone())
             .collect::<Vec<_>>();
         if self.cut.checkpoint != parent_ref
@@ -54,7 +63,7 @@ impl TopologyMigrationRoot {
             || parent.scope != CheckpointScope::Cluster
             || target.scope != CheckpointScope::Cluster
             || parent.vnode_count != target.vnode_count
-            || parent.source_names != preserved_sources
+            || parent.source_names != parent_sources
             || target.source_names != sources
             || target_assignment.assignment_version < parent_assignment.assignment_version
             || target_assignment.assignment_digest != parent_assignment.assignment_digest

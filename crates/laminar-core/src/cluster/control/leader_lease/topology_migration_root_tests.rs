@@ -25,6 +25,7 @@ enum FixtureChange {
     FutureStream,
     NewSources,
     RemoveSink,
+    RemovePipeline,
 }
 
 struct Fixture {
@@ -133,10 +134,13 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
     assignments.save_if_absent(&snapshot).await.unwrap();
     let fence = snapshot.assignment_fence().unwrap();
     let mut target = parent.clone();
-    if matches!(change, FixtureChange::RemoveSink) {
-        target
-            .entries
-            .retain(|entry| entry.canonical_name != "totals_sink");
+    if matches!(
+        change,
+        FixtureChange::RemoveSink | FixtureChange::RemovePipeline
+    ) {
+        target.entries.retain(|entry| {
+            matches!(change, FixtureChange::RemoveSink) && entry.canonical_name != "totals_sink"
+        });
     } else {
         target
             .entries
@@ -173,7 +177,13 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         },
         environment_sha256: "3".repeat(64),
         compatibility_sha256: String::new(),
-        statements: if matches!(change, FixtureChange::RemoveSink) {
+        statements: if matches!(change, FixtureChange::RemovePipeline) {
+            vec![
+                "DROP SINK totals_sink".into(),
+                "DROP STREAM totals".into(),
+                "DROP SOURCE events".into(),
+            ]
+        } else if matches!(change, FixtureChange::RemoveSink) {
             vec!["DROP SINK totals_sink".into()]
         } else {
             target.entries[parent.entries.len()..]
@@ -221,7 +231,15 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
                 },
                 definition_sha256: digest(1),
                 compatibility_sha256: digest(2),
-                dependencies: Vec::new(),
+                dependencies: if matches!(change, FixtureChange::RemovePipeline) {
+                    match e.kind {
+                        CatalogObjectKind::Stream => vec!["events".into()],
+                        CatalogObjectKind::Sink => vec!["totals".into()],
+                        _ => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                },
                 schema_sha256: (e.kind != CatalogObjectKind::Sink)
                     .then(|| SubscriptionDigest::from_bytes([8; 32]).to_hex()),
                 managed_state_contract: (e.canonical_name == "totals")
@@ -718,7 +736,7 @@ async fn topology_root_new_managed_state_requires_explicit_initialization_and_ke
     let error =
         TopologyMigrationRoot::build(&operation, &descriptor, &index, &manifests).unwrap_err();
     assert!(
-        error.to_string().contains("cold start is forbidden"),
+        error.to_string().contains("no parent vnode state"),
         "{error}"
     );
 }
@@ -1059,7 +1077,7 @@ mod sink_removal {
         stream.transition = ClusterTopologyObjectTransition::Remove;
         stream.initialization = TopologyInitialization::RetireAtCut;
         report.compatibility_sha256 = report.descriptor_digest().unwrap();
-        assert!(report.encode_and_reference().is_err());
+        assert!(report.validate_catalogs(&parent, &target).is_err());
         let mut manifests = fixture.manifests.clone();
         let mut index = fixture.index.clone();
         for (manifest, participant) in manifests.iter_mut().zip(&mut index.participants) {
@@ -1108,9 +1126,15 @@ mod sink_removal {
     }
 
     #[tokio::test]
-    async fn topology_sink_removal_survives_a_lost_commit_response_and_blocks_name_reuse() {
+    async fn topology_removal_survives_a_lost_commit_response_and_blocks_name_reuse() {
+        for change in [FixtureChange::RemoveSink, FixtureChange::RemovePipeline] {
+            assert_retirement_lost_response(change).await;
+        }
+    }
+
+    async fn assert_retirement_lost_response(change: FixtureChange) {
         let (raw, authority) = ambiguous_once_at(30_000, lease_path(14));
-        let fixture = fixture_with_changes(&authority, FixtureChange::RemoveSink).await;
+        let fixture = fixture_with_changes(&authority, change).await;
         let (fixture, input) = topology_commit::prepared_fixture(&authority, fixture).await;
         let committed = topology_commit::commit(&authority, &fixture, &input)
             .await
@@ -1122,7 +1146,13 @@ mod sink_removal {
         let reopened = LeaderLeaseStore::new(authority.store.clone(), 30_000);
         assert_eq!(
             reopened.retired_topology_names().await.unwrap(),
-            std::collections::BTreeSet::from(["totals_sink".into()])
+            input
+                .descriptor()
+                .objects
+                .iter()
+                .filter(|object| object.transition == ClusterTopologyObjectTransition::Remove)
+                .map(|object| object.name.clone())
+                .collect()
         );
         assert_eq!(
             reopened
@@ -1167,5 +1197,117 @@ mod sink_removal {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("retired name"), "{error}");
+    }
+}
+
+mod pipeline_removal {
+    use super::*;
+
+    #[tokio::test]
+    async fn topology_removal_accounts_for_parent_state_subscriptions_and_source_inventory() {
+        let authority = store(30_000);
+        let fixture = fixture_with_changes(&authority, FixtureChange::RemovePipeline).await;
+        let parent = authority
+            .load_catalog_manifest(&fixture.descriptor.parent_manifest)
+            .await
+            .unwrap();
+        let target = authority
+            .load_catalog_manifest(&fixture.descriptor.target_manifest)
+            .await
+            .unwrap();
+        fixture
+            .descriptor
+            .validate_catalogs(&parent, &target)
+            .unwrap();
+        assert!(target.entries.is_empty());
+        let staged = fixture.stage(&authority).await.unwrap();
+        let root = authority
+            .topology_migration_root(staged.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(root.preserved_objects.is_empty());
+        assert!(root.subscriptions.is_empty());
+        assert!(root.future_only_objects.is_empty());
+        root.validate_restore_cut(
+            &staged,
+            &fixture.descriptor,
+            &fixture.index,
+            &fixture.manifests,
+        )
+        .unwrap();
+
+        let mut report = fixture.descriptor.clone();
+        let sink = report
+            .objects
+            .iter_mut()
+            .find(|object| object.name == "totals_sink")
+            .unwrap();
+        sink.transition = ClusterTopologyObjectTransition::Preserve;
+        sink.initialization = TopologyInitialization::PreserveExactCut;
+        report.compatibility_sha256 = report.descriptor_digest().unwrap();
+        assert!(
+            report.encode_and_reference().is_err(),
+            "a surviving sink cannot consume a removed stream"
+        );
+
+        let mut manifests = fixture.manifests.clone();
+        for manifest in &mut manifests {
+            manifest.state_frames.clear();
+            manifest.node_data.object_length = 0;
+            manifest.node_data.sha256 = crate::checkpoint::checkpoint_sha256(b"");
+        }
+        let mut index = fixture.index.clone();
+        index.participants = manifests
+            .iter()
+            .map(|manifest| {
+                CommittedParticipantRef::from_manifest(
+                    manifest,
+                    &checkpoint_manifest_bytes(manifest).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut operation = fixture.operation.clone();
+        operation
+            .cut
+            .as_mut()
+            .unwrap()
+            .committed
+            .as_mut()
+            .unwrap()
+            .checkpoint = index.encode_and_reference().unwrap().1;
+        let error =
+            TopologyMigrationRoot::build(&operation, &fixture.descriptor, &index, &manifests)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("no parent vnode state"),
+            "{error}"
+        );
+
+        let mut target_index = fixture.index.clone();
+        target_index.pipeline_identity = fixture.descriptor.target_pipeline.clone();
+        target_index.epoch += 1;
+        target_index.checkpoint_id += 1;
+        target_index.predecessor = Some(root.cut.checkpoint.clone());
+        target_index.source_names.clear();
+        target_index.source_offsets.clear();
+        target_index.channel_progress.clear();
+        target_index.source_watermarks.clear();
+        target_index.checkpoint_watermark = None;
+        root.validate_target_checkpoint_predecessor(
+            &fixture.descriptor,
+            &target_index,
+            &fixture.index,
+        )
+        .unwrap();
+        target_index.source_names = fixture.index.source_names.clone();
+        assert!(root
+            .validate_target_checkpoint_predecessor(
+                &fixture.descriptor,
+                &target_index,
+                &fixture.index
+            )
+            .is_err());
     }
 }

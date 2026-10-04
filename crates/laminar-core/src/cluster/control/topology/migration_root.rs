@@ -172,11 +172,15 @@ impl TopologyMigrationRoot {
                     future.push(object.name.clone());
                 }
                 ClusterTopologyObjectTransition::Remove => {
-                    if object.kind != CatalogObjectKind::Sink
-                        || object.initialization != super::TopologyInitialization::RetireAtCut
+                    if !matches!(
+                        object.kind,
+                        CatalogObjectKind::Source
+                            | CatalogObjectKind::Stream
+                            | CatalogObjectKind::Sink
+                    ) || object.initialization != super::TopologyInitialization::RetireAtCut
                     {
                         return Err(TopologyError::Unsupported(
-                            "only sinks can retire at the checkpoint cut".into(),
+                            "removed objects must retire at the checkpoint cut".into(),
                         ));
                     }
                 }
@@ -241,6 +245,37 @@ impl TopologyMigrationRoot {
             .map_err(TopologyError::Invalid)?;
         let (preserved_objects, future_only_objects) = Self::object_mappings(descriptor)?;
         Self::validate_parent_inventory(index, manifests, descriptor)?;
+        Self::validate_parent_state(manifests, descriptor)?;
+        let subscriptions = Self::subscription_mappings(index, manifests, descriptor)?;
+        let root = Self {
+            format_version: if source_initializations.is_empty() {
+                1
+            } else {
+                2
+            },
+            operation_id: operation.operation_id,
+            plan: operation.plan.clone(),
+            compatibility: operation
+                .preparation
+                .as_ref()
+                .ok_or_else(|| TopologyError::Protocol("root has no preparation".into()))?
+                .compatibility
+                .clone(),
+            cut: cut.clone(),
+            preserved_objects,
+            future_only_objects,
+            subscriptions,
+            source_initializations,
+        };
+        root.validate_source_mappings(descriptor)?;
+        root.encode_and_reference()?;
+        Ok(root)
+    }
+
+    fn validate_parent_state(
+        manifests: &[CheckpointManifest],
+        descriptor: &ClusterTopologyValidation,
+    ) -> Result<(), TopologyError> {
         for manifest in manifests {
             for frame in &manifest.state_frames {
                 let (operator_id, vnode) = match &frame.key {
@@ -252,12 +287,12 @@ impl TopologyMigrationRoot {
                     .iter()
                     .find(|o| {
                         o.kind == CatalogObjectKind::Stream
-                            && o.transition == ClusterTopologyObjectTransition::Preserve
+                            && o.transition != ClusterTopologyObjectTransition::AddFutureOnly
                             && operator_id.strip_prefix("graph:") == Some(o.name.as_str())
                     })
                     .ok_or_else(|| {
                         TopologyError::Unsupported(format!(
-                            "cut frame '{operator_id}' has no certified preserved state mapping"
+                            "cut frame '{operator_id}' has no certified parent state mapping"
                         ))
                     })?;
                 if vnode && object.managed_state_contract.is_none() {
@@ -269,7 +304,7 @@ impl TopologyMigrationRoot {
             }
         }
         for object in descriptor.objects.iter().filter(|o| {
-            o.transition == ClusterTopologyObjectTransition::Preserve
+            o.transition != ClusterTopologyObjectTransition::AddFutureOnly
                 && o.managed_state_contract.is_some()
         }) {
             if !manifests.iter().any(|m| {
@@ -279,11 +314,19 @@ impl TopologyMigrationRoot {
                 })
             }) {
                 return Err(TopologyError::Invalid(format!(
-                    "managed stream '{}' has no preserved vnode state; cold start is forbidden",
+                    "managed stream '{}' has no parent vnode state; a complete cut is required",
                     object.name
                 )));
             }
         }
+        Ok(())
+    }
+
+    fn subscription_mappings(
+        index: &CommittedCheckpointIndex,
+        manifests: &[CheckpointManifest],
+        descriptor: &ClusterTopologyValidation,
+    ) -> Result<Vec<TopologySubscriptionRoot>, TopologyError> {
         let subscription_views = manifests
             .iter()
             .filter_map(|m| {
@@ -315,10 +358,10 @@ impl TopologyMigrationRoot {
                 .find(|o| {
                     o.name == parent_certificate.stream_id
                         && o.kind == CatalogObjectKind::Stream
-                        && o.transition == ClusterTopologyObjectTransition::Preserve
+                        && o.transition != ClusterTopologyObjectTransition::AddFutureOnly
                 })
                 .ok_or_else(|| {
-                    TopologyError::Invalid("subscription has no preserved stream mapping".into())
+                    TopologyError::Invalid("subscription has no parent stream mapping".into())
                 })?;
             if object.catalog_generation != parent_certificate.catalog_generation
                 || object.schema_sha256.as_deref()
@@ -329,6 +372,9 @@ impl TopologyMigrationRoot {
                     "subscription incarnation/schema/operator differs from the descriptor".into(),
                 ));
             }
+            if object.transition == ClusterTopologyObjectTransition::Remove {
+                continue;
+            }
             let mut target_certificate = parent_certificate.clone();
             target_certificate.pipeline_identity = descriptor.target_pipeline.clone();
             subscriptions.push(TopologySubscriptionRoot {
@@ -337,29 +383,7 @@ impl TopologyMigrationRoot {
                 frontiers: stream.manifest.frontiers,
             });
         }
-        let root = Self {
-            format_version: if source_initializations.is_empty() {
-                1
-            } else {
-                2
-            },
-            operation_id: operation.operation_id,
-            plan: operation.plan.clone(),
-            compatibility: operation
-                .preparation
-                .as_ref()
-                .ok_or_else(|| TopologyError::Protocol("root has no preparation".into()))?
-                .compatibility
-                .clone(),
-            cut: cut.clone(),
-            preserved_objects,
-            future_only_objects,
-            subscriptions,
-            source_initializations,
-        };
-        root.validate_source_mappings(descriptor)?;
-        root.encode_and_reference()?;
-        Ok(root)
+        Ok(subscriptions)
     }
 
     fn validate_parent_inventory(

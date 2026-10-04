@@ -94,6 +94,9 @@ impl LaminarDB {
         let mut progress: FxHashMap<String, FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>> =
             FxHashMap::default();
         for channel in metadata.recovered.channel_progress() {
+            if !metadata.sources.contains_key(&channel.source_name) {
+                continue;
+            }
             if channel.input_channel == SINGLETON_WATERMARK_CHANNEL
                 && channel.participant_id != metadata.input.process().participant.node_id
             {
@@ -114,6 +117,7 @@ impl LaminarDB {
             .recovered
             .source_offsets()
             .iter()
+            .filter(|(name, _)| metadata.sources.contains_key(*name))
             .filter_map(|(name, checkpoint)| {
                 checkpoint
                     .input_channels
@@ -132,6 +136,7 @@ impl LaminarDB {
                 .effective_source_watermarks()
                 .map_err(DbError::Checkpoint)?
                 .into_iter()
+                .filter(|(name, _)| metadata.sources.contains_key(name))
                 .collect(),
             recovered_checkpoint_index_version: Some(metadata.recovered.committed.version),
             recovered_watermark_frontier: channel_progress_frontier(

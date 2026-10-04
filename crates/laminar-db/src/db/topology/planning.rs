@@ -32,7 +32,8 @@ pub use laminar_core::cluster::control::topology::{
 impl LaminarDB {
     /// Compile a topology candidate separately from the active graph.
     ///
-    /// Each entry is one typed CREATE or DROP SINK without CASCADE. The parent is versioned.
+    /// Each entry is one typed CREATE or DROP SOURCE/STREAM/SINK without CASCADE.
+    /// Drop dependents before their inputs. The parent is versioned.
     /// Supports replayable sources, supported managed/stateless streams and durable sinks while
     /// proving unchanged definitions remain compatible. New managed state starts empty at the cut;
     /// input that can retract an unavailable prefix is rejected. No source is opened
@@ -169,7 +170,7 @@ impl LaminarDB {
         for (name, previous) in &parent_objects {
             match objects.get(name) {
                 Some(current) if current == previous => {}
-                None if previous.kind == CatalogObjectKind::Sink => {
+                None => {
                     let mut removed = previous.clone();
                     removed.transition = ClusterTopologyObjectTransition::Remove;
                     removed.initialization = TopologyInitialization::RetireAtCut;

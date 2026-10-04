@@ -2682,7 +2682,7 @@ impl LaminarDB {
             sealed: false,
         };
         topology::catalog_changes::validate_manifest_ddl(&manifest)?;
-        self.reconcile_retired_catalog_sinks(&manifest, &store, &topology)
+        self.reconcile_retired_catalog_objects(&manifest, &store, &topology)
             .await?;
 
         for entry in &manifest.entries {

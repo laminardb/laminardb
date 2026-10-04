@@ -40,9 +40,26 @@ async fn committed_fixture_with_additions(
 }
 
 #[tokio::test]
-async fn topology_sink_removal_cold_bootstrap_asserts_original_config_without_recreating_sink() {
-    let (fixture, staged) =
-        restorable_fixture_with_statements(vec!["DROP SINK existing_sink".into()]).await;
+async fn topology_removal_cold_bootstrap_asserts_original_config_without_recreating_objects() {
+    for drop_count in 1..=3 {
+        assert_removal_cold_bootstrap(drop_count).await;
+    }
+}
+
+async fn assert_removal_cold_bootstrap(drop_count: usize) {
+    let statements = [
+        "DROP SINK existing_sink",
+        "DROP STREAM totals",
+        "DROP SOURCE trades",
+    ];
+    let (fixture, staged) = restorable_fixture_with_statements(
+        statements[..drop_count]
+            .iter()
+            .map(|sql| (*sql).into())
+            .collect(),
+    )
+    .await;
+    let expected_frames = if drop_count == 1 { 9 } else { 0 };
     let parent = fixture
         .authority
         .manifest_store
@@ -60,7 +77,7 @@ async fn topology_sink_removal_cold_bootstrap_asserts_original_config_without_re
         .prepare_cluster_topology_restore(staged.operation_id)
         .await
         .unwrap();
-    assert_eq!(image.restored_frame_count(), 9);
+    assert_eq!(image.restored_frame_count(), expected_frames);
     let committed = fixture
         .db
         .commit_cluster_topology_target(&mut image)
@@ -68,7 +85,7 @@ async fn topology_sink_removal_cold_bootstrap_asserts_original_config_without_re
         .unwrap();
     assert_eq!(committed.phase, TopologyAdmissionPhase::Committed);
     assert!(image.root().future_only_objects.is_empty());
-    assert_eq!(image.source_positions().len(), 1);
+    assert_eq!(image.source_positions().len(), usize::from(drop_count < 3));
     drop(image);
     let authority = TestCatalogAuthority {
         checkpoint_store: Arc::clone(&fixture.authority.checkpoint_store),
@@ -81,7 +98,7 @@ async fn topology_sink_removal_cold_bootstrap_asserts_original_config_without_re
     let fresh = Fixture::with_authority(authority).await;
     assert_eq!(
         fresh.db.catalog_manifest_inventory().unwrap(),
-        parent.entries[..2]
+        parent.entries[..3 - drop_count]
     );
     assert!(fresh.db.connector_manager.lock().sinks().is_empty());
     let results = fresh
@@ -100,11 +117,12 @@ async fn topology_sink_removal_cold_bootstrap_asserts_original_config_without_re
         .execute_cluster_bootstrap_batch(&changed)
         .await
         .is_err());
-    assert!(fresh
+    let source_assertion = fresh
         .db
         .execute_cluster_bootstrap_batch(&original[..1])
-        .await
-        .is_err());
+        .await;
+    // Removing the sink and stream leaves this as the complete current configuration.
+    assert_eq!(source_assertion.is_ok(), drop_count == 2);
     assert!(fresh.db.connector_manager.lock().sinks().is_empty());
     let authorization = fresh
         .authority
@@ -122,13 +140,25 @@ async fn topology_sink_removal_cold_bootstrap_asserts_original_config_without_re
         .recover_committed_cluster_topology(committed.operation_id)
         .await
         .unwrap();
-    assert_eq!(recovered.restored_frame_count(), 9);
+    assert_eq!(recovered.restored_frame_count(), expected_frames);
+    // Private complete-cycle assertions are independent of the production wall-clock budget.
+    recovered.graph.set_query_budget_ns(u64::MAX);
+    let batches = if drop_count < 3 {
+        input(5)
+    } else {
+        rustc_hash::FxHashMap::default()
+    };
     let output = recovered
         .graph
-        .execute_cycle(&input(5), i64::MIN, None)
+        .execute_cycle(&batches, i64::MIN, None)
         .await
         .unwrap();
-    assert_eq!(total(&output["totals"]), 45);
+    if drop_count == 1 {
+        assert_eq!(total(&output["totals"]), 45);
+    } else {
+        assert!(output.is_empty());
+        assert!(recovered.root().subscriptions.is_empty());
+    }
     assert_eq!(fresh.effects.load(Ordering::SeqCst), 0);
     assert_eq!(fresh.resolutions.load(Ordering::SeqCst), 0);
     fresh.db.shutdown().await.unwrap();

@@ -1,4 +1,4 @@
-//! Strict checkpoint restoration and explicitly initialized topology additions.
+//! Strict checkpoint restoration through certified topology mappings.
 
 use super::{DbError, FxHashMap, OperatorCheckpoint, OperatorGraph};
 
@@ -75,12 +75,10 @@ impl OperatorGraph {
                 "topology restore has a foreign checkpoint identity".into(),
             ));
         };
+        let frames = select_topology_state_frames(recovered, input)?;
         let mut whole = Vec::new();
         let mut vnodes = Vec::new();
-        for frame in &recovered.state_frames {
-            if frame.participant_id != input.process().participant.node_id {
-                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
-            }
+        for frame in &frames {
             let operator_id = match &frame.key {
                 StateFrameKey::OperatorWhole { operator_id }
                 | StateFrameKey::Vnode { operator_id, .. } => operator_id,
@@ -129,7 +127,7 @@ impl OperatorGraph {
                     .ok_or(laminar_core::cluster::control::TopologyError::Fenced)?,
                 &recovered.predecessor_owners,
                 input.assignment(),
-                &recovered.state_frames,
+                &frames.into_iter().cloned().collect::<Vec<_>>(),
                 &empty_at_cut,
             );
         }
@@ -305,4 +303,51 @@ impl OperatorGraph {
         self.whole_restore_open = false;
         Ok((self, restored))
     }
+}
+
+#[cfg(feature = "cluster")]
+fn select_topology_state_frames<'a>(
+    recovered: &'a crate::recovery_manager::RecoveredState,
+    input: &laminar_core::cluster::control::TopologyRestoreInput,
+) -> Result<Vec<&'a crate::recovery_manager::RecoveredStateFrame>, DbError> {
+    use laminar_core::checkpoint::StateFrameKey;
+    use laminar_core::cluster::control::topology::ClusterTopologyObjectTransition;
+    use laminar_core::cluster::control::CatalogObjectKind;
+
+    let parent_cut = recovered.committed.pipeline_identity == input.descriptor().parent_pipeline;
+    let mut frames = Vec::new();
+    for frame in &recovered.state_frames {
+        if frame.participant_id != input.process().participant.node_id {
+            return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+        }
+        let operator_id = match &frame.key {
+            StateFrameKey::OperatorWhole { operator_id }
+            | StateFrameKey::Vnode { operator_id, .. } => operator_id,
+        };
+        let object = input
+            .descriptor()
+            .objects
+            .iter()
+            .find(|object| {
+                object.kind == CatalogObjectKind::Stream
+                    && operator_id.strip_prefix("graph:") == Some(object.name.as_str())
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "topology checkpoint has no certified state mapping for '{operator_id}'"
+                ))
+            })?;
+        if object.transition == ClusterTopologyObjectTransition::Remove {
+            if !parent_cut {
+                return Err(DbError::Checkpoint(format!(
+                    "target checkpoint contains retired operator '{operator_id}'"
+                )));
+            }
+            // The root and recovery reader already verified the complete historical cut and
+            // these bytes. Only a certified retirement permits omitting a parent frame.
+            continue;
+        }
+        frames.push(frame);
+    }
+    Ok(frames)
 }

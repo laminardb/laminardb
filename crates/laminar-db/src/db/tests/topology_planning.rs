@@ -1414,9 +1414,83 @@ async fn topology_validation_missing_parent_blob_fails_closed() {
 }
 
 mod removal {
-    //! Sink retirement preserves the upstream graph and requires the complete old checkpoint cut.
+    //! Explicit retirement preserves surviving contracts and requires the complete old cut.
 
     use super::*;
+
+    #[tokio::test]
+    async fn topology_pipeline_removal_requires_dependency_order_and_preserves_exact_request() {
+        let fixture = Fixture::new().await;
+        fixture.adopt().await;
+        let inventory = fixture.db.catalog_manifest_inventory().unwrap();
+        let before = fixture.authority.lease_store.load().await.unwrap();
+        let paths = object_paths(fixture.authority.checkpoint_store.as_ref()).await;
+        let mut statements = vec![
+            "DROP SINK existing_sink".into(),
+            "DROP STREAM totals".into(),
+            "DROP SOURCE trades".into(),
+        ];
+        statements.extend(independent_pipeline());
+        let report = fixture.validate(&statements).await.unwrap();
+        assert_eq!(report.statements, statements);
+        for entry in &inventory {
+            let object = report
+                .objects
+                .iter()
+                .find(|object| object.name == entry.canonical_name)
+                .unwrap();
+            assert_eq!(object.transition, ClusterTopologyObjectTransition::Remove);
+            assert_eq!(object.initialization, TopologyInitialization::RetireAtCut);
+            assert_eq!(object.catalog_generation, entry.catalog_generation);
+        }
+        assert_eq!(report.objects.iter().filter(|object| object.transition == ClusterTopologyObjectTransition::AddFutureOnly).count(), 3);
+        assert!(report
+            .objects
+            .iter()
+            .find(|object| object.name == "totals")
+            .unwrap()
+            .managed_state_contract
+            .is_some());
+        for statements in [
+            vec![
+                "DROP SOURCE trades".into(),
+                "DROP STREAM totals".into(),
+                "DROP SINK existing_sink".into(),
+            ],
+            vec!["DROP SOURCE IF EXISTS missing".into()],
+            vec!["DROP STREAM IF EXISTS missing".into()],
+            vec!["DROP SOURCE trades CASCADE".into()],
+            vec!["DROP STREAM totals CASCADE".into()],
+            vec![
+                "DROP SINK existing_sink".into(),
+                "DROP STREAM totals /* hidden */".into(),
+            ],
+            vec![
+                "DROP SINK existing_sink".into(),
+                "DROP STREAM totals".into(),
+                inventory[1].ddl.clone(),
+            ],
+            vec![
+                "DROP SINK existing_sink".into(),
+                "DROP STREAM totals".into(),
+                "DROP SOURCE trades".into(),
+                inventory[0].ddl.clone(),
+            ],
+        ] {
+            assert!(
+                fixture.validate(&statements).await.is_err(),
+                "{statements:?}"
+            );
+        }
+        assert_eq!(fixture.db.catalog_manifest_inventory().unwrap(), inventory);
+        assert_eq!(fixture.authority.lease_store.load().await.unwrap(), before);
+        assert_eq!(
+            object_paths(fixture.authority.checkpoint_store.as_ref()).await,
+            paths
+        );
+        fixture.assert_no_effects();
+        fixture.db.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn topology_sink_removal_validation_is_effect_free_and_preserves_upstream_contracts() {
@@ -1460,8 +1534,6 @@ mod removal {
         for statements in [
             vec!["DROP SINK IF EXISTS missing".into()],
             vec!["DROP SINK existing_sink CASCADE".into()],
-            vec!["DROP SOURCE trades".into()],
-            vec!["DROP STREAM totals".into()],
             vec![
                 "DROP SINK existing_sink".into(),
                 parent.entries[2].ddl.clone(),
@@ -1475,6 +1547,9 @@ mod removal {
                 fixture.validate(&statements).await,
                 Err(DbError::Topology(TopologyError::Unsupported(_)))
             ));
+        }
+        for sql in ["DROP SOURCE trades", "DROP STREAM totals"] {
+            assert!(fixture.validate(&[sql.into()]).await.is_err());
         }
         assert_eq!(
             fixture.db.catalog_manifest_inventory().unwrap(),

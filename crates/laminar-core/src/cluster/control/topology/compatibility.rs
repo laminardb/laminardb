@@ -24,7 +24,7 @@ pub enum ClusterTopologyObjectTransition {
     Preserve,
     /// New object, activated at an explicitly persisted future-only boundary.
     AddFutureOnly,
-    /// Retire an existing sink after its checkpoint outcomes and actor termination are settled.
+    /// Retire an existing source, stream or sink after its cut and actor termination are settled.
     Remove,
 }
 
@@ -41,7 +41,7 @@ pub enum TopologyInitialization {
     EmptyManagedStateAtCut,
     /// Resolve concrete latest source/partition positions once at the cut and persist before commit.
     ResolveSourcePositionsOnce,
-    /// Settle old-generation effects at the cut and omit the sink from the target catalog.
+    /// Settle old-generation state/progress/effects at the cut and omit the object from the target.
     RetireAtCut,
 }
 
@@ -118,7 +118,7 @@ pub struct ClusterTopologyValidation {
     /// Exact submitted DDL, including removals absent from the target inventory. Binds retries
     /// and participant compilation to the same ordered payload.
     pub statements: Vec<String>,
-    /// Parent/target union, including retired sinks, with explicit cut requirements.
+    /// Parent/target union, including retired objects, with explicit cut requirements.
     pub objects: Vec<ClusterTopologyObjectPlan>,
     /// A processing pause is required for the implemented old-topology cut contract.
     pub requires_processing_pause: bool,
@@ -211,7 +211,11 @@ impl ClusterTopologyValidation {
                     retained.push(entry.clone());
                     ClusterTopologyObjectTransition::Preserve
                 }
-                None if entry.kind == CatalogObjectKind::Sink => {
+                None if matches!(
+                    entry.kind,
+                    CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink
+                ) =>
+                {
                     ClusterTopologyObjectTransition::Remove
                 }
                 _ => return Err(TopologyError::Invalid(
@@ -306,12 +310,13 @@ impl ClusterTopologyValidation {
                 (ClusterTopologyObjectTransition::Preserve, _) => {
                     TopologyInitialization::PreserveExactCut
                 }
-                (ClusterTopologyObjectTransition::Remove, CatalogObjectKind::Sink) => {
-                    TopologyInitialization::RetireAtCut
-                }
+                (
+                    ClusterTopologyObjectTransition::Remove,
+                    CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink,
+                ) => TopologyInitialization::RetireAtCut,
                 (ClusterTopologyObjectTransition::Remove, _) => {
                     return Err(TopologyError::Unsupported(
-                        "only sinks have a certified removal contract".into(),
+                        "only sources, streams and sinks have a certified removal contract".into(),
                     ))
                 }
                 (_, CatalogObjectKind::Source) => {
@@ -340,12 +345,11 @@ impl ClusterTopologyValidation {
                             .objects
                             .binary_search_by(|obj| obj.name.cmp(name))
                             .map_or(true, |index| {
-                                self.objects[index].transition
-                                    == ClusterTopologyObjectTransition::Remove
+                                object.transition != ClusterTopologyObjectTransition::Remove
+                                    && self.objects[index].transition
+                                        == ClusterTopologyObjectTransition::Remove
                             })
                 })
-                || (object.transition == ClusterTopologyObjectTransition::Remove
-                    && (object.managed_state_contract.is_some() || object.schema_sha256.is_some()))
                 || object
                     .managed_state_contract
                     .as_ref()

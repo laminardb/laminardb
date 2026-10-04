@@ -219,29 +219,38 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
     assert_eq!(added["transition"], "add_future_only");
     assert_eq!(added["initialization"], "empty_managed_state_at_cut");
     assert_eq!(added["managed_state_contract"], "sql_aggregate_v1");
-    let response = validate(
-        app.clone(),
-        &token,
-        serde_json::json!({"expected_parent_version": 1, "statements": ["DROP SINK totals_sink"]}),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let removal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        removal["statements"],
-        serde_json::json!(["DROP SINK totals_sink"])
-    );
-    let removed = removal["objects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|object| object["name"] == "totals_sink")
-        .unwrap();
-    assert_eq!(removed["transition"], "remove");
-    assert_eq!(removed["initialization"], "retire_at_cut");
+    for statements in [
+        vec!["DROP SINK totals_sink"],
+        vec!["DROP SINK totals_sink", "DROP STREAM totals"],
+        vec![
+            "DROP SINK totals_sink",
+            "DROP STREAM totals",
+            "DROP SOURCE trades",
+        ],
+    ] {
+        let response = validate(
+            app.clone(),
+            &token,
+            serde_json::json!({"expected_parent_version": 1, "statements": statements}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let removal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(removal["statements"], serde_json::json!(statements));
+        let removed = removal["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|object| object["transition"] == "remove")
+            .collect::<Vec<_>>();
+        assert_eq!(removed.len(), statements.len());
+        assert!(removed
+            .iter()
+            .all(|object| object["initialization"] == "retire_at_cut"));
+    }
     for (request, expected) in [
         (
             serde_json::json!({"expected_parent_version": 2, "statements": additions}),
