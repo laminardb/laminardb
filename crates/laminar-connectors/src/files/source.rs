@@ -677,6 +677,58 @@ fn append_metadata_column(
         .map_err(|e| ConnectorError::ReadError(format!("metadata append error: {e}")))
 }
 
+fn restore_ingestion_position(
+    position: SourcePosition,
+) -> Result<(FileIngestionManifest, Option<FileProgress>), ConnectorError> {
+    Ok(match position {
+        SourcePosition::Initial => (FileIngestionManifest::new(), None),
+        SourcePosition::Initialized { .. } => {
+            return Err(ConnectorError::ConfigurationError(
+                "file source has no sealed topology startup contract".into(),
+            ));
+        }
+        SourcePosition::Resume {
+            attempt,
+            checkpoint,
+        } => {
+            validate_file_checkpoint(&checkpoint)?;
+            if checkpoint.get_offset("manifest").is_none() {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "file checkpoint {attempt:?} is missing required manifest state"
+                )));
+            }
+            let manifest = FileIngestionManifest::from_checkpoint(&checkpoint).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid file manifest in checkpoint {attempt:?}: {e}"
+                ))
+            })?;
+            let progress = checkpoint
+                .get_offset("file_progress")
+                .map(serde_json::from_str::<FileProgress>)
+                .transpose()
+                .map_err(|e| {
+                    ConnectorError::ConfigurationError(format!(
+                        "invalid file progress in checkpoint {attempt:?}: {e}"
+                    ))
+                })?
+                .map(|mut progress| {
+                    progress.path = local_files_path(&progress.path)?;
+                    Ok::<_, ConnectorError>(progress)
+                })
+                .transpose()?;
+            if progress
+                .as_ref()
+                .is_some_and(|p| manifest.contains(&p.path) || p.next_row == 0)
+            {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "file checkpoint {attempt:?} contains contradictory progress"
+                )));
+            }
+            (manifest, progress)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1301,56 +1353,4 @@ mod tests {
         assert_eq!(contract.consistency, SourceConsistency::Replayable);
         assert_eq!(contract.topology, SourceTopology::Singleton);
     }
-}
-
-fn restore_ingestion_position(
-    position: SourcePosition,
-) -> Result<(FileIngestionManifest, Option<FileProgress>), ConnectorError> {
-    Ok(match position {
-        SourcePosition::Initial => (FileIngestionManifest::new(), None),
-        SourcePosition::Initialized { .. } => {
-            return Err(ConnectorError::ConfigurationError(
-                "file source has no sealed topology startup contract".into(),
-            ));
-        }
-        SourcePosition::Resume {
-            attempt,
-            checkpoint,
-        } => {
-            validate_file_checkpoint(&checkpoint)?;
-            if checkpoint.get_offset("manifest").is_none() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "file checkpoint {attempt:?} is missing required manifest state"
-                )));
-            }
-            let manifest = FileIngestionManifest::from_checkpoint(&checkpoint).map_err(|e| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid file manifest in checkpoint {attempt:?}: {e}"
-                ))
-            })?;
-            let progress = checkpoint
-                .get_offset("file_progress")
-                .map(serde_json::from_str::<FileProgress>)
-                .transpose()
-                .map_err(|e| {
-                    ConnectorError::ConfigurationError(format!(
-                        "invalid file progress in checkpoint {attempt:?}: {e}"
-                    ))
-                })?
-                .map(|mut progress| {
-                    progress.path = local_files_path(&progress.path)?;
-                    Ok::<_, ConnectorError>(progress)
-                })
-                .transpose()?;
-            if progress
-                .as_ref()
-                .is_some_and(|p| manifest.contains(&p.path) || p.next_row == 0)
-            {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "file checkpoint {attempt:?} contains contradictory progress"
-                )));
-            }
-            (manifest, progress)
-        }
-    })
 }
