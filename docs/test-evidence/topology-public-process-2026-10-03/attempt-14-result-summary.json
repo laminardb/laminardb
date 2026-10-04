@@ -1,0 +1,38 @@
+{
+  "recorded_utc": "2026-10-04T03:04:49.844176+00:00",
+  "run_id": "584532-1791082741786545600",
+  "test": "three_node_alo_public_topology_migration_restart_soak",
+  "test_exit_code": 101,
+  "test_elapsed_seconds": 197.93,
+  "requested_kills": 0,
+  "compiler_idle": true,
+  "server_sha256": "60169d459a29e8bf973defa845c9661f3460ab09b0f840a465c885a1cdb2cf72",
+  "harness_sha256": "cbdf3983b4f0b7c14eeb9e7d56a02d22010476098722f2a132a06375ad11d113",
+  "max_sampled_combined_rss_bytes": 571621376,
+  "copied_phase_evidence": [
+    {
+      "file": "attempt-14-public-topology-2-active.json",
+      "sha256": "2b9f943ab325a59d29aa22d8c4b83280f08f409eb5f02c0fd1247d5c9269d3ef"
+    },
+    {
+      "file": "attempt-14-public-topology-2-submission-phase-observations.json",
+      "sha256": "7d709d726c58c99ce4def4e99dbc8398830ff6b799d1c17980399b4294401d00"
+    },
+    {
+      "file": "attempt-14-public-topology-3-active.json",
+      "sha256": "261e53a2b382fadb73dfa7650c474cfe3d8362e1412cf8782db235117982c336"
+    },
+    {
+      "file": "attempt-14-public-topology-3-submission-phase-observations.json",
+      "sha256": "2372dd707483a91699a38ada092a9218db6371bd03b0bef7ff0fa0b3f545dcf3"
+    },
+    {
+      "file": "attempt-14-public-topology-observations.json",
+      "sha256": "f6cca314cd3e513efaf6a1e5ac500c86923207bc22c7555a56d983925a740e4c"
+    }
+  ],
+  "passing_final_oracles": false,
+  "allocation_events": null,
+  "queue_depth": null,
+  "scope": "Original public topology harness and its unchanged final stateful, sink and sequence oracles. Failures remain failures; completed zero-kill cold recovery and repeated kills are separately identified."
+}

@@ -1,0 +1,227 @@
+{
+  "recorded_utc": "2026-10-04T02:58:39.294851+00:00",
+  "source_identity": {
+    "recorded_utc": "2026-10-04T02:35:50.690832+00:00",
+    "base_commit": "582b7cf0f6101433e0ad7c88bd3a9d0bc66e3831",
+    "changed_sources": [
+      {
+        "path": "crates/laminar-db/src/db/tests/topology_recovery.rs",
+        "sha256": "66ccdbc31ef9304e6b97c8a57f17778a551993687e50d3cf1197e0d93bb9a443",
+        "normalized_sha256": "66ccdbc31ef9304e6b97c8a57f17778a551993687e50d3cf1197e0d93bb9a443"
+      },
+      {
+        "path": "crates/laminar-db/src/db/topology/restore.rs",
+        "sha256": "b5a3ddd6ba724cdb918ee6707a7bb416ed2e7901648454077624fe0d6c540392",
+        "normalized_sha256": "b5a3ddd6ba724cdb918ee6707a7bb416ed2e7901648454077624fe0d6c540392"
+      },
+      {
+        "path": "crates/laminar-db/src/recovery_manager/mod.rs",
+        "sha256": "4d339065525bff4b24fe305f8a04f34d75c37fc5ca38a4037475c37973218d33",
+        "normalized_sha256": "4d339065525bff4b24fe305f8a04f34d75c37fc5ca38a4037475c37973218d33"
+      }
+    ],
+    "protobuf_sources": [
+      {
+        "path": "crates/laminar-core/build.rs",
+        "sha256": "789c1a66b34f9b10008d9e6d233d895bdbaa8a175bba12c388764dd6c7d6f34e",
+        "normalized_sha256": "0d5f520caabb350aa246861ff7ced38779b1c735c38b9b9ed2abca9e3990a694"
+      },
+      {
+        "path": "crates/laminar-core/proto/shuffle.proto",
+        "sha256": "34ee91c0abdaeecd5caeee1b01d917737822922f3e31c25aa3124dc5ad8abd9a",
+        "normalized_sha256": "e7bc5d27a64632e0bb8fb110da4dc026b5eb031c7d4c55585f8b6c4f0e812a68"
+      },
+      {
+        "path": "crates/laminar-core/proto/barrier.proto",
+        "sha256": "657f6183ae817ea53cc8acb6e89d77c186fe8dc09dd81dad998af7a421765b74",
+        "normalized_sha256": "3287aee88a54a3f39e09beaf101761cfd3dca8c70184d52e7f895bd78d7f6e29"
+      }
+    ],
+    "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+    "build_command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+    "scope": "Exact older-assignment topology restore repair using existing portable checkpoint bootstrap; same complete owner map and vnode set. Native qualification is separate."
+  },
+  "commands": [
+    {
+      "phase": "red",
+      "command": null,
+      "exit_code": 101,
+      "red_test_filter": "topology_recovery_older_assignment_uses_checkpoint_bootstrap_without_relabelling",
+      "command_note": "Exact earlier shell argv is not retained; raw output proves this regression failed before the repair.",
+      "raw_log_path": "target/topology-evidence/topology-older-assignment-bootstrap-red-raw.txt",
+      "raw_log_sha256": "d4fdd8ace25d7748543007d98b3826e99e78265a0313334a8c3e976fe67f69cc",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "test_elapsed_seconds": 1.3
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 14s\r"
+      ]
+    },
+    {
+      "phase": "focused",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_ -- --test-threads=8",
+      "exit_code": 0,
+      "red_test_filter": null,
+      "command_note": null,
+      "raw_log_path": "target/topology-evidence/topology-older-assignment-bootstrap-green-raw.txt",
+      "raw_log_sha256": "6465da5a5589f1cf6cc129aa64ca09ffca3bba740e70aafd48b5640d8876f414",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 12,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 3.09
+        },
+        {
+          "result": "ok",
+          "passed": 136,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 31.63
+        },
+        {
+          "result": "ok",
+          "passed": 129,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 21.58
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.14
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 09s\r"
+      ]
+    },
+    {
+      "phase": "full",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins -- --test-threads=8",
+      "exit_code": 0,
+      "red_test_filter": null,
+      "command_note": null,
+      "raw_log_path": "target/topology-evidence/topology-portable-bootstrap-full-raw.txt",
+      "raw_log_sha256": "033e5407826653e35a0526cebc374356f9f4c85c816b46fb1bd8a9ebcda4a073",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 921,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 46.82
+        },
+        {
+          "result": "ok",
+          "passed": 1107,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 32.27
+        },
+        {
+          "result": "ok",
+          "passed": 2083,
+          "failed": 0,
+          "ignored": 1,
+          "test_elapsed_seconds": 24.3
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "ok",
+          "passed": 359,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 6.15
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.90s\r"
+      ]
+    },
+    {
+      "phase": "clippy",
+      "command": "cargo clippy --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings",
+      "exit_code": 0,
+      "red_test_filter": null,
+      "command_note": null,
+      "raw_log_path": "target/topology-evidence/topology-portable-bootstrap-clippy-raw.txt",
+      "raw_log_sha256": "a694548b72cc6e502dbf29256445247c4dd06e931f433deaf59715a28768ef0e",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 48s\r"
+      ]
+    },
+    {
+      "phase": "minimal",
+      "command": "cargo check --locked -p laminar-server --no-default-features",
+      "exit_code": 0,
+      "red_test_filter": null,
+      "command_note": null,
+      "raw_log_path": "target/topology-evidence/topology-portable-bootstrap-minimal-raw.txt",
+      "raw_log_sha256": "a48b1f47be0e1d7f9e308d3132759531f5d83dbc9305efff61f132afec5bda5d",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.15s\r"
+      ]
+    },
+    {
+      "phase": "stock_build",
+      "command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+      "exit_code": 0,
+      "red_test_filter": null,
+      "command_note": null,
+      "raw_log_path": "target/topology-evidence/topology-portable-bootstrap-stock-soak-build-raw.txt",
+      "raw_log_sha256": "fd98f1e95a90edd8c41e72853559f7ce1952382c7c1251a48f1c3fb9408d4d06",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `soak` profile [optimized] target(s) in 22m 18s\r"
+      ]
+    }
+  ],
+  "red_scope": "Base 582 production plus the frozen regression test, before the two-module repair. Both root and target paths are asserted by the same test; the red run fails on the first root case.",
+  "green_scope": "Frozen three-source repair. Tests include both root and target private restores, exact historical assignment/index preservation and aggregate continuation. They do not replace the native cold process oracle.",
+  "environment": {
+    "cargo_build_jobs": 1,
+    "rust_min_stack_bytes": 4194304,
+    "locked_dependencies": true,
+    "unsafe_or_profile_changes": false
+  },
+  "scope": "Verification chain completed in order and stopped on any nonzero exit. Stock executable result is recorded separately."
+}

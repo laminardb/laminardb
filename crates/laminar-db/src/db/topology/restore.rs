@@ -651,7 +651,36 @@ fn restore_local_frames(
     let mut whole = Vec::new();
     let mut vnodes = Vec::new();
     if recovered.reassigned {
-        return Err(TopologyError::Fenced.into());
+        let predecessor = recovered
+            .committed
+            .assignment_fence
+            .as_ref()
+            .ok_or(TopologyError::Fenced)?;
+        let target = input.assignment();
+        if predecessor.assignment_digest != target.assignment_digest
+            || predecessor.vnode_count != target.vnode_count
+            || predecessor.partitioning_abi_version != target.partitioning_abi_version
+            || !predecessor
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .eq(target
+                    .participants
+                    .iter()
+                    .map(|participant| participant.node_id))
+            || recovered.target_vnodes != input.owned_vnodes()
+        {
+            return Err(TopologyError::Fenced.into());
+        }
+        // The authority-selected cut retains its historical assignment. Reuse ordinary
+        // checkpoint bootstrap to audit portable whole/vnode state against that predecessor
+        // and publish it under the exact current transport. This permits no survivor rescale.
+        return graph.restore_reassigned_vnode_state(
+            predecessor,
+            &recovered.predecessor_owners,
+            target,
+            &recovered.state_frames,
+        );
     }
     for frame in &recovered.state_frames {
         if frame.participant_id != input.process().participant.node_id {

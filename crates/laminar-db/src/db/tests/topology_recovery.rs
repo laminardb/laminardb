@@ -387,3 +387,128 @@ async fn topology_recovery_image_corrupt_target_state_never_loads_valid_parent_r
     assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
 }
+
+async fn advance_decode_assignment(fixture: &Fixture) {
+    use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
+
+    // The storage-only fixture preserves the complete owner map and process roster. Native
+    // cold-restart tests separately exercise fenced process takeover and assignment decisions.
+    let assignments = AssignmentSnapshotStore::new(Arc::clone(&fixture.authority.checkpoint_store));
+    let prior = assignments.load().await.unwrap().unwrap();
+    let next = prior
+        .next_for_participants(prior.vnodes.clone(), prior.participants.clone())
+        .unwrap();
+    assert!(matches!(
+        assignments
+            .save_if_version(&next, prior.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let fence = next.assignment_fence().unwrap();
+    let registry = fixture.db.vnode_registry.lock().clone().unwrap();
+    let owners = registry.versioned_snapshot().owners().to_vec();
+    registry.set_assignment_and_version(owners.into(), fence.assignment_version);
+    let owner_ids = vec![1; 8];
+    fixture
+        .db
+        .shuffle_sender
+        .lock()
+        .clone()
+        .unwrap()
+        .install_assignment_fence(&fence, &owner_ids)
+        .unwrap();
+    fixture
+        .db
+        .shuffle_receiver
+        .lock()
+        .clone()
+        .unwrap()
+        .install_assignment_fence(&fence, &owner_ids)
+        .unwrap();
+    fixture
+        .authority
+        .controller
+        .publish_checkpoint_assignment_fence(Some(fence.clone()));
+    fixture
+        .authority
+        .controller
+        .announce_adopted_assignment(&laminar_core::checkpoint::CheckpointAssignmentAdoption {
+            participant: fence.participants[0],
+            assignment_version: fence.assignment_version,
+            partitioning_abi_version: fence.partitioning_abi_version,
+            vnode_count: fence.vnode_count,
+            assignment_digest: fence.assignment_digest,
+            vnode_state_ready: true,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn topology_recovery_older_assignment_uses_checkpoint_bootstrap_without_relabelling() {
+    for target_checkpoint in [false, true] {
+        let (fixture, operation) = if target_checkpoint {
+            let (fixture, operation, _) = Box::pin(checkpointed()).await;
+            (fixture, operation)
+        } else {
+            let (fixture, committed) = committed_fixture().await;
+            (fixture, committed.operation_id)
+        };
+        advance_decode_assignment(&fixture).await;
+        let selected = fixture
+            .authority
+            .controller
+            .committed_topology_recovery_input(operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            selected
+                .checkpoint()
+                .assignment_fence
+                .as_ref()
+                .unwrap()
+                .assignment_version,
+            1
+        );
+        assert_eq!(selected.migration().assignment().assignment_version, 2);
+        let store =
+            ObjectStoreCheckpointStore::new(Arc::clone(&fixture.authority.checkpoint_store), "")
+                .with_participant_id(1)
+                .with_key_group_count(fixture.db.checkpoint_key_groups());
+        let reader = crate::recovery_manager::RecoveryManager::new(
+            &store,
+            &selected.checkpoint().pipeline_identity,
+            &selected.checkpoint().deployment_id,
+            CheckpointScope::Cluster,
+        );
+        let recovered = reader
+            .recover_topology_selection(&selected, 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            recovered.reassigned,
+            "older topology cut bypassed checkpoint bootstrap"
+        );
+        assert_eq!(recovered.committed, *selected.checkpoint());
+        assert_eq!(recovered.target_vnodes, selected.migration().owned_vnodes());
+        let mut image = fixture
+            .db
+            .prepare_cluster_topology_recovery(operation)
+            .await
+            .unwrap();
+        let output = image
+            .graph
+            .execute_cycle(&input(5), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            total(&output["totals"]),
+            if target_checkpoint { 60 } else { 45 }
+        );
+        assert_eq!(fixture.resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+        assert!(fixture.db.owned_source_tasks.lock().is_empty());
+        assert!(fixture.db.owned_sink_handles.lock().is_empty());
+    }
+}

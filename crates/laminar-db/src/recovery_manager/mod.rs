@@ -226,7 +226,7 @@ impl<'a> RecoveryManager<'a> {
             input.outcome(),
             input.checkpoint(),
             Some(ClusterRecoveryTarget {
-                assignment: input.plan().assignment.clone(),
+                assignment: input.assignment().clone(),
                 owned_vnodes: input.owned_vnodes().to_vec(),
                 max_graph_payload_bytes,
             }),
@@ -264,16 +264,14 @@ impl<'a> RecoveryManager<'a> {
                 "target checkpoint reader differs from its selected target/process authority",
             ));
         }
-        let assignment = input.checkpoint().assignment_fence.clone().ok_or_else(|| {
-            checkpoint_error("selected target checkpoint has no assignment certificate")
-        })?;
-        // Selection proved the same owner map. Private reads retain the cut's historical boots
-        // and assignment; a later installation must use the current recovery round's identities.
+        // Selection proved the same owner map. Keep the exact historical checkpoint bytes;
+        // choose the existing portable bootstrap when its assignment precedes the current one.
+        // Ordinary strict restore remains mandatory for an identical assignment.
         self.recover_committed_for_target(
             input.outcome(),
             input.checkpoint(),
             Some(ClusterRecoveryTarget {
-                assignment,
+                assignment: input.migration().assignment().clone(),
                 owned_vnodes: input.migration().owned_vnodes().to_vec(),
                 max_graph_payload_bytes,
             }),

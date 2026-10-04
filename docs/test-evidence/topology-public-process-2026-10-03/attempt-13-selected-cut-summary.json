@@ -1,0 +1,71 @@
+{
+  "recorded_utc": "2026-10-04T02:22:23.654999+00:00",
+  "run_id": "576636-1791078946966558900",
+  "reference": {
+    "epoch": 42,
+    "checkpoint_id": 42,
+    "sha256": "31400b2aba08f9831ef22d252fed71dfe282f9bd322d6f6b577d3e0b39f6ebc7",
+    "len": 60389
+  },
+  "verified_sha256": "31400b2aba08f9831ef22d252fed71dfe282f9bd322d6f6b577d3e0b39f6ebc7",
+  "verified_encoded_length": 60389,
+  "archived_assignment": {
+    "assignment_digest": [
+      4,
+      129,
+      37,
+      184,
+      28,
+      193,
+      137,
+      119,
+      42,
+      153,
+      19,
+      91,
+      95,
+      41,
+      14,
+      107,
+      74,
+      116,
+      175,
+      189,
+      101,
+      148,
+      200,
+      56,
+      194,
+      6,
+      158,
+      183,
+      203,
+      130,
+      105,
+      203
+    ],
+    "assignment_version": 1,
+    "participants": [
+      {
+        "boot_incarnation": "c266b4e0-fbfd-46f9-96a3-97292e96c56c",
+        "node_id": 12632117528189947522
+      },
+      {
+        "boot_incarnation": "c4b36568-e5f7-46e2-94cb-4aa09052caaa",
+        "node_id": 15506916534570490772
+      },
+      {
+        "boot_incarnation": "442e9383-88d7-446a-aed4-2fbc70d1e2cf",
+        "node_id": 16059159448129433833
+      }
+    ],
+    "partitioning_abi_version": 2,
+    "vnode_count": 64
+  },
+  "reassignment_portable": true,
+  "pipeline_identity": {
+    "canonical_version": 7,
+    "sha256": "25d8c7938e32c1711709964a1072b7900d7b1af54cc98049320c00d18bed29cf"
+  },
+  "scope": "Exact selected checkpoint bytes verified against the durable handoff reference. The older assignment is portable; bytes have not been relabelled."
+}

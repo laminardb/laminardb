@@ -172,6 +172,33 @@ pin old state, and the journal rejects new identities at 64 retained operations.
   Exact identities, raw samples and
   scope are in [performance evidence](test-evidence/topology-performance-2026-10-04/README.md).
 
+- Local commit `582b7cf0` records the observed Created teardown, exact handoff-pin
+  recovery, protected-state preflight and source-bound failed native/matched
+  steady measurements. The next regression reproduces older-assignment topology
+  reads incorrectly selecting ordinary restore. Both migration-root and target
+  checkpoint readers now select the existing portable checkpoint bootstrap using
+  the current assignment; the immutable archived index and payloads retain their
+  original identity. Private restoration also requires the unchanged complete
+  owner map/roster and exact target vnodes. Focused verification is in progress;
+  no newly passing native restart is claimed. The focused rerun passed 283 tests
+  (two ignored), followed by all 4,470 selected library/server tests (three
+  ignored). All-target Clippy with warnings denied and the minimal server check
+  passed. The exact three-source repair is frozen against `582b7cf0` for the
+  ordinary optimized server build. The passing
+  [fault-boundary index](test-evidence/topology-public-process-2026-10-03/portable-bootstrap-fault-coverage.json)
+  records 40 existing deterministic regressions without claiming native kills at
+  every phase.
+
+- The stock portable-bootstrap server (`60169d45…`, 22m 18s build) completed both
+  public migrations in native attempt 14. Exact target checkpoints 35/42 and all
+  six future pairs matched. All three cold replacements restored private state
+  successfully, then the coordinator's blanket `recovered.reassigned` guard
+  rejected held runtime installation. The unchanged 90-second Release deadline
+  expired; the 197.93-second test failed before final stateful/sink/sequence
+  oracles. Its evidence is retained. The next repair must install the exact
+  selected cut under the current certified owner map without relabelling a
+  historical manifest or bypassing sink/recovery authority.
+
 ## Next work, in order
 
 1. Run and fix the new real-process public migration/restart soak. Keep its existing

@@ -132,9 +132,33 @@ the test failed after 203.32s and did not reach the final stateful/sink/sequence
 oracles. The final authority summary binds sequence 341 and exact checkpoint 42.
 This identifies the next repair; it does not qualify full cold restart.
 
-The sampled combined server working-set maximum was 566,935,552 bytes; per-process
-observed peak working sets were 173,953,024, 191,991,808 and 243,068,928 bytes.
+Attempt 13's sampled combined server working-set maximum was 594,001,920 bytes
+across 103 samples and six processes (the initial and cold replacement rosters).
+The original processes' observed peak working sets were 192,360,448, 168,738,816
+and 235,720,704 bytes; replacement peaks were 75,440,128, 76,386,304 and
+78,524,416 bytes.
 The resource JSON retains sampling intervals, private bytes and available
 input-buffer/managed-state gauges. Allocation events were not profiled and are
 reported as unavailable. Raw node/build logs remain under ignored
-`target/topology-evidence` and `target/tmp/soak-532300-1791066190126809200`.
+`target/topology-evidence` and `target/tmp/soak-576636-1791078946966558900`.
+
+Attempt 14 used stock server `60169d45…`, built in 22m 18s from `582b7cf0`
+plus the frozen three-source portable-bootstrap repair. The focused run passed
+283 tests (two ignored), the full selected suite passed 4,470 (three ignored),
+all-target Clippy denied warnings and passed, and the minimal server check passed.
+The verification summary binds those logs and exact sources. The checkpoint
+decoder now retains the historical assignment and uses ordinary portable
+bootstrap for the certified newer assignment with the same complete owner map.
+
+With idle compilers and zero injected kills, both public migrations reached
+exact target checkpoints 35 and 42 and all six new-pipeline pairs matched.
+All three cold replacements used the original bootstrap. Private managed-state
+restoration passed, including the interval join that failed in attempt 13.
+Held runtime startup then rejected `recovered.reassigned` in the target
+checkpoint coordinator. The existing 90-second Release deadline expired; the
+test failed after 197.93 seconds and reached none of its final stateful, sink
+or sequence oracles. This is another separately observed recovery defect.
+Intake remained held, with no replacement Release or rewritten Active receipt.
+The result, exact final authority/checkpoint references and artifact endpoint
+are recorded in the attempt-14 summaries. Sampled combined server RSS peaked
+at 571,621,376 bytes. No successful cold-restart qualification is claimed.

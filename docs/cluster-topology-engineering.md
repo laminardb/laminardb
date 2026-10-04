@@ -93,6 +93,16 @@ greatest checkpoint. The pin is rechecked after control I/O and remains present
 through Release. A differing pin, unsettled checkpoint, cleanup cursor or drain
 reservation still fences recovery; Release itself does not retire restore state.
 
+Private topology restore selects the existing portable checkpoint bootstrap when
+the selected cut has an older assignment version. The checkpoint index and state
+payloads keep their historical assignment; they are not rewritten. Selection and
+restore require the same complete owner digest, vnode count, partition ABI,
+stable node roster and exact local vnode set. The ordinary bootstrap then audits
+drained portable whole/vnode state, current transport/process authority and the
+managed-state budget before publication. An identical assignment still uses
+strict ordinary restore. This handles process replacement within the existing
+topology contract and grants no survivor rescaling authority.
+
 Cold startup accepts the complete current catalog or the exact complete original adopted bootstrap as an assertion. Durable target authority takes precedence over that original bootstrap. Arbitrary subsets and changed definitions reject. The target catalog is reconstructed, namespace ownership retained and the same coordinated recovery owner queued before actors can publish.
 
 Missing deployment identity is an error, including through a cached decision store. Reads never recreate it. Source cursors for every target source come from the selected checkpoint; recovery cannot re-resolve latest or reuse an old initializer when target progress exists. Checkpoint allocation and publication frontiers continue monotonically.
@@ -137,6 +147,12 @@ Compiler ownership precedes the catalog read lock during isolated validation. Pu
 ## Evidence and outstanding qualification
 
 The linked evidence folders record the original baseline, tested source hashes, unchanged Cargo.lock, features, exact commands/results and each fixture's scope. Existing control/graph/sink/source tests cover malformed artifacts, stale evidence, lost responses, cancellation, checkpoint races and replacement release. Stored-segment tests cover reconnect identity and cleanup corruption.
+
+The [boundary-test index](test-evidence/topology-public-process-2026-10-03/portable-bootstrap-fault-coverage.json)
+binds 40 existing authority and owned-runtime fault regressions to the passing
+4,470-test run. It covers lost responses, cancellation, stale leaders, failed
+installation and held replacement Release at their stated boundaries. It does
+not claim that native processes were killed at every migration phase.
 
 The public migration soak extends the existing real three-process Kafka/S3 stateful harness. It adds an independent latest-source pipeline, SQL downstream stream, deterministic paused-input/output checks, post-migration hard kills and full target restart with the original bootstrap. Its consumer-visible timing starts before producing records during a held prepared cut, including the explicit test hold and subsequent Release. Existing independent join/window/aggregate oracles remain required. It must pass before it is cited as real-process migration evidence.
 
