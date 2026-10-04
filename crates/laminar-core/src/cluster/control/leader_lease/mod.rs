@@ -20,6 +20,9 @@ mod topology_retention;
 mod topology_subscription;
 mod topology_target_preparation;
 
+mod checkpoint_publication;
+mod history_retention;
+
 pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
     SubscriptionReplayPin, SubscriptionReplayPinAcquire, SUBSCRIPTION_REPLAY_PIN_RENEW_INTERVAL,
@@ -2759,53 +2762,9 @@ impl LeaderLeaseStore {
         };
         let head_sequence = head.lease.seq;
         let mut retained = BTreeSet::from([head_sequence]);
-        if let Some(baseline) = head.topology_baseline.as_ref() {
-            authority.audit_topology_adoption(baseline).await?;
-            retained.insert(baseline.authority_sequence);
-        }
-        for operation in &head.topology_operations {
-            authority.audit_topology_operation(operation).await?;
-            retained.insert(operation.admitted_sequence);
-            retained.insert(operation.status_sequence);
-            retained.extend(
-                operation
-                    .target_preparations
-                    .iter()
-                    .map(|receipt| receipt.authority_sequence),
-            );
-            if let Some(commit) = &operation.commit {
-                retained.insert(commit.authority_sequence);
-            }
-            if let Some(activation) = &operation.activation {
-                retained.insert(activation.authority_sequence);
-                retained.extend(
-                    activation
-                        .installations
-                        .iter()
-                        .map(|receipt| receipt.authority_sequence),
-                );
-                if let Some(release) = &activation.release {
-                    retained.insert(release.authority_sequence);
-                }
-            }
-            if let Some(root) = &operation.migration_root {
-                retained.insert(root.authority_sequence);
-            }
-            if let Some(preparation) = &operation.preparation {
-                retained.extend(
-                    preparation
-                        .certificates
-                        .iter()
-                        .map(|certificate| certificate.authority_sequence),
-                );
-            }
-            if let Some(cut) = &operation.cut {
-                retained.insert(cut.bound_sequence);
-                if let Some(commit) = &cut.committed {
-                    retained.insert(commit.authority_sequence);
-                }
-            }
-        }
+        authority
+            .retain_topology_history(&head, &mut retained)
+            .await?;
         if let Some(reservation) = &head.assignment_drain_reservation {
             retained.insert(reservation.authority_sequence);
         }
@@ -2926,55 +2885,13 @@ impl LeaderLeaseStore {
                 ));
             }
         }
-        let boundary_commit_head = head
-            .outcome_floor
-            .as_ref()
-            .and_then(|floor| floor.terminal_anchor.as_ref())
-            .and_then(|anchor| {
-                retained_commit_links
-                    .iter()
-                    .rev()
-                    .find(|link| link.epoch <= anchor.epoch)
-                    .copied()
-                    .or_else(|| {
-                        head.outcome_floor
-                            .as_ref()
-                            .and_then(|floor| floor.committed_anchor_link)
-                    })
-            });
-        if expected_commit_head != boundary_commit_head {
-            return Err(LeaseError::Invalid(
-                "retained terminal chain lost Commit continuity at its durable floor".into(),
-            ));
-        }
-        if !terminal_commit_links.is_subset(&retained_commit_links) {
-            return Err(LeaseError::Invalid(
-                "terminal Commit records are not linked from the retained Commit chain".into(),
-            ));
-        }
-        if let Some((anchor, anchor_link)) = head.outcome_floor.as_ref().and_then(|floor| {
-            floor
-                .terminal_anchor
-                .as_ref()
-                .zip(floor.terminal_anchor_link)
-        }) {
-            if anchor.is_commit() {
-                let linked = if anchor.epoch >= artifact_floor {
-                    retained_commit_links.contains(&anchor_link)
-                } else {
-                    head.outcome_floor.as_ref().is_some_and(|floor| {
-                        floor.committed_anchor.as_ref() == Some(anchor)
-                            && floor.committed_anchor_link == Some(anchor_link)
-                    })
-                };
-                if !linked {
-                    return Err(LeaseError::Invalid(
-                        "terminal Commit anchor is not linked from the retained Commit chain"
-                            .into(),
-                    ));
-                }
-            }
-        }
+        Self::validate_retained_commit_boundary(
+            &head,
+            expected_commit_head,
+            &retained_commit_links,
+            &terminal_commit_links,
+            artifact_floor,
+        )?;
         let mut assignment_link = head.assignment_decision_head;
         let mut assignment_links = 0;
         while let Some(current) = assignment_link {
@@ -4825,305 +4742,6 @@ impl LeaderLeaseStore {
         .await
     }
 
-    async fn record_cluster_outcome_inner(
-        &self,
-        proof: &LeaderProof,
-        epoch: u64,
-        checkpoint_id: u64,
-        assignment_fence: CheckpointAssignmentFence,
-        verdict: CheckpointVerdict,
-        committed_checkpoint: Option<CommittedCheckpointRef>,
-        require_unadmitted: bool,
-    ) -> Result<RecordOutcomeResult, ClusterCheckpointAuthorityError> {
-        if !proof.is_canonical() {
-            return Err(ClusterCheckpointAuthorityError::Fenced);
-        }
-        let attempt = crate::checkpoint::CheckpointAttempt::new(epoch, checkpoint_id);
-        if !attempt.is_canonical() {
-            return Err(DecisionError::Conflict(
-                "cluster checkpoint outcomes require one nonzero canonical checkpoint ID".into(),
-            )
-            .into());
-        }
-        let initial = self
-            .load_record()
-            .await?
-            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-        if !initial.lease.matches_proof(proof) {
-            return Err(ClusterCheckpointAuthorityError::Fenced);
-        }
-        let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
-        let (candidate, committed_index) = decisions
-            .canonical_outcome_with_index(
-                epoch,
-                checkpoint_id,
-                CheckpointScope::Cluster,
-                Some(assignment_fence),
-                Some(proof.clone()),
-                verdict,
-                committed_checkpoint,
-            )
-            .await?;
-
-        loop {
-            let published = self
-                .load_published_authority_head()
-                .await?
-                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            let current = &published.record;
-            if !current.lease.matches_proof(proof) {
-                return Err(ClusterCheckpointAuthorityError::Fenced);
-            }
-            let snapshot = self.cached_audited_cluster_outcomes_from(current).await?;
-            let outcomes = &snapshot.outcomes;
-            if let Some((index, winner)) = outcomes
-                .iter()
-                .enumerate()
-                .find(|(_, outcome)| outcome.epoch == candidate.epoch)
-            {
-                if require_unadmitted && winner == &candidate {
-                    let link = snapshot.terminal_links.get(index).ok_or_else(|| {
-                        LeaseError::Invalid("reserved Abort has no authority link".into())
-                    })?;
-                    let anchor = read_authority_record(self.store.as_ref(), link.sequence)
-                        .await?
-                        .ok_or_else(|| {
-                            LeaseError::Invalid("reserved Abort anchor is missing".into())
-                        })?;
-                    if anchor.active_checkpoint_artifacts.is_some() {
-                        return Err(DecisionError::Conflict(
-                            "admitted checkpoint Abort cannot become reservation-only cleanup"
-                                .into(),
-                        )
-                        .into());
-                    }
-                }
-                return if winner == &candidate {
-                    Ok(RecordOutcomeResult::Unchanged(winner.clone()))
-                } else {
-                    Ok(RecordOutcomeResult::Conflict {
-                        winner: winner.clone(),
-                    })
-                };
-            }
-            if require_unadmitted && current.active_checkpoint_artifacts.is_some() {
-                return Err(DecisionError::Conflict(
-                    "checkpoint reservation already has admitted artifacts".into(),
-                )
-                .into());
-            }
-            let active = match current.active_checkpoint_artifacts.as_ref() {
-                Some(active)
-                    if active.deployment_id == candidate.deployment_id
-                        && active.attempt.epoch == candidate.epoch
-                        && active.attempt.checkpoint_id == candidate.checkpoint_id
-                        && active.assignment_fence.as_ref()
-                            == candidate.assignment_fence.as_ref() =>
-                {
-                    Some(active)
-                }
-                Some(_) => {
-                    return Err(DecisionError::Conflict(format!(
-                        "cluster checkpoint {} does not match the active artifact inventory",
-                        candidate.checkpoint_id
-                    ))
-                    .into());
-                }
-                None if candidate.is_commit() => {
-                    return Err(DecisionError::Conflict(format!(
-                        "cluster Commit checkpoint {} has no admitted artifact inventory",
-                        candidate.checkpoint_id
-                    ))
-                    .into());
-                }
-                None => None,
-            };
-            if candidate.is_commit()
-                && current.active_checkpoint_artifact_leader_proof.as_ref() != Some(proof)
-            {
-                return Err(DecisionError::Conflict(format!(
-                    "takeover leader cannot Commit checkpoint {} admitted by an older leader term",
-                    candidate.checkpoint_id
-                ))
-                .into());
-            }
-            if let Some(last) = outcomes.last() {
-                if candidate.checkpoint_id <= last.checkpoint_id {
-                    return Err(DecisionError::Conflict(format!(
-                        "cluster checkpoint {} does not advance durable checkpoint {}",
-                        candidate.checkpoint_id, last.checkpoint_id
-                    ))
-                    .into());
-                }
-            }
-            if candidate.is_commit()
-                && current
-                    .assignment_handoff_pin
-                    .as_ref()
-                    .is_some_and(|pin| candidate.assignment_fence.as_ref() != Some(&pin.target))
-            {
-                return Err(DecisionError::Conflict(
-                    "cluster Commit does not bind the active assignment handoff target".into(),
-                )
-                .into());
-            }
-            let (commit_index, expected_predecessor) = if candidate.is_commit() {
-                let index = committed_index.as_ref().ok_or_else(|| {
-                    DecisionError::Conflict(
-                        "canonical cluster Commit is missing its committed checkpoint index".into(),
-                    )
-                })?;
-                let expected_predecessor = outcomes
-                    .iter()
-                    .rev()
-                    .find(|outcome| outcome.is_commit())
-                    .and_then(|outcome| outcome.committed_checkpoint.clone());
-                if index.predecessor != expected_predecessor {
-                    return Err(DecisionError::Conflict(format!(
-                        "cluster Commit checkpoint {} does not extend the authoritative Commit head",
-                        candidate.checkpoint_id
-                    ))
-                    .into());
-                }
-                if active.is_none_or(|active| index.pipeline_identity != active.pipeline_identity) {
-                    return Err(DecisionError::Conflict(format!(
-                        "cluster Commit checkpoint {} does not match its admitted pipeline identity",
-                        candidate.checkpoint_id
-                    ))
-                    .into());
-                }
-                (Some(index), expected_predecessor)
-            } else {
-                (None, None)
-            };
-            if candidate.is_commit() && snapshot.commit_links.len() >= MAX_LIVE_AUTHORITY_LINKS {
-                return Err(DecisionError::Conflict(format!(
-                    "live Commit retention reached the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound; advance the artifact-retention horizon before admitting another Commit"
-                ))
-                .into());
-            }
-            if let Some(floor) = current.outcome_floor.as_ref() {
-                if candidate.deployment_id != floor.deployment_id
-                    || candidate.epoch < floor.authority_before_epoch
-                {
-                    return Err(DecisionError::Conflict(format!(
-                        "cluster outcome epoch {} is below or outside authority floor {}",
-                        candidate.epoch, floor.authority_before_epoch
-                    ))
-                    .into());
-                }
-            }
-            if Box::pin(
-                self.compact_cluster_outcome_history_before_append(proof, current, &snapshot),
-            )
-            .await?
-            {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            if let (Some(index), Some(predecessor_ref)) =
-                (commit_index, expected_predecessor.as_ref())
-            {
-                let predecessor = decisions.load_committed_checkpoint(predecessor_ref).await?;
-                self.validate_checkpoint_predecessor_from(current, index, &predecessor)
-                    .await?;
-            }
-
-            let base_sequence = current.lease.seq;
-            let sequence = base_sequence
-                .checked_add(1)
-                .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
-            let mut next = current.preserve_with_lease(LeaderLease {
-                seq: sequence,
-                renewal_sequence: current.lease.renewal_sequence,
-                token: current.lease.token,
-                owner: current.lease.owner.clone(),
-                expires_at_ms: current.lease.expires_at_ms,
-                catalog_manifest: current.lease.catalog_manifest.clone(),
-            });
-            next.checkpoint_outcome = Some(candidate.clone());
-            next.previous_outcome = current.outcome_head;
-            let new_link = OutcomeLink {
-                sequence,
-                epoch: candidate.epoch,
-                checkpoint_id: candidate.checkpoint_id,
-            };
-            next.outcome_head = Some(new_link);
-            next.record_topology_cut_outcome(&candidate)?;
-            if candidate.is_commit() {
-                next.previous_commit = current.commit_head;
-                next.commit_head = Some(new_link);
-                next.active_checkpoint_artifacts = None;
-                next.active_checkpoint_artifact_leader_proof = None;
-                if next
-                    .assignment_handoff_pin
-                    .as_ref()
-                    .is_some_and(|pin| candidate.assignment_fence.as_ref() == Some(&pin.target))
-                {
-                    next.assignment_handoff_pin = None;
-                }
-            }
-            next.validate()?;
-            match self
-                .create_authority_record(Some(&published), &next)
-                .await?
-            {
-                AuthorityCreateOutcome::Created => {
-                    let mut appended = outcomes.to_vec();
-                    appended.push(candidate.clone());
-                    let mut terminal_links = snapshot.terminal_links.to_vec();
-                    terminal_links.push(new_link);
-                    let mut commit_links = snapshot.commit_links.to_vec();
-                    if candidate.is_commit() {
-                        commit_links.push(new_link);
-                    }
-                    self.install_cluster_outcome_audit(
-                        Self::cluster_outcome_audit_key(&next),
-                        next.lease.seq,
-                        ClusterOutcomeAuditSnapshot {
-                            outcomes: Arc::from(appended),
-                            terminal_links: Arc::from(terminal_links),
-                            commit_links: Arc::from(commit_links),
-                        },
-                    );
-                    return Ok(RecordOutcomeResult::Created(candidate));
-                }
-                AuthorityCreateOutcome::ExistingIdentical => {
-                    return Ok(RecordOutcomeResult::Unchanged(candidate));
-                }
-                AuthorityCreateOutcome::Contended(winner_head) => {
-                    let winners = self
-                        .cached_audited_cluster_outcomes_from(&winner_head)
-                        .await?;
-                    if let Some(winner) = winners
-                        .outcomes
-                        .iter()
-                        .find(|outcome| outcome.epoch == candidate.epoch)
-                    {
-                        return if winner == &candidate {
-                            Ok(RecordOutcomeResult::Unchanged(winner.clone()))
-                        } else {
-                            Ok(RecordOutcomeResult::Conflict {
-                                winner: winner.clone(),
-                            })
-                        };
-                    }
-                    if !winner_head.lease.matches_proof(proof) {
-                        return Err(ClusterCheckpointAuthorityError::Fenced);
-                    }
-                    if winner_head.lease.seq <= base_sequence {
-                        return Err(LeaseError::Invalid(
-                            "cluster outcome contention did not advance the authority sequence"
-                                .into(),
-                        )
-                        .into());
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
-        }
-    }
-
     async fn validate_assignment_recovery_snapshot(
         &self,
         decision: &AssignmentRecoveryDecision,
@@ -5389,56 +5007,9 @@ impl LeaderLeaseStore {
                     })
                 };
             }
-            match &decision {
-                AuthorityAssignmentDecision::Recovery(_) => {
-                    current.reject_uncommitted_topology_preparation()?;
-                }
-                AuthorityAssignmentDecision::Drain(_) => current.reject_topology_preparation()?,
-            }
-            let target = match &decision {
-                AuthorityAssignmentDecision::Recovery(recovery) => &recovery.target,
-                AuthorityAssignmentDecision::Drain(drain) => match drain.verdict {
-                    AssignmentDrainVerdict::Commit => &drain.transition.target,
-                    AssignmentDrainVerdict::Abort => &drain.transition.predecessor,
-                },
-            };
-            self.validate_topology_assignment_proposal_from(current, target)
+            self.validate_assignment_topology_settlement(current, &decision, assignments)
                 .await?;
-            current.validate_reserved_assignment_decision(&decision)?;
-            if let (Some(reservation), AuthorityAssignmentDecision::Drain(_)) =
-                (&current.assignment_drain_reservation, &decision)
-            {
-                let assignments = assignments.ok_or_else(|| {
-                    LeaseError::Invalid(
-                        "reserved drain settlement requires its configured assignment store".into(),
-                    )
-                })?;
-                self.materialize_drain_reservation(reservation, assignments)
-                    .await?;
-            }
-            if matches!(&decision, AuthorityAssignmentDecision::Drain(_)) {
-                let predecessor = decision.predecessor();
-                if let Some(active) = current.active_checkpoint_artifacts.as_ref() {
-                    let active_fence = active.assignment_fence.as_ref().ok_or_else(|| {
-                        DecisionError::Conflict(
-                            "active checkpoint artifact inventory lost its assignment fence".into(),
-                        )
-                    })?;
-                    if active_fence.assignment_version == predecessor.assignment_version {
-                        let detail = if active_fence == predecessor {
-                            "matches"
-                        } else {
-                            "conflicts with"
-                        };
-                        return Err(DecisionError::Conflict(format!(
-                            "assignment drain decision cannot overtake checkpoint {} whose assignment fence {detail} predecessor version {}",
-                            active.attempt.checkpoint_id,
-                            predecessor.assignment_version
-                        ))
-                        .into());
-                    }
-                }
-            }
+            current.reject_assignment_checkpoint_overtake(&decision)?;
             if let Some(last) = decisions.last() {
                 if decision.target_version() <= last.target_version() {
                     return Err(DecisionError::Conflict(format!(
@@ -6307,20 +5878,7 @@ impl LeaderLeaseStore {
                 ))
                 .into());
             }
-            if current.assignment_handoff_pin.as_ref().is_some_and(|pin| {
-                protected.epoch > pin.checkpoint.epoch
-                    && protected.checkpoint_id > pin.checkpoint.checkpoint_id
-            }) {
-                return Ok(None);
-            }
-            if current.topology_cut_blocks_cleanup(&protected) {
-                return Ok(None);
-            }
-            if current
-                .outcome_floor
-                .as_ref()
-                .is_some_and(|floor| floor.artifact_before_epoch >= protected.epoch)
-            {
+            if current.cleanup_is_pinned(&protected) {
                 return Ok(None);
             }
 
@@ -6361,9 +5919,7 @@ impl LeaderLeaseStore {
                 return Ok(None);
             }
             // Retained roots remain metadata/state pins, even after ordinary target cuts expire.
-            Box::pin(self.retained_topology_checkpoints())
-                .await
-                .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+            self.audit_topology_cleanup_roots().await?;
             let expired_index = decisions.load_committed_checkpoint(&expired).await?;
             protected_index
                 .validate_predecessor_index(&expired_index)

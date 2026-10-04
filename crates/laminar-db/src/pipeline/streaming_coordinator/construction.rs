@@ -476,18 +476,11 @@ impl StreamingCoordinator {
                 let error = format!(
                     "shared {source_start_timeout:?} source-start stage deadline exhausted before start began"
                 );
-                return match start_position {
-                    SourcePosition::Initialized { .. } => Err(DbError::Checkpoint(format!(
-                        "source '{src_name}' sealed initialization failed: {error}"
-                    ))),
-                    SourcePosition::Initial => Err(DbError::Config(format!(
-                        "source '{src_name}' start was not attempted: {error}"
-                    ))),
-                    SourcePosition::Resume { attempt, .. } => Err(DbError::Checkpoint(format!(
-                        "[LDB-6003] source '{src_name}' start was not attempted while resuming exact checkpoint epoch={} id={}: {error}",
-                        attempt.epoch, attempt.checkpoint_id
-                    ))),
-                };
+                return Err(source_stage_deadline_error(
+                    &src_name,
+                    &start_position,
+                    &error,
+                ));
             }
             // Only a durable resume seeds committed progress. Sealed initialization is a start
             // boundary, not processed input and never an acknowledgement of the skipped prefix.
@@ -753,4 +746,23 @@ impl StreamingCoordinator {
             process_authority: source_process_authority,
         })
     }
+}
+
+fn source_stage_deadline_error(
+    src_name: &str,
+    start_position: &SourcePosition,
+    error: &str,
+) -> DbError {
+    match start_position {
+                    SourcePosition::Initialized { .. } => DbError::Checkpoint(format!(
+                        "source '{src_name}' sealed initialization failed: {error}"
+                    )),
+                    SourcePosition::Initial => DbError::Config(format!(
+                        "source '{src_name}' start was not attempted: {error}"
+                    )),
+                    SourcePosition::Resume { attempt, .. } => DbError::Checkpoint(format!(
+                        "[LDB-6003] source '{src_name}' start was not attempted while resuming exact checkpoint epoch={} id={}: {error}",
+                        attempt.epoch, attempt.checkpoint_id
+                    )),
+                }
 }

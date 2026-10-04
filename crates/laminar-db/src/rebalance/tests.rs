@@ -44,7 +44,7 @@ impl GetBarrier {
         }
         if self
             .reads_before_wait
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

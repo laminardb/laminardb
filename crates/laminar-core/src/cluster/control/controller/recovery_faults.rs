@@ -13,7 +13,7 @@ impl ClusterController {
     pub fn next_recovery_fault_request(&self) -> Result<RecoveryFaultRequest, String> {
         let sequence = self
             .recovery_fault_request_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| "recovery fault request sequence exhausted".to_string())?;

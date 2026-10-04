@@ -458,7 +458,7 @@ async fn snapshotable_operator_work_keeps_idle_cycles_live() {
         ) -> Result<Vec<RecordBatch>, DbError> {
             assert!(inputs.is_empty());
             self.0
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Acquire,
                     |remaining| remaining.checked_sub(1),

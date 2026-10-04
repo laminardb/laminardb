@@ -1563,53 +1563,12 @@ impl RecoveryMonitor {
                 return;
             }
         };
-        let round = match Box::pin(controller.bind_recovery_round(round)).await {
-            Ok(round) => round,
-            Err(error) => {
-                tracing::error!(gen = gen_id, %error, "could not bind the exact recovery topology and process roster");
-                return;
-            }
+        let Some(round) = self
+            .publish_recovery_prepare(db, controller, round, required_prepare_fence)
+            .await
+        else {
+            return;
         };
-        if let Err(error) = replicate_recovery_gen(controller, gen_id).await {
-            tracing::error!(gen = gen_id, %error, "could not publish recovery generation");
-            return;
-        }
-
-        let prepare_fence = current_recovery_assignment_fence(
-            db,
-            controller,
-            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
-        )
-        .await;
-        let prepare_fence_matches = matches!(
-            prepare_fence.as_ref(),
-            Ok(Some(fence))
-                if fence == &round.assignment_fence
-                    && required_prepare_fence.is_none_or(|required| required == fence)
-        );
-        if !prepare_fence_matches {
-            if let Err(error) = prepare_fence {
-                tracing::warn!(
-                    gen = gen_id,
-                    %error,
-                    "recovery assignment audit failed before Prepare; deferring round"
-                );
-            } else {
-                tracing::warn!(
-                    gen = gen_id,
-                    "recovery assignment changed before Prepare; deferring round"
-                );
-            }
-            return;
-        }
-
-        controller.set_recovering(true);
-        db.set_source_gate(true);
-        if let Err(error) = announce_recover_prepare_bounded(controller, &round).await {
-            tracing::warn!(gen = gen_id, %error, "could not publish recovery Prepare");
-            return;
-        }
-        tracing::warn!(gen = gen_id, "leader announced recovery prepare");
         if !quiesce_recovery_driver(db, controller, &round).await {
             return;
         }
@@ -2285,33 +2244,14 @@ impl RecoveryMonitor {
         db.set_source_gate(true);
         let release_deadline = tokio::time::Instant::now() + RELEASE_PROTOCOL_TIMEOUT;
         let authority_revision = db.assignment_authority_revision.load(Ordering::Acquire);
-        if let Err(error) = db
-            .validate_recovered_cluster_topology_release(release)
-            .await
-        {
-            tracing::error!(gen = release.round.id.generation, %error, "recovery Release does not match the live target runtime");
-            return false;
-        }
-        let assignment_restorable = match recovery_round_assignment_is_restorable(
+        if !Self::release_installation_is_current(
             db,
             controller,
-            &release.round,
+            release,
             release_deadline,
+            authority_revision,
         )
         .await
-        {
-            Ok(restorable) => restorable,
-            Err(error) => {
-                tracing::error!(
-                    gen = release.round.id.generation,
-                    %error,
-                    "could not audit recovery Release assignment"
-                );
-                false
-            }
-        };
-        if !assignment_restorable
-            || db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
         {
             return false;
         }
@@ -2550,64 +2490,24 @@ impl RecoveryMonitor {
             drop(release_guard);
             return false;
         }
-        controller.set_recovering(false);
-        if committed.round.topology_binding().is_some() {
-            // The exact generic terminal is already committed and guarded. Admit the successor
-            // sink epoch while source intake remains held, using the ordinary coordinator path.
-            let sink_ready = async {
-                let mut coordinator = db.coordinator.lock().await;
-                let coordinator = coordinator
-                    .as_mut()
-                    .ok_or(laminar_core::cluster::control::TopologyError::Fenced)?;
-                coordinator
-                    .reconcile_sink_open_witness_until(release_deadline)
-                    .await?;
-                coordinator
-                    .ensure_assignment_sink_epoch_until(release_deadline)
-                    .await
-            }
-            .await;
-            if let Err(error) = sink_ready {
-                controller.set_recovering(true);
-                tracing::error!(gen = release.round.id.generation, %error, "target recovery successor sink epoch did not become ready");
+        match self
+            .release_recovered_data_plane(
+                db,
+                controller,
+                release,
+                &committed,
+                release_deadline,
+                authority_revision,
+            )
+            .await
+        {
+            topology::DataPlaneRelease::Released => {}
+            topology::DataPlaneRelease::Held => return false,
+            topology::DataPlaneRelease::RecheckFailed => {
+                drop(release_guard);
                 self.defer_release_retry(db, controller, release.round.id.generation, false);
                 return false;
             }
-            if let Err(error) = db.record_recovered_topology_release(&committed) {
-                controller.set_recovering(true);
-                tracing::error!(gen = release.round.id.generation, %error, "target recovery lost local runtime ownership before intake release");
-                return false;
-            }
-        }
-        // This Release certifies retirement, restore/readiness and the exact current authority.
-        // Assignment refresh alone cannot clear a held topology cut. Reuse the source-release
-        // transition lock so checkpoint capture cannot race a gate reopen.
-        let topology_cut_was_held = {
-            let _transition = db.cluster_authority_transition.lock();
-            db.topology_cut_hold.swap(false, Ordering::AcqRel)
-        };
-        db.set_source_gate(false);
-        if db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
-            || db.terminal_pipeline_halt.load(Ordering::Acquire)
-            || db.durable_terminal_recovery_fence.load(Ordering::Acquire)
-            || controller.is_recovering()
-            || db.cluster_intake_fenced()
-            || !controller.process_lease_is_live()
-            || controller
-                .checkpoint_assignment_fence(release.round.assignment_fence.assignment_version)
-                .as_ref()
-                != Some(&release.round.assignment_fence)
-            || controller.checkpoint_drain_transition().is_some()
-        {
-            controller.set_recovering(true);
-            db.set_source_gate(true);
-            if topology_cut_was_held {
-                let _transition = db.cluster_authority_transition.lock();
-                db.topology_cut_hold.store(true, Ordering::Release);
-            }
-            drop(release_guard);
-            self.defer_release_retry(db, controller, release.round.id.generation, false);
-            return false;
         }
         self.record_released_faults(&release.round);
         drop(release_guard);

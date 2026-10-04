@@ -81,3 +81,91 @@ impl LeaderLeaseStore {
         Ok((outcome, index))
     }
 }
+
+impl LeaderLeaseStore {
+    pub(super) async fn retain_topology_history(
+        &self,
+        head: &super::LeaderAuthorityRecord,
+        retained: &mut std::collections::BTreeSet<u64>,
+    ) -> Result<(), super::LeaseError> {
+        if let Some(baseline) = head.topology_baseline.as_ref() {
+            self.audit_topology_adoption(baseline).await?;
+            retained.insert(baseline.authority_sequence);
+        }
+        for operation in &head.topology_operations {
+            self.audit_topology_operation(operation).await?;
+            retained.insert(operation.admitted_sequence);
+            retained.insert(operation.status_sequence);
+            retained.extend(
+                operation
+                    .target_preparations
+                    .iter()
+                    .map(|receipt| receipt.authority_sequence),
+            );
+            if let Some(commit) = &operation.commit {
+                retained.insert(commit.authority_sequence);
+            }
+            if let Some(activation) = &operation.activation {
+                retained.insert(activation.authority_sequence);
+                retained.extend(
+                    activation
+                        .installations
+                        .iter()
+                        .map(|receipt| receipt.authority_sequence),
+                );
+                if let Some(release) = &activation.release {
+                    retained.insert(release.authority_sequence);
+                }
+            }
+            if let Some(root) = &operation.migration_root {
+                retained.insert(root.authority_sequence);
+            }
+            if let Some(preparation) = &operation.preparation {
+                retained.extend(
+                    preparation
+                        .certificates
+                        .iter()
+                        .map(|certificate| certificate.authority_sequence),
+                );
+            }
+            if let Some(cut) = &operation.cut {
+                retained.insert(cut.bound_sequence);
+                if let Some(commit) = &cut.committed {
+                    retained.insert(commit.authority_sequence);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl super::LeaderAuthorityRecord {
+    pub(super) fn cleanup_is_pinned(&self, protected: &CommittedCheckpointRef) -> bool {
+        if self.assignment_handoff_pin.as_ref().is_some_and(|pin| {
+            protected.epoch > pin.checkpoint.epoch
+                && protected.checkpoint_id > pin.checkpoint.checkpoint_id
+        }) {
+            return true;
+        }
+        if self.topology_cut_blocks_cleanup(protected) {
+            return true;
+        }
+        if self
+            .outcome_floor
+            .as_ref()
+            .is_some_and(|floor| floor.artifact_before_epoch >= protected.epoch)
+        {
+            return true;
+        }
+        false
+    }
+}
+
+impl LeaderLeaseStore {
+    pub(super) async fn audit_topology_cleanup_roots(&self) -> Result<(), super::DecisionError> {
+        Box::pin(self.retained_topology_checkpoints())
+            .await
+            .map_err(|error| super::DecisionError::Conflict(error.to_string()))?;
+        Ok(())
+    }
+}

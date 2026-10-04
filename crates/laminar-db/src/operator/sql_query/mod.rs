@@ -121,6 +121,13 @@ pub struct ClusterShuffleConfig {
 
 #[cfg(feature = "cluster")]
 impl ClusterShuffleConfig {
+    pub(crate) fn topology_snapshot(
+        &self,
+    ) -> Result<laminar_core::state::VnodeAssignmentSnapshot, DbError> {
+        self.ensure_topology_current()?;
+        Ok(self.registry.versioned_snapshot())
+    }
+
     pub(crate) fn ensure_topology_current(&self) -> Result<(), DbError> {
         let version = self
             .topology
@@ -1464,8 +1471,7 @@ impl SqlQueryOperator {
                 self.op_name
             ))
         })?;
-        config.ensure_topology_current()?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let sender_digest = config.sender.active_assignment_digest();
         if u32::try_from(assignment.owners().len()).ok() != Some(u32::from(self.key_group_count))
             || assignment.version() != pinned.version()
@@ -3554,8 +3560,7 @@ impl GraphOperator for SqlQueryOperator {
         };
         aggregate.validate_vnode_count(transition.target.vnode_count)?;
 
-        config.ensure_topology_current()?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
         let installed = self.cluster_assignment.as_ref().ok_or_else(|| {
             DbError::Checkpoint(format!(

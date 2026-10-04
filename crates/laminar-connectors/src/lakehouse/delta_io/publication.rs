@@ -196,7 +196,7 @@ async fn refresh_publication_cursor_once(
     #[cfg(test)]
     if let Ok(remaining) = FAIL_COORDINATED_CURSOR_REFRESHES.try_with(Arc::clone) {
         let inject_failure = remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
                 count.checked_sub(1)
             })
             .is_ok();

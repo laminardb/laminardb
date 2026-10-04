@@ -195,6 +195,47 @@ impl ShuffleReceiver {
     }
 }
 
+impl ShuffleSender {
+    pub(super) fn current_scope(
+        &self,
+        expected: Option<u64>,
+        topology: Option<ShuffleTopologyFence>,
+    ) -> io::Result<ScopeLease> {
+        let assignment = self.assignment.read();
+        let installed = assignment.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "shuffle assignment certificate is not installed",
+            )
+        })?;
+        let version = self.assignment_version.load(Ordering::Acquire);
+        let recovery_gen = self.recovery_gen.load(Ordering::Acquire);
+        let cancel = self.scope_cancel.read().clone();
+        self.process_lease.require_live_io()?;
+        if version == 0
+            || version != installed.fence.assignment_version
+            || cancel.is_cancelled()
+            || installed.topology != topology
+        {
+            return Err(scope_cancelled_io());
+        }
+        if expected.is_some_and(|expected| expected == 0 || expected != version) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                format!(
+                    "shuffle assignment scope mismatch: routed at {}, sender at {version}",
+                    expected.unwrap_or_default()
+                ),
+            ));
+        }
+        Ok(ScopeLease {
+            assignment: Arc::clone(installed),
+            recovery_gen,
+            cancel,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

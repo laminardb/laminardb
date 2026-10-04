@@ -1,5 +1,7 @@
 //! Managed vnode-local temporal join execution.
 
+mod transition_validation;
+
 use std::collections::BTreeMap;
 #[cfg(feature = "cluster")]
 use std::collections::VecDeque;
@@ -1098,8 +1100,7 @@ impl ManagedTemporalJoinOperator {
                 self.name
             ))
         })?;
-        config.ensure_topology_current()?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let sender_digest = config.sender.active_assignment_digest();
         let receiver_digest = config.receiver.active_assignment_digest();
         if u32::try_from(assignment.owners().len()).ok() != Some(self.vnode_count.get())
@@ -4727,8 +4728,7 @@ impl ManagedTemporalJoinOperator {
                 self.name
             ))
         })?;
-        config.ensure_topology_current()?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
         let target_contains_self = assignment.owners().contains(&config.self_id);
         let endpoints_match_process = config.sender.local_id() == config.self_id.0
@@ -5222,34 +5222,6 @@ impl ManagedTemporalJoinOperator {
             });
         }
         Ok(prepared)
-    }
-
-    fn validate_vnode_roster(
-        &self,
-        required_vnodes: &[u32],
-        vnode_count: u32,
-    ) -> Result<(), DbError> {
-        if vnode_count != u32::from(self.key_group_count)
-            || required_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
-            || required_vnodes.iter().any(|vnode| *vnode >= vnode_count)
-        {
-            return Err(DbError::Checkpoint(format!(
-                "temporal join [{}] received a non-canonical vnode roster {required_vnodes:?} for vnode_count {vnode_count}",
-                self.name
-            )));
-        }
-        if let Some(unowned) = self
-            .resident_vnodes
-            .iter()
-            .copied()
-            .find(|vnode| required_vnodes.binary_search(vnode).is_err())
-        {
-            return Err(DbError::Checkpoint(format!(
-                "temporal join [{}] retained unowned vnode state {unowned}",
-                self.name
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -5876,7 +5848,7 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                         .min(max_managed_state_bytes);
                     let frame = capture.encode(frame_limit, Some(PRESENT_VNODE))?;
                     remaining_operator_bytes
-                        .fetch_update(
+                        .try_update(
                             AtomicOrdering::Relaxed,
                             AtomicOrdering::Relaxed,
                             |remaining| remaining.checked_sub(frame.len()),

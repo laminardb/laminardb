@@ -3,6 +3,9 @@
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)] // cold path
 
+mod head_validation;
+use head_validation::{assignment_publication_error, validate_local_assignment_head};
+
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
 use std::time::Duration;
 
@@ -811,15 +814,7 @@ impl SnapshotWatcher {
             let audit = tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return,
-                result = tokio::time::timeout_at(head_deadline, async {
-                    if let Some(controller) = self.controller.as_deref() {
-                        let authority = controller.checkpoint_authority()
-                            .map_err(|e| SnapshotError::Invalid(e.to_string()))?;
-                        authority.materialize_reserved_assignment_drain(&self.store).await
-                            .map_err(assignment_publication_error)?;
-                    }
-                    self.store.load().await
-                }) => result,
+                result = tokio::time::timeout_at(head_deadline, self.load_materialized_assignment_head()) => result,
             };
             let mut audited_target = None;
             let mut audited_terminal = None;
@@ -3316,21 +3311,6 @@ enum DrainPublicationReconciliation {
     },
 }
 
-fn assignment_publication_error(
-    error: laminar_core::cluster::control::ClusterCheckpointAuthorityError,
-) -> SnapshotError {
-    use laminar_core::cluster::control::{ClusterCheckpointAuthorityError, LeaseError};
-    match error {
-        ClusterCheckpointAuthorityError::Authority(LeaseError::Io(reason)) => {
-            SnapshotError::Io(reason)
-        }
-        ClusterCheckpointAuthorityError::Decision(
-            laminar_core::checkpoint_decision::DecisionError::Io(reason),
-        ) => SnapshotError::Io(reason),
-        error => SnapshotError::Invalid(error.to_string()),
-    }
-}
-
 async fn reconcile_drain_publication(
     store: &AssignmentSnapshotStore,
     controller: &ClusterController,
@@ -3987,27 +3967,6 @@ fn try_rebalance_owned(
         )
         .await
     })
-}
-
-fn validate_local_assignment_head(
-    current: &AssignmentSnapshot,
-    current_owners: &[NodeId],
-    local_version: u64,
-    local_owners: &[NodeId],
-) -> Result<(), String> {
-    if current.version < local_version {
-        return Err(format!(
-            "durable assignment head {} regressed behind local assignment {local_version}",
-            current.version
-        ));
-    }
-    if current.version == local_version && current_owners != local_owners {
-        return Err(format!(
-            "durable and local assignment {} have different owner maps",
-            current.version
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

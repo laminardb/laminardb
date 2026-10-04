@@ -32,6 +32,7 @@
 #![cfg_attr(
     test,
     allow(
+        clippy::assert_is_empty, // Assert cardinality without requiring equality on fixture elements.
         clippy::assertions_on_constants,
         clippy::default_trait_access,
         clippy::field_reassign_with_default,

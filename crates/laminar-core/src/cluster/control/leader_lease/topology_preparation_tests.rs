@@ -7,11 +7,8 @@ use crate::cluster::control::{
 
 #[test]
 fn prior_public_candidate_reports_keep_the_same_descriptor_digest() {
-    let reports: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/test-evidence/topology-planning-2026-10-01/topology-local-validations.json"
-    )))
-    .unwrap();
+    let reports: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/topology-local-validations.json")).unwrap();
     let mut expected_reference = None;
     for report in reports.as_array().unwrap() {
         let descriptor: ClusterTopologyValidation =

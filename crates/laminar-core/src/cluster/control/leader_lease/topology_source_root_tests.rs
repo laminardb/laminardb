@@ -382,11 +382,8 @@ async fn topology_initialization_leader_loss_after_seal_cannot_publish_or_reuse_
 
 #[test]
 fn topology_initialization_preserves_previous_format_one_root_bytes() {
-    let evidence: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/test-evidence/topology-root-2026-10-01/topology-migration-root.json",
-    )))
-    .unwrap();
+    let evidence: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/topology-migration-root.json")).unwrap();
     let root: TopologyMigrationRoot = serde_json::from_value(evidence["root"].clone()).unwrap();
     assert!(root.source_initializations.is_empty());
     let (_, reference) = root.encode_and_reference().unwrap();

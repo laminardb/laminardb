@@ -4799,27 +4799,9 @@ impl LaminarDB {
         }
 
         if let Some(manifest) = self.restore_catalog_from_manifest().await? {
-            let configured_catalog_store = self.catalog_manifest_store.lock().clone();
-            let configured_legacy_baseline = if let Some(store) = configured_catalog_store {
-                if let laminar_core::cluster::control::TopologyCatalogState::Versioned {
-                    baseline,
-                    committed: Some(commit),
-                } = store.topology_state().await?
-                {
-                    // Additive Commit audit certifies that the original inventory remains this
-                    // exact ordered prefix. Only the full current inventory or the full original
-                    // bootstrap is accepted; an arbitrary subset is never a startup assertion.
-                    commit.manifest
-                        == manifest
-                            .reference()
-                            .map_err(laminar_core::cluster::control::TopologyError::from)?
-                        && parsed.len() == baseline.manifest.entry_count as usize
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            let configured_legacy_baseline = self
+                .bootstrap_is_original_adopted_catalog(&manifest, parsed.len())
+                .await?;
             let configured_matches = parsed.iter().zip(&manifest.entries).all(
                 |((ddl, _, canonical_name, kind), entry)| {
                     ddl == &entry.ddl

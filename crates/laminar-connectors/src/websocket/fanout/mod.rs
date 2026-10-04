@@ -168,7 +168,7 @@ impl FanoutManager {
         })?;
         let previous = self
             .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(amount)
             })
             .map_err(|_| {

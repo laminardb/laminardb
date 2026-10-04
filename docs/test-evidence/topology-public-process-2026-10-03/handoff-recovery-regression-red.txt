@@ -1,7 +1,0 @@
-test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 923 filtered out; finished in 0.00s
-test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::activation::recovery::rounds::topology_recovery_round_preserves_exact_handoff_pin_until_new_target_checkpoint ... FAILED
----- cluster::control::leader_lease::tests::topology_migration_root::topology_commit::activation::recovery::rounds::topology_recovery_round_preserves_exact_handoff_pin_until_new_target_checkpoint stdout ----
-thread 'cluster::control::leader_lease::tests::topology_migration_root::topology_commit::activation::recovery::rounds::topology_recovery_round_preserves_exact_handoff_pin_until_new_target_checkpoint' (543592) panicked at crates\laminar-core\src\cluster\control\leader_lease\topology_recovery_round_tests.rs:491:10:
-called `Result::unwrap()` on an `Err` value: Decision(Conflict("topology recovery Start/install/Release requires settled checkpoint, cleanup and assignment authority"))
-    cluster::control::leader_lease::tests::topology_migration_root::topology_commit::activation::recovery::rounds::topology_recovery_round_preserves_exact_handoff_pin_until_new_target_checkpoint
-test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1106 filtered out; finished in 30.21s
