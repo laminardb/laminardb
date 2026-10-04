@@ -409,7 +409,7 @@ mod tests {
             parse_id2label(config),
             vec!["negative", "neutral", "positive"]
         );
-        assert!(parse_id2label("{}").is_empty());
+        assert_eq!(parse_id2label("{}"), Vec::<String>::new());
     }
 
     #[test]

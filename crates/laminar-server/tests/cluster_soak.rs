@@ -6147,6 +6147,7 @@ fn wait_for_minimum_offset_rate(
 // Native CI runners have delivered up to three spontaneous recoveries inside one
 // durable-progress window (runs 34785105619, 35068174540, 35099393770); each consumes up
 // to the full recovery ceiling.
+#[cfg(feature = "kafka")]
 const SPONTANEOUS_RECOVERY_ALLOWANCE: u32 = 3;
 
 #[cfg(feature = "kafka")]

@@ -1064,7 +1064,7 @@ impl ManagedTemporalJoinOperator {
 
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
-        debug_assert_eq!(self.resident_vnodes, []);
+        debug_assert_eq!(self.resident_vnodes, [] as [u32; 0]);
         debug_assert_eq!(config.registry.vnode_count(), self.vnode_count.get());
         let assignment = config.registry.versioned_snapshot();
         self.local_assignment = assignment.clone();

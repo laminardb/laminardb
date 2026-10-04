@@ -1182,8 +1182,8 @@ impl IntervalJoinOperator {
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         debug_assert!(self.vnode_states.iter().all(Option::is_none));
-        debug_assert_eq!(self.resident_vnodes, []);
-        debug_assert_eq!(self.dirty_vnode_roster, []);
+        debug_assert_eq!(self.resident_vnodes, [] as [u32; 0]);
+        debug_assert_eq!(self.dirty_vnode_roster, [] as [u32; 0]);
         self.key_group_count = KeyGroupCount::try_from(config.registry.vnode_count())
             .expect("vnode registry count must fit the checkpoint key-group ABI");
         self.vnode_states
