@@ -1,0 +1,90 @@
+soak: laminardb executable origin=prebuilt-override path=\\?\C:\Users\sujit\.codex\worktrees\9929\laminardb\target\topology-evidence\laminardb-topology-recovery-loss-stock-soak.exe sha256=9cd06a8c24359353cf5b9e14af0f50b9a113f5f5e5d4c52e0fef3ec50f2240b9 bytes=172193280
+soak: PROFILE mode=cluster delivery=ALO seconds=60 checkpoint_ms=500 checkpoint_timeout_ms=30000 checkpoint_slo_mode=observe hot_path_slo_mode=observe join_interval_ms=100 rps=400 keys=4096 zipf_milli=1200 kills=0 min_live_state_bytes=0 kafka_sink_linger_ms=0
+soak: node logs in C:\Users\sujit\.codex\worktrees\9929\laminardb\target\tmp\soak-626372-1791101455660518000
+soak: node0 generation=1 pid=617884 executable_sha256=9cd06a8c24359353cf5b9e14af0f50b9a113f5f5e5d4c52e0fef3ec50f2240b9
+soak: node1 generation=1 pid=626036 executable_sha256=9cd06a8c24359353cf5b9e14af0f50b9a113f5f5e5d4c52e0fef3ec50f2240b9
+soak: node2 generation=1 pid=624400 executable_sha256=9cd06a8c24359353cf5b9e14af0f50b9a113f5f5e5d4c52e0fef3ec50f2240b9
+soak: cluster up, checkpoint 2 epoch 2, ingested=15220, Kafka committed offset sum=6766
+soak: three-node ALO pre-fault temporal history observed idle temporal inputs and committed checkpoint 26 epoch 26
+soak: three-node ALO temporal right history is durable before fault injection
+soak: completed 10 rounds (0 kills: 0 leader, 0 follower), final checkpoint 66 epoch 66
+soak: three-node ALO post-fault join matrix is durable through checkpoint 68
+soak: ACTIVE LOAD producer_accepted=400.0 logical_pairs/s/12034 pairs/30.1s
+soak: ACTIVE LOAD bounded_durable=408.0 logical_pair_equivalents/s/24650 rows/30.2s
+soak: ACTIVE LOAD temporal_load_durable=406.5 logical_pair_equivalents/s/24560 rows/30.2s
+soak: ACTIVE LOAD bounded_output=1378.5 rps/43458 records/31.5s
+soak: ACTIVE LOAD temporal_load_output=429.7 rps/12987 records/30.2s
+soak: PROFILE three-node ALO continuous join aggregate accounted-state observation=1262391 bytes, aggregate operator ceiling=805306368 bytes
+soak: three-node ALO checkpoint observation budget total=90s collection=0ns max_missing=0 max_cadence=3.508s capped=false
+soak: EXACT node0 process generation 1 LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 16059159448129433833, boot_incarnation: 208f6362-10a7-488d-b836-aeed9deed2a3 }, process_term: 1 }: 91 records (leader=0, follower=91, no_handoff=0, deadline_exhausted=0, slo_violations=0)
+soak: EXACT MAX node0 generation 1 stage=pipeline_stall sequence=40 attempt=40/40 role=Follower assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 16059159448129433833, boot_incarnation: 208f6362-10a7-488d-b836-aeed9deed2a3 }, process_term: 1 } duration_ns=621406900 deadline_exhausted=false
+soak: EXACT MAX node0 generation 1 stage=local_barrier sequence=54 attempt=54/54 role=Follower assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 16059159448129433833, boot_incarnation: 208f6362-10a7-488d-b836-aeed9deed2a3 }, process_term: 1 } duration_ns=491751100 deadline_exhausted=false
+soak: EXACT MAX node0 generation 1 stage=aligned_resume sequence=34 attempt=34/34 role=Follower assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 16059159448129433833, boot_incarnation: 208f6362-10a7-488d-b836-aeed9deed2a3 }, process_term: 1 } duration_ns=323208200 deadline_exhausted=false
+soak: EXACT ARTIFACT node0 generation 1: C:\Users\sujit\.codex\worktrees\9929\laminardb\target\tmp\soak-626372-1791101455660518000\checkpoint-timing-node0-generation1.jsonl.log
+soak: EXACT node1 process generation 1 LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 15506916534570490772, boot_incarnation: 00a2c816-9e88-4657-9d15-ddc0ddf2b547 }, process_term: 1 }: 91 records (leader=0, follower=91, no_handoff=0, deadline_exhausted=0, slo_violations=0)
+soak: EXACT MAX node1 generation 1 stage=pipeline_stall sequence=40 attempt=40/40 role=Follower assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 15506916534570490772, boot_incarnation: 00a2c816-9e88-4657-9d15-ddc0ddf2b547 }, process_term: 1 } duration_ns=618699400 deadline_exhausted=false
+soak: EXACT MAX node1 generation 1 stage=local_barrier sequence=85 attempt=85/85 role=Follower assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 15506916534570490772, boot_incarnation: 00a2c816-9e88-4657-9d15-ddc0ddf2b547 }, process_term: 1 } duration_ns=441523300 deadline_exhausted=false
+soak: EXACT MAX node1 generation 1 stage=aligned_resume sequence=38 attempt=38/38 role=Follower assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 15506916534570490772, boot_incarnation: 00a2c816-9e88-4657-9d15-ddc0ddf2b547 }, process_term: 1 } duration_ns=386801700 deadline_exhausted=false
+soak: EXACT ARTIFACT node1 generation 1: C:\Users\sujit\.codex\worktrees\9929\laminardb\target\tmp\soak-626372-1791101455660518000\checkpoint-timing-node1-generation1.jsonl.log
+soak: EXACT node2 process generation 1 LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 12632117528189947522, boot_incarnation: 1f2e0cd8-1e68-425f-918a-84eda88ff7e3 }, process_term: 1 }: 91 records (leader=91, follower=0, no_handoff=0, deadline_exhausted=0, slo_violations=0)
+soak: EXACT MAX node2 generation 1 stage=pipeline_stall sequence=70 attempt=70/70 role=Leader assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 12632117528189947522, boot_incarnation: 1f2e0cd8-1e68-425f-918a-84eda88ff7e3 }, process_term: 1 } duration_ns=607260200 deadline_exhausted=false
+soak: EXACT MAX node2 generation 1 stage=local_barrier sequence=70 attempt=70/70 role=Leader assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 12632117528189947522, boot_incarnation: 1f2e0cd8-1e68-425f-918a-84eda88ff7e3 }, process_term: 1 } duration_ns=604842800 deadline_exhausted=false
+soak: EXACT MAX node2 generation 1 stage=aligned_resume sequence=34 attempt=34/34 role=Leader assignment_version=1 assignment_digest=[169, 91, 85, 166, 75, 130, 20, 13, 65, 18, 146, 77, 3, 167, 231, 90, 11, 26, 91, 78, 0, 159, 191, 91, 11, 133, 231, 218, 252, 29, 8, 200] handoff=true process=LocalProcessAuthorityIdentity { participant: CheckpointParticipant { node_id: 12632117528189947522, boot_incarnation: 1f2e0cd8-1e68-425f-918a-84eda88ff7e3 }, process_term: 1 } duration_ns=315485700 deadline_exhausted=false
+soak: EXACT ARTIFACT node2 generation 1: C:\Users\sujit\.codex\worktrees\9929\laminardb\target\tmp\soak-626372-1791101455660518000\checkpoint-timing-node2-generation1.jsonl.log
+soak: PROFILE node0 process generation 1: state capture avg=1ms, <= 64ms=100.00% of 91 obs; total stall <= 1024ms=100.00% of 91 obs; local barrier avg=125ms, <= 1024ms=100.00% of 91 obs; aligned resume avg=35ms, <= 1024ms=100.00% of 91 obs
+soak: PROFILE node1 process generation 1: state capture avg=2ms, <= 64ms=100.00% of 91 obs; total stall <= 1024ms=100.00% of 91 obs; local barrier avg=114ms, <= 1024ms=100.00% of 91 obs; aligned resume avg=38ms, <= 1024ms=100.00% of 91 obs
+soak: PROFILE node2 process generation 1: state capture avg=2ms, <= 64ms=100.00% of 91 obs; total stall <= 1024ms=100.00% of 91 obs; local barrier avg=164ms, <= 1024ms=100.00% of 91 obs; aligned resume avg=12ms, <= 1024ms=100.00% of 91 obs
+soak: PROFILE checkpoint_slo_mode=observe; state-capture non-certifying because retained-state floor is disabled; pipeline-stall <= 1024ms for 100.00% of 273 obs; checkpoint_duration avg=1493ms over 270 obs (finalized pre-restart generations plus observed cuts of live generations)
+soak: PROFILE checkpoint latency is observational and non-certifying; exact timing evidence remains enforced
+soak: PROFILE three-node ALO nullable temporal ASOF canary exact Kafka visibility_ms=786.262 rows=2
+soak: PROFILE three-node ALO inner temporal probe canary exact Kafka visibility_ms=1790.197 rows=3
+soak: three-node ALO nullable temporal ASOF canary observed 2 exact rows with 0 ALO duplicates
+soak: three-node ALO inner temporal probe canary observed 3 exact rows with 0 ALO duplicates
+soak: PROFILE three-node ALO CoreWindow canaries CoreWindow visibility_ms=0.053
+soak: three-node ALO CoreWindow canaries validated 4 window rows across 4 ALO records
+soak: producer acknowledged 62039 records in 155.1s (400.0 rps; target 400 rps)
+soak: frozen bounded and temporal input prefix is durable through checkpoint 111 epoch 111
+soak: output oracle consumed the frozen broker boundary and observed all 219125 pairs from 62039 logical input IDs with 0 at-least-once duplicates
+soak: output oracle consumed the frozen broker boundary and observed all 62039 pairs from 62039 logical input IDs with 0 at-least-once duplicates
+soak: three-node ALO bounded-join matrix observed all 30 bounded-join matrix rows with 0 ALO duplicates
+soak: HOT PATH three-node ALO stateful workload node0 p50<=0.500ms p95<=1.000ms p99<=5.000ms over 70265 cycles
+soak: HOT PHASE three-node ALO stateful workload node0 execute total=12.474s avg=0.178ms p50<=0.500ms p95<=1.000ms p99<=5.000ms over 70265 obs
+soak: HOT PHASE three-node ALO stateful workload node0 output_store total=0.049s avg=0.001ms p50<=0.001ms p95<=0.005ms p99<=0.005ms over 70265 obs
+soak: HOT PHASE three-node ALO stateful workload node0 sink_enqueue total=0.668s avg=0.010ms p50<=0.005ms p95<=0.050ms p99<=0.050ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_join_aggregate mode=normal total=2.256s avg=0.032ms p50<=0.100ms p95<=0.400ms p99<=1.600ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_join mode=normal total=1.747s avg=0.025ms p50<=0.100ms p95<=0.100ms p99<=0.400ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_temporal_load mode=normal total=0.986s avg=0.014ms p50<=0.100ms p95<=0.100ms p99<=0.400ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_matrix_full mode=normal total=0.150s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_temporal mode=normal total=0.134s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_window_hop mode=normal total=0.122s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_matrix_left_anti mode=normal total=0.111s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70265 obs
+soak: HOT OPERATOR three-node ALO stateful workload node0 soak_matrix_inner mode=normal total=0.111s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70265 obs
+soak: HOT PATH three-node ALO stateful workload node1 p50<=0.500ms p95<=1.000ms p99<=5.000ms over 70284 cycles
+soak: HOT PHASE three-node ALO stateful workload node1 execute total=14.338s avg=0.204ms p50<=0.500ms p95<=1.000ms p99<=5.000ms over 70284 obs
+soak: HOT PHASE three-node ALO stateful workload node1 output_store total=0.050s avg=0.001ms p50<=0.001ms p95<=0.005ms p99<=0.005ms over 70284 obs
+soak: HOT PHASE three-node ALO stateful workload node1 sink_enqueue total=0.610s avg=0.009ms p50<=0.005ms p95<=0.050ms p99<=0.050ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_join_aggregate mode=normal total=3.257s avg=0.046ms p50<=0.100ms p95<=1.600ms p99<=1.600ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_join mode=normal total=1.984s avg=0.028ms p50<=0.100ms p95<=0.400ms p99<=0.400ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_temporal_load mode=normal total=0.969s avg=0.014ms p50<=0.100ms p95<=0.100ms p99<=0.400ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_matrix_full mode=normal total=0.159s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_temporal mode=normal total=0.133s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_window_hop mode=normal total=0.126s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_matrix_inner mode=normal total=0.115s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70284 obs
+soak: HOT OPERATOR three-node ALO stateful workload node1 soak_matrix_left_anti mode=normal total=0.113s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 70284 obs
+soak: HOT PATH three-node ALO stateful workload node2 p50<=0.500ms p95<=1.000ms p99<=5.000ms over 24509 cycles
+soak: HOT PHASE three-node ALO stateful workload node2 execute total=7.699s avg=0.314ms p50<=0.500ms p95<=1.000ms p99<=5.000ms over 24509 obs
+soak: HOT PHASE three-node ALO stateful workload node2 output_store total=0.031s avg=0.001ms p50<=0.001ms p95<=0.005ms p99<=0.010ms over 24509 obs
+soak: HOT PHASE three-node ALO stateful workload node2 sink_enqueue total=0.219s avg=0.009ms p50<=0.010ms p95<=0.050ms p99<=0.050ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_join_aggregate mode=normal total=2.340s avg=0.095ms p50<=0.100ms p95<=1.600ms p99<=1.600ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_join mode=normal total=1.318s avg=0.054ms p50<=0.100ms p95<=0.400ms p99<=1.600ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_temporal_load mode=normal total=0.506s avg=0.021ms p50<=0.100ms p95<=0.100ms p99<=0.400ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_matrix_full mode=normal total=0.061s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_temporal mode=normal total=0.061s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_window_hop mode=normal total=0.056s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_matrix_inner mode=normal total=0.043s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 24509 obs
+soak: HOT OPERATOR three-node ALO stateful workload node2 soak_matrix_left_anti mode=normal total=0.042s avg=0.002ms p50<=0.100ms p95<=0.100ms p99<=0.100ms over 24509 obs
+soak: PROFILE three-node ALO bounded join accounted-state observation=6600048 bytes, aggregate operator ceiling=805306368 bytes
+soak: PROFILE three-node ALO temporal ASOF load accounted-state observation=153759854 bytes, aggregate operator ceiling=805306368 bytes
+soak: PROFILE three-node ALO tumble CoreWindow accounted-state observation=7130 bytes, aggregate operator ceiling=805306368 bytes
+soak: PROFILE three-node ALO hop CoreWindow accounted-state observation=7932 bytes, aggregate operator ceiling=805306368 bytes
+soak: PROFILE three-node ALO session CoreWindow accounted-state observation=7442 bytes, aggregate operator ceiling=805306368 bytes

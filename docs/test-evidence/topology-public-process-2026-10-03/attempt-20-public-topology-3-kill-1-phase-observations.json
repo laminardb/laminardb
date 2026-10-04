@@ -1,0 +1,14 @@
+{
+  "observations": [
+    {
+      "elapsed_since_submission_or_restart_ms": 189,
+      "phase": {
+        "phase": "active"
+      },
+      "status_sequence": 384
+    }
+  ],
+  "operation_id": "177c0c87-0728-48d4-bc22-6d5fe50287e9",
+  "scope": "First observed durable status after public submission or restart; polling and IO delay are included. Unobserved transitions have no inferred duration.",
+  "trigger": "kill-1"
+}

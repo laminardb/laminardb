@@ -35,6 +35,48 @@ guarantee or statistical claim is inferred from the average difference.
 
 ## Process comparison status
 
+The third matched pair qualifies source commit `a7dcd6a7`, stock server
+`9cd06a8c...`, against original `72a4ae46...` with the same retained
+`cbdf3983...` harness. Both runs pass every final oracle with idle compilers,
+60 steady seconds, zero kills, 400 paced logical IDs/s and the retained 4 GiB,
+one-shard Kafka/S3 fixtures. No topic, volume or checkpoint namespace was reset.
+
+| Third pair observation | Original | Modified |
+| --- | ---: | ---: |
+| Whole scenario elapsed, s | 213.77 | 192.50 |
+| Acknowledged logical IDs | 70,418 | 62,039 |
+| Paced producer logical IDs/s | 400.0 | 400.0 |
+| Graph-cycle p50 bucket bound, all nodes, ms | 0.5 | 0.5 |
+| Graph-cycle p95 bucket bound, all nodes, ms | 1 | 1 |
+| Graph-cycle p99 bucket bound, nodes 0/1/2, ms | 1 / 5 / 5 | 5 / 5 / 5 |
+| Full-run sampled combined RSS, bytes | 806,535,168 | 702,754,816 |
+| Final stored endpoint, objects | 335 | 276 |
+| Final stored endpoint, bytes | 91,836,753 | 90,508,799 |
+
+The summary/resource/log/metric and inventory files with suffix `stock-03` bind
+these observations to each executable and run namespace. This is one paced-load
+pair, with differing whole-run input counts. It does not establish throughput
+capacity, statistical equivalence, speedup, a memory budget or an artifact growth
+rate. Graph-cycle bucket bounds exclude the producer-to-consumer path.
+
+The same modified server passes native migration attempt 20, three kills and
+whole cold restart with all final oracles. Its nine consumer observations include
+the 2.023 s deliberate cut hold: nearest-rank p50 105.34 ms and p95/p99
+15,302.55 ms. Independent activation takes 17.551 s; whole restart-to-freshness
+takes 49.443 s. The
+[phase record](../topology-public-process-2026-10-03/attempt-20-phase-measurements.json)
+separates first-observed status windows, checkpoint observations, activation,
+replacement Release and cold freshness. Quiescing-to-Active windows are
+12.849/11.081 s, including polling/control I/O; they are not exact processing
+pause or pure restore timers. Checkpoint average 939 ms across 325 observations
+combines process generations with the state-size floor disabled. Native RSS
+peaks at 745,672,704 bytes and the artifact endpoint contains 1,136 objects and
+403,604,639 bytes. These local observations do not establish production SLOs.
+
+Allocation events need elevated Windows tracing. Queue item counts,
+preparing-only consumer latency and pure state-restore duration are unmeasured;
+buffer bytes and managed-state charges remain separate available gauges.
+
 The second matched pair qualifies the `5f270ef4...` complete-map admission
 server against the same `72a4ae46...` original and `cbdf3983...` harness. Both
 stock-profile runs pass all final oracles, with compilers idle, 60 steady seconds,

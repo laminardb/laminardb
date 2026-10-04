@@ -1,0 +1,49 @@
+{
+  "recorded_utc": "2026-10-04T08:15:21.274831+00:00",
+  "revision": "original",
+  "source_identity_file": "original-stock-soak-binary-identity.json",
+  "run_id": "617740-1791101240013837700",
+  "test": "three_node_alo_join_kill9_soak",
+  "test_exit_code": 0,
+  "test_elapsed_seconds": 213.77,
+  "requested_steady_seconds": 60,
+  "kills": 0,
+  "compiler_idle": true,
+  "server_binary_sha256": "72a4ae46e0343c569dfcf89a7741f6e951bae195699204995df70bfab1ae29a9",
+  "harness_binary_sha256": "cbdf3983b4f0b7c14eeb9e7d56a02d22010476098722f2a132a06375ad11d113",
+  "producer": {
+    "acknowledged_logical_ids": 70418,
+    "producer_elapsed_seconds": 176.1,
+    "acknowledged_logical_ids_per_second": 400.0,
+    "offered_logical_ids_per_second": 400,
+    "scope": "Paced offered-load acknowledgement across startup/probes/steady input; not peak server capacity."
+  },
+  "hot_cycle_percentiles": [
+    {
+      "node": 0,
+      "p50_bucket_upper_ms": 0.5,
+      "p95_bucket_upper_ms": 1.0,
+      "p99_bucket_upper_ms": 1.0,
+      "cycles": 89388
+    },
+    {
+      "node": 1,
+      "p50_bucket_upper_ms": 0.5,
+      "p95_bucket_upper_ms": 1.0,
+      "p99_bucket_upper_ms": 5.0,
+      "cycles": 95508
+    },
+    {
+      "node": 2,
+      "p50_bucket_upper_ms": 0.5,
+      "p95_bucket_upper_ms": 1.0,
+      "p99_bucket_upper_ms": 5.0,
+      "cycles": 61593
+    }
+  ],
+  "max_sampled_combined_rss_bytes": 806535168,
+  "allocation_events": null,
+  "queue_depth": null,
+  "matched_pair": 3,
+  "scope": "Matched stock-profile process pair 3, same retained harness and owned fixtures, compiler idle. All final stateful/sink/oracle assertions passed. Graph-cycle bucket upper bounds are not producer-to-consumer latency. Full-run RSS includes preparation/probes."
+}

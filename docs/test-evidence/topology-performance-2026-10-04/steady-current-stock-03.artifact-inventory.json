@@ -1,0 +1,29 @@
+{
+  "run_id": "626372-1791101455660518000",
+  "classes": {
+    "other": {
+      "objects": 13,
+      "bytes": 4407
+    },
+    "committed_indexes": {
+      "objects": 4,
+      "bytes": 235517
+    },
+    "control_authority": {
+      "objects": 217,
+      "bytes": 562749
+    },
+    "state_objects": {
+      "objects": 30,
+      "bytes": 87504160
+    },
+    "participant_manifests": {
+      "objects": 12,
+      "bytes": 2201966
+    }
+  },
+  "objects": 276,
+  "encoded_bytes": 90508799,
+  "raw_listing_sha256": "a3206e9dafe2820eed22d4399ae486e24c189b5e98a33dd7d05bafff345f4f97",
+  "scope": "Read-only post-run namespace endpoint, including persisted orphans; no reachability/deletion authority or growth-rate claim."
+}

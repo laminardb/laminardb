@@ -1,5 +1,39 @@
 # Public three-process migration qualification
 
+Attempt 20 qualifies source commit `a7dcd6a7` and stock server `9cd06a8c...`
+against the unchanged `cbdf3983...` harness. Its five frozen Rust sources extend
+`b9c3c948`, with unchanged dependencies, protobufs, durable formats, profile and
+1 MiB Windows main stack. Focused/full suites pass 291/4,478 tests; Clippy,
+minimal check, formatting and the 24m 13s optimized build pass. The meaningful
+pre-repair owned-runtime failure and 49-test boundary index are bound to exact
+sources/logs in `transport-loss-verification-summary.json` and
+`transport-loss-fault-coverage.json`.
+
+Both public migrations, all three hard kills, the whole original-bootstrap cold
+restart and every final stateful/sink/sequence oracle pass in 356.28 s. Full
+replacement Release/checkpoints take 42.88/32.99/29.51 s. Cold restart reaches
+fresh output in 49.44 s and produces nine expected new-pipeline pairs with zero
+observed replay duplicates. Actual survivor shuffle transit loss is recorded in
+`attempt-20-delivery-loss-observations.json`; recovery still reaches Release.
+The unchanged 90-second deadlines and complete owner roster are preserved.
+
+The read-only collector verifies final authority sequence 877, exact checkpoint
+148 (60,429 bytes, SHA-256
+`1b20ecd29f451caa2ed0bfe84b4a11c80d8ca1ba31dbe4906185bf37a919f21e`)
+and roots 50/57 against their immutable cut Commits after the artifact floor
+advances to 123. No cleanup cursor remains. All owned test executables terminate;
+fixtures, topics, namespaces and volumes remain retained.
+
+Sampled combined RSS peaks at 745,672,704 bytes. Nine consumer observations,
+including the 2.023 s test hold, yield nearest-rank p50 105.34 ms and p95/p99
+15,302.55 ms. `attempt-20-phase-measurements.json` keeps observed status windows,
+checkpoint averages, activation, replacement Release and cold freshness separate.
+It explicitly leaves pure restore, preparing-only latency, allocation events and
+queue item counts unmeasured. Quiescing-to-Active windows include control I/O and
+polling and are not exact processing-pause timers. Matched steady pair three
+passes both original/current final oracles; its distinct paced-load measurements
+are in [performance evidence](../topology-performance-2026-10-04/README.md).
+
 Attempt 19 uses stock server `a2eabead...`, with twelve frozen post-Commit boot
 and retained-root cleanup sources against `4a972885`. The focused/full suites
 pass 288/4,475 tests, and the 46-test boundary index, Clippy, minimal check and
@@ -15,7 +49,8 @@ restart nor final oracles. The artifact floor advances to 52 while exact roots
 cursor remains. The surviving leader repeatedly rejects topology transport
 installation because its delivery-loss repair floor advances only after
 Release. The existing prepared recovery-generation cutoff is being used to
-repair that ordering without forgiving later losses. Pair three did not start.
+repair that ordering without forgiving later losses. Pair three did not start
+for this failed source scope; it later passes the attempt-20 server.
 This failed result and its distinct source scope remain preserved.
 
 Attempt 18 passes the complete-owner-map admission repair, both public additive

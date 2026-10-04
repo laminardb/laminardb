@@ -111,6 +111,16 @@ greatest checkpoint. The pin is rechecked after control I/O and remains present
 through Release. A differing pin, unsettled checkpoint, cleanup cursor or drain
 reservation still fences recovery; Release itself does not retire restore state.
 
+Coordinated recovery captures a delivery-loss cutoff for its exact generation
+before restoring actors. Held transport installation may use that pending
+cutoff only after the DB proves the durable Start, selected cut, stopped actor
+roster and current process/assignment authority. It neither clears the incident
+counter nor advances its repair floor. Only exact recovery completion after
+full-roster Release promotes the captured cutoff. Later loss, stale generations
+and an exhausted counter stay fenced; ordinary migration installation still
+rejects any unrepaired loss. The check runs at control-path installation, with
+the existing assignment/peer lock order and no lock held across an await.
+
 Private topology restore selects the existing portable checkpoint bootstrap when
 the selected cut has an older assignment version. The checkpoint index and state
 payloads keep their historical assignment; they are not rewritten. Selection and
@@ -195,9 +205,9 @@ Compiler ownership precedes the catalog read lock during isolated validation. Pu
 
 The linked evidence folders record the original baseline, tested source hashes, unchanged Cargo.lock, features, exact commands/results and each fixture's scope. Existing control/graph/sink/source tests cover malformed artifacts, stale evidence, lost responses, cancellation, checkpoint races and replacement release. Stored-segment tests cover reconnect identity and cleanup corruption.
 
-The [boundary-test index](test-evidence/topology-public-process-2026-10-03/root-boot-fault-coverage.json)
-binds 46 authority, owned-runtime and retention fault regressions to the passing
-4,475-test run. It covers lost responses, cancellation, stale leaders, failed
+The [boundary-test index](test-evidence/topology-public-process-2026-10-03/transport-loss-fault-coverage.json)
+binds 49 authority, owned-runtime, transport and retention fault regressions to
+the passing 4,478-test run. It covers lost responses, cancellation, stale leaders, failed
 installation, held replacement Release and root state protection at their stated boundaries. It does
 not claim that native processes were killed at every migration phase.
 
@@ -206,14 +216,16 @@ stateful harness. It adds an independent latest-source pipeline, SQL downstream
 stream, deterministic paused-input/output checks, post-migration hard kills and
 full target restart with the original bootstrap. Consumer-visible timing starts
 before producing records during a held prepared cut, including the explicit
-test hold and subsequent Release. Attempt 18 passes both migrations, one leader
-and two follower kills, the whole cold restart and the independent
-join/window/aggregate, sink and sequence oracles. It qualifies the complete-map
-admission repair; the newer post-Commit boot/retained-root source scope requires
-its own native result in [process evidence](test-evidence/topology-public-process-2026-10-03/README.md).
+test hold and subsequent Release. Attempt 20 passes both migrations, one leader
+and two follower kills, the whole original-bootstrap cold restart and every
+independent join/window/aggregate, sink and sequence oracle. It includes actual
+survivor shuffle loss followed by successful recovery Release. The collector
+verifies roots 50/57 after the artifact floor advances to 123 and final checkpoint
+148 by exact length/hash. This qualifies source commit `a7dcd6a7`; earlier failed
+and passing scopes remain in [process evidence](test-evidence/topology-public-process-2026-10-03/README.md).
 
 The [performance evidence](test-evidence/topology-performance-2026-10-04/README.md)
-records queue trials, two matched original/current process pairs and
+records queue trials, three matched original/current process pairs and
 pause-inclusive migration observations. Their exact source scopes differ.
 Windows allocation tracing, queue item counts, preparing-only consumer latency
 and pure state-restore timing are not measured. Existing buffer/state gauges

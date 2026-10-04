@@ -4,28 +4,32 @@ Public additive SQL/API submission passes the selected regression suite, actual
 actor/checkpoint tests and the three-process Kafka/S3 migration/full-restart
 oracle, including three injected failures. Complete-map admission fixes the
 observed rebalance defect. Post-Commit boot admission and root-retained ordinary
-cleanup now pass deterministic regressions; their native qualification is
-incomplete: attempt 19 exposes a shuffle recovery/install ordering defect on its
-third replacement. Safe removals, replacements and root/journal reclamation remain
+cleanup now pass deterministic and native regressions. Attempt 19 exposed a
+shuffle recovery/install ordering defect on its third replacement; the exact
+prepared loss-cutoff repair passes attempt 20 with all three kills and the whole
+original-bootstrap restart. Matched steady pair three also passes all final oracles.
+Safe removals, replacements and root/journal reclamation remain
 unsupported until their incarnation and replay contracts exist.
 
 ## Baseline and current validation
 
 - Original clean baseline: `5d81ba9b18d80343373ecfaec4793df8c5caccf1`, fetched
   from `origin/main` on 2026-09-30.
-- Branch: `feature/cluster-topology-migrations`. This continuation starts from
-  `f4c7e3de1ffed921c5fff94203aa216258760b75`, following the public-submission
-  and observed cold-recovery repairs. No user changes were reset or stashed. No push or PR has been made.
+- Branch: `feature/cluster-topology-migrations`. The current five-source increment
+  starts from `b9c3c9485e013281628aab9cc72943a7c07db908`, following the public
+  migration, complete-map recovery and retained-root repairs. No user changes
+  were reset or stashed. No push or PR has been made.
 - Windows MSVC, rustc/cargo 1.98.0, unchanged Cargo.lock. Locked dependencies
   include Arrow 58.4.0, DataFusion 53.1.0, sqlparser 0.61.0, object_store 0.13.2,
   tokio 1.53.1 and tonic 0.14.6. No AGENTS.md applies.
 - The latest full four-package `cluster,aws,kafka` library/binary suite passes
-  4,475 tests: core 1,110, connectors 921, DB 2,085, server 359; three existing
-  tests remain ignored. The focused topology suite passes 288 tests, including
+  4,478 tests: core 1,112, connectors 921, DB 2,086, server 359; three existing
+  tests remain ignored. The focused topology suite passes 291 tests, including
   Committed/Activating boot replacement, retained-root cleanup and damaged-root
   deletion refusal. Eight test threads and 4 MiB stacks retain existing deadlines.
-  Twelve Rust sources are frozen against `4a972885`; formatting and diff checks pass.
+  Five Rust sources are frozen against `b9c3c948`; formatting and diff checks pass.
   All-target Clippy with warnings denied and the minimal-server check pass.
+  Qualified source commit: `a7dcd6a755a59282fe2cf9a1c0bc1a4e77b7c2b8`.
   Earlier cluster/FFI checks passed; default connector feature suites are not run.
 - Earlier [public evidence](test-evidence/topology-public-2026-10-03/README.md) binds 37
   changed Rust sources and Cargo.lock. No binary/performance identity is implied
@@ -83,6 +87,21 @@ pin old state, and the journal rejects new identities at 64 retained operations.
 
 ## Current increment
 
+- The exact owned-runtime loss regression fails against `b9c3c948`: held
+  installation rejects unrepaired loss, while repair requires Release. The
+  five-source repair permits installation only under the pending cutoff for
+  the exact authorized coordinated-recovery generation. It does not advance the
+  repair floor before full-roster Release. New loopback transport tests reject
+  later loss, stale generations and the permanently poisoned counter. All 291
+  focused and 4,478 full tests pass, as do Clippy, minimal check and formatting.
+  The unchanged stock optimized build passes in 24m 13s. Server `9cd06a8c...`
+  passes attempt 20 in 356.28 s with all final oracles. Replacement full
+  Release/checkpoints take 42.88/32.99/29.51 s; whole cold restart reaches fresh
+  output in 49.44 s. Sampled combined RSS peaks at 745,672,704 bytes. Matched
+  steady pair three passes both original/current final oracles in 213.77/192.50 s.
+  Exact final checkpoint 148 and retained roots 50/57 are verified after the
+  artifact floor advances to 123. The 49-test boundary index and separate native
+  loss observations are retained. Native attempt 19 remains a failed historical result.
 - Local commit `582b7cf0` adds observed Created-state recovery teardown, permits
   only the exact assignment/checkpoint handoff pin through recovery Release, and
   strengthens protected-state cleanup preflight. State objects are fully hashed
@@ -197,27 +216,30 @@ checkpoint references remain in
 The owned Kafka/S3 fixtures retain their exact namespaces, topics and volume;
 no storage reset or external deletion was used.
 
-## Next work, in order
+## Qualification and guarded follow-up work
 
-1. Reproduce and repair the attempt-19 shuffle installation deadlock using only
-   the exact loss cutoff captured for an authorized recovery generation. Keep
-   normal installation, later losses, expired processes and stale generations
-   fenced; promote no repair floor before Release. Requalify the unchanged
-   three-kill/full-restart harness, then matched pair three with compilers idle.
-2. Implement only removals whose stop, sink-settlement and state contracts prove
-   safety. Removal also needs retired-incarnation and replay evidence; the current
-   additive descriptor cannot supply it. Preserve unsupported transformation
-   guards and distinct drop/recreate identities, with no external DROP deletion.
-3. Reclaim old state only after an exact validated target checkpoint and replay
-   horizon make it unnecessary. Preserve root audit metadata and reuse serialized
-   cleanup reservations. Release alone cannot consume a root. Add bounded journal
-   retirement without forgetting idempotency or replay continuity.
-4. Keep any subsequent repair outside the recorded second matched pair's source
-   scope until requalified. Keep preparation, pause, checkpoint, restore,
-   activation and recovery-to-freshness measurements distinct.
-5. Finish verified operator examples and the final handoff. Distinguish the
-   initial A–D support contract from unsupported removals, replacements and
-   root/journal retirement. Keep native and deterministic fault scopes explicit.
+The initial additive A–D contract is implemented and qualified against source
+commit `a7dcd6a7`. Full tests, the stock build, three-kill/full-restart attempt 20,
+matched pair three, exact durable-byte collection and the operator/engineering
+handoff are complete. All owned test executables have terminated. Fixtures,
+topics, volumes and durable namespaces remain retained. No push or PR was made.
+
+- Removals and replacements need stop/sink-settlement, dependency projection,
+  retired-incarnation and replay evidence beyond the current additive descriptor.
+  They remain unsupported; changed keys/schemas/state semantics stay guarded.
+- Root consumption and bounded journal retirement need proof that state/output,
+  replay and idempotency references have retired. Release alone is insufficient;
+  roots stay protected and admission fails closed at 64 retained operations.
+- Allocation events need an elevated Windows tracing session. Queue item counts,
+  preparing-only consumer latency and pure restore duration need separate
+  instrumentation. Current phase windows include polling/control I/O, consumer
+  observations include the cut hold, and artifact endpoints are not growth rates.
+- Default connector variants and native exactly-once Delta/S3 scenarios require
+  their features and fixtures. Native kills at every durable phase are not
+  claimed; the deterministic boundary index states its actual fault coverage.
+
+Exact commands, source identities, results and unmeasured cases are recorded in
+the [implementation report](cluster-topology-implementation-report.md).
 
 ## Earlier evidence
 

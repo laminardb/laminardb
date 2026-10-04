@@ -4,8 +4,10 @@
 
 Starting clean commit: `5d81ba9b18d80343373ecfaec4793df8c5caccf1` on
 `feature/cluster-topology-migrations`. The current candidate extends qualified
-commit `4a972885d747d1054be57d27bcede710b8453c22` with twelve frozen Rust sources.
-Its optimized build passes; native attempt 19 fails its third replacement. No user changes,
+commit `b9c3c9485e013281628aab9cc72943a7c07db908` with five frozen Rust sources.
+Final qualified implementation source commit:
+`a7dcd6a755a59282fe2cf9a1c0bc1a4e77b7c2b8`. Its tests, optimized build, native
+attempt 20 and matched steady pair three pass. No user changes,
 catalogs, checkpoints, namespaces, topics or volumes were reset. No push or PR
 has been made. Cargo.lock and dependency versions are unchanged.
 
@@ -46,6 +48,15 @@ Pre-Commit recovery and graceful drain during pending activation remain
 excluded. Stale boots, changed assignments and incomplete installation cannot
 authorize Release. Portable restore retains historical checkpoint identities
 while installing the certified current assignment.
+
+Held coordinated-recovery transport installation accepts only delivery loss
+covered by the pending cutoff captured for the exact authorized generation.
+Durable Start, stopped actors, selected cut and current process/assignment
+authority remain required. Installation neither clears the loss counter nor
+promotes the repair floor; exact completion after full-roster Release does that.
+Ordinary installation, later loss, stale generations and an exhausted counter
+remain fenced. This repairs the installation/Release deadlock observed in native
+attempt 19 without adding record-path work or changing wire/durable formats.
 
 Routine target-checkpoint cleanup protects every irreversible migration root's
 metadata, state chunks and output references. Pending migrations block cleanup;
@@ -95,15 +106,17 @@ cargo clippy --locked -p laminar-core -p laminar-connectors -p laminar-db -p lam
 cargo check --locked -p laminar-server --no-default-features
 ```
 
-Focused: 288 passed, two existing ignored. Full: 4475 passed, three existing
-ignored (core 1110, connectors 921, DB 2085, server 359). Formatting and diff
-checks pass. The unchanged stock optimized build passes in 24m 00s; retained
-server SHA-256 is `a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c`.
+Focused: 291 passed, two existing ignored. Full: 4478 passed, three existing
+ignored (core 1112, connectors 921, DB 2086, server 359). Formatting and diff
+checks pass. The unchanged stock optimized build passes in 24m 13s; retained
+server SHA-256 is `9cd06a8c24359353cf5b9e14af0f50b9a113f5f5e5d4c52e0fef3ec50f2240b9`.
 The binary keeps the original Windows 1 MiB main stack. The
-[verification summary](test-evidence/topology-public-process-2026-10-03/root-boot-verification-summary.json)
-binds exact commands, source hashes and build logs. Two authority regressions failed before the repair; the first repair
-still failed pending-root handoff validation and an obsolete blanket cleanup
-assertion. Exact source identities and both failures are retained.
+[verification summary](test-evidence/topology-public-process-2026-10-03/transport-loss-verification-summary.json)
+binds exact commands, source hashes and build logs. The exact new owned-runtime
+loss regression fails against b9 production before the repair. The
+[boundary index](test-evidence/topology-public-process-2026-10-03/transport-loss-fault-coverage.json)
+binds 49 selected regressions to the full passing run. Earlier failed authority
+and pending-root handoff regressions remain preserved with their exact sources.
 
 The earlier qualified stock server passes native attempt 18: both public
 migrations, one leader and two follower hard kills, the whole original-bootstrap
@@ -113,9 +126,37 @@ third full-roster Release at the unchanged 90-second ceiling after 284.86 s.
 Root metadata remains exact after the artifact floor advances to 52. The
 surviving fabric retains delivery-loss incidents: installation rejects them,
 but their repair floor cannot advance until Release. That recovery ordering
-defect is being repaired against the existing prepared generation cutoff.
-Whole cold restart and final oracles are not reached. Matched pair three did
-not start. Historical results do not qualify newer source changes.
+defect is repaired in the five-source candidate against the existing prepared
+generation cutoff. Attempt 19 reaches neither whole cold restart nor final
+oracles. Its result remains failed. Attempt 20 passes the current stock binary
+in 356.28 s, including both public migrations, one leader and two follower
+replacements, the whole original-bootstrap restart and every final oracle.
+Replacement Release/checkpoints take 42.88/32.99/29.51 s; cold restart reaches
+fresh output in 49.44 s, all within the unchanged 90-second ceiling. Sampled
+combined server RSS peaks at 745,672,704 bytes. Exact final checkpoint 148
+(60,429 bytes, SHA-256 `1b20ecd29f451caa2ed0bfe84b4a11c80d8ca1ba31dbe4906185bf37a919f21e`)
+and retained roots 50/57 are verified after the artifact floor advances to 123.
+The native log records real survivor shuffle loss followed by successful recovery.
+Historical results retain their distinct source scopes.
+
+Matched steady pair three passes all final oracles with idle compilers, the same
+retained fixtures/harness, 60 steady seconds and zero kills. Original/current
+scenario elapsed times are 213.77/192.50 s. Both producers acknowledge 400 paced
+logical IDs/s. All graph-cycle p50/p95 bucket bounds are 0.5/1 ms. Original
+node 0 p99 is 1 ms; its other nodes and all current nodes are 5 ms. Sampled
+combined RSS is 806,535,168/702,754,816 bytes; stored endpoints contain
+91,836,753/90,508,799 bytes. These observations do not prove capacity,
+statistical equivalence, speedup, a memory budget or artifact growth rate.
+
+The [phase measurements](test-evidence/topology-public-process-2026-10-03/attempt-20-phase-measurements.json)
+retain first-observed durable status windows separately: quiescing to Active
+is 12.849/11.081 s for the two migrations, including control I/O and polling.
+These are not exact processing-pause or pure state-restore timers. Independent
+activation takes 17.551 s. Nine consumer observations include the explicit
+2.023 s test hold, yielding nearest-rank p50 105.34 ms and p95/p99 15,302.55 ms.
+The observed checkpoint-cycle average is 939 ms across 325 observations,
+combining process generations with the state-size floor disabled. None of these
+small local observations establishes a production latency guarantee.
 
 [Process evidence](test-evidence/topology-public-process-2026-10-03/README.md)
 records exact source/binary identities, authority/checkpoint references and
