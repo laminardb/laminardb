@@ -64,6 +64,8 @@ async fn checkpointed_with_additions(
         .recover_committed_cluster_topology(committed.operation_id)
         .await
         .unwrap();
+    // This fixture captures a complete cycle, independent of CI scheduling delays.
+    image.graph.set_query_budget_ns(u64::MAX);
     let input = image.input.clone();
     let controller = &fixture.authority.controller;
     controller

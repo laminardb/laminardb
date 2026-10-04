@@ -35,6 +35,8 @@ async fn topology_stateful_root_starts_empty_and_preserves_existing_state_across
             .recover_committed_cluster_topology(staged.operation_id)
             .await
             .unwrap();
+        // Recovery assertions require complete cycle output, independent of wall-clock budget.
+        image.graph.set_query_budget_ns(u64::MAX);
         assert_eq!(image.root(), &root);
         assert_eq!(image.restored_frame_count(), 9);
         let output = image
@@ -90,6 +92,8 @@ async fn topology_stateful_target_checkpoint_restores_new_state_and_sequences_wi
         .prepare_cluster_topology_recovery(operation)
         .await
         .unwrap();
+    // Recovery assertions require complete cycle output, independent of wall-clock budget.
+    image.graph.set_query_budget_ns(u64::MAX);
     assert_eq!(
         image.recovery_input().unwrap().cut(),
         TopologyRecoveryCut::TargetCheckpoint
@@ -171,6 +175,8 @@ async fn topology_stateful_joins_use_only_post_cut_rows_and_preserve_their_check
         .prepare_cluster_topology_recovery(operation)
         .await
         .unwrap();
+    // Recovery assertions require complete cycle output, independent of wall-clock budget.
+    image.graph.set_query_budget_ns(u64::MAX);
     let right = future_input(7, 91, 200_000).remove("trades").unwrap();
     let right = rustc_hash::FxHashMap::from_iter([(Arc::from("added_source"), right)]);
     let output = image.graph.execute_cycle(&right, 100, None).await.unwrap();
@@ -328,6 +334,8 @@ async fn topology_stateful_root_recovers_under_a_new_assignment_incarnation() {
         .prepare_cluster_topology_recovery(committed.operation_id)
         .await
         .unwrap();
+    // Recovery assertions require complete cycle output, independent of wall-clock budget.
+    image.graph.set_query_budget_ns(u64::MAX);
     assert_eq!(
         image.recovery_input().unwrap().cut(),
         TopologyRecoveryCut::MigrationRoot
