@@ -10,6 +10,13 @@ mod activation;
 
 async fn prepared(authority: &LeaderLeaseStore) -> (Fixture, TopologyRestoreInput) {
     let fixture = fixture(authority).await;
+    prepared_fixture(authority, fixture).await
+}
+
+pub(super) async fn prepared_fixture(
+    authority: &LeaderLeaseStore,
+    fixture: Fixture,
+) -> (Fixture, TopologyRestoreInput) {
     fixture.stage(authority).await.unwrap();
     for index in 0..2 {
         let input = target_preparation::input(authority, &fixture, index).await;
@@ -27,7 +34,7 @@ async fn prepared(authority: &LeaderLeaseStore) -> (Fixture, TopologyRestoreInpu
     (fixture, input)
 }
 
-async fn commit(
+pub(super) async fn commit(
     authority: &LeaderLeaseStore,
     fixture: &Fixture,
     input: &TopologyRestoreInput,
@@ -42,7 +49,7 @@ async fn commit(
         .await
 }
 
-async fn reconstruct(
+pub(super) async fn reconstruct(
     authority: &LeaderLeaseStore,
     fixture: &Fixture,
     process: LocalProcessAuthorityIdentity,

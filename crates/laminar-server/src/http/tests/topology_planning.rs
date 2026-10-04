@@ -51,6 +51,7 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
     let statements = vec![
         "CREATE SOURCE trades (id BIGINT NOT NULL, value BIGINT NOT NULL) FROM KAFKA ('bootstrap.servers' = '127.0.0.1:1', 'group.id' = 'planning', 'topic' = 'parent')".to_owned(),
         "CREATE STREAM totals AS SELECT id, SUM(value) AS total FROM trades GROUP BY id WITH ('retain_history' = '4mb')".to_owned(),
+        "CREATE SINK totals_sink FROM totals INTO KAFKA ('bootstrap.servers' = '127.0.0.1:1', 'topic' = 'old-output')".to_owned(),
     ];
     let manifest = CatalogManifest::new(vec![
         CatalogManifestEntry {
@@ -64,6 +65,12 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
             kind: CatalogObjectKind::Stream,
             catalog_generation: 1,
             ddl: statements[1].clone(),
+        },
+        CatalogManifestEntry {
+            canonical_name: "totals_sink".into(),
+            kind: CatalogObjectKind::Sink,
+            catalog_generation: 1,
+            ddl: statements[2].clone(),
         },
     ])
     .unwrap();
@@ -173,7 +180,7 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
         serde_json::to_value(&reference).unwrap()
     );
     assert_ne!(plan["parent_pipeline"], plan["target_pipeline"]);
-    assert_eq!(plan["objects"].as_array().unwrap().len(), 4);
+    assert_eq!(plan["objects"].as_array().unwrap().len(), 5);
     assert!(plan["objects"]
         .as_array()
         .unwrap()
@@ -212,6 +219,29 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
     assert_eq!(added["transition"], "add_future_only");
     assert_eq!(added["initialization"], "empty_managed_state_at_cut");
     assert_eq!(added["managed_state_contract"], "sql_aggregate_v1");
+    let response = validate(
+        app.clone(),
+        &token,
+        serde_json::json!({"expected_parent_version": 1, "statements": ["DROP SINK totals_sink"]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let removal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        removal["statements"],
+        serde_json::json!(["DROP SINK totals_sink"])
+    );
+    let removed = removal["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["name"] == "totals_sink")
+        .unwrap();
+    assert_eq!(removed["transition"], "remove");
+    assert_eq!(removed["initialization"], "retire_at_cut");
     for (request, expected) in [
         (
             serde_json::json!({"expected_parent_version": 2, "statements": additions}),

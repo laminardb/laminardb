@@ -1,7 +1,7 @@
 //! Explicit committed-root reconstruction, retaining historical checkpoint identities.
 
 use super::topology_admission::{topology_assignment_error, CONTROL_TIMEOUT};
-use super::topology_migration_root::validate_manifest_budget;
+use super::topology_restore::validate_parent_cut;
 use super::{AssignmentSnapshotStore, LeaderLeaseStore, LeaseError};
 use crate::cluster::control::{
     LocalProcessAuthorityIdentity, ProcessLeaseAuthority, TopologyError, TopologyOperationId,
@@ -99,17 +99,8 @@ impl LeaderLeaseStore {
             let (outcome, checkpoint) = self
                 .load_retained_topology_root_checkpoint(operation)
                 .await?;
-            if !outcome.is_commit()
-                || outcome.committed_checkpoint.as_ref() != Some(&root.cut.checkpoint)
-                || checkpoint.pipeline_identity != descriptor.parent_pipeline
-                || checkpoint.deployment_id != descriptor.deployment_id
-                || checkpoint.assignment_fence.as_ref() != Some(&plan.assignment)
-            {
-                return Err(TopologyError::Invalid(
-                    "committed root differs from the exact historical parent cut".into(),
-                ));
-            }
-            validate_manifest_budget(&checkpoint)?;
+            validate_parent_cut(&outcome, &checkpoint, &root, &plan, &descriptor)?;
+            let parent = self.load_catalog_manifest(&plan.parent_manifest).await?;
             let target = self.load_catalog_manifest(&plan.target_manifest).await?;
             for identity in &restore_processes {
                 self.require_topology_process(processes, *identity).await?;
@@ -137,6 +128,7 @@ impl LeaderLeaseStore {
             Ok(TopologyRestoreInput {
                 operation: operation.clone(),
                 plan,
+                parent,
                 target,
                 descriptor,
                 root,

@@ -5,28 +5,6 @@ use crate::cluster::control::{
     LocalProcessAuthorityIdentity, ProcessLeaseAuthority, ProcessLeaseStore,
 };
 
-#[test]
-fn prior_public_candidate_reports_keep_the_same_descriptor_digest() {
-    let reports: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/topology-local-validations.json")).unwrap();
-    let mut expected_reference = None;
-    for report in reports.as_array().unwrap() {
-        let descriptor: ClusterTopologyValidation =
-            serde_json::from_value(report["validation"].clone()).unwrap();
-        assert_eq!(
-            descriptor.descriptor_digest().unwrap(),
-            descriptor.compatibility_sha256
-        );
-        let (_, reference) = descriptor.encode_and_reference().unwrap();
-        if let Some(expected) = &expected_reference {
-            assert_eq!(&reference, expected);
-        } else {
-            expected_reference = Some(reference);
-        }
-    }
-    assert!(expected_reference.is_some());
-}
-
 pub(super) fn processes(authority: &LeaderLeaseStore) -> ProcessLeaseAuthority {
     ProcessLeaseAuthority::new(authority.store.clone(), Duration::from_secs(30)).unwrap()
 }
@@ -82,7 +60,7 @@ pub(super) async fn fixture(
         .collect::<Vec<_>>();
     objects.sort_by(|left, right| left.name.cmp(&right.name));
     let mut descriptor = ClusterTopologyValidation {
-        validation_format_version: 1,
+        validation_format_version: 2,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment,
         parent_version: plan.expected_parent,
@@ -96,6 +74,10 @@ pub(super) async fn fixture(
         },
         environment_sha256: "3".repeat(64),
         compatibility_sha256: String::new(),
+        statements: target.entries[parent.entries.len()..]
+            .iter()
+            .map(|entry| entry.ddl.clone())
+            .collect(),
         objects,
         requires_processing_pause: true,
         required_before_activation: vec![

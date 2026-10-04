@@ -1038,7 +1038,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         .collect::<Vec<_>>();
     objects.sort_by(|left, right| left.name.cmp(&right.name));
     let mut descriptor = ClusterTopologyValidation {
-        validation_format_version: 1,
+        validation_format_version: 2,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
         parent_version: TopologyVersion::LEGACY_BASELINE,
@@ -1052,6 +1052,10 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         },
         environment_sha256: "3".repeat(64),
         compatibility_sha256: String::new(),
+        statements: target.entries[parent.entries.len()..]
+            .iter()
+            .map(|entry| entry.ddl.clone())
+            .collect(),
         objects,
         requires_processing_pause: true,
         required_before_activation: vec![

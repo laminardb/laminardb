@@ -135,22 +135,12 @@ impl LaminarDB {
 
         #[cfg(feature = "cluster")]
         if startup_runtime == RuntimeMode::Cluster {
-            self.bind_subscription_output_certificates(
+            self.bind_startup_subscriptions(
                 &mut stream_regs,
                 pipeline_identity.as_ref(),
+                topology.as_ref(),
             )
             .await?;
-            self.connector_manager
-                .lock()
-                .install_stream_subscription_certificates(&stream_regs)?;
-            let certified_streams = stream_regs
-                .values()
-                .filter(|stream| stream.subscription_certificate.is_some())
-                .count();
-            tracing::debug!(
-                certified_streams,
-                "Bound cluster subscription output distributions"
-            );
         }
 
         let install_runtime = has_external || !stream_regs.is_empty();
@@ -190,6 +180,35 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         drop(startup_assignment_guard);
 
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn bind_startup_subscriptions(
+        &self,
+        stream_regs: &mut HashMap<String, crate::connector_manager::StreamRegistration>,
+        pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
+        topology: Option<&crate::db::PreparedTopologyRestore>,
+    ) -> Result<(), DbError> {
+        if let Some(image) = topology {
+            // The restored graph already binds the preserved incarnations and sequences.
+            // Fresh definition binding would overwrite their public catalog certificates.
+            stream_regs.clone_from(image.candidate.connector_manager.lock().streams());
+        } else {
+            self.bind_subscription_output_certificates(stream_regs, pipeline_identity)
+                .await?;
+        }
+        self.connector_manager
+            .lock()
+            .install_stream_subscription_certificates(stream_regs)?;
+        let certified_streams = stream_regs
+            .values()
+            .filter(|stream| stream.subscription_certificate.is_some())
+            .count();
+        tracing::debug!(
+            certified_streams,
+            "Bound cluster subscription output distributions"
+        );
         Ok(())
     }
 

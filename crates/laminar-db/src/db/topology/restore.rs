@@ -332,12 +332,8 @@ impl LaminarDB {
                 if !committed {
                     self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline).await?;
                 }
-                let parent_count = input.plan().parent_manifest.entry_count as usize;
-                let parent_entries = input.target().entries.get(..parent_count).ok_or_else(|| {
-                    TopologyError::Invalid("restore target is shorter than its parent".into())
-                })?;
                 let local = self.catalog_manifest_inventory()?;
-                let catalog_matches = local == parent_entries
+                let catalog_matches = local == input.parent().entries
                     || (committed && (local.is_empty() || local == input.target().entries));
                 if !catalog_matches {
                     return Err(TopologyError::Conflict(
@@ -400,9 +396,9 @@ impl LaminarDB {
                 }
                 let (description, graph) = candidate.compile_topology_restore_graph(&input, scope).await?;
                 let objects = super::planning::describe_catalog(
-                    &candidate, input.target(), &identities, &description, parent_count,
+                    &candidate, input.target(), &identities, &description, input.parent(),
                 )?;
-                if objects.into_values().collect::<Vec<_>>() != input.descriptor().objects {
+                if objects.into_values().ne(input.descriptor().objects.iter().filter(|object| object.transition != super::ClusterTopologyObjectTransition::Remove).cloned()) {
                     return Err(TopologyError::Conflict(
                         "restore graph differs from its certified descriptor".into(),
                     ).into());

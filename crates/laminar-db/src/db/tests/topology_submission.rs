@@ -68,6 +68,196 @@ async fn latest_index(fixture: &Fixture) -> laminar_core::checkpoint::CommittedC
 }
 
 #[tokio::test]
+async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery() {
+    let (fixture, _) = Box::pin(preparation_fixture()).await;
+    let probe = enable_runtime(&fixture);
+    probe.allow_parent_initial.store(true, Ordering::Release);
+    fixture
+        .authority
+        .controller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            fixture.process_lease.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    DbState::Created.store(&fixture.db.state);
+    fixture.db.enable_coordinated_recovery().unwrap();
+    Box::pin(fixture.db.start()).await.unwrap();
+    Box::pin(
+        fixture
+            .db
+            .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(5)),
+    )
+    .await
+    .unwrap();
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(10)["trades"][0].clone(),
+            0,
+        )]),
+    );
+    wait_until(|| sink_total(&probe) == 30).await;
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    let certificate = fixture.db.connector_manager.lock().streams()["totals"]
+        .subscription_certificate
+        .clone()
+        .unwrap();
+    probe.output.lock().clear();
+    let request = request(
+        1401,
+        vec![
+            "DROP SINK IF EXISTS existing_sink".into(),
+            "CREATE SINK kept_sink FROM totals INTO \"planning-sink\" ('topic' = 'kept-output')"
+                .into(),
+        ],
+    );
+    let admitted = Box::pin(fixture.db.submit_cluster_topology_change(&request))
+        .await
+        .unwrap();
+    assert!(admitted.commit.is_none());
+    assert!(fixture
+        .db
+        .connector_manager
+        .lock()
+        .sinks()
+        .contains_key("existing_sink"));
+    active(&fixture, request.operation_id).await;
+    assert!(!fixture
+        .db
+        .connector_manager
+        .lock()
+        .sinks()
+        .contains_key("existing_sink"));
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["totals"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        certificate.stream_generation
+    );
+    assert_eq!(probe.sink_closes.load(Ordering::Acquire), 1);
+    assert!(probe.output.lock().is_empty());
+    let compiler = fixture.db.topology_validation_lock.lock().await;
+    assert_eq!(
+        Box::pin(fixture.db.submit_cluster_topology_change(&request))
+            .await
+            .unwrap()
+            .phase,
+        TopologyAdmissionPhase::Active
+    );
+    let mut changed = request.clone();
+    changed.statements[0] = "DROP SINK existing_sink".into();
+    assert!(matches!(
+        Box::pin(fixture.db.submit_cluster_topology_change(&changed)).await,
+        Err(DbError::Topology(TopologyError::Conflict(_)))
+    ));
+    drop(compiler);
+    let kept_total = || {
+        total(
+            &probe
+                .output
+                .lock()
+                .iter()
+                .filter(|(topic, _)| topic == "kept-output")
+                .map(|(_, batch)| batch.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(5)["trades"][0].clone(),
+            3,
+        )]),
+    );
+    wait_until(|| kept_total() == 45).await;
+    assert!(probe
+        .output
+        .lock()
+        .iter()
+        .all(|(topic, _)| topic != "old-output"));
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    assert_eq!(
+        latest_index(&fixture).await.source_offsets["trades"].offsets["old.cursor"],
+        "6"
+    );
+    let selected = fixture
+        .authority
+        .controller
+        .committed_topology_recovery_input(request.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.cut(),
+        laminar_core::cluster::control::TopologyRecoveryCut::TargetCheckpoint
+    );
+    fixture.db.fence_coordinated_recovery_lifecycle();
+    fixture.authority.controller.set_recovering(true);
+    fixture
+        .db
+        .stop_pipeline_for_coordinated_recovery()
+        .await
+        .unwrap();
+    assert!(fixture
+        .db
+        .prepare_committed_cluster_topology_startup()
+        .await
+        .unwrap());
+    probe.output.lock().clear();
+    probe.block_start.store(true, Ordering::Release);
+    fixture.db.enable_coordinated_recovery().unwrap();
+    super::recovery::held_start(&fixture, &probe, 2).await;
+    probe.input.lock().insert(
+        "trades".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(5)["trades"][0].clone(),
+            6,
+        )]),
+    );
+    super::recovery::released(&fixture).await;
+    wait_until(|| kept_total() == 60).await;
+    assert!(probe
+        .output
+        .lock()
+        .iter()
+        .all(|(topic, _)| topic != "old-output"));
+    assert_eq!(
+        fixture.db.connector_manager.lock().streams()["totals"]
+            .subscription_certificate
+            .as_ref()
+            .unwrap()
+            .stream_generation,
+        certificate.stream_generation
+    );
+    let recreate = fixture.db.validate_cluster_topology_change(TopologyVersion::new(2).unwrap(), &["CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')".into()]).await.unwrap_err();
+    assert!(recreate.to_string().contains("retired"), "{recreate}");
+    let result = Box::pin(fixture.db.execute("DROP SINK kept_sink"))
+        .await
+        .unwrap();
+    let ExecuteResult::Ddl(info) = result else {
+        panic!("SQL must return a durable removal receipt")
+    };
+    assert!(!info.applied);
+    active(&fixture, info.topology_operation.unwrap().operation_id).await;
+    assert!(fixture.db.connector_manager.lock().sinks().is_empty());
+    assert!(Box::pin(fixture.db.checkpoint()).await.unwrap().success);
+    assert_eq!(
+        fixture
+            .authority
+            .lease_store
+            .retired_topology_names()
+            .await
+            .unwrap(),
+        std::collections::BTreeSet::from(["existing_sink".into(), "kept_sink".into()])
+    );
+    Box::pin(fixture.db.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
 async fn topology_public_atomic_then_sql_migration_preserves_actual_aggregate_and_progress() {
     let (fixture, _) = Box::pin(preparation_fixture()).await;
     let probe = enable_runtime(&fixture);

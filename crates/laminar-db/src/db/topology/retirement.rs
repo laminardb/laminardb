@@ -72,12 +72,7 @@ impl LaminarDB {
         }
         self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline)
             .await?;
-        let parent_count = input.plan().parent_manifest.entry_count as usize;
-        let parent =
-            input.target().entries.get(..parent_count).ok_or_else(|| {
-                TopologyError::Invalid("target is shorter than its parent".into())
-            })?;
-        if self.catalog_manifest_inventory()? != parent
+        if self.catalog_manifest_inventory()? != input.parent().entries
             || self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline
         {
             return Err(TopologyError::Fenced.into());

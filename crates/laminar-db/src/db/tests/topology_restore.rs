@@ -26,7 +26,6 @@ async fn restorable_fixture_with_additions(
     Fixture,
     laminar_core::cluster::control::TopologyAdmissionStatus,
 ) {
-    let (fixture, assignments) = preparation_fixture_with_generation(7).await;
     let mut entries: Vec<_> = independent_pipeline()
         .into_iter()
         .zip([
@@ -53,7 +52,17 @@ async fn restorable_fixture_with_additions(
         )
         .collect();
     entries.extend(additions);
-    let admitted = admit_preparation_entries(&fixture, &assignments, entries).await;
+    restorable_fixture_with_statements(entries.into_iter().map(|entry| entry.ddl).collect()).await
+}
+
+async fn restorable_fixture_with_statements(
+    statements: Vec<String>,
+) -> (
+    Fixture,
+    laminar_core::cluster::control::TopologyAdmissionStatus,
+) {
+    let (fixture, assignments) = preparation_fixture_with_generation(7).await;
+    let admitted = admit_preparation_statements(&fixture, &assignments, statements).await;
     fixture
         .db
         .prepare_cluster_topology_operation(admitted.operation_id)

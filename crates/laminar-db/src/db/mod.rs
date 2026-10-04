@@ -2629,38 +2629,6 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    fn exact_bootstrap_noop(
-        &self,
-        sql: &str,
-        statement: &StreamingStatement,
-    ) -> Result<Option<ExecuteResult>, DbError> {
-        let Some((name, kind, statement_type)) = catalog_create_identity(statement)? else {
-            return Ok(None);
-        };
-        let local_ddl = self
-            .connector_manager
-            .lock()
-            .get_ddl(&name)
-            .map(str::to_owned);
-        let local_kind = self.catalog_namespace.lock().get(&name).copied();
-        if local_ddl.is_none() && local_kind.is_none() {
-            return Ok(None);
-        }
-        if local_ddl.as_deref() != Some(sql) || local_kind != Some(kind) {
-            return Err(DbError::Pipeline(format!(
-                "cluster bootstrap definition for '{name}' differs from the durable typed catalog"
-            )));
-        }
-        Ok(Some(ExecuteResult::Ddl(DdlInfo {
-            statement_type: statement_type.to_string(),
-            object_name: name,
-            #[cfg(feature = "cluster")]
-            topology_operation: None,
-            applied: false,
-        })))
-    }
-
-    #[cfg(feature = "cluster")]
     fn validate_catalog_seal_authority(
         &self,
         proof: Option<&laminar_core::cluster::control::LeaderProof>,
@@ -2713,57 +2681,9 @@ impl LaminarDB {
             created: Vec::new(),
             sealed: false,
         };
-        for entry in &manifest.entries {
-            if catalog_ddl_contains_comment(&entry.ddl)? {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' contains SQL comments rather than one canonical typed definition",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            let statements = parse_streaming_sql(&entry.ddl).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' is not valid topology DDL: {error}",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                ))
-            })?;
-            if statements.len() != 1 {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' must contain exactly one typed CREATE statement",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            let Some((name, kind, _)) = catalog_create_identity(&statements[0])? else {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' must contain exactly one typed CREATE statement",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            };
-            if name != entry.canonical_name || kind != entry.kind {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' does not match its typed DDL identity",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            if connector_source_requires_schema_discovery(&statements[0]) {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest source '{}' lacks an explicit durable schema",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            if let Some(key) = sensitive_catalog_property(&statements[0]) {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' contains secret property '{key}'",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-        }
+        topology::catalog_changes::validate_manifest_ddl(&manifest)?;
+        self.reconcile_retired_catalog_sinks(&manifest, &store, &topology)
+            .await?;
 
         for entry in &manifest.entries {
             let local_ddl = self
@@ -4799,37 +4719,9 @@ impl LaminarDB {
         }
 
         if let Some(manifest) = self.restore_catalog_from_manifest().await? {
-            let configured_legacy_baseline = self
-                .bootstrap_is_original_adopted_catalog(&manifest, parsed.len())
-                .await?;
-            let configured_matches = parsed.iter().zip(&manifest.entries).all(
-                |((ddl, _, canonical_name, kind), entry)| {
-                    ddl == &entry.ddl
-                        && canonical_name == &entry.canonical_name
-                        && kind == &entry.kind
-                },
-            );
-            if (parsed.len() != manifest.entries.len() && !configured_legacy_baseline)
-                || !configured_matches
-            {
-                return Err(DbError::Pipeline(format!(
-                    "configured cluster catalog must exactly match the complete ordered sealed inventory or its original adopted bootstrap (configured entries: {}, sealed entries: {})",
-                    parsed.len(),
-                    manifest.entries.len()
-                )));
-            }
-            let mut results = Vec::with_capacity(parsed.len());
-            for (stmt_sql, statement, name, _) in &parsed {
-                let result = self
-                    .exact_bootstrap_noop(stmt_sql, statement)?
-                    .ok_or_else(|| {
-                        DbError::Pipeline(format!(
-                            "sealed cluster catalog rejects startup addition '{name}'"
-                        ))
-                    })?;
-                results.push(result);
-            }
-            return Ok(results);
+            return self
+                .validate_sealed_topology_bootstrap(&manifest, &parsed)
+                .await;
         }
 
         if !self.catalog_manifest_inventory()?.is_empty() {

@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use super::{DbError, DbState, LaminarDB};
 
 mod activation;
+pub(super) mod catalog_changes;
 mod commit;
 pub(crate) use activation::InstalledTopologyRuntime;
 mod forwarding;
@@ -150,32 +151,59 @@ impl LaminarDB {
 }
 
 impl LaminarDB {
-    pub(super) async fn bootstrap_is_original_adopted_catalog(
+    pub(super) async fn validate_sealed_topology_bootstrap(
         &self,
         manifest: &laminar_core::cluster::control::CatalogManifest,
-        configured_entry_count: usize,
-    ) -> Result<bool, DbError> {
-        let configured_catalog_store = self.catalog_manifest_store.lock().clone();
-        let configured_legacy_baseline = if let Some(store) = configured_catalog_store {
-            if let laminar_core::cluster::control::TopologyCatalogState::Versioned {
-                baseline,
-                committed: Some(commit),
-            } = store.topology_state().await?
-            {
-                // Additive Commit audit certifies that the original inventory remains this
-                // exact ordered prefix. Only the full current inventory or the full original
-                // bootstrap is accepted; an arbitrary subset is never a startup assertion.
-                commit.manifest
-                    == manifest
-                        .reference()
-                        .map_err(laminar_core::cluster::control::TopologyError::from)?
-                    && configured_entry_count == baseline.manifest.entry_count as usize
-            } else {
-                false
-            }
-        } else {
-            false
+        parsed: &[(
+            String,
+            laminar_sql::parser::StreamingStatement,
+            String,
+            laminar_core::cluster::control::CatalogObjectKind,
+        )],
+    ) -> Result<Vec<crate::handle::ExecuteResult>, DbError> {
+        let matches = |catalog: &laminar_core::cluster::control::CatalogManifest| {
+            parsed.len() == catalog.entries.len()
+                && parsed
+                    .iter()
+                    .zip(&catalog.entries)
+                    .all(|((ddl, _, name, kind), entry)| {
+                        ddl == &entry.ddl && name == &entry.canonical_name && kind == &entry.kind
+                    })
         };
-        Ok(configured_legacy_baseline)
+        if !matches(manifest) {
+            let store = self.catalog_manifest_store.lock().clone().ok_or_else(|| {
+                DbError::Pipeline("cluster catalog manifest store is not configured".into())
+            })?;
+            let original = store
+                .original_topology_catalog(
+                    &manifest
+                        .reference()
+                        .map_err(laminar_core::cluster::control::TopologyError::from)?,
+                )
+                .await?;
+            if !original.as_ref().is_some_and(matches) {
+                return Err(DbError::Pipeline(format!(
+                    "configured cluster catalog must exactly match the complete ordered sealed inventory or its original adopted bootstrap (configured entries: {}, sealed entries: {})",
+                    parsed.len(), manifest.entries.len()
+                )));
+            }
+        }
+        parsed
+            .iter()
+            .map(|(_, statement, _, _)| {
+                let (name, _, statement_type) = super::catalog_create_identity(statement)?
+                    .ok_or_else(|| {
+                        DbError::InvalidOperation(
+                            "bootstrap assertion requires typed CREATE statements".into(),
+                        )
+                    })?;
+                Ok(crate::handle::ExecuteResult::Ddl(crate::handle::DdlInfo {
+                    statement_type: statement_type.to_string(),
+                    object_name: name,
+                    topology_operation: None,
+                    applied: false,
+                }))
+            })
+            .collect()
     }
 }

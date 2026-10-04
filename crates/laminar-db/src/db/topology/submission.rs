@@ -103,23 +103,12 @@ impl LaminarDB {
                     .await?
                     .is_some()
                 {
-                    let (operation, plan, target, _) = authority
+                    let (operation, plan, _target, descriptor) = authority
                         .topology_preparation_input(request.operation_id)
                         .await?;
-                    let suffix = target
-                        .entries
-                        .get(plan.parent_manifest.entry_count as usize..)
-                        .ok_or_else(|| {
-                            TopologyError::Invalid(
-                                "request target omitted its parent inventory".into(),
-                            )
-                        })?;
                     if plan.protocol_version != TOPOLOGY_SUBMISSION_PROTOCOL_VERSION
                         || plan.expected_parent != request.expected_parent_version
-                        || suffix
-                            .iter()
-                            .map(|entry| &entry.ddl)
-                            .ne(request.statements.iter())
+                        || descriptor.statements != request.statements
                     {
                         return Err(TopologyError::Conflict(
                             "operation identity was already bound to another payload".into(),
@@ -313,7 +302,7 @@ impl LaminarDB {
         sql: &str,
         statement: &StreamingStatement,
     ) -> Result<crate::handle::ExecuteResult, DbError> {
-        let (name, _, _) = super::super::validate_cluster_catalog_create(self, sql, statement)?;
+        let (name, _, _) = super::catalog_changes::statement_identity(self, sql, statement)?;
         let parent = self
             .cluster_topology_status()
             .await?

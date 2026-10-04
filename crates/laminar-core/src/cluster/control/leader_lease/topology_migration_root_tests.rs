@@ -20,6 +20,13 @@ use std::collections::{BTreeMap, HashMap};
 #[path = "topology_commit_tests.rs"]
 mod topology_commit;
 
+#[derive(Clone, Copy)]
+enum FixtureChange {
+    FutureStream,
+    NewSources,
+    RemoveSink,
+}
+
 struct Fixture {
     lease: LeaderLease,
     assignments: AssignmentSnapshotStore,
@@ -53,6 +60,18 @@ async fn fixture(authority: &LeaderLeaseStore) -> Fixture {
 }
 
 async fn fixture_with_sources(authority: &LeaderLeaseStore, add_sources: bool) -> Fixture {
+    fixture_with_changes(
+        authority,
+        if add_sources {
+            FixtureChange::NewSources
+        } else {
+            FixtureChange::FutureStream
+        },
+    )
+    .await
+}
+
+async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChange) -> Fixture {
     let incumbent = owner(1, 1, 1);
     let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&incumbent, 0).await.unwrap()
     else {
@@ -114,15 +133,21 @@ async fn fixture_with_sources(authority: &LeaderLeaseStore, add_sources: bool) -
     assignments.save_if_absent(&snapshot).await.unwrap();
     let fence = snapshot.assignment_fence().unwrap();
     let mut target = parent.clone();
-    target
-        .entries
-        .push(crate::cluster::control::CatalogManifestEntry {
-            canonical_name: "later".into(),
-            kind: CatalogObjectKind::Stream,
-            catalog_generation: 1,
-            ddl: "CREATE STREAM later AS SELECT * FROM totals".into(),
-        });
-    if add_sources {
+    if matches!(change, FixtureChange::RemoveSink) {
+        target
+            .entries
+            .retain(|entry| entry.canonical_name != "totals_sink");
+    } else {
+        target
+            .entries
+            .push(crate::cluster::control::CatalogManifestEntry {
+                canonical_name: "later".into(),
+                kind: CatalogObjectKind::Stream,
+                catalog_generation: 1,
+                ddl: "CREATE STREAM later AS SELECT * FROM totals".into(),
+            });
+    }
+    if matches!(change, FixtureChange::NewSources) {
         for (name, kind, ddl) in [
             ("added_source", CatalogObjectKind::Source, "CREATE SOURCE added_source (id BIGINT) FROM kafka ('topic' = 'new', 'startup.mode' = 'latest')"),
             ("added_stream", CatalogObjectKind::Stream, "CREATE STREAM added_stream AS SELECT * FROM added_source"),
@@ -134,7 +159,7 @@ async fn fixture_with_sources(authority: &LeaderLeaseStore, add_sources: bool) -
         }
     }
     let mut descriptor = ClusterTopologyValidation {
-        validation_format_version: 1,
+        validation_format_version: 2,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
         parent_version: TopologyVersion::LEGACY_BASELINE,
@@ -148,20 +173,46 @@ async fn fixture_with_sources(authority: &LeaderLeaseStore, add_sources: bool) -
         },
         environment_sha256: "3".repeat(64),
         compatibility_sha256: String::new(),
-        objects: target
+        statements: if matches!(change, FixtureChange::RemoveSink) {
+            vec!["DROP SINK totals_sink".into()]
+        } else {
+            target.entries[parent.entries.len()..]
+                .iter()
+                .map(|entry| entry.ddl.clone())
+                .collect()
+        },
+        objects: parent
             .entries
             .iter()
+            .chain(target.entries.iter().filter(|entry| {
+                !parent
+                    .entries
+                    .iter()
+                    .any(|old| old.canonical_name == entry.canonical_name)
+            }))
             .enumerate()
             .map(|(index, e)| ClusterTopologyObjectPlan {
                 name: e.canonical_name.clone(),
                 kind: e.kind,
                 catalog_generation: e.catalog_generation,
-                transition: if index < parent.entries.len() {
+                transition: if !target
+                    .entries
+                    .iter()
+                    .any(|entry| entry.canonical_name == e.canonical_name)
+                {
+                    ClusterTopologyObjectTransition::Remove
+                } else if index < parent.entries.len() {
                     ClusterTopologyObjectTransition::Preserve
                 } else {
                     ClusterTopologyObjectTransition::AddFutureOnly
                 },
-                initialization: if index < parent.entries.len() {
+                initialization: if !target
+                    .entries
+                    .iter()
+                    .any(|entry| entry.canonical_name == e.canonical_name)
+                {
+                    TopologyInitialization::RetireAtCut
+                } else if index < parent.entries.len() {
                     TopologyInitialization::PreserveExactCut
                 } else if e.kind == CatalogObjectKind::Source {
                     TopologyInitialization::ResolveSourcePositionsOnce
@@ -967,4 +1018,154 @@ async fn topology_root_metadata_budgets_formats_and_exact_progress_fail_closed()
         record.validate().is_err(),
         "format 16 cannot carry a migration root"
     );
+}
+
+mod sink_removal {
+    //! A sink is retired only through the certified parent cut and irreversible target decision.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn topology_sink_removal_requires_explicit_mapping_and_complete_old_sink_inventory() {
+        let authority = store(30_000);
+        let fixture = fixture_with_changes(&authority, FixtureChange::RemoveSink).await;
+        let parent = authority
+            .load_catalog_manifest(&fixture.descriptor.parent_manifest)
+            .await
+            .unwrap();
+        let target = authority
+            .load_catalog_manifest(&fixture.descriptor.target_manifest)
+            .await
+            .unwrap();
+        fixture
+            .descriptor
+            .validate_catalogs(&parent, &target)
+            .unwrap();
+        let mut report = fixture.descriptor.clone();
+        report
+            .objects
+            .iter_mut()
+            .find(|object| object.name == "totals_sink")
+            .unwrap()
+            .transition = ClusterTopologyObjectTransition::Preserve;
+        report.compatibility_sha256 = report.descriptor_digest().unwrap();
+        assert!(report.validate_catalogs(&parent, &target).is_err());
+        report = fixture.descriptor.clone();
+        let stream = report
+            .objects
+            .iter_mut()
+            .find(|object| object.name == "totals")
+            .unwrap();
+        stream.transition = ClusterTopologyObjectTransition::Remove;
+        stream.initialization = TopologyInitialization::RetireAtCut;
+        report.compatibility_sha256 = report.descriptor_digest().unwrap();
+        assert!(report.encode_and_reference().is_err());
+        let mut manifests = fixture.manifests.clone();
+        let mut index = fixture.index.clone();
+        for (manifest, participant) in manifests.iter_mut().zip(&mut index.participants) {
+            manifest.sink_names.clear();
+            *participant = CommittedParticipantRef::from_manifest(
+                manifest,
+                &checkpoint_manifest_bytes(manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut operation = fixture.operation.clone();
+        operation
+            .cut
+            .as_mut()
+            .unwrap()
+            .committed
+            .as_mut()
+            .unwrap()
+            .checkpoint = index.encode_and_reference().unwrap().1;
+        let error =
+            TopologyMigrationRoot::build(&operation, &fixture.descriptor, &index, &manifests)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("cut source/sink inventory"),
+            "{error}"
+        );
+        let staged = fixture.stage(&authority).await.unwrap();
+        let root = authority
+            .topology_migration_root(staged.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.preserved_objects.len(), 2);
+        assert!(root.future_only_objects.is_empty());
+        assert_eq!(root.subscriptions.len(), 1);
+        assert!(authority.retired_topology_names().await.unwrap().is_empty());
+        let aborted = authority
+            .abort_topology_plan(&fixture.lease.proof(), staged.operation_id, &staged.plan)
+            .await
+            .unwrap();
+        assert!(matches!(
+            aborted.phase,
+            TopologyAdmissionPhase::Aborted { .. }
+        ));
+        assert!(authority.retired_topology_names().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn topology_sink_removal_survives_a_lost_commit_response_and_blocks_name_reuse() {
+        let (raw, authority) = ambiguous_once_at(30_000, lease_path(14));
+        let fixture = fixture_with_changes(&authority, FixtureChange::RemoveSink).await;
+        let (fixture, input) = topology_commit::prepared_fixture(&authority, fixture).await;
+        let committed = topology_commit::commit(&authority, &fixture, &input)
+            .await
+            .unwrap();
+        assert!(raw
+            .did_return_ambiguous
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(committed.phase, TopologyAdmissionPhase::Committed);
+        let reopened = LeaderLeaseStore::new(authority.store.clone(), 30_000);
+        assert_eq!(
+            reopened.retired_topology_names().await.unwrap(),
+            std::collections::BTreeSet::from(["totals_sink".into()])
+        );
+        assert_eq!(
+            reopened
+                .original_topology_catalog(&input.plan().target_manifest)
+                .await
+                .unwrap()
+                .unwrap(),
+            *input.parent()
+        );
+        let restored = topology_commit::reconstruct(&reopened, &fixture, input.process())
+            .await
+            .unwrap();
+        assert_eq!(restored.parent(), input.parent());
+        assert_eq!(restored.target(), input.target());
+        assert_eq!(restored.root().subscriptions, input.root().subscriptions);
+        assert!(restored
+            .target()
+            .entries
+            .iter()
+            .all(|entry| entry.canonical_name != "totals_sink"));
+        let mut target = restored.target().clone();
+        let sink = input
+            .parent()
+            .entries
+            .iter()
+            .find(|entry| entry.canonical_name == "totals_sink")
+            .unwrap()
+            .clone();
+        target.entries.push(sink);
+        let record = reopened.load_record().await.unwrap().unwrap();
+        let plan = TopologyAdmissionPlan {
+            protocol_version: crate::cluster::control::topology::TOPOLOGY_PROTOCOL_VERSION,
+            operation_id: Uuid::from_u128(141).try_into().unwrap(),
+            expected_parent: TopologyVersion::new(2).unwrap(),
+            parent_manifest: restored.target().reference().unwrap(),
+            target_manifest: target.reference().unwrap(),
+            assignment: restored.plan().assignment.clone(),
+            compatibility: None,
+        };
+        let error = reopened
+            .validate_topology_inventory_proposal(&record, &plan, restored.target(), &target)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("retired name"), "{error}");
+    }
 }

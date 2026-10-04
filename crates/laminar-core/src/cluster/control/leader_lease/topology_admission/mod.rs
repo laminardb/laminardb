@@ -1,5 +1,6 @@
 //! Pre-cut admission and assignment publication share the existing authority CAS.
 
+mod catalog_history;
 mod validation;
 
 use super::*;
@@ -591,24 +592,8 @@ impl LeaderLeaseStore {
                 .await
                 .map_err(topology_checkpoint_error)?;
             let parent = self.load_catalog_manifest(&plan.parent_manifest).await?;
-            // Only additive inventory reservation is implemented. DB semantic compatibility
-            // certificates and a cut are required before any future target commit transition.
-            if target.entries.len() <= parent.entries.len()
-                || !target.entries.starts_with(&parent.entries)
-            {
-                return Err(TopologyError::Invalid("admission currently requires exact preservation of the ordered parent inventory".into()));
-            }
-            if let Some(reference) = &plan.compatibility {
-                let descriptor = self.load_topology_compatibility(reference).await?;
-                descriptor.validate_catalogs(&parent, target)?;
-                if descriptor.parent_version != plan.expected_parent
-                    || descriptor.deployment_id != baseline.deployment_id
-                {
-                    return Err(TopologyError::Conflict(
-                        "descriptor parent/deployment differs from admission authority".into(),
-                    ));
-                }
-            }
+            self.validate_topology_inventory_proposal(current, plan, &parent, target)
+                .await?;
             self.ensure_catalog_manifest_blob(&target_bytes, &target_ref)
                 .await?;
             self.stage_admission_blob(&plan_path(&reference), &encoded)
@@ -663,6 +648,51 @@ impl LeaderLeaseStore {
             }
         }
         Err(TopologyError::Contended)
+    }
+
+    pub(super) async fn validate_topology_inventory_proposal(
+        &self,
+        current: &LeaderAuthorityRecord,
+        plan: &TopologyAdmissionPlan,
+        parent: &CatalogManifest,
+        target: &CatalogManifest,
+    ) -> Result<(), TopologyError> {
+        if let Some(reference) = &plan.compatibility {
+            let descriptor = self.load_topology_compatibility(reference).await?;
+            descriptor.validate_catalogs(parent, target)?;
+            let baseline = current
+                .topology_baseline
+                .as_ref()
+                .ok_or(TopologyError::Fenced)?;
+            if descriptor.parent_version != plan.expected_parent
+                || descriptor.deployment_id != baseline.deployment_id
+            {
+                return Err(TopologyError::Conflict(
+                    "descriptor parent/deployment differs from admission authority".into(),
+                ));
+            }
+        } else if target.entries.len() <= parent.entries.len()
+            || !target.entries.starts_with(&parent.entries)
+        {
+            return Err(TopologyError::Invalid(
+                "removal requires an explicit certified compatibility mapping".into(),
+            ));
+        }
+        let retired = self
+            .retired_names_from_operations(&current.topology_operations)
+            .await?;
+        if target.entries.iter().any(|entry| {
+            !parent
+                .entries
+                .iter()
+                .any(|old| old.canonical_name == entry.canonical_name)
+                && retired.contains(&entry.canonical_name)
+        }) {
+            return Err(TopologyError::Unsupported(
+                "target reuses a retired name without a new incarnation contract".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Durably abort an exact pre-cut request under current authority. No graph rollback occurs.

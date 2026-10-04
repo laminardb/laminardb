@@ -83,17 +83,8 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| TopologyError::Invalid("restore cut outcome is missing".into()))?;
             let checkpoint = checkpoint
                 .ok_or_else(|| TopologyError::Invalid("restore cut is not committed".into()))?;
-            if !outcome.is_commit()
-                || outcome.committed_checkpoint.as_ref() != Some(&root.cut.checkpoint)
-                || checkpoint.pipeline_identity != descriptor.parent_pipeline
-                || checkpoint.deployment_id != descriptor.deployment_id
-                || checkpoint.assignment_fence.as_ref() != Some(&plan.assignment)
-            {
-                return Err(TopologyError::Invalid(
-                    "restore cut differs from the sealed parent checkpoint".into(),
-                ));
-            }
-            validate_manifest_budget(&checkpoint)?;
+            validate_parent_cut(&outcome, &checkpoint, &root, &plan, &descriptor)?;
+            let parent = self.load_catalog_manifest(&plan.parent_manifest).await?;
             let target = self.load_catalog_manifest(&plan.target_manifest).await?;
             // Renewals and target preparation receipts can advance while this read runs.
             // Restore requirements, leader and assignment must stay exact. This writes no receipt.
@@ -128,6 +119,7 @@ impl LeaderLeaseStore {
                 restore_processes: Vec::new(),
                 committed_leader: None,
                 plan,
+                parent,
                 target,
                 descriptor,
                 root,
@@ -140,4 +132,24 @@ impl LeaderLeaseStore {
         .await
         .map_err(|_| TopologyError::ReadTimedOut)?
     }
+}
+
+pub(super) fn validate_parent_cut(
+    outcome: &crate::checkpoint_decision::CheckpointOutcome,
+    checkpoint: &crate::checkpoint::CommittedCheckpointIndex,
+    root: &crate::cluster::control::TopologyMigrationRoot,
+    plan: &crate::cluster::control::TopologyAdmissionPlan,
+    descriptor: &crate::cluster::control::ClusterTopologyValidation,
+) -> Result<(), TopologyError> {
+    if !outcome.is_commit()
+        || outcome.committed_checkpoint.as_ref() != Some(&root.cut.checkpoint)
+        || checkpoint.pipeline_identity != descriptor.parent_pipeline
+        || checkpoint.deployment_id != descriptor.deployment_id
+        || checkpoint.assignment_fence.as_ref() != Some(&plan.assignment)
+    {
+        return Err(TopologyError::Invalid(
+            "topology restore differs from the exact historical parent cut".into(),
+        ));
+    }
+    validate_manifest_budget(checkpoint)
 }

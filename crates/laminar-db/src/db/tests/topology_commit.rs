@@ -40,6 +40,102 @@ async fn committed_fixture_with_additions(
 }
 
 #[tokio::test]
+async fn topology_sink_removal_cold_bootstrap_asserts_original_config_without_recreating_sink() {
+    let (fixture, staged) =
+        restorable_fixture_with_statements(vec!["DROP SINK existing_sink".into()]).await;
+    let parent = fixture
+        .authority
+        .manifest_store
+        .load()
+        .await
+        .unwrap()
+        .unwrap();
+    let original = parent
+        .entries
+        .iter()
+        .map(|entry| entry.ddl.clone())
+        .collect::<Vec<_>>();
+    let mut image = fixture
+        .db
+        .prepare_cluster_topology_restore(staged.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(image.restored_frame_count(), 9);
+    let committed = fixture
+        .db
+        .commit_cluster_topology_target(&mut image)
+        .await
+        .unwrap();
+    assert_eq!(committed.phase, TopologyAdmissionPhase::Committed);
+    assert!(image.root().future_only_objects.is_empty());
+    assert_eq!(image.source_positions().len(), 1);
+    drop(image);
+    let authority = TestCatalogAuthority {
+        checkpoint_store: Arc::clone(&fixture.authority.checkpoint_store),
+        manifest_store: Arc::clone(&fixture.authority.manifest_store),
+        lease_store: Arc::clone(&fixture.authority.lease_store),
+        controller: Arc::clone(&fixture.authority.controller),
+        lease_tx: fixture.authority.lease_tx.clone(),
+        lease: fixture.authority.lease.clone(),
+    };
+    let fresh = Fixture::with_authority(authority).await;
+    assert_eq!(
+        fresh.db.catalog_manifest_inventory().unwrap(),
+        parent.entries[..2]
+    );
+    assert!(fresh.db.connector_manager.lock().sinks().is_empty());
+    let results = fresh
+        .db
+        .execute_cluster_bootstrap_batch(&original)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results
+        .iter()
+        .all(|result| matches!(result, ExecuteResult::Ddl(info) if !info.applied)));
+    let mut changed = original.clone();
+    changed[2] = changed[2].replace("old-output", "different-output");
+    assert!(fresh
+        .db
+        .execute_cluster_bootstrap_batch(&changed)
+        .await
+        .is_err());
+    assert!(fresh
+        .db
+        .execute_cluster_bootstrap_batch(&original[..1])
+        .await
+        .is_err());
+    assert!(fresh.db.connector_manager.lock().sinks().is_empty());
+    let authorization = fresh
+        .authority
+        .controller
+        .committed_topology_restore_input(committed.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(authorization.parent(), &parent);
+    fresh
+        .db
+        .install_shuffle_assignment_fence(authorization.assignment())
+        .unwrap();
+    let mut recovered = fresh
+        .db
+        .recover_committed_cluster_topology(committed.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(recovered.restored_frame_count(), 9);
+    let output = recovered
+        .graph
+        .execute_cycle(&input(5), i64::MIN, None)
+        .await
+        .unwrap();
+    assert_eq!(total(&output["totals"]), 45);
+    assert_eq!(fresh.effects.load(Ordering::SeqCst), 0);
+    assert_eq!(fresh.resolutions.load(Ordering::SeqCst), 0);
+    fresh.db.shutdown().await.unwrap();
+    fixture.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn topology_commit_db_preserves_state_and_reconstructs_after_image_loss() {
     let (fixture, staged) = restorable_fixture().await;
     let file = namespace_lock(&fixture.db);

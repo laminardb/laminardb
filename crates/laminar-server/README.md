@@ -199,8 +199,8 @@ including remote AI — runs normally.
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/api/v1/cluster/topology` | Durable catalog version and this process's activation evidence (console authorization) |
 | POST | `/api/v1/cluster/topology/adopt` | Explicitly adopt an existing legacy catalog after a coordinated upgrade |
-| POST | `/api/v1/cluster/topology/validate` | Validate an additive topology candidate without applying it |
-| POST | `/api/v1/cluster/topology/operations` | Submit one atomic additive migration with an operation UUID and expected parent version |
+| POST | `/api/v1/cluster/topology/validate` | Validate a topology candidate without applying it |
+| POST | `/api/v1/cluster/topology/operations` | Submit one atomic migration with an operation UUID and expected parent version |
 | GET | `/api/v1/cluster/topology/operations/{operation_id}` | Audited migration status (console authorization) |
 | GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
 

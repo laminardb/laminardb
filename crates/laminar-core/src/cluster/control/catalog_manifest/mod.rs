@@ -291,6 +291,30 @@ impl CatalogManifestStore {
         self.authority.catalog_with_topology().await
     }
 
+    /// Load the complete adopted startup catalog while checking the exact current inventory.
+    /// Removed objects remain startup assertions and are never recreated.
+    ///
+    /// # Errors
+    /// Rejects changed authority, invalid retained evidence or the bounded read deadline.
+    pub async fn original_topology_catalog(
+        &self,
+        expected_current: &CatalogManifestRef,
+    ) -> Result<Option<CatalogManifest>, super::topology::TopologyError> {
+        self.authority
+            .original_topology_catalog(expected_current)
+            .await
+    }
+
+    /// Read sink names retired by the bounded, retained committed topology journal.
+    ///
+    /// # Errors
+    /// Rejects invalid retained evidence, changed committed authority or the read deadline.
+    pub async fn retired_topology_names(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, super::topology::TopologyError> {
+        self.authority.retired_topology_names().await
+    }
+
     /// Explicitly adopt a sealed legacy inventory without changing the processing graph.
     ///
     /// Requires a coordinated binary upgrade; this is not runtime migration admission.

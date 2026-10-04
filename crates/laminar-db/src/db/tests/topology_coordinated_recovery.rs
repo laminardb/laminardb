@@ -147,7 +147,7 @@ fn request_recovery(fixture: &Fixture) {
     fixture.db.enable_coordinated_recovery().unwrap();
 }
 
-async fn released(fixture: &Fixture) {
+pub(super) async fn released(fixture: &Fixture) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if fixture
@@ -230,7 +230,7 @@ async fn outputs(probe: &runtime_probe::InstallationProbe, expected: i64) {
     );
 }
 
-async fn held_start(
+pub(super) async fn held_start(
     fixture: &Fixture,
     probe: &runtime_probe::InstallationProbe,
     prior_starts: usize,

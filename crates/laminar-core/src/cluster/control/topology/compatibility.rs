@@ -16,7 +16,7 @@ pub enum TopologyValidationScope {
     LocalCandidatePlan,
 }
 
-/// Conservative operation classification for the initial additive planner.
+/// Supported catalog-object transitions at an exact checkpoint cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClusterTopologyObjectTransition {
@@ -24,6 +24,8 @@ pub enum ClusterTopologyObjectTransition {
     Preserve,
     /// New object, activated at an explicitly persisted future-only boundary.
     AddFutureOnly,
+    /// Retire an existing sink after its checkpoint outcomes and actor termination are settled.
+    Remove,
 }
 
 /// Required initialization semantics. These are requirements, never concrete cut positions.
@@ -39,6 +41,8 @@ pub enum TopologyInitialization {
     EmptyManagedStateAtCut,
     /// Resolve concrete latest source/partition positions once at the cut and persist before commit.
     ResolveSourcePositionsOnce,
+    /// Settle old-generation effects at the cut and omit the sink from the target catalog.
+    RetireAtCut,
 }
 
 /// Authorization still needed before this local plan can activate a target graph.
@@ -111,7 +115,10 @@ pub struct ClusterTopologyValidation {
     pub environment_sha256: String,
     /// Deterministic descriptor digest. Participants must agree on this before admission advances.
     pub compatibility_sha256: String,
-    /// Preserved and additive objects with explicit state and initialization requirements.
+    /// Exact submitted DDL, including removals absent from the target inventory. Binds retries
+    /// and participant compilation to the same ordered payload.
+    pub statements: Vec<String>,
+    /// Parent/target union, including retired sinks, with explicit cut requirements.
     pub objects: Vec<ClusterTopologyObjectPlan>,
     /// A processing pause is required for the implemented old-topology cut contract.
     pub requires_processing_pause: bool,
@@ -157,7 +164,7 @@ impl ClusterTopologyValidation {
     /// Returns a typed encoding failure; this never writes authority.
     pub fn descriptor_digest(&self) -> Result<String, TopologyError> {
         let bytes = serde_json::to_vec(&(
-            "laminardb-topology-compatibility-v1",
+            "laminardb-topology-compatibility-v2",
             self.validation_format_version,
             &self.deployment_id,
             self.parent_version,
@@ -167,6 +174,7 @@ impl ClusterTopologyValidation {
             &self.parent_pipeline,
             &self.target_pipeline,
             &self.environment_sha256,
+            &self.statements,
             &self.objects,
         ))
         .map_err(|error| TopologyError::Invalid(error.to_string()))?;
@@ -185,34 +193,56 @@ impl ClusterTopologyValidation {
     ) -> Result<(), TopologyError> {
         if parent.reference()? != self.parent_manifest
             || target.reference()? != self.target_manifest
-            || target.entries.len() <= parent.entries.len()
-            || !target.entries.starts_with(&parent.entries)
-            || target.entries.len() != self.objects.len()
         {
             return Err(TopologyError::Invalid(
-                "compatibility descriptor differs from additive catalog inventories".into(),
+                "compatibility descriptor differs from the exact catalog inventories".into(),
             ));
         }
         self.encode_and_reference()?;
-        for (index, entry) in target.entries.iter().enumerate() {
-            let object = self
-                .objects
-                .binary_search_by(|object| object.name.cmp(&entry.canonical_name))
-                .ok()
-                .map(|index| &self.objects[index])
-                .ok_or_else(|| {
-                    TopologyError::Invalid(
-                        "catalog object is absent from compatibility descriptor".into(),
-                    )
-                })?;
-            let transition = if index < parent.entries.len() {
-                ClusterTopologyObjectTransition::Preserve
-            } else {
-                ClusterTopologyObjectTransition::AddFutureOnly
+        let mut expected = std::collections::BTreeMap::new();
+        let mut retained = Vec::new();
+        for entry in &parent.entries {
+            let transition = match target
+                .entries
+                .iter()
+                .find(|target| target.canonical_name == entry.canonical_name)
+            {
+                Some(target) if target == entry => {
+                    retained.push(entry.clone());
+                    ClusterTopologyObjectTransition::Preserve
+                }
+                None if entry.kind == CatalogObjectKind::Sink => {
+                    ClusterTopologyObjectTransition::Remove
+                }
+                _ => return Err(TopologyError::Invalid(
+                    "target changes a preserved definition or removes an unsupported catalog kind"
+                        .into(),
+                )),
             };
+            expected.insert(entry.canonical_name.as_str(), (entry, transition));
+        }
+        if !target.entries.starts_with(&retained) {
+            return Err(TopologyError::Invalid(
+                "target reordered the retained parent inventory".into(),
+            ));
+        }
+        for entry in &target.entries {
+            expected
+                .entry(entry.canonical_name.as_str())
+                .or_insert((entry, ClusterTopologyObjectTransition::AddFutureOnly));
+        }
+        if expected.len() != self.objects.len() {
+            return Err(TopologyError::Invalid(
+                "compatibility descriptor omitted or added a catalog mapping".into(),
+            ));
+        }
+        for object in &self.objects {
+            let (entry, transition) = expected.get(object.name.as_str()).ok_or_else(|| {
+                TopologyError::Invalid("compatibility object is absent from both catalogs".into())
+            })?;
             if object.kind != entry.kind
                 || object.catalog_generation != entry.catalog_generation
-                || object.transition != transition
+                || object.transition != *transition
             {
                 return Err(TopologyError::Invalid(
                     "compatibility object incarnation/classification differs from catalog".into(),
@@ -233,7 +263,11 @@ impl ClusterTopologyValidation {
             .map_err(|_| TopologyError::Invalid("invalid descriptor deployment".into()))?;
         self.parent_manifest.validate()?;
         self.target_manifest.validate()?;
-        if self.validation_format_version != 1
+        let sql_bytes = self
+            .statements
+            .iter()
+            .try_fold(0_usize, |total, sql| total.checked_add(sql.len()));
+        if self.validation_format_version != 2
             || deployment.is_nil()
             || deployment.to_string() != self.deployment_id
             || self.parent_version.successor()? != self.target_version
@@ -242,6 +276,10 @@ impl ClusterTopologyValidation {
             || !self.target_pipeline.is_canonical()
             || self.parent_pipeline == self.target_pipeline
             || !is_digest(&self.environment_sha256)
+            || self.statements.is_empty()
+            || self.statements.len() > 64
+            || self.statements.iter().any(|sql| sql.trim().is_empty())
+            || sql_bytes.is_none_or(|bytes| bytes > 256 * 1024)
             || self.objects.is_empty()
             || self.objects.len() > 256
             || !self
@@ -268,6 +306,14 @@ impl ClusterTopologyValidation {
                 (ClusterTopologyObjectTransition::Preserve, _) => {
                     TopologyInitialization::PreserveExactCut
                 }
+                (ClusterTopologyObjectTransition::Remove, CatalogObjectKind::Sink) => {
+                    TopologyInitialization::RetireAtCut
+                }
+                (ClusterTopologyObjectTransition::Remove, _) => {
+                    return Err(TopologyError::Unsupported(
+                        "only sinks have a certified removal contract".into(),
+                    ))
+                }
                 (_, CatalogObjectKind::Source) => {
                     TopologyInitialization::ResolveSourcePositionsOnce
                 }
@@ -293,8 +339,13 @@ impl ClusterTopologyValidation {
                         || self
                             .objects
                             .binary_search_by(|obj| obj.name.cmp(name))
-                            .is_err()
+                            .map_or(true, |index| {
+                                self.objects[index].transition
+                                    == ClusterTopologyObjectTransition::Remove
+                            })
                 })
+                || (object.transition == ClusterTopologyObjectTransition::Remove
+                    && (object.managed_state_contract.is_some() || object.schema_sha256.is_some()))
                 || object
                     .managed_state_contract
                     .as_ref()

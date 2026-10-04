@@ -16,6 +16,7 @@ use crate::cluster::control::{CatalogManifest, LocalProcessAuthorityIdentity};
 pub struct TopologyRestoreInput {
     pub(crate) operation: TopologyAdmissionStatus,
     pub(crate) plan: TopologyAdmissionPlan,
+    pub(crate) parent: CatalogManifest,
     pub(crate) target: CatalogManifest,
     pub(crate) descriptor: ClusterTopologyValidation,
     pub(crate) root: TopologyMigrationRoot,
@@ -54,6 +55,7 @@ impl TopologyRestoreInput {
     pub fn same_installed_generation(&self, other: &Self) -> bool {
         self.operation.same_restore_binding(&other.operation)
             && self.plan == other.plan
+            && self.parent == other.parent
             && self.target == other.target
             && self.descriptor == other.descriptor
             && self.root == other.root
@@ -75,6 +77,7 @@ impl TopologyRestoreInput {
             && prepared.operation.commit.is_none()
             && self.operation.same_migration_binding(&prepared.operation)
             && self.plan == prepared.plan
+            && self.parent == prepared.parent
             && self.target == prepared.target
             && self.descriptor == prepared.descriptor
             && self.root == prepared.root
@@ -106,6 +109,11 @@ impl TopologyRestoreInput {
     #[must_use]
     pub const fn plan(&self) -> &TopologyAdmissionPlan {
         &self.plan
+    }
+    /// Complete exact predecessor inventory. Removals cannot be inferred from a target prefix.
+    #[must_use]
+    pub const fn parent(&self) -> &CatalogManifest {
+        &self.parent
     }
     /// Complete sealed target inventory, committed only when this authorization records Commit.
     #[must_use]

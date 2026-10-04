@@ -1,4 +1,4 @@
-//! Local additive validation against an authority-audited parent. No durable operation is admitted.
+//! Local topology validation against an authority-audited parent. No durable operation is admitted.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -9,7 +9,6 @@ use laminar_core::cluster::control::{
     CatalogManifest, CatalogManifestEntry, CatalogObjectKind, TopologyCatalogState, TopologyError,
     TopologyVersion,
 };
-use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
 
 use crate::db::{DbState, LaminarDB, RuntimeMode};
 use crate::error::DbError;
@@ -20,8 +19,8 @@ use crate::pipeline_identity::{
 };
 use crate::pipeline_lifecycle::PlannedTopologyGraph;
 
-const VALIDATION_FORMAT_VERSION: u16 = 1;
-const MAX_VALIDATION_OBJECTS: usize = 256;
+const VALIDATION_FORMAT_VERSION: u16 = 2;
+pub(super) const MAX_VALIDATION_OBJECTS: usize = 256;
 const MAX_VALIDATION_STATEMENTS: usize = 64;
 const MAX_VALIDATION_SQL_BYTES: usize = 256 * 1024;
 
@@ -31,20 +30,20 @@ pub use laminar_core::cluster::control::topology::{
 };
 
 impl LaminarDB {
-    /// Compile an additive topology candidate separately from the active graph.
+    /// Compile a topology candidate separately from the active graph.
     ///
-    /// Each array entry is exactly one typed CREATE. The parent must be explicitly versioned.
+    /// Each entry is one typed CREATE or DROP SINK without CASCADE. The parent is versioned.
     /// Supports replayable sources, supported managed/stateless streams and durable sinks while
     /// proving unchanged definitions remain compatible. New managed state starts empty at the cut;
     /// input that can retract an unavailable prefix is rejected. No source is opened
     /// or polled, no sink is opened or published, and no authority/checkpoint ID is written.
     /// A successful response does not authorize SQL submission, restore or target activation.
     ///
-    /// One compiler per process, 64 statements/256 KiB input, 256 total catalog objects, a 1 MiB
+    /// One compiler per process, 64 statements/256 KiB input, 256 parent/target object mappings, a 1 MiB
     /// descriptor and a 30 second end-to-end deadline bound control-path resource use.
     ///
     /// # Errors
-    /// Rejects parent conflicts, non-additive operations, uncertified execution or
+    /// Rejects parent conflicts, unsupported mutations, uncertified execution or
     /// connector contracts, divergent local definitions, malformed input and exceeded bounds.
     pub async fn validate_cluster_topology_change(
         &self,
@@ -56,7 +55,7 @@ impl LaminarDB {
             .map(|(report, _)| report)
     }
 
-    pub(super) async fn plan_cluster_topology_change(
+    pub(in crate::db) async fn plan_cluster_topology_change(
         &self,
         expected_parent: TopologyVersion,
         statements: &[String],
@@ -112,7 +111,7 @@ impl LaminarDB {
             ))
             .into());
         }
-        if parent.entries.len().saturating_add(statements.len()) > MAX_VALIDATION_OBJECTS {
+        if parent.entries.len() > MAX_VALIDATION_OBJECTS {
             return Err(TopologyError::Unsupported(format!(
                 "candidate exceeds the {MAX_VALIDATION_OBJECTS} object planning bound"
             ))
@@ -144,38 +143,22 @@ impl LaminarDB {
             &parent,
             &parent_identities,
             &parent_graph,
-            parent.entries.len(),
+            &parent,
         )?;
         drop(parent_graph);
-        let mut target_entries = parent.entries.clone();
-        for sql in statements {
-            let statement = parse_one_create(sql)?;
-            let (name, kind, _) =
-                super::super::validate_cluster_catalog_create(&candidate, sql, &statement)?;
-            if target_entries
-                .iter()
-                .any(|entry| entry.canonical_name == name)
-            {
-                return Err(TopologyError::Unsupported(format!("'{name}' already exists; replacements and drop/recreate need a separate state/incarnation contract, even with IF NOT EXISTS")).into());
-            }
-            let entry = CatalogManifestEntry {
-                canonical_name: name,
-                kind,
-                catalog_generation: 1,
-                ddl: sql.clone(),
-            };
-            replay_entry(&candidate, &entry).await?;
-            target_entries.push(entry);
-        }
-        let target = CatalogManifest::new(target_entries).map_err(TopologyError::from)?;
+        let retired = store.retired_topology_names().await?;
+        let target = super::catalog_changes::apply_catalog_changes(
+            &candidate, &parent, statements, &retired,
+        )
+        .await?;
         let target_identities = candidate.topology_definition_identities()?;
         let target_graph = candidate.plan_topology_graph().await?;
-        let objects = describe_catalog(
+        let mut objects = describe_catalog(
             &candidate,
             &target,
             &target_identities,
             &target_graph,
-            parent.entries.len(),
+            &parent,
         )?;
         if parent_identities.environment_sha256 != target_identities.environment_sha256 {
             return Err(TopologyError::Unsupported(
@@ -184,8 +167,17 @@ impl LaminarDB {
             .into());
         }
         for (name, previous) in &parent_objects {
-            if objects.get(name) != Some(previous) {
-                return Err(TopologyError::Unsupported(format!("preserved object '{name}' changed its resolved state, schema, connector or dependency contract")).into());
+            match objects.get(name) {
+                Some(current) if current == previous => {}
+                None if previous.kind == CatalogObjectKind::Sink => {
+                    let mut removed = previous.clone();
+                    removed.transition = ClusterTopologyObjectTransition::Remove;
+                    removed.initialization = TopologyInitialization::RetireAtCut;
+                    objects.insert(name.clone(), removed);
+                }
+                _ => return Err(TopologyError::Unsupported(format!(
+                    "preserved object '{name}' changed its resolved state, schema, connector or dependency contract"
+                )).into()),
             }
         }
         // No stale response can masquerade as validation against a newer parent. Normal lease
@@ -216,6 +208,7 @@ impl LaminarDB {
             target_pipeline: target_identities.pipeline,
             environment_sha256: parent_identities.environment_sha256,
             compatibility_sha256: String::new(),
+            statements: statements.to_vec(),
             objects,
             requires_processing_pause: true,
             required_before_activation: vec![
@@ -324,7 +317,7 @@ impl LaminarDB {
 pub(super) fn validate_request_bounds(statements: &[String]) -> Result<(), DbError> {
     if statements.is_empty() || statements.len() > MAX_VALIDATION_STATEMENTS {
         return Err(TopologyError::Invalid(
-            "validation requires 1..=64 individual CREATE statements".into(),
+            "validation requires 1..=64 individual topology DDL statements".into(),
         )
         .into());
     }
@@ -337,34 +330,11 @@ pub(super) fn validate_request_bounds(statements: &[String]) -> Result<(), DbErr
     Ok(())
 }
 
-fn parse_one_create(sql: &str) -> Result<StreamingStatement, DbError> {
-    let mut parsed = parse_streaming_sql(sql)?;
-    if parsed.len() != 1 {
-        return Err(TopologyError::Invalid(
-            "each validation entry must contain exactly one CREATE statement".into(),
-        )
-        .into());
-    }
-    let statement = parsed
-        .pop()
-        .ok_or_else(|| TopologyError::Invalid("empty validation entry".into()))?;
-    let allowed = match &statement {
-        StreamingStatement::CreateSource(create) => !create.or_replace,
-        StreamingStatement::CreateSink(create) => !create.or_replace,
-        StreamingStatement::CreateStream { or_replace, .. } => !or_replace,
-        _ => false,
-    };
-    if !allowed {
-        return Err(TopologyError::Unsupported("initial topology validation supports additive CREATE SOURCE/STREAM/SINK only; replacement, removal, reference tables and materialized views require separate contracts".into()).into());
-    }
-    Ok(statement)
-}
-
 pub(super) async fn replay_entry(
     candidate: &LaminarDB,
     entry: &CatalogManifestEntry,
 ) -> Result<(), DbError> {
-    let statement = parse_one_create(&entry.ddl)?;
+    let statement = super::catalog_changes::parse_one_change(&entry.ddl)?;
     let (name, kind, _) =
         super::super::validate_cluster_catalog_create(candidate, &entry.ddl, &statement)?;
     if name != entry.canonical_name || kind != entry.kind {
@@ -372,19 +342,7 @@ pub(super) async fn replay_entry(
             TopologyError::Invalid("candidate DDL and catalog identity disagree".into()).into(),
         );
     }
-    // This exception is scoped to this private, unstarted catalog only. Runtime requests still
-    // execute against the active DB's guarded path and can never invoke this helper.
-    let result = super::super::CATALOG_MANIFEST_REPLAY
-        .scope((), candidate.execute_parsed_single(&entry.ddl, &statement))
-        .await?;
-    if !matches!(result, crate::handle::ExecuteResult::Ddl(ref info) if info.applied && info.object_name == name)
-    {
-        return Err(TopologyError::Invalid(format!(
-            "candidate CREATE '{name}' did not apply exactly once"
-        ))
-        .into());
-    }
-    Ok(())
+    super::catalog_changes::apply_statement(candidate, &entry.ddl, &statement, &name).await
 }
 
 pub(super) fn describe_catalog(
@@ -392,13 +350,16 @@ pub(super) fn describe_catalog(
     manifest: &CatalogManifest,
     identities: &PipelineCompatibilityIdentities,
     graph: &PlannedTopologyGraph,
-    parent_count: usize,
+    parent: &CatalogManifest,
 ) -> Result<BTreeMap<String, ClusterTopologyObjectPlan>, DbError> {
     let manager = candidate.connector_manager.lock();
     let mut objects = BTreeMap::<String, ClusterTopologyObjectPlan>::new();
-    for (index, entry) in manifest.entries.iter().enumerate() {
+    for entry in &manifest.entries {
         let name = &entry.canonical_name;
-        let preserved = index < parent_count;
+        let preserved = parent
+            .entries
+            .iter()
+            .any(|entry| &entry.canonical_name == name);
         let mut dependencies = match entry.kind {
             CatalogObjectKind::Source => Vec::new(),
             CatalogObjectKind::Sink => vec![manager
@@ -443,7 +404,7 @@ pub(super) fn describe_catalog(
             }
             _ => {
                 return Err(TopologyError::Unsupported(format!(
-                    "'{name}' has an unsupported catalog kind for additive validation"
+                    "'{name}' has an unsupported catalog kind for topology validation"
                 ))
                 .into())
             }

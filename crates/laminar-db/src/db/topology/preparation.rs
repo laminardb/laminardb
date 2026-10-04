@@ -23,17 +23,14 @@ impl LaminarDB {
             let controller = self.cluster_controller.lock().clone().ok_or_else(|| TopologyError::Protocol("preparation requires the configured cluster controller".into()))?;
             let before = controller.try_live_local_process_authority_identity().map_err(|_| TopologyError::Fenced)?;
             let authority = controller.checkpoint_authority().map_err(|error| TopologyError::Protocol(error.to_string()))?;
-            let (operation, plan, target, descriptor) = authority.topology_preparation_input(operation_id).await?;
+            let (operation, plan, _target, descriptor) = authority.topology_preparation_input(operation_id).await?;
             if !matches!(operation.phase, TopologyAdmissionPhase::Planned | TopologyAdmissionPhase::Preparing | TopologyAdmissionPhase::Quiescing | TopologyAdmissionPhase::CutPrepared) {
                 return Err(TopologyError::Conflict("aborted topology operation cannot prepare participants".into()).into());
             }
             if plan.assignment.participant_incarnation(before.participant.node_id) != Some(before.participant.boot_incarnation) {
                 return Err(TopologyError::Fenced.into());
             }
-            let parent_len = plan.parent_manifest.entry_count as usize;
-            let statements = target.entries.get(parent_len..).ok_or_else(|| TopologyError::Invalid("candidate inventory is shorter than its parent".into()))?
-                .iter().map(|entry| entry.ddl.clone()).collect::<Vec<_>>();
-            let compiled = self.validate_cluster_topology_change(plan.expected_parent, &statements).await?;
+            let compiled = self.validate_cluster_topology_change(plan.expected_parent, &descriptor.statements).await?;
             if compiled != descriptor {
                 return Err(TopologyError::Conflict("this process compiled a divergent candidate; check binary, config, catalog and connector versions".into()).into());
             }

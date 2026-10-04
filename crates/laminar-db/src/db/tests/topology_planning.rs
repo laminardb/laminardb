@@ -580,19 +580,26 @@ async fn admit_preparation_entries(
     assignments: &laminar_core::cluster::control::AssignmentSnapshotStore,
     entries: Vec<laminar_core::cluster::control::CatalogManifestEntry>,
 ) -> laminar_core::cluster::control::TopologyAdmissionStatus {
+    let statements = entries
+        .iter()
+        .map(|entry| entry.ddl.clone())
+        .collect::<Vec<_>>();
+    admit_preparation_statements(fixture, assignments, statements).await
+}
+
+async fn admit_preparation_statements(
+    fixture: &Fixture,
+    assignments: &laminar_core::cluster::control::AssignmentSnapshotStore,
+    statements: Vec<String>,
+) -> laminar_core::cluster::control::TopologyAdmissionStatus {
     use laminar_core::cluster::control::{
         TopologyAdmissionPlan, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
     };
-    let statements = entries.iter().map(|e| e.ddl.clone()).collect::<Vec<_>>();
-    let descriptor = fixture.validate(&statements).await.unwrap();
-    let mut target = fixture
-        .authority
-        .manifest_store
-        .load()
+    let (descriptor, target) = fixture
+        .db
+        .plan_cluster_topology_change(TopologyVersion::LEGACY_BASELINE, &statements)
         .await
-        .unwrap()
         .unwrap();
-    target.entries.extend(entries);
     let compatibility = fixture
         .authority
         .lease_store
@@ -1404,4 +1411,81 @@ async fn topology_validation_missing_parent_blob_fails_closed() {
         .unwrap();
     assert!(fixture.validate(&independent_pipeline()).await.is_err());
     fixture.assert_no_effects();
+}
+
+mod removal {
+    //! Sink retirement preserves the upstream graph and requires the complete old checkpoint cut.
+
+    use super::*;
+
+    #[tokio::test]
+    async fn topology_sink_removal_validation_is_effect_free_and_preserves_upstream_contracts() {
+        let fixture = Fixture::new().await;
+        fixture.adopt().await;
+        let parent = fixture
+            .authority
+            .manifest_store
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        let before = fixture.authority.lease_store.load().await.unwrap();
+        let paths = object_paths(fixture.authority.checkpoint_store.as_ref()).await;
+        let statements = vec!["DROP SINK IF EXISTS existing_sink".into()];
+        let (report, target) = fixture
+            .db
+            .plan_cluster_topology_change(TopologyVersion::LEGACY_BASELINE, &statements)
+            .await
+            .unwrap();
+        assert_eq!(report.statements, statements);
+        assert_eq!(report.objects.len(), 3);
+        assert_eq!(target.entries, parent.entries[..2]);
+        let removed = report
+            .objects
+            .iter()
+            .find(|object| object.name == "existing_sink")
+            .unwrap();
+        assert_eq!(removed.transition, ClusterTopologyObjectTransition::Remove);
+        assert_eq!(removed.initialization, TopologyInitialization::RetireAtCut);
+        assert!(report
+            .objects
+            .iter()
+            .filter(|object| object.name != "existing_sink")
+            .all(|object| {
+                object.transition == ClusterTopologyObjectTransition::Preserve
+                    && object.initialization == TopologyInitialization::PreserveExactCut
+            }));
+        report.validate_catalogs(&parent, &target).unwrap();
+        assert_eq!(fixture.validate(&statements).await.unwrap(), report);
+        for statements in [
+            vec!["DROP SINK IF EXISTS missing".into()],
+            vec!["DROP SINK existing_sink CASCADE".into()],
+            vec!["DROP SOURCE trades".into()],
+            vec!["DROP STREAM totals".into()],
+            vec![
+                "DROP SINK existing_sink".into(),
+                parent.entries[2].ddl.clone(),
+            ],
+            vec![
+                "DROP SINK existing_sink".into(),
+                "DROP SINK existing_sink".into(),
+            ],
+        ] {
+            assert!(matches!(
+                fixture.validate(&statements).await,
+                Err(DbError::Topology(TopologyError::Unsupported(_)))
+            ));
+        }
+        assert_eq!(
+            fixture.db.catalog_manifest_inventory().unwrap(),
+            parent.entries
+        );
+        assert_eq!(fixture.authority.lease_store.load().await.unwrap(), before);
+        assert_eq!(
+            object_paths(fixture.authority.checkpoint_store.as_ref()).await,
+            paths
+        );
+        fixture.assert_no_effects();
+        fixture.db.shutdown().await.unwrap();
+    }
 }

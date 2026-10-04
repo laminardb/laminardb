@@ -89,7 +89,7 @@ impl LeaderLeaseStore {
         }
     }
 
-    /// Pin exact-cut restore requirements for certified stateless downstream additions.
+    /// Pin exact-cut restore requirements for a certified topology candidate.
     /// Call through the live controller with its configured authorities and checkpoint reader.
     /// No candidate actor, source, output, target catalog Commit or Release is authorized.
     /// Identical retries return the retained append, including after a lost response.

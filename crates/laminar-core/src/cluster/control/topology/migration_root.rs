@@ -1,4 +1,4 @@
-//! Exact-cut, additive restore requirements. Staging these requirements grants no target authority.
+//! Exact-cut restore and retirement requirements. Staging grants no target authority.
 
 use super::{
     ClusterTopologyObjectTransition, ClusterTopologyValidation, TopologyAdmissionPhase,
@@ -171,6 +171,15 @@ impl TopologyMigrationRoot {
                     }
                     future.push(object.name.clone());
                 }
+                ClusterTopologyObjectTransition::Remove => {
+                    if object.kind != CatalogObjectKind::Sink
+                        || object.initialization != super::TopologyInitialization::RetireAtCut
+                    {
+                        return Err(TopologyError::Unsupported(
+                            "only sinks can retire at the checkpoint cut".into(),
+                        ));
+                    }
+                }
             }
         }
         Ok((preserved, future))
@@ -231,22 +240,7 @@ impl TopologyMigrationRoot {
             .validate_participant_manifests(&views)
             .map_err(TopologyError::Invalid)?;
         let (preserved_objects, future_only_objects) = Self::object_mappings(descriptor)?;
-        let names = |kind| {
-            preserved_objects
-                .iter()
-                .filter(|o| o.kind == kind)
-                .map(|o| o.name.clone())
-                .collect::<Vec<_>>()
-        };
-        if index.source_names != names(CatalogObjectKind::Source)
-            || manifests
-                .iter()
-                .any(|m| m.sink_names != names(CatalogObjectKind::Sink))
-        {
-            return Err(TopologyError::Invalid(
-                "cut source/sink inventory differs from the preserved catalog".into(),
-            ));
-        }
+        Self::validate_parent_inventory(index, manifests, descriptor)?;
         for manifest in manifests {
             for frame in &manifest.state_frames {
                 let (operator_id, vnode) = match &frame.key {
@@ -366,6 +360,33 @@ impl TopologyMigrationRoot {
         root.validate_source_mappings(descriptor)?;
         root.encode_and_reference()?;
         Ok(root)
+    }
+
+    fn validate_parent_inventory(
+        index: &CommittedCheckpointIndex,
+        manifests: &[CheckpointManifest],
+        descriptor: &ClusterTopologyValidation,
+    ) -> Result<(), TopologyError> {
+        let names = |kind| {
+            descriptor
+                .objects
+                .iter()
+                .filter(|o| {
+                    o.kind == kind && o.transition != ClusterTopologyObjectTransition::AddFutureOnly
+                })
+                .map(|o| o.name.clone())
+                .collect::<Vec<_>>()
+        };
+        if index.source_names != names(CatalogObjectKind::Source)
+            || manifests
+                .iter()
+                .any(|m| m.sink_names != names(CatalogObjectKind::Sink))
+        {
+            return Err(TopologyError::Invalid(
+                "cut source/sink inventory differs from the complete parent catalog".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_binding(
