@@ -1,5 +1,23 @@
 # Public three-process migration qualification
 
+Attempt 19 uses stock server `a2eabead...`, with twelve frozen post-Commit boot
+and retained-root cleanup sources against `4a972885`. The focused/full suites
+pass 288/4,475 tests, and the 46-test boundary index, Clippy, minimal check and
+24m 00s optimized build are recorded in `root-boot-verification-summary.json`.
+The harness remains `cbdf3983...`; compilers are idle during native execution.
+
+Both migrations and all six new-pipeline pairs pass. The leader and first
+follower replacements reach full Release/checkpoints 48/51 in 43.19/31.47 s.
+The third replacement fails full-roster Release at the unchanged 90-second
+ceiling; the scenario fails after 284.86 s and reaches neither the whole cold
+restart nor final oracles. The artifact floor advances to 52 while exact roots
+38/44 remain verified against their immutable cut Commits. No active cleanup
+cursor remains. The surviving leader repeatedly rejects topology transport
+installation because its delivery-loss repair floor advances only after
+Release. The existing prepared recovery-generation cutoff is being used to
+repair that ordering without forgiving later losses. Pair three did not start.
+This failed result and its distinct source scope remain preserved.
+
 Attempt 18 passes the complete-owner-map admission repair, both public additive
 migrations, three hard kills (one leader and two followers), the final whole
 original-bootstrap cold restart, and every independent final stateful, sink and

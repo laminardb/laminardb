@@ -94,6 +94,15 @@ it against its exact head; preflight alone grants no assignment or process
 authority. Complete-map replacement still validates takeover proofs, current
 leases, the exact portable checkpoint and a fresh recovery Release.
 
+Recovery admission distinguishes uncommitted preparation from irreversible
+Commit. Planned through CutPrepared still reserve assignment recovery. A
+Committed or partially Activating target may replace a failed boot before its
+first target checkpoint, using the exact root and unchanged complete owner map.
+Authority validation accepts the pending handoff pin only when its full root
+reference, owner digest, vnode/partition ABI and stable node roster match the
+committed cut. Graceful drain remains excluded until Active. Missing replacement
+installation receipts and stale predecessor boots cannot authorize Release.
+
 An assignment-recovery handoff pin protects the exact selected restore cut until
 the replacement assignment commits its first target checkpoint. Recovery
 Start/install/Release may retain that pin only when its complete assignment fence
@@ -135,7 +144,24 @@ Old prepared sink effects settle against their durable logical checkpoint identi
 
 Unchanged subscription certificates retain generation, schema, query, distribution, changelog, event-time and retention contracts. A reader crosses a historical pipeline boundary only through exact released roots and complete certificate equality for the mapped incarnation. Historical segment bindings remain unchanged. Audits occur at checkpoint boundaries and cache the selected certificate; there is no per-row remote audit. Reconnect and AS OF EPOCH retain existing no-silent-gap and bounded-consumer semantics, without inventing named-consumer acknowledgement storage.
 
-Retention uses those exact predecessor edges and historical certificates. A cleanup horizon is checked by its full encoded reference, digest and length. Missing/corrupt roots or changed horizons stop deletion before output/state loss. Migration roots/state pins are still retained conservatively after Release; consumption and bounded topology-journal reclamation remain outstanding. The 64-operation bound fails closed rather than forgetting idempotency history.
+Retention uses those exact predecessor edges and historical certificates. A
+cleanup horizon is checked by its full encoded reference, digest and length.
+Pending topology phases block cleanup. Once Active, obsolete target checkpoints
+may be reclaimed, stopping before the latest retained root or prior cleanup
+anchor. Predecessor validation remains strict within each target pipeline.
+
+Every irreversible topology decision pins its exact root metadata and complete
+state/output closure. Protected-cut preflight combines the current target and
+all audited roots, including incremental chunks and subscription segments.
+Ordinary checkpoint authority can expire below the artifact floor; only the
+audited immutable topology cut Commit may read retained root metadata there.
+This exception grants no assignment, actor-installation or Release authority.
+Missing/corrupt roots or changed horizons prevent deletion.
+
+Root state consumption and topology-journal reclamation are unsupported. The
+64-operation bound fails closed rather than forgetting idempotency or replay
+history. A target checkpoint and Release alone do not prove that a root's
+subscription replay horizon has ended.
 
 Protected-cut artifact preflight verifies complete owned and incremental state
 objects by length and SHA-256 before cluster cleanup publishes its floor/cursor.
@@ -145,6 +171,9 @@ agree exactly; empty objects must still exist. This verifies stored bytes rather
 than decoding every state codec. Existing local retention publishes its floor
 before protected-cut loading and retains that ordering. Cleanup rechecks topology
 and assignment-handoff references after preflight before its conditional append.
+Root/target participant manifest metadata is capped at 16 MiB, with one root
+index loaded at a time and a 15-second total combined preflight deadline. An
+exceeded bound retains artifacts; it cannot authorize partial protection.
 
 ## Ordering and failure matrix
 
@@ -166,12 +195,33 @@ Compiler ownership precedes the catalog read lock during isolated validation. Pu
 
 The linked evidence folders record the original baseline, tested source hashes, unchanged Cargo.lock, features, exact commands/results and each fixture's scope. Existing control/graph/sink/source tests cover malformed artifacts, stale evidence, lost responses, cancellation, checkpoint races and replacement release. Stored-segment tests cover reconnect identity and cleanup corruption.
 
-The [boundary-test index](test-evidence/topology-public-process-2026-10-03/owner-map-fault-coverage.json)
-binds 43 existing authority and owned-runtime fault regressions to the passing
-4,472-test run. It covers lost responses, cancellation, stale leaders, failed
-installation and held replacement Release at their stated boundaries. It does
+The [boundary-test index](test-evidence/topology-public-process-2026-10-03/root-boot-fault-coverage.json)
+binds 46 authority, owned-runtime and retention fault regressions to the passing
+4,475-test run. It covers lost responses, cancellation, stale leaders, failed
+installation, held replacement Release and root state protection at their stated boundaries. It does
 not claim that native processes were killed at every migration phase.
 
-The public migration soak extends the existing real three-process Kafka/S3 stateful harness. It adds an independent latest-source pipeline, SQL downstream stream, deterministic paused-input/output checks, post-migration hard kills and full target restart with the original bootstrap. Its consumer-visible timing starts before producing records during a held prepared cut, including the explicit test hold and subsequent Release. Attempt 15 passes both migrations, the whole cold restart and the independent join/window/aggregate oracles. Attempt 17 exposed survivor-map assignment admission after its second kill; qualification of the complete-map admission repair is recorded separately in [process evidence](test-evidence/topology-public-process-2026-10-03/README.md).
+The public migration soak extends the existing real three-process Kafka/S3
+stateful harness. It adds an independent latest-source pipeline, SQL downstream
+stream, deterministic paused-input/output checks, post-migration hard kills and
+full target restart with the original bootstrap. Consumer-visible timing starts
+before producing records during a held prepared cut, including the explicit
+test hold and subsequent Release. Attempt 18 passes both migrations, one leader
+and two follower kills, the whole cold restart and the independent
+join/window/aggregate, sink and sequence oracles. It qualifies the complete-map
+admission repair; the newer post-Commit boot/retained-root source scope requires
+its own native result in [process evidence](test-evidence/topology-public-process-2026-10-03/README.md).
 
-Safe removals/replacements require their own descriptor/projection and incarnation contracts. Root consumption, journal reclamation, the remaining fault matrix and matched baseline/current steady-state and pause-inclusive performance measurements remain tracked work. Local timings are observations of their stated workload/environment, not production guarantees.
+The [performance evidence](test-evidence/topology-performance-2026-10-04/README.md)
+records queue trials, two matched original/current process pairs and
+pause-inclusive migration observations. Their exact source scopes differ.
+Windows allocation tracing, queue item counts, preparing-only consumer latency
+and pure state-restore timing are not measured. Existing buffer/state gauges
+and observed control-phase windows do not substitute for those measurements.
+Local timings describe their stated workloads; they provide no production
+guarantees or capacity claim.
+
+Safe removals/replacements require descriptor/projection, retired-incarnation
+and replay contracts. Root consumption and journal reclamation require proof
+that every state/output and idempotency reference has retired. Those operations
+remain rejected; the initial additive contract preserves those references.

@@ -70,6 +70,7 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
+            current.reject_topology_preparation()?;
             self.validate_topology_assignment_proposal_from(current, &transition.target)
                 .await?;
             if let Some(reservation) = &current.assignment_drain_reservation {
@@ -85,7 +86,6 @@ impl LeaderLeaseStore {
                     .await
                     .map_err(snapshot_authority_error);
             }
-            current.reject_topology_preparation()?;
             if current
                 .recovery_fault_slots
                 .iter()

@@ -178,7 +178,8 @@ impl LeaderAuthorityRecord {
                                         .is_none_or(|cut| cut.inventory != *active)
                                 })
                         })
-                    || self.assignment_handoff_pin.is_some()
+                    || (self.assignment_handoff_pin.is_some()
+                        && !self.pending_topology_handoff_is_exact())
                     || (self
                         .topology_operations
                         .iter()
@@ -190,6 +191,45 @@ impl LeaderAuthorityRecord {
             ));
         }
         Ok(())
+    }
+
+    fn pending_topology_handoff_is_exact(&self) -> bool {
+        if self
+            .topology_operations
+            .iter()
+            .any(TopologyAdmissionStatus::is_preparing)
+        {
+            return false;
+        }
+        let (Some(pin), Some(operation)) = (
+            &self.assignment_handoff_pin,
+            self.committed_topology_operation(),
+        ) else {
+            return false;
+        };
+        let Some(cut) = operation.cut.as_ref() else {
+            return false;
+        };
+        let (Some(commit), Some(assignment)) = (&cut.committed, &cut.inventory.assignment_fence)
+        else {
+            return false;
+        };
+        operation.has_target_commit()
+            && operation.phase != TopologyAdmissionPhase::Active
+            && pin.checkpoint == commit.checkpoint
+            && pin.target.assignment_version >= assignment.assignment_version
+            && pin.target.assignment_digest == assignment.assignment_digest
+            && pin.target.vnode_count == assignment.vnode_count
+            && pin.target.partitioning_abi_version == assignment.partitioning_abi_version
+            && pin
+                .target
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .eq(assignment
+                    .participants
+                    .iter()
+                    .map(|participant| participant.node_id))
     }
 
     pub(super) fn abort_topology_preparation(&mut self, reason: TopologyAbortReason) {
@@ -211,6 +251,23 @@ impl LeaderAuthorityRecord {
         {
             return Err(DecisionError::Conflict(format!(
                 "topology operation {} reserves checkpoint and assignment admission",
+                operation.operation_id.get()
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn reject_uncommitted_topology_preparation(
+        &self,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        if let Some(operation) = self
+            .topology_operations
+            .iter()
+            .find(|operation| operation.is_preparing())
+        {
+            return Err(DecisionError::Conflict(format!(
+                "uncommitted topology operation {} reserves assignment recovery admission",
                 operation.operation_id.get()
             ))
             .into());

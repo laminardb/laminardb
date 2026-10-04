@@ -2465,3 +2465,105 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
     assert_eq!(coordinator.local_watermark, CheckpointWatermark::Active(42));
     assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
 }
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn topology_retention_pins_root_chunks_and_rejects_damaged_root_state() {
+    use super::retention::load_protected_checkpoint_with_roots;
+
+    for corrupt in [false, true] {
+        let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "topology-pins")
+            .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+        let decisions = CheckpointDecisionStore::new(Arc::clone(&objects));
+        let deployment = decisions.load_or_create_deployment_id().await.unwrap();
+        let mut predecessor = None;
+        let mut root = None;
+        let mut root_chunk = None;
+        let mut expired = None;
+        for checkpoint_id in 1..=3 {
+            let retained = (checkpoint_id == 2).then(|| root_chunk.clone().unwrap());
+            let (manifest, payload) = manifest(checkpoint_id, &deployment, retained);
+            store.save_checkpoint(&manifest, &[payload]).await.unwrap();
+            let encoded = checkpoint_manifest_bytes(&manifest).unwrap();
+            let index = CommittedCheckpointIndex {
+                version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+                deployment_id: deployment.clone(),
+                pipeline_identity: manifest.pipeline_identity.clone(),
+                epoch: checkpoint_id,
+                checkpoint_id,
+                scope: CheckpointScope::Local,
+                vnode_count: 1,
+                assignment_fence: None,
+                reassignment_portable: false,
+                predecessor,
+                participants: vec![
+                    CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap()
+                ],
+                source_names: Vec::new(),
+                source_offsets: BTreeMap::new(),
+                channel_progress: Vec::new(),
+                source_watermarks: BTreeMap::new(),
+                checkpoint_watermark: None,
+            };
+            let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+            if checkpoint_id == 1 {
+                root = Some(reference.clone());
+                root_chunk = Some((
+                    manifest.node_data.chunk,
+                    manifest.node_data.object_length,
+                    manifest.node_data.sha256.clone(),
+                ));
+            } else if checkpoint_id == 2 {
+                expired = Some(manifest);
+            }
+            predecessor = Some(reference);
+        }
+        let protected = predecessor.unwrap();
+        let roots = [root.unwrap()];
+        let retained = load_protected_checkpoint_with_roots(&store, &decisions, &protected, &roots)
+            .await
+            .unwrap();
+        delete_retired_data(&store, &[expired.unwrap()], &retained.live)
+            .await
+            .unwrap();
+        assert!(node_data_exists(&store, root_chunk.unwrap().0, 1).await);
+        assert!(
+            !node_data_exists(
+                &store,
+                StateChunkId {
+                    participant_id: 1,
+                    checkpoint_id: 2
+                },
+                0
+            )
+            .await
+        );
+        let path = object_store::path::Path::from(
+            "topology-pins/nodes/1/checkpoints/00000000000000000001/node-data.bin",
+        );
+        if corrupt {
+            objects
+                .put(&path, Bytes::from_static(&[255]).into())
+                .await
+                .unwrap();
+        } else {
+            objects.delete(&path).await.unwrap();
+        }
+        assert!(
+            load_protected_checkpoint_with_roots(&store, &decisions, &protected, &roots)
+                .await
+                .is_err()
+        );
+        assert!(store
+            .load_manifest_for_participant(1, 1)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .load_manifest_for_participant(1, 3)
+            .await
+            .unwrap()
+            .is_some());
+    }
+}

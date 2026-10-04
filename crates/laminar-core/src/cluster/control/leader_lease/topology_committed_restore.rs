@@ -1,8 +1,6 @@
 //! Explicit committed-root reconstruction, retaining historical checkpoint identities.
 
-use super::topology_admission::{
-    topology_assignment_error, topology_checkpoint_error, CONTROL_TIMEOUT,
-};
+use super::topology_admission::{topology_assignment_error, CONTROL_TIMEOUT};
 use super::topology_migration_root::validate_manifest_budget;
 use super::{AssignmentSnapshotStore, LeaderLeaseStore, LeaseError};
 use crate::cluster::control::{
@@ -99,14 +97,8 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| TopologyError::Invalid("committed target has no root".into()))?;
             let root = self.load_topology_root(&binding.root).await?;
             let (outcome, checkpoint) = self
-                .cluster_outcome_with_committed_checkpoint(root.cut.checkpoint.epoch)
-                .await
-                .map_err(topology_checkpoint_error)?
-                .ok_or_else(|| {
-                    TopologyError::Invalid("committed target root outcome is missing".into())
-                })?;
-            let checkpoint = checkpoint
-                .ok_or_else(|| TopologyError::Invalid("migration cut is not committed".into()))?;
+                .load_retained_topology_root_checkpoint(operation)
+                .await?;
             if !outcome.is_commit()
                 || outcome.committed_checkpoint.as_ref() != Some(&root.cut.checkpoint)
                 || checkpoint.pipeline_identity != descriptor.parent_pipeline

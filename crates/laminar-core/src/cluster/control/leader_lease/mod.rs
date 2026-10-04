@@ -16,6 +16,7 @@ mod topology_preparation;
 mod topology_recovery;
 mod topology_recovery_round;
 mod topology_restore;
+mod topology_retention;
 mod topology_subscription;
 mod topology_target_preparation;
 
@@ -5388,7 +5389,12 @@ impl LeaderLeaseStore {
                     })
                 };
             }
-            current.reject_topology_preparation()?;
+            match &decision {
+                AuthorityAssignmentDecision::Recovery(_) => {
+                    current.reject_uncommitted_topology_preparation()?;
+                }
+                AuthorityAssignmentDecision::Drain(_) => current.reject_topology_preparation()?,
+            }
             let target = match &decision {
                 AuthorityAssignmentDecision::Recovery(recovery) => &recovery.target,
                 AuthorityAssignmentDecision::Drain(drain) => match drain.verdict {
@@ -6228,6 +6234,19 @@ impl LeaderLeaseStore {
             .filter(|floor| floor.artifact_before_epoch != 0)
             .and_then(|floor| floor.committed_anchor.as_ref())
             .and_then(|outcome| outcome.committed_checkpoint.clone())
+            .into_iter()
+            .chain(head.topology_operations.iter().filter_map(|operation| {
+                operation.has_target_commit().then_some(
+                    operation
+                        .cut
+                        .as_ref()?
+                        .committed
+                        .as_ref()?
+                        .checkpoint
+                        .clone(),
+                )
+            }))
+            .max_by_key(|reference| (reference.epoch, reference.checkpoint_id))
     }
 
     /// Read the exact cluster checkpoint artifact cleanup position.
@@ -6334,6 +6353,17 @@ impl LeaderLeaseStore {
             let Some(expired) = protected_index.predecessor.clone() else {
                 return Ok(None);
             };
+            let stop_before = Self::cleanup_stop_before(current);
+            if stop_before
+                .as_ref()
+                .is_some_and(|stop| expired.epoch <= stop.epoch)
+            {
+                return Ok(None);
+            }
+            // Retained roots remain metadata/state pins, even after ordinary target cuts expire.
+            Box::pin(self.retained_topology_checkpoints())
+                .await
+                .map_err(|error| DecisionError::Conflict(error.to_string()))?;
             let expired_index = decisions.load_committed_checkpoint(&expired).await?;
             protected_index
                 .validate_predecessor_index(&expired_index)
@@ -6369,7 +6399,7 @@ impl LeaderLeaseStore {
                 protected: protected.clone(),
                 current: expired,
                 next: expired_index.predecessor.clone(),
-                stop_before: Self::cleanup_stop_before(current),
+                stop_before,
                 participant_ids: Self::cleanup_participant_ids(&expired_index)?,
                 phase: ClusterArtifactCleanupPhase::DeleteData,
             };

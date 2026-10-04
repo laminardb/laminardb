@@ -1,0 +1,194 @@
+{
+  "run_id": "613648-1791097159338849800",
+  "roots": [
+    {
+      "operation_id": "7bf29985-f250-406b-9ef4-5b08123b5095",
+      "checkpoint": {
+        "epoch": 38,
+        "checkpoint_id": 38,
+        "sha256": "60833660945858d706cb72c830e9267871cab465d05781e14a6439d3088f7a80",
+        "len": 58875
+      },
+      "verified_encoded_length": 58875,
+      "immutable_cut_sequence": 242
+    },
+    {
+      "operation_id": "0eaf8079-ec99-461f-83a9-9dedf6dda97d",
+      "checkpoint": {
+        "epoch": 44,
+        "checkpoint_id": 44,
+        "sha256": "1e6b1b73c54e5a487506deb4fc436967c22dafba9de3be9787d050439c3d06ba",
+        "len": 60386
+      },
+      "verified_encoded_length": 60386,
+      "immutable_cut_sequence": 298
+    }
+  ],
+  "outcome_floor": {
+    "deployment_id": "01a105b5-f939-7721-aff8-5e4e7ecc3fe3",
+    "artifact_before_epoch": 52,
+    "authority_before_epoch": 52,
+    "terminal_anchor": {
+      "version": 3,
+      "scope": "cluster",
+      "epoch": 51,
+      "checkpoint_id": 51,
+      "deployment_id": "01a105b5-f939-7721-aff8-5e4e7ecc3fe3",
+      "assignment_fence": {
+        "assignment_version": 3,
+        "partitioning_abi_version": 2,
+        "vnode_count": 64,
+        "assignment_digest": [
+          4,
+          129,
+          37,
+          184,
+          28,
+          193,
+          137,
+          119,
+          42,
+          153,
+          19,
+          91,
+          95,
+          41,
+          14,
+          107,
+          74,
+          116,
+          175,
+          189,
+          101,
+          148,
+          200,
+          56,
+          194,
+          6,
+          158,
+          183,
+          203,
+          130,
+          105,
+          203
+        ],
+        "participants": [
+          {
+            "node_id": 12632117528189947522,
+            "boot_incarnation": "81f01f86-7012-4dd0-9a9e-67bbe142ca05"
+          },
+          {
+            "node_id": 15506916534570490772,
+            "boot_incarnation": "819ca549-41ea-4249-93ec-13deb14e76aa"
+          },
+          {
+            "node_id": 16059159448129433833,
+            "boot_incarnation": "2925011e-b1a6-4cd6-85bb-27cd388e4b73"
+          }
+        ]
+      },
+      "leader_proof": {
+        "owner": {
+          "node_id": 12632117528189947522,
+          "boot_id": "81f01f86-7012-4dd0-9a9e-67bbe142ca05",
+          "process_term": 2
+        },
+        "fencing_token": 3
+      },
+      "committed_checkpoint": {
+        "epoch": 51,
+        "checkpoint_id": 51,
+        "sha256": "a11416ebf7efd50da0cb741cbb67be7febbdef2a78291e9f1ac44a7ce361e976",
+        "len": 60386
+      },
+      "verdict": "commit"
+    },
+    "terminal_anchor_link": {
+      "sequence": 385,
+      "epoch": 51,
+      "checkpoint_id": 51
+    },
+    "committed_anchor": {
+      "version": 3,
+      "scope": "cluster",
+      "epoch": 51,
+      "checkpoint_id": 51,
+      "deployment_id": "01a105b5-f939-7721-aff8-5e4e7ecc3fe3",
+      "assignment_fence": {
+        "assignment_version": 3,
+        "partitioning_abi_version": 2,
+        "vnode_count": 64,
+        "assignment_digest": [
+          4,
+          129,
+          37,
+          184,
+          28,
+          193,
+          137,
+          119,
+          42,
+          153,
+          19,
+          91,
+          95,
+          41,
+          14,
+          107,
+          74,
+          116,
+          175,
+          189,
+          101,
+          148,
+          200,
+          56,
+          194,
+          6,
+          158,
+          183,
+          203,
+          130,
+          105,
+          203
+        ],
+        "participants": [
+          {
+            "node_id": 12632117528189947522,
+            "boot_incarnation": "81f01f86-7012-4dd0-9a9e-67bbe142ca05"
+          },
+          {
+            "node_id": 15506916534570490772,
+            "boot_incarnation": "819ca549-41ea-4249-93ec-13deb14e76aa"
+          },
+          {
+            "node_id": 16059159448129433833,
+            "boot_incarnation": "2925011e-b1a6-4cd6-85bb-27cd388e4b73"
+          }
+        ]
+      },
+      "leader_proof": {
+        "owner": {
+          "node_id": 12632117528189947522,
+          "boot_id": "81f01f86-7012-4dd0-9a9e-67bbe142ca05",
+          "process_term": 2
+        },
+        "fencing_token": 3
+      },
+      "committed_checkpoint": {
+        "epoch": 51,
+        "checkpoint_id": 51,
+        "sha256": "a11416ebf7efd50da0cb741cbb67be7febbdef2a78291e9f1ac44a7ce361e976",
+        "len": 60386
+      },
+      "verdict": "commit"
+    },
+    "committed_anchor_link": {
+      "sequence": 385,
+      "epoch": 51,
+      "checkpoint_id": 51
+    }
+  },
+  "artifact_cleanup": null,
+  "scope": "Read-only verification that every irreversible topology root index still matches its immutable cut Commit after native failures/restart. State byte closure and deletion refusal are verified by the separate deterministic retention tests; this read grants no cleanup authority."
+}

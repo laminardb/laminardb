@@ -15,6 +15,8 @@ use super::{CheckpointCoordinator, MAX_RETENTION_IO_CONCURRENCY};
 use crate::error::DbError;
 
 const RETENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
+#[cfg(feature = "cluster")]
+const MAX_RETAINED_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(super) enum GcAuthority {
@@ -235,6 +237,79 @@ pub(super) async fn load_protected_checkpoint(
     Ok(ProtectedCheckpoint { index, live })
 }
 
+#[cfg(feature = "cluster")]
+pub(super) async fn load_protected_checkpoint_with_roots(
+    store: &dyn CheckpointStore,
+    decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    reference: &CommittedCheckpointRef,
+    roots: &[CommittedCheckpointRef],
+) -> Result<ProtectedCheckpoint, DbError> {
+    if roots.len() > laminar_core::cluster::control::MAX_TOPOLOGY_OPERATIONS {
+        return Err(DbError::Checkpoint(
+            "retained topology root inventory exceeds its bound".into(),
+        ));
+    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let index = decisions
+            .load_committed_checkpoint(reference)
+            .await
+            .map_err(|error| DbError::Checkpoint(format!("load retained checkpoint: {error}")))?;
+        let mut metadata_bytes = index
+            .participants
+            .iter()
+            .try_fold(0_u64, |total, participant| {
+                total.checked_add(participant.manifest_len)
+            });
+        if metadata_bytes.is_none_or(|bytes| bytes > MAX_RETAINED_MANIFEST_BYTES) {
+            return Err(DbError::Checkpoint(
+                "retained root/target manifest metadata exceeds 16 MiB; artifacts retained".into(),
+            ));
+        }
+        let mut manifests = load_index_manifests(store, &index).await?;
+        for root in roots.iter().filter(|root| *root != reference) {
+            let pinned = decisions
+                .load_committed_checkpoint(root)
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("load pinned topology root: {error}"))
+                })?;
+            if pinned.deployment_id != index.deployment_id
+                || pinned.scope != index.scope
+                || pinned.vnode_count != index.vnode_count
+                || pinned.epoch >= index.epoch
+            {
+                return Err(DbError::Checkpoint(
+                    "pinned topology root differs from its retained deployment/cut".into(),
+                ));
+            }
+            metadata_bytes = pinned
+                .participants
+                .iter()
+                .try_fold(metadata_bytes.unwrap_or(u64::MAX), |total, participant| {
+                    total.checked_add(participant.manifest_len)
+                });
+            if metadata_bytes.is_none_or(|bytes| bytes > MAX_RETAINED_MANIFEST_BYTES) {
+                return Err(DbError::Checkpoint(
+                    "retained root/target manifest metadata exceeds 16 MiB; artifacts retained"
+                        .into(),
+                ));
+            }
+            manifests.extend(load_index_manifests(store, &pinned).await?);
+        }
+        // A target's incremental closure alone need not include every historical root chunk or
+        // output segment. Keep the whole audited root closure live and validate all state bytes.
+        super::retention_state::validate_retained_state(store, &manifests).await?;
+        Ok(ProtectedCheckpoint {
+            index,
+            live: live_chunk_inventory(&manifests),
+        })
+    })
+    .await
+    .map_err(|_| {
+        DbError::Checkpoint("retained root/target preflight timed out; artifacts retained".into())
+    })?
+}
+
 pub(super) async fn load_cleanup_target(
     store: &dyn CheckpointStore,
     decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
@@ -400,23 +475,33 @@ async fn run_local_gc_request(
 async fn begin_cluster_cleanup(
     store: Arc<dyn CheckpointStore>,
     decisions: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
-    authority: &laminar_core::cluster::control::LeaderLeaseStore,
+    authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
     proof: &LeaderProof,
     protected: CommittedCheckpointRef,
 ) -> Result<Option<laminar_core::cluster::control::ClusterArtifactCleanupCursor>, DbError> {
+    let artifact_authority = Arc::clone(&authority);
     authority
         .begin_cluster_artifact_cleanup(proof, protected, move |outcome| {
             let store = Arc::clone(&store);
             let decisions = Arc::clone(&decisions);
+            let authority = Arc::clone(&artifact_authority);
             async move {
                 let reference = outcome
                     .committed_checkpoint
                     .as_ref()
                     .ok_or_else(|| "retained Commit has no checkpoint index".to_owned())?;
-                load_protected_checkpoint(store.as_ref(), decisions.as_ref(), reference)
+                let roots = Box::pin(authority.retained_topology_checkpoints())
                     .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                Box::pin(load_protected_checkpoint_with_roots(
+                    store.as_ref(),
+                    decisions.as_ref(),
+                    reference,
+                    &roots,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
             }
         })
         .await
@@ -443,7 +528,7 @@ async fn run_cluster_gc_protocol(
         cursor = begin_cluster_cleanup(
             Arc::clone(&store),
             Arc::clone(&request.decision_store),
-            authority.as_ref(),
+            Arc::clone(&authority),
             &proof,
             requested.clone(),
         )
@@ -461,13 +546,17 @@ async fn run_cluster_gc_protocol(
                     .as_ref()
                     .is_none_or(|(reference, _)| reference != &current.protected)
                 {
+                    let roots = Box::pin(authority.retained_topology_checkpoints())
+                        .await
+                        .map_err(|error| DbError::Checkpoint(error.to_string()))?;
                     protected = Some((
                         current.protected.clone(),
-                        load_protected_checkpoint(
+                        Box::pin(load_protected_checkpoint_with_roots(
                             store.as_ref(),
                             request.decision_store.as_ref(),
                             &current.protected,
-                        )
+                            &roots,
+                        ))
                         .await?,
                     ));
                 }
@@ -529,7 +618,7 @@ async fn run_cluster_gc_protocol(
                     cursor = begin_cluster_cleanup(
                         Arc::clone(&store),
                         Arc::clone(&request.decision_store),
-                        authority.as_ref(),
+                        Arc::clone(&authority),
                         &proof,
                         requested.clone(),
                     )

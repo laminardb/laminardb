@@ -3,9 +3,11 @@
 Public additive SQL/API submission passes the selected regression suite, actual
 actor/checkpoint tests and the three-process Kafka/S3 migration/full-restart
 oracle, including three injected failures. Complete-map admission fixes the
-observed rebalance defect. Post-Commit boot admission, safe removals and
-root/journal reclamation remain
-unfinished. The complete requested scope has not yet been met.
+observed rebalance defect. Post-Commit boot admission and root-retained ordinary
+cleanup now pass deterministic regressions; their native qualification is
+incomplete: attempt 19 exposes a shuffle recovery/install ordering defect on its
+third replacement. Safe removals, replacements and root/journal reclamation remain
+unsupported until their incarnation and replay contracts exist.
 
 ## Baseline and current validation
 
@@ -18,11 +20,11 @@ unfinished. The complete requested scope has not yet been met.
   include Arrow 58.4.0, DataFusion 53.1.0, sqlparser 0.61.0, object_store 0.13.2,
   tokio 1.53.1 and tonic 0.14.6. No AGENTS.md applies.
 - The latest full four-package `cluster,aws,kafka` library/binary suite passes
-  4,472 tests: core 1,108, connectors 921, DB 2,084, server 359; three existing
-  tests remain ignored. The focused topology suite passes 285 tests, including
-  older-assignment root/target actor recovery and a subsequent checkpoint.
-  Eight test threads and 4 MiB stacks retain existing deadlines. Six Rust
-  sources are frozen against `b8f38a02`; formatting and diff checks pass.
+  4,475 tests: core 1,110, connectors 921, DB 2,085, server 359; three existing
+  tests remain ignored. The focused topology suite passes 288 tests, including
+  Committed/Activating boot replacement, retained-root cleanup and damaged-root
+  deletion refusal. Eight test threads and 4 MiB stacks retain existing deadlines.
+  Twelve Rust sources are frozen against `4a972885`; formatting and diff checks pass.
   All-target Clippy with warnings denied and the minimal-server check pass.
   Earlier cluster/FFI checks passed; default connector feature suites are not run.
 - Earlier [public evidence](test-evidence/topology-public-2026-10-03/README.md) binds 37
@@ -38,8 +40,8 @@ remain separate domains. Catalog encoding remains one. Public protocol six
 requires authority encoding 23 before the old cut; coordinated binary upgrade
 still observes all old processes stopped.
 
-The durable phases are Planned â†’ Preparing â†’ Quiescing â†’ CutPrepared â†’ Committed
-â†’ Activating â†’ Active. Pre-Commit abort reconciles an already committed old cut.
+The durable phases are Planned → Preparing → Quiescing → CutPrepared → Committed
+→ Activating → Active. Pre-Commit abort reconciles an already committed old cut.
 Commit binds the exact target, root, mapping and concrete source initializations.
 Release requires actual held installation by the complete process roster. A
 manifest or cancellation request is insufficient evidence. Post-Commit recovery
@@ -54,7 +56,7 @@ observed before superseded ownership is released.
 
 | Operation | Current contract |
 | --- | --- |
-| Independent supported source â†’ stateless stream â†’ durable sink | Atomic candidate validation; persisted once-resolved source positions; future-only activation. |
+| Independent supported source → stateless stream → durable sink | Atomic candidate validation; persisted once-resolved source positions; future-only activation. |
 | Stateless downstream stream or compatible sink | Future input after Release; no backfill. |
 | Unchanged managed aggregate/window/join | Exact identities, definitions, codecs, state, timers, source/watermark and output progress preserved. |
 | Full restart | Greatest exact target checkpoint, otherwise the authorized root; original adopted bootstrap is an assertion, never a rollback. Library actor cases and the three-process cold restart pass. |
@@ -120,6 +122,32 @@ pin old state, and the journal rejects new identities at 64 retained operations.
   ceiling passed. Pause-inclusive consumer p95/p99 were 18,835.13 ms over nine
   observations; sampled combined server RSS peaked at 844,259,328 bytes.
   Exact final checkpoint 118 bytes/hash and durable authority were verified.
+- Local commit `4a972885` records complete-map admission, the passing three-kill
+  native qualification and the second matched process pair. The next increment
+  exercises Committed/Activating process replacement before a target checkpoint
+  and permits obsolete target-checkpoint cleanup while retaining roots. Both
+  meaningful authority regressions fail on that commit (137 passed, two failed,
+  31.68 s). Their exact test-source hashes are retained before the repair.
+  Candidate cleanup stops before the latest retained root and includes all
+  committed roots in protected state/output inventory. Root metadata reads use
+  only the audited immutable cut Commit; ordinary expired cuts remain unavailable.
+  The first repair passed cleanup but failed the pending-root handoff validation
+  and an obsolete blanket-cleanup assertion (137 passed, two failed, 31.68 s).
+  The final focused suite passes 288 and the full suite passes 4,475 tests; the
+  exact root pin and root stop boundary remain mandatory. All-target Clippy
+  and the minimal check pass. The stock optimized build passes in 24m 00s;
+  retained server SHA-256 is
+  `a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c`,
+  with the unchanged 1 MiB main stack and harness. Native qualification and a
+  third matched pair do not qualify this candidate yet. Attempt 19 passes both
+  migrations and its first two replacements (43.19/31.47 s), then fails the third
+  full-roster Release at the unchanged 90-second ceiling after 284.86 s. Floor
+  52 and exact roots 38/44 are retained and verified. The surviving leader's
+  transport rejects unrecovered delivery loss before installation, while the
+  loss repair floor is promoted only after Release. The existing prepared
+  recovery-generation cutoff supplies the required scoped installation proof.
+  No cold restart or final oracle pass is claimed, and the performance chain
+  stopped before pair three. Source/binary/failure evidence remains retained.
 - Focused verification passes 284 tests; the full selected suite passes 4,471
   (three ignored). All-target Clippy denies warnings and passes; the minimal
   server and formatting checks pass. Sources are frozen against `f4c7e3de` and
@@ -143,8 +171,8 @@ pin old state, and the journal rejects new identities at 64 retained operations.
 - Existing deterministic fault evidence covers lost responses, cancellation,
   leader/process replacement, every durable migration phase, owned actor startup,
   target-cut selection and cleanup races. The
-  [43-test boundary index](test-evidence/topology-public-process-2026-10-03/owner-map-fault-coverage.json)
-  binds the current 4,472-test run. It is neither a new fault framework nor a
+  [46-test boundary index](test-evidence/topology-public-process-2026-10-03/root-boot-fault-coverage.json)
+  binds the current 4,475-test run. It is neither a new fault framework nor a
   claim of native kills at every phase.
 - Three alternating original/modified stock queue trials average 6.05832/6.02855
   microseconds per 32-batch burst (-0.49145% point estimate). The matched first
@@ -171,9 +199,11 @@ no storage reset or external deletion was used.
 
 ## Next work, in order
 
-1. Close the remaining admission gap for fresh process boots after Commit and
-   before the first target checkpoint, including partial installation. Preserve
-   pre-Commit exclusion, the complete map, process fences and full-roster Release.
+1. Reproduce and repair the attempt-19 shuffle installation deadlock using only
+   the exact loss cutoff captured for an authorized recovery generation. Keep
+   normal installation, later losses, expired processes and stale generations
+   fenced; promote no repair floor before Release. Requalify the unchanged
+   three-kill/full-restart harness, then matched pair three with compilers idle.
 2. Implement only removals whose stop, sink-settlement and state contracts prove
    safety. Removal also needs retired-incarnation and replay evidence; the current
    additive descriptor cannot supply it. Preserve unsupported transformation
@@ -185,9 +215,9 @@ no storage reset or external deletion was used.
 4. Keep any subsequent repair outside the recorded second matched pair's source
    scope until requalified. Keep preparation, pause, checkpoint, restore,
    activation and recovery-to-freshness measurements distinct.
-5. Update verified operator examples, the support matrix and final handoff. Additional
-   failure qualification, removals and root/journal retirement remain unfinished;
-   do not mark the complete request done based on unit tests alone.
+5. Finish verified operator examples and the final handoff. Distinguish the
+   initial A–D support contract from unsupported removals, replacements and
+   root/journal retirement. Keep native and deterministic fault scopes explicit.
 
 ## Earlier evidence
 

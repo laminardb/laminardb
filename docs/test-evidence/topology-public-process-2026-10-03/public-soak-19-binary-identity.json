@@ -1,0 +1,138 @@
+{
+  "recorded_utc": "2026-10-04T06:58:34.404408+00:00",
+  "source_identity": {
+    "recorded_utc": "2026-10-04T06:34:14.085284+00:00",
+    "base_commit": "4a972885d747d1054be57d27bcede710b8453c22",
+    "changed_sources": [
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/assignment_drain.rs",
+        "sha256": "0623060f34a12bd5c3b142f3154da75bbe2221c179fe901d9653c28a8f4ec3be",
+        "normalized_sha256": "0623060f34a12bd5c3b142f3154da75bbe2221c179fe901d9653c28a8f4ec3be"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/mod.rs",
+        "sha256": "e5f0cee335b62abbb72a480507c9cabd4e2941faea7547bc308979d5c447920e",
+        "normalized_sha256": "e5f0cee335b62abbb72a480507c9cabd4e2941faea7547bc308979d5c447920e"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_activation_tests.rs",
+        "sha256": "dbefc825dd4e894e8c83487e4660f36815e2f2cc92059ce9a9b7382ef40417ec",
+        "normalized_sha256": "dbefc825dd4e894e8c83487e4660f36815e2f2cc92059ce9a9b7382ef40417ec"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission.rs",
+        "sha256": "4859b0161aa3e7f6d99e3d4a03157756d7a841b212d43f615bc09b3c2e092696",
+        "normalized_sha256": "4859b0161aa3e7f6d99e3d4a03157756d7a841b212d43f615bc09b3c2e092696"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_committed_restore.rs",
+        "sha256": "ecceb78940636b2457bea60f8b861f66983fc9b9da736a0ecceab718a5dad1c7",
+        "normalized_sha256": "ecceb78940636b2457bea60f8b861f66983fc9b9da736a0ecceab718a5dad1c7"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_cut.rs",
+        "sha256": "b2f6ff588d9a7ec63a74ae8d4f625ac331f2858e34426557f99d7e2034056b6e",
+        "normalized_sha256": "b2f6ff588d9a7ec63a74ae8d4f625ac331f2858e34426557f99d7e2034056b6e"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round.rs",
+        "sha256": "5239353651751260d49e2f3af6f13cedee3b282bccfd8068c3155be468bd7fc6",
+        "normalized_sha256": "5239353651751260d49e2f3af6f13cedee3b282bccfd8068c3155be468bd7fc6"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round_tests.rs",
+        "sha256": "6a7a524e97a103fd60ddf708027add08c1b9e8ee5931f3f14990f8222b30ea02",
+        "normalized_sha256": "6a7a524e97a103fd60ddf708027add08c1b9e8ee5931f3f14990f8222b30ea02"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_tests.rs",
+        "sha256": "0c2ea3713fd0334df2defca1a185c6172fd835994cf96c172e1990042f85f6be",
+        "normalized_sha256": "0c2ea3713fd0334df2defca1a185c6172fd835994cf96c172e1990042f85f6be"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_retention.rs",
+        "sha256": "ff8618a9af796411f3de6298c3f58e79b4d394c7d7b98475560f2a54e0fe7a7f",
+        "normalized_sha256": "ff8618a9af796411f3de6298c3f58e79b4d394c7d7b98475560f2a54e0fe7a7f"
+      },
+      {
+        "path": "crates/laminar-db/src/checkpoint_coordinator/artifact_tests.rs",
+        "sha256": "2b130ba4c3ddd2370a38c053867e269c79aea5d5fab92499c3105714b7bd2afc",
+        "normalized_sha256": "2b130ba4c3ddd2370a38c053867e269c79aea5d5fab92499c3105714b7bd2afc"
+      },
+      {
+        "path": "crates/laminar-db/src/checkpoint_coordinator/retention.rs",
+        "sha256": "ebf09c48ef7ea89f6d71438d48571e1220332689d44160770af5e9e74f220c8b",
+        "normalized_sha256": "ebf09c48ef7ea89f6d71438d48571e1220332689d44160770af5e9e74f220c8b"
+      }
+    ],
+    "protobuf_sources": [
+      {
+        "path": "crates/laminar-core/build.rs",
+        "sha256": "789c1a66b34f9b10008d9e6d233d895bdbaa8a175bba12c388764dd6c7d6f34e",
+        "normalized_sha256": "0d5f520caabb350aa246861ff7ced38779b1c735c38b9b9ed2abca9e3990a694"
+      },
+      {
+        "path": "crates/laminar-core/proto/shuffle.proto",
+        "sha256": "34ee91c0abdaeecd5caeee1b01d917737822922f3e31c25aa3124dc5ad8abd9a",
+        "normalized_sha256": "e7bc5d27a64632e0bb8fb110da4dc026b5eb031c7d4c55585f8b6c4f0e812a68"
+      },
+      {
+        "path": "crates/laminar-core/proto/barrier.proto",
+        "sha256": "657f6183ae817ea53cc8acb6e89d77c186fe8dc09dd81dad998af7a421765b74",
+        "normalized_sha256": "3287aee88a54a3f39e09beaf101761cfd3dca8c70184d52e7f895bd78d7f6e29"
+      }
+    ],
+    "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+    "build_command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+    "scope": "Post-Commit same-map process recovery and ordinary target-checkpoint cleanup with retained exact root metadata/state/output pins. No wire, durable format, dependency, unsafe, profile or record-path changes."
+  },
+  "binaries": [
+    {
+      "role": "server",
+      "path": "target/topology-evidence/laminardb-topology-root-retained-stock-soak.exe",
+      "sha256": "a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c",
+      "encoded_len": 172193280,
+      "profile": "soak",
+      "pe_main_stack_reserve_bytes": 1048576,
+      "pe_main_stack_commit_bytes": 4096,
+      "unmodified_copy": true
+    },
+    {
+      "role": "harness",
+      "path": "target/topology-evidence/cluster-soak-public-fixed-roster.exe",
+      "sha256": "cbdf3983b4f0b7c14eeb9e7d56a02d22010476098722f2a132a06375ad11d113",
+      "encoded_len": 31457280,
+      "profile": "soak",
+      "pe_main_stack_reserve_bytes": 1048576,
+      "pe_main_stack_commit_bytes": 4096,
+      "unmodified_copy": true
+    }
+  ],
+  "harness_source_identity": {
+    "commit": "4cfcb2cd60e864c96d714db822751d87092a3e81",
+    "frozen_at_utc": "2026-10-03T22:57:51.124614+00:00",
+    "server_source": "Unchanged production Rust at the commit, stock soak profile, PE unchanged.",
+    "harness_profile": "Unmodified stock soak profile (optimized, ThinLTO, one codegen unit); production server is the retained stock binary.",
+    "features": [
+      "cluster",
+      "aws",
+      "kafka"
+    ],
+    "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+    "changed_sources": [
+      {
+        "path": "crates/laminar-server/tests/cluster_soak.rs",
+        "sha256": "92548a16f30ac9c6e0730e0700e354716a0bdae941b014a5ef2cd9c4a1c9a9ab",
+        "normalized_sha256": "92548a16f30ac9c6e0730e0700e354716a0bdae941b014a5ef2cd9c4a1c9a9ab"
+      },
+      {
+        "path": "crates/laminar-server/tests/cluster_soak/topology_migration.rs",
+        "sha256": "1c932a11860191fd6f8c74531305398658c16cd93dba95a401a24eb8c59d5bea",
+        "normalized_sha256": "1c932a11860191fd6f8c74531305398658c16cd93dba95a401a24eb8c59d5bea"
+      }
+    ],
+    "scope": "Test-only consumer observations and process replacement with the complete original owner map. Original survivor resharding mode and data oracles remain in place."
+  },
+  "scope": "New production server with exact frozen post-Commit boot and root-retained checkpoint cleanup repair, unchanged stock soak profile. Retained harness production library dependencies are at 4cf; unchanged wire/persisted formats. Binary identity alone does not establish a passing process result.",
+  "completed_build_command_exit_code": 0
+}

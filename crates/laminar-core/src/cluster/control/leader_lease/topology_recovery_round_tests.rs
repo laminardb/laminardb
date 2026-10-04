@@ -609,3 +609,189 @@ async fn topology_recovery_round_preserves_exact_handoff_pin_until_new_target_ch
         None
     );
 }
+
+#[tokio::test]
+async fn topology_recovery_round_replaces_boot_before_first_target_checkpoint() {
+    use crate::cluster::control::{ProcessLeaseFence, ProcessLeaseOutcome, ProcessLeaseStore};
+
+    let preparing = store(30_000);
+    let (fixture, _) = prepared(&preparing).await;
+    let current = fixture.assignments.load().await.unwrap().unwrap();
+    let before = preparing.load_record().await.unwrap();
+    assert!(preparing
+        .validate_topology_assignment_proposal(&current.assignment_fence().unwrap())
+        .await
+        .is_err());
+    assert_eq!(preparing.load_record().await.unwrap(), before);
+
+    for partial_installation in [false, true] {
+        let authority = store(30_000);
+        let (fixture, input) = committed(&authority).await;
+        let input = if partial_installation {
+            certify(&authority, &fixture, &input, 88).await.unwrap();
+            reconstruct(&authority, &fixture, input.process())
+                .await
+                .unwrap()
+        } else {
+            input
+        };
+        assert_eq!(
+            input.operation().phase,
+            if partial_installation {
+                TopologyAdmissionPhase::Activating
+            } else {
+                TopologyAdmissionPhase::Committed
+            }
+        );
+        let original_commit = input.operation().commit.clone();
+        let current = fixture.assignments.load().await.unwrap().unwrap();
+        let proof = input.current_leader().unwrap();
+        let drain = current
+            .next_draining(
+                current.vnodes.clone(),
+                current.participants.clone(),
+                proof.clone(),
+            )
+            .unwrap();
+        let authority_before = authority.load_record().await.unwrap();
+        assert!(authority
+            .publish_assignment_drain(&proof, &fixture.assignments, &drain)
+            .await
+            .is_err());
+        assert_eq!(authority.load_record().await.unwrap(), authority_before);
+        assert_eq!(fixture.assignments.load().await.unwrap(), Some(current));
+        let checkpoint = input.root().cut.checkpoint.clone();
+        let process_store = ProcessLeaseStore::new(authority.store.clone(), NodeId(2), 30_000);
+        let prior = process_store.load().await.unwrap().unwrap();
+        let observed = process_store.observe_rival(&prior).unwrap();
+        tokio::time::sleep(Duration::from_millis(30_001)).await;
+        let ProcessLeaseOutcome::Acquired(replacement) = process_store
+            .try_takeover(Uuid::from_u128(222), &observed, 30_001)
+            .await
+            .unwrap()
+        else {
+            panic!("replacement process");
+        };
+        let before = fixture.assignments.load().await.unwrap().unwrap();
+        let mut roster = before.participants.clone();
+        roster[1].boot_incarnation = replacement.owner;
+        let assignment = before
+            .next_for_participants(before.vnodes.clone(), roster)
+            .unwrap();
+        let target = assignment.assignment_fence().unwrap();
+        let proof = input.current_leader().unwrap();
+        let authority_before = authority.load_record().await.unwrap();
+        authority
+            .validate_topology_assignment_proposal(&target)
+            .await
+            .unwrap();
+        assert_eq!(authority.load_record().await.unwrap(), authority_before);
+        let proposal = fixture
+            .assignments
+            .stage_recovery_proposal(&assignment)
+            .await
+            .unwrap();
+        let decision = AssignmentRecoveryDecision::new(
+            before.assignment_fence().unwrap(),
+            target.clone(),
+            proposal,
+            vec![ProcessLeaseFence::new(prior.clone(), replacement).unwrap()],
+            checkpoint.clone(),
+            proof.clone(),
+        )
+        .unwrap();
+        authority
+            .record_assignment_recovery_decision(&proof, decision)
+            .await
+            .unwrap();
+        authority
+            .materialize_assignment_recovery(target.assignment_version)
+            .await
+            .unwrap();
+        let head = authority.load_record().await.unwrap().unwrap();
+        for invalid in 0..2 {
+            let mut changed = head.clone();
+            let pin = changed.assignment_handoff_pin.as_mut().unwrap();
+            if invalid == 0 {
+                pin.checkpoint.sha256 = "f".repeat(64);
+            } else {
+                pin.target.assignment_digest[0] ^= 1;
+            }
+            assert!(changed.validate().is_err());
+        }
+        let input = reconstruct(&authority, &fixture, input.process())
+            .await
+            .unwrap();
+        assert_eq!(input.operation().commit, original_commit);
+        assert_eq!(input.checkpoint(), &fixture.index);
+        let selection = select(&authority, &fixture, input.process()).await.unwrap();
+        assert_eq!(selection.cut(), TopologyRecoveryCut::MigrationRoot);
+        assert_eq!(selection.checkpoint(), &fixture.index);
+        assert_eq!(
+            authority
+                .assignment_handoff_checkpoint(&target)
+                .await
+                .unwrap(),
+            Some(checkpoint.clone())
+        );
+        let round = recovery_round(&authority, &fixture, &input, 1).await;
+        assert!(certify_recovered(
+            &authority,
+            &fixture,
+            &round,
+            LocalProcessAuthorityIdentity {
+                participant: crate::checkpoint::CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: prior.owner
+                },
+                process_term: prior.term,
+            },
+            700,
+            1
+        )
+        .await
+        .is_err());
+        assert!(publish(&authority, &fixture, &terminal(&round, 1))
+            .await
+            .is_err());
+        for (index, process) in input.processes().iter().enumerate() {
+            certify_recovered(
+                &authority,
+                &fixture,
+                &round,
+                *process,
+                800 + index as u128,
+                1,
+            )
+            .await
+            .unwrap();
+        }
+        publish(&authority, &fixture, &terminal(&round, 1))
+            .await
+            .unwrap();
+        let head = authority.load_record().await.unwrap().unwrap();
+        assert_eq!(
+            head.topology_operations[0].phase,
+            TopologyAdmissionPhase::Active
+        );
+        assert_eq!(head.topology_operations[0].commit, original_commit);
+        assert_eq!(
+            authority
+                .assignment_handoff_checkpoint(&target)
+                .await
+                .unwrap(),
+            Some(checkpoint)
+        );
+        assert!(authority
+            .authorize_recovery_release_with_topology(
+                owner_recovery_fault_publisher(&fixture.lease.owner),
+                &terminal(&round, 1),
+                Some((
+                    &fixture.assignments,
+                    &topology_preparation::processes(&authority)
+                )),
+            )
+            .await
+            .unwrap());
+    }
+}

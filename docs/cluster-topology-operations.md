@@ -4,14 +4,15 @@ Supported cluster DDL uses a coordinated processing pause and the existing check
 
 ## Supported changes
 
-| Change | Boundary and contract |
-| --- | --- |
-| Independent source → stateless stream → durable sink | New sources start at once-resolved, persisted connector positions. New streams and sinks process future input after Release. |
-| Stateless downstream stream or compatible sink on an existing pipeline | Future input after the cut; no historical backfill. |
-| Unchanged managed aggregates, supported windows and joins | Exact definitions, incarnations, codecs, state, timers, watermarks, source positions and publication frontiers survive the cut. |
-| Full cluster restart | Reconstructs the committed target from its greatest exact target checkpoint or authorized migration root. |
-| Keys, windows, schemas, source identity, sink semantics, new stateful operators, materialized views, reference tables, custom functions/optimizer implementations | Rejected until a certified transformation or initialization contract exists. |
-| Removal and replacement | Remain rejected in this checkpoint. |
+| Change | Classification | Boundary and contract |
+| --- | --- | --- |
+| Independent source → stateless stream → durable sink | Additive, future-only | New sources start at once-resolved, persisted connector positions. New streams and sinks process future input after Release. |
+| Stateless downstream stream or compatible sink on an existing pipeline | Additive, future-only | Future input after the cut; no historical backfill. |
+| Unchanged managed aggregates, supported windows and joins | Preserved within an additive migration | Exact definitions, incarnations, codecs, state, timers, watermarks, source positions and publication frontiers survive the cut. |
+| Full cluster restart | Recovery of a committed topology | Reconstructs the committed target from its greatest exact target checkpoint or authorized migration root. |
+| Keys, windows, schemas, source identity, sink semantics, new stateful operators | State transformation or explicit initialization required; unsupported | Rejected until a certified transformation or initialization contract exists. |
+| Materialized views, reference tables, custom functions/optimizer implementations | Unsupported | Required cluster execution and initialization contracts are not certified. |
+| Removal and replacement | Unsupported | Require retired-incarnation, dependency, sink-settlement and replay evidence beyond the current additive descriptor. |
 
 An unchanged SQL name alone does not prove compatibility. Kafka earliest/latest sources with explicit topics support sealed initialization. Other sources require implemented pause, replay, cursor-validation and atomic startup contracts. Sinks must support the selected delivery mode. At-least-once configurations can replay duplicates; arbitrary external effects are not exactly-once.
 
@@ -98,6 +99,11 @@ this topology contract; a reduced owner map cannot activate the committed target
 An already Active operation keeps its original immutable Release evidence while
 the replacement uses a fresh recovery Release.
 
+The same replacement procedure applies after Commit and during partial
+installation before the first target checkpoint. Recovery uses the authorized
+root and requires every fresh installed process before Release. Graceful drain
+stays blocked while activation is pending.
+
 Restart with the same durable namespace and either the complete current inventory or the exact complete original adopted bootstrap. Durable target authority takes precedence over that original bootstrap. Changed definitions and arbitrary subsets reject. Recovery selects the greatest target checkpoint, or the exact authorized migration root before the first target checkpoint, and rechecks state/source availability and full readiness before intake Release.
 
 Timeout or absent acknowledgement is not proof that a durable write or sink commit failed. Query status and retry the same identity. Pre-Commit leader/process failure follows the existing abort/recovery path. After Commit, preserve target authority and recover it. A reversal is another checked forward migration.
@@ -108,14 +114,36 @@ Errors preserve registry codes: 400 malformed/bounded request; 409 stale parent,
 
 Unchanged streams retain incarnation and output sequence identities. Reader reconnect crosses pipeline identities only through exact released roots while keeping all schema/query/distribution/changelog/retention contracts strict. Dropped/recreated identity reuse is prohibited. AS OF EPOCH remains an existing replay boundary, not durable named-consumer acknowledgement storage.
 
-Cleanup audits checkpoint predecessor edges and exact horizon references. Missing/corrupt roots stop deletion. This checkpoint retains migration roots and their old state pins conservatively, and its journal rejects admission at 64 retained operation identities. Root consumption and journal reclamation remain outstanding work; Release alone is insufficient retirement authority.
+Cleanup audits checkpoint predecessor edges and exact horizon references.
+Pending migrations retain their cuts. Once Active, routine cleanup can reclaim
+obsolete target checkpoints while retaining every migration root's metadata,
+state chunks and output references. Missing/corrupt roots prevent deletion.
+Root consumption and journal reclamation are unsupported; Release alone is
+insufficient retirement authority. Admission rejects new operation identities
+at 64 retained operations. Do not remove old authority or root files to bypass
+that bound.
 
 Cluster cleanup also verifies the protected checkpoint's complete state-object
 lengths and hashes before publishing its cleanup cursor. Missing or corrupt
 owned/incremental state, conflicting references, or exceeded object/read budgets
 stop that cleanup. The current state preflight accepts at most 8192 objects and
 4 GiB in total within a 15-second read deadline; these are control-path bounds.
+Combined root/target manifest metadata is capped at 16 MiB and the combined
+preflight has a 15-second deadline. Exceeded budgets leave artifacts retained.
 
 ## Qualification
+
+The public harness verifies this exact ordinary SQL request against its existing
+stateful `soak_join_aggregate` stream, returning the asynchronous migration receipt:
+
+```json
+{"sql":"CREATE STREAM topology_live_downstream AS SELECT join_key, match_count, max_right_id FROM soak_join_aggregate"}
+```
+
+It submits that body to `POST /api/v1/sql`. The independent three-object request
+uses `topology_live_source`, `topology_live_stream` and `topology_live_sink`, with
+the run's already-created Kafka topics and broker address. See the exact
+statements and assertions in
+[`topology_migration.rs`](../crates/laminar-server/tests/cluster_soak/topology_migration.rs).
 
 See [progress](cluster-topology-migrations-progress.md) and the linked source/test evidence. Controlled connector tests, authority fixtures, real Kafka/S3 processes and comparative performance results have distinct scopes. No zero-downtime or unqualified production latency claim is made. The original cut/abort soak does not certify target activation; the new public migration soak must pass separately.

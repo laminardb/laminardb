@@ -11,13 +11,14 @@ use crate::cluster::control::{
 };
 
 impl LeaderLeaseStore {
-    /// Check placement compatibility before fencing processes for an assignment proposal.
+    /// Check placement compatibility before fencing processes for an assignment recovery.
     /// This is read-only preflight; the shared assignment append rechecks the same constraint.
     /// An irreversible topology Commit currently supports replacement in the same node slots,
     /// with its complete vnode map, rather than membership changes or state redistribution.
     ///
     /// # Errors
-    /// Rejects a pending topology, changed placement, corrupt evidence or a bounded read failure.
+    /// Rejects uncommitted preparation, changed placement, corrupt evidence or a bounded read
+    /// failure. Committed/Activating targets may replace processes before their first checkpoint.
     pub async fn validate_topology_assignment_proposal(
         &self,
         proposal: &CheckpointAssignmentFence,
@@ -27,13 +28,14 @@ impl LeaderLeaseStore {
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            before.reject_uncommitted_topology_preparation()?;
             self.validate_topology_assignment_proposal_from(&before, proposal)
                 .await?;
             let after = self
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            after.reject_topology_preparation()?;
+            after.reject_uncommitted_topology_preparation()?;
             if before.lease.proof() != after.lease.proof()
                 || before.committed_topology_identity() != after.committed_topology_identity()
             {
@@ -50,7 +52,6 @@ impl LeaderLeaseStore {
         current: &LeaderAuthorityRecord,
         proposal: &CheckpointAssignmentFence,
     ) -> Result<(), ClusterCheckpointAuthorityError> {
-        current.reject_topology_preparation()?;
         if !proposal.is_canonical() {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }

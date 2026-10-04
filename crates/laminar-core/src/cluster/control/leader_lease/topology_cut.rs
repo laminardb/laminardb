@@ -72,19 +72,11 @@ impl LeaderAuthorityRecord {
         Ok(())
     }
 
-    pub(super) fn topology_cut_blocks_cleanup(&self, protected: &CommittedCheckpointRef) -> bool {
+    pub(super) fn topology_cut_blocks_cleanup(&self, _protected: &CommittedCheckpointRef) -> bool {
         self.topology_operations.iter().any(|operation| {
-            if operation.blocks_admission() {
-                // Planned/Preparing reserve the parent before any cut has been recorded.
-                return true;
-            }
-            // Release alone cannot retire state required by recovery or replay.
-            operation.has_target_commit()
-                && operation
-                    .cut
-                    .as_ref()
-                    .and_then(|cut| cut.committed.as_ref())
-                    .is_some_and(|commit| protected.epoch > commit.checkpoint.epoch)
+            // Before Release, no target checkpoint can replace the root's restore obligation.
+            // Active roots are retained by the cleanup stop boundary and live-state inventory.
+            operation.blocks_admission()
         })
     }
 }

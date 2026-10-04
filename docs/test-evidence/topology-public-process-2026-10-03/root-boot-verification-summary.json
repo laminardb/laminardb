@@ -1,0 +1,340 @@
+{
+  "recorded_utc": "2026-10-04T06:59:02.120608+00:00",
+  "source_identity": {
+    "recorded_utc": "2026-10-04T06:34:14.085284+00:00",
+    "base_commit": "4a972885d747d1054be57d27bcede710b8453c22",
+    "changed_sources": [
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/assignment_drain.rs",
+        "sha256": "0623060f34a12bd5c3b142f3154da75bbe2221c179fe901d9653c28a8f4ec3be",
+        "normalized_sha256": "0623060f34a12bd5c3b142f3154da75bbe2221c179fe901d9653c28a8f4ec3be"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/mod.rs",
+        "sha256": "e5f0cee335b62abbb72a480507c9cabd4e2941faea7547bc308979d5c447920e",
+        "normalized_sha256": "e5f0cee335b62abbb72a480507c9cabd4e2941faea7547bc308979d5c447920e"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_activation_tests.rs",
+        "sha256": "dbefc825dd4e894e8c83487e4660f36815e2f2cc92059ce9a9b7382ef40417ec",
+        "normalized_sha256": "dbefc825dd4e894e8c83487e4660f36815e2f2cc92059ce9a9b7382ef40417ec"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission.rs",
+        "sha256": "4859b0161aa3e7f6d99e3d4a03157756d7a841b212d43f615bc09b3c2e092696",
+        "normalized_sha256": "4859b0161aa3e7f6d99e3d4a03157756d7a841b212d43f615bc09b3c2e092696"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_committed_restore.rs",
+        "sha256": "ecceb78940636b2457bea60f8b861f66983fc9b9da736a0ecceab718a5dad1c7",
+        "normalized_sha256": "ecceb78940636b2457bea60f8b861f66983fc9b9da736a0ecceab718a5dad1c7"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_cut.rs",
+        "sha256": "b2f6ff588d9a7ec63a74ae8d4f625ac331f2858e34426557f99d7e2034056b6e",
+        "normalized_sha256": "b2f6ff588d9a7ec63a74ae8d4f625ac331f2858e34426557f99d7e2034056b6e"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round.rs",
+        "sha256": "5239353651751260d49e2f3af6f13cedee3b282bccfd8068c3155be468bd7fc6",
+        "normalized_sha256": "5239353651751260d49e2f3af6f13cedee3b282bccfd8068c3155be468bd7fc6"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round_tests.rs",
+        "sha256": "6a7a524e97a103fd60ddf708027add08c1b9e8ee5931f3f14990f8222b30ea02",
+        "normalized_sha256": "6a7a524e97a103fd60ddf708027add08c1b9e8ee5931f3f14990f8222b30ea02"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_tests.rs",
+        "sha256": "0c2ea3713fd0334df2defca1a185c6172fd835994cf96c172e1990042f85f6be",
+        "normalized_sha256": "0c2ea3713fd0334df2defca1a185c6172fd835994cf96c172e1990042f85f6be"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_retention.rs",
+        "sha256": "ff8618a9af796411f3de6298c3f58e79b4d394c7d7b98475560f2a54e0fe7a7f",
+        "normalized_sha256": "ff8618a9af796411f3de6298c3f58e79b4d394c7d7b98475560f2a54e0fe7a7f"
+      },
+      {
+        "path": "crates/laminar-db/src/checkpoint_coordinator/artifact_tests.rs",
+        "sha256": "2b130ba4c3ddd2370a38c053867e269c79aea5d5fab92499c3105714b7bd2afc",
+        "normalized_sha256": "2b130ba4c3ddd2370a38c053867e269c79aea5d5fab92499c3105714b7bd2afc"
+      },
+      {
+        "path": "crates/laminar-db/src/checkpoint_coordinator/retention.rs",
+        "sha256": "ebf09c48ef7ea89f6d71438d48571e1220332689d44160770af5e9e74f220c8b",
+        "normalized_sha256": "ebf09c48ef7ea89f6d71438d48571e1220332689d44160770af5e9e74f220c8b"
+      }
+    ],
+    "protobuf_sources": [
+      {
+        "path": "crates/laminar-core/build.rs",
+        "sha256": "789c1a66b34f9b10008d9e6d233d895bdbaa8a175bba12c388764dd6c7d6f34e",
+        "normalized_sha256": "0d5f520caabb350aa246861ff7ced38779b1c735c38b9b9ed2abca9e3990a694"
+      },
+      {
+        "path": "crates/laminar-core/proto/shuffle.proto",
+        "sha256": "34ee91c0abdaeecd5caeee1b01d917737822922f3e31c25aa3124dc5ad8abd9a",
+        "normalized_sha256": "e7bc5d27a64632e0bb8fb110da4dc026b5eb031c7d4c55585f8b6c4f0e812a68"
+      },
+      {
+        "path": "crates/laminar-core/proto/barrier.proto",
+        "sha256": "657f6183ae817ea53cc8acb6e89d77c186fe8dc09dd81dad998af7a421765b74",
+        "normalized_sha256": "3287aee88a54a3f39e09beaf101761cfd3dca8c70184d52e7f895bd78d7f6e29"
+      }
+    ],
+    "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+    "build_command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+    "scope": "Post-Commit same-map process recovery and ordinary target-checkpoint cleanup with retained exact root metadata/state/output pins. No wire, durable format, dependency, unsafe, profile or record-path changes."
+  },
+  "red_test_source_identity": {
+    "base_commit": "4a972885d747d1054be57d27bcede710b8453c22",
+    "changed_test_sources": [
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round_tests.rs",
+        "sha256": "dd1f9587e4b7513bedf59802895af6d23805e39798bfb24764d8568aedbdd950"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_tests.rs",
+        "sha256": "0c2ea3713fd0334df2defca1a185c6172fd835994cf96c172e1990042f85f6be"
+      }
+    ],
+    "scope": "Production at the qualified owner-map commit; exact new regression sources before the post-Commit boot and root-retained cleanup repairs."
+  },
+  "partial_failure_source_identity": {
+    "base_commit": "4a972885d747d1054be57d27bcede710b8453c22",
+    "changed_sources": [
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/mod.rs",
+        "sha256": "5a12480ce2fd02a790ce6167bdab061cb393e3b168f04af4ba69b61be20c3b23"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission.rs",
+        "sha256": "aa465b57ee6c4f96f215e22a19c1cc0611ddb9f263f2ac3e45d70530803e30af"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_committed_restore.rs",
+        "sha256": "ecceb78940636b2457bea60f8b861f66983fc9b9da736a0ecceab718a5dad1c7"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_cut.rs",
+        "sha256": "b2f6ff588d9a7ec63a74ae8d4f625ac331f2858e34426557f99d7e2034056b6e"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round.rs",
+        "sha256": "5239353651751260d49e2f3af6f13cedee3b282bccfd8068c3155be468bd7fc6"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_round_tests.rs",
+        "sha256": "dd1f9587e4b7513bedf59802895af6d23805e39798bfb24764d8568aedbdd950"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_recovery_tests.rs",
+        "sha256": "0c2ea3713fd0334df2defca1a185c6172fd835994cf96c172e1990042f85f6be"
+      },
+      {
+        "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_retention.rs",
+        "sha256": "ff8618a9af796411f3de6298c3f58e79b4d394c7d7b98475560f2a54e0fe7a7f"
+      },
+      {
+        "path": "crates/laminar-db/src/checkpoint_coordinator/artifact_tests.rs",
+        "sha256": "2b130ba4c3ddd2370a38c053867e269c79aea5d5fab92499c3105714b7bd2afc"
+      },
+      {
+        "path": "crates/laminar-db/src/checkpoint_coordinator/retention.rs",
+        "sha256": "c3197ec3d3bdb6185192ee81917a4d29e2e9e4e4b132cf8d77da02125206c808"
+      }
+    ],
+    "scope": "Exact initial post-Commit/root-retained candidate tested by the partial failed focused run, before the record-shape correction and drain/bounded-read review adjustments."
+  },
+  "commands": [
+    {
+      "phase": "red",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_ -- --test-threads=8",
+      "exit_code": 101,
+      "raw_log_path": "target/topology-evidence/topology-root-boot-red-raw.txt",
+      "raw_log_sha256": "4a6d77417f0775116e32dd2c844fe19a8fe372df07ca59e23780ebb2926ceee3",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 12,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 3.06
+        },
+        {
+          "result": "FAILED",
+          "passed": 137,
+          "failed": 2,
+          "ignored": 0,
+          "test_elapsed_seconds": 31.68
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 46.91s\r"
+      ]
+    },
+    {
+      "phase": "partial_failure",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_ -- --test-threads=8",
+      "exit_code": 101,
+      "raw_log_path": "target/topology-evidence/topology-root-boot-green-raw.txt",
+      "raw_log_sha256": "0ae35effdb44c34f249e83aa5a8aeee584cd0148bcc1c7025d4ae98cd41962ef",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 12,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 2.95
+        },
+        {
+          "result": "FAILED",
+          "passed": 137,
+          "failed": 2,
+          "ignored": 0,
+          "test_elapsed_seconds": 31.68
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 14m 48s\r"
+      ]
+    },
+    {
+      "phase": "focused",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_ -- --test-threads=8",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-root-boot-green-final-raw.txt",
+      "raw_log_sha256": "7001f8503618b39b3abf0537850d26aff7d83d0ed6e1339ab4b1d7105285becf",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 12,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 4.02
+        },
+        {
+          "result": "ok",
+          "passed": 139,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 60.87
+        },
+        {
+          "result": "ok",
+          "passed": 131,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 21.59
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "ok",
+          "passed": 6,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.61
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 14m 05s\r"
+      ]
+    },
+    {
+      "phase": "full",
+      "command": "cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins -- --test-threads=8",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-root-boot-full-raw.txt",
+      "raw_log_sha256": "501a6760ad5bfba07ccfcf012154635e5145c9822bb84d7080a4044b86e1a075",
+      "test_results": [
+        {
+          "result": "ok",
+          "passed": 921,
+          "failed": 0,
+          "ignored": 2,
+          "test_elapsed_seconds": 46.79
+        },
+        {
+          "result": "ok",
+          "passed": 1110,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 61.79
+        },
+        {
+          "result": "ok",
+          "passed": 2085,
+          "failed": 0,
+          "ignored": 1,
+          "test_elapsed_seconds": 23.8
+        },
+        {
+          "result": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 0.0
+        },
+        {
+          "result": "ok",
+          "passed": 359,
+          "failed": 0,
+          "ignored": 0,
+          "test_elapsed_seconds": 6.15
+        }
+      ],
+      "finished_lines": [
+        "    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.51s\r"
+      ]
+    },
+    {
+      "phase": "clippy",
+      "command": "cargo clippy --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-root-boot-clippy-raw.txt",
+      "raw_log_sha256": "a66b8a1e921cb4068ec2d7013064631d2097a7dfbd053d5c407c825ffa7cbc78",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 42s\r"
+      ]
+    },
+    {
+      "phase": "minimal",
+      "command": "cargo check --locked -p laminar-server --no-default-features",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-root-boot-minimal-raw.txt",
+      "raw_log_sha256": "a58cad9f62ed311bc436a39663fab1b74e0ee11afb2d6842a8172424b2bb8717",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.64s\r"
+      ]
+    },
+    {
+      "phase": "stock_build",
+      "command": "cargo build --locked --profile soak -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb",
+      "exit_code": 0,
+      "raw_log_path": "target/topology-evidence/topology-root-boot-stock-soak-build-raw.txt",
+      "raw_log_sha256": "3a4c8698e7e6678ca56cde99f3bf13eb3c2a6eca9199264032732c92649f40b6",
+      "test_results": [],
+      "finished_lines": [
+        "    Finished `soak` profile [optimized] target(s) in 24m 00s\r"
+      ]
+    }
+  ],
+  "red_scope": "Qualified 4a production with two exact new regression sources. Ordinary target checkpoint cleanup remained blocked, and same-map process recovery was rejected after Commit before the first target checkpoint.",
+  "partial_failure_scope": "Ten exact initial repair sources: the cleanup regression passed, while a legacy blanket-pin assertion and the pending-root handoff record validation still failed. The final repair preserves the root stop boundary and permits only an exact committed-root handoff pin.",
+  "green_scope": "Twelve frozen Rust sources. Committed/Activating replacement recovery preserves the complete map and fresh full-roster Release; pre-Commit recovery and graceful drain remain blocked. Target cleanup stops before retained roots and protects their complete state/output closure. Corrupt or missing root state prevents deletion.",
+  "environment": {
+    "cargo_build_jobs": 1,
+    "rust_min_stack_bytes": 4194304,
+    "locked_dependencies": true,
+    "unsafe_or_profile_changes": false
+  },
+  "scope": "Focused verification followed by fail-fast full tests, Clippy, minimal check and stock build. Binary identity and native process qualification are recorded separately."
+}

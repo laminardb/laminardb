@@ -96,7 +96,11 @@ async fn topology_activation_requires_complete_current_roster_then_releases_exac
     assert_eq!(after.version, TOPOLOGY_INSTALLATION_RECORD_VERSION);
     let mut later_checkpoint = input.root().cut.checkpoint.clone();
     later_checkpoint.epoch += 1;
-    assert!(after.topology_cut_blocks_cleanup(&later_checkpoint));
+    assert!(!after.topology_cut_blocks_cleanup(&later_checkpoint));
+    assert_eq!(
+        LeaderLeaseStore::cleanup_stop_before(&after),
+        Some(input.root().cut.checkpoint.clone())
+    );
     assert_eq!(after.commit_head, head.commit_head);
     assert_eq!(after.outcome_head, head.outcome_head);
     assert_eq!(release(&authority, &fixture, &input).await.unwrap(), active);

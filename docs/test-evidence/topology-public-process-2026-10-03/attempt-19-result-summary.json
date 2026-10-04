@@ -1,0 +1,54 @@
+{
+  "recorded_utc": "2026-10-04T07:04:34.806938+00:00",
+  "run_id": "613648-1791097159338849800",
+  "test": "three_node_alo_public_topology_migration_restart_soak",
+  "test_exit_code": 101,
+  "test_elapsed_seconds": 284.86,
+  "requested_kills": 3,
+  "compiler_idle": true,
+  "server_sha256": "a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c",
+  "harness_sha256": "cbdf3983b4f0b7c14eeb9e7d56a02d22010476098722f2a132a06375ad11d113",
+  "max_sampled_combined_rss_bytes": 529711104,
+  "copied_phase_evidence": [
+    {
+      "file": "attempt-19-public-topology-2-active.json",
+      "sha256": "e3cd3631e9ed4da2a0ab3fb7c3fecde7d3950a5867f991bdea81e304cd2c9058"
+    },
+    {
+      "file": "attempt-19-public-topology-2-submission-phase-observations.json",
+      "sha256": "f1bf1430a8118091dcbbec19d590bc342b750a006b7f11d8c3b4431bc9575f3e"
+    },
+    {
+      "file": "attempt-19-public-topology-3-active.json",
+      "sha256": "6010238757d09b9e174c770f1be27ef01caf62992be350d32084ce4d76036dd3"
+    },
+    {
+      "file": "attempt-19-public-topology-3-kill-1-phase-observations.json",
+      "sha256": "7dd2581e4c7712dfb08cadcd9c1cd5d090c643b89f4eb4a05a4580ac92f810da"
+    },
+    {
+      "file": "attempt-19-public-topology-3-kill-2-phase-observations.json",
+      "sha256": "04f2e81f80a6afe1bc1ea256ca56864cc90fbb59257b5d7786ec88a73e6fc310"
+    },
+    {
+      "file": "attempt-19-public-topology-3-submission-phase-observations.json",
+      "sha256": "f083fd6f5fde7ada40bc8755ec7d9c5f29e0861352fccba4afde804c04b7077a"
+    },
+    {
+      "file": "attempt-19-public-topology-kill-1.json",
+      "sha256": "d0dbabc733073ea0eb33c3197108a282de007021d7caf6490f5bf780bfab3ed8"
+    },
+    {
+      "file": "attempt-19-public-topology-kill-2.json",
+      "sha256": "b9470a6bce24ffa233a222f6232876ae7a62135ad50d22ceac68f8f0b75d1df4"
+    },
+    {
+      "file": "attempt-19-public-topology-observations.json",
+      "sha256": "55abca817d2cf1eb79ce604f478457949e75e96484afd7d2407e2c33d0390ae3"
+    }
+  ],
+  "passing_final_oracles": false,
+  "allocation_events": null,
+  "queue_depth": null,
+  "scope": "Original public topology harness and its unchanged final stateful, sink and sequence oracles. Failures remain failures; completed zero-kill cold recovery and repeated kills are separately identified."
+}

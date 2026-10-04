@@ -397,3 +397,61 @@ async fn topology_recovery_selection_checkpoint_transition_requires_exact_releas
     assert_eq!(authority.load_record().await.unwrap(), before);
     assert!(target.validate_predecessor_index(&fixture.index).is_err());
 }
+
+#[tokio::test]
+async fn topology_cleanup_reclaims_target_checkpoints_but_retains_exact_root() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let root = input.root().cut.checkpoint.clone();
+    let (first, _) = target_checkpoint(&authority, &fixture, &input, 2).await;
+    let proof = input.current_leader().unwrap();
+    assert!(authority
+        .begin_cluster_artifact_cleanup(
+            &proof,
+            first.committed_checkpoint.clone().unwrap(),
+            |_| async { Ok(()) }
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let (protected, _) = target_checkpoint(&authority, &fixture, &input, 3).await;
+    target_checkpoint(&authority, &fixture, &input, 4).await;
+    let protected = protected.committed_checkpoint.unwrap();
+    let cursor = authority
+        .begin_cluster_artifact_cleanup(&proof, protected.clone(), |_| async { Ok(()) })
+        .await
+        .unwrap()
+        .expect("obsolete target checkpoint must be reclaimable");
+    assert_eq!(cursor.current, first.committed_checkpoint.unwrap());
+    assert_eq!(cursor.next, Some(root.clone()));
+    assert_eq!(cursor.stop_before, Some(root.clone()));
+    let cursor = authority
+        .mark_cluster_artifact_data_deleted(&proof, &cursor)
+        .await
+        .unwrap();
+    CheckpointDecisionStore::new(authority.store.clone())
+        .delete_committed_checkpoint(&cursor.current)
+        .await
+        .unwrap();
+    assert!(authority
+        .mark_cluster_artifact_metadata_deleted(&proof, &cursor)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(authority
+        .cluster_outcome_with_committed_checkpoint(root.epoch)
+        .await
+        .unwrap()
+        .is_none());
+    let selection = select(&authority, &fixture, input.process()).await.unwrap();
+    assert_eq!(selection.cut(), TopologyRecoveryCut::TargetCheckpoint);
+    assert_eq!(selection.checkpoint().epoch, 4);
+    assert_eq!(selection.migration().checkpoint(), &fixture.index);
+    assert_eq!(
+        CheckpointDecisionStore::new(authority.store.clone())
+            .load_committed_checkpoint(&root)
+            .await
+            .unwrap(),
+        fixture.index
+    );
+}

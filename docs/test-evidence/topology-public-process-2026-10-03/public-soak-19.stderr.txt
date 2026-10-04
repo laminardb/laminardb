@@ -1,0 +1,149 @@
+soak: laminardb executable origin=prebuilt-override path=\\?\C:\Users\sujit\.codex\worktrees\9929\laminardb\target\topology-evidence\laminardb-topology-root-retained-stock-soak.exe sha256=a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c bytes=172193280
+soak: PROFILE mode=cluster delivery=ALO seconds=5 checkpoint_ms=500 checkpoint_timeout_ms=30000 checkpoint_slo_mode=observe hot_path_slo_mode=observe join_interval_ms=100 rps=400 keys=4096 zipf_milli=1200 kills=3 min_live_state_bytes=0 kafka_sink_linger_ms=0
+soak: node logs in C:\Users\sujit\.codex\worktrees\9929\laminardb\target\tmp\soak-613648-1791097159338849800
+soak: node0 generation=1 pid=614956 executable_sha256=a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c
+soak: node1 generation=1 pid=615228 executable_sha256=a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c
+soak: node2 generation=1 pid=615352 executable_sha256=a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c
+soak: cluster up, checkpoint 3 epoch 3, ingested=50839, Kafka committed offset sum=24507
+soak: public exact-inventory adoption d1da722a-e29f-4f75-a939-1308038516ed at sequence 21
+soak: three-node ALO pre-fault temporal history observed idle temporal inputs and committed checkpoint 32 epoch 32
+soak: three-node ALO temporal right history is durable before fault injection
+soak: public topology 1 -> 2 -> 3, independent latest source and downstream existing aggregate, exact pairs 6, target epochs 40 -> 45, additive activation 19.1296275s, consumer-visible 13.4055957s including explicit two-second cut hold
+soak round 1: kill -9 observed leader node 2 inside checkpoint
+soak round 1: kill -9 delivered to leader node 2
+soak: node2 generation=2 pid=614112 executable_sha256=a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c
+soak round 1: replaced leader node 2, full target Release and checkpoint 48 epoch 48 in 43.1936017s
+soak round 2: kill -9 observed follower node 0 inside checkpoint
+soak round 2: kill -9 delivered to follower node 0
+soak: node0 generation=2 pid=616992 executable_sha256=a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c
+soak round 2: replaced follower node 0, full target Release and checkpoint 51 epoch 51 in 31.4747025s
+soak round 3: kill -9 observed follower node 1 inside checkpoint
+soak round 3: kill -9 delivered to follower node 1
+soak: node1 generation=2 pid=617124 executable_sha256=a2eabeadc2c3eb9802ea50c64d6235527e6bbac025647276f73051f225387c6c
+
+thread 'three_node_alo_public_topology_migration_restart_soak' (602192) panicked at crates\laminar-server\tests\cluster_soak.rs:11406:5:
+soak: timed out after 89.8954116s waiting for: full-roster public topology Release
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--- node0 log tail:
+  2026-10-04T07:03:54.318574Z  INFO laminar_db::pipeline_lifecycle::shutdown: Pipeline stopped cleanly
+  2026-10-04T07:03:54.359494Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=14
+  2026-10-04T07:03:54.568771Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:54.850511Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:55.133282Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:55.413640Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:55.588879Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:55.698053Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:55.980723Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:56.264208Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:56.548048Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:56.750294Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T07:03:56.750740Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:56.751135Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:03:56.838476Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:57.125263Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:57.398964Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:57.411394Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:57.698908Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:57.987883Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:58.271749Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:58.556898Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:58.763557Z  INFO laminar_db::pipeline_lifecycle::startup_preparation: Starting pipeline sources=9 sinks=16 streams=26 tables=0 has_external=true
+  2026-10-04T07:03:58.841035Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:59.127538Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:59.229750Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:59.412070Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:59.701728Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:03:59.932013Z  WARN laminar_db::pipeline_lifecycle::reference_tables: Pipeline mixes watermarked and un-watermarked sources. An un-watermarked source in a join/window inherits the global watermark — time-based operators may behave unexpectedly. Add `WATERMARK FOR` to the missing sources or split into separate pipelines. watermarked=8 unwatermarked=1 unwatermarked_names=["topology_live_source"]
+  2026-10-04T07:03:59.932081Z  INFO laminar_db::pipeline_lifecycle::reference_tables: restored checkpoint watermark state sources=8 pipeline_watermark=Some(1791097347887) idle_sources=4
+  2026-10-04T07:03:59.932093Z  INFO laminar_db::pipeline_lifecycle::runtime_launch: Starting event-driven connector pipeline sources=9 sinks=16 streams=26 watermark_sources=8
+  2026-10-04T07:03:59.993115Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:04:00.280894Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:04:00.565848Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:04:00.850450Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:04:00.952171Z ERROR laminar_db::coordinated_recovery: target actors did not certify exact held recovery installation gen=14 error=[LDB-6062] topology operation was fenced by current leader authority
+  2026-10-04T07:04:01.025136Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:04:01.136581Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:04:01.417773Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+  2026-10-04T07:04:01.699268Z  INFO laminardb::http::router: GET /api/v1/cluster/topology -> 503 Service Unavailable (0ms)
+--- node1 log tail:
+  2026-10-04T07:03:38.306570Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:38.306955Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:03:39.206336Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:40.383208Z  INFO laminar_db::pipeline_lifecycle::startup_preparation: Starting pipeline sources=9 sinks=16 streams=26 tables=0 has_external=true
+  2026-10-04T07:03:41.292729Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:41.467394Z  WARN laminar_db::pipeline_lifecycle::reference_tables: Pipeline mixes watermarked and un-watermarked sources. An un-watermarked source in a join/window inherits the global watermark — time-based operators may behave unexpectedly. Add `WATERMARK FOR` to the missing sources or split into separate pipelines. watermarked=8 unwatermarked=1 unwatermarked_names=["topology_live_source"]
+  2026-10-04T07:03:41.467465Z  INFO laminar_db::pipeline_lifecycle::reference_tables: restored checkpoint watermark state sources=8 pipeline_watermark=Some(1791097347887) idle_sources=4
+  2026-10-04T07:03:41.467477Z  INFO laminar_db::pipeline_lifecycle::runtime_launch: Starting event-driven connector pipeline sources=9 sinks=16 streams=26 watermark_sources=8
+  2026-10-04T07:03:43.097739Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:43.279102Z ERROR laminar_db::coordinated_recovery: target actors did not certify exact held recovery installation gen=12 error=[LDB-6062] topology operation was fenced by current leader authority
+  2026-10-04T07:03:44.823695Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:44.879178Z  INFO laminar_db::pipeline_lifecycle::shutdown: Pipeline stopped cleanly
+  2026-10-04T07:03:44.930638Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=13
+  2026-10-04T07:03:46.519623Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:48.303066Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:48.323213Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T07:03:48.323643Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:48.324037Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:03:50.110996Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:50.371480Z  INFO laminar_db::pipeline_lifecycle::startup_preparation: Starting pipeline sources=9 sinks=16 streams=26 tables=0 has_external=true
+  2026-10-04T07:03:51.562002Z  WARN laminar_db::pipeline_lifecycle::reference_tables: Pipeline mixes watermarked and un-watermarked sources. An un-watermarked source in a join/window inherits the global watermark — time-based operators may behave unexpectedly. Add `WATERMARK FOR` to the missing sources or split into separate pipelines. watermarked=8 unwatermarked=1 unwatermarked_names=["topology_live_source"]
+  2026-10-04T07:03:51.562069Z  INFO laminar_db::pipeline_lifecycle::reference_tables: restored checkpoint watermark state sources=8 pipeline_watermark=Some(1791097347887) idle_sources=4
+  2026-10-04T07:03:51.562081Z  INFO laminar_db::pipeline_lifecycle::runtime_launch: Starting event-driven connector pipeline sources=9 sinks=16 streams=26 watermark_sources=8
+  2026-10-04T07:03:52.168815Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:52.453148Z ERROR laminar_db::coordinated_recovery: target actors did not certify exact held recovery installation gen=13 error=[LDB-6062] topology operation was fenced by current leader authority
+  2026-10-04T07:03:53.896581Z  INFO laminar_db::pipeline_lifecycle::shutdown: Pipeline stopped cleanly
+  2026-10-04T07:03:53.898119Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:53.934837Z  WARN laminar_db::coordinated_recovery: stopped for recovery round; awaiting target gen=14
+  2026-10-04T07:03:55.593186Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:56.295233Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T07:03:56.295664Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:56.296093Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:03:57.403927Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:58.345130Z  INFO laminar_db::pipeline_lifecycle::startup_preparation: Starting pipeline sources=9 sinks=16 streams=26 tables=0 has_external=true
+  2026-10-04T07:03:59.234872Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:59.431187Z  WARN laminar_db::pipeline_lifecycle::reference_tables: Pipeline mixes watermarked and un-watermarked sources. An un-watermarked source in a join/window inherits the global watermark — time-based operators may behave unexpectedly. Add `WATERMARK FOR` to the missing sources or split into separate pipelines. watermarked=8 unwatermarked=1 unwatermarked_names=["topology_live_source"]
+  2026-10-04T07:03:59.431245Z  INFO laminar_db::pipeline_lifecycle::reference_tables: restored checkpoint watermark state sources=8 pipeline_watermark=Some(1791097347887) idle_sources=4
+  2026-10-04T07:03:59.431256Z  INFO laminar_db::pipeline_lifecycle::runtime_launch: Starting event-driven connector pipeline sources=9 sinks=16 streams=26 watermark_sources=8
+  2026-10-04T07:04:01.029915Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:04:01.219266Z ERROR laminar_db::coordinated_recovery: target actors did not certify exact held recovery installation gen=14 error=[LDB-6062] topology operation was fenced by current leader authority
+--- node2 log tail:
+  2026-10-04T07:03:51.084074Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:51.084469Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:03:52.173597Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:52.371644Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=13 terminal=false error=[LDB-6061] topology parent conflict: topology installation requires the exact live local shuffle fabric
+  2026-10-04T07:03:52.371715Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=13 attempt=3
+  2026-10-04T07:03:52.371728Z ERROR laminar_db::coordinated_recovery: leader self-restore failed; abandoning round gen=13
+  2026-10-04T07:03:52.371738Z ERROR laminar_db::coordinated_recovery: recovery restore quorum failed gen=13 quorum=TimedOut
+  2026-10-04T07:03:52.426026Z ERROR laminar_db::coordinated_recovery: holding intake shut and requesting a fresh recovery round gen=13 restore_quorum=false
+  2026-10-04T07:03:52.512939Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=11
+  2026-10-04T07:03:52.529298Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=11
+  2026-10-04T07:03:53.112954Z  WARN laminar_db::coordinated_recovery: leader announced recovery prepare gen=14
+  2026-10-04T07:03:53.113241Z  WARN laminar_db::coordinated_recovery: leader Prepare quiesced gen=14
+  2026-10-04T07:03:53.902420Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:54.414624Z  WARN laminar_db::coordinated_recovery: leader stop quorum reached gen=14
+  2026-10-04T07:03:54.934535Z  WARN laminar_db::coordinated_recovery: leader target selected gen=14
+  2026-10-04T07:03:55.124546Z  WARN laminar_db::coordinated_recovery: leader announced recovery start target_epoch=52 checkpoint_id=52 participants=3 gen=14
+  2026-10-04T07:03:55.597198Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:55.714625Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T07:03:55.715039Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:55.715430Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:03:56.972907Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=14 terminal=false error=[LDB-6061] topology parent conflict: topology installation requires the exact live local shuffle fabric
+  2026-10-04T07:03:56.972989Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=14 attempt=1
+  2026-10-04T07:03:57.408296Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:57.659846Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T07:03:57.660284Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:57.660676Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:03:58.868095Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=14 terminal=false error=[LDB-6061] topology parent conflict: topology installation requires the exact live local shuffle fabric
+  2026-10-04T07:03:58.868409Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=14 attempt=2
+  2026-10-04T07:03:59.239712Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
+  2026-10-04T07:03:59.528379Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_hop window_type=Sliding
+  2026-10-04T07:03:59.528853Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_session window_type=Session
+  2026-10-04T07:03:59.529254Z  INFO laminar_db::operator::eowc_query: EOWC operator: initialized core window state query=soak_window_tumble window_type=Tumbling
+  2026-10-04T07:04:00.812168Z  WARN laminar_db::coordinated_recovery: recovery pipeline restart failed gen=14 terminal=false error=[LDB-6061] topology parent conflict: topology installation requires the exact live local shuffle fabric
+  2026-10-04T07:04:00.814589Z  WARN laminar_db::coordinated_recovery: leader self-restore failed; retrying gen=14 attempt=3
+  2026-10-04T07:04:00.814640Z ERROR laminar_db::coordinated_recovery: leader self-restore failed; abandoning round gen=14
+  2026-10-04T07:04:00.814649Z ERROR laminar_db::coordinated_recovery: recovery restore quorum failed gen=14 quorum=TimedOut
+  2026-10-04T07:04:00.851527Z ERROR laminar_db::coordinated_recovery: holding intake shut and requesting a fresh recovery round gen=14 restore_quorum=false
+  2026-10-04T07:04:00.882884Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=12
+  2026-10-04T07:04:00.896731Z  WARN laminar_db::coordinated_recovery::local_faults: reported local fault for coordinated cluster recovery request_ordinal=12
+  2026-10-04T07:04:01.033860Z  INFO laminardb::http::router: GET /metrics -> 200 OK (0ms)
