@@ -805,7 +805,7 @@ impl LaminarDB {
             DbState::Faulted.store(&self.state);
             return Err(error);
         }
-        return match DbState::compare_exchange(DbState::Starting, DbState::Created, &self.state) {
+        match DbState::compare_exchange(DbState::Starting, DbState::Created, &self.state) {
             Ok(_) => Err(error),
             Err(observed) => Err(DbError::Pipeline(format!(
                 "{error}; catalog bootstrap rollback completed but startup was superseded by \
@@ -813,6 +813,6 @@ impl LaminarDB {
                 self.last_fault()
                     .unwrap_or_else(|| "no fault reason was recorded".into())
             ))),
-        };
+        }
     }
 }
