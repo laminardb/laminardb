@@ -468,7 +468,13 @@ impl MigrationProbe {
             ceiling,
             || super::has_full_membership(nodes),
         );
-        self.produce(500);
+        let sent = self.produce(400);
+        for id in 400..403 {
+            // The reset aggregate must retain its first post-reset values across both recoveries.
+            self.expected.insert((id, id * 2));
+            self.input_started.remove(&(id, id));
+            self.input_started.insert((id, id * 2), sent);
+        }
         self.wait_output(nodes, ceiling);
         let after = self.checkpoint(ceiling, version);
         assert!(after.checkpoint_id > before.checkpoint_id && after.epoch > before.epoch);
