@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use laminar_db::{FromBatch, LaminarConfig, LaminarDB, TypedSubscription};
+use laminar_db::{EngineMetrics, FromBatch, LaminarConfig, LaminarDB, TypedSubscription};
 
 #[derive(Clone, Debug)]
 struct CapturedBatch(RecordBatch);
@@ -70,10 +70,15 @@ async fn healthy_rows_with_isolation(isolation: bool) -> usize {
     let config = LaminarConfig {
         storage_dir: Some(dir.path().to_path_buf()),
         shared_source_isolation: isolation,
+        // Execute both siblings in one cycle. A time budget could defer the failing sibling
+        // and publish healthy rows before the shared domain faults.
+        pipeline_query_budget_ns: Some(30_000_000_000),
         ..LaminarConfig::default()
     };
 
     let db = LaminarDB::open_with_config(config).unwrap();
+    let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    db.set_engine_metrics(Arc::clone(&metrics));
     db.execute(
         "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
          WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
@@ -104,7 +109,13 @@ async fn healthy_rows_with_isolation(isolation: bool) -> usize {
             .unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.pipeline_cycle_errors_total.get() == 0 || metrics.events_ingested.get() < 20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both shared-source siblings must process the input and observe the fault");
     let rows = drain_rows(&mut healthy);
     db.shutdown().await.unwrap();
     rows
@@ -113,8 +124,8 @@ async fn healthy_rows_with_isolation(isolation: bool) -> usize {
 #[tokio::test]
 async fn test_shared_source_isolation_keeps_sibling_alive() {
     let rows = healthy_rows_with_isolation(true).await;
-    assert!(
-        rows > 0,
+    assert_eq!(
+        rows, 20,
         "with isolation on, the healthy projection keeps producing while its \
          shared-source aggregation sibling faults every cycle (got {rows} rows)"
     );
