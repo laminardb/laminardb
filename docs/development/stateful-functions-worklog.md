@@ -818,10 +818,45 @@ record-path qualification or cluster admission. Primary references checked on 20
 and [TraceProcessor](https://learn.microsoft.com/en-us/windows/apps/trace-processing/tutorial).
 Evidence is under `target/process-owner-execution-20261005/`.
 
+### Continuation: saved hardware counter analysis (2026-10-05)
+
+The preceding IPC analysis is now complete. Microsoft's standalone
+`Microsoft.Windows.EventTracing.Processing.All` 1.12.10 reads the saved trace
+successfully; the WPA-bundled 1.8.1 reader failed during data-source registration.
+The analysis-only .NET project, package lock and output remain in the ignored
+evidence directory. No runtime source or workspace dependency changed. Primary
+references checked on 2026-10-05: the
+[standalone reader tutorial](https://learn.microsoft.com/en-us/windows/apps/trace-processing/tutorial)
+and [Microsoft package](https://www.nuget.org/packages/Microsoft.Windows.EventTracing.Processing.All/1.12.10).
+
+The reader requires both `InstructionRetired` and `TotalCycles`, filters by the
+actual recorded benchmark PIDs, and divides summed retired instructions by summed
+cycles across each process's context-switch intervals. It rejects missing or
+nonpositive counters. Processing succeeds with `AllowLostEvents` and
+`AllowTimeInversion` both false. Each process includes its benchmark harness and
+initialization; these are process-wide 30-second profiles, not isolated handler
+instructions or representative tail-latency measurements.
+
+| Prepared 64 distinct keys | PID | Instructions | Cycles | Scheduling intervals | IPC |
+|---|---:|---:|---:|---:|---:|
+| Local | 277124 | 542,582,599,826 | 152,287,203,118 | 961 | 3.563 |
+| Private single-owner | 298440 | 503,628,265,522 | 156,098,871,426 | 514 | 3.226 |
+
+Both exceed the repository's 2.0 profiling guideline for this workload on the
+stated dev host. This closes the counter-extraction prerequisite for `edc9f6dd`;
+the distinct-key throughput limitation and closed cluster admission remain.
+The trace SHA-256 is
+`D15DC8982C5E11A50C2278FC5544B7511A303718617A97F7C8F5E019CC490A19`;
+both captured workloads use the preserved final executable SHA-256
+`B28E66A24E348D82F63F0CC3A9D10F8397C58EC54484E2CC9A7691303A59A12F`.
+`ipc-standalone-results.json`, `ipc-standalone-analysis.log`, and the reader source
+record the method and exact totals. The existing Rust gates for `edc9f6dd` remain
+applicable because this continuation changes only the worklog and ignored analysis
+artifacts; no Rust tests or benchmarks were rebuilt or rerun.
+
 ## Next executable task
 
-Resolve the pending hardware counter analysis for this record-path increment.
-Then continue original Phase E through the existing graph
+Continue original Phase E through the existing graph
 lifecycle: ordered cross-node process input and frontiers, followed by actual
 ownership transfer, rescale, node loss and delayed old-owner replies restored
 from a committed shared checkpoint. The process participant now implements
