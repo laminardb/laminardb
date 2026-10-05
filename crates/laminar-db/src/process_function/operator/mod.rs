@@ -41,6 +41,7 @@ struct RegisteredTimer {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct OperatorFrame {
     codec: u32,
     descriptor_sha256: String,
@@ -49,6 +50,9 @@ struct OperatorFrame {
     next_activation_id: u64,
     next_timer_generation: u64,
     watermark_us: i64,
+    #[cfg(feature = "cluster")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shuffle: Option<execution::shuffle::Checkpoint>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -114,9 +118,16 @@ pub(crate) struct ProcessFunctionOperator {
     vnode_transition: transition::ProcessVnodeTransition,
     #[cfg(feature = "cluster")]
     execution: execution::ProcessExecution,
+    #[cfg(feature = "cluster")]
+    shuffle: execution::shuffle::ShuffleState,
 }
 
 impl ProcessFunctionOperator {
+    #[cfg(feature = "benchmark-internals")]
+    pub(crate) fn accepted_activations(&self) -> u64 {
+        self.next_activation_id
+    }
+
     pub(crate) fn new(
         descriptor: ProcessFunctionDescriptor,
         handler: Arc<dyn NativeProcessFunction>,
@@ -198,6 +209,8 @@ impl ProcessFunctionOperator {
             vnode_transition: transition::ProcessVnodeTransition::Idle,
             #[cfg(feature = "cluster")]
             execution: execution::ProcessExecution::Local,
+            #[cfg(feature = "cluster")]
+            shuffle: execution::shuffle::ShuffleState::Unbound,
         })
     }
 

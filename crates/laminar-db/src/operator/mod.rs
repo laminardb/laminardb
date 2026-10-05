@@ -184,6 +184,52 @@ pub(crate) async fn send_shuffle_plan_retaining(
     Result<(), DbError>,
     Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
 ) {
+    send_shuffle_plan_inner(
+        sender,
+        topology,
+        assignment_version,
+        None,
+        outbound,
+        context,
+    )
+    .await
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) async fn send_shuffle_plan_for_generation_retaining(
+    sender: &laminar_core::shuffle::ShuffleSender,
+    topology: Option<laminar_core::shuffle::ShuffleTopologyFence>,
+    assignment_version: u64,
+    recovery_generation: u64,
+    outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
+    context: &str,
+) -> (
+    Result<(), DbError>,
+    Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
+) {
+    send_shuffle_plan_inner(
+        sender,
+        topology,
+        assignment_version,
+        Some(recovery_generation),
+        outbound,
+        context,
+    )
+    .await
+}
+
+#[cfg(feature = "cluster")]
+async fn send_shuffle_plan_inner(
+    sender: &laminar_core::shuffle::ShuffleSender,
+    topology: Option<laminar_core::shuffle::ShuffleTopologyFence>,
+    assignment_version: u64,
+    recovery_generation: Option<u64>,
+    outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
+    context: &str,
+) -> (
+    Result<(), DbError>,
+    Option<Vec<(u64, laminar_core::shuffle::ShuffleMessage)>>,
+) {
     let mut group_indices = rustc_hash::FxHashMap::default();
     let mut peer_groups = Vec::<(u64, Vec<(usize, laminar_core::shuffle::ShuffleMessage)>)>::new();
     for (index, (peer, message)) in outbound.into_iter().enumerate() {
@@ -203,9 +249,15 @@ pub(crate) async fn send_shuffle_plan_retaining(
             let mut admitted_any = false;
             let mut messages = messages.into_iter();
             while let Some((index, message)) = messages.next() {
-                match sender
-                    .send_to_for_topology(peer, assignment_version, topology, &message)
-                    .await
+                match send_shuffle_message(
+                    sender,
+                    peer,
+                    assignment_version,
+                    recovery_generation,
+                    topology,
+                    &message,
+                )
+                .await
                 {
                     Ok(()) => admitted_any = true,
                     Err(error) => {
@@ -266,6 +318,29 @@ pub(crate) async fn send_shuffle_plan_retaining(
         None
     };
     (result, retry_plan)
+}
+
+#[cfg(feature = "cluster")]
+async fn send_shuffle_message(
+    sender: &laminar_core::shuffle::ShuffleSender,
+    peer: u64,
+    assignment_version: u64,
+    recovery_generation: Option<u64>,
+    topology: Option<laminar_core::shuffle::ShuffleTopologyFence>,
+    message: &laminar_core::shuffle::ShuffleMessage,
+) -> std::io::Result<()> {
+    match recovery_generation {
+        Some(generation) => {
+            sender
+                .send_to_for_generation(peer, assignment_version, generation, topology, message)
+                .await
+        }
+        None => {
+            sender
+                .send_to_for_topology(peer, assignment_version, topology, message)
+                .await
+        }
+    }
 }
 
 /// Prepare a physical plan for repeated execution over live source leaves.
@@ -400,7 +475,7 @@ impl LiveSqlCache {
 pub(crate) mod ai_inference;
 pub(crate) mod eowc_query;
 #[cfg(feature = "cluster")]
-mod frontier;
+pub(crate) mod frontier;
 pub(crate) mod interval_join;
 /// Private mutable-input normalization state used only by explicitly configured bounded joins.
 pub(crate) mod interval_join_input;

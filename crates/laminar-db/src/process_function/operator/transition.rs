@@ -63,6 +63,12 @@ impl ProcessVnodeTransition {
 
 impl ProcessFunctionOperator {
     fn validate_transition(&self, transition: &ManagedVnodeTransition<'_>) -> Result<(), DbError> {
+        if !matches!(
+            self.shuffle,
+            super::execution::shuffle::ShuffleState::Unbound
+        ) {
+            return Err(DbError::Unsupported("distributed process frontier transfer requires coordinated reassignment qualification".into()));
+        }
         if !self.vnode_transition.is_idle() || self.checkpoint_drain_pending() {
             return Err(DbError::Checkpoint(
                 "process vnode transition requires finished cleanup and drained invocations".into(),
@@ -174,6 +180,9 @@ impl ProcessFunctionOperator {
                 ));
             }
             let frame = self.decode_metadata(restore.state)?;
+            if frame.shuffle.is_some() {
+                return Err(DbError::Unsupported("distributed process donor frontier transfer requires coordinated reassignment qualification".into()));
+            }
             if watermark.is_some_and(|watermark| watermark != frame.watermark_us) {
                 return Err(DbError::Checkpoint(
                     "process donor watermarks do not describe one drained cut".into(),

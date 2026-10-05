@@ -47,6 +47,27 @@ impl Fixture {
         ttl: Duration,
     ) -> Self {
         let node = NodeId(7);
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            version,
+            &[7; 4],
+            vec![CheckpointParticipant {
+                node_id: 7,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+        Self::for_assignment(authority, node, fence, [7; 4], recovery, ttl).await
+    }
+
+    async fn for_assignment(
+        authority: Arc<ProcessLeaseAuthority>,
+        node: NodeId,
+        fence: CheckpointAssignmentFence,
+        owners: [u64; 4],
+        recovery: u64,
+        ttl: Duration,
+    ) -> Self {
+        let boot = fence.participant_incarnation(node.0).unwrap();
         let store = authority.store_for(node);
         let started = Instant::now();
         let ProcessLeaseOutcome::Acquired(lease) = store.try_acquire(boot, 0).await.unwrap() else {
@@ -86,28 +107,22 @@ impl Fixture {
             .publish_leased_recovery_incarnation(&lease)
             .await
             .unwrap();
-        let fence = CheckpointAssignmentFence::from_owner_map(
-            version,
-            &[7; 4],
-            vec![CheckpointParticipant {
-                node_id: 7,
-                boot_incarnation: boot,
-            }],
-        )
-        .unwrap();
         let registry = Arc::new(VnodeRegistry::single_owner(4, node));
-        registry.set_assignment_and_version(Arc::from([node; 4]), version);
-        let sender = Arc::new(ShuffleSender::new(7, boot));
+        registry.set_assignment_and_version(
+            Arc::from(owners.iter().copied().map(NodeId).collect::<Vec<_>>()),
+            fence.assignment_version,
+        );
+        let sender = Arc::new(ShuffleSender::new(node.0, boot));
         let receiver = Arc::new(
-            ShuffleReceiver::bind(7, "127.0.0.1:0".parse().unwrap(), boot)
+            ShuffleReceiver::bind(node.0, "127.0.0.1:0".parse().unwrap(), boot)
                 .await
                 .unwrap(),
         );
         sender
             .bind_process_lease_deadline_pair(&receiver, deadline)
             .unwrap();
-        sender.install_assignment_fence(&fence, &[7; 4]).unwrap();
-        receiver.install_assignment_fence(&fence, &[7; 4]).unwrap();
+        sender.install_assignment_fence(&fence, &owners).unwrap();
+        receiver.install_assignment_fence(&fence, &owners).unwrap();
         sender.set_recovery_gen(recovery);
         receiver.set_recovery_gen(recovery);
         Self {
@@ -126,10 +141,26 @@ impl Fixture {
 
     fn bind_operator(&self, operator: &mut ProcessFunctionOperator) {
         if matches!(operator.execution, ProcessExecution::Local) {
-            operator.require_cluster_execution().unwrap();
+            operator
+                .require_cluster_execution("activity", tokio::runtime::Handle::current())
+                .unwrap();
         }
         operator
-            .bind_startup_assignment(self.binding.assignment(), &[0, 1, 2, 3])
+            .bind_startup_assignment(
+                self.binding.assignment(),
+                &self
+                    .scope
+                    .registry
+                    .versioned_snapshot()
+                    .owners()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(vnode, owner)| {
+                        (*owner == self.scope.self_id)
+                            .then_some(u32::try_from(vnode).expect("fixture vnode domain fits u32"))
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .unwrap();
         operator
             .bind_process_execution_authority(
@@ -283,7 +314,9 @@ async fn cluster_process_cannot_execute_before_authority_binding_or_transport_ac
     let fixture = Fixture::new(Uuid::from_u128(7), 7, 3, TTL).await;
     let mut operator =
         ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
-    operator.require_cluster_execution().unwrap();
+    operator
+        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .unwrap();
     let before = state_image(&operator);
     assert!(operator
         .process_with_frontiers(&[vec![input_batch(&[("a", 1, 100_000)])]], &frontier(100))
@@ -417,7 +450,7 @@ async fn routing_rejects_input_and_temporary_budget_overflow_before_state_applic
 }
 
 #[tokio::test]
-async fn multi_owner_execution_remains_rejected_before_intake() {
+async fn private_multi_owner_binding_keeps_public_cluster_admission_closed() {
     let fixture = Fixture::new(Uuid::from_u128(7), 7, 3, TTL).await;
     let owners = [7, 7, 8, 8];
     let fence = CheckpointAssignmentFence::from_owner_map(
@@ -450,16 +483,26 @@ async fn multi_owner_execution_remains_rejected_before_intake() {
         .install_assignment_fence(&fence, &owners)
         .unwrap();
     let binding = InstalledVnodeStateBinding::new(fence, PipelineIdentity::empty()).unwrap();
-    let error = fixture
+    let rejected = fixture
+        .graph(
+            descriptor(),
+            ProcessHandler::Native(Arc::new(AccountActivity)),
+        )
+        .initialize_managed_state()
+        .await
+        .err()
+        .unwrap();
+    assert!(rejected.to_string().contains("not cluster"), "{rejected}");
+    let _private_graph = fixture
         .graph(
             descriptor(),
             ProcessHandler::Native(Arc::new(AccountActivity)),
         )
         .bind_startup_assignment(&binding, &fixture.controller)
-        .err()
         .unwrap();
-    assert!(error.to_string().contains("ordered cross-node"), "{error}");
 }
 
 #[cfg(feature = "process-remote")]
 mod remote;
+
+mod shuffle;

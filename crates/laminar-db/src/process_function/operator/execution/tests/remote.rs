@@ -3,15 +3,15 @@ use crate::process_function::remote::{wire, RemoteProcessClient, RustReferenceWo
 use crate::process_function::ProcessRuntime;
 use tokio_util::sync::CancellationToken;
 
-struct Worker {
+pub(super) struct Worker {
     client: Arc<RemoteProcessClient>,
-    scopes: tokio::sync::mpsc::Receiver<wire::Open>,
+    pub(super) scopes: tokio::sync::mpsc::Receiver<wire::Open>,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<(), DbError>>,
 }
 
 impl Worker {
-    async fn new(
+    pub(super) async fn new(
         binding: ProcessFunctionDescriptor,
         handler: Arc<dyn NativeProcessFunction>,
     ) -> Self {
@@ -36,7 +36,7 @@ impl Worker {
         }
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         self.shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(3), self.task)
             .await
@@ -46,7 +46,7 @@ impl Worker {
     }
 }
 
-fn remote_operator(
+pub(super) fn remote_operator(
     fixture: &Fixture,
     worker: &Worker,
     binding: ProcessFunctionDescriptor,
@@ -130,9 +130,9 @@ async fn real_worker_receives_assignment_and_recovery_for_data_and_timers() {
     worker.stop().await;
 }
 
-struct DelayedActivity {
-    entered: tokio::sync::Notify,
-    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+pub(super) struct DelayedActivity {
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 impl NativeProcessFunction for DelayedActivity {
@@ -261,7 +261,9 @@ async fn lost_owner_reply_is_rejected_and_new_boot_restores_the_selected_state_a
         4,
     )
     .unwrap();
-    operator.require_cluster_execution().unwrap();
+    operator
+        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .unwrap();
     operator
         .restore(OperatorCheckpoint {
             data: metadata.clone(),
@@ -311,7 +313,9 @@ async fn lost_owner_reply_is_rejected_and_new_boot_restores_the_selected_state_a
         4,
     )
     .unwrap();
-    restored.require_cluster_execution().unwrap();
+    restored
+        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .unwrap();
     restored
         .restore(OperatorCheckpoint {
             data: metadata.clone(),
@@ -338,7 +342,9 @@ async fn lost_owner_reply_is_rejected_and_new_boot_restores_the_selected_state_a
         4,
     )
     .unwrap();
-    restored.require_cluster_execution().unwrap();
+    restored
+        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .unwrap();
     restored
         .restore(OperatorCheckpoint { data: metadata })
         .unwrap();

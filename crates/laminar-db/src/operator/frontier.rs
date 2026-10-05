@@ -4,7 +4,7 @@ use crate::operator_graph::InputFrontier;
 
 /// Keeps restored authority monotonic while the upstream observation catches up.
 /// Idle observations and revival inherit the effective frontier already applied by the operator.
-pub(super) fn normalize_restored_local_frontier(
+pub(crate) fn normalize_restored_local_frontier(
     input: InputFrontier,
     installed: InputFrontier,
     effective_floor: Option<i64>,

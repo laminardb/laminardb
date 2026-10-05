@@ -193,6 +193,7 @@ fn native_operator_routing(criterion: &mut Criterion) {
     for (path, mode) in [
         ("local", NativeProcessBenchmarkMode::Local),
         ("single_owner", NativeProcessBenchmarkMode::SingleOwner),
+        ("two_owners", NativeProcessBenchmarkMode::TwoOwners),
     ] {
         for (shape, rows, keys) in [
             ("one_row", 1, 1),

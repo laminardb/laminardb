@@ -38,7 +38,10 @@ impl OperatorGraph {
         let operator = {
             let mut operator = operator;
             if self.cluster_shuffle.is_some() {
-                operator.require_cluster_execution()?;
+                let runtime = self.main_runtime_handle.clone().ok_or_else(|| {
+                    DbError::Config("process shuffle requires a main runtime handle".into())
+                })?;
+                operator.require_cluster_execution(&registration.output_name, runtime)?;
             }
             operator
         };

@@ -1,4 +1,4 @@
-//! Live process execution under a pinned, single-owner cluster assignment.
+//! Live process execution under a pinned cluster assignment.
 
 use std::sync::Arc;
 
@@ -14,8 +14,12 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 
 pub(super) enum ProcessExecution {
     Local,
-    AwaitingAssignment,
+    AwaitingAssignment {
+        stage: String,
+        runtime: tokio::runtime::Handle,
+    },
     SingleOwner(ProcessExecutionAuthority),
+    Distributed(ProcessExecutionAuthority),
 }
 
 pub(super) struct ProcessExecutionAuthority {
@@ -26,6 +30,13 @@ pub(super) struct ProcessExecutionAuthority {
 }
 
 impl ProcessExecutionAuthority {
+    pub(super) fn is_distributed(&self) -> bool {
+        self.assignment
+            .owners()
+            .iter()
+            .any(|owner| *owner != self.config.self_id)
+    }
+
     pub(super) fn bind(
         config: &ClusterShuffleConfig,
         fence: &CheckpointAssignmentFence,
@@ -48,16 +59,6 @@ impl ProcessExecutionAuthority {
         {
             return Err(DbError::Checkpoint(
                 "process execution authority differs from its installed assignment or incarnation"
-                    .into(),
-            ));
-        }
-        if assignment
-            .owners()
-            .iter()
-            .any(|owner| *owner != config.self_id)
-        {
-            return Err(DbError::Unsupported(
-                "multi-owner process input requires ordered cross-node shuffle qualification"
                     .into(),
             ));
         }
@@ -111,23 +112,30 @@ impl ProcessExecutionAuthority {
 }
 
 impl ProcessFunctionOperator {
-    pub(crate) fn require_cluster_execution(&mut self) -> Result<(), DbError> {
+    pub(crate) fn require_cluster_execution(
+        &mut self,
+        stage: &str,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<(), DbError> {
         if !matches!(self.execution, ProcessExecution::Local) || self.next_activation_id != 0 {
             return Err(DbError::Checkpoint(
                 "cluster process execution must be selected before input".into(),
             ));
         }
-        self.execution = ProcessExecution::AwaitingAssignment;
+        self.execution = ProcessExecution::AwaitingAssignment {
+            stage: stage.to_owned(),
+            runtime,
+        };
         Ok(())
     }
 
     pub(super) fn require_execution_current(&self) -> Result<(), DbError> {
         match &self.execution {
             ProcessExecution::Local => Ok(()),
-            ProcessExecution::AwaitingAssignment => Err(DbError::ShuffleNotReady(
+            ProcessExecution::AwaitingAssignment { .. } => Err(DbError::ShuffleNotReady(
                 "process execution has no startup authority binding".into(),
             )),
-            ProcessExecution::SingleOwner(authority) => {
+            ProcessExecution::SingleOwner(authority) | ProcessExecution::Distributed(authority) => {
                 if self
                     .assignment_fence
                     .as_ref()
@@ -147,12 +155,16 @@ impl ProcessFunctionOperator {
     pub(super) fn execution_generations(&self) -> Result<(u64, u64), DbError> {
         self.require_execution_current()?;
         match &self.execution {
-            ProcessExecution::SingleOwner(authority) => Ok((
-                authority.assignment.version(),
-                authority.recovery_generation,
-            )),
+            ProcessExecution::SingleOwner(authority) | ProcessExecution::Distributed(authority) => {
+                Ok((
+                    authority.assignment.version(),
+                    authority.recovery_generation,
+                ))
+            }
             ProcessExecution::Local => Ok((0, 0)),
-            ProcessExecution::AwaitingAssignment => unreachable!("unbound execution was rejected"),
+            ProcessExecution::AwaitingAssignment { .. } => {
+                unreachable!("unbound execution was rejected")
+            }
         }
     }
 
@@ -164,7 +176,7 @@ impl ProcessFunctionOperator {
         let ProcessExecution::SingleOwner(authority) = &self.execution else {
             return Ok(None);
         };
-        let input_bytes = self.validate_routed_input(inputs)?;
+        let input_bytes = self.validate_routed_batches(inputs.iter().flatten())?;
         let mut routed = Vec::new();
         let mut routed_bytes = 0usize;
         for batch in inputs.iter().flatten() {
@@ -239,10 +251,13 @@ impl ProcessFunctionOperator {
         Ok(Some(routed))
     }
 
-    fn validate_routed_input(&self, inputs: &[Vec<RecordBatch>]) -> Result<usize, DbError> {
+    pub(super) fn validate_routed_batches<'a>(
+        &self,
+        batches: impl IntoIterator<Item = &'a RecordBatch>,
+    ) -> Result<usize, DbError> {
         let mut rows = 0usize;
         let mut bytes = 0usize;
-        for batch in inputs.iter().flatten() {
+        for batch in batches {
             rows = rows.checked_add(batch.num_rows()).ok_or_else(|| {
                 DbError::BackpressureFail("process input row count overflow".into())
             })?;
@@ -259,7 +274,7 @@ impl ProcessFunctionOperator {
                 ));
             }
             if batch.schema().as_ref() != self.descriptor.input_schema.as_ref() {
-                return Err(DbError::InvalidOperation(
+                return Err(DbError::ShuffleTerminal(
                     "process function input schema changed after registration".into(),
                 ));
             }
@@ -267,7 +282,7 @@ impl ProcessFunctionOperator {
                 .column(self.time_index)
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| DbError::InvalidOperation("invalid event-time array".into()))?;
+                .ok_or_else(|| DbError::ShuffleTerminal("invalid event-time array".into()))?;
             for row in 0..batch.num_rows() {
                 if self
                     .key_indices
@@ -276,7 +291,7 @@ impl ProcessFunctionOperator {
                     || time.is_null(row)
                     || time.value(row) < self.watermark_us
                 {
-                    return Err(DbError::InvalidOperation(
+                    return Err(DbError::ShuffleTerminal(
                         "process function rejects null keys, null event time, or late input".into(),
                     ));
                 }
@@ -288,3 +303,5 @@ impl ProcessFunctionOperator {
 
 #[cfg(test)]
 mod tests;
+
+pub(super) mod shuffle;

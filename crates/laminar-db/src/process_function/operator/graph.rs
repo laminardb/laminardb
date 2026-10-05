@@ -24,8 +24,14 @@ impl GraphOperator for ProcessFunctionOperator {
         let (prepared, retired) = self.vnode_transition.accounting();
         #[cfg(not(feature = "cluster"))]
         let (prepared, retired) = (0, 0);
+        #[cfg(feature = "cluster")]
+        let live = self
+            .live_bytes
+            .saturating_add(self.shuffle.retained_bytes());
+        #[cfg(not(feature = "cluster"))]
+        let live = self.live_bytes;
         Some(ManagedStateAccountingSnapshot {
-            live: self.live_bytes,
+            live,
             prepared,
             retired,
         })
@@ -104,7 +110,7 @@ impl GraphOperator for ProcessFunctionOperator {
     ) -> Result<(), DbError> {
         if !matches!(
             self.execution,
-            super::execution::ProcessExecution::AwaitingAssignment
+            super::execution::ProcessExecution::AwaitingAssignment { .. }
         ) || !self.vnode_transition.is_idle()
             || self.checkpoint_drain_pending()
         {
@@ -117,7 +123,51 @@ impl GraphOperator for ProcessFunctionOperator {
         })?;
         let authority =
             super::execution::ProcessExecutionAuthority::bind(config, assignment, deadline)?;
-        self.execution = super::execution::ProcessExecution::SingleOwner(authority);
+        if authority.is_distributed() {
+            if self.metadata_restored
+                && matches!(
+                    self.shuffle,
+                    super::execution::shuffle::ShuffleState::Unbound
+                )
+            {
+                return Err(DbError::Checkpoint(
+                    "distributed process restore requires persisted shuffle frontiers".into(),
+                ));
+            }
+            let super::execution::ProcessExecution::AwaitingAssignment { stage, runtime } =
+                &self.execution
+            else {
+                unreachable!("validated unbound process execution");
+            };
+            let shuffle = super::execution::shuffle::ProcessShuffle::new(
+                stage.clone(),
+                runtime.clone(),
+                &authority,
+                &self.shuffle,
+            )?;
+            if self
+                .live_bytes
+                .saturating_add(self.shuffle.retained_bytes())
+                .saturating_add(shuffle.retained_bytes())
+                > self.graph_budget
+            {
+                return Err(DbError::Checkpoint(
+                    "process shuffle startup exceeds its retained-state budget".into(),
+                ));
+            }
+            self.shuffle = super::execution::shuffle::ShuffleState::Active(Box::new(shuffle));
+            self.execution = super::execution::ProcessExecution::Distributed(authority);
+        } else {
+            if !matches!(
+                self.shuffle,
+                super::execution::shuffle::ShuffleState::Unbound
+            ) {
+                return Err(DbError::Checkpoint(
+                    "process shuffle restore cannot discard its distributed frontier roster".into(),
+                ));
+            }
+            self.execution = super::execution::ProcessExecution::SingleOwner(authority);
+        }
         Ok(())
     }
 
@@ -152,6 +202,13 @@ impl GraphOperator for ProcessFunctionOperator {
             ));
         }
         #[cfg(feature = "cluster")]
+        if matches!(
+            self.execution,
+            super::execution::ProcessExecution::Distributed(_)
+        ) {
+            return self.process_shuffled(inputs, frontiers[0]);
+        }
+        #[cfg(feature = "cluster")]
         let routed = self
             .route_owned_input(inputs)
             .map_err(|error| {
@@ -169,43 +226,15 @@ impl GraphOperator for ProcessFunctionOperator {
             .map(|batches| [batches]);
         #[cfg(feature = "cluster")]
         let inputs = routed.as_ref().map_or(inputs, |ports| ports.as_slice());
-        #[cfg(feature = "process-remote")]
-        if matches!(&self.handler, ProcessHandler::Remote(_)) {
-            return self.process_remote(inputs, frontiers);
-        }
-        let start_id = self.next_activation_id;
-        let old_watermark = self.watermark_us;
-        let mut output = Vec::new();
-        let mut rows = 0;
-        let mut bytes = 0;
-        let outcome = (|| {
-            self.process_rows(inputs, &mut output, &mut rows, &mut bytes)?;
-            if let Some(watermark_ms) = frontiers[0].watermark {
-                self.watermark_us = self.watermark_us.max(watermark_ms.saturating_mul(1_000));
-            }
-            self.fire_due_timers(&mut output, &mut rows, &mut bytes)
-        })();
-        if let Err(error) = outcome {
-            if self.next_activation_id != start_id {
-                return Err(DbError::StatefulOperatorPartialApply(format!(
-                    "process function accepted earlier activations before failure; recover from the committed checkpoint: {error}"
-                )));
-            }
-            self.watermark_us = old_watermark;
-            return Err(
-                if error.requires_pipeline_halt() || error.requires_pipeline_recovery() {
-                    error
-                } else {
-                    DbError::PipelineTerminal(format!(
-                        "process function rejected an activation: {error}"
-                    ))
-                },
-            );
-        }
-        Ok(output)
+        self.apply_process_step(inputs, frontiers[0])
     }
 
     fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        #[cfg(feature = "cluster")]
+        let input = self
+            .shuffle
+            .active()
+            .map_or(input, super::execution::shuffle::ProcessShuffle::frontier);
         let mut output = input;
         #[cfg(feature = "process-remote")]
         if let Some(held_time_us) = self
@@ -227,6 +256,14 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn deferred_work_is_runnable(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        if self
+            .shuffle
+            .active()
+            .is_some_and(super::execution::shuffle::ProcessShuffle::runnable)
+        {
+            return true;
+        }
         let due_now = self
             .due
             .first()
@@ -239,6 +276,14 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn wants_input(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        if self
+            .shuffle
+            .active()
+            .is_some_and(super::execution::shuffle::ProcessShuffle::pending)
+        {
+            return false;
+        }
         #[cfg(feature = "process-remote")]
         if let Some(remote) = &self.remote {
             return !remote.is_pending();
@@ -247,6 +292,14 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn checkpoint_drain_pending(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        if self
+            .shuffle
+            .active()
+            .is_some_and(super::execution::shuffle::ProcessShuffle::pending)
+        {
+            return true;
+        }
         #[cfg(feature = "process-remote")]
         if let Some(remote) = &self.remote {
             return remote.is_pending();
@@ -258,10 +311,43 @@ impl GraphOperator for ProcessFunctionOperator {
         true
     }
 
+    #[cfg(feature = "cluster")]
+    fn restored_output_frontier(&self) -> Option<InputFrontier> {
+        self.metadata_restored.then(|| {
+            self.output_frontier(InputFrontier {
+                watermark: (self.watermark_us != i64::MIN)
+                    .then_some(self.watermark_us.div_euclid(1_000)),
+                idle: false,
+            })
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle(
+        &mut self,
+        stage: &str,
+        batch: crate::operator::RetainedBatch,
+        _watermark: i64,
+    ) -> Result<(), DbError> {
+        self.retain_shuffle_data(stage, batch)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle_frontier(
+        &mut self,
+        stage: &str,
+        peer: u64,
+        frontier: InputFrontier,
+        assignment_version: u64,
+        recovery_gen: u64,
+    ) -> Result<(), DbError> {
+        self.retain_shuffle_frontier(stage, peer, frontier, assignment_version, recovery_gen)
+    }
+
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         if self.checkpoint_drain_pending() {
             return Err(DbError::Checkpoint(
-                "process worker invocation must drain before checkpoint capture".into(),
+                "process input and worker invocations must drain before checkpoint capture".into(),
             ));
         }
         let frame = self.checkpoint_frame();
@@ -295,9 +381,24 @@ impl GraphOperator for ProcessFunctionOperator {
             ));
         }
         let frame = self.decode_metadata(&checkpoint.data)?;
+        #[cfg(feature = "cluster")]
+        if frame.shuffle.is_some()
+            && !matches!(
+                self.execution,
+                super::execution::ProcessExecution::AwaitingAssignment { .. }
+            )
+        {
+            return Err(DbError::Checkpoint(
+                "distributed process restore requires cluster execution selection".into(),
+            ));
+        }
         self.next_activation_id = frame.next_activation_id;
         self.next_timer_generation = frame.next_timer_generation;
         self.watermark_us = frame.watermark_us;
+        #[cfg(feature = "cluster")]
+        if let Some(shuffle) = frame.shuffle {
+            self.shuffle = super::execution::shuffle::ShuffleState::Restored(Box::new(shuffle));
+        }
         self.metadata_restored = true;
         Ok(())
     }
@@ -377,6 +478,11 @@ impl GraphOperator for ProcessFunctionOperator {
             .limits
             .max_state_bytes
             .min(self.graph_budget);
+        #[cfg(feature = "cluster")]
+        let state_limit = state_limit.min(
+            self.graph_budget
+                .saturating_sub(self.shuffle.retained_bytes()),
+        );
         let remaining_state_bytes = state_limit.checked_sub(self.live_bytes).ok_or_else(|| {
             DbError::Checkpoint("process restored state exceeds its budget".into())
         })?;
@@ -442,9 +548,61 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 }
 
+impl ProcessFunctionOperator {
+    #[cfg(feature = "cluster")]
+    pub(super) fn worker_pending(&self) -> bool {
+        #[cfg(feature = "process-remote")]
+        if let Some(remote) = &self.remote {
+            return remote.is_pending();
+        }
+        false
+    }
+
+    pub(super) fn apply_process_step(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        frontier: InputFrontier,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        #[cfg(feature = "process-remote")]
+        if matches!(&self.handler, ProcessHandler::Remote(_)) {
+            return self.process_remote(inputs, &[frontier]);
+        }
+        let start_id = self.next_activation_id;
+        let old_watermark = self.watermark_us;
+        let mut output = Vec::new();
+        let mut rows = 0;
+        let mut bytes = 0;
+        let outcome = (|| {
+            self.process_rows(inputs, &mut output, &mut rows, &mut bytes)?;
+            if let Some(watermark_ms) = frontier.watermark {
+                self.watermark_us = self.watermark_us.max(watermark_ms.saturating_mul(1_000));
+            }
+            self.fire_due_timers(&mut output, &mut rows, &mut bytes)
+        })();
+        if let Err(error) = outcome {
+            if self.next_activation_id != start_id {
+                return Err(DbError::StatefulOperatorPartialApply(format!(
+                    "process function accepted earlier activations before failure; recover from the committed checkpoint: {error}"
+                )));
+            }
+            self.watermark_us = old_watermark;
+            return Err(
+                if error.requires_pipeline_halt() || error.requires_pipeline_recovery() {
+                    error
+                } else {
+                    DbError::PipelineTerminal(format!(
+                        "process function rejected an activation: {error}"
+                    ))
+                },
+            );
+        }
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{VnodeCapture, MAX_OPERATOR_FRAME_BYTES};
+    use super::VnodeCapture;
     use crate::process_function::operator::{KeyState, OperatorFrame, VnodeFrame};
     use crate::process_function::{ValueState, STATE_CODEC_VERSION};
 
@@ -458,8 +616,13 @@ mod tests {
             next_activation_id: u64::MAX,
             next_timer_generation: u64::MAX,
             watermark_us: i64::MIN,
+            #[cfg(feature = "cluster")]
+            shuffle: None,
         };
-        assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_OPERATOR_FRAME_BYTES);
+        assert!(
+            serde_json::to_vec(&frame).unwrap().len()
+                <= super::super::restoration::MAX_LOCAL_METADATA_FRAME_BYTES
+        );
     }
 
     #[test]

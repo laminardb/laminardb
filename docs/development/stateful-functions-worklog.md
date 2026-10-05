@@ -854,14 +854,148 @@ record the method and exact totals. The existing Rust gates for `edc9f6dd` remai
 applicable because this continuation changes only the worklog and ignored analysis
 artifacts; no Rust tests or benchmarks were rebuilt or rerun.
 
+### Continuation: ordered cross-node process input (2026-10-05)
+
+This increment starts from `283755a1441374b4b466c14007e9a5d5b064d001` on the
+existing branch, with Rust/Cargo 1.99.0 and unchanged workspace dependencies.
+Private multi-owner execution now uses the existing graph shuffle hooks,
+canonical vnode router, transport admission credits and remote worker scheduler.
+One bounded queue retains graph-delivered peer batches/frontiers; one background
+send task owns a local input cut until every peer's admission outcome is known.
+Safe pre-admission failures retain the same send plan for a later graph cycle;
+partial/uncertain sends require recovery. Queued retries remain runnable.
+
+Frontiers follow earlier data on each peer channel. The effective frontier waits
+for input application and worker completion; cached minimum batch times hold
+output progress without rescanning Arrow rows. Idle channels require ordered
+revival. Stage, canonical routes, ownership, assignment, process lease, topology
+and recovery generation are checked before retention and application. Invalid
+input schema/key/time is terminal; resource failures retain the existing recovery
+classification. A send future pins recovery before it is scheduled, so an old
+plan cannot acquire a newer generation's stream or sequence.
+
+Drained metadata records the exact assignment/digest, node and applied peer/local
+frontiers. Same-assignment restore under a newer recovery generation rebroadcasts
+the local frontier before intake and preserves state, timers and activation
+progress. Distributed metadata cannot be installed into local execution. Local
+serialized metadata is unchanged and remains bounded to 512 bytes;
+cluster-enabled decoding has a 256 KiB ceiling for the peer roster and rejects
+oversized local frames. Builds without cluster support keep the original
+512-byte pre-decode bound. Distributed donor/frontier transfer remains explicitly
+rejected until coordinated reassignment qualification.
+
+Embedded and single-node server execution retain their existing public paths.
+Public single-node cluster and multi-node cluster admission remain closed. These
+tests certify neither deterministic replay across independent source channels nor
+a committed distributed source/state/sink cut. No second scheduler, state backend,
+protocol, SDK or dependency is added.
+
+The unchanged execution baseline passes nine tests. Its first restricted-sandbox
+run passed six but failed three worker connections; the same baseline passes with
+loopback access. The final focused configuration is
+`cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files process_function:: -- --test-threads=1 --quiet`:
+110 passed, one ignored, in 40.11 seconds (159.93 including compilation). Thirteen
+new execution tests cover actual two-peer lease/transport fixtures, canonical
+routing and per-channel key order, frontier/timer ordering, idle revival, retained
+budgets, safe send retry, stale authority, drained restore, mode/assignment/metadata
+rejection, graph barrier draining, and real Rust worker scopes and delayed replies.
+The twelve core topology transport tests pass in 1.22 seconds, including a future
+created before a recovery-generation change. The initial core filter matched zero
+tests; the corrected `topology_transport::` filter is the reported result. A
+no-default-feature test separately verifies the local pre-decode metadata bound.
+
+All required Rust gates pass with `CARGO_BUILD_JOBS=2` and
+`RUST_MIN_STACK=8388608`. The final `cargo test --workspace --lib` passes 6,212:
+1,989 connectors (two ignored), 1,127 core, 2,226 database (two ignored), and 870
+SQL; 427.62 seconds including compilation. Both Clippy configurations pass;
+the final all-feature/all-target source check takes 29.66 seconds, and the
+no-default check 9.77 seconds. Nightly formatting, diff checks and readability
+pass with unchanged 18 module/214 function exceptions. The initial Clippy run
+found an inverted branch and truncating fixture casts; these are corrected.
+Existing native FILES host-loss/replay tests pass. No real-Python environment,
+Kafka/S3 distributed soak or committed distributed process cut is qualified here.
+
+Criterion uses 30 samples, three-second warm-up and seven-second measurement,
+without concurrent builds or tests. The exact preserved starting binary is the
+reference. The optimized build initially reused a stale core artifact missing
+the new method; preserving and moving its release fingerprint forces the affected
+packages to rebuild. Cargo's package-clean command refused the untagged target
+directory. The rebuilt final binary contains all nine direct cases and has SHA-256
+`B3F606AD68E06B55BD5AD1D8BD0B8838A4BAD992D016958E12AEFFC2DA408445`.
+The reference hash remains
+`B28E66A24E348D82F63F0CC3A9D10F8397C58EC54484E2CC9A7691303A59A12F`.
+
+| Existing path | Before mean | After mean | Relative mean change |
+|---|---:|---:|---:|
+| Prepared local, one row | 1.818 us | 1.467 us | -19.32% |
+| Prepared local, 64 distinct keys | 77.813 us | 65.951 us | -15.24% |
+| Prepared local, 64 rows sharing a key | 83.324 us | 70.492 us | -15.40% |
+| Private single-owner, one row | 2.993 us | 2.704 us | -9.66% |
+| Private single-owner, 64 distinct keys | 196.873 us | 176.211 us | -10.50% |
+| Private single-owner, 64 rows sharing a key | 89.728 us | 77.499 us | -13.63% |
+| Source/subscription, one row | 26.538 us | 26.997 us | +1.73% |
+| Source/subscription, 64 distinct keys | 112.963 us | 107.748 us | -4.62% |
+| Source/subscription, 64 rows sharing a key | 111.256 us | 109.764 us | -1.34% |
+| Core tumbling-window assignment | 1.399 ns | 1.407 ns | +0.56% |
+
+No existing-path point regression exceeds 5%. The source/subscription comparisons
+have no statistically detected change; their confidence intervals and outliers
+remain in the evidence. The broad direct-path reductions are observations on this
+host, not an optimization or product-throughput claim.
+
+| New private two-owner topology | Mean |
+|---|---:|
+| One row | 61.901 us |
+| 64 distinct keys | 199.228 us |
+| 64 rows sharing a key | 145.532 us |
+
+The two-owner fixture uses two real loopback endpoints in one current-thread
+runtime, identical prepared keys/handler, unknown frontiers and no timers. It
+measures routing, background transport of remote rows, application and draining;
+it excludes sources/subscriptions, worker RPC, shared checkpoint persistence and
+real multi-process/network latency. There was no admitted path before this task.
+The distinct-key result remains below the 500 K events/s reference rate; these
+means do not establish target-hardware throughput or tail latency.
+
+Fresh hardware profiling completes all three 30-second distinct-key cases from
+the final binary, each with exit code zero, in 111.80 seconds including recording
+and trace cleanup. Only the task-owned recorder is started/stopped; WPR confirms
+it is stopped. The standalone `Microsoft.Windows.EventTracing.Processing.All`
+1.12.10 reader accepts the trace with lost events and time inversion disallowed.
+Weighted IPC is the sum of retired instructions divided by the sum of cycles
+for each actual benchmark PID's scheduling intervals.
+
+| Profile | PID | Retired instructions | Cycles | Intervals | Weighted IPC |
+|---|---:|---:|---:|---:|---:|
+| Local, 64 distinct keys | 318028 | 548,205,921,634 | 151,751,959,699 | 420 | 3.613 |
+| Private single-owner, 64 distinct keys | 349540 | 522,471,043,840 | 163,646,932,146 | 1,297 | 3.193 |
+| Private two-owner, 64 distinct keys | 337396 | 377,561,405,983 | 161,380,132,475 | 1,634 | 2.340 |
+
+All three meet the IPC > 2.0 guideline. The counters include initialization and
+the benchmark harness; they do not isolate handler instructions, certify real
+multi-process cluster load, or establish target-hardware tail latency. The final
+ETL has SHA-256
+`06E60DEFFF5B1EC09DDF664BF83E4AF5EDBB7EF8183E5A86904DEFB60065731E`.
+Its manifest binds the same final executable hash reported above.
+
+The first recorder saves a partial local trace before Windows PowerShell fails
+to retrieve the redirected benchmark's exit code. The
+[upstream handle-caching correction](https://github.com/PowerShell/PowerShell/issues/5421)
+is verified with the same executable's `--list` invocation. A corrected
+administrator launch is canceled by Windows; the approved retry completes the
+full capture. These capture-only repairs change no Rust source or benchmark
+binary. Evidence, exact commands, durations, hashes, Criterion means/intervals
+and capture scripts are under `target/process-shuffle-20261005/`; the partial
+trace, capture failure and its counter analysis remain under `ipc-first-partial/`.
+
 ## Next executable task
 
-Continue original Phase E through the existing graph
-lifecycle: ordered cross-node process input and frontiers, followed by actual
+Continue original Phase E through the existing graph lifecycle: actual
 ownership transfer, rescale, node loss and delayed old-owner replies restored
 from a committed shared checkpoint. The process participant now implements
 staged state/timer replacement, cold startup assignment binding and private
-single-owner intake/result fencing. Its frame-restoration and CAS-takeover tests
+single-owner intake/result fencing and private ordered cross-node input. Its
+frame-restoration and CAS-takeover tests
 do not certify a committed distributed cut or live vnode publication. Keep both
 cluster forms closed until their actual lifecycle tests pass. Do not add a second
 scheduler or state backend. Coordinator/core changes require the repository's

@@ -177,9 +177,64 @@ impl ShuffleSender {
             Some(expected_assignment_version),
             None,
             topology,
+            None,
         )
         .await
     }
+
+    /// Send under the exact routing assignment, recovery generation, and graph topology.
+    /// A retained pre-recovery plan cannot acquire a stream in a newer recovery generation.
+    ///
+    /// # Errors
+    /// Rejects a stale generation before connection or sequence allocation, plus ordinary send errors.
+    pub async fn send_to_for_generation(
+        &self,
+        peer: ShufflePeerId,
+        assignment_version: u64,
+        recovery_generation: u64,
+        topology: Option<ShuffleTopologyFence>,
+        message: &ShuffleMessage,
+    ) -> io::Result<()> {
+        self.send_to_inner(
+            peer,
+            message,
+            Some(assignment_version),
+            None,
+            topology,
+            Some(recovery_generation),
+        )
+        .await
+    }
+
+    pub(super) fn current_send_scope(
+        &self,
+        assignment: Option<u64>,
+        topology: Option<ShuffleTopologyFence>,
+        recovery: Option<u64>,
+    ) -> io::Result<ScopeLease> {
+        let scope = self.current_scope(assignment, topology)?;
+        if recovery.is_some_and(|expected| expected != scope.recovery_gen) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "shuffle send plan belongs to a stale recovery generation",
+            ));
+        }
+        Ok(scope)
+    }
+}
+
+pub(super) fn outbound_admission_bytes(
+    message: &ShuffleMessage,
+    assignment_fence: Option<&CheckpointAssignmentFence>,
+) -> io::Result<usize> {
+    let bytes = outbound_workspace_bytes(message)?;
+    if matches!(message, ShuffleMessage::Barrier(_)) && assignment_fence.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "shuffle checkpoint barriers require an admitted assignment certificate",
+        ));
+    }
+    Ok(bytes)
 }
 
 impl ShuffleReceiver {
@@ -233,6 +288,20 @@ impl ShuffleSender {
             recovery_gen,
             cancel,
         })
+    }
+
+    pub(super) fn validate_expected_assignment(&self, expected: Option<u64>) -> io::Result<()> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let current = self.assignment_version.load(Ordering::Acquire);
+        if expected != 0 && expected == current {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("shuffle assignment scope mismatch: routed at {expected}, sender at {current}"),
+        ))
     }
 }
 

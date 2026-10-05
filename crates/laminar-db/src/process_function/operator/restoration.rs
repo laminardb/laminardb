@@ -9,8 +9,12 @@ use super::{charged_key, DueTimer, KeyState, OperatorFrame, ProcessFunctionOpera
 use crate::error::DbError;
 use crate::process_function::STATE_CODEC_VERSION;
 
-// Metadata has fixed fields, a 64-byte digest, and bounded integer widths.
-pub(super) const MAX_OPERATOR_FRAME_BYTES: usize = 512;
+// Distributed metadata adds a bounded participant/frontier roster. Pending input drains first.
+#[cfg(feature = "cluster")]
+pub(super) const MAX_OPERATOR_FRAME_BYTES: usize = 256 * 1_024;
+pub(super) const MAX_LOCAL_METADATA_FRAME_BYTES: usize = 512;
+#[cfg(not(feature = "cluster"))]
+pub(super) const MAX_OPERATOR_FRAME_BYTES: usize = MAX_LOCAL_METADATA_FRAME_BYTES;
 
 pub(super) struct RestoredVnode {
     pub(super) state: FxHashMap<Vec<u8>, KeyState>,
@@ -28,6 +32,8 @@ impl ProcessFunctionOperator {
             next_activation_id: self.next_activation_id,
             next_timer_generation: self.next_timer_generation,
             watermark_us: self.watermark_us,
+            #[cfg(feature = "cluster")]
+            shuffle: self.shuffle.checkpoint(),
         }
     }
 
@@ -39,6 +45,12 @@ impl ProcessFunctionOperator {
         }
         let frame: OperatorFrame = serde_json::from_slice(bytes)
             .map_err(|error| DbError::Checkpoint(format!("decode process checkpoint: {error}")))?;
+        #[cfg(feature = "cluster")]
+        if frame.shuffle.is_none() && bytes.len() > MAX_LOCAL_METADATA_FRAME_BYTES {
+            return Err(DbError::Checkpoint(
+                "process metadata frame exceeds its local size bound".into(),
+            ));
+        }
         if frame.codec != STATE_CODEC_VERSION
             || frame.descriptor_sha256 != self.descriptor_sha256
             || frame.partitioning_abi != PARTITIONING_ABI_VERSION
@@ -47,6 +59,15 @@ impl ProcessFunctionOperator {
             return Err(DbError::Checkpoint(
                 "process function checkpoint binding or state codec mismatch".into(),
             ));
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(shuffle) = &frame.shuffle {
+            shuffle.validate(self.vnode_count.get(), frame.watermark_us)?;
+            if shuffle.retained_bytes().saturating_add(self.live_bytes) > self.graph_budget {
+                return Err(DbError::Checkpoint(
+                    "process shuffle restore exceeds its retained-state budget".into(),
+                ));
+            }
         }
         Ok(frame)
     }

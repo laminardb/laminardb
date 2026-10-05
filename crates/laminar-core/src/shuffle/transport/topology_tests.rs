@@ -31,6 +31,27 @@ async fn receive(receiver: &ShuffleReceiver) -> ReceivedShuffle {
 }
 
 #[tokio::test]
+async fn queued_send_cannot_acquire_the_next_recovery_generation() {
+    let (first, _local, _second, remote) = fabrics().await;
+    let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(10));
+    let old_plan = first.send_to_for_generation(2, 1, 0, None, &message);
+    first.set_recovery_gen(1);
+    remote.set_recovery_gen(1);
+    let error = old_plan.await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    assert!(!shuffle_send_may_have_been_admitted(&error));
+    assert!(remote.drain_checkpointed_staged().is_empty());
+    first
+        .send_to_for_generation(2, 1, 1, None, &message)
+        .await
+        .unwrap();
+    let received = receive(&remote).await;
+    assert_eq!(received.recovery_gen(), 1);
+    assert_eq!(received.checkpoint_sequence(), 0);
+    assert_eq!(received.message(), &message);
+}
+
+#[tokio::test]
 async fn topology_transport_reconnect_and_identical_install_preserve_sequence_domain() {
     let (first, local, second, remote) = fabrics().await;
     let topology = target();

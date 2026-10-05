@@ -2455,7 +2455,7 @@ mod grpc {
         /// Returns `io::Error` when the peer is unregistered/undiscoverable, the
         /// endpoint cannot be built, or the per-peer stream has shut down.
         pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
-            self.send_to_inner(peer, msg, None, None, None).await
+            self.send_to_inner(peer, msg, None, None, None, None).await
         }
 
         /// Send only while the sender remains in `expected_assignment_version`.
@@ -2472,8 +2472,15 @@ mod grpc {
             expected_assignment_version: u64,
             msg: &ShuffleMessage,
         ) -> io::Result<()> {
-            self.send_to_inner(peer, msg, Some(expected_assignment_version), None, None)
-                .await
+            self.send_to_inner(
+                peer,
+                msg,
+                Some(expected_assignment_version),
+                None,
+                None,
+                None,
+            )
+            .await
         }
 
         async fn send_to_inner(
@@ -2483,6 +2490,7 @@ mod grpc {
             expected_assignment_version: Option<u64>,
             assignment_fence: Option<&CheckpointAssignmentFence>,
             topology: Option<ShuffleTopologyFence>,
+            expected_recovery_generation: Option<u64>,
         ) -> io::Result<()> {
             if peer == 0 || peer == self.local_id {
                 return Err(io::Error::new(
@@ -2490,14 +2498,12 @@ mod grpc {
                     "shuffle peer must be a different assigned node",
                 ));
             }
-            let admission_bytes = outbound_workspace_bytes(msg)?;
-            if matches!(msg, ShuffleMessage::Barrier(_)) && assignment_fence.is_none() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "shuffle checkpoint barriers require an admitted assignment certificate",
-                ));
-            }
-            let scope = self.current_scope(expected_assignment_version, topology)?;
+            let admission_bytes = topology::outbound_admission_bytes(msg, assignment_fence)?;
+            let scope = self.current_send_scope(
+                expected_assignment_version,
+                topology,
+                expected_recovery_generation,
+            )?;
             let conn = self.connection_for(peer, &scope).await?;
             let _send_guard = tokio::select! {
                 biased;
@@ -2652,22 +2658,6 @@ mod grpc {
             self.process_lease
                 .require_live_io()
                 .map_err(may_have_admitted_shuffle_frame)
-        }
-
-        fn validate_expected_assignment(&self, expected: Option<u64>) -> io::Result<()> {
-            let Some(expected) = expected else {
-                return Ok(());
-            };
-            let current = self.assignment_version.load(Ordering::Acquire);
-            if expected != 0 && expected == current {
-                return Ok(());
-            }
-            Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                format!(
-                    "shuffle assignment scope mismatch: routed at {expected}, sender at {current}"
-                ),
-            ))
         }
 
         fn current_assignment(&self) -> io::Result<Arc<InstalledAssignment>> {
@@ -2836,6 +2826,7 @@ mod grpc {
                             Some(assignment_fence.assignment_version),
                             Some(assignment_fence),
                             topology,
+                            None,
                         )
                         .await,
                     )
