@@ -36,6 +36,7 @@ pub(super) struct SinkTaskInner {
     pub(super) contract: SinkContract,
     pub(super) requires_recovery_on_error: bool,
     pub(super) event_tx: Producer<SinkEvent>,
+    pub(super) generation: tokio_util::sync::CancellationToken,
     #[cfg(feature = "cluster")]
     pub(super) process_authority: Option<Arc<ClusterController>>,
     #[cfg(feature = "cluster")]
@@ -63,6 +64,9 @@ pub(super) async fn run_sink_task(
     epoch_poisoned: Arc<AtomicBool>,
     actor_state: Arc<SinkActorState>,
 ) {
+    actor_state
+        .ready
+        .store(true, std::sync::atomic::Ordering::Release);
     #[cfg(feature = "cluster")]
     if let Some(controller) = inner.process_authority.clone() {
         run_process_fenced_sink_task(inner, epoch_poisoned, controller, actor_state.as_ref()).await;
@@ -223,6 +227,7 @@ pub(super) async fn flush_sink_periodically(
         "periodic flush",
         operation_deadline(inner.write_timeout),
         inner.sink.cancellation_policy(),
+        &inner.generation,
         #[cfg(feature = "cluster")]
         inner.process_authority.clone(),
         || inner.sink.flush(),
@@ -248,6 +253,7 @@ pub(super) async fn close_disconnected_sink(inner: &mut SinkTaskInner) {
             "flush on channel close",
             operation_deadline(inner.write_timeout),
             inner.sink.cancellation_policy(),
+            &inner.generation,
             #[cfg(feature = "cluster")]
             inner.process_authority.clone(),
             || inner.sink.flush(),
@@ -273,6 +279,7 @@ pub(super) async fn close_disconnected_sink(inner: &mut SinkTaskInner) {
         "connector close",
         operation_deadline(SINK_CLOSE_TIMEOUT),
         inner.sink.cancellation_policy(),
+        &inner.generation,
         #[cfg(feature = "cluster")]
         inner.process_authority.clone(),
         || inner.sink.close(),

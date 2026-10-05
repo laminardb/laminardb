@@ -21,12 +21,13 @@ mod protocol;
 mod recovery;
 mod request;
 mod retention;
+mod retention_state;
 mod sink_artifact_intents;
 mod sink_commit;
 pub(crate) mod sink_epoch_admission;
 mod sink_protocol;
 #[cfg(feature = "cluster")]
-mod subscription_output;
+pub(crate) mod subscription_output;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;

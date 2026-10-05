@@ -100,12 +100,25 @@ location. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip
 [Helm chart](deploy/helm/laminardb/README.md), and
 [cluster SQL limits](docs/SQL_REFERENCE.md#cluster-sql-boundary) before deploying.
 
+### Change a running cluster's topology
+
+Cluster migrations support adding, dropping and replacing sources, streams or sinks.
+Progress is preserved by default; reset incompatible objects with ordered DROP/CREATE
+in one migration request, dropping dependents first. New or reset state processes future input.
+Migrations pause at a checkpoint and return an asynchronous receipt. All required nodes
+must be ready to resume; node IDs and the complete vnode owner map must stay unchanged.
+See the [server REST API](crates/laminar-server/README.md#rest-api) for topology endpoints.
+
 ## Production tuning
 
 LaminarDB is pre-1.0. Test your own workload and recovery path before production use. Configure
 persistent checkpoints, authentication, and network security. Measure peak process memory under
 normal load, bursts, and recovery; individual engine limits do not cap total process memory.
 Choose checkpoint frequency and container resources from those measurements.
+
+For topology migrations, measure pause duration and peak restore memory, and budget storage
+for retained migration roots. The current limit is 64 retained operations; do not delete
+authority or root objects to bypass it.
 
 The [server tuning guide](crates/laminar-server/README.md#memory-limits-and-production-tuning)
 and [site guide](https://laminardb.io/docs/#production-tuning) cover memory limits, monitoring,

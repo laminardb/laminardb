@@ -32,6 +32,9 @@ use laminar_core::cluster::control::ClusterController;
 use laminar_core::streaming::AsyncConsumer;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "generation_tests.rs"]
+mod generation;
+
 #[cfg(feature = "cluster")]
 use crossfire::AsyncTxTrait as _;
 
@@ -57,6 +60,7 @@ async fn late_blocking_completion_is_a_deadline_and_retires_the_generation() {
         "flush",
         deadline,
         ConnectorCancellationPolicy::RetireConnector,
+        &tokio_util::sync::CancellationToken::new(),
         #[cfg(feature = "cluster")]
         None,
         || async {
@@ -685,6 +689,11 @@ async fn spawn_uses_the_exact_captured_connector_tracker() {
     .await
     .expect("sink actor did not finish close");
     assert!(!close.is_finished());
+    #[cfg(feature = "cluster")]
+    assert!(
+        !handle.is_ready(),
+        "a dead actor with a live child cannot certify topology readiness"
+    );
 
     drop(first_guard);
     tokio::time::timeout(Duration::from_secs(1), close)

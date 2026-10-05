@@ -81,6 +81,9 @@ fn checked_recovery_deadline(timeout: Duration) -> Option<tokio::time::Instant> 
 }
 
 mod local_faults;
+mod topology;
+#[cfg(test)]
+pub(crate) use topology::TopologyDriver;
 
 use local_faults::{flush_pending_local_fault, local_fault_disposition, request_fresh_local_fault};
 pub(crate) use local_faults::{
@@ -95,10 +98,13 @@ pub(crate) fn spawn_monitor(db: &Arc<LaminarDB>, runtime: &Handle) -> tokio::tas
     let weak = Arc::downgrade(db);
     runtime.spawn(async move {
         loop {
-            let outcome =
+            // The sole private graph owner enlarges this control future. Pin it once per monitor
+            // generation, avoiding repeated large stack moves without any record-path allocation.
+            let outcome = Box::pin(
                 std::panic::AssertUnwindSafe(RecoveryMonitor::default().run(Weak::clone(&weak)))
-                    .catch_unwind()
-                    .await;
+                    .catch_unwind(),
+            )
+            .await;
             if outcome.is_ok() {
                 return;
             }
@@ -224,6 +230,9 @@ enum PrepareOwnership {
 
 impl RecoveryMonitor {
     async fn run(mut self, weak: Weak<LaminarDB>) {
+        // Private operators are Send but not Sync. Keep their sole owner in this supervisor's
+        // future, outside the shared monitor observations used across existing recovery awaits.
+        let mut topology = topology::TopologyDriver::default();
         let mut poll = tokio::time::interval(POLL_INTERVAL);
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -270,12 +279,17 @@ impl RecoveryMonitor {
             }
             let local_pending = local_fault.into_iter().collect::<Vec<_>>();
             self.hold_for_visible_or_queued_fault(&db, &controller, &local_pending);
-            self.observe(&db, &controller, local_fault).await;
+            topology.pause_if_fenced(&db, &controller);
+            Box::pin(self.observe(&db, &controller, local_fault)).await;
+            // Observing a new remote Prepare/Start can install the recovery latch during this
+            // await. Release private preparation immediately before any later driver action.
+            topology.pause_if_fenced(&db, &controller);
             let leader = controller.is_leader();
             if leader != std::mem::replace(&mut self.monitor_gates.0, leader) {
                 tracing::warn!(leader, "recovery monitor leadership gate changed");
             }
             if !leader {
+                topology.drive(&db, &controller).await;
                 continue;
             }
             let inventory = match self.fault_inventory(&controller).await {
@@ -416,19 +430,22 @@ impl RecoveryMonitor {
                     _ => {}
                 },
             }
-            if !pending.is_empty() {
+            if pending.is_empty() {
+                topology.drive(&db, &controller).await;
+            } else {
+                topology.pause_if_fenced(&db, &controller);
                 // A stopped-Prepare handoff re-drives a fenced round now; a new round waits one
                 // poll for the fault set to settle.
                 if required_prepare_fence.is_some()
                     || self.fault_inventory_settled(inventory.revision(), &fault_snapshot)
                 {
-                    self.drive_round(
+                    Box::pin(self.drive_round(
                         &db,
                         &controller,
                         inventory.revision(),
                         fault_snapshot,
                         required_prepare_fence.as_ref(),
-                    )
+                    ))
                     .await;
                 }
             }
@@ -964,7 +981,7 @@ impl RecoveryMonitor {
             );
             return;
         }
-        match self.restore_and_ack(db, controller, &start, epoch).await {
+        match Box::pin(self.restore_and_ack(db, controller, &start, epoch)).await {
             RestoreAckOutcome::Restored => {
                 tracing::warn!(
                     target_epoch = epoch,
@@ -1546,46 +1563,12 @@ impl RecoveryMonitor {
                 return;
             }
         };
-        if let Err(error) = replicate_recovery_gen(controller, gen_id).await {
-            tracing::error!(gen = gen_id, %error, "could not publish recovery generation");
+        let Some(round) = self
+            .publish_recovery_prepare(db, controller, round, required_prepare_fence)
+            .await
+        else {
             return;
-        }
-
-        let prepare_fence = current_recovery_assignment_fence(
-            db,
-            controller,
-            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
-        )
-        .await;
-        let prepare_fence_matches = matches!(
-            prepare_fence.as_ref(),
-            Ok(Some(fence))
-                if fence == &round.assignment_fence
-                    && required_prepare_fence.is_none_or(|required| required == fence)
-        );
-        if !prepare_fence_matches {
-            if let Err(error) = prepare_fence {
-                tracing::warn!(
-                    gen = gen_id,
-                    %error,
-                    "recovery assignment audit failed before Prepare; deferring round"
-                );
-            } else {
-                tracing::warn!(
-                    gen = gen_id,
-                    "recovery assignment changed before Prepare; deferring round"
-                );
-            }
-            return;
-        }
-
-        controller.set_recovering(true);
-        db.set_source_gate(true);
-        if let Err(error) = announce_recover_prepare_bounded(controller, &round).await {
-            tracing::warn!(gen = gen_id, %error, "could not publish recovery Prepare");
-            return;
-        }
-        tracing::warn!(gen = gen_id, "leader announced recovery prepare");
+        };
         if !quiesce_recovery_driver(db, controller, &round).await {
             return;
         }
@@ -1786,6 +1769,20 @@ impl RecoveryMonitor {
         };
         let selected = selected.as_ref();
         let target = selected.map_or(GENESIS, |(cut, _)| cut.epoch);
+        if round.topology_binding().is_some() {
+            if let Err(error) = Box::pin(controller.topology_recovery_input(&round, target)).await {
+                drop(selection_guard);
+                tracing::error!(gen = gen_id, %error, "exact committed target recovery selection failed");
+                handle_failed_recovery_boundary(
+                    db,
+                    controller,
+                    &round,
+                    "topology recovery target selection",
+                )
+                .await;
+                return;
+            }
+        }
         let ownership = driver_owns_prepare(db, controller, &round).await;
         if ownership != PrepareOwnership::Owned {
             drop(selection_guard);
@@ -1828,7 +1825,7 @@ impl RecoveryMonitor {
         // Retry self-restore inline so the round and its cleanup stay in the leader's control.
         let mut restored = false;
         for attempt in 1..=SELF_RESTORE_ATTEMPTS {
-            match self.restore_and_ack(db, controller, &start, target).await {
+            match Box::pin(self.restore_and_ack(db, controller, &start, target)).await {
                 RestoreAckOutcome::Restored => {
                     restored = true;
                     break;
@@ -1985,6 +1982,12 @@ impl RecoveryMonitor {
                 "recovery assignment changed while rebuilding the data plane; withholding restore acknowledgement"
             );
             return RestoreAckOutcome::Retry;
+        }
+        if start.round.topology_binding().is_some() {
+            if let Err(error) = Box::pin(db.certify_recovered_cluster_topology(start)).await {
+                tracing::error!(gen = gen_id, %error, "target actors did not certify exact held recovery installation");
+                return RestoreAckOutcome::Retry;
+            }
         }
         match controller.announce_recovered(start).await {
             Ok(()) => {
@@ -2241,26 +2244,14 @@ impl RecoveryMonitor {
         db.set_source_gate(true);
         let release_deadline = tokio::time::Instant::now() + RELEASE_PROTOCOL_TIMEOUT;
         let authority_revision = db.assignment_authority_revision.load(Ordering::Acquire);
-        let assignment_restorable = match recovery_round_assignment_is_restorable(
+        if !Self::release_installation_is_current(
             db,
             controller,
-            &release.round,
+            release,
             release_deadline,
+            authority_revision,
         )
         .await
-        {
-            Ok(restorable) => restorable,
-            Err(error) => {
-                tracing::error!(
-                    gen = release.round.id.generation,
-                    %error,
-                    "could not audit recovery Release assignment"
-                );
-                false
-            }
-        };
-        if !assignment_restorable
-            || db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
         {
             return false;
         }
@@ -2484,6 +2475,13 @@ impl RecoveryMonitor {
             self.defer_release_retry(db, controller, release.round.id.generation, false);
             return false;
         }
+        if let Err(error) = db
+            .validate_recovered_cluster_topology_release(&committed)
+            .await
+        {
+            tracing::error!(gen = release.round.id.generation, %error, "target runtime changed before Release consumption");
+            return false;
+        }
         if !self.clear_authorized_pending_request(db) {
             tracing::warn!(
                 gen = release.round.id.generation,
@@ -2492,25 +2490,24 @@ impl RecoveryMonitor {
             drop(release_guard);
             return false;
         }
-        controller.set_recovering(false);
-        db.set_source_gate(false);
-        if db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
-            || db.terminal_pipeline_halt.load(Ordering::Acquire)
-            || db.durable_terminal_recovery_fence.load(Ordering::Acquire)
-            || controller.is_recovering()
-            || db.cluster_intake_fenced()
-            || !controller.process_lease_is_live()
-            || controller
-                .checkpoint_assignment_fence(release.round.assignment_fence.assignment_version)
-                .as_ref()
-                != Some(&release.round.assignment_fence)
-            || controller.checkpoint_drain_transition().is_some()
+        match self
+            .release_recovered_data_plane(
+                db,
+                controller,
+                release,
+                &committed,
+                release_deadline,
+                authority_revision,
+            )
+            .await
         {
-            controller.set_recovering(true);
-            db.set_source_gate(true);
-            drop(release_guard);
-            self.defer_release_retry(db, controller, release.round.id.generation, false);
-            return false;
+            topology::DataPlaneRelease::Released => {}
+            topology::DataPlaneRelease::Held => return false,
+            topology::DataPlaneRelease::RecheckFailed => {
+                drop(release_guard);
+                self.defer_release_retry(db, controller, release.round.id.generation, false);
+                return false;
+            }
         }
         self.record_released_faults(&release.round);
         drop(release_guard);
@@ -2771,7 +2768,7 @@ where
     let spawned = std::thread::Builder::new()
         .name("laminar-coord-recover".into())
         .spawn(move || {
-            let result = handle.block_on(f(db));
+            let result = handle.block_on(Box::pin(f(db)));
             // INVARIANT: completion is observable only after the overlap fence is released.
             drop(active);
             let _ = tx.send(result);

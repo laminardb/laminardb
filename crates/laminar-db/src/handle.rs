@@ -15,7 +15,7 @@ use crate::DbError;
 /// Result of executing a SQL statement.
 #[derive(Debug)]
 pub enum ExecuteResult {
-    /// DDL statement completed (CREATE, DROP, ALTER).
+    /// DDL result (CREATE, DROP, ALTER), including an admitted cluster migration receipt.
     Ddl(DdlInfo),
     /// Query is running, subscribe to results.
     Query(QueryHandle),
@@ -40,7 +40,7 @@ impl ExecuteResult {
     }
 }
 
-/// Information about a completed DDL statement.
+/// Information about a local DDL result or durable cluster migration admission.
 #[derive(Debug, Clone)]
 pub struct DdlInfo {
     /// e.g. `"CREATE SOURCE"`.
@@ -50,6 +50,9 @@ pub struct DdlInfo {
     /// Whether this statement changed catalog/runtime state. `IF NOT EXISTS`
     /// success uses `false` so the attempted definition cannot replace durable DDL.
     pub(crate) applied: bool,
+    /// Durable cluster admission; target activation is reported separately by operation status.
+    #[cfg(feature = "cluster")]
+    pub topology_operation: Option<Box<laminar_core::cluster::control::TopologyAdmissionStatus>>,
 }
 
 /// Handle to a running streaming query.

@@ -14,6 +14,7 @@ fn canonical_source_digest(
         source_idle_timeout_ms: None,
         event_time_max_future_skew_ms: laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
         sources: vec![CanonicalSource {
+            catalog_generation: 1,
             name: "events".into(),
             connector_type: "test".into(),
             options: BTreeMap::new(),

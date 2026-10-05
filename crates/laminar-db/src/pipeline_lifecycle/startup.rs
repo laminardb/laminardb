@@ -1,52 +1,15 @@
+#[cfg(feature = "cluster")]
+use super::TopologyStartup;
 use super::{
     checked_pipeline_deadline, panic_message, publish_runtime_fault_state, required_recovery_scope,
-    Arc, CheckpointStorageScope, DbError, DbState, DeliveryGuarantee, FutureExt, HashMap,
-    LaminarDB, PipelineLifecycleAuthority, RuntimeMode, StartupAttempt, StartupDriverGuard,
+    Arc, CheckpointStorageScope, DbError, DbState, DeliveryGuarantee, FutureExt, LaminarDB,
+    PipelineLifecycleAuthority, RuntimeMode, StartupAttempt, StartupDriverGuard,
 };
 #[cfg(feature = "cluster")]
 use super::{report_cluster_terminal_halt, retire_cluster_compute_generation};
 use laminar_core::storage_location::StorageProvider;
 
-fn checkpoint_store(
-    backing: Arc<dyn object_store::ObjectStore>,
-    max_node_data_bytes: u64,
-    key_group_count: laminar_core::state::KeyGroupCount,
-    participant_id: u64,
-    exclusive_writer: bool,
-) -> Result<Box<dyn laminar_core::checkpoint::CheckpointStore>, DbError> {
-    let store = laminar_core::checkpoint::ObjectStoreCheckpointStore::new(backing, "")
-        .with_max_node_data_bytes(max_node_data_bytes)?
-        .with_key_group_count(key_group_count)
-        .with_participant_id(participant_id);
-    let store = if exclusive_writer {
-        store.with_exclusive_writer()
-    } else {
-        store
-    };
-    Ok(Box::new(store))
-}
-
-fn validate_checkpoint_timing(
-    config: &laminar_core::streaming::StreamCheckpointConfig,
-) -> Result<(), DbError> {
-    if config.interval_ms == Some(0) {
-        return Err(DbError::Config(
-            "checkpoint.interval_ms must be greater than zero; use None for manual-only".into(),
-        ));
-    }
-    let Some(timeout_ms) = config.timeout_ms else {
-        return Ok(());
-    };
-    if timeout_ms == 0 {
-        return Err(DbError::Config(
-            "checkpoint.timeout_ms must be greater than zero".into(),
-        ));
-    }
-    checked_pipeline_deadline(std::time::Duration::from_millis(timeout_ms), "checkpoint").map_err(
-        |_| DbError::Config("checkpoint.timeout_ms exceeds the platform clock range".into()),
-    )?;
-    Ok(())
-}
+mod checkpoint_initialization;
 
 impl LaminarDB {
     /// Publish `Running` only if the compute watcher did not fault during startup.
@@ -107,6 +70,44 @@ impl LaminarDB {
         self.ensure_terminal_halt_allows_start(PipelineLifecycleAuthority::CoordinatedRecovery)?;
         // RECOVERY: a durable Start is published only after cluster-wide artifact settlement.
         *self.startup_checkpoint_artifact_audit.lock() = None;
+        if !self.is_cluster_runtime() {
+            return self
+                .start_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
+                .await;
+        }
+        let controller = self
+            .cluster_controller
+            .lock()
+            .clone()
+            .ok_or_else(|| DbError::Checkpoint("recovery has no controller".into()))?;
+        let announcement = controller
+            .observe_recover_control()
+            .await
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        if let Some(start) = announcement.filter(|start| start.round.topology_binding().is_some()) {
+            let laminar_core::cluster::control::RecoverPhase::Start { epoch } = start.phase else {
+                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+            };
+            if *self.recover_target_epoch.lock() != Some(epoch) {
+                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+            }
+            if DbState::load(&self.state) == DbState::Running {
+                return Box::pin(self.certify_recovered_cluster_topology(&start)).await;
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+            let mut image = Box::pin(self.prepare_coordinated_topology_restore(&start)).await?;
+            tokio::time::timeout_at(
+                deadline,
+                self.prepare_coordinated_topology_transport(&mut image),
+            )
+            .await
+            .map_err(|_| laminar_core::cluster::control::TopologyError::Contended)??;
+            return Box::pin(self.start_with_runtime_image(
+                PipelineLifecycleAuthority::CoordinatedRecovery,
+                Some(TopologyStartup { image, deadline }),
+            ))
+            .await;
+        }
         self.start_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
             .await
     }
@@ -123,6 +124,58 @@ impl LaminarDB {
         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
         #[cfg(not(feature = "cluster"))]
         Self::ensure_pipeline_lifecycle_authorized(authority, "start");
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime() {
+            let catalog = self.catalog_manifest_store.lock().clone();
+            if let Some(catalog) = catalog {
+                let topology = catalog.topology_state().await.map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "[{}] catalog manifest load failed: {error}",
+                        laminar_core::error_codes::RECOVERY_FAILED
+                    ))
+                })?;
+                if matches!(
+                    topology,
+                    laminar_core::cluster::control::TopologyCatalogState::Versioned {
+                        committed: Some(_),
+                        ..
+                    }
+                ) {
+                    return Err(laminar_core::cluster::control::TopologyError::Conflict(
+                        "committed target requires migration-root reconstruction, installation and Release; ordinary startup cannot restore the parent checkpoint".into(),
+                    ).into());
+                }
+            }
+        }
+        self.start_with_runtime_image(
+            authority,
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn start_with_topology_image(
+        self: &Arc<Self>,
+        image: crate::db::PreparedTopologyRestore,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        self.start_with_runtime_image(
+            PipelineLifecycleAuthority::TopologyInstallation,
+            Some(TopologyStartup { image, deadline }),
+        )
+        .await
+    }
+
+    async fn start_with_runtime_image(
+        self: &Arc<Self>,
+        authority: PipelineLifecycleAuthority,
+        #[cfg(feature = "cluster")] mut topology: Option<TopologyStartup>,
+    ) -> Result<(), DbError> {
+        if self.is_closed() {
+            return Err(DbError::Shutdown);
+        }
         self.connector_registry.freeze();
         let runtime = self.control_runtime.handle()?;
         let attempt = {
@@ -155,12 +208,23 @@ impl LaminarDB {
                                 .into(),
                         ));
                     }
-                    DbState::ShuttingDown => {
+                    DbState::ShuttingDown
+                        if {
+                            #[cfg(feature = "cluster")]
+                            {
+                                authority != PipelineLifecycleAuthority::TopologyInstallation
+                            }
+                            #[cfg(not(feature = "cluster"))]
+                            {
+                                true
+                            }
+                        } =>
+                    {
                         return Err(DbError::InvalidOperation(
                             "cannot start pipeline: shutdown/stop in progress".into(),
                         ));
                     }
-                    claimed @ (DbState::Created | DbState::Faulted) => {
+                    claimed @ (DbState::Created | DbState::Faulted | DbState::ShuttingDown) => {
                         // A compute fault publishes the cluster recovery fence before Faulted.
                         // Re-read that fence after observing the state so a public restart cannot
                         // slip through the fence-before-state publication window.
@@ -169,6 +233,19 @@ impl LaminarDB {
                         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
                         #[cfg(not(feature = "cluster"))]
                         Self::ensure_pipeline_lifecycle_authorized(authority, "start");
+                        #[cfg(feature = "cluster")]
+                        if authority == PipelineLifecycleAuthority::TopologyInstallation
+                            && (topology.is_none()
+                                || !matches!(claimed, DbState::Created | DbState::ShuttingDown)
+                                || self.last_fault.lock().is_some()
+                                || !self.owned_source_tasks.lock().is_empty()
+                                || !self.owned_sink_handles.lock().is_empty()
+                                || !self.owned_connector_task_fences.lock().is_empty())
+                        {
+                            return Err(
+                                laminar_core::cluster::control::TopologyError::Fenced.into()
+                            );
+                        }
                         let attempt = Arc::new(StartupAttempt::new());
                         // Publish ownership before Starting so stop/shutdown can always find the
                         // exact attempt they must await.
@@ -178,6 +255,8 @@ impl LaminarDB {
                         let driver_attempt = Arc::clone(&attempt);
                         let emergency_attempt = Arc::clone(&attempt);
                         let driver_runtime = runtime.clone();
+                        #[cfg(feature = "cluster")]
+                        let driver_topology = topology.take();
                         let startup_thread = match std::thread::Builder::new()
                             .name("laminar-start".into())
                             .spawn(move || {
@@ -190,6 +269,8 @@ impl LaminarDB {
                                             driver_attempt,
                                             claimed == DbState::Faulted,
                                             authority,
+                                            #[cfg(feature = "cluster")]
+                                            driver_topology,
                                         ));
                                     }));
                                 if result.is_err() && !emergency_attempt.is_complete() {
@@ -216,6 +297,12 @@ impl LaminarDB {
                         {
                             let _ = start_tx.send(false);
                             *owned = None;
+                            #[cfg(feature = "cluster")]
+                            if authority == PipelineLifecycleAuthority::TopologyInstallation {
+                                return Err(
+                                    laminar_core::cluster::control::TopologyError::Fenced.into()
+                                );
+                            }
                             continue;
                         }
                         if start_tx.send(true).is_err() {
@@ -237,12 +324,16 @@ impl LaminarDB {
         attempt: Arc<StartupAttempt>,
         starting_from_fault: bool,
         authority: PipelineLifecycleAuthority,
+        #[cfg(feature = "cluster")] topology: Option<TopologyStartup>,
     ) {
         let terminal = StartupDriverGuard::new(&self, Arc::clone(&attempt));
-        let result =
-            std::panic::AssertUnwindSafe(Box::pin(self.run_claimed_start(starting_from_fault)))
-                .catch_unwind()
-                .await;
+        let result = std::panic::AssertUnwindSafe(Box::pin(self.run_claimed_start(
+            starting_from_fault,
+            #[cfg(feature = "cluster")]
+            topology,
+        )))
+        .catch_unwind()
+        .await;
         let result = match result {
             Ok(result) => result,
             Err(panic) => {
@@ -271,6 +362,41 @@ impl LaminarDB {
                     ))),
                 }
             }
+        };
+        let result = if result.is_err() && DbState::load(&self.state) == DbState::Starting {
+            match self.cleanup_failed_start().await {
+                Ok(()) => {
+                    if result
+                        .as_ref()
+                        .err()
+                        .is_some_and(DbError::requires_pipeline_halt)
+                    {
+                        DbState::Faulted.store(&self.state);
+                    } else {
+                        let _ = DbState::compare_exchange(
+                            DbState::Starting,
+                            DbState::Created,
+                            &self.state,
+                        );
+                    }
+                    result
+                }
+                Err(error) => {
+                    DbState::Faulted.store(&self.state);
+                    if result
+                        .as_ref()
+                        .err()
+                        .is_some_and(DbError::requires_pipeline_halt)
+                    {
+                        tracing::error!(cleanup_error = %error, "cleanup also failed after a permanent startup error");
+                        result
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        } else {
+            result
         };
         let result = self.normalize_start_result_for_terminal_latch(result);
         self.terminalize_start_attempt_if_needed(authority, &result)
@@ -370,11 +496,18 @@ impl LaminarDB {
         );
     }
 
-    pub(super) async fn run_claimed_start(&self, starting_from_fault: bool) -> Result<(), DbError> {
+    pub(super) async fn run_claimed_start(
+        &self,
+        starting_from_fault: bool,
+        #[cfg(feature = "cluster")] topology: Option<TopologyStartup>,
+    ) -> Result<(), DbError> {
         const FAULT_RESTART_QUIESCE_TIMEOUT: std::time::Duration =
             std::time::Duration::from_secs(10);
-        let _topology = self.topology_ddl_lock.write().await;
-        let _lifecycle = self.lifecycle_lock.lock().await;
+        #[cfg(feature = "cluster")]
+        let deadline = topology.as_ref().map(|startup| startup.deadline);
+        #[cfg(not(feature = "cluster"))]
+        let deadline: Option<tokio::time::Instant> = None;
+        let (_topology, _lifecycle) = self.lock_startup_ownership(deadline).await?;
         self.ensure_catalog_cleanup_unfenced("pipeline start")?;
         if DbState::load(&self.state) != DbState::Starting {
             return Err(DbError::Pipeline(
@@ -384,6 +517,10 @@ impl LaminarDB {
 
         let generation_quiesce_deadline =
             tokio::time::Instant::now() + FAULT_RESTART_QUIESCE_TIMEOUT;
+        self.runtime_shutdown.read().cancel();
+        self.shutdown_signal.notify_one();
+        self.join_runtime_watcher_until(generation_quiesce_deadline)
+            .await?;
         if let Err(error) = self
             .quiesce_connector_generation_until(generation_quiesce_deadline)
             .await
@@ -419,47 +556,22 @@ impl LaminarDB {
         }
 
         #[cfg(feature = "cluster")]
-        if let Err(error) = self.restore_catalog_from_manifest().await {
-            if let Err(cleanup_error) =
-                self.ensure_catalog_cleanup_unfenced("catalog bootstrap rollback")
-            {
-                // `CatalogBootstrapGuard` has already tried to remove every replayed object.
-                // An incomplete rollback is a terminal per-instance fence: never turn it into a
-                // retryable startup failure by publishing `Created` over the guard's `Faulted`.
-                DbState::Faulted.store(&self.state);
-                if error.requires_pipeline_halt() {
-                    tracing::error!(
-                        %cleanup_error,
-                        "catalog rollback also failed after a permanent startup error"
-                    );
-                    return Err(error);
-                }
-                if cleanup_error.requires_pipeline_halt() {
-                    return Err(DbError::PipelineTerminal(format!(
-                        "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
-                    )));
-                }
-                return Err(DbError::Pipeline(format!(
-                    "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
-                )));
+        let catalog_restore = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, self.restore_catalog_from_manifest())
+                    .await
+                    .map_err(|_| {
+                        DbError::Pipeline(
+                            "topology catalog replay exceeded the installation deadline".into(),
+                        )
+                    })
+                    .and_then(|result| result)
             }
-
-            // No runtime resources have been constructed and catalog rollback completed. Publish
-            // a retryable state only if no concurrent fault superseded this startup generation.
-            if error.requires_pipeline_halt() {
-                DbState::Faulted.store(&self.state);
-                return Err(error);
-            }
-            return match DbState::compare_exchange(DbState::Starting, DbState::Created, &self.state)
-            {
-                Ok(_) => Err(error),
-                Err(observed) => Err(DbError::Pipeline(format!(
-                    "{error}; catalog bootstrap rollback completed but startup was superseded by \
-                     lifecycle state {observed:?}: {}",
-                    self.last_fault()
-                        .unwrap_or_else(|| "no fault reason was recorded".into())
-                ))),
-            };
+            None => self.restore_catalog_from_manifest().await,
+        };
+        #[cfg(feature = "cluster")]
+        if let Err(error) = catalog_restore {
+            return self.fail_catalog_bootstrap_start(error);
         }
 
         // Drain a shutdown permit a prior fault's `notify_one()` left with no
@@ -470,7 +582,22 @@ impl LaminarDB {
             () = std::future::ready(()) => {}
         }
 
-        match self.start_inner().await {
+        let start = Box::pin(self.start_inner(
+            #[cfg(feature = "cluster")]
+            topology.map(|startup| startup.image),
+        ));
+        #[cfg(feature = "cluster")]
+        let result = if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, start)
+                .await
+                .map_err(|_| laminar_core::cluster::control::TopologyError::Contended.into())
+                .and_then(|result| result)
+        } else {
+            start.await
+        };
+        #[cfg(not(feature = "cluster"))]
+        let result = start.await;
+        match result {
             Ok(()) => {
                 // CAS, not store: don't clobber a Faulted set by the watcher if the compute thread
                 // already panicked during startup. Losing that CAS is a failed start, not success.
@@ -610,258 +737,82 @@ impl LaminarDB {
 
         Ok(injected_cluster_checkpoint_store)
     }
+}
 
-    pub(super) async fn initialize_checkpointing(
+impl LaminarDB {
+    async fn lock_startup_ownership(
         &self,
-        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
-        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
-        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-        table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
-        startup_runtime: RuntimeMode,
-        injected_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
-    ) -> Result<Option<laminar_core::checkpoint::PipelineIdentity>, DbError> {
-        let participant = self.checkpoint_participant();
-        let bound_pipeline_identity =
-            if self.config.checkpoint.is_some() || startup_runtime == RuntimeMode::Cluster {
-                let process_regs = self
-                    .connector_manager
-                    .lock()
-                    .process_functions()
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let identity_registrations = crate::pipeline_identity::PipelineRegistrations::new(
-                    source_regs.values(),
-                    sink_regs.values(),
-                    stream_regs.values(),
-                    table_regs.values(),
-                )
-                .with_process_functions(process_regs.iter());
-                let identity_context = crate::pipeline_identity::PipelineIdentityContext::new(
-                    &self.config,
-                    &self.catalog,
-                    &self.connector_registry,
-                    identity_registrations,
-                    self.checkpoint_key_groups().get(),
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<
+        (
+            tokio::sync::RwLockWriteGuard<'_, ()>,
+            tokio::sync::MutexGuard<'_, ()>,
+        ),
+        DbError,
+    > {
+        let topology = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.topology_ddl_lock.write())
+                .await
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "topology installation exceeded its lifecycle deadline".into(),
+                    )
+                })?,
+            None => self.topology_ddl_lock.write().await,
+        };
+        let lifecycle = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+                .await
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "topology installation exceeded its lifecycle deadline".into(),
+                    )
+                })?,
+            None => self.lifecycle_lock.lock().await,
+        };
+        Ok((topology, lifecycle))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn fail_catalog_bootstrap_start(&self, error: DbError) -> Result<(), DbError> {
+        if let Err(cleanup_error) =
+            self.ensure_catalog_cleanup_unfenced("catalog bootstrap rollback")
+        {
+            // `CatalogBootstrapGuard` has already tried to remove every replayed object.
+            // An incomplete rollback is a terminal per-instance fence: never turn it into a
+            // retryable startup failure by publishing `Created` over the guard's `Faulted`.
+            DbState::Faulted.store(&self.state);
+            if error.requires_pipeline_halt() {
+                tracing::error!(
+                    %cleanup_error,
+                    "catalog rollback also failed after a permanent startup error"
                 );
-                Some(crate::pipeline_identity::compute(&identity_context)?)
-            } else {
-                None
-            };
-        if let Some(ref cp_config) = self.config.checkpoint {
-            use crate::checkpoint_coordinator::{
-                CheckpointConfig as CkpConfig, CheckpointCoordinator,
-            };
-
-            let max_node_data_bytes = cp_config.max_node_data_bytes.ok_or_else(|| {
-                DbError::Config(
-                    "checkpoint.max_node_data_bytes was not resolved at construction".into(),
-                )
-            })?;
-            validate_checkpoint_timing(cp_config)?;
-            let key_group_count = self.checkpoint_key_groups();
-
-            let data_dir = cp_config
-                .data_dir
-                .clone()
-                .or_else(|| self.config.storage_dir.clone())
-                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-            let explicit_file_checkpoint_root = self
-                .config
-                .object_store_url
-                .as_deref()
-                .filter(|url| StorageProvider::detect_uri(url) == Some(StorageProvider::Local))
-                .map(|url| {
-                    laminar_core::checkpoint::object_store_builder::file_url_path(url)
-                        .map_err(|error| DbError::Config(format!("object store: {error}")))
-                })
-                .transpose()?;
-            let local_checkpoint_root = explicit_file_checkpoint_root.as_ref().unwrap_or(&data_dir);
-            let uses_local_checkpoint_store = injected_cluster_checkpoint_store.is_none()
-                && (self.config.object_store_url.is_none()
-                    || explicit_file_checkpoint_root.is_some());
-            if startup_runtime == RuntimeMode::Local
-                && uses_local_checkpoint_store
-                && self.checkpoint_namespace_lock.lock().is_none()
-            {
-                laminar_core::durable_fs::ensure_durable_directory(local_checkpoint_root).map_err(
-                    |error| {
-                        DbError::Config(format!(
-                            "create local checkpoint directory {}: {error}",
-                            local_checkpoint_root.display()
-                        ))
-                    },
-                )?;
-                let lock_path = local_checkpoint_root.join(".laminardb-checkpoint.lock");
-                let lock = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&lock_path)
-                    .map_err(|error| {
-                        DbError::Config(format!(
-                            "[LDB-0014] open checkpoint namespace lock {}: {error}",
-                            lock_path.display()
-                        ))
-                    })?;
-                lock.try_lock().map_err(|error| {
-                    DbError::Config(format!(
-                        "[LDB-0014] checkpoint namespace {} is already owned by \
-                         another live process: {error}",
-                        local_checkpoint_root.display()
-                    ))
-                })?;
-                *self.checkpoint_namespace_lock.lock() = Some(lock);
+                return Err(error);
             }
-            let participant_id = participant.unwrap_or(laminar_core::state::LOCAL_NODE_ID.0);
-            let pipeline_identity = bound_pipeline_identity.clone().ok_or_else(|| {
-                DbError::Checkpoint(
-                    "checkpoint startup did not derive the pipeline identity".into(),
-                )
-            })?;
-
-            let checkpoint_backing = self
-                .checkpoint_object_store()?
-                .ok_or_else(|| DbError::Checkpoint("checkpoint object store is disabled".into()))?;
-            let probe_timeout = std::time::Duration::from_secs(10);
-            let probe = if uses_local_checkpoint_store {
-                laminar_core::checkpoint::probe_object_store_conditional_create(
-                    checkpoint_backing.as_ref(),
-                    "",
-                    probe_timeout,
-                )
-                .await
-            } else {
-                laminar_core::checkpoint::probe_object_store_conditional_update(
-                    checkpoint_backing.as_ref(),
-                    "",
-                    probe_timeout,
-                )
-                .await
-            };
-            probe.map_err(|error| {
-                DbError::Config(format!(
-                    "checkpoint object store does not provide required conditional writes: {error}"
-                ))
-            })?;
-            let store = checkpoint_store(
-                Arc::clone(&checkpoint_backing),
-                max_node_data_bytes,
-                key_group_count,
-                participant_id,
-                uses_local_checkpoint_store,
-            )?;
-            let decision_backing = (!uses_local_checkpoint_store).then_some(checkpoint_backing);
-
-            let defaults = CkpConfig::default();
-            let config = CkpConfig {
-                checkpoint_timeout: cp_config.timeout_ms.map_or(
-                    defaults.checkpoint_timeout,
-                    std::time::Duration::from_millis,
-                ),
-                max_node_data_bytes,
-                ..defaults
-            };
-            let mut coord = CheckpointCoordinator::new(config, store)?;
-            coord.bind_pipeline_identity(pipeline_identity.clone())?;
-            if let Some(ref prom) = *self.engine_metrics.lock() {
-                coord.set_metrics(Arc::clone(prom));
-            }
-
-            #[cfg(feature = "cluster")]
-            if let Some(controller) = self.cluster_controller.lock().clone() {
-                if coord.participant_id() != controller.instance_id().0 {
-                    return Err(DbError::Config(format!(
-                        "[LDB-0012] checkpoint store participant {} does not match cluster \
-                         instance {}",
-                        coord.participant_id(),
-                        controller.instance_id().0
+            if cleanup_error.requires_pipeline_halt() {
+                return Err(DbError::PipelineTerminal(format!(
+                        "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
                     )));
-                }
-                coord.set_cluster_controller(controller);
             }
-
-            let ds = {
-                #[cfg(feature = "cluster")]
-                {
-                    if let Some(injected) = self.decision_store.lock().clone() {
-                        injected
-                    } else if let Some(backing) = decision_backing.as_ref() {
-                        Arc::new(
-                            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
-                                Arc::clone(backing),
-                            ),
-                        )
-                    } else {
-                        Arc::new(
-                            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
-                                local_checkpoint_root,
-                            )
-                            .map_err(|error| {
-                                DbError::Config(format!(
-                                    "open durable local checkpoint metadata store: {error}"
-                                ))
-                            })?,
-                        )
-                    }
-                }
-                #[cfg(not(feature = "cluster"))]
-                {
-                    if let Some(backing) = decision_backing.as_ref() {
-                        Arc::new(
-                            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
-                                Arc::clone(backing),
-                            ),
-                        )
-                    } else {
-                        Arc::new(
-                            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
-                                local_checkpoint_root,
-                            )
-                            .map_err(|error| {
-                                DbError::Config(format!(
-                                    "open durable local checkpoint metadata store: {error}"
-                                ))
-                            })?,
-                        )
-                    }
-                }
-            };
-            let deployment_id = ds.load_or_create_deployment_id().await.map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "load/create durable deployment identity before checkpoint startup: {error}"
-                ))
-            })?;
-            coord.set_decision_store(ds)?;
-            coord.bind_deployment_id(deployment_id.clone())?;
-
-            let vnode_registry = self.vnode_registry.lock().clone();
-            if let Some(registry) = vnode_registry {
-                let owner = {
-                    #[cfg(feature = "cluster")]
-                    {
-                        self.cluster_controller
-                            .lock()
-                            .as_ref()
-                            .map_or(laminar_core::state::LOCAL_NODE_ID, |c| {
-                                laminar_core::state::NodeId(c.instance_id().0)
-                            })
-                    }
-                    #[cfg(not(feature = "cluster"))]
-                    {
-                        laminar_core::state::LOCAL_NODE_ID
-                    }
-                };
-                let version = registry.assignment_version();
-                coord.set_assignment_version(version);
-                if startup_runtime == RuntimeMode::Cluster {
-                    coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
-                }
-            }
-
-            *self.coordinator.lock().await = Some(coord);
+            return Err(DbError::Pipeline(format!(
+                "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
+            )));
         }
-        Ok(bound_pipeline_identity)
+
+        // No runtime resources have been constructed and catalog rollback completed. Publish
+        // a retryable state only if no concurrent fault superseded this startup generation.
+        if error.requires_pipeline_halt() {
+            DbState::Faulted.store(&self.state);
+            return Err(error);
+        }
+        match DbState::compare_exchange(DbState::Starting, DbState::Created, &self.state) {
+            Ok(_) => Err(error),
+            Err(observed) => Err(DbError::Pipeline(format!(
+                "{error}; catalog bootstrap rollback completed but startup was superseded by \
+                     lifecycle state {observed:?}: {}",
+                self.last_fault()
+                    .unwrap_or_else(|| "no fault reason was recorded".into())
+            ))),
+        }
     }
 }

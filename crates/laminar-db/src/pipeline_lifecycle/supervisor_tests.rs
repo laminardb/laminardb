@@ -33,7 +33,7 @@ impl SourceConnector for TransientStartSource {
     async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
         if self
             .failures_remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

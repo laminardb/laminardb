@@ -193,6 +193,21 @@ pub const SUBSCRIPTION_RETENTION_LOST: &str = "LDB-6036";
 /// Subscription wire or segment protocol is unsupported.
 pub const SUBSCRIPTION_PROTOCOL_UNSUPPORTED: &str = "LDB-6037";
 
+/// Invalid topology proposal or durable compatibility evidence.
+pub const TOPOLOGY_INVALID: &str = "LDB-6060";
+/// Expected parent topology or manifest does not match durable authority.
+pub const TOPOLOGY_PARENT_CONFLICT: &str = "LDB-6061";
+/// A topology operation lost its exact durable leader proof.
+pub const TOPOLOGY_FENCED: &str = "LDB-6062";
+/// A required topology protocol or storage encoding is unsupported.
+pub const TOPOLOGY_PROTOCOL_UNSUPPORTED: &str = "LDB-6063";
+/// Topology authority retry/deadline budget was exhausted with no definitive response.
+pub const TOPOLOGY_AUTHORITY_CONTENDED: &str = "LDB-6064";
+/// Shared topology authority could not be read or persisted.
+pub const TOPOLOGY_AUTHORITY_FAILED: &str = "LDB-6065";
+/// Candidate topology needs an unimplemented state, initialization or connector contract.
+pub const TOPOLOGY_CHANGE_UNSUPPORTED: &str = "LDB-6066";
+
 // ── DataFusion / Arrow Interop (LDB-7xxx) ──
 
 /// Query execution failed (`DataFusion` engine error).

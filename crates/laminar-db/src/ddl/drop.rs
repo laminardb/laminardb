@@ -62,6 +62,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "DROP SOURCE".to_string(),
                 object_name: name_str,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         }
@@ -70,6 +72,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP SOURCE".to_string(),
             object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -86,6 +90,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "DROP SINK".to_string(),
                 object_name: name_str,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         }
@@ -94,6 +100,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP SINK".to_string(),
             object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -123,6 +131,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "DROP STREAM".to_string(),
                 object_name: name_str,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         }
@@ -154,6 +164,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP STREAM".to_string(),
             object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -336,6 +348,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "DROP MATERIALIZED VIEW".to_string(),
                 object_name: name_str,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         }
@@ -372,6 +386,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP MATERIALIZED VIEW".to_string(),
             object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -387,6 +403,8 @@ impl LaminarDB {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "DROP LOOKUP TABLE".into(),
                 object_name: name,
+                #[cfg(feature = "cluster")]
+                topology_operation: None,
                 applied: false,
             }));
         }
@@ -395,6 +413,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP LOOKUP TABLE".into(),
             object_name: name,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -432,6 +452,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP TABLE".to_string(),
             object_name: name,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied,
         }))
     }

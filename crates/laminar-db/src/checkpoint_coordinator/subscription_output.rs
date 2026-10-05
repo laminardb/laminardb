@@ -1,3 +1,7 @@
+mod retention;
+pub(crate) use retention::cluster_subscription_retention_horizon;
+use retention::retained_subscription_segments;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -90,7 +94,7 @@ impl CheckpointCoordinator {
         );
     }
 
-    pub(super) async fn prepare_subscription_output_until(
+    pub(crate) async fn prepare_subscription_output_until(
         &self,
         attempt: CheckpointAttempt,
         assignment: Option<&CheckpointAssignmentFence>,
@@ -221,12 +225,13 @@ impl CheckpointCoordinator {
 
     pub(super) async fn validate_subscription_continuity_until(
         &self,
-        attempt: CheckpointAttempt,
-        assignment: Option<&CheckpointAssignmentFence>,
-        predecessor: Option<&CommittedCheckpointRef>,
+        index: &CommittedCheckpointIndex,
         manifests: &[(CheckpointManifest, bytes::Bytes)],
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        let attempt = CheckpointAttempt::new(index.epoch, index.checkpoint_id);
+        let assignment = index.assignment_fence.as_ref();
+        let predecessor = index.predecessor.as_ref();
         let current = merged_subscription_outputs(attempt, assignment, manifests)?;
         if current.is_empty() {
             return Ok(());
@@ -239,7 +244,7 @@ impl CheckpointCoordinator {
                         "subscription predecessor validation requires a decision store".into(),
                     )
                 })?;
-                let index = tokio::time::timeout_at(
+                let parent = tokio::time::timeout_at(
                     deadline,
                     decisions.load_committed_checkpoint(reference),
                 )
@@ -254,7 +259,7 @@ impl CheckpointCoordinator {
                 })?;
                 let predecessor_manifests = tokio::time::timeout_at(
                     deadline,
-                    super::retention::load_index_manifests(self.store.as_ref(), &index),
+                    super::retention::load_index_manifests(self.store.as_ref(), &parent),
                 )
                 .await
                 .map_err(|_| {
@@ -262,14 +267,39 @@ impl CheckpointCoordinator {
                         "subscription predecessor participant read timed out".into(),
                     )
                 })??;
-                merged_subscription_outputs(
-                    CheckpointAttempt::new(index.epoch, index.checkpoint_id),
-                    index.assignment_fence.as_ref(),
+                let root = if let Some(controller) = &self.cluster_controller {
+                    let authority = controller
+                        .checkpoint_authority()
+                        .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+                    tokio::time::timeout_at(
+                        deadline,
+                        authority.validate_cluster_checkpoint_predecessor(index, &parent),
+                    )
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(
+                            "subscription topology continuity audit timed out".into(),
+                        )
+                    })?
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))?
+                } else {
+                    index
+                        .validate_predecessor_index(&parent)
+                        .map_err(DbError::Checkpoint)?;
+                    None
+                };
+                let mut outputs = merged_subscription_outputs(
+                    CheckpointAttempt::new(parent.epoch, parent.checkpoint_id),
+                    parent.assignment_fence.as_ref(),
                     &predecessor_manifests
                         .into_iter()
                         .map(|manifest| (manifest, bytes::Bytes::new()))
                         .collect::<Vec<_>>(),
-                )?
+                )?;
+                if let Some(root) = root {
+                    map_topology_subscription_predecessors(&root, &mut outputs, &current)?;
+                }
+                outputs
             }
         };
         for checkpoint in &current {
@@ -287,6 +317,54 @@ impl CheckpointCoordinator {
     }
 }
 
+fn map_topology_subscription_predecessors(
+    root: &laminar_core::cluster::control::TopologyMigrationRoot,
+    outputs: &mut Vec<MergedSubscriptionCheckpoint>,
+    current: &[MergedSubscriptionCheckpoint],
+) -> Result<(), DbError> {
+    if current.iter().any(|output| {
+        let name = &output.manifest.distribution_certificate.stream_id;
+        !root.preserved_objects.iter().any(|object| {
+            object.kind == laminar_core::cluster::control::CatalogObjectKind::Stream
+                && &object.name == name
+        }) && root.future_only_objects.binary_search(name).is_err()
+    }) {
+        return Err(DbError::Checkpoint(
+            "target subscription has no certified topology object".into(),
+        ));
+    }
+    // The audited root accounts for every parent stream. Retired subscriptions
+    // retain their historical output, but have no target continuity mapping.
+    outputs.retain(|output| {
+        root.preserved_objects.iter().any(|object| {
+            object.kind == laminar_core::cluster::control::CatalogObjectKind::Stream
+                && object.name == output.manifest.distribution_certificate.stream_id
+        })
+    });
+    for output in outputs.iter_mut() {
+        let mapping = root
+            .subscriptions
+            .iter()
+            .find(|mapping| {
+                mapping.parent_certificate.stream_generation == output.manifest.stream_generation
+            })
+            .ok_or_else(|| {
+                DbError::Checkpoint("parent subscription has no sealed topology mapping".into())
+            })?;
+        if output.manifest.distribution_certificate != mapping.parent_certificate
+            || output.manifest.frontiers != mapping.frontiers
+        {
+            return Err(DbError::Checkpoint(
+                "parent subscription differs from the exact migration root".into(),
+            ));
+        }
+        // An audited comparison view only; stored manifests, digests and sequences
+        // retain their historical parent identity and are never rewritten.
+        output.manifest.distribution_certificate = mapping.target_certificate.clone();
+    }
+    Ok(())
+}
+
 pub(super) async fn cluster_subscription_retention_reference(
     store: &dyn laminar_core::checkpoint::CheckpointStore,
     decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
@@ -302,9 +380,14 @@ pub(super) async fn cluster_subscription_retention_reference(
         .await
         .map_err(|error| DbError::Checkpoint(format!("load cluster retention boundary: {error}")))?
         .artifact_before_epoch;
-    let horizon =
-        cluster_subscription_retention_horizon(store, decisions, latest, artifact_floor_epoch)
-            .await?;
+    let horizon = cluster_subscription_retention_horizon(
+        store,
+        decisions,
+        authority,
+        latest,
+        artifact_floor_epoch,
+    )
+    .await?;
     let selected_epoch = authority
         .reserve_subscription_cleanup_floor(proof, horizon.epoch)
         .await
@@ -335,14 +418,16 @@ pub(super) async fn cluster_subscription_retention_reference(
         .map_err(DbError::Checkpoint)
 }
 
-pub(super) async fn cleanup_subscription_orphans(
+pub(crate) async fn cleanup_subscription_orphans(
     store: &dyn laminar_core::checkpoint::CheckpointStore,
     decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    authority: &laminar_core::cluster::control::LeaderLeaseStore,
     latest: &CommittedCheckpointIndex,
     horizon: &CommittedCheckpointRef,
     grace_before_ms: i64,
 ) -> Result<SubscriptionOutputCleanup, DbError> {
-    let retained = retained_subscription_segments(store, decisions, latest, horizon).await?;
+    let retained =
+        retained_subscription_segments(store, decisions, authority, latest, horizon).await?;
     let orphan = store
         .delete_subscription_orphans(&retained.keys, latest.checkpoint_id, grace_before_ms)
         .await
@@ -353,9 +438,9 @@ pub(super) async fn cleanup_subscription_orphans(
     })
 }
 
-pub(super) struct SubscriptionOutputCleanup {
-    pub(super) retained_bytes: u64,
-    pub(super) orphan: laminar_core::checkpoint::checkpoint_store::SubscriptionOrphanCleanup,
+pub(crate) struct SubscriptionOutputCleanup {
+    pub(crate) retained_bytes: u64,
+    pub(crate) orphan: laminar_core::checkpoint::checkpoint_store::SubscriptionOrphanCleanup,
 }
 
 pub(super) fn record_subscription_cleanup(
@@ -392,134 +477,37 @@ struct RetainedSubscriptionSegments {
     bytes: u64,
 }
 
-async fn retained_subscription_segments(
-    store: &dyn laminar_core::checkpoint::CheckpointStore,
-    decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-    latest: &CommittedCheckpointIndex,
-    horizon: &CommittedCheckpointRef,
-) -> Result<RetainedSubscriptionSegments, DbError> {
-    let mut current = latest.clone();
-    let mut retained = RetainedSubscriptionSegments {
-        keys: std::collections::BTreeSet::new(),
-        bytes: 0,
-    };
-    for _ in 0..MAX_RETAINED_SUBSCRIPTION_INTERVALS {
-        let manifests = super::retention::load_index_manifests(store, &current).await?;
-        for (object_key, encoded_length) in manifests
-            .iter()
-            .filter_map(|manifest| manifest.subscription_output.as_ref())
-            .flat_map(|output| &output.streams)
-            .flat_map(|stream| &stream.segments)
-            .map(|segment| (&segment.object_key, segment.encoded_length))
-        {
-            if !retained.keys.insert(object_key.clone()) {
-                return Err(ClusterSubscriptionError::ManifestCorrupt {
-                    reason: "one segment object is referenced by multiple retained checkpoints"
-                        .into(),
-                }
-                .into());
-            }
-            retained.bytes = retained.bytes.checked_add(encoded_length).ok_or_else(|| {
-                DbError::Checkpoint("retained subscription byte count overflow".into())
-            })?;
-            if retained.keys.len() > MAX_RETAINED_SUBSCRIPTION_SEGMENTS {
-                return Err(DbError::Checkpoint(format!(
-                    "retained subscription segment roster exceeds {MAX_RETAINED_SUBSCRIPTION_SEGMENTS} objects"
-                )));
-            }
-        }
-        if current.epoch == horizon.epoch && current.checkpoint_id == horizon.checkpoint_id {
-            return Ok(retained);
-        }
-        let predecessor = current.predecessor.as_ref().ok_or_else(|| {
-            DbError::Checkpoint(
-                "subscription retention horizon is not in the committed chain".into(),
-            )
+fn predecessor_subscription_certificates(
+    current: &BTreeMap<StreamGeneration, laminar_core::checkpoint::OutputDistributionCertificate>,
+    root: &laminar_core::cluster::control::TopologyMigrationRoot,
+) -> Result<
+    BTreeMap<StreamGeneration, laminar_core::checkpoint::OutputDistributionCertificate>,
+    DbError,
+> {
+    let mut predecessor = BTreeMap::new();
+    for mapping in &root.subscriptions {
+        let generation = mapping.parent_certificate.stream_generation;
+        let certificate = current.get(&generation).ok_or_else(|| {
+            DbError::Checkpoint("retention omitted a preserved subscription incarnation".into())
         })?;
-        let loaded = decisions
-            .load_committed_checkpoint(predecessor)
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!("load retained subscription checkpoint: {error}"))
-            })?;
-        current
-            .validate_predecessor_index(&loaded)
-            .map_err(DbError::Checkpoint)?;
-        current = loaded;
-    }
-    Err(DbError::Checkpoint(format!(
-        "subscription retention chain exceeds {MAX_RETAINED_SUBSCRIPTION_INTERVALS} checkpoints"
-    )))
-}
-
-pub(super) async fn cluster_subscription_retention_horizon(
-    store: &dyn laminar_core::checkpoint::CheckpointStore,
-    decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-    latest: &CommittedCheckpointIndex,
-    artifact_floor_epoch: u64,
-) -> Result<CommittedCheckpointIndex, DbError> {
-    let latest_manifests = super::retention::load_index_manifests(store, latest).await?;
-    let latest_outputs = merged_subscription_manifests(
-        CheckpointAttempt::new(latest.epoch, latest.checkpoint_id),
-        latest.assignment_fence.as_ref(),
-        latest_manifests.iter(),
-    )?;
-    let certificates = latest_outputs
-        .iter()
-        .map(|output| {
-            (
-                output.manifest.stream_generation,
-                output.manifest.distribution_certificate.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let caps = retention_caps(&certificates);
-    if caps.values().all(|cap| *cap == 0) {
-        return Ok(latest.clone());
-    }
-
-    let mut retained_bytes = retained_output_bytes(&latest_outputs, &certificates)?;
-    let mut current = latest.clone();
-    let mut horizon = latest.clone();
-    for _ in 0..MAX_RETAINED_SUBSCRIPTION_INTERVALS {
-        if current.epoch <= artifact_floor_epoch || !retention_caps_fit(&retained_bytes, &caps) {
-            break;
-        }
-        let Some(predecessor_ref) = current.predecessor.as_ref() else {
-            break;
-        };
-        if predecessor_ref.epoch < artifact_floor_epoch {
-            break;
-        }
-        let predecessor = decisions
-            .load_committed_checkpoint(predecessor_ref)
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!("load subscription retention predecessor: {error}"))
-            })?;
-        current
-            .validate_predecessor_index(&predecessor)
+        certificate
+            .require_match(&mapping.target_certificate)
             .map_err(|error| {
                 DbError::Checkpoint(format!(
-                    "subscription retention predecessor is invalid: {error}"
+                    "retention target certificate differs from its sealed root: {error}"
                 ))
             })?;
-        let manifests = super::retention::load_index_manifests(store, &predecessor).await?;
-        let outputs = merged_subscription_manifests(
-            CheckpointAttempt::new(predecessor.epoch, predecessor.checkpoint_id),
-            predecessor.assignment_fence.as_ref(),
-            manifests.iter(),
-        )?;
-        let mut candidate_bytes = retained_bytes.clone();
-        add_retained_output_bytes(&mut candidate_bytes, &outputs, &certificates)?;
-        if !retention_caps_fit(&candidate_bytes, &caps) {
-            break;
-        }
-        retained_bytes = candidate_bytes;
-        horizon = predecessor.clone();
-        current = predecessor;
+        predecessor.insert(generation, mapping.parent_certificate.clone());
     }
-    Ok(horizon)
+    if current.iter().any(|(generation, certificate)| {
+        !predecessor.contains_key(generation)
+            && !root.future_only_objects.contains(&certificate.stream_id)
+    }) {
+        return Err(DbError::Checkpoint(
+            "retention stream roster has no exact preserved/future-only root mapping".into(),
+        ));
+    }
+    Ok(predecessor)
 }
 
 fn merged_subscription_manifests<'a>(

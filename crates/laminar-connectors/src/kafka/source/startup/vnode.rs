@@ -17,7 +17,7 @@ impl KafkaSource {
         consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
         config: &KafkaSourceConfig,
         delivery: DeliveryGuarantee,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_baselines: &KafkaPartitionBaselines,
     ) -> Result<bool, ConnectorError> {
         self.vnode_partition_routes.clear();
@@ -37,7 +37,7 @@ impl KafkaSource {
             consumer,
             config,
             delivery,
-            is_resume,
+            has_saved_position,
             resume_baselines,
             &registry,
             self_id,
@@ -54,7 +54,7 @@ impl KafkaSource {
         consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
         config: &KafkaSourceConfig,
         delivery: DeliveryGuarantee,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_baselines: &KafkaPartitionBaselines,
         registry: &Arc<laminar_core::state::VnodeRegistry>,
         self_id: laminar_core::state::NodeId,
@@ -65,7 +65,7 @@ impl KafkaSource {
                 consumer,
                 config,
                 delivery,
-                is_resume,
+                has_saved_position,
                 resume_baselines,
                 registry.vnode_count(),
                 topics,
@@ -133,7 +133,7 @@ impl KafkaSource {
         consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
         config: &KafkaSourceConfig,
         delivery: DeliveryGuarantee,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_baselines: &KafkaPartitionBaselines,
         vnode_count: u32,
         topics: &[String],
@@ -173,7 +173,7 @@ impl KafkaSource {
                 &all_partitions,
             )
             .await?;
-            let baselines = if is_resume {
+            let baselines = if has_saved_position {
                 validate_partition_baselines(resume_baselines, &all_partitions)?;
                 resume_baselines.clone()
             } else {
@@ -188,7 +188,11 @@ impl KafkaSource {
             self.manual_partition_baselines = baselines;
         }
         self.manual_topic_partitions = all_partitions;
-        let default_offset = if self
+        let default_offset = if has_saved_position && requires_numeric_cut {
+            // The complete saved numeric baselines were validated above. No partition can fall
+            // back to mutable latest, including assignment rebinds before the first poll.
+            rdkafka::Offset::Beginning
+        } else if self
             .deterministic_unrecorded_position
             .load(Ordering::Acquire)
         {

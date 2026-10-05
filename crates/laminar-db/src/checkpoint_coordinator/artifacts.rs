@@ -20,6 +20,77 @@ struct SealedParticipantManifests {
 }
 
 impl CheckpointCoordinator {
+    /// Topology cuts bind their exact artifact admission through the same authority append.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn begin_checkpoint_artifacts_for_flags_until(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+        leader_proof: Option<&LeaderProof>,
+        flags: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        if flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT == 0 {
+            return self
+                .begin_checkpoint_artifacts_until(attempt, assignment_fence, leader_proof, deadline)
+                .await;
+        }
+        if flags != laminar_core::checkpoint::flags::TOPOLOGY_CUT {
+            return Err(DbError::Checkpoint(
+                "topology cut cannot carry assignment handoff or other flags".into(),
+            ));
+        }
+        if let Some(controller) = self.cluster_controller.as_ref() {
+            let proof = leader_proof
+                .ok_or_else(|| DbError::Checkpoint("topology cut has no leader proof".into()))?;
+            let fence = assignment_fence.as_ref().ok_or_else(|| {
+                DbError::Checkpoint("topology cut has no assignment fence".into())
+            })?;
+            let authority = controller
+                .checkpoint_authority()
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            let inventory =
+                self.checkpoint_artifact_inventory(attempt, assignment_fence.clone())?;
+            let status = tokio::time::timeout_at(deadline, async {
+                let operation = authority
+                    .topology_checkpoint_operation(proof, fence)
+                    .await
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))?
+                    .ok_or_else(|| {
+                        DbError::Checkpoint("topology cut has no admitted operation".into())
+                    })?;
+                controller
+                    .begin_topology_checkpoint_cut(
+                        proof,
+                        operation.operation_id,
+                        &operation.plan,
+                        inventory.clone(),
+                    )
+                    .await
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))
+            })
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint("topology cut artifact admission timed out".into())
+            })??;
+            if status.phase
+                != laminar_core::cluster::control::topology::TopologyAdmissionPhase::Quiescing
+                || status
+                    .cut
+                    .as_ref()
+                    .is_none_or(|cut| cut.inventory != inventory || cut.committed.is_some())
+            {
+                return Err(DbError::Checkpoint(
+                    "topology cut admission returned a different or settled binding".into(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(DbError::Checkpoint(
+            "topology cut requires a configured cluster runtime".into(),
+        ))
+    }
+
     pub(super) fn checkpoint_artifact_inventory(
         &self,
         attempt: CheckpointAttempt,

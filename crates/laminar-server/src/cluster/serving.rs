@@ -84,7 +84,13 @@ async fn start_pipeline_and_recovery_monitor(
                 "HTTP API server exited while starting the pipeline".into(),
             ))
         }
-        result = db.start() => result.map_err(|error| {
+        result = async {
+            if db.prepare_committed_cluster_topology_startup().await? {
+                Ok(())
+            } else {
+                db.start().await
+            }
+        } => result.map_err(|error: laminar_db::DbError| {
             ClusterStartupError::EngineConstruction(format!("pipeline start: {error}"))
         }),
     };
@@ -108,7 +114,7 @@ async fn start_pipeline_and_recovery_monitor(
         .await;
         return Err(error);
     }
-    info!("Pipeline started from the certified assignment");
+    info!("Pipeline startup or committed-target recovery prepared from the certified assignment");
 
     if let Err(error) = db.enable_coordinated_recovery() {
         PostActiveFailure::new(

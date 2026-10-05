@@ -37,6 +37,7 @@ use laminar_sql::translator::{
 
 mod catalog_context;
 mod input_admission;
+mod state_restore;
 
 use input_admission::retained_input_bytes;
 #[cfg(feature = "cluster")]
@@ -465,6 +466,11 @@ pub(crate) trait GraphOperator: Send {
     fn advances_frontier_without_input(&self) -> bool {
         false
     }
+
+    /// Bind a privately restored operator's future transport to the exact target generation.
+    /// The graph invokes this only before execution, without rebuilding or changing saved state.
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, _topology: laminar_core::shuffle::ShuffleTopologyFence) {}
 
     /// Retain a peer-shipped shuffle batch as channel state outside the normal `process` path so
     /// the barrier-aligned row and its pending downstream emission enter the snapshot together.
@@ -1077,6 +1083,10 @@ pub(crate) struct OperatorGraph {
     build_errors: Vec<DbError>,
     // Whole-graph restore is a one-shot startup transition and closes before the first cycle.
     whole_restore_open: bool,
+    // Decoding closes restore, but the private topology image may still bind its transport until
+    // an execution attempt is armed. Sticky even when the attempt later fails or is cancelled.
+    #[cfg(feature = "cluster")]
+    execution_started: bool,
     // Sticky for this in-memory graph generation. A dropped/panicking execution attempt may have
     // advanced operator state while losing graph-local inputs/results; only fresh restore is safe.
     execution_poisoned: Arc<AtomicBool>,
@@ -1179,6 +1189,8 @@ impl OperatorGraph {
             reference_tables: FxHashSet::default(),
             build_errors: Vec::new(),
             whole_restore_open: true,
+            #[cfg(feature = "cluster")]
+            execution_started: false,
             execution_poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1213,6 +1225,48 @@ impl OperatorGraph {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Inspect an isolated, initialized candidate on the control path. Every retained-state
+    /// operator must bind a declared catalog output, so synthetic traversal indices can never
+    /// become a migration mapping. This inventory supplements existing DDL/codec checks.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn topology_operator_contracts(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, OperatorCapability>, DbError> {
+        use laminar_core::cluster::control::TopologyError;
+
+        let mut contracts = std::collections::BTreeMap::new();
+        for node in self.nodes.iter().filter(|node| !node.removed) {
+            if node.capability.cluster_status != ClusterExecutionStatus::DdlGuarded {
+                return Err(TopologyError::Unsupported(format!(
+                    "operator '{}' has no admitted cluster execution contract: {:?}",
+                    node.name, node.capability.cluster_status
+                ))
+                .into());
+            }
+            if node.capability.state_class != OperatorStateClass::Stateless
+                && (node.capability.managed_state.is_none()
+                    || !self.output_map.contains_key(node.name.as_ref()))
+            {
+                return Err(TopologyError::Unsupported(format!(
+                    "retained-state operator '{}' lacks a catalog-bound managed state mapping",
+                    node.name
+                ))
+                .into());
+            }
+        }
+        for (name, node_id) in &self.output_map {
+            let node = self
+                .nodes
+                .get(*node_id)
+                .filter(|node| !node.removed)
+                .ok_or_else(|| {
+                    TopologyError::Invalid(format!("output '{name}' has no live planned operator"))
+                })?;
+            contracts.insert(name.to_string(), node.capability);
+        }
+        Ok(contracts)
     }
 
     pub fn set_shared_source_isolation(&mut self, on: bool, max_replay_buffer_bytes: usize) {
@@ -1446,6 +1500,28 @@ impl OperatorGraph {
         &self,
     ) -> Option<&crate::operator::sql_query::ClusterShuffleConfig> {
         self.cluster_shuffle.as_ref()
+    }
+
+    /// Control-path handoff of a private image's transport binding; never a runtime/output permit.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn bind_cluster_topology_fence(
+        &mut self,
+        topology: laminar_core::shuffle::ShuffleTopologyFence,
+    ) -> Result<(), DbError> {
+        if self.whole_restore_open || self.execution_started || self.has_pending_vnode_transition()
+        {
+            return Err(DbError::Checkpoint(
+                "topology binding requires an unexecuted private restore image".into(),
+            ));
+        }
+        let scope = self.cluster_shuffle.as_mut().ok_or_else(|| {
+            DbError::Checkpoint("topology binding requires a cluster graph".into())
+        })?;
+        scope.topology = Some(topology);
+        for node in &mut self.nodes {
+            node.operator.bind_cluster_topology(topology);
+        }
+        Ok(())
     }
 
     /// Install node-local source progress for managed ordered peer-frontier channels.
@@ -1733,7 +1809,7 @@ impl OperatorGraph {
         Ok(self)
     }
 
-    fn managed_state_accounted_bytes(&self) -> usize {
+    pub(crate) fn managed_state_accounted_bytes(&self) -> usize {
         self.nodes
             .iter()
             .filter(|node| !node.removed)
@@ -3240,9 +3316,13 @@ impl OperatorGraph {
             )
         })?;
         let _rotation_guard = Arc::clone(rotation_fence).read_owned().await;
+        if let Some(scope) = &self.cluster_shuffle {
+            scope.ensure_topology_current()?;
+        }
 
         // Waiting for assignment publication has not touched operator state. Cancellation after
         // this point is indeterminate for the same reason as a normal graph cycle.
+        self.execution_started = true;
         let mut attempt = GraphExecutionAttemptGuard::new(self);
         self.whole_restore_open = false;
         self.last_execution_assignment_version = None;
@@ -3329,8 +3409,16 @@ impl OperatorGraph {
             None => None,
         };
 
+        #[cfg(feature = "cluster")]
+        if let Some(scope) = &self.cluster_shuffle {
+            scope.ensure_topology_current()?;
+        }
         // Waiting for the cluster rotation fence has not admitted input or touched operator state.
         // Arm only after it is held so cancellation while ownership is rotating is not poisoned.
+        #[cfg(feature = "cluster")]
+        {
+            self.execution_started = true;
+        }
         let mut attempt = GraphExecutionAttemptGuard::new(self);
         let result = self
             .execute_cycle_attempt(source_batches, current_watermark, source_frontiers, mode)
@@ -3825,6 +3913,7 @@ impl OperatorGraph {
             ));
         }
         let current_assignment = cfg.registry.assignment_version();
+        cfg.ensure_topology_current()?;
         let current_recovery = cfg.receiver.recovery_gen();
         if received.peer() == cfg.self_id.0
             || received.stream_id().is_nil()
@@ -3834,6 +3923,7 @@ impl OperatorGraph {
             || received.assignment_version() != cfg.receiver.assignment_version()
             || received.recovery_gen() != current_recovery
             || received.recovery_gen() != cfg.sender.recovery_gen()
+            || received.topology_fence() != cfg.topology
         {
             return Err(DbError::Checkpoint(format!(
                 "shuffle frontier from peer {} is outside current assignment {current_assignment} recovery {current_recovery}",
@@ -4075,6 +4165,7 @@ impl OperatorGraph {
         recovery_gen: u64,
         controller: Option<&laminar_core::cluster::control::ClusterController>,
     ) -> Result<(), DbError> {
+        cfg.ensure_topology_current()?;
         if !assignment_fence.is_canonical() || !assignment_fence.contains(cfg.self_id.0) {
             return Err(DbError::Pipeline(
                 "shuffle alignment has a non-canonical or incomplete assignment certificate".into(),
@@ -4838,6 +4929,7 @@ impl OperatorGraph {
         let mut staged_graph_state = false;
         let mut irreversible_dequeue = false;
         let alignment = tokio::time::timeout_at(deadline, async {
+            cfg.ensure_topology_current()?;
             if cfg.receiver.assignment_version() == 0 || cfg.sender.assignment_version() == 0 {
                 return Ok(ShuffleFlushWaveOutcome {
                     outcome: ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging,
@@ -4880,7 +4972,7 @@ impl OperatorGraph {
             };
             let fan_out = cfg
                 .sender
-                .fan_out_barrier(&peers, barrier, assignment_fence);
+                .fan_out_barrier_for_topology(&peers, barrier, assignment_fence, cfg.topology);
             tokio::pin!(fan_out);
             let (fan_out_complete, queued_work_pending) = match Self::gate_shuffle_barrier_fan_out(
                 &cfg,
@@ -5408,151 +5500,6 @@ impl OperatorGraph {
                 node.operator.force_full_vnode_capture();
             }
         }
-    }
-
-    /// Restore independently checksummed whole-operator and vnode frames into a newly built graph.
-    /// The graph is consumed so a late operator failure drops the partial image.
-    pub(crate) fn restore_state_frames(
-        mut self,
-        whole: &[(String, bytes::Bytes)],
-        vnodes: &[(String, u32, bytes::Bytes)],
-        vnode_count: u32,
-    ) -> Result<(Self, usize), DbError> {
-        if !self.whole_restore_open {
-            return Err(DbError::Checkpoint(
-                "[LDB-6029] operator graph restore is only valid before the first execution cycle"
-                    .into(),
-            ));
-        }
-        if vnode_count != u32::from(self.key_group_count) {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6043] checkpoint vnode domain {vnode_count} does not match graph domain {}",
-                u32::from(self.key_group_count)
-            )));
-        }
-
-        let mut whole_names = std::collections::BTreeSet::new();
-        for (name, _) in whole {
-            if !whole_names.insert(name.as_str()) {
-                return Err(DbError::Checkpoint(format!(
-                    "checkpoint repeats whole state for operator '{name}'"
-                )));
-            }
-            if !self
-                .nodes
-                .iter()
-                .any(|node| !node.removed && &*node.name == name)
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6029] checkpoint requires missing operator '{name}'"
-                )));
-            }
-        }
-
-        #[cfg(feature = "cluster")]
-        let owned_vnodes = self.owned_vnodes_for_managed_state()?;
-        #[cfg(not(feature = "cluster"))]
-        let owned_vnodes = self.local_owned_vnodes_for_managed_state();
-        let owned_vnodes = owned_vnodes.as_deref().unwrap_or(&[]);
-        let mut actual_vnodes: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
-        for (name, vnode, _) in vnodes {
-            let node = self
-                .nodes
-                .iter()
-                .find(|node| !node.removed && &*node.name == name)
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6029] checkpoint requires missing operator '{name}'"
-                    ))
-                })?;
-            if node.capability.managed_state.is_none() {
-                return Err(DbError::Checkpoint(format!(
-                    "checkpoint supplies vnode {vnode} for unmanaged operator '{name}'"
-                )));
-            }
-            actual_vnodes.entry(name).or_default().push(*vnode);
-        }
-        for vnodes in actual_vnodes.values_mut() {
-            vnodes.sort_unstable();
-            if vnodes.windows(2).any(|pair| pair[0] == pair[1]) {
-                return Err(DbError::Checkpoint(
-                    "checkpoint repeats a logical operator vnode frame".into(),
-                ));
-            }
-        }
-        for node in self.nodes.iter().filter(|node| !node.removed) {
-            if node.capability.managed_state.is_none() {
-                continue;
-            }
-            let required = Self::required_vnodes_for_capability(node.capability, owned_vnodes)?;
-            let actual = actual_vnodes
-                .get(&*node.name)
-                .map_or(&[][..], Vec::as_slice);
-            if actual != required {
-                return Err(DbError::Checkpoint(format!(
-                    "managed operator '{}' restore has vnode roster {actual:?}; expected {required:?}",
-                    node.name
-                )));
-            }
-        }
-
-        let mut restored = 0;
-        for (name, bytes) in whole {
-            let node_id = self
-                .nodes
-                .iter()
-                .position(|node| !node.removed && &*node.name == name)
-                .expect("whole-frame names were validated");
-            let node = &mut self.nodes[node_id];
-            node.operator
-                .restore(OperatorCheckpoint {
-                    data: bytes.to_vec(),
-                })
-                .map_err(|error| {
-                    if error.requires_pipeline_halt() {
-                        error
-                    } else {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6029] operator '{}' restore failed: {error}",
-                            node.name
-                        ))
-                    }
-                })?;
-            restored += 1;
-        }
-        for (name, vnode, bytes) in vnodes {
-            let node_id = self
-                .nodes
-                .iter()
-                .position(|node| !node.removed && &*node.name == name)
-                .expect("vnode-frame names were validated");
-            let node = &mut self.nodes[node_id];
-            node.operator
-                .restore_vnode(*vnode, vnode_count, bytes)
-                .map_err(|error| {
-                    if error.requires_pipeline_halt() {
-                        error
-                    } else {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6029] operator '{}' vnode {vnode} restore failed: {error}",
-                            node.name
-                        ))
-                    }
-                })?;
-            restored += 1;
-        }
-        #[cfg(feature = "cluster")]
-        for (node_id, node) in self.nodes.iter_mut().enumerate() {
-            if !node.removed {
-                if let Some(frontier) = node.operator.restored_output_frontier() {
-                    self.output_watermarks[node_id] = frontier.watermark_or_min();
-                    self.output_idle[node_id] = frontier.idle;
-                }
-            }
-        }
-        self.validate_managed_state_budget("whole-graph restore")?;
-        self.whole_restore_open = false;
-        Ok((self, restored))
     }
 }
 

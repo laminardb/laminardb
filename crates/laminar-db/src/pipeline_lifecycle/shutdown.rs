@@ -238,17 +238,19 @@ impl LaminarDB {
             .await
     }
 
+    /// Reuse terminal observation without releasing the namespace or publishing Created.
+    /// Only the exact-root preparation path calls this after authority validation.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn stop_pipeline_for_topology_retirement(&self) -> Result<(), DbError> {
+        self.stop_pipeline_with_lifecycle_authority(PipelineLifecycleAuthority::TopologyRetirement)
+            .await
+    }
+
     pub(super) async fn stop_pipeline_with_lifecycle_authority(
         &self,
         authority: PipelineLifecycleAuthority,
     ) -> Result<(), DbError> {
-        let stop_timeout = match authority {
-            PipelineLifecycleAuthority::Public => PUBLIC_PIPELINE_STOP_TIMEOUT,
-            #[cfg(feature = "cluster")]
-            PipelineLifecycleAuthority::CoordinatedRecovery => {
-                self.coordinated_recovery_stop_timeout()
-            }
-        };
+        let stop_timeout = self.pipeline_stop_timeout(authority)?;
         let deadline = checked_pipeline_deadline(stop_timeout, "pipeline stop")?;
         let first_stop = loop {
             let startup = {
@@ -262,6 +264,12 @@ impl LaminarDB {
                 } else {
                     match DbState::load(&self.state) {
                         DbState::Created | DbState::Stopped => {
+                            #[cfg(feature = "cluster")]
+                            match self.claim_cold_recovery_stop(authority)? {
+                                Some(true) => break true,
+                                Some(false) => {}
+                                None => continue,
+                            }
                             drop(owned);
                             return Ok(());
                         }
@@ -340,6 +348,14 @@ impl LaminarDB {
                 }
                 Ok(Err(e)) => {
                     runtime_handle.take();
+                    #[cfg(feature = "cluster")]
+                    if authority == PipelineLifecycleAuthority::TopologyRetirement {
+                        let reason = format!(
+                            "parent runtime watcher failed during topology retirement: {e}"
+                        );
+                        self.last_fault.lock().get_or_insert_with(|| reason.clone());
+                        return Err(DbError::Pipeline(reason));
+                    }
                     tracing::warn!(error = %e, "Pipeline task panicked during stop");
                 }
                 Err(_) => {
@@ -390,6 +406,13 @@ impl LaminarDB {
         self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
+        #[cfg(feature = "cluster")]
+        if authority == PipelineLifecycleAuthority::TopologyRetirement {
+            // Keep T's identity, exact cut, namespace and ShuttingDown fence until a future
+            // authorized target install or coordinated recovery takes ownership. Cancellation
+            // at any earlier await leaves all unresolved handles in their existing DB registries.
+            return Ok(());
+        }
         *self.checkpoint_namespace_lock.lock() = None;
         if self.is_closed() {
             // A concurrent shutdown owns the terminal transition. Leaving ShuttingDown in place
@@ -415,5 +438,58 @@ impl LaminarDB {
                 "pipeline stop completed from unexpected lifecycle state {observed:?}; restart remains fenced"
             ))),
         }
+    }
+}
+
+impl LaminarDB {
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unnecessary_wraps))]
+    // Cluster builds reject startup-only authority through the same typed result.
+    fn pipeline_stop_timeout(
+        &self,
+        authority: PipelineLifecycleAuthority,
+    ) -> Result<std::time::Duration, DbError> {
+        let stop_timeout = match authority {
+            PipelineLifecycleAuthority::Public => PUBLIC_PIPELINE_STOP_TIMEOUT,
+            #[cfg(feature = "cluster")]
+            PipelineLifecycleAuthority::CoordinatedRecovery => {
+                self.coordinated_recovery_stop_timeout()
+            }
+            #[cfg(feature = "cluster")]
+            PipelineLifecycleAuthority::TopologyRetirement => std::time::Duration::from_secs(45),
+            #[cfg(feature = "cluster")]
+            PipelineLifecycleAuthority::TopologyInstallation => {
+                return Err(DbError::InvalidOperation(
+                    "topology installation authority is confined to held startup".into(),
+                ));
+            }
+        };
+        Ok(stop_timeout)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn claim_cold_recovery_stop(
+        &self,
+        authority: PipelineLifecycleAuthority,
+    ) -> Result<Option<bool>, DbError> {
+        if authority == PipelineLifecycleAuthority::TopologyRetirement {
+            return Err(DbError::InvalidOperation(
+                "topology retirement lost the held parent runtime".into(),
+            ));
+        }
+        if authority == PipelineLifecycleAuthority::CoordinatedRecovery {
+            // A cold target has no actors yet, but teardown must retire its owned token/handles.
+            return Ok(
+                match DbState::compare_exchange(
+                    DbState::Created,
+                    DbState::ShuttingDown,
+                    &self.state,
+                ) {
+                    Ok(_) => Some(true),
+                    Err(DbState::Stopped) => Some(false),
+                    Err(_) => None,
+                },
+            );
+        }
+        Ok(Some(false))
     }
 }

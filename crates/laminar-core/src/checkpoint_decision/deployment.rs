@@ -86,6 +86,16 @@ impl CheckpointDecisionStore {
         }))
     }
 
+    /// Read the checkpoint namespace's deployment incarnation without creating or allocating.
+    ///
+    /// # Errors
+    /// Fails for storage I/O or malformed/conflicting persisted identity.
+    pub async fn load_deployment_id(&self) -> Result<Option<String>, DecisionError> {
+        self.read_deployment_identity()
+            .await
+            .map(|identity| identity.map(|stored| stored.head.id))
+    }
+
     /// Load the checkpoint namespace's create-once deployment incarnation, creating it when the
     /// durable store is empty. Concurrent cluster members converge through object-store CAS.
     ///

@@ -666,6 +666,10 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         quorum_timeout: Duration::from_secs(1),
         checkpoint_committable_sinks: false,
         intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        #[cfg(feature = "cluster")]
+        topology_cut_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        #[cfg(feature = "cluster")]
+        intake_gate_transition: Arc::new(parking_lot::Mutex::new(())),
     }
 }
 
@@ -809,6 +813,7 @@ fn local_controller() -> Arc<laminar_core::cluster::control::ClusterController> 
 
 #[cfg(feature = "cluster")]
 struct AuthoritativeLocalLeader {
+    objects: Arc<dyn object_store::ObjectStore>,
     controller: Arc<laminar_core::cluster::control::ClusterController>,
     assignment_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
@@ -877,10 +882,10 @@ async fn authoritative_local_leader(
     let node = NodeId(1);
     let boot = "00000000-0000-0000-0000-000000000001".parse().unwrap();
     let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let objects: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
     let assignment_store = Arc::new(
-        laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::new(
-            object_store::memory::InMemory::new(),
-        )),
+        laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::clone(&objects)),
     );
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
         node,
@@ -896,11 +901,7 @@ async fn authoritative_local_leader(
         .unwrap();
 
     let process_authority = Arc::new(
-        ProcessLeaseAuthority::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            Duration::from_secs(30),
-        )
-        .unwrap(),
+        ProcessLeaseAuthority::new(Arc::clone(&objects), Duration::from_secs(30)).unwrap(),
     );
     let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
         .store_for(node)
@@ -918,9 +919,7 @@ async fn authoritative_local_leader(
         .await
         .unwrap();
 
-    let backing: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::memory::InMemory::new());
-    let authority = Arc::new(LeaderLeaseStore::new(backing, 1_000));
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 1_000));
     let owner = LeaderLeaseOwner {
         node,
         boot,
@@ -954,12 +953,418 @@ async fn authoritative_local_leader(
     controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
     let proof = controller.capture_leader_proof().unwrap();
     AuthoritativeLocalLeader {
+        objects,
         controller,
         assignment_store,
         authority,
         fence,
         proof,
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn topology_cut_prepare_binds_real_artifact_admission_before_source_capture() {
+    use laminar_core::checkpoint::{flags, ObjectStoreCheckpointStore, PipelineIdentity};
+    use laminar_core::checkpoint_decision::{CheckpointDecisionStore, CheckpointVerdict};
+    use laminar_core::cluster::control::{
+        CatalogManifest, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind, ClusterKv,
+        InMemoryKv, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyVersion,
+        ANNOUNCEMENT_KEY, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    };
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::state::{KeyGroupCount, VnodeRegistry};
+
+    let kv = Arc::new(InMemoryKv::new(NodeId(1)));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let leader = authoritative_local_leader(control).await;
+    let catalog = CatalogManifestStore::new(Arc::clone(&leader.authority));
+    let parent = CatalogManifest {
+        entries: vec![CatalogManifestEntry {
+            canonical_name: "existing".into(),
+            kind: CatalogObjectKind::Source,
+            catalog_generation: 1,
+            ddl: "CREATE SOURCE existing (id BIGINT)".into(),
+        }],
+    };
+    catalog.seal(&parent, &leader.proof).await.unwrap();
+    let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&leader.objects)));
+    let deployment = decisions.load_or_create_deployment_id().await.unwrap();
+    leader
+        .authority
+        .adopt_legacy_topology(
+            &leader.proof,
+            uuid::Uuid::from_u128(40).try_into().unwrap(),
+            &parent.reference().unwrap(),
+            &deployment,
+        )
+        .await
+        .unwrap();
+    let mut target = parent.clone();
+    target.entries.push(CatalogManifestEntry {
+        canonical_name: "candidate".into(),
+        kind: CatalogObjectKind::Source,
+        catalog_generation: 1,
+        ddl: "CREATE SOURCE candidate (id BIGINT)".into(),
+    });
+    use laminar_core::cluster::control::topology::{
+        ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+        TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+    };
+    let mut objects = target
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| ClusterTopologyObjectPlan {
+            name: entry.canonical_name.clone(),
+            kind: entry.kind,
+            catalog_generation: entry.catalog_generation,
+            transition: if index == 0 {
+                ClusterTopologyObjectTransition::Preserve
+            } else {
+                ClusterTopologyObjectTransition::AddFutureOnly
+            },
+            initialization: if index == 0 {
+                TopologyInitialization::PreserveExactCut
+            } else {
+                TopologyInitialization::ResolveSourcePositionsOnce
+            },
+            definition_sha256: "1".repeat(64),
+            compatibility_sha256: "1".repeat(64),
+            dependencies: Vec::new(),
+            schema_sha256: None,
+            managed_state_contract: None,
+        })
+        .collect::<Vec<_>>();
+    objects.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut descriptor = ClusterTopologyValidation {
+        validation_format_version: 3,
+        scope: TopologyValidationScope::LocalCandidatePlan,
+        deployment_id: deployment.clone(),
+        parent_version: TopologyVersion::LEGACY_BASELINE,
+        target_version: TopologyVersion::new(2).unwrap(),
+        parent_manifest: parent.reference().unwrap(),
+        target_manifest: target.reference().unwrap(),
+        parent_pipeline: PipelineIdentity::empty(),
+        target_pipeline: PipelineIdentity {
+            canonical_version: 7,
+            sha256: "2".repeat(64),
+        },
+        environment_sha256: "3".repeat(64),
+        compatibility_sha256: String::new(),
+        statements: target.entries[parent.entries.len()..]
+            .iter()
+            .map(|entry| entry.ddl.clone())
+            .collect(),
+        objects,
+        requires_processing_pause: true,
+        required_before_activation: vec![
+            TopologyActivationRequirement::ParticipantPlanAgreement,
+            TopologyActivationRequirement::ReconciledCheckpointCut,
+            TopologyActivationRequirement::DurableInitializationAndProgress,
+            TopologyActivationRequirement::ObservedActorRetirement,
+            TopologyActivationRequirement::AtomicTargetCommit,
+            TopologyActivationRequirement::InstalledTargetRelease,
+        ],
+    };
+    descriptor.compatibility_sha256 = descriptor.descriptor_digest().unwrap();
+    let compatibility = leader
+        .authority
+        .stage_topology_compatibility(&descriptor)
+        .await
+        .unwrap();
+    let plan = TopologyAdmissionPlan {
+        protocol_version: TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+        operation_id: uuid::Uuid::from_u128(41).try_into().unwrap(),
+        expected_parent: TopologyVersion::LEGACY_BASELINE,
+        parent_manifest: parent.reference().unwrap(),
+        target_manifest: target.reference().unwrap(),
+        assignment: leader.fence.clone(),
+        compatibility: Some(compatibility),
+    };
+    let store = ObjectStoreCheckpointStore::new(Arc::clone(&leader.objects), "topology-cut")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
+        .with_participant_id(1);
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        Box::new(store),
+    )
+    .unwrap();
+    coordinator
+        .bind_durable_decision_store(decisions)
+        .await
+        .unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator.set_assignment_version(leader.fence.assignment_version);
+    coordinator.set_cluster_controller(Arc::clone(&leader.controller));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    registry.set_assignment_and_version(vec![NodeId(1)].into(), 1);
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(Arc::clone(&leader.controller));
+    callback.vnode_registry = Some(registry);
+    callback.epoch_allocator = Some(coordinator.epoch_allocator());
+    callback.coordinator = Arc::new(tokio::sync::Mutex::new(Some(coordinator)));
+
+    // Force the real admission race: an ordinary checkpoint audits flags and reserves its exact
+    // ID, then the topology reservation wins before Prepare. No sleeps or mocked authority.
+    let ordinary_flags = ConnectorPipelineCallback::checkpoint_flags_for_assignment(
+        Some(Arc::clone(&leader.controller)),
+        Some(leader.fence.clone()),
+        deadline,
+    )
+    .await
+    .unwrap();
+    let ordinary_flags = ordinary_flags.unwrap();
+    assert_eq!(ordinary_flags, flags::NONE);
+    let rejected = callback.reserve_attempt(deadline).await.unwrap();
+    assert_eq!(
+        callback.checkpoint_leader_proofs.get(&rejected),
+        Some(&leader.proof)
+    );
+    let admitted = leader
+        .authority
+        .admit_topology_plan(&leader.proof, &leader.assignment_store, &plan, &target)
+        .await
+        .unwrap();
+    let error = crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
+        &mut callback,
+        rejected,
+        std::time::Instant::now(),
+        deadline,
+        ordinary_flags,
+        Some(leader.fence.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("no longer match admission"), "{error}");
+    callback
+        .abandon_reserved_attempt(rejected, error, ordinary_flags, Some(leader.fence.clone()))
+        .await
+        .unwrap();
+    let outcome = leader
+        .authority
+        .cluster_outcome(rejected.epoch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
+    assert_eq!(outcome.checkpoint_id, rejected.checkpoint_id);
+    assert_eq!(outcome.leader_proof.as_ref(), Some(&leader.proof));
+    assert_eq!(outcome.assignment_fence.as_ref(), Some(&leader.fence));
+    assert!(callback.checkpoint_leader_proofs.is_empty());
+    assert!(callback.checkpoint_fault.lock().is_none());
+    assert!(kv.read_from(NodeId(1), ANNOUNCEMENT_KEY).await.is_none());
+    assert!(leader
+        .authority
+        .cluster_checkpoint_artifacts()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!callback
+        .intake_gate
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        leader
+            .authority
+            .topology_operation_status(plan.operation_id)
+            .await
+            .unwrap(),
+        Some(admitted.clone())
+    );
+    assert_eq!(
+        leader
+            .authority
+            .admit_topology_plan(&leader.proof, &leader.assignment_store, &plan, &target)
+            .await
+            .unwrap(),
+        admitted
+    );
+
+    // Deadline expiry after reservation owns the same cleanup obligation, even without Prepare.
+    let expired = callback.reserve_attempt(deadline).await.unwrap();
+    callback
+        .abandon_reserved_attempt(
+            expired,
+            "deadline expired after reservation".into(),
+            flags::TOPOLOGY_CUT,
+            Some(leader.fence.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        leader
+            .authority
+            .cluster_outcome(expired.epoch)
+            .await
+            .unwrap()
+            .unwrap()
+            .verdict,
+        CheckpointVerdict::Abort
+    );
+    assert!(callback.checkpoint_fault.lock().is_none());
+    assert_eq!(
+        leader
+            .authority
+            .topology_operation_status(plan.operation_id)
+            .await
+            .unwrap(),
+        Some(admitted)
+    );
+    let attempt = callback.reserve_attempt(deadline).await.unwrap();
+    assert!(attempt.checkpoint_id > expired.checkpoint_id);
+    let mut guard = callback.coordinator.lock().await;
+    let coordinator = guard.as_mut().unwrap();
+    assert!(coordinator
+        .begin_checkpoint_artifacts_until(
+            attempt,
+            Some(leader.fence.clone()),
+            Some(&leader.proof),
+            deadline,
+        )
+        .await
+        .is_err());
+    assert!(coordinator
+        .begin_checkpoint_artifacts_for_flags_until(
+            attempt,
+            Some(leader.fence.clone()),
+            Some(&leader.proof),
+            flags::HANDOFF | flags::TOPOLOGY_CUT,
+            deadline,
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        leader
+            .authority
+            .topology_operation_status(plan.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        TopologyAdmissionPhase::Planned
+    );
+
+    drop(guard);
+    assert_eq!(
+        ConnectorPipelineCallback::checkpoint_flags_for_assignment(
+            Some(Arc::clone(&leader.controller)),
+            Some(leader.fence.clone()),
+            deadline
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    let processes = laminar_core::cluster::control::ProcessLeaseAuthority::new(
+        Arc::clone(&leader.objects),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let _prepared = leader
+        .authority
+        .certify_topology_participant(
+            &leader.assignment_store,
+            &processes,
+            plan.operation_id,
+            &leader
+                .authority
+                .topology_operation_status(plan.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .plan,
+            leader
+                .controller
+                .try_live_local_process_authority_identity()
+                .unwrap(),
+            TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+            &descriptor,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ConnectorPipelineCallback::checkpoint_flags_for_assignment(
+            Some(Arc::clone(&leader.controller)),
+            Some(leader.fence.clone()),
+            deadline,
+        )
+        .await
+        .unwrap(),
+        Some(flags::TOPOLOGY_CUT)
+    );
+    crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
+        &mut callback,
+        attempt,
+        std::time::Instant::now(),
+        deadline,
+        flags::TOPOLOGY_CUT,
+        Some(leader.fence.clone()),
+    )
+    .await
+    .unwrap();
+    let status = leader
+        .authority
+        .topology_operation_status(plan.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.phase, TopologyAdmissionPhase::Quiescing);
+    let cut = status.cut.unwrap();
+    assert_eq!(cut.inventory.attempt, attempt);
+    assert_eq!(cut.inventory.pipeline_identity, PipelineIdentity::empty());
+    assert_eq!(cut.inventory.assignment_fence, Some(leader.fence.clone()));
+    assert!(cut.committed.is_none());
+    assert!(cut.completed_participants.is_empty());
+    assert_eq!(catalog.load().await.unwrap(), Some(parent));
+    assert!(
+        !callback
+            .intake_gate
+            .load(std::sync::atomic::Ordering::Acquire),
+        "Prepare must let the source barrier reach capture before holding intake"
+    );
+    assert!(fence_intake_after_terminal_cut_capture(
+        &callback.intake_gate,
+        &callback.topology_cut_hold,
+        &callback.intake_gate_transition,
+        flags::TOPOLOGY_CUT,
+        false
+    ));
+    assert!(callback
+        .intake_gate
+        .load(std::sync::atomic::Ordering::Acquire));
+    // After artifact admission, even an otherwise clean Abort still requires coordinated
+    // recovery. The reservation-only exception must not release captured participant state.
+    assert!(callback
+        .abandon_reserved_attempt(
+            attempt,
+            "injected failure after Prepare".into(),
+            flags::TOPOLOGY_CUT,
+            Some(leader.fence.clone()),
+        )
+        .await
+        .is_err());
+    assert!(callback.checkpoint_fault.lock().is_some());
+    assert_eq!(
+        leader
+            .authority
+            .topology_operation_status(plan.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        TopologyAdmissionPhase::Aborted {
+            reason: laminar_core::cluster::control::TopologyAbortReason::CheckpointAborted
+        }
+    );
+    assert!(leader
+        .authority
+        .cluster_checkpoint_artifacts()
+        .await
+        .unwrap()
+        .is_some());
 }
 
 #[cfg(feature = "cluster")]
@@ -1688,7 +2093,11 @@ fn certified_barrier(
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn reserve_attempt_uses_durable_order_after_unannounced_leader_crash() {
-    let (controller, _kv) = local_controller_with_kv();
+    let kv: Arc<dyn laminar_core::cluster::control::ClusterKv> =
+        Arc::new(laminar_core::cluster::control::InMemoryKv::new(
+            laminar_core::cluster::discovery::NodeId(1),
+        ));
+    let leader = authoritative_local_leader(kv).await;
     let abandoned = CheckpointAttempt::canonical(7);
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
@@ -1715,7 +2124,7 @@ async fn reserve_attempt_uses_durable_order_after_unannounced_leader_crash() {
         .unwrap();
 
     let mut callback = empty_callback_fixture();
-    callback.cluster_controller = Some(controller);
+    callback.cluster_controller = Some(Arc::clone(&leader.controller));
     callback.epoch_allocator = Some(coordinator.epoch_allocator());
     let reserved = callback
         .reserve_attempt(tokio::time::Instant::now())
@@ -1723,6 +2132,10 @@ async fn reserve_attempt_uses_durable_order_after_unannounced_leader_crash() {
         .unwrap();
 
     assert_eq!(reserved, CheckpointAttempt::canonical(8));
+    assert_eq!(
+        callback.checkpoint_leader_proofs.get(&reserved),
+        Some(&leader.proof)
+    );
     assert_eq!(
         reserved.relation_to(abandoned),
         CheckpointAttemptRelation::Newer
@@ -2303,76 +2716,115 @@ fn spawn_batch_recording_sink(
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn terminal_handoff_completion_leaves_sink_sealed_for_target_assignment() {
+async fn terminal_cuts_keep_sink_sealed_and_report_missing_topology_completion_authority() {
     use laminar_connectors::connector::{SinkConsistency, SinkInputMode, SinkTopology};
 
-    let contract = SinkContract::new(
-        SinkConsistency::CheckpointCommittable,
-        SinkTopology::MultiWriter,
-        SinkInputMode::AppendOnly,
-    );
-    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
-        crate::sink_task::SinkEvent,
-    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
-    let (sink, _batches) = spawn_batch_recording_sink(
-        "terminal-handoff",
-        contract,
-        Arc::new(arrow_schema::Schema::empty()),
-        event_tx,
-    );
-    let attempt = CheckpointAttempt::canonical(7);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    sink.begin_epoch_until(attempt.epoch, deadline)
-        .await
-        .unwrap();
-    let admission = sink.begun_epoch_admission(attempt.epoch).unwrap();
-    sink.publish_open_epoch(admission).unwrap();
+    for flags in [
+        laminar_core::checkpoint::flags::HANDOFF,
+        laminar_core::checkpoint::flags::TOPOLOGY_CUT,
+    ] {
+        let contract = SinkContract::new(
+            SinkConsistency::CheckpointCommittable,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        );
+        let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+            crate::sink_task::SinkEvent,
+        >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+        let (sink, _batches) = spawn_batch_recording_sink(
+            "terminal-handoff",
+            contract,
+            Arc::new(arrow_schema::Schema::empty()),
+            event_tx,
+        );
+        let attempt = CheckpointAttempt::canonical(7);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        sink.begin_epoch_until(attempt.epoch, deadline)
+            .await
+            .unwrap();
+        let admission = sink.begun_epoch_admission(attempt.epoch).unwrap();
+        sink.publish_open_epoch(admission).unwrap();
 
-    let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
-    let mut epoch_guard =
-        EpochInFlightGuard::claim(&in_flight, &checkpoint_fault, attempt, [sink.clone()]).unwrap();
-    epoch_guard.seal_sink_epoch_until(deadline).await.unwrap();
-    let (complete_tx, _complete_rx) =
-        crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
-    let mut tail = LeaderTail {
-        in_flight: epoch_guard,
-        coordinator: Arc::new(tokio::sync::Mutex::new(None)),
-        complete_tx,
-        request: crate::checkpoint_coordinator::CheckpointRequest::default(),
-        operator_state: None,
-        operator_state_staged_cap_bytes: 0,
-        mutable_operator_capture_guard: None,
-        fan_out: FxHashMap::default(),
-        local_watermark: CheckpointWatermark::Uninitialized,
-        handoff: HandoffCapture::new(laminar_core::checkpoint::flags::HANDOFF, false),
-        attempt,
-        attempt_started: std::time::Instant::now(),
-        attempt_deadline: deadline,
-        checkpoint_timeout: Duration::from_secs(1),
-        serialization_timeout: Duration::from_secs(1),
-        checkpoint_cleanup_timeout: Duration::from_secs(1),
-        fault_on_retryable_failure: true,
-        fault_on_unclassified_error: true,
-        checkpoint_fault: Arc::clone(&checkpoint_fault),
-        controller: None,
-        leader_proof: None,
-        full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
-    let result = crate::checkpoint_coordinator::CheckpointResult {
-        success: true,
-        checkpoint_id: attempt.checkpoint_id,
-        epoch: attempt.epoch,
-        duration: Duration::ZERO,
-        error: None,
-        failure_disposition: None,
-    };
+        let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
+        let mut epoch_guard =
+            EpochInFlightGuard::claim(&in_flight, &checkpoint_fault, attempt, [sink.clone()])
+                .unwrap();
+        epoch_guard.seal_sink_epoch_until(deadline).await.unwrap();
+        let (complete_tx, complete_rx) =
+            crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
+        let mut tail = LeaderTail {
+            in_flight: epoch_guard,
+            coordinator: Arc::new(tokio::sync::Mutex::new(None)),
+            complete_tx,
+            request: crate::checkpoint_coordinator::CheckpointRequest::default(),
+            operator_state: None,
+            operator_state_staged_cap_bytes: 0,
+            mutable_operator_capture_guard: None,
+            fan_out: FxHashMap::default(),
+            local_watermark: CheckpointWatermark::Uninitialized,
+            handoff: HandoffCapture::new(flags, false),
+            attempt,
+            attempt_started: std::time::Instant::now(),
+            attempt_deadline: deadline,
+            checkpoint_timeout: Duration::from_secs(1),
+            serialization_timeout: Duration::from_secs(1),
+            checkpoint_cleanup_timeout: Duration::from_secs(1),
+            fault_on_retryable_failure: true,
+            fault_on_unclassified_error: true,
+            checkpoint_fault: Arc::clone(&checkpoint_fault),
+            controller: None,
+            leader_proof: None,
+            full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let result = crate::checkpoint_coordinator::CheckpointResult {
+            success: true,
+            checkpoint_id: attempt.checkpoint_id,
+            epoch: attempt.epoch,
+            duration: Duration::ZERO,
+            error: None,
+            failure_disposition: None,
+        };
 
-    ConnectorPipelineCallback::complete_successful_leader_tail(&mut tail, result).await;
+        ConnectorPipelineCallback::complete_successful_leader_tail(&mut tail, result).await;
 
-    assert!(checkpoint_fault.lock().is_none());
-    sink.begin_epoch_until(8, deadline).await.unwrap();
-    sink.close().await.unwrap();
+        let crate::pipeline::CheckpointCompletion::Committed {
+            result: completion_result,
+            ..
+        } = complete_rx.recv().await.unwrap()
+        else {
+            panic!("cut application failure must retain its already committed checkpoint result");
+        };
+        assert!(
+            completion_result.success,
+            "an application error must not rewind the durable Commit"
+        );
+        assert!(
+            sink.open_epoch_admission(8).is_err(),
+            "a terminal cut reopened successor output"
+        );
+        if flags == laminar_core::checkpoint::flags::TOPOLOGY_CUT {
+            assert!(checkpoint_fault
+                .lock()
+                .as_ref()
+                .unwrap()
+                .contains("no controller"));
+            assert!(completion_result
+                .continuation_error()
+                .unwrap()
+                .contains("no controller"));
+            assert!(
+                sink.wait_for_write_gate_until(Some(deadline))
+                    .await
+                    .is_err(),
+                "completion publication failure must fence ordinary sink writes"
+            );
+        } else {
+            assert!(checkpoint_fault.lock().is_none());
+            sink.begin_epoch_until(8, deadline).await.unwrap();
+        }
+        sink.close().await.unwrap();
+    }
 }
 
 fn recorded_i64_values(batches: &[RecordBatch]) -> Vec<i64> {
@@ -3629,6 +4081,8 @@ fn cluster_callback_fixture(
             quorum_timeout: Duration::from_secs(1),
             checkpoint_committable_sinks: false,
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            topology_cut_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            intake_gate_transition: Arc::new(parking_lot::Mutex::new(())),
         },
     }
 }
@@ -5740,6 +6194,7 @@ async fn install_callback_shuffle(
             registry: Arc::new(VnodeRegistry::single_owner(2, NodeId(7))),
             sender: Arc::clone(&sender),
             receiver: Arc::clone(&receiver),
+            topology: None,
             self_id: NodeId(7),
         });
     (sender, receiver)

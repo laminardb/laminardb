@@ -41,6 +41,10 @@ pub(super) struct SinkTerminalState {
 
 pub(super) struct SinkActorState {
     pub(super) accepting: AtomicBool,
+    /// Unique to this actor, shared by every handle and connector operation. Revocation is
+    /// monotonic and precedes forced cancellation; a successor gets a fresh token.
+    pub(super) revoked: tokio_util::sync::CancellationToken,
+    pub(super) ready: AtomicBool,
     pub(super) finished: AtomicBool,
     pub(super) finished_notify: tokio::sync::Notify,
 }
@@ -49,6 +53,8 @@ impl SinkActorState {
     pub(super) fn new() -> Self {
         Self {
             accepting: AtomicBool::new(true),
+            revoked: tokio_util::sync::CancellationToken::new(),
+            ready: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             finished_notify: tokio::sync::Notify::new(),
         }
@@ -60,6 +66,7 @@ impl SinkActorState {
 
     pub(super) fn finish(&self) {
         self.stop_admission();
+        self.revoked.cancel();
         if !self.finished.swap(true, Ordering::AcqRel) {
             self.finished_notify.notify_waiters();
         }
@@ -230,6 +237,8 @@ pub(super) struct OwnedSinkTask {
 
 impl OwnedSinkTask {
     pub(super) fn abort_actor(&self) {
+        self.terminal_state.actor.stop_admission();
+        self.terminal_state.actor.revoked.cancel();
         self.actor_abort.abort();
     }
 }

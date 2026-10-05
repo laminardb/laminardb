@@ -33,6 +33,9 @@ use crate::connector::{
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
 
+mod configuration;
+use configuration::build_pull_config;
+
 const ACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ACK_CONCURRENCY: usize = 64;
@@ -368,6 +371,11 @@ impl SourceConnector for NatsSource {
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        if matches!(&position, SourcePosition::Initialized { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "NATS has no sealed topology startup contract".into(),
+            ));
+        }
         if let SourcePosition::Resume { attempt, .. } = position {
             return Err(ConnectorError::ConfigurationError(format!(
                 "NATS is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
@@ -658,51 +666,6 @@ async fn connect(
         .connect(&cfg.servers)
         .await
         .map_err(|error| classify_connect_error(&error))
-}
-
-fn build_pull_config(
-    cfg: &NatsSourceConfig,
-    consumer_name: &str,
-) -> Result<pull::Config, ConnectorError> {
-    let filter_subjects = if cfg.subject_filters.is_empty() {
-        cfg.subject.iter().cloned().collect()
-    } else {
-        cfg.subject_filters.clone()
-    };
-
-    Ok(pull::Config {
-        durable_name: Some(consumer_name.to_string()),
-        filter_subjects,
-        deliver_policy: map_deliver_policy(cfg)?,
-        ack_policy: map_ack_policy(cfg.ack_policy),
-        ack_wait: cfg.ack_wait,
-        max_deliver: cfg.max_deliver,
-        max_ack_pending: cfg.max_ack_pending,
-        ..Default::default()
-    })
-}
-
-fn map_deliver_policy(
-    cfg: &NatsSourceConfig,
-) -> Result<async_nats::jetstream::consumer::DeliverPolicy, ConnectorError> {
-    use async_nats::jetstream::consumer::DeliverPolicy as Nats;
-    Ok(match cfg.deliver_policy {
-        DeliverPolicy::All => Nats::All,
-        DeliverPolicy::New => Nats::New,
-        DeliverPolicy::ByStartSequence => Nats::ByStartSequence {
-            start_sequence: cfg.start_sequence.unwrap_or(1),
-        },
-        DeliverPolicy::ByStartTime => {
-            let raw = cfg
-                .start_time
-                .as_deref()
-                .ok_or_else(|| err("deliver.policy=by_start_time requires 'start.time'"))?;
-            let start_time =
-                time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
-                    .map_err(|e| err(&format!("start.time '{raw}' is not valid RFC3339: {e}")))?;
-            Nats::ByStartTime { start_time }
-        }
-    })
 }
 
 fn map_ack_policy(p: AckPolicy) -> async_nats::jetstream::consumer::AckPolicy {

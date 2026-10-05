@@ -188,14 +188,13 @@ impl WebSocketSource {
                                 () = tokio::time::sleep(delay) => continue,
                                 _ = shutdown_rx.changed() => break,
                             }
-                        } else {
-                            publish_terminal(
-                                &terminal_error,
-                                &data_ready,
-                                format!("connection failed, no more retries: {e}"),
-                            );
-                            break;
                         }
+                        publish_terminal(
+                            &terminal_error,
+                            &data_ready,
+                            format!("connection failed, no more retries: {e}"),
+                        );
+                        break;
                     }
                 };
 
@@ -219,14 +218,13 @@ impl WebSocketSource {
                                 () = tokio::time::sleep(delay) => continue,
                                 _ = shutdown_rx.changed() => break 'outer,
                             }
-                        } else {
-                            publish_terminal(
-                                &terminal_error,
-                                &data_ready,
-                                format!("subscription failed, no more retries: {e}"),
-                            );
-                            break 'outer;
                         }
+                        publish_terminal(
+                            &terminal_error,
+                            &data_ready,
+                            format!("subscription failed, no more retries: {e}"),
+                        );
+                        break 'outer;
                     }
                     debug!("subscription message sent");
                 }
@@ -413,6 +411,11 @@ impl SourceConnector for WebSocketSource {
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        if matches!(&position, SourcePosition::Initialized { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "WebSocket has no sealed topology startup contract".into(),
+            ));
+        }
         if !matches!(self.state, ConnectorState::Created | ConnectorState::Closed) {
             return Err(ConnectorError::InvalidState {
                 expected: "Created or Closed".into(),

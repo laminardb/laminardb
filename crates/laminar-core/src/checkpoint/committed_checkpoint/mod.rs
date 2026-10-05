@@ -2,6 +2,8 @@
 
 #![allow(clippy::disallowed_types)] // cold-path canonical checkpoint metadata
 
+mod participant_validation;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
@@ -421,11 +423,26 @@ impl CommittedCheckpointIndex {
         {
             return Err("committed checkpoint predecessor breaks recovery continuity".into());
         }
+        self.validate_predecessor_watermarks(predecessor)
+    }
+
+    pub(crate) fn validate_predecessor_watermarks(
+        &self,
+        predecessor: &CommittedCheckpointIndex,
+    ) -> Result<(), String> {
+        self.validate_source_watermark_continuity(predecessor, &self.source_names)
+    }
+
+    pub(crate) fn validate_source_watermark_continuity(
+        &self,
+        predecessor: &CommittedCheckpointIndex,
+        inherited_sources: &[String],
+    ) -> Result<(), String> {
         if self.version == COMMITTED_CHECKPOINT_INDEX_VERSION {
             let mut expected = predecessor
                 .effective_source_watermarks()?
                 .into_iter()
-                .filter(|(source, _)| self.source_names.binary_search(source).is_ok())
+                .filter(|(source, _)| inherited_sources.binary_search(source).is_ok())
                 .collect::<BTreeMap<_, _>>();
             for (source, frontier) in channel_progress_frontiers_by_source(&self.channel_progress)?
             {
@@ -470,118 +487,6 @@ impl CommittedCheckpointIndex {
             });
         }
         Ok(self.source_watermarks.clone())
-    }
-
-    /// Verify exact participant manifest bytes and complete, exclusive vnode ownership.
-    ///
-    /// # Errors
-    /// Returns an error when the manifests do not exactly represent this committed cut.
-    pub fn validate_participant_manifests(
-        &self,
-        manifests: &[(&CheckpointManifest, &[u8])],
-    ) -> Result<(), String> {
-        self.validate()?;
-        if manifests.len() != self.participants.len() {
-            return Err("participant manifest count differs from the committed index".into());
-        }
-
-        let key_group_count = KeyGroupCount::try_from(u32::from(self.vnode_count))
-            .map_err(|_| "committed checkpoint vnode count is invalid".to_owned())?;
-        let mut owners = vec![None; usize::from(self.vnode_count)];
-        let mut sink_names = None;
-        for ((manifest, encoded), reference) in manifests.iter().zip(&self.participants) {
-            reference.verify_manifest(manifest, encoded)?;
-            let errors = manifest.validate(key_group_count);
-            if let Some(error) = errors.first() {
-                return Err(format!(
-                    "participant {} manifest is invalid: {error}",
-                    reference.participant_id
-                ));
-            }
-            if manifest.checkpoint_id != self.checkpoint_id
-                || manifest.epoch != self.epoch
-                || manifest.deployment_id != self.deployment_id
-                || manifest.pipeline_identity != self.pipeline_identity
-                || manifest.vnode_count != self.vnode_count
-                || manifest.assignment_fence != self.assignment_fence
-                || manifest.reassignment_portable != self.reassignment_portable
-            {
-                return Err(format!(
-                    "participant {} manifest belongs to a different checkpoint cut",
-                    reference.participant_id
-                ));
-            }
-
-            if manifest.source_names != self.source_names {
-                return Err(
-                    "participant manifest source topology differs from the committed index".into(),
-                );
-            }
-            match sink_names {
-                Some(expected) if expected != manifest.sink_names.as_slice() => {
-                    return Err(
-                        "participant manifests disagree on the registered sink topology".into(),
-                    );
-                }
-                None => sink_names = Some(manifest.sink_names.as_slice()),
-                Some(_) => {}
-            }
-            for vnode in &manifest.owned_vnodes {
-                let owner = owners
-                    .get_mut(usize::from(*vnode))
-                    .ok_or_else(|| format!("manifest owns out-of-range vnode {vnode}"))?;
-                if owner.replace(manifest.participant_id).is_some() {
-                    return Err(format!(
-                        "vnode {vnode} is owned by more than one participant"
-                    ));
-                }
-            }
-        }
-        if owners.iter().any(Option::is_none) {
-            return Err("participant manifests do not exactly cover the vnode domain".into());
-        }
-        if let Some(fence) = &self.assignment_fence {
-            let owner_map = owners.into_iter().flatten().collect::<Vec<_>>();
-            if !fence.matches_owner_map(&owner_map) {
-                return Err(
-                    "committed manifest vnode owners do not match the assignment fence".into(),
-                );
-            }
-            let subscription_manifests = manifests
-                .iter()
-                .filter_map(|(manifest, _)| {
-                    manifest
-                        .subscription_output
-                        .as_ref()
-                        .map(|output| (output, manifest.owned_vnodes.as_slice()))
-                })
-                .collect::<Vec<_>>();
-            if !subscription_manifests.is_empty() {
-                if subscription_manifests.len() != manifests.len() {
-                    return Err(
-                        "participant manifests do not agree on subscription output presence".into(),
-                    );
-                }
-                if subscription_manifests.iter().any(|(manifest, _)| {
-                    manifest.streams.iter().any(|stream| {
-                        stream.distribution_certificate.pipeline_identity != self.pipeline_identity
-                    })
-                }) {
-                    return Err(
-                        "subscription output pipeline identity differs from the committed index"
-                            .into(),
-                    );
-                }
-                merge_node_subscription_manifests(
-                    self.epoch,
-                    self.checkpoint_id,
-                    fence,
-                    &subscription_manifests,
-                )
-                .map_err(|error| format!("committed subscription output is invalid: {error}"))?;
-            }
-        }
-        Ok(())
     }
 
     /// Encode the canonical index and derive its exact content reference.
@@ -664,6 +569,114 @@ fn validate_sources(
                 return Err(format!(
                     "source '{source}' assignment version is {}; expected {}",
                     version, fence.assignment_version
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_manifest_progress(
+    manifest: &CheckpointManifest,
+    source_offsets: &mut BTreeMap<String, ConnectorCheckpoint>,
+    channel_progress: &mut BTreeMap<(u64, String, Vec<u8>), ChannelProgress>,
+) -> Result<(), String> {
+    for (source, local) in &manifest.source_offsets {
+        let (merged, first_participant) = match source_offsets.entry(source.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => (
+                entry.insert(ConnectorCheckpoint {
+                    offsets: std::collections::HashMap::new(),
+                    metadata: std::collections::HashMap::new(),
+                    input_channels: local.input_channels.clone(),
+                    source_assignment_version: local.source_assignment_version,
+                }),
+                true,
+            ),
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get().source_assignment_version != local.source_assignment_version {
+                    return Err(format!(
+                        "participant {} source '{source}' has a conflicting assignment version",
+                        manifest.participant_id
+                    ));
+                }
+                (entry.into_mut(), false)
+            }
+        };
+        merge_connector_map(
+            manifest.participant_id,
+            source,
+            "offset",
+            &mut merged.offsets,
+            &local.offsets,
+        )?;
+        merge_connector_map(
+            manifest.participant_id,
+            source,
+            "metadata",
+            &mut merged.metadata,
+            &local.metadata,
+        )?;
+        if !first_participant {
+            match (&mut merged.input_channels, &local.input_channels) {
+                (None, None) => {}
+                (Some(merged), Some(local)) => {
+                    if local
+                        .iter()
+                        .any(|channel| merged.binary_search(channel).is_ok())
+                    {
+                        return Err(format!(
+                            "source '{source}' input channel is owned by multiple participants"
+                        ));
+                    }
+                    merged.extend(local.iter().cloned());
+                    merged.sort_unstable();
+                }
+                _ => {
+                    return Err(format!(
+                        "source '{source}' participant checkpoints disagree on whether input channels are declared"
+                    ));
+                }
+            }
+        }
+    }
+
+    for channel in &manifest.channel_progress {
+        if channel.participant_id != manifest.participant_id {
+            return Err(format!(
+                "participant {} manifest contains source '{}' progress owned by participant {}",
+                manifest.participant_id, channel.source_name, channel.participant_id
+            ));
+        }
+        let key = (
+            channel.participant_id,
+            channel.source_name.clone(),
+            channel.input_channel.clone(),
+        );
+        if let Some(existing) = channel_progress.insert(key, channel.clone()) {
+            if existing == *channel {
+                continue;
+            }
+            return Err(format!(
+                "participant {} source '{}' input channel has conflicting progress",
+                manifest.participant_id, channel.source_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn merge_connector_map(
+    participant_id: u64,
+    source: &str,
+    field: &str,
+    merged: &mut std::collections::HashMap<String, String>,
+    local: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    for (key, value) in local {
+        if let Some(existing) = merged.insert(key.clone(), value.clone()) {
+            if existing != *value {
+                return Err(format!(
+                    "participant {participant_id} source '{source}' has conflicting {field} '{key}'"
                 ));
             }
         }

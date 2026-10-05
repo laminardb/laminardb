@@ -91,6 +91,10 @@ enum PipelineLifecycleAuthority {
     Public,
     #[cfg(feature = "cluster")]
     CoordinatedRecovery,
+    #[cfg(feature = "cluster")]
+    TopologyRetirement,
+    #[cfg(feature = "cluster")]
+    TopologyInstallation,
 }
 
 #[derive(Clone, Copy)]
@@ -277,12 +281,12 @@ pub(crate) use cluster_faults::report_cluster_terminal_halt;
 #[cfg(feature = "cluster")]
 use cluster_faults::{queue_owned_cluster_compute_fault, report_cluster_compute_fault};
 mod source_admission;
+pub(crate) use source_admission::validate_source_recovery_assignment;
 use source_admission::{
     admit_sink_contract, admit_source_contract, admit_source_recovery_contract,
     admit_temporal_source_contract, has_only_ordered_interval_consumers,
-    has_only_temporal_right_consumers, validate_source_recovery_assignment,
-    OrderedIntervalAdmissions, PipelineRecoveryState, PipelineSinkSetup, PipelineWatermarks,
-    PreparedSink, SinkAdmissionContext, TemporalSourceRole,
+    has_only_temporal_right_consumers, OrderedIntervalAdmissions, PipelineRecoveryState,
+    PipelineSinkSetup, PipelineWatermarks, PreparedSink, SinkAdmissionContext, TemporalSourceRole,
 };
 mod watermarks;
 use watermarks::{
@@ -325,6 +329,16 @@ mod sink_preparation;
 mod source_contracts;
 mod startup;
 mod startup_preparation;
+#[cfg(feature = "cluster")]
+mod topology_installation;
+#[cfg(feature = "cluster")]
+mod topology_recovery_startup;
+#[cfg(feature = "cluster")]
+use topology_installation::TopologyStartup;
+#[cfg(feature = "cluster")]
+mod topology_planning;
+#[cfg(feature = "cluster")]
+pub(crate) use topology_planning::PlannedTopologyGraph;
 mod state_recovery;
 
 #[cfg(all(test, feature = "cluster"))]

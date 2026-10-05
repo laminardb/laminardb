@@ -3,6 +3,9 @@
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)] // cold path
 
+mod head_validation;
+use head_validation::{assignment_publication_error, validate_local_assignment_head};
+
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
 use std::time::Duration;
 
@@ -811,7 +814,7 @@ impl SnapshotWatcher {
             let audit = tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return,
-                result = tokio::time::timeout_at(head_deadline, self.store.load()) => result,
+                result = tokio::time::timeout_at(head_deadline, self.load_materialized_assignment_head()) => result,
             };
             let mut audited_target = None;
             let mut audited_terminal = None;
@@ -3160,6 +3163,18 @@ fn authorize_recovery_successor<'a>(
             .assignment_fence()
             .map_err(|error| error.to_string())?;
         let deadline = controller.process_fencing_deadline(operation_timeout)?;
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        // A committed topology cannot restore on a survivor map. Wait for complete-slot
+        // replacement before closing authority or taking over any predecessor process lease.
+        tokio::time::timeout_at(
+            deadline,
+            authority.validate_topology_assignment_proposal(&target),
+        )
+        .await
+        .map_err(|_| "topology assignment preflight exceeded the fencing deadline".to_string())?
+        .map_err(|error| error.to_string())?;
         let removed = replaced_predecessor_processes(&predecessor, &target);
         let process_fences =
             close_local_assignment_authority(db, controller, &target, &removed, deadline).await?;
@@ -3199,9 +3214,6 @@ fn authorize_recovery_successor<'a>(
             }
         }
 
-        let authority = controller
-            .checkpoint_authority()
-            .map_err(|error| error.to_string())?;
         let committed_head =
             tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
                 .await
@@ -3319,7 +3331,24 @@ async fn reconcile_drain_publication(
             return Ok(DrainPublicationReconciliation::Deferred);
         }
 
-        match store.save_if_version(drain, prior_version).await {
+        if transition.predecessor.assignment_version != prior_version {
+            return Err(SnapshotError::Invalid(
+                "drain predecessor differs from publication version".into(),
+            ));
+        }
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(assignment_publication_error)?;
+        let published = authority
+            .publish_assignment_drain(&transition.leader, store, drain)
+            .await;
+        if matches!(
+            &published,
+            Err(laminar_core::cluster::control::ClusterCheckpointAuthorityError::Fenced)
+        ) {
+            return Ok(DrainPublicationReconciliation::Deferred);
+        }
+        match published.map_err(assignment_publication_error) {
             Ok(outcome) => {
                 authority_changed |=
                     controller.is_recovering() || !controller.proof_is_live(&transition.leader);
@@ -3662,6 +3691,16 @@ fn try_rebalance_owned(
 ) -> futures::future::BoxFuture<'static, Result<Option<u64>, String>> {
     Box::pin(async move {
         let head_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout_at(
+            head_deadline,
+            authority.materialize_reserved_assignment_drain(&store),
+        )
+        .await
+        .map_err(|_| "reserved assignment drain materialization timed out".to_string())?
+        .map_err(|error| error.to_string())?;
         let current = tokio::time::timeout_at(head_deadline, store.load())
             .await
             .map_err(|_| "durable assignment head audit timed out".to_string())?
@@ -3928,27 +3967,6 @@ fn try_rebalance_owned(
         )
         .await
     })
-}
-
-fn validate_local_assignment_head(
-    current: &AssignmentSnapshot,
-    current_owners: &[NodeId],
-    local_version: u64,
-    local_owners: &[NodeId],
-) -> Result<(), String> {
-    if current.version < local_version {
-        return Err(format!(
-            "durable assignment head {} regressed behind local assignment {local_version}",
-            current.version
-        ));
-    }
-    if current.version == local_version && current_owners != local_owners {
-        return Err(format!(
-            "durable and local assignment {} have different owner maps",
-            current.version
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -4441,7 +4459,7 @@ async fn finalize_drain_snapshot(
         .checkpoint_authority()
         .map_err(|error| error.to_string())?;
     let decision = match authority
-        .record_assignment_drain_decision(&deciding_proof, requested)
+        .record_assignment_drain_decision_with_assignments(&deciding_proof, requested, store)
         .await
         .map_err(|error| error.to_string())?
     {

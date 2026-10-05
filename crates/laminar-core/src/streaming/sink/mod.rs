@@ -26,8 +26,8 @@ pub struct Sink<T: Record> {
 
 impl<T: Record> Sink<T> {
     pub(crate) fn new(consumer: AsyncConsumer<SourceMessage<T>>, schema: SchemaRef) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
-        let tx = broadcast_tx.clone();
+        let sink = Self::schema_only(schema);
+        let tx = sink.broadcast_tx.clone();
 
         // Detached on purpose. Task ends naturally when `consumer.recv()`
         // returns Err (source closed). Aborting on Sink::drop would cut
@@ -36,6 +36,11 @@ impl<T: Record> Sink<T> {
             drain_loop(consumer, tx).await;
         });
 
+        sink
+    }
+
+    pub(crate) fn schema_only(schema: SchemaRef) -> Self {
+        let (broadcast_tx, _) = broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
         Self {
             broadcast_tx,
             schema,

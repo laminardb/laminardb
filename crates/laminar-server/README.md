@@ -197,9 +197,17 @@ including remote AI — runs normally.
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
+| GET | `/api/v1/cluster/topology` | Durable catalog version and this process's activation evidence (console authorization) |
+| POST | `/api/v1/cluster/topology/adopt` | Explicitly adopt an existing legacy catalog after a coordinated upgrade |
+| POST | `/api/v1/cluster/topology/validate` | Validate a topology candidate without applying it |
+| POST | `/api/v1/cluster/topology/operations` | Submit one atomic migration with an operation UUID and expected parent version |
+| GET | `/api/v1/cluster/topology/operations/{operation_id}` | Audited migration status (console authorization) |
 | GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
 
 `POST /api/v1/sql` returns at most 1000 result rows (and stops after a 5s collection budget). When the result is larger, the JSON response sets `"truncated": true` and `data` holds the first 1000 rows; the field is omitted when the result is complete. Use SUBSCRIBE (pgwire/WebSocket) to stream unbounded results.
+
+Supported cluster DDL returns an asynchronous migration receipt. See the main
+README's [topology support and limits](../../README.md#change-a-running-clusters-topology).
 
 ## Postgres Wire Protocol
 

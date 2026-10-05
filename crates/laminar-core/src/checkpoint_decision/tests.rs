@@ -126,6 +126,33 @@ async fn committed_index_create_is_idempotent_and_exactly_verified() {
 }
 
 #[tokio::test]
+async fn committed_index_read_never_recreates_a_missing_deployment() {
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = CheckpointDecisionStore::local_single_writer(Arc::clone(&raw));
+    let index = local_index(&store, 1, None).await;
+    let reference = store.create_committed_checkpoint(&index).await.unwrap();
+    raw.delete(&CheckpointDecisionStore::deployment_identity_path())
+        .await
+        .unwrap();
+
+    // Both a cached writer and a newly opened reader must fail without changing the namespace.
+    let fresh = CheckpointDecisionStore::local_single_writer(Arc::clone(&raw));
+    for reader in [&store, &fresh] {
+        assert!(matches!(
+            reader.load_committed_checkpoint(&reference).await,
+            Err(DecisionError::Conflict(reason)) if reason.contains("deployment identity is missing")
+        ));
+        assert!(reader.load_deployment_id().await.unwrap().is_none());
+    }
+    assert!(raw
+        .head(&CheckpointDecisionStore::committed_checkpoint_path(
+            &reference
+        ))
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
 async fn aborted_candidate_seal_blocks_create_and_replaces_an_existing_candidate() {
     let raw: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let store = CheckpointDecisionStore::local_single_writer(Arc::clone(&raw));

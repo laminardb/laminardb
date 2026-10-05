@@ -26,6 +26,7 @@ fn fence(sender: u128, receiver: u128, stream: u128, version: u64) -> StreamFenc
         stream_id: Uuid::from_u128(stream),
         assignment_version: version,
         assignment_certificate_digest: [1; 32],
+        topology: None,
         recovery_gen: 0,
     }
 }

@@ -118,6 +118,7 @@ impl SinkTaskHandle {
                 contract,
                 requires_recovery_on_error,
                 event_tx: task_event_tx,
+                generation: actor_state.revoked.clone(),
                 #[cfg(feature = "cluster")]
                 process_authority: process_authority.clone(),
                 #[cfg(feature = "cluster")]
@@ -170,6 +171,7 @@ impl SinkTaskHandle {
     }
 
     fn ensure_open(&self) -> Result<(), ConnectorError> {
+        self.ensure_current_generation("command admission")?;
         if self.closing.load(Ordering::Acquire) {
             return Err(self.closed_err());
         }
@@ -183,6 +185,34 @@ impl SinkTaskHandle {
             }
         }
         Ok(())
+    }
+
+    fn ensure_current_generation(&self, operation: &str) -> Result<(), ConnectorError> {
+        if self.actor_state.revoked.is_cancelled() {
+            return Err(super::operation::generation_retired_error(
+                &self.name, operation,
+            ));
+        }
+        #[cfg(feature = "cluster")]
+        if self
+            .process_authority
+            .as_ref()
+            .is_some_and(|controller| !controller.process_lease_is_live())
+        {
+            return Err(process_authority_error(&self.name, operation));
+        }
+        Ok(())
+    }
+
+    /// Actor readiness is distinct from unresolved connector-child ownership. A dead actor with
+    /// a retained native child must continue blocking succession, but cannot certify readiness.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn is_ready(&self) -> bool {
+        self.actor_state.ready.load(Ordering::Acquire)
+            && self.actor_state.accepting.load(Ordering::Acquire)
+            && !self.actor_state.finished.load(Ordering::Acquire)
+            && !self.closing.load(Ordering::Acquire)
+            && self.ensure_current_generation("readiness").is_ok()
     }
 
     fn epoch_gate_error(
@@ -284,6 +314,7 @@ impl SinkTaskHandle {
         &self,
         admission: SinkEpochAdmission,
     ) -> Result<(), ConnectorError> {
+        self.ensure_open()?;
         let Some(gate) = self.epoch_gate.as_ref() else {
             return Ok(());
         };
@@ -493,7 +524,8 @@ impl SinkTaskHandle {
             return tokio::select! {
                 biased;
                 result = &mut ack_rx => match result {
-                    Ok(result) => result,
+                    Ok(Ok(result)) => { self.ensure_current_generation(operation)?; Ok(result) },
+                    Ok(Err(error)) => Err(error),
                     Err(_) => Err(self.ack_dropped_err(operation)),
                 },
                 () = std::future::ready(()) => Err(self.closed_err()),
@@ -502,7 +534,8 @@ impl SinkTaskHandle {
         tokio::select! {
             biased;
             result = &mut ack_rx => match result {
-                Ok(result) => result,
+                Ok(Ok(result)) => { self.ensure_current_generation(operation)?; Ok(result) },
+                Ok(Err(error)) => Err(error),
                 Err(_) => Err(self.ack_dropped_err(operation)),
             },
             () = actor_finished.as_mut() => Err(self.closed_err()),

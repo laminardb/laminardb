@@ -73,6 +73,26 @@ impl ConnectorPipelineCallback {
         tail: &mut LeaderTail,
         result: crate::checkpoint_coordinator::CheckpointResult,
     ) {
+        #[cfg(feature = "cluster")]
+        let mut result = result;
+        #[cfg(feature = "cluster")]
+        if result.continuation_error().is_none()
+            && tail.handoff.flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT != 0
+        {
+            let deadline = tokio::time::Instant::now() + tail.checkpoint_cleanup_timeout;
+            if let Err(error) = Self::publish_topology_cut_completion_until(
+                tail.controller.as_deref(),
+                tail.leader_proof.as_ref(),
+                tail.attempt,
+                tail.handoff.flags,
+                tail.handoff.replay_pending,
+                deadline,
+            )
+            .await
+            {
+                result.error = Some(error.to_string());
+            }
+        }
         let mut continuation_error = result.continuation_error().map(str::to_owned);
         match CheckpointCompletion::validated(
             tail.attempt,
@@ -136,5 +156,45 @@ impl ConnectorPipelineCallback {
                 .await;
             }
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) async fn publish_topology_cut_completion_until(
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+        proof: Option<&laminar_core::checkpoint::LeaderProof>,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
+        flags: u64,
+        replay_pending: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), crate::error::DbError> {
+        use crate::error::DbError;
+        if flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT == 0 {
+            return Ok(());
+        }
+        if replay_pending || flags != laminar_core::checkpoint::flags::TOPOLOGY_CUT {
+            return Err(DbError::Checkpoint("topology cut completion requires intake and sink succession held at a replay-free cut".into()));
+        }
+        let controller = controller.ok_or_else(|| {
+            DbError::Checkpoint("topology cut completion has no controller".into())
+        })?;
+        let proof = proof.ok_or_else(|| {
+            DbError::Checkpoint("topology cut completion has no original leader proof".into())
+        })?;
+        tokio::time::timeout_at(
+            deadline,
+            controller.complete_topology_checkpoint_cut(proof, attempt),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(
+                "topology cut completion publication timed out; intake remains held".into(),
+            )
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "topology cut completion failed; intake remains held: {error}"
+            ))
+        })?;
+        Ok(())
     }
 }

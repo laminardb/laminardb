@@ -209,7 +209,7 @@ pub(super) type KafkaPartitionBaselines = std::collections::HashMap<(String, i32
 pub(super) struct KafkaStartPlan {
     pub(super) config: KafkaSourceConfig,
     pub(super) delivery: DeliveryGuarantee,
-    pub(super) is_resume: bool,
+    pub(super) has_saved_position: bool,
     pub(super) resume_input_channels: Option<Vec<Vec<u8>>>,
     pub(super) resume_baselines: KafkaPartitionBaselines,
 }

@@ -10,7 +10,11 @@
 
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2024-10-13T13-34-11Z
+    build: &minio-build
+      context: .
+      dockerfile: minio.Dockerfile
+    image: laminardb-minio-test:2024-10-13
+    pull_policy: build
     command: server /data --console-address :9001
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -25,7 +29,9 @@ services:
       retries: 30
 
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2024-10-08T09-37-26Z
+    build: *minio-build
+    image: laminardb-minio-test:2024-10-13
+    pull_policy: build
     depends_on:
       minio:
         condition: service_healthy

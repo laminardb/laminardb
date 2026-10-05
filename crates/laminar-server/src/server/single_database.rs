@@ -2,11 +2,31 @@
 
 use std::sync::Arc;
 
-use laminar_db::LaminarDB;
+use laminar_db::{EngineMetrics, LaminarDB};
 
 use crate::config::ServerConfig;
 
 use super::{apply_local_checkpoint_config, ServerError};
+
+pub(super) fn install_metrics(
+    db: &LaminarDB,
+    config: &ServerConfig,
+) -> Result<Arc<prometheus::Registry>, ServerError> {
+    let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+    let pipeline_name = config
+        .pipelines
+        .first()
+        .map_or("default", |p| p.name.as_str())
+        .to_string();
+    let registry = Arc::new(crate::metrics::build_registry([
+        ("instance".into(), hostname),
+        ("pipeline".into(), pipeline_name),
+    ]));
+    db.set_engine_metrics(Arc::new(EngineMetrics::new(&registry)));
+    db.set_prometheus_registry(Arc::clone(&registry))
+        .map_err(|error| ServerError::Start(error.to_string()))?;
+    Ok(registry)
+}
 
 pub(super) async fn build(config: &ServerConfig) -> Result<Arc<LaminarDB>, ServerError> {
     let mut builder = LaminarDB::builder();
@@ -38,8 +58,14 @@ pub(super) async fn build(config: &ServerConfig) -> Result<Arc<LaminarDB>, Serve
         builder = builder.ai(ai_runtime);
     }
 
-    builder
+    let db = builder
         .build()
         .await
-        .map_err(|error| ServerError::Build(error.to_string()))
+        .map_err(|error| ServerError::Build(error.to_string()))?;
+    // A failed local worker has no in-place replacement. A generic graph restart would reuse
+    // the dead client and could reopen source intake.
+    if config.process_functions.is_empty() {
+        db.enable_supervision();
+    }
+    Ok(db)
 }

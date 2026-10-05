@@ -402,6 +402,28 @@ pub(crate) struct SourceTaskLease {
 pub(crate) type OwnedSourceTasks = Arc<parking_lot::Mutex<Vec<SourceTaskLease>>>;
 
 impl SourceTaskLease {
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn spawn_for_test<F>(
+        name: &str,
+        actor: F,
+        terminal_tasks: Option<ConnectorTaskTracker>,
+    ) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let runtime = tokio::runtime::Handle::current();
+        let (join, terminal) = spawn_source_actor(&runtime, actor);
+        Self::supervise(
+            Arc::from(name),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            join,
+            terminal,
+            terminal_tasks,
+            &runtime,
+        )
+    }
+
     pub(super) fn supervise(
         name: Arc<str>,
         shutdown: Arc<tokio::sync::Notify>,
@@ -458,6 +480,13 @@ impl SourceTaskLease {
                 .terminal_tasks
                 .as_ref()
                 .is_none_or(ConnectorTaskTracker::is_terminated)
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn is_running(&self) -> bool {
+        !self.state.actor_terminal.is_finished()
+            && !self.state.abort.is_finished()
+            && !self.state.expected_shutdown.load(Ordering::Acquire)
     }
 
     pub(crate) fn request_shutdown(&self) {

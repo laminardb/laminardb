@@ -3,7 +3,7 @@ use super::RuntimeMode;
 use super::{DbError, HashMap, LaminarDB};
 
 impl LaminarDB {
-    pub(super) fn build_registered_source_config(
+    pub(crate) fn build_registered_source_config(
         &self,
         source_name: &str,
         registration: &crate::connector_manager::SourceRegistration,
@@ -18,12 +18,32 @@ impl LaminarDB {
         Ok(config)
     }
 
-    pub(super) async fn start_inner(&self) -> Result<(), DbError> {
+    pub(super) async fn start_inner(
+        &self,
+        #[cfg(feature = "cluster")] mut topology: Option<crate::db::PreparedTopologyRestore>,
+    ) -> Result<(), DbError> {
         let runtime_shutdown = tokio_util::sync::CancellationToken::new();
         *self.runtime_shutdown.write() = runtime_shutdown.clone();
+        #[cfg(feature = "cluster")]
+        self.installed_topology_runtime.lock().take();
         if self.is_closed() {
             runtime_shutdown.cancel();
             return Err(DbError::Shutdown);
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(image) = topology.as_mut() {
+            if image.recovery_input().is_none() {
+                self.ensure_topology_installation_held()?;
+            }
+            self.validate_topology_runtime_image(image).await?;
+            let input = &image.input;
+            let identities = self.topology_definition_identities()?;
+            if self.catalog_manifest_inventory()? != input.target().entries
+                || identities.pipeline != input.descriptor().target_pipeline
+                || identities.environment_sha256 != input.descriptor().environment_sha256
+            {
+                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
+            }
         }
 
         let (source_regs, sink_regs, stream_regs, table_regs, has_external, has_process_functions) = {
@@ -89,38 +109,53 @@ impl LaminarDB {
             None
         };
 
+        let process_regs = self
+            .connector_manager
+            .lock()
+            .process_functions()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         let pipeline_identity = self
             .initialize_checkpointing(
-                &source_regs,
-                &sink_regs,
-                &stream_regs,
-                &table_regs,
+                crate::pipeline_identity::PipelineRegistrations::new(
+                    source_regs.values(),
+                    sink_regs.values(),
+                    stream_regs.values(),
+                    table_regs.values(),
+                )
+                .with_process_functions(process_regs.iter()),
                 startup_runtime,
                 injected_cluster_checkpoint_store,
+                {
+                    #[cfg(feature = "cluster")]
+                    {
+                        topology
+                            .as_ref()
+                            .map(|image| image.input.descriptor().deployment_id.as_str())
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    {
+                        None
+                    }
+                },
             )
             .await?;
 
         #[cfg(feature = "cluster")]
         if startup_runtime == RuntimeMode::Cluster {
-            self.bind_subscription_output_certificates(
+            self.bind_startup_subscriptions(
                 &mut stream_regs,
                 pipeline_identity.as_ref(),
+                topology.as_ref(),
             )
             .await?;
-            self.connector_manager
-                .lock()
-                .install_stream_subscription_certificates(&stream_regs)?;
-            let certified_streams = stream_regs
-                .values()
-                .filter(|stream| stream.subscription_certificate.is_some())
-                .count();
-            tracing::debug!(
-                certified_streams,
-                "Bound cluster subscription output distributions"
-            );
         }
 
-        if has_external || !stream_regs.is_empty() || has_process_functions {
+        let install_runtime = has_external || !stream_regs.is_empty() || has_process_functions;
+        #[cfg(feature = "cluster")]
+        let install_runtime = install_runtime || topology.is_some();
+        if install_runtime {
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),
@@ -129,7 +164,7 @@ impl LaminarDB {
                 has_external,
                 "Starting pipeline"
             );
-            self.start_connector_pipeline(
+            Box::pin(self.start_connector_pipeline(
                 source_regs,
                 sink_regs,
                 stream_regs,
@@ -139,7 +174,9 @@ impl LaminarDB {
                 temporal_source_roles,
                 ordered_interval_admissions,
                 runtime_shutdown,
-            )
+                #[cfg(feature = "cluster")]
+                topology,
+            ))
             .await?;
         } else {
             tracing::info!(
@@ -156,7 +193,36 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    async fn bind_subscription_output_certificates(
+    async fn bind_startup_subscriptions(
+        &self,
+        stream_regs: &mut HashMap<String, crate::connector_manager::StreamRegistration>,
+        pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
+        topology: Option<&crate::db::PreparedTopologyRestore>,
+    ) -> Result<(), DbError> {
+        if let Some(image) = topology {
+            // The restored graph already binds the preserved incarnations and sequences.
+            // Fresh definition binding would overwrite their public catalog certificates.
+            stream_regs.clone_from(image.candidate.connector_manager.lock().streams());
+        } else {
+            self.bind_subscription_output_certificates(stream_regs, pipeline_identity)
+                .await?;
+        }
+        self.connector_manager
+            .lock()
+            .install_stream_subscription_certificates(stream_regs)?;
+        let certified_streams = stream_regs
+            .values()
+            .filter(|stream| stream.subscription_certificate.is_some())
+            .count();
+        tracing::debug!(
+            certified_streams,
+            "Bound cluster subscription output distributions"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn bind_subscription_output_certificates(
         &self,
         stream_regs: &mut HashMap<String, crate::connector_manager::StreamRegistration>,
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,

@@ -25,6 +25,13 @@ use laminar_core::checkpoint::checkpoint_manifest::{PipelineIdentity, PIPELINE_I
 const STATE_ABI_VERSION: u32 = crate::operator_graph::STATE_FRAME_ABI_VERSION;
 const STATE_LAYOUT: &str = "vnode";
 
+#[cfg(feature = "cluster")]
+mod compatibility;
+#[cfg(feature = "cluster")]
+pub(crate) use compatibility::digest as compatibility_digest;
+#[cfg(feature = "cluster")]
+pub(crate) use compatibility::{compatibility_identities, PipelineCompatibilityIdentities};
+
 #[derive(Serialize)]
 struct CanonicalPipeline {
     canonical_version: u16,
@@ -46,6 +53,7 @@ struct CanonicalPipeline {
 #[derive(Serialize)]
 struct CanonicalSource {
     name: String,
+    catalog_generation: u64,
     connector_type: String,
     options: BTreeMap<String, String>,
     input_mode: &'static str,
@@ -95,6 +103,7 @@ struct CanonicalTable {
 #[derive(Serialize)]
 struct CanonicalSink {
     name: String,
+    catalog_generation: u64,
     input: String,
     connector_type: String,
     options: BTreeMap<String, String>,
@@ -186,7 +195,11 @@ impl<'a> PipelineIdentityContext<'a> {
 
 /// Compute the exact checkpoint recovery identity.
 pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineIdentity, DbError> {
-    let payload = CanonicalPipeline {
+    identity_for_payload(&canonical_pipeline(context)?)
+}
+
+fn canonical_pipeline(context: &PipelineIdentityContext<'_>) -> Result<CanonicalPipeline, DbError> {
+    Ok(CanonicalPipeline {
         canonical_version: PIPELINE_IDENTITY_VERSION,
         state_abi_version: STATE_ABI_VERSION,
         partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
@@ -210,7 +223,10 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
         process_functions: canonical_processes(&context.registrations)?,
         tables: canonical_tables(context.catalog, &context.registrations)?,
         sinks: canonical_sinks(context.config, &context.registrations)?,
-    };
+    })
+}
+
+fn identity_for_payload(payload: &CanonicalPipeline) -> Result<PipelineIdentity, DbError> {
     let encoded = serde_json::to_vec(&payload)
         .map_err(|error| DbError::Checkpoint(format!("pipeline identity encode: {error}")))?;
     let digest = Sha256::digest(encoded);
@@ -240,6 +256,7 @@ fn canonical_sources(
         let entry = catalog.get_source(&reg.name);
         sources.push(canonical_source(
             reg.name.clone(),
+            reg.catalog_generation,
             connector_type,
             options,
             input_mode,
@@ -257,6 +274,7 @@ fn canonical_sources(
         let entry = catalog.get_source(&name);
         sources.push(canonical_source(
             name,
+            1,
             "catalog-bridge".into(),
             BTreeMap::new(),
             SourceInputMode::AppendOnly,
@@ -270,6 +288,7 @@ fn canonical_sources(
 
 fn canonical_source(
     name: String,
+    catalog_generation: u64,
     connector_type: String,
     options: BTreeMap<String, String>,
     input_mode: SourceInputMode,
@@ -278,6 +297,7 @@ fn canonical_source(
 ) -> CanonicalSource {
     CanonicalSource {
         name,
+        catalog_generation,
         connector_type,
         options,
         input_mode: canonical_source_input_mode(input_mode),
@@ -398,6 +418,7 @@ fn canonical_sinks(
         };
         sinks.push(CanonicalSink {
             name: reg.name.clone(),
+            catalog_generation: reg.catalog_generation,
             input: reg.input.clone(),
             connector_type,
             options,

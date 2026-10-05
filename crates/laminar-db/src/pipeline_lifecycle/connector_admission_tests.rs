@@ -867,12 +867,15 @@ async fn cluster_without_checkpoint_config_still_derives_graph_identity() {
 
     let identity = db
         .initialize_checkpointing(
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
+            crate::pipeline_identity::PipelineRegistrations::new(
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+                std::iter::empty(),
+            ),
             RuntimeMode::Cluster,
             db.cluster_checkpoint_object_store(),
+            None,
         )
         .await
         .unwrap();
@@ -1827,6 +1830,7 @@ async fn persisted_temporal_preflight_requires_direct_event_time_sources() {
             .unwrap();
     }
     let source = |name: &str, mode: &str| crate::connector_manager::SourceRegistration {
+        catalog_generation: 1,
         name: name.into(),
         connector_type: Some(crate::temporal_test_source::CONNECTOR_NAME.into()),
         connector_options: HashMap::from([("mode".into(), mode.into())]),

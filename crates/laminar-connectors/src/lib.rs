@@ -13,6 +13,7 @@
 #![cfg_attr(
     test,
     allow(
+        clippy::assert_is_empty, // Assert cardinality without requiring equality on fixture elements.
         clippy::field_reassign_with_default,
         clippy::float_cmp,
         clippy::manual_let_else,

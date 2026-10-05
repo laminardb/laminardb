@@ -8,7 +8,7 @@ use tracing::info;
 
 use laminar_core::storage_location::StorageProvider;
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
-use laminar_db::{DbError, EngineMetrics, LaminarDB};
+use laminar_db::{DbError, LaminarDB};
 
 #[cfg(feature = "cluster")]
 use crate::cluster_config::{ClusterConfig, ClusterConfigError};
@@ -172,27 +172,8 @@ pub async fn run_server(
     }
 
     let db = single_database::build(&config).await?;
-    // A failed local process worker has no in-place replacement. Generic graph supervision
-    // would restart against the same dead client and could reopen direct source intake.
-    if config.process_functions.is_empty() {
-        db.enable_supervision();
-    }
 
-    // Prometheus registry — must be set before start().
-    let hostname = gethostname::gethostname().to_string_lossy().into_owned();
-    let pipeline_name = config
-        .pipelines
-        .first()
-        .map_or("default", |p| p.name.as_str())
-        .to_string();
-    let registry = Arc::new(crate::metrics::build_registry([
-        ("instance".into(), hostname),
-        ("pipeline".into(), pipeline_name),
-    ]));
-    let engine_metrics = Arc::new(EngineMetrics::new(&registry));
-    db.set_engine_metrics(Arc::clone(&engine_metrics));
-    db.set_prometheus_registry(Arc::clone(&registry))
-        .map_err(|error| ServerError::Start(error.to_string()))?;
+    let registry = single_database::install_metrics(&db, &config)?;
 
     #[cfg(feature = "process-remote")]
     let process_workers = match crate::process_functions::install(&db, &config, &config_path).await

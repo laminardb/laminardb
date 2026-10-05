@@ -115,6 +115,31 @@ pub struct ClusterShuffleConfig {
     pub sender: Arc<laminar_core::shuffle::ShuffleSender>,
     pub receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     pub self_id: laminar_core::state::NodeId,
+    /// Immutable graph generation; None is the legacy fabric only.
+    pub topology: Option<laminar_core::shuffle::ShuffleTopologyFence>,
+}
+
+#[cfg(feature = "cluster")]
+impl ClusterShuffleConfig {
+    pub(crate) fn topology_snapshot(
+        &self,
+    ) -> Result<laminar_core::state::VnodeAssignmentSnapshot, DbError> {
+        self.ensure_topology_current()?;
+        Ok(self.registry.versioned_snapshot())
+    }
+
+    pub(crate) fn ensure_topology_current(&self) -> Result<(), DbError> {
+        let version = self
+            .topology
+            .map_or(0, laminar_core::shuffle::ShuffleTopologyFence::version);
+        if self.sender.topology_version() != version || self.receiver.topology_version() != version
+        {
+            return Err(DbError::ShuffleNotReady(
+                "shuffle topology does not match this graph generation".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -1446,7 +1471,7 @@ impl SqlQueryOperator {
                 self.op_name
             ))
         })?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let sender_digest = config.sender.active_assignment_digest();
         if u32::try_from(assignment.owners().len()).ok() != Some(u32::from(self.key_group_count))
             || assignment.version() != pinned.version()
@@ -2090,6 +2115,7 @@ impl SqlQueryOperator {
             .outbound
             .take()
             .expect("idle aggregate send plan must retain its outbound cut");
+        let topology = config.topology;
         let sender = Arc::clone(&config.sender);
         let wake = config.receiver.work_ready_notify();
         let context = format!("aggregate [{}] shuffle", self.op_name);
@@ -2098,6 +2124,7 @@ impl SqlQueryOperator {
         pending.send = Some(tokio::spawn(async move {
             let outcome = crate::operator::send_shuffle_plan_retaining(
                 &sender,
+                topology,
                 assignment_version,
                 outbound,
                 &context,
@@ -2605,6 +2632,13 @@ pub(crate) fn hash_rows_to_vnodes(
 
 #[async_trait]
 impl GraphOperator for SqlQueryOperator {
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, topology: laminar_core::shuffle::ShuffleTopologyFence) {
+        if let Some(scope) = &mut self.cluster_shuffle {
+            scope.topology = Some(topology);
+        }
+    }
+
     fn cluster_capability(&self) -> OperatorCapability {
         debug_assert_eq!(
             self.capability.implementation,
@@ -3526,7 +3560,7 @@ impl GraphOperator for SqlQueryOperator {
         };
         aggregate.validate_vnode_count(transition.target.vnode_count)?;
 
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
         let installed = self.cluster_assignment.as_ref().ok_or_else(|| {
             DbError::Checkpoint(format!(

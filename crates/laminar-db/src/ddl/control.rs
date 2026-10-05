@@ -96,6 +96,8 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "SET".to_string(),
                     object_name: key,
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                     applied: true,
                 }))
             }
@@ -129,6 +131,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "SET".to_string(),
             object_name: "checkpoint_interval".to_string(),
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }

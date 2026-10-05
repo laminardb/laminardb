@@ -458,7 +458,7 @@ async fn snapshotable_operator_work_keeps_idle_cycles_live() {
         ) -> Result<Vec<RecordBatch>, DbError> {
             assert!(inputs.is_empty());
             self.0
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::AcqRel,
                     std::sync::atomic::Ordering::Acquire,
                     |remaining| remaining.checked_sub(1),
@@ -1278,6 +1278,7 @@ async fn alignment_harness() -> AlignmentHarness {
         registry,
         sender: Arc::new(local_sender),
         receiver: Arc::clone(&local_receiver),
+        topology: None,
         self_id: NodeId(1),
     });
     AlignmentHarness {
@@ -1825,6 +1826,7 @@ async fn three_node_alignment_harness() -> ThreeNodeAlignmentHarness {
         registry,
         sender: Arc::new(local_sender),
         receiver: Arc::clone(&local_receiver),
+        topology: None,
         self_id: NodeId(1),
     });
 

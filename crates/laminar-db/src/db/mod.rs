@@ -9,9 +9,23 @@ mod cluster_subscription;
 mod datafusion_memory_tests;
 mod session;
 #[cfg(feature = "cluster")]
+mod topology;
+#[cfg(feature = "cluster")]
 pub(crate) use assignment_authority::{
     audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
 };
+#[cfg(feature = "cluster")]
+pub use topology::{
+    ClusterTopologyAdoptionRequest, ClusterTopologyRequest, ClusterTopologyStatus,
+    PreparedTopologyRestore, PreparedTopologySourcePosition,
+};
+#[cfg(feature = "cluster")]
+pub use topology::{
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
+#[cfg(feature = "cluster")]
+pub(crate) use topology::{InstalledTopologyRuntime, TopologyRuntimeMetadata};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -287,6 +301,13 @@ pub struct LaminarDB {
     /// Serializes topology DDL through manifest persistence; catalog reads take a shared guard so
     /// they cannot observe a tentative create that may still roll back.
     pub(crate) topology_ddl_lock: tokio::sync::RwLock<()>,
+    /// One effect-free candidate compiler at a time; rejected callers do not queue more graphs.
+    #[cfg(feature = "cluster")]
+    pub(crate) topology_validation_lock: Arc<tokio::sync::Mutex<()>>,
+    // Only a private, unstarted topology catalog carries a resource-availability snapshot.
+    // Normal databases check their actual transport and ownership handles during DDL admission.
+    #[cfg(feature = "cluster")]
+    pub(crate) topology_planning_ownership_scope: Option<bool>,
     /// Typed ownership for every user-visible catalog identifier.
     pub(crate) catalog_namespace: parking_lot::Mutex<HashMap<String, CatalogObjectKind>>,
     #[cfg(test)]
@@ -396,6 +417,14 @@ pub struct LaminarDB {
     /// peer whose receiver isn't up yet and the fire-and-forget frames are lost.
     #[cfg(feature = "cluster")]
     pub(crate) source_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// A terminal topology cut is held independently of assignment readiness. Only an
+    /// authorized recovery or topology Release may clear it after retirement and readiness.
+    #[cfg(feature = "cluster")]
+    pub(crate) topology_cut_hold: Arc<std::sync::atomic::AtomicBool>,
+    /// Exact runtime that installed a committed topology; cancellation invalidates its receipts.
+    #[cfg(feature = "cluster")]
+    pub(crate) installed_topology_runtime:
+        parking_lot::Mutex<Option<topology::InstalledTopologyRuntime>>,
     /// One-way local data-plane fence after stable process-lease loss.
     #[cfg(feature = "cluster")]
     pub(crate) cluster_authority_revoked: std::sync::atomic::AtomicBool,
@@ -423,6 +452,10 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) catalog_manifest_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
+    /// Version loaded by exact catalog replay; runtime activation requires Running and release.
+    #[cfg(feature = "cluster")]
+    pub(crate) replayed_topology_version:
+        parking_lot::Mutex<Option<laminar_core::cluster::control::TopologyVersion>>,
     /// Pre-built shared checkpoint namespace installed during cluster construction.
     #[cfg(feature = "cluster")]
     cluster_checkpoint_object_store: Option<Arc<dyn object_store::ObjectStore>>,
@@ -1775,6 +1808,10 @@ impl LaminarDB {
             control_runtime: DbControlRuntime::new(),
             startup_attempt: parking_lot::Mutex::new(None),
             topology_ddl_lock: tokio::sync::RwLock::new(()),
+            #[cfg(feature = "cluster")]
+            topology_validation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "cluster")]
+            topology_planning_ownership_scope: None,
             catalog_namespace: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             topology_planning_gate: parking_lot::Mutex::new(None),
@@ -1830,6 +1867,10 @@ impl LaminarDB {
                 runtime_mode.is_cluster(),
             )),
             #[cfg(feature = "cluster")]
+            topology_cut_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            installed_topology_runtime: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
             cluster_authority_revoked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "cluster")]
             cluster_authority_transition: Arc::new(parking_lot::Mutex::new(())),
@@ -1853,6 +1894,8 @@ impl LaminarDB {
             assignment_snapshot_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             catalog_manifest_store: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            replayed_topology_version: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             cluster_checkpoint_object_store: None,
             #[cfg(feature = "cluster")]
@@ -2326,6 +2369,34 @@ impl LaminarDB {
         let intake_open = false;
         let preserve_predecessor_execution = source_drain_active && !intake_was_closed;
         if !controller.is_recovering() && (!source_drain_active || preserve_predecessor_execution) {
+            // The exact installed certificate remains useful during a held topology cut, but
+            // ordinary recovery admission cannot authorize its target or clear that hold.
+            if self
+                .topology_cut_hold
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(AssignmentAuthorityActivation {
+                    installed: true,
+                    intake_open: false,
+                    revision: expected_revision,
+                });
+            }
+            match self
+                .refresh_released_topology_assignment(
+                    &controller,
+                    fence,
+                    expected_revision,
+                    deadline,
+                )
+                .await
+            {
+                Ok(Some(activation)) => return Ok(activation),
+                Ok(None) => {}
+                Err(error) => {
+                    self.withdraw_assignment_authority(&controller);
+                    return Err(error);
+                }
+            }
             // Recovery authority and active faults must come from one durable view. Reading them
             // independently can pair an old terminal with the empty fault set created by a newer
             // committed Release.
@@ -2558,36 +2629,6 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    fn exact_bootstrap_noop(
-        &self,
-        sql: &str,
-        statement: &StreamingStatement,
-    ) -> Result<Option<ExecuteResult>, DbError> {
-        let Some((name, kind, statement_type)) = catalog_create_identity(statement)? else {
-            return Ok(None);
-        };
-        let local_ddl = self
-            .connector_manager
-            .lock()
-            .get_ddl(&name)
-            .map(str::to_owned);
-        let local_kind = self.catalog_namespace.lock().get(&name).copied();
-        if local_ddl.is_none() && local_kind.is_none() {
-            return Ok(None);
-        }
-        if local_ddl.as_deref() != Some(sql) || local_kind != Some(kind) {
-            return Err(DbError::Pipeline(format!(
-                "cluster bootstrap definition for '{name}' differs from the durable typed catalog"
-            )));
-        }
-        Ok(Some(ExecuteResult::Ddl(DdlInfo {
-            statement_type: statement_type.to_string(),
-            object_name: name,
-            applied: false,
-        })))
-    }
-
-    #[cfg(feature = "cluster")]
     fn validate_catalog_seal_authority(
         &self,
         proof: Option<&laminar_core::cluster::control::LeaderProof>,
@@ -2625,7 +2666,7 @@ impl LaminarDB {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
             return Ok(None);
         };
-        let Some(manifest) = store.load().await.map_err(|error| {
+        let Some((manifest, topology)) = store.load_with_topology().await.map_err(|error| {
             DbError::Pipeline(format!(
                 "[{}] catalog manifest load failed: {error}",
                 laminar_core::error_codes::RECOVERY_FAILED
@@ -2640,57 +2681,9 @@ impl LaminarDB {
             created: Vec::new(),
             sealed: false,
         };
-        for entry in &manifest.entries {
-            if catalog_ddl_contains_comment(&entry.ddl)? {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' contains SQL comments rather than one canonical typed definition",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            let statements = parse_streaming_sql(&entry.ddl).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' is not valid topology DDL: {error}",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                ))
-            })?;
-            if statements.len() != 1 {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' must contain exactly one typed CREATE statement",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            let Some((name, kind, _)) = catalog_create_identity(&statements[0])? else {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' must contain exactly one typed CREATE statement",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            };
-            if name != entry.canonical_name || kind != entry.kind {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' does not match its typed DDL identity",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            if connector_source_requires_schema_discovery(&statements[0]) {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest source '{}' lacks an explicit durable schema",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-            if let Some(key) = sensitive_catalog_property(&statements[0]) {
-                return Err(DbError::Pipeline(format!(
-                    "[{}] catalog manifest entry '{}' contains secret property '{key}'",
-                    laminar_core::error_codes::RECOVERY_FAILED,
-                    entry.canonical_name
-                )));
-            }
-        }
+        topology::catalog_changes::validate_manifest_ddl(&manifest)?;
+        self.reconcile_superseded_catalog_objects(&manifest, &store, &topology)
+            .await?;
 
         for entry in &manifest.entries {
             let local_ddl = self
@@ -2758,6 +2751,7 @@ impl LaminarDB {
             )));
         }
         replay_guard.sealed();
+        *self.replayed_topology_version.lock() = topology.committed_version();
         Ok(Some(manifest))
     }
 
@@ -4439,6 +4433,8 @@ impl LaminarDB {
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE LOOKUP TABLE".to_string(),
             object_name: info.name,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
             applied: true,
         }))
     }
@@ -4723,32 +4719,9 @@ impl LaminarDB {
         }
 
         if let Some(manifest) = self.restore_catalog_from_manifest().await? {
-            let configured_matches = parsed.iter().zip(&manifest.entries).all(
-                |((ddl, _, canonical_name, kind), entry)| {
-                    ddl == &entry.ddl
-                        && canonical_name == &entry.canonical_name
-                        && kind == &entry.kind
-                },
-            );
-            if parsed.len() != manifest.entries.len() || !configured_matches {
-                return Err(DbError::Pipeline(format!(
-                    "configured cluster catalog must exactly match the complete ordered sealed inventory (configured entries: {}, sealed entries: {})",
-                    parsed.len(),
-                    manifest.entries.len()
-                )));
-            }
-            let mut results = Vec::with_capacity(parsed.len());
-            for (stmt_sql, statement, name, _) in &parsed {
-                let result = self
-                    .exact_bootstrap_noop(stmt_sql, statement)?
-                    .ok_or_else(|| {
-                        DbError::Pipeline(format!(
-                            "sealed cluster catalog rejects startup addition '{name}'"
-                        ))
-                    })?;
-                results.push(result);
-            }
-            return Ok(results);
+            return self
+                .validate_sealed_topology_bootstrap(&manifest, &parsed)
+                .await;
         }
 
         if !self.catalog_manifest_inventory()?.is_empty() {
@@ -4846,6 +4819,16 @@ impl LaminarDB {
             self.ensure_catalog_cleanup_unfenced("database mutation")?;
         }
         if is_topology_ddl(statement) {
+            #[cfg(feature = "cluster")]
+            if self.is_cluster_runtime()
+                && DbState::load(&self.state) == DbState::Running
+                && !catalog_manifest_replay_active()
+                && !catalog_bootstrap_active()
+            {
+                // Admission plans its private catalog under the read lock. Do not take the
+                // direct-mutation write lock or invoke the startup bootstrap exception here.
+                return Box::pin(self.submit_cluster_topology_sql(sql, statement)).await;
+            }
             let _topology_ddl = self.topology_ddl_lock.write().await;
             self.ensure_catalog_cleanup_unfenced("database mutation")?;
             #[cfg(feature = "cluster")]
@@ -4982,6 +4965,8 @@ impl LaminarDB {
                     return Ok(ExecuteResult::Ddl(DdlInfo {
                         statement_type: "CREATE LOOKUP TABLE".into(),
                         object_name: name,
+                        #[cfg(feature = "cluster")]
+                        topology_operation: None,
                         applied: false,
                     }));
                 };
@@ -5093,6 +5078,8 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "CHECKPOINT".to_string(),
                     object_name: format!("checkpoint_{}", result.checkpoint_id),
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                     applied: true,
                 }))
             }
@@ -5578,6 +5565,8 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DDL".to_string(),
                     object_name: info.name,
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                     applied: true,
                 }))
             }
@@ -5585,6 +5574,8 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DDL".to_string(),
                     object_name: info.name,
+                    #[cfg(feature = "cluster")]
+                    topology_operation: None,
                     applied: true,
                 }))
             }

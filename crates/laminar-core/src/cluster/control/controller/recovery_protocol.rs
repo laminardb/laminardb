@@ -3,6 +3,61 @@
 use super::*;
 
 impl ClusterController {
+    /// Freeze the current irreversible catalog target and complete process terms before Prepare.
+    /// The existing round keeps the same nonce, assignment and fault inventory throughout stop,
+    /// restore and Release. This does not choose a checkpoint or authorize runtime work.
+    ///
+    /// # Errors
+    /// Rejects obsolete driver/process/assignment evidence or damaged topology authority.
+    pub async fn bind_recovery_round(
+        &self,
+        round: RecoveryRound,
+    ) -> Result<RecoveryRound, RecoveryControlError> {
+        self.audit_recovery_driver_proof(&round, "topology binding")
+            .await?;
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
+        let context = self
+            .snapshot
+            .as_deref()
+            .zip(self.process_lease_authority.get().map(Arc::as_ref));
+        let binding = Box::pin(authority.recovery_topology_binding(&round, context))
+            .await
+            .map_err(RecoveryControlError::from_authority)?;
+        let round = round
+            .bind_topology(binding)
+            .map_err(RecoveryControlError::Conflict)?;
+        self.audit_recovery_topology(&round, None).await?;
+        self.audit_recovery_driver_proof(&round, "topology binding read-back")
+            .await?;
+        Ok(round)
+    }
+
+    /// Revalidate this round's exact target, complete process terms and selected cut.
+    /// Pass an epoch at Start/install/Release commit; later consumption uses the immutable target
+    /// so ordinary target checkpoints cannot invalidate a healthy released runtime.
+    ///
+    /// # Errors
+    /// Classifies stale or damaged target/process/assignment/cut evidence without parent fallback.
+    pub async fn audit_recovery_topology(
+        &self,
+        round: &RecoveryRound,
+        epoch: Option<u64>,
+    ) -> Result<(), RecoveryControlError> {
+        round.validate().map_err(RecoveryControlError::Conflict)?;
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
+        let context = self
+            .snapshot
+            .as_deref()
+            .zip(self.process_lease_authority.get().map(Arc::as_ref));
+        Box::pin(authority.audit_recovery_topology(round, epoch, context))
+            .await
+            .map_err(RecoveryControlError::from_authority)
+    }
+
     pub(super) async fn durable_recovery_proof_is_current(
         &self,
         proof: &LeaderProof,
@@ -111,6 +166,9 @@ impl ClusterController {
     /// Returns an error unless this node is the round's current leader and driver.
     pub async fn announce_recover_prepare(&self, round: &RecoveryRound) -> Result<(), String> {
         round.validate()?;
+        self.audit_recovery_topology(round, None)
+            .await
+            .map_err(|error| error.to_string())?;
         if round.id.driver != self.instance_id {
             return Err("only the current leader may prepare its recovery round".into());
         }
@@ -127,6 +185,9 @@ impl ClusterController {
             return Err("recovery stopped-process roster changed before Prepare".into());
         }
         let _guard = self.recovery_writes.lock().await;
+        self.audit_recovery_topology(round, None)
+            .await
+            .map_err(|error| error.to_string())?;
         self.require_recovery_driver_proof(round, "Prepare publication")
             .await?;
         if !self.recovery_evidence_roster_matches(round).await? {
@@ -164,6 +225,9 @@ impl ClusterController {
         epoch: u64,
     ) -> Result<(), String> {
         round.validate()?;
+        self.audit_recovery_topology(round, Some(epoch))
+            .await
+            .map_err(|error| error.to_string())?;
         if round.has_terminal_fault() {
             return Err("terminal recovery fault is permanently retained in Prepare".into());
         }
@@ -195,6 +259,9 @@ impl ClusterController {
             .map_err(|error| error.to_string())?;
         self.require_recovery_driver_proof(round, "Start publication")
             .await?;
+        self.audit_recovery_topology(round, Some(epoch))
+            .await
+            .map_err(|error| error.to_string())?;
         let announcement = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Start { epoch },
@@ -217,6 +284,9 @@ impl ClusterController {
         epoch: u64,
     ) -> Result<(), String> {
         round.validate()?;
+        self.audit_recovery_topology(round, Some(epoch))
+            .await
+            .map_err(|error| error.to_string())?;
         if round.has_terminal_fault() {
             return Err("terminal recovery fault cannot advance to Release".into());
         }
@@ -242,6 +312,9 @@ impl ClusterController {
         }
         self.require_recovery_driver_proof(round, "Release publication")
             .await?;
+        self.audit_recovery_topology(round, Some(epoch))
+            .await
+            .map_err(|error| error.to_string())?;
         let release = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Release { epoch },
@@ -338,10 +411,21 @@ impl ClusterController {
         }
         self.audit_recovery_driver_proof(round, "Release commit publication")
             .await?;
-        match Box::pin(authority.record_recovery_release_commit(&round.leader_proof, reference))
+        let recorded = if round.topology_binding().is_some() {
+            let context = self
+                .snapshot
+                .as_deref()
+                .zip(self.process_lease_authority.get().map(Arc::as_ref));
+            Box::pin(authority.record_recovery_release_commit_with_topology(
+                &round.leader_proof,
+                reference,
+                context,
+            ))
             .await
-            .map_err(RecoveryControlError::from_authority)?
-        {
+        } else {
+            Box::pin(authority.record_recovery_release_commit(&round.leader_proof, reference)).await
+        };
+        match recorded.map_err(RecoveryControlError::from_authority)? {
             super::super::leader_lease::RecordRecoveryReleaseCommitResult::Created(_)
             | super::super::leader_lease::RecordRecoveryReleaseCommitResult::Unchanged(_) => {
                 Ok(ReleaseCommitStatus::Committed {
@@ -450,6 +534,17 @@ impl ClusterController {
                 "recovery authority changed while observing {current_driver}"
             )));
         }
+        if !self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?
+            .recovery_round_topology_is_current(&announcement.round)
+            .await
+            .map_err(RecoveryControlError::from_authority)?
+        {
+            return Err(RecoveryControlError::Superseded(
+                "recovery announcement differs from the committed catalog target".into(),
+            ));
+        }
         Ok(Some(announcement))
     }
 
@@ -490,6 +585,17 @@ impl ClusterController {
             return Err(RecoveryControlError::Superseded(format!(
                 "recovery authority changed while observing {driver} through its durable proof"
             )));
+        }
+        if !self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?
+            .recovery_round_topology_is_current(&announcement.round)
+            .await
+            .map_err(RecoveryControlError::from_authority)?
+        {
+            return Err(RecoveryControlError::Superseded(
+                "recovery announcement differs from the committed catalog target".into(),
+            ));
         }
         Ok(Some(announcement))
     }

@@ -96,6 +96,9 @@ pub struct RecoveryRound {
     fault_revision: u64,
     /// Canonical nonzero fault reports covered by this round's terminal `Release`.
     pub faults: Vec<RecoveryFault>,
+    /// Exact irreversible target frozen before Prepare. Absent for legacy/unchanged topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topology: Option<Box<super::TopologyRecoveryBinding>>,
 }
 
 /// One durable fault report covered by a coordinated recovery round.
@@ -225,9 +228,15 @@ pub struct RecoveryAdmissionSnapshot {
     pub(crate) fault_inventory: RecoveryFaultInventory,
     pub(crate) authority_sequence: u64,
     pub(crate) release_head: Option<super::leader_lease::RecoveryReleaseLink>,
+    pub(crate) topology: Option<super::TopologyCommit>,
 }
 
 impl RecoveryAdmissionSnapshot {
+    /// Current irreversible catalog decision in this coherent authority view.
+    #[must_use]
+    pub const fn topology_commit(&self) -> Option<&super::TopologyCommit> {
+        self.topology.as_ref()
+    }
     /// Latest committed recovery release in this authority view.
     #[must_use]
     pub fn committed_release(&self) -> Option<&RecoveryAnnouncement> {
@@ -266,9 +275,25 @@ impl RecoveryRound {
             evidence_participants,
             fault_revision,
             faults,
+            topology: None,
         };
         round.validate()?;
         Ok(round)
+    }
+
+    pub(super) fn bind_topology(
+        mut self,
+        binding: Option<super::TopologyRecoveryBinding>,
+    ) -> Result<Self, String> {
+        self.topology = binding.map(Box::new);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Exact committed target of this immutable round, independent of its later selected cut.
+    #[must_use]
+    pub fn topology_binding(&self) -> Option<&super::TopologyRecoveryBinding> {
+        self.topology.as_deref()
     }
 
     /// Whether `node` belongs to the immutable assignment-owner quorum.
@@ -357,6 +382,17 @@ impl RecoveryRound {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if let Some(binding) = &self.topology {
+            binding.validate().map_err(|error| error.to_string())?;
+            if !binding
+                .processes()
+                .iter()
+                .map(|process| process.participant)
+                .eq(self.assignment_fence.participants.iter().copied())
+            {
+                return Err("topology recovery process terms differ from the complete frozen assignment roster".into());
+            }
+        }
         if self.id.generation == 0 {
             return Err("recovery generation must be nonzero".into());
         }
@@ -880,6 +916,8 @@ mod membership;
 mod recovery_faults;
 mod recovery_identity;
 mod recovery_protocol;
+#[cfg(feature = "cluster")]
+mod topology;
 mod wire;
 
 use wire::{

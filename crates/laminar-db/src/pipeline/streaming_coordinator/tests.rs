@@ -11,6 +11,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 
+#[path = "sealed_start_tests.rs"]
+mod sealed_start_tests;
+
 fn test_source_channel(capacity: usize) -> (SourceMsgTx, SourceMsgRx) {
     source_channel::channel(capacity, crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES)
 }
@@ -1550,8 +1553,10 @@ impl PipelineCallback for MockCallback {
         #[cfg(not(feature = "cluster"))]
         let _ = (flags, self.handoff_replay_pending);
         #[cfg(feature = "cluster")]
-        crate::pipeline_callback::fence_intake_after_terminal_handoff_capture(
+        crate::pipeline_callback::fence_intake_after_terminal_cut_capture(
             &self.intake_gate,
+            &AtomicBool::new(false),
+            &parking_lot::Mutex::new(()),
             flags,
             self.handoff_replay_pending,
         );
@@ -3551,6 +3556,48 @@ async fn periodic_admission_defers_handoff_to_manual_owner_arriving_during_audit
     assert_eq!(callback.barrier_captures.as_slice(), &[(attempt, 0)]);
     #[cfg(feature = "cluster")]
     assert!(callback.intake_gate.load(Ordering::Acquire));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn topology_cut_waits_for_a_manual_owner_and_holds_intake_after_completion() {
+    let interval = Duration::from_secs(60);
+    let mut coordinator = admission_coordinator(Vec::new());
+    coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(interval);
+    coordinator.last_checkpoint = Instant::now() - interval;
+    let due_since = coordinator.last_checkpoint;
+    let attempt = CheckpointAttempt::canonical(18_002);
+    let mut callback = MockCallback::new();
+    callback.attempt_to_reserve = attempt;
+    callback.assignment_flags = laminar_core::checkpoint::flags::TOPOLOGY_CUT;
+    coordinator.maybe_checkpoint(&mut callback).await;
+    assert_eq!(callback.reserve_calls, 0);
+    assert!(callback.prepared_attempts.is_empty());
+    assert!(!callback.intake_gate.load(Ordering::Acquire));
+    assert_eq!(coordinator.last_checkpoint, due_since);
+
+    let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
+    let (request, mut reservation) = unreserved_manual_request(reply_tx);
+    coordinator.manual_waiting.push(request);
+    coordinator.maybe_checkpoint(&mut callback).await;
+    reservation.wait().await.unwrap();
+    let result = reply_rx.await.unwrap().unwrap();
+    assert_eq!(
+        CheckpointAttempt::new(result.epoch, result.checkpoint_id),
+        attempt
+    );
+    assert_eq!(callback.reserve_calls, 1);
+    assert_eq!(callback.prepared_attempts.as_slice(), &[(attempt, None)]);
+    assert_eq!(callback.barrier_captures.as_slice(), &[(attempt, 0)]);
+    assert!(
+        callback.intake_gate.load(Ordering::Acquire),
+        "old-topology completion must leave intake held for target preparation or recovery"
+    );
+    assert!(coordinator.manual_waiting.is_empty());
+    assert!(
+        !coordinator.manual_handoff_required,
+        "topology cuts cannot use intermediate handoff replay"
+    );
 }
 
 #[tokio::test]
@@ -6777,6 +6824,10 @@ impl laminar_connectors::connector::SourceConnector for BarrierRetrySource {
 
 #[async_trait::async_trait]
 impl laminar_connectors::connector::SourceConnector for StartupSource {
+    fn supports_initialized_start(&self) -> bool {
+        true
+    }
+
     fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
         self.cancellation_policy
     }

@@ -18,5 +18,7 @@ pub use checkpoint::StreamCheckpointConfig;
 pub use config::{BackpressureStrategy, ChannelConfig, SourceConfig, WaitStrategy};
 pub use error::{RecvError, StreamingError, TryPushError};
 pub use sink::Sink;
+#[cfg(feature = "cluster")]
+pub use source::create_for_schema_planning;
 pub use source::{create, create_with_config, Record, Source};
 pub use subscription::Subscription;

@@ -335,7 +335,7 @@ impl CheckpointBarrierTimingLedger {
     pub(crate) fn note_recording_loss(&self) {
         if self
             .recording_loss_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .is_err()

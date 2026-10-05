@@ -31,6 +31,36 @@ use object_store::memory::InMemory;
 #[cfg(feature = "cluster")]
 use object_store::ObjectStoreExt;
 
+#[tokio::test]
+async fn terminal_cut_capture_rejects_unconfigured_mixed_and_replay_cuts() {
+    use laminar_core::checkpoint::flags;
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "invalid-topology-cut");
+    let coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    let mut request = CheckpointRequest {
+        flags: flags::TOPOLOGY_CUT,
+        ..Default::default()
+    };
+    assert!(coordinator
+        .validate_request(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("requires"));
+    request.flags |= flags::HANDOFF;
+    assert!(coordinator
+        .validate_request(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("exclusive"));
+    request.flags = flags::TOPOLOGY_CUT;
+    request.handoff_replay_pending = true;
+    assert!(coordinator
+        .validate_request(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("replay-free"));
+}
+
 #[cfg(feature = "cluster")]
 pub(super) struct CommitThenIoStore {
     pub(super) inner: Arc<dyn object_store::ObjectStore>,
@@ -569,6 +599,208 @@ async fn node_data_exists(
         .await
         .unwrap()
         .is_some()
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn retention_protected_cut_rejects_missing_or_corrupt_incremental_state() {
+    for incremental in [false, true] {
+        for corrupt in [false, true] {
+            let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "preflight")
+                .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+            let decisions = CheckpointDecisionStore::new(Arc::clone(&objects));
+            let deployment = decisions.load_or_create_deployment_id().await.unwrap();
+            let (old, payload) = manifest(1, &deployment, None);
+            store.save_checkpoint(&old, &[payload]).await.unwrap();
+            let retained = incremental.then(|| {
+                (
+                    old.node_data.chunk,
+                    old.node_data.object_length,
+                    old.node_data.sha256.clone(),
+                )
+            });
+            let (target, payload) = manifest(2, &deployment, retained);
+            store.save_checkpoint(&target, &[payload]).await.unwrap();
+            let encoded = checkpoint_manifest_bytes(&target).unwrap();
+            let index = CommittedCheckpointIndex {
+                version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+                deployment_id: deployment,
+                pipeline_identity: target.pipeline_identity.clone(),
+                epoch: 2,
+                checkpoint_id: 2,
+                scope: CheckpointScope::Local,
+                vnode_count: 1,
+                assignment_fence: None,
+                reassignment_portable: false,
+                predecessor: None,
+                participants: vec![
+                    CommittedParticipantRef::from_manifest(&target, &encoded).unwrap()
+                ],
+                source_names: Vec::new(),
+                source_offsets: BTreeMap::new(),
+                channel_progress: Vec::new(),
+                source_watermarks: BTreeMap::new(),
+                checkpoint_watermark: None,
+            };
+            let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+            load_protected_checkpoint(&store, &decisions, &reference)
+                .await
+                .unwrap();
+            let damaged = if incremental { &old } else { &target };
+            let path = object_store::path::Path::from(format!(
+                "preflight/nodes/1/checkpoints/{:020}/node-data.bin",
+                damaged.checkpoint_id,
+            ));
+            if corrupt {
+                objects
+                    .put(&path, Bytes::from_static(&[255]).into())
+                    .await
+                    .unwrap();
+            } else {
+                objects.delete(&path).await.unwrap();
+            }
+            assert!(
+                load_protected_checkpoint(&store, &decisions, &reference)
+                    .await
+                    .is_err(),
+                "retention accepted damaged state: incremental={incremental}, corrupt={corrupt}"
+            );
+            assert!(store
+                .load_manifest_for_participant(1, 1)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store
+                .load_manifest_for_participant(1, 2)
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn retention_state_preflight_bounds_inventory_and_checks_duplicate_contracts() {
+    use super::retention_state::validate_retained_state;
+
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "preflight-bounds")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let (first, payload) = manifest(1, &uuid::Uuid::from_u128(1).to_string(), None);
+    store.save_checkpoint(&first, &[payload]).await.unwrap();
+    validate_retained_state(&store, &[first.clone(), first.clone()])
+        .await
+        .unwrap();
+    let mut different = first.clone();
+    different.node_data.sha256 = "f".repeat(64);
+    assert!(validate_retained_state(&store, &[first.clone(), different])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("divergent"));
+    let mut oversized = first.clone();
+    oversized.node_data.object_length = 4 * 1024 * 1024 * 1024 + 1;
+    assert!(validate_retained_state(&store, &[oversized])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("4 GiB"));
+    let mut many = first;
+    many.referenced_chunks = (2..=8193)
+        .map(|checkpoint_id| ReferencedStateChunk {
+            chunk: StateChunkId {
+                participant_id: 1,
+                checkpoint_id,
+            },
+            object_length: 0,
+            sha256: checkpoint_sha256(&[]),
+            ref_count: NonZeroU32::new(1).unwrap(),
+        })
+        .collect();
+    assert!(validate_retained_state(&store, &[many])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("8192-object"));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn retention_state_preflight_stalled_read_has_a_bounded_deadline() {
+    let objects = Arc::new(CommitThenIoStore {
+        inner: Arc::new(InMemory::new()),
+        lose_put_ack: std::sync::atomic::AtomicBool::new(false),
+        path_suffix: "manifest.json",
+        block_get: std::sync::atomic::AtomicBool::new(true),
+        deny_list: std::sync::atomic::AtomicBool::new(true),
+    });
+    let store = ObjectStoreCheckpointStore::new(objects, "preflight-deadline")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let (first, _) = manifest(1, &uuid::Uuid::from_u128(1).to_string(), None);
+    let started = tokio::time::Instant::now();
+    let error = super::retention_state::validate_retained_state(&store, &[first])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert_eq!(started.elapsed(), Duration::from_secs(15));
+}
+
+#[tokio::test]
+async fn retention_state_preflight_requires_the_empty_object_to_exist() {
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "preflight-empty")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let mut empty = CheckpointManifest::new_with_key_group_count(1, 1, store.key_group_count());
+    empty.deployment_id = uuid::Uuid::from_u128(1).to_string();
+    store.save_checkpoint(&empty, &[]).await.unwrap();
+    super::retention_state::validate_retained_state(&store, &[empty.clone()])
+        .await
+        .unwrap();
+    store.delete_node_data(empty.node_data.chunk).await.unwrap();
+    assert!(
+        super::retention_state::validate_retained_state(&store, &[empty])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("missing")
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn retention_state_preflight_checks_the_last_bounded_range() {
+    let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "preflight-ranges")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let (mut cut, _) = manifest(1, &uuid::Uuid::from_u128(1).to_string(), None);
+    let mut data = vec![1_u8; 256 * 1024 + 17];
+    cut.node_data.object_length = data.len() as u64;
+    cut.node_data.sha256 = checkpoint_sha256(&data);
+    cut.state_frames[0].range.length = data.len() as u64;
+    cut.state_frames[0].sha256 = cut.node_data.sha256.clone();
+    store
+        .save_checkpoint(&cut, &[Bytes::from(data.clone())])
+        .await
+        .unwrap();
+    super::retention_state::validate_retained_state(&store, &[cut.clone()])
+        .await
+        .unwrap();
+    *data.last_mut().unwrap() = 255;
+    objects
+        .put(
+            &object_store::path::Path::from(
+                "preflight-ranges/nodes/1/checkpoints/00000000000000000001/node-data.bin",
+            ),
+            Bytes::from(data).into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        super::retention_state::validate_retained_state(&store, &[cut])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("complete-object digest")
+    );
 }
 
 async fn admit_local_artifacts(
@@ -2232,4 +2464,106 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
     assert!(coordinator.failure_requires_recovery);
     assert_eq!(coordinator.local_watermark, CheckpointWatermark::Active(42));
     assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn topology_retention_pins_root_chunks_and_rejects_damaged_root_state() {
+    use super::retention::load_protected_checkpoint_with_roots;
+
+    for corrupt in [false, true] {
+        let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "topology-pins")
+            .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+        let decisions = CheckpointDecisionStore::new(Arc::clone(&objects));
+        let deployment = decisions.load_or_create_deployment_id().await.unwrap();
+        let mut predecessor = None;
+        let mut root = None;
+        let mut root_chunk = None;
+        let mut expired = None;
+        for checkpoint_id in 1..=3 {
+            let retained = (checkpoint_id == 2).then(|| root_chunk.clone().unwrap());
+            let (manifest, payload) = manifest(checkpoint_id, &deployment, retained);
+            store.save_checkpoint(&manifest, &[payload]).await.unwrap();
+            let encoded = checkpoint_manifest_bytes(&manifest).unwrap();
+            let index = CommittedCheckpointIndex {
+                version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+                deployment_id: deployment.clone(),
+                pipeline_identity: manifest.pipeline_identity.clone(),
+                epoch: checkpoint_id,
+                checkpoint_id,
+                scope: CheckpointScope::Local,
+                vnode_count: 1,
+                assignment_fence: None,
+                reassignment_portable: false,
+                predecessor,
+                participants: vec![
+                    CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap()
+                ],
+                source_names: Vec::new(),
+                source_offsets: BTreeMap::new(),
+                channel_progress: Vec::new(),
+                source_watermarks: BTreeMap::new(),
+                checkpoint_watermark: None,
+            };
+            let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+            if checkpoint_id == 1 {
+                root = Some(reference.clone());
+                root_chunk = Some((
+                    manifest.node_data.chunk,
+                    manifest.node_data.object_length,
+                    manifest.node_data.sha256.clone(),
+                ));
+            } else if checkpoint_id == 2 {
+                expired = Some(manifest);
+            }
+            predecessor = Some(reference);
+        }
+        let protected = predecessor.unwrap();
+        let roots = [root.unwrap()];
+        let retained = load_protected_checkpoint_with_roots(&store, &decisions, &protected, &roots)
+            .await
+            .unwrap();
+        delete_retired_data(&store, &[expired.unwrap()], &retained.live)
+            .await
+            .unwrap();
+        assert!(node_data_exists(&store, root_chunk.unwrap().0, 1).await);
+        assert!(
+            !node_data_exists(
+                &store,
+                StateChunkId {
+                    participant_id: 1,
+                    checkpoint_id: 2
+                },
+                0
+            )
+            .await
+        );
+        let path = object_store::path::Path::from(
+            "topology-pins/nodes/1/checkpoints/00000000000000000001/node-data.bin",
+        );
+        if corrupt {
+            objects
+                .put(&path, Bytes::from_static(&[255]).into())
+                .await
+                .unwrap();
+        } else {
+            objects.delete(&path).await.unwrap();
+        }
+        assert!(
+            load_protected_checkpoint_with_roots(&store, &decisions, &protected, &roots)
+                .await
+                .is_err()
+        );
+        assert!(store
+            .load_manifest_for_participant(1, 1)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .load_manifest_for_participant(1, 3)
+            .await
+            .unwrap()
+            .is_some());
+    }
 }

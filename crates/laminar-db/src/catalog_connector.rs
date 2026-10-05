@@ -49,6 +49,9 @@ impl SourceConnector for CatalogSourceConnector {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         match request.into_parts().1 {
             SourcePosition::Initial => Ok(()),
+            SourcePosition::Initialized { .. } => Err(ConnectorError::ConfigurationError(
+                "catalog bridge has no sealed topology startup contract".into(),
+            )),
             SourcePosition::Resume { attempt, .. } => {
                 Err(ConnectorError::ConfigurationError(format!(
                     "catalog bridge is ephemeral and cannot resume checkpoint epoch={} id={}",

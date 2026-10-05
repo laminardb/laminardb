@@ -273,6 +273,11 @@ impl SourceConnector for TemporalTestSource {
         }
         self.cursor = match position {
             SourcePosition::Initial => 0,
+            SourcePosition::Initialized { .. } => {
+                return Err(ConnectorError::ConfigurationError(
+                    "temporal test source has no sealed topology startup contract".into(),
+                ));
+            }
             SourcePosition::Resume { checkpoint, .. } => {
                 let expected_channels = self.input_channels();
                 if checkpoint.input_channels() != Some(expected_channels.as_slice()) {

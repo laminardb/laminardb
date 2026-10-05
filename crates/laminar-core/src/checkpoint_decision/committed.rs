@@ -127,7 +127,12 @@ impl CheckpointDecisionStore {
                 reference.sha256
             )));
         }
-        let deployment_id = self.load_or_create_deployment_id().await?;
+        let deployment_id = self.load_deployment_id().await?.ok_or_else(|| {
+            DecisionError::Conflict(
+                "committed checkpoint deployment identity is missing; do not recreate or reset the namespace"
+                    .into(),
+            )
+        })?;
         if index.deployment_id != deployment_id {
             return Err(DecisionError::Conflict(format!(
                 "committed checkpoint belongs to deployment {}, current deployment is {deployment_id}",

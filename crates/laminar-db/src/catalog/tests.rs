@@ -8,6 +8,58 @@ fn test_schema() -> SchemaRef {
     ]))
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn topology_validation_catalog_bounds_empty_queues_without_changing_runtime_buffers() {
+    let config = crate::LaminarConfig {
+        default_buffer_size: 8192,
+        ..Default::default()
+    };
+    let planning = SourceCatalog::for_topology_planning(&config);
+    for (name, buffer_size) in [("default", None), ("explicit", Some(usize::MAX))] {
+        let source = planning
+            .register_source(name, test_schema(), vec![], None, None, buffer_size, None)
+            .unwrap();
+        assert_eq!(source.source.capacity(), 1024);
+        assert_eq!(source.buffer.lock().capacity, 1);
+        assert_eq!(source.source.pending(), 0);
+        assert!(source.snapshot().is_empty());
+        assert!(matches!(
+            source.push_and_buffer(RecordBatch::new_empty(test_schema())),
+            Err(StreamingError::Disconnected)
+        ));
+    }
+    let runtime = SourceCatalog::from_config(&config);
+    let source = runtime
+        .register_source(
+            "runtime",
+            test_schema(),
+            vec![],
+            None,
+            None,
+            Some(4096),
+            None,
+        )
+        .unwrap();
+    assert_eq!(source.source.capacity(), 4096);
+    assert_eq!(source.buffer.lock().capacity, 4096);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn topology_validation_catalog_needs_no_runtime_or_background_drain_task() {
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    let planning = SourceCatalog::for_topology_planning(&crate::LaminarConfig::default());
+    let source = planning
+        .register_source("private", test_schema(), vec![], None, None, None, None)
+        .unwrap();
+    assert!(matches!(
+        source.push_and_buffer(RecordBatch::new_empty(test_schema())),
+        Err(StreamingError::Disconnected)
+    ));
+    assert!(source.snapshot().is_empty());
+}
+
 #[tokio::test]
 async fn test_register_source() {
     let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);

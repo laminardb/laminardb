@@ -92,10 +92,16 @@ impl KafkaSource {
                 actual: self.state.to_string(),
             });
         }
+        if let Some((config, checkpoint)) = request.initialized_checkpoint() {
+            // Read-only full inventory/retention validation precedes active consumer creation.
+            // Reuse the sealed numeric vector; never resolve latest, subscribe, poll or commit.
+            self.inspect_initial_position_inner(config, Some(checkpoint))
+                .await?;
+        }
         let KafkaStartPlan {
             config: kafka_config,
             delivery,
-            is_resume,
+            has_saved_position,
             resume_input_channels,
             resume_baselines,
         } = self.prepare_start(request)?;
@@ -116,6 +122,9 @@ impl KafkaSource {
             // librdkafka to auto-reset would silently cross the sealed checkpoint cut after the
             // preflight watermark validation (including a retention race while paused).
             rdkafka_config.set("auto.offset.reset", "error");
+        }
+        if has_saved_position {
+            rdkafka_config.set("allow.auto.create.topics", "false");
         }
         let context = LaminarConsumerContext::new(
             Arc::clone(&self.rebalance_state),
@@ -142,7 +151,7 @@ impl KafkaSource {
                 &consumer,
                 &kafka_config,
                 delivery,
-                is_resume,
+                has_saved_position,
                 &resume_baselines,
             )
             .await?;
@@ -152,7 +161,7 @@ impl KafkaSource {
                 &kafka_config,
                 delivery,
                 vnode_assigned,
-                is_resume,
+                has_saved_position,
                 resume_input_channels.as_deref(),
                 &resume_baselines,
             )
@@ -162,7 +171,7 @@ impl KafkaSource {
             &kafka_config,
             vnode_assigned,
             local_guaranteed_assignment,
-            is_resume,
+            has_saved_position,
             resume_input_channels.as_deref(),
             &resume_baselines,
         )

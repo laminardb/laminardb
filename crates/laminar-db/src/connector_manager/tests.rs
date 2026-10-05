@@ -4,6 +4,7 @@ use super::*;
 fn test_register_source() {
     let mut mgr = ConnectorManager::new();
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "clicks".to_string(),
         connector_type: Some("KAFKA".to_string()),
         connector_options: HashMap::from([("topic".to_string(), "clicks".to_string())]),
@@ -18,6 +19,7 @@ fn test_register_source() {
 fn test_register_sink() {
     let mut mgr = ConnectorManager::new();
     mgr.register_sink(SinkRegistration {
+        catalog_generation: 1,
         name: "output".to_string(),
         input: "events".to_string(),
         query_inputs: Vec::new(),
@@ -55,6 +57,7 @@ fn test_register_stream() {
 fn test_unregister() {
     let mut mgr = ConnectorManager::new();
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "test".to_string(),
         connector_type: None,
         connector_options: HashMap::new(),
@@ -70,6 +73,7 @@ fn test_registration_count() {
     let mut mgr = ConnectorManager::new();
     assert_eq!(mgr.registration_count(), 0);
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "s1".to_string(),
         connector_type: None,
         connector_options: HashMap::new(),
@@ -77,6 +81,7 @@ fn test_registration_count() {
         format_options: HashMap::new(),
     });
     mgr.register_sink(SinkRegistration {
+        catalog_generation: 1,
         name: "k1".to_string(),
         input: "s1".to_string(),
         query_inputs: Vec::new(),
@@ -93,6 +98,7 @@ fn test_registration_count() {
 fn test_no_external_connectors() {
     let mut mgr = ConnectorManager::new();
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "test".to_string(),
         connector_type: None,
         connector_options: HashMap::new(),
@@ -106,6 +112,7 @@ fn test_no_external_connectors() {
 fn test_clear() {
     let mut mgr = ConnectorManager::new();
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "test".to_string(),
         connector_type: None,
         connector_options: HashMap::new(),
@@ -135,6 +142,7 @@ fn test_get_source() {
     let mut mgr = ConnectorManager::new();
     assert!(mgr.get_source("test").is_none());
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "test".to_string(),
         connector_type: Some("KAFKA".to_string()),
         connector_options: HashMap::new(),
@@ -150,6 +158,7 @@ fn test_get_sink() {
     let mut mgr = ConnectorManager::new();
     assert!(mgr.get_sink("test").is_none());
     mgr.register_sink(SinkRegistration {
+        catalog_generation: 1,
         name: "test".to_string(),
         input: "events".to_string(),
         query_inputs: Vec::new(),
@@ -168,6 +177,7 @@ fn test_get_sink() {
 fn test_overwrite_registration() {
     let mut mgr = ConnectorManager::new();
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "test".to_string(),
         connector_type: Some("KAFKA".to_string()),
         connector_options: HashMap::new(),
@@ -175,6 +185,7 @@ fn test_overwrite_registration() {
         format_options: HashMap::new(),
     });
     mgr.register_source(SourceRegistration {
+        catalog_generation: 1,
         name: "test".to_string(),
         connector_type: Some("POSTGRES".to_string()),
         connector_options: HashMap::new(),
@@ -192,6 +203,7 @@ fn test_overwrite_registration() {
 fn test_unregister_sink_and_stream() {
     let mut mgr = ConnectorManager::new();
     mgr.register_sink(SinkRegistration {
+        catalog_generation: 1,
         name: "s1".to_string(),
         input: "src".to_string(),
         query_inputs: Vec::new(),
@@ -282,6 +294,7 @@ fn test_table_in_registration_count() {
 #[test]
 fn test_build_source_config_valid() {
     let reg = SourceRegistration {
+        catalog_generation: 1,
         name: "clicks".to_string(),
         connector_type: Some("KAFKA".to_string()),
         connector_options: HashMap::from([
@@ -312,6 +325,7 @@ fn test_build_source_config_valid() {
 #[test]
 fn connector_options_are_not_rewritten_by_the_generic_bridge() {
     let reg = SourceRegistration {
+        catalog_generation: 1,
         name: "custom".to_string(),
         connector_type: Some("custom".to_string()),
         connector_options: HashMap::from([
@@ -330,6 +344,7 @@ fn connector_options_are_not_rewritten_by_the_generic_bridge() {
 #[test]
 fn test_build_source_config_missing_type() {
     let reg = SourceRegistration {
+        catalog_generation: 1,
         name: "clicks".to_string(),
         connector_type: None,
         connector_options: HashMap::new(),
@@ -343,6 +358,7 @@ fn test_build_source_config_missing_type() {
 #[test]
 fn test_build_source_config_invalid_format() {
     let reg = SourceRegistration {
+        catalog_generation: 1,
         name: "clicks".to_string(),
         connector_type: Some("KAFKA".to_string()),
         connector_options: HashMap::new(),
@@ -357,6 +373,7 @@ fn test_build_source_config_invalid_format() {
 #[test]
 fn test_build_source_config_no_format() {
     let reg = SourceRegistration {
+        catalog_generation: 1,
         name: "clicks".to_string(),
         connector_type: Some("KAFKA".to_string()),
         connector_options: HashMap::new(),
@@ -371,6 +388,7 @@ fn test_build_source_config_no_format() {
 #[test]
 fn test_build_sink_config_valid() {
     let reg = SinkRegistration {
+        catalog_generation: 1,
         name: "output".to_string(),
         input: "events".to_string(),
         query_inputs: Vec::new(),
@@ -400,6 +418,7 @@ fn test_build_sink_config_valid() {
 #[test]
 fn test_build_sink_config_rejects_per_sink_delivery() {
     let reg = SinkRegistration {
+        catalog_generation: 1,
         name: "output".to_string(),
         input: "events".to_string(),
         query_inputs: Vec::new(),
@@ -452,6 +471,7 @@ fn connector_and_format_option_namespaces_must_not_collide() {
 #[test]
 fn test_build_sink_config_missing_type() {
     let reg = SinkRegistration {
+        catalog_generation: 1,
         name: "output".to_string(),
         input: "events".to_string(),
         query_inputs: Vec::new(),
@@ -472,6 +492,7 @@ fn test_build_sink_config_missing_type() {
 #[test]
 fn test_build_sink_config_invalid_format() {
     let reg = SinkRegistration {
+        catalog_generation: 1,
         name: "output".to_string(),
         input: "events".to_string(),
         query_inputs: Vec::new(),
@@ -494,6 +515,7 @@ fn test_build_source_config_case_insensitive_format() {
     // Avro, avro, AVRO should all work
     for fmt in ["avro", "AVRO", "Avro"] {
         let reg = SourceRegistration {
+            catalog_generation: 1,
             name: "s".to_string(),
             connector_type: Some("kafka".to_string()),
             connector_options: HashMap::new(),
@@ -569,6 +591,7 @@ fn test_normalize_connector_type_hyphenated() {
 #[test]
 fn test_build_source_config_normalizes_case_only() {
     let reg = SourceRegistration {
+        catalog_generation: 1,
         name: "cdc".to_string(),
         connector_type: Some("POSTGRES-CDC".to_string()),
         connector_options: HashMap::new(),
@@ -582,6 +605,7 @@ fn test_build_source_config_normalizes_case_only() {
 #[test]
 fn test_build_sink_config_normalizes_case_only() {
     let reg = SinkRegistration {
+        catalog_generation: 1,
         name: "lake".to_string(),
         input: "events".to_string(),
         query_inputs: Vec::new(),

@@ -61,6 +61,60 @@ pub struct RecoveredState {
 }
 
 impl RecoveredState {
+    /// Validate topology recovery under the same complete owner map and stable participant ids.
+    /// Historical assignment bytes remain immutable; only a portable older cut may bootstrap
+    /// the exact current vnode set. This grants neither sink continuation nor intake Release.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn validate_topology_assignment(
+        &self,
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+    ) -> Result<(), DbError> {
+        use laminar_core::cluster::control::TopologyError;
+
+        let predecessor = self
+            .committed
+            .assignment_fence
+            .as_ref()
+            .ok_or(TopologyError::Fenced)?;
+        let target = input.assignment();
+        let owner_ids = self
+            .predecessor_owners
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        let owns_same_vnodes = self
+            .predecessor_owners
+            .iter()
+            .enumerate()
+            .filter(|(_, owner)| owner.0 == input.process().participant.node_id)
+            .map(|(vnode, _)| u32::try_from(vnode))
+            .eq(input.owned_vnodes().iter().copied().map(Ok));
+        if !predecessor.is_canonical()
+            || !target.is_canonical()
+            || !predecessor.matches_owner_map(&owner_ids)
+            || predecessor.assignment_version > target.assignment_version
+            || self.reassigned != (predecessor.assignment_version < target.assignment_version)
+            || (!self.reassigned && predecessor != target)
+            || (self.reassigned && !self.committed.reassignment_portable)
+            || predecessor.assignment_digest != target.assignment_digest
+            || predecessor.vnode_count != target.vnode_count
+            || predecessor.partitioning_abi_version != target.partitioning_abi_version
+            || !predecessor
+                .participants
+                .iter()
+                .map(|participant| participant.node_id)
+                .eq(target
+                    .participants
+                    .iter()
+                    .map(|participant| participant.node_id))
+            || self.target_vnodes != input.owned_vnodes()
+            || !owns_same_vnodes
+        {
+            return Err(TopologyError::Fenced.into());
+        }
+        Ok(())
+    }
+
     /// Recovered epoch.
     #[must_use]
     pub const fn epoch(&self) -> u64 {
@@ -198,6 +252,87 @@ impl VerifiedStateFramePlan {
 }
 
 impl<'a> RecoveryManager<'a> {
+    /// Load a currently authorized migration cut using the strict parent identity and local roster.
+    /// All historical manifests/segments retain their original identity. The rebuilt root must
+    /// equal the sealed requirements before any state payload is read. This supports private
+    /// target preparation and reconstruction after Commit. Ordinary recovery retains its strict
+    /// pipeline identity checks; this method grants no source/output authorization.
+    ///
+    /// # Errors
+    /// Rejects a reader bound to another participant, pipeline, deployment or scope, divergent
+    /// root metadata, damaged state/output bytes and exceeded configured graph payload limits.
+    #[cfg(feature = "cluster")]
+    pub async fn recover_topology_root(
+        &self,
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+        max_graph_payload_bytes: usize,
+    ) -> Result<RecoveredState, DbError> {
+        if self.store.participant_id() != input.process().participant.node_id
+            || self.pipeline_identity != input.descriptor().parent_pipeline
+            || self.deployment_id != input.descriptor().deployment_id
+            || self.scope != CheckpointScope::Cluster
+        {
+            return Err(checkpoint_error(
+                "migration restore reader differs from its exact parent/process authority",
+            ));
+        }
+        self.recover_committed_inner(
+            input.outcome(),
+            input.checkpoint(),
+            Some(ClusterRecoveryTarget {
+                assignment: input.assignment().clone(),
+                owned_vnodes: input.owned_vnodes().to_vec(),
+                max_graph_payload_bytes,
+            }),
+            Some(input),
+        )
+        .await
+    }
+
+    /// Load the authority-selected target checkpoint or explicitly mapped migration root.
+    /// Target checkpoint state uses the ordinary strict target identity and manifest validation;
+    /// it never passes through the parent's migration mapping. This does not authorize actors.
+    ///
+    /// # Errors
+    /// Rejects a foreign reader/process, divergent selected identity, missing/corrupt artifacts
+    /// and managed-state limits. A failed target checkpoint read never falls back to the root.
+    #[cfg(feature = "cluster")]
+    pub async fn recover_topology_selection(
+        &self,
+        input: &laminar_core::cluster::control::TopologyRecoveryInput,
+        max_graph_payload_bytes: usize,
+    ) -> Result<RecoveredState, DbError> {
+        use laminar_core::cluster::control::TopologyRecoveryCut;
+
+        if input.cut() == TopologyRecoveryCut::MigrationRoot {
+            return self
+                .recover_topology_root(input.migration(), max_graph_payload_bytes)
+                .await;
+        }
+        if self.store.participant_id() != input.migration().process().participant.node_id
+            || self.pipeline_identity != input.migration().descriptor().target_pipeline
+            || self.deployment_id != input.migration().descriptor().deployment_id
+            || self.scope != CheckpointScope::Cluster
+        {
+            return Err(checkpoint_error(
+                "target checkpoint reader differs from its selected target/process authority",
+            ));
+        }
+        // Selection proved the same owner map. Keep the exact historical checkpoint bytes;
+        // choose the existing portable bootstrap when its assignment precedes the current one.
+        // Ordinary strict restore remains mandatory for an identical assignment.
+        self.recover_committed_for_target(
+            input.outcome(),
+            input.checkpoint(),
+            Some(ClusterRecoveryTarget {
+                assignment: input.migration().assignment().clone(),
+                owned_vnodes: input.migration().owned_vnodes().to_vec(),
+                max_graph_payload_bytes,
+            }),
+        )
+        .await
+    }
+
     /// Bind recovery to one runtime topology, deployment, and outcome domain.
     #[must_use]
     pub fn new(
@@ -236,34 +371,52 @@ impl<'a> RecoveryManager<'a> {
         committed: &CommittedCheckpointIndex,
         cluster_target: Option<ClusterRecoveryTarget>,
     ) -> Result<RecoveredState, DbError> {
+        self.recover_committed_inner(outcome, committed, cluster_target, None)
+            .await
+    }
+
+    async fn recover_committed_inner(
+        &self,
+        outcome: &CheckpointOutcome,
+        committed: &CommittedCheckpointIndex,
+        cluster_target: Option<ClusterRecoveryTarget>,
+        #[cfg(feature = "cluster")] topology: Option<
+            &laminar_core::cluster::control::TopologyRestoreInput,
+        >,
+        #[cfg(not(feature = "cluster"))] _topology: Option<()>,
+    ) -> Result<RecoveredState, DbError> {
         self.validate_cut(outcome, committed)?;
 
         let checkpoint_id = committed.checkpoint_id;
-        let reads = committed.participants.iter().map(|participant| {
-            let store = self.store;
-            async move {
-                store
-                    .load_manifest_verified(
-                        participant.participant_id,
-                        checkpoint_id,
-                        participant.manifest_len,
-                        &participant.manifest_sha256,
-                    )
-                    .await
-                    .map_err(|error| {
-                        checkpoint_error(format!(
-                            "participant {} checkpoint {} manifest is unreadable: {error}",
-                            participant.participant_id, checkpoint_id
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        checkpoint_error(format!(
-                            "participant {} checkpoint {} manifest is missing",
-                            participant.participant_id, checkpoint_id
-                        ))
-                    })
-            }
-        });
+        let reads = committed
+            .participants
+            .iter()
+            .map(|participant| {
+                let store = self.store;
+                async move {
+                    store
+                        .load_manifest_verified(
+                            participant.participant_id,
+                            checkpoint_id,
+                            participant.manifest_len,
+                            &participant.manifest_sha256,
+                        )
+                        .await
+                        .map_err(|error| {
+                            checkpoint_error(format!(
+                                "participant {} checkpoint {} manifest is unreadable: {error}",
+                                participant.participant_id, checkpoint_id
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            checkpoint_error(format!(
+                                "participant {} checkpoint {} manifest is missing",
+                                participant.participant_id, checkpoint_id
+                            ))
+                        })
+                }
+            })
+            .collect::<Vec<_>>();
         let mut manifests = futures::stream::iter(reads)
             .buffer_unordered(PARALLEL_MANIFEST_READS)
             .try_collect::<Vec<_>>()
@@ -271,6 +424,15 @@ impl<'a> RecoveryManager<'a> {
         manifests.sort_unstable_by_key(|manifest| manifest.participant_id);
 
         self.validate_manifests(committed, &manifests)?;
+        #[cfg(feature = "cluster")]
+        if let Some(input) = topology {
+            input.root().validate_restore_cut(
+                input.operation(),
+                input.descriptor(),
+                committed,
+                &manifests,
+            )?;
+        }
         #[cfg(feature = "cluster")]
         subscription_output::validate_committed_subscription_segments(self.store, &manifests)
             .await?;
@@ -422,22 +584,6 @@ impl<'a> RecoveryManager<'a> {
                 checkpoint_error(format!("committed checkpoint manifests: {error}"))
             })?;
 
-        let mut source_offsets = BTreeMap::<String, ConnectorCheckpoint>::new();
-        let mut channel_progress = BTreeMap::<(u64, String, Vec<u8>), ChannelProgress>::new();
-        for manifest in manifests {
-            merge_manifest_progress(manifest, &mut source_offsets, &mut channel_progress)?;
-        }
-        if source_offsets != committed.source_offsets {
-            return Err(checkpoint_error(
-                "participant source offsets do not exactly reconstruct the committed source cut",
-            ));
-        }
-        let merged_channels = channel_progress.into_values().collect::<Vec<_>>();
-        if merged_channels != committed.channel_progress {
-            return Err(checkpoint_error(
-                "participant channel progress does not exactly reconstruct the committed time cut",
-            ));
-        }
         Ok(())
     }
 }
@@ -649,114 +795,6 @@ pub(crate) async fn load_verified_state_frames(
         ));
     }
     Ok(recovered)
-}
-
-fn merge_manifest_progress(
-    manifest: &CheckpointManifest,
-    source_offsets: &mut BTreeMap<String, ConnectorCheckpoint>,
-    channel_progress: &mut BTreeMap<(u64, String, Vec<u8>), ChannelProgress>,
-) -> Result<(), DbError> {
-    for (source, local) in &manifest.source_offsets {
-        let (merged, first_participant) = match source_offsets.entry(source.clone()) {
-            std::collections::btree_map::Entry::Vacant(entry) => (
-                entry.insert(ConnectorCheckpoint {
-                    offsets: std::collections::HashMap::new(),
-                    metadata: std::collections::HashMap::new(),
-                    input_channels: local.input_channels.clone(),
-                    source_assignment_version: local.source_assignment_version,
-                }),
-                true,
-            ),
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                if entry.get().source_assignment_version != local.source_assignment_version {
-                    return Err(checkpoint_error(format!(
-                        "participant {} source '{source}' has a conflicting assignment version",
-                        manifest.participant_id
-                    )));
-                }
-                (entry.into_mut(), false)
-            }
-        };
-        merge_connector_map(
-            manifest.participant_id,
-            source,
-            "offset",
-            &mut merged.offsets,
-            &local.offsets,
-        )?;
-        merge_connector_map(
-            manifest.participant_id,
-            source,
-            "metadata",
-            &mut merged.metadata,
-            &local.metadata,
-        )?;
-        if !first_participant {
-            match (&mut merged.input_channels, &local.input_channels) {
-                (None, None) => {}
-                (Some(merged), Some(local)) => {
-                    if local
-                        .iter()
-                        .any(|channel| merged.binary_search(channel).is_ok())
-                    {
-                        return Err(checkpoint_error(format!(
-                            "source '{source}' input channel is owned by multiple participants"
-                        )));
-                    }
-                    merged.extend(local.iter().cloned());
-                    merged.sort_unstable();
-                }
-                _ => {
-                    return Err(checkpoint_error(format!(
-                        "source '{source}' participant checkpoints disagree on whether input channels are declared"
-                    )));
-                }
-            }
-        }
-    }
-
-    for channel in &manifest.channel_progress {
-        if channel.participant_id != manifest.participant_id {
-            return Err(checkpoint_error(format!(
-                "participant {} manifest contains source '{}' progress owned by participant {}",
-                manifest.participant_id, channel.source_name, channel.participant_id
-            )));
-        }
-        let key = (
-            channel.participant_id,
-            channel.source_name.clone(),
-            channel.input_channel.clone(),
-        );
-        if let Some(existing) = channel_progress.insert(key, channel.clone()) {
-            if existing == *channel {
-                continue;
-            }
-            return Err(checkpoint_error(format!(
-                "participant {} source '{}' input channel has conflicting progress",
-                manifest.participant_id, channel.source_name
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn merge_connector_map(
-    participant_id: u64,
-    source: &str,
-    field: &str,
-    merged: &mut std::collections::HashMap<String, String>,
-    local: &std::collections::HashMap<String, String>,
-) -> Result<(), DbError> {
-    for (key, value) in local {
-        if let Some(existing) = merged.insert(key.clone(), value.clone()) {
-            if existing != *value {
-                return Err(checkpoint_error(format!(
-                    "participant {participant_id} source '{source}' has conflicting {field} '{key}'"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn insert_chunk(

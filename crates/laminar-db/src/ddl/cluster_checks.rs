@@ -31,6 +31,21 @@ pub(super) enum ChangelogInputKind {
 }
 
 impl LaminarDB {
+    #[cfg(feature = "cluster")]
+    pub(crate) fn has_cluster_query_ownership_scope(&self) -> bool {
+        if let Some(available) = self.topology_planning_ownership_scope {
+            // This snapshot supplies compile-time resource availability, never execution,
+            // assignment, checkpoint, restore, or publication authority.
+            return available
+                && crate::db::DbState::load(&self.state) == crate::db::DbState::Created
+                && self.cluster_controller.lock().is_none()
+                && self.catalog_manifest_store.lock().is_none();
+        }
+        self.shuffle_sender.lock().is_some()
+            && self.shuffle_receiver.lock().is_some()
+            && self.vnode_registry.lock().is_some()
+    }
+
     pub(crate) async fn validate_interval_join_schema(
         &self,
         object_name: &str,
@@ -461,10 +476,7 @@ impl LaminarDB {
             ));
         }
         #[cfg(feature = "cluster")]
-        if self.shuffle_sender.lock().is_none()
-            || self.shuffle_receiver.lock().is_none()
-            || self.vnode_registry.lock().is_none()
-        {
+        if !self.has_cluster_query_ownership_scope() {
             return Err(reject(
                 "CoreWindow has no complete shuffle and vnode ownership scope",
             ));
@@ -510,10 +522,7 @@ impl LaminarDB {
                 reject(&format!("managed temporal join validation failed: {error}"))
             })?;
             #[cfg(feature = "cluster")]
-            if self.shuffle_sender.lock().is_none()
-                || self.shuffle_receiver.lock().is_none()
-                || self.vnode_registry.lock().is_none()
-            {
+            if !self.has_cluster_query_ownership_scope() {
                 return Err(reject(
                     "temporal join has no complete shuffle and vnode ownership scope",
                 ));
@@ -548,10 +557,7 @@ impl LaminarDB {
             ));
         }
         #[cfg(feature = "cluster")]
-        if self.shuffle_sender.lock().is_none()
-            || self.shuffle_receiver.lock().is_none()
-            || self.vnode_registry.lock().is_none()
-        {
+        if !self.has_cluster_query_ownership_scope() {
             return Err(reject(
                 "interval join has no complete shuffle and vnode ownership scope",
             ));
@@ -603,10 +609,7 @@ impl LaminarDB {
         };
         if has_aggregate {
             #[cfg(feature = "cluster")]
-            if self.shuffle_sender.lock().is_none()
-                || self.shuffle_receiver.lock().is_none()
-                || self.vnode_registry.lock().is_none()
-            {
+            if !self.has_cluster_query_ownership_scope() {
                 return Err(reject(
                     "aggregate has no complete distributed shuffle and vnode ownership scope",
                 ));

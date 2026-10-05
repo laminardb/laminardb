@@ -92,6 +92,7 @@ pub(super) async fn handle_sink_command(
                 batch,
                 deadline,
                 cancellation_policy,
+                &inner.generation,
                 #[cfg(feature = "cluster")]
                 inner.process_authority.clone(),
             )
@@ -112,6 +113,7 @@ pub(super) async fn handle_sink_command(
                 &namespace,
                 deadline,
                 cancellation_policy,
+                &inner.generation,
                 #[cfg(feature = "cluster")]
                 inner.process_authority.clone(),
             )
@@ -213,6 +215,7 @@ pub(super) async fn begin_sink_epoch(
         "begin_epoch",
         deadline,
         inner.sink.cancellation_policy(),
+        &inner.generation,
         #[cfg(feature = "cluster")]
         inner.process_authority.clone(),
         || inner.sink.begin_epoch(epoch),
@@ -242,6 +245,7 @@ pub(super) async fn flush_checkpoint_sink(
             "checkpoint flush",
             deadline,
             inner.sink.cancellation_policy(),
+            &inner.generation,
             #[cfg(feature = "cluster")]
             inner.process_authority.clone(),
             || inner.sink.flush(),
@@ -274,6 +278,7 @@ pub(super) async fn pre_commit_sink(
             "pre_commit",
             deadline,
             inner.sink.cancellation_policy(),
+            &inner.generation,
             #[cfg(feature = "cluster")]
             inner.process_authority.clone(),
             || inner.sink.pre_commit(epoch),
@@ -288,6 +293,7 @@ pub(super) async fn commit_aggregated_sink(
     batch: CoordinatedCommitBatch,
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
+    generation: &tokio_util::sync::CancellationToken,
     #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
 ) -> (Result<(), ConnectorError>, bool) {
     match committer {
@@ -298,6 +304,7 @@ pub(super) async fn commit_aggregated_sink(
                 "coordinated external commit",
                 deadline,
                 cancellation_policy,
+                generation,
                 #[cfg(feature = "cluster")]
                 process_authority,
                 || committer.commit_aggregated(batch, context),
@@ -324,6 +331,7 @@ async fn checkpoint_artifact_intent(
         "checkpoint artifact intent",
         deadline,
         inner.sink.cancellation_policy(),
+        &inner.generation,
         #[cfg(feature = "cluster")]
         inner.process_authority.clone(),
         || inner.sink.checkpoint_artifact_intent(epoch),
@@ -337,6 +345,7 @@ pub(super) async fn committed_cursor(
     namespace: &CoordinatedCommitNamespace,
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
+    generation: &tokio_util::sync::CancellationToken,
     #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
 ) -> (
     Result<Option<CoordinatedCommitCursor>, ConnectorError>,
@@ -349,6 +358,7 @@ pub(super) async fn committed_cursor(
                 "external commit cursor read",
                 deadline,
                 cancellation_policy,
+                generation,
                 #[cfg(feature = "cluster")]
                 process_authority,
                 || committer.committed_cursor(namespace),
@@ -386,6 +396,7 @@ pub(super) async fn close_sink_connector(
             "shutdown flush",
             deadline,
             cancellation_policy,
+            &inner.generation,
             #[cfg(feature = "cluster")]
             inner.process_authority.clone(),
             || inner.sink.flush(),
@@ -414,6 +425,7 @@ pub(super) async fn close_sink_connector(
             "connector close",
             deadline,
             cancellation_policy,
+            &inner.generation,
             #[cfg(feature = "cluster")]
             inner.process_authority.clone(),
             || inner.sink.close(),
@@ -514,6 +526,7 @@ pub(super) async fn handle_write_batch(
     let cancellation_policy = inner.sink.cancellation_policy();
     let outcome = await_connector_operation(
         deadline,
+        &inner.generation,
         #[cfg(feature = "cluster")]
         inner.process_authority.clone(),
         || inner.sink.write_batch(&batch),
@@ -535,6 +548,20 @@ pub(super) async fn handle_write_batch(
                 epoch_poisoned,
             );
             retire
+        }
+        ConnectorOperationOutcome::GenerationRetired => {
+            let error = super::operation::generation_retired_error(&inner.name, "write");
+            record_write_error(
+                &inner.name,
+                &inner.sink_id,
+                inner.requires_recovery_on_error,
+                &inner.event_tx,
+                current_epoch,
+                rows,
+                &error,
+                epoch_poisoned,
+            );
+            true
         }
         ConnectorOperationOutcome::Deadline => {
             record_write_timeout(
@@ -606,6 +633,7 @@ pub(super) async fn handle_rollback_epoch(
         "rollback_epoch",
         deadline,
         inner.sink.cancellation_policy(),
+        &inner.generation,
         #[cfg(feature = "cluster")]
         inner.process_authority.clone(),
         || inner.sink.rollback_epoch(epoch),

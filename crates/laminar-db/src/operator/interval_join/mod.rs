@@ -3,6 +3,8 @@
 //! Buffers left/right rows across cycles for
 //! `right_ts BETWEEN left_ts AND left_ts + time_bound`; evicts on watermark advance.
 
+mod checkpoint_validation;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -1180,8 +1182,8 @@ impl IntervalJoinOperator {
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         debug_assert!(self.vnode_states.iter().all(Option::is_none));
-        debug_assert!(self.resident_vnodes.is_empty());
-        debug_assert!(self.dirty_vnode_roster.is_empty());
+        debug_assert_eq!(self.resident_vnodes, [] as [u32; 0]);
+        debug_assert_eq!(self.dirty_vnode_roster, [] as [u32; 0]);
         self.key_group_count = KeyGroupCount::try_from(config.registry.vnode_count())
             .expect("vnode registry count must fit the checkpoint key-group ABI");
         self.vnode_states
@@ -1250,7 +1252,7 @@ impl IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let sender_digest = config.sender.active_assignment_digest();
         let receiver_digest = config.receiver.active_assignment_digest();
         if assignment.version() != self.local_assignment.version()
@@ -2186,143 +2188,6 @@ impl IntervalJoinOperator {
         }
     }
 
-    fn validate_handoff_cutoffs(
-        left_evicted_cutoff: i64,
-        right_evicted_cutoff: i64,
-        left_nonempty: bool,
-        right_nonempty: bool,
-        config: &StreamJoinConfig,
-        context: &str,
-        cut: IntervalHandoffCut,
-    ) -> Result<(), DbError> {
-        let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "{context}: configured time bound exceeds the supported millisecond range"
-            ))
-        })?;
-        let expected_left_cutoff = cut.right_watermark.saturating_sub(bound_ms);
-        let expected_right_cutoff = cut.left_watermark;
-        if left_evicted_cutoff > expected_left_cutoff
-            || right_evicted_cutoff > expected_right_cutoff
-            || (left_nonempty && left_evicted_cutoff != expected_left_cutoff)
-            || (right_nonempty && right_evicted_cutoff != expected_right_cutoff)
-        {
-            return Err(DbError::Checkpoint(format!(
-                "{context}: vnode eviction state is inconsistent with the portable handoff cut"
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_ordered_core_cutoffs(
-        state: &IntervalJoinVnodeState,
-        config: &StreamJoinConfig,
-        context: &str,
-        cut: IntervalHandoffCut,
-    ) -> Result<(), DbError> {
-        let bound_ms = i64::try_from(config.time_bound.as_millis()).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "{context}: configured time bound exceeds the supported millisecond range"
-            ))
-        })?;
-        let expected = (
-            cut.right_watermark.saturating_sub(bound_ms),
-            cut.left_watermark,
-        );
-        if state.evicted_cutoffs() != expected {
-            return Err(DbError::Checkpoint(format!(
-                "{context}: weighted core cutoffs disagree with authoritative normalizer cutoffs"
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_checkpoint_config(
-        &self,
-        checkpoint: &IntervalJoinOperatorCheckpoint,
-    ) -> Result<(), DbError> {
-        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] configured time bound exceeds the supported millisecond range",
-                self.projection.op_name
-            ))
-        })?;
-        if checkpoint.version != OPERATOR_CHECKPOINT_VERSION
-            || checkpoint.ordered_input_fingerprints
-                != self
-                    .ordered_input_spec
-                    .as_ref()
-                    .map(|spec| [spec.left.fingerprint, spec.right.fingerprint])
-            || checkpoint.join_type != join_type_tag(self.config.join_type)
-            || checkpoint.left_keys != self.config.left_keys
-            || checkpoint.right_keys != self.config.right_keys
-            || checkpoint.left_time_column != self.config.left_time_column
-            || checkpoint.right_time_column != self.config.right_time_column
-            || checkpoint.left_table != self.config.left_table
-            || checkpoint.right_table != self.config.right_table
-            || checkpoint.bound_ms != bound_ms
-        {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] checkpoint version or configuration does not match the operator",
-                self.projection.op_name
-            )));
-        }
-        Ok(())
-    }
-
-    fn validate_archived_checkpoint_config(
-        &self,
-        checkpoint: &ArchivedIntervalJoinOperatorCheckpoint,
-    ) -> Result<(), DbError> {
-        let bound_ms = i64::try_from(self.config.time_bound.as_millis()).map_err(|_| {
-            DbError::Checkpoint(format!(
-                "interval join [{}] configured bound is not checkpointable",
-                self.projection.op_name
-            ))
-        })?;
-        let expected_fingerprints = self
-            .ordered_input_spec
-            .as_ref()
-            .map(|spec| [spec.left.fingerprint, spec.right.fingerprint]);
-        let fingerprints_match = match (
-            checkpoint.ordered_input_fingerprints.as_ref(),
-            expected_fingerprints.as_ref(),
-        ) {
-            (None, None) => true,
-            (Some(archived), Some(expected)) => archived.as_slice() == expected.as_slice(),
-            _ => false,
-        };
-        let left_keys_match = checkpoint.left_keys.len() == self.config.left_keys.len()
-            && checkpoint
-                .left_keys
-                .iter()
-                .zip(&self.config.left_keys)
-                .all(|(archived, expected)| archived.as_str() == expected.as_str());
-        let right_keys_match = checkpoint.right_keys.len() == self.config.right_keys.len()
-            && checkpoint
-                .right_keys
-                .iter()
-                .zip(&self.config.right_keys)
-                .all(|(archived, expected)| archived.as_str() == expected.as_str());
-        if checkpoint.version != OPERATOR_CHECKPOINT_VERSION
-            || !fingerprints_match
-            || checkpoint.join_type != join_type_tag(self.config.join_type)
-            || !left_keys_match
-            || !right_keys_match
-            || checkpoint.left_time_column.as_str() != self.config.left_time_column.as_str()
-            || checkpoint.right_time_column.as_str() != self.config.right_time_column.as_str()
-            || checkpoint.left_table.as_str() != self.config.left_table.as_str()
-            || checkpoint.right_table.as_str() != self.config.right_table.as_str()
-            || checkpoint.bound_ms != bound_ms
-        {
-            return Err(DbError::Checkpoint(format!(
-                "interval join [{}] archived checkpoint version or configuration does not match the operator",
-                self.projection.op_name
-            )));
-        }
-        Ok(())
-    }
-
     fn preflight_whole_restore_archive(
         &self,
         bytes: &Vec<u8>,
@@ -2717,7 +2582,7 @@ impl IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let requested_owner_bytes = assignment
             .owners()
             .len()
@@ -4079,6 +3944,7 @@ impl IntervalJoinOperator {
             .outbound
             .take()
             .expect("idle interval send plan must retain its outbound cut");
+        let topology = config.topology;
         let sender = Arc::clone(&config.sender);
         let wake = config.receiver.work_ready_notify();
         let context = format!("interval join [{}] shuffle", self.projection.op_name);
@@ -4087,6 +3953,7 @@ impl IntervalJoinOperator {
         pending.send = Some(tokio::spawn(async move {
             let outcome = crate::operator::send_shuffle_plan_retaining(
                 &sender,
+                topology,
                 assignment_version,
                 outbound,
                 &context,
@@ -4491,6 +4358,13 @@ impl IntervalJoinOperator {
 
 #[async_trait]
 impl GraphOperator for IntervalJoinOperator {
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, topology: laminar_core::shuffle::ShuffleTopologyFence) {
+        if let Some(scope) = &mut self.cluster_shuffle {
+            scope.topology = Some(topology);
+        }
+    }
+
     fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
         crate::operator::capability::OperatorCapability::bounded_interval_join()
     }
@@ -5336,7 +5210,7 @@ impl GraphOperator for IntervalJoinOperator {
                             .min(logical_remaining);
                         let encoded = Self::encode_state_capture(state_capture, &context, limit)?;
                         operator_remaining
-                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                                 remaining.checked_sub(encoded.payload_len())
                             })
                             .map_err(|_| {
@@ -5462,7 +5336,7 @@ impl GraphOperator for IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
-        let assignment = config.registry.versioned_snapshot();
+        let assignment = config.topology_snapshot()?;
         let allocation = |bytes: usize| {
             bytes
                 .checked_add(usize::from(bytes != 0) * HEAP_ALLOCATION_CHARGE)

@@ -14,7 +14,13 @@ use super::subscription_output;
 use super::{CheckpointCoordinator, MAX_RETENTION_IO_CONCURRENCY};
 use crate::error::DbError;
 
+mod inventory;
+pub(super) use inventory::live_chunk_inventory;
+pub(super) use inventory::load_index_manifests;
+
 const RETENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
+#[cfg(feature = "cluster")]
+const MAX_RETAINED_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(super) enum GcAuthority {
@@ -50,101 +56,10 @@ pub(super) struct GcRequest {
     pub(super) metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
 }
 
-pub(super) async fn load_index_manifests(
-    store: &dyn CheckpointStore,
-    index: &CommittedCheckpointIndex,
-) -> Result<Vec<CheckpointManifest>, DbError> {
-    let checkpoint_id = index.checkpoint_id;
-    let reads = index
-        .participants
-        .clone()
-        .into_iter()
-        .map(|participant| async move {
-            let manifest = store
-                .load_manifest_verified(
-                    participant.participant_id,
-                    checkpoint_id,
-                    participant.manifest_len,
-                    &participant.manifest_sha256,
-                )
-                .await
-                .map_err(DbError::from)?
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "checkpoint {} participant {} manifest is missing",
-                        checkpoint_id, participant.participant_id
-                    ))
-                })?;
-            let encoded = checkpoint_manifest_bytes(&manifest).map_err(|error| {
-                DbError::Checkpoint(format!("encode checkpoint manifest: {error}"))
-            })?;
-            participant
-                .verify_manifest(&manifest, &encoded)
-                .map_err(DbError::Checkpoint)?;
-            Ok::<_, DbError>((participant.participant_id, manifest, encoded))
-        });
-    let mut loaded = futures::stream::iter(reads)
-        .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-    loaded.sort_unstable_by_key(|(participant_id, _, _)| *participant_id);
-    if let Some((participant_id, _, _)) = loaded.iter().find(|(_, manifest, _)| {
-        manifest.epoch != index.epoch
-            || manifest.checkpoint_id != index.checkpoint_id
-            || manifest.deployment_id != index.deployment_id
-            || manifest.pipeline_identity != index.pipeline_identity
-            || manifest.vnode_count != index.vnode_count
-            || manifest.assignment_fence != index.assignment_fence
-    }) {
-        return Err(DbError::Checkpoint(format!(
-            "checkpoint {} participant {} manifest belongs to a different committed cut",
-            index.checkpoint_id, participant_id
-        )));
-    }
-    let views = loaded
-        .iter()
-        .map(|(_, manifest, bytes)| (manifest, bytes.as_slice()))
-        .collect::<Vec<_>>();
-    index
-        .validate_participant_manifests(&views)
-        .map_err(DbError::Checkpoint)?;
-    Ok(loaded
-        .into_iter()
-        .map(|(_, manifest, _)| manifest)
-        .collect())
-}
-
 pub(super) struct LiveChunkInventory {
     references: BTreeSet<StateChunkId>,
     pinned: BTreeSet<StateChunkId>,
     subscription_segments: BTreeSet<String>,
-}
-
-pub(super) fn live_chunk_inventory(manifests: &[CheckpointManifest]) -> LiveChunkInventory {
-    let mut references = BTreeSet::new();
-    let mut pinned = BTreeSet::new();
-    let mut subscription_segments = BTreeSet::new();
-    for manifest in manifests {
-        pinned.insert(manifest.node_data.chunk);
-        for reference in &manifest.referenced_chunks {
-            references.insert(reference.chunk);
-        }
-        if let Some(output) = &manifest.subscription_output {
-            for stream in &output.streams {
-                subscription_segments.extend(
-                    stream
-                        .segments
-                        .iter()
-                        .map(|segment| segment.object_key.clone()),
-                );
-            }
-        }
-    }
-    LiveChunkInventory {
-        references,
-        pinned,
-        subscription_segments,
-    }
 }
 
 pub(super) async fn delete_retired_data(
@@ -230,8 +145,82 @@ pub(super) async fn load_protected_checkpoint(
         .await
         .map_err(|error| DbError::Checkpoint(format!("load retained checkpoint index: {error}")))?;
     let manifests = load_index_manifests(store, &index).await?;
+    super::retention_state::validate_retained_state(store, &manifests).await?;
     let live = live_chunk_inventory(&manifests);
     Ok(ProtectedCheckpoint { index, live })
+}
+
+#[cfg(feature = "cluster")]
+pub(super) async fn load_protected_checkpoint_with_roots(
+    store: &dyn CheckpointStore,
+    decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    reference: &CommittedCheckpointRef,
+    roots: &[CommittedCheckpointRef],
+) -> Result<ProtectedCheckpoint, DbError> {
+    if roots.len() > laminar_core::cluster::control::MAX_TOPOLOGY_OPERATIONS {
+        return Err(DbError::Checkpoint(
+            "retained topology root inventory exceeds its bound".into(),
+        ));
+    }
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let index = decisions
+            .load_committed_checkpoint(reference)
+            .await
+            .map_err(|error| DbError::Checkpoint(format!("load retained checkpoint: {error}")))?;
+        let mut metadata_bytes = index
+            .participants
+            .iter()
+            .try_fold(0_u64, |total, participant| {
+                total.checked_add(participant.manifest_len)
+            });
+        if metadata_bytes.is_none_or(|bytes| bytes > MAX_RETAINED_MANIFEST_BYTES) {
+            return Err(DbError::Checkpoint(
+                "retained root/target manifest metadata exceeds 16 MiB; artifacts retained".into(),
+            ));
+        }
+        let mut manifests = load_index_manifests(store, &index).await?;
+        for root in roots.iter().filter(|root| *root != reference) {
+            let pinned = decisions
+                .load_committed_checkpoint(root)
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("load pinned topology root: {error}"))
+                })?;
+            if pinned.deployment_id != index.deployment_id
+                || pinned.scope != index.scope
+                || pinned.vnode_count != index.vnode_count
+                || pinned.epoch >= index.epoch
+            {
+                return Err(DbError::Checkpoint(
+                    "pinned topology root differs from its retained deployment/cut".into(),
+                ));
+            }
+            metadata_bytes = pinned
+                .participants
+                .iter()
+                .try_fold(metadata_bytes.unwrap_or(u64::MAX), |total, participant| {
+                    total.checked_add(participant.manifest_len)
+                });
+            if metadata_bytes.is_none_or(|bytes| bytes > MAX_RETAINED_MANIFEST_BYTES) {
+                return Err(DbError::Checkpoint(
+                    "retained root/target manifest metadata exceeds 16 MiB; artifacts retained"
+                        .into(),
+                ));
+            }
+            manifests.extend(load_index_manifests(store, &pinned).await?);
+        }
+        // A target's incremental closure alone need not include every historical root chunk or
+        // output segment. Keep the whole audited root closure live and validate all state bytes.
+        super::retention_state::validate_retained_state(store, &manifests).await?;
+        Ok(ProtectedCheckpoint {
+            index,
+            live: live_chunk_inventory(&manifests),
+        })
+    })
+    .await
+    .map_err(|_| {
+        DbError::Checkpoint("retained root/target preflight timed out; artifacts retained".into())
+    })?
 }
 
 pub(super) async fn load_cleanup_target(
@@ -399,23 +388,33 @@ async fn run_local_gc_request(
 async fn begin_cluster_cleanup(
     store: Arc<dyn CheckpointStore>,
     decisions: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
-    authority: &laminar_core::cluster::control::LeaderLeaseStore,
+    authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
     proof: &LeaderProof,
     protected: CommittedCheckpointRef,
 ) -> Result<Option<laminar_core::cluster::control::ClusterArtifactCleanupCursor>, DbError> {
+    let artifact_authority = Arc::clone(&authority);
     authority
         .begin_cluster_artifact_cleanup(proof, protected, move |outcome| {
             let store = Arc::clone(&store);
             let decisions = Arc::clone(&decisions);
+            let authority = Arc::clone(&artifact_authority);
             async move {
                 let reference = outcome
                     .committed_checkpoint
                     .as_ref()
                     .ok_or_else(|| "retained Commit has no checkpoint index".to_owned())?;
-                load_protected_checkpoint(store.as_ref(), decisions.as_ref(), reference)
+                let roots = Box::pin(authority.retained_topology_checkpoints())
                     .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                Box::pin(load_protected_checkpoint_with_roots(
+                    store.as_ref(),
+                    decisions.as_ref(),
+                    reference,
+                    &roots,
+                ))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
             }
         })
         .await
@@ -442,7 +441,7 @@ async fn run_cluster_gc_protocol(
         cursor = begin_cluster_cleanup(
             Arc::clone(&store),
             Arc::clone(&request.decision_store),
-            authority.as_ref(),
+            Arc::clone(&authority),
             &proof,
             requested.clone(),
         )
@@ -460,13 +459,17 @@ async fn run_cluster_gc_protocol(
                     .as_ref()
                     .is_none_or(|(reference, _)| reference != &current.protected)
                 {
+                    let roots = Box::pin(authority.retained_topology_checkpoints())
+                        .await
+                        .map_err(|error| DbError::Checkpoint(error.to_string()))?;
                     protected = Some((
                         current.protected.clone(),
-                        load_protected_checkpoint(
+                        Box::pin(load_protected_checkpoint_with_roots(
                             store.as_ref(),
                             request.decision_store.as_ref(),
                             &current.protected,
-                        )
+                            &roots,
+                        ))
                         .await?,
                     ));
                 }
@@ -528,7 +531,7 @@ async fn run_cluster_gc_protocol(
                     cursor = begin_cluster_cleanup(
                         Arc::clone(&store),
                         Arc::clone(&request.decision_store),
-                        authority.as_ref(),
+                        Arc::clone(&authority),
                         &proof,
                         requested.clone(),
                     )
@@ -557,7 +560,7 @@ async fn run_cluster_gc_request(
     run_cluster_gc_protocol(
         Arc::clone(&store),
         request,
-        authority,
+        Arc::clone(&authority),
         proof,
         requested.clone(),
     )
@@ -578,6 +581,7 @@ async fn run_cluster_gc_request(
     let cleanup = subscription_output::cleanup_subscription_orphans(
         store.as_ref(),
         request.decision_store.as_ref(),
+        authority.as_ref(),
         latest,
         horizon,
         grace_before_ms,

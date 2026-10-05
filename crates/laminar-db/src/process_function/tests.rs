@@ -2544,6 +2544,11 @@ def handle(activations):
             let (_, position, _) = request.into_parts();
             self.cursor = match position {
                 SourcePosition::Initial => 0,
+                SourcePosition::Initialized { .. } => {
+                    return Err(ConnectorError::ConfigurationError(
+                        "process replay fixture does not support sealed topology startup".into(),
+                    ));
+                }
                 SourcePosition::Resume { checkpoint, .. } => checkpoint
                     .get_offset("cursor")
                     .and_then(|cursor| cursor.parse::<usize>().ok())

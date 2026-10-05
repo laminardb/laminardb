@@ -11,7 +11,8 @@ use tokio::sync::Notify;
 /// Cancellation always respects the runtime-owned deadline. A connector may be
 /// reused only when dropping the exact future is known to preserve its state;
 /// otherwise the runtime retires the complete connector generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConnectorCancellationPolicy {
     /// Dropping an in-flight future leaves the connector valid for recovery or reuse.
     CancelSafe,

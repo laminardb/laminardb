@@ -32,6 +32,7 @@
 #![cfg_attr(
     test,
     allow(
+        clippy::assert_is_empty, // Assert cardinality without requiring equality on fixture elements.
         clippy::assertions_on_constants,
         clippy::default_trait_access,
         clippy::field_reassign_with_default,
@@ -194,6 +195,16 @@ pub use subscription::cluster::benchmark::{
 /// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]
 pub use db::{ClusterStartupDisposition, SnapshotAdoption};
+#[cfg(feature = "cluster")]
+pub use db::{
+    ClusterTopologyAdoptionRequest, ClusterTopologyRequest, ClusterTopologyStatus,
+    PreparedTopologyRestore, PreparedTopologySourcePosition,
+};
+#[cfg(feature = "cluster")]
+pub use db::{
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

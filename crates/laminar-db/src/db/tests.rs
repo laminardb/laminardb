@@ -729,6 +729,7 @@ async fn complete_audited_vnode_revocation(final_owner_exit: bool) {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity.clone());
@@ -1200,6 +1201,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         registry: Arc::clone(&registry),
         sender: Arc::clone(&sender),
         receiver: Arc::clone(&receiver),
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity.clone());
@@ -3738,6 +3740,7 @@ async fn replacement_process_stages_and_publishes_zero_owner_topology() {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity);
@@ -6439,6 +6442,9 @@ struct TestCatalogAuthority {
     lease_tx: tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
     lease: laminar_core::cluster::control::LeaderLease,
 }
+
+#[cfg(feature = "cluster")]
+mod topology_planning;
 
 #[cfg(feature = "cluster")]
 async fn test_catalog_authority(
@@ -10840,6 +10846,138 @@ async fn startup_bootstrap_restores_before_config_and_requires_exact_ddl() {
         manifest_store.load().await.unwrap().unwrap().entries.len(),
         1
     );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn topology_status_distinguishes_adoption_replay_and_runtime_release() {
+    use laminar_core::cluster::control::{TopologyCatalogState, TopologyVersion};
+    use object_store::ObjectStore;
+
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let authority = test_catalog_authority(Arc::clone(&objects)).await;
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&authority.controller))
+        .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
+        .catalog_manifest_store(Arc::clone(&authority.manifest_store))
+        .build()
+        .await
+        .unwrap();
+    db.execute_cluster_bootstrap("CREATE SOURCE existing (id INT)")
+        .await
+        .unwrap();
+    let before = db.cluster_topology_status().await.unwrap();
+    let TopologyCatalogState::LegacySealed { manifest } = before.catalog else {
+        panic!("sealed catalog has no implied logical version");
+    };
+    assert_eq!(before.committed_version, None);
+    assert_eq!(before.locally_active_version, None);
+    let deployment = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(objects)
+        .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    authority
+        .manifest_store
+        .adopt_legacy_topology(
+            &authority.lease.proof(),
+            uuid::Uuid::from_u128(42).try_into().unwrap(),
+            &manifest,
+            &deployment,
+        )
+        .await
+        .unwrap();
+    let adopted = db.cluster_topology_status().await.unwrap();
+    assert_eq!(
+        adopted.committed_version,
+        Some(TopologyVersion::LEGACY_BASELINE)
+    );
+    assert_eq!(adopted.locally_active_version, None);
+    db.restore_catalog_from_manifest().await.unwrap();
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+
+    // Control-state fixture: authority/replay alone cannot claim activation. Running and the
+    // actual intake-release gate are both required, and a fault immediately removes it.
+    DbState::Running.store(&db.state);
+    db.set_source_gate(true);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+    db.set_source_gate(false);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        Some(TopologyVersion::LEGACY_BASELINE)
+    );
+    // The real capture helper and assignment/source release share the existing authority lock.
+    // A still-current assignment must not reopen a held topology cut or report it active.
+    assert!(
+        crate::pipeline_callback::fence_intake_after_terminal_cut_capture(
+            &db.source_gate,
+            &db.topology_cut_hold,
+            &db.cluster_authority_transition,
+            laminar_core::checkpoint::flags::TOPOLOGY_CUT,
+            false,
+        )
+    );
+    db.set_source_gate(false);
+    assert!(db.source_gate.load(std::sync::atomic::Ordering::Acquire));
+    assert!(db
+        .topology_cut_hold
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+    // Reset the control-state fixture; production clears this only at authorized recovery Release.
+    db.topology_cut_hold
+        .store(false, std::sync::atomic::Ordering::Release);
+    db.set_source_gate(false);
+    authority.controller.set_recovering(true);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+    authority.controller.set_recovering(false);
+    authority.controller.fence_process_lease();
+    let fenced = db.cluster_topology_status().await.unwrap();
+    assert_eq!(
+        fenced.committed_version,
+        Some(TopologyVersion::LEGACY_BASELINE)
+    );
+    assert_eq!(fenced.locally_active_version, None);
+    DbState::Faulted.store(&db.state);
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+
+    let error = db
+        .execute("CREATE SOURCE still_guarded (id INT)")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    assert!(db.catalog.get_source("still_guarded").is_none());
 }
 
 #[cfg(feature = "cluster")]

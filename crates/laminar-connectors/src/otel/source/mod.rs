@@ -211,6 +211,11 @@ impl SourceConnector for OtelSource {
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        if matches!(&position, SourcePosition::Initialized { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "OTLP has no sealed topology startup contract".into(),
+            ));
+        }
         if let SourcePosition::Resume { attempt, .. } = position {
             return Err(ConnectorError::ConfigurationError(format!(
                 "OTLP is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"

@@ -135,7 +135,12 @@ impl StreamingCoordinator {
         // attempt that observes the same assignment fence must leave the cadence due and defer;
         // otherwise it can commit the handoff, fence intake, and leave the manual owner waiting
         // for a second reservation that can no longer be admitted.
-        if !manual && flags & laminar_core::checkpoint::flags::HANDOFF != 0 {
+        if !manual
+            && flags
+                & (laminar_core::checkpoint::flags::HANDOFF
+                    | laminar_core::checkpoint::flags::TOPOLOGY_CUT)
+                != 0
+        {
             tracing::debug!(
                 "periodic checkpoint admission deferred to the assignment handoff owner"
             );

@@ -19,6 +19,8 @@ pub mod flags {
     pub const CANCEL: u64 = 1 << 2;
     /// This checkpoint participates in an assignment handoff.
     pub const HANDOFF: u64 = 1 << 3;
+    /// Exact old-topology cut for a reserved logical migration. Intake and sink succession stay held.
+    pub const TOPOLOGY_CUT: u64 = 1 << 4;
 }
 
 /// Internal flag layout used only by the clustered shuffle fixed-point flush.

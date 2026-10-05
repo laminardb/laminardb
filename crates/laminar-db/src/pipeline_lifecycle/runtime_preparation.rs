@@ -263,6 +263,10 @@ impl LaminarDB {
             checkpoint_committable_sinks,
             #[cfg(feature = "cluster")]
             intake_gate: Arc::clone(&self.source_gate),
+            #[cfg(feature = "cluster")]
+            topology_cut_hold: Arc::clone(&self.topology_cut_hold),
+            #[cfg(feature = "cluster")]
+            intake_gate_transition: Arc::clone(&self.cluster_authority_transition),
             #[cfg(not(feature = "cluster"))]
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };

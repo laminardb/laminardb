@@ -51,7 +51,12 @@ pub(super) async fn run_gateway(
         }
         renew_replay_pin(&authority, replay_pin).await?;
         let refresh_started = Instant::now();
-        let indexes = next_committed_indexes(&authority, &cursor).await;
+        let indexes = tokio::time::timeout(
+            GATEWAY_IO_TIMEOUT,
+            next_committed_indexes(&authority, &cursor),
+        )
+        .await
+        .map_err(|_| ClusterSubscriptionError::BackendUnavailable)?;
         if let Some(metrics) = metrics {
             metrics
                 .cluster_subscription
@@ -65,9 +70,10 @@ pub(super) async fn run_gateway(
             continue;
         }
         for index in indexes {
+            let bound_certificate = cursor.current_certificate.as_ref().unwrap_or(&certificate);
             let loaded = tokio::time::timeout(
                 GATEWAY_IO_TIMEOUT,
-                load_checkpoint(&store, index, &certificate),
+                load_checkpoint(&authority, &store, index, bound_certificate),
             )
             .await
             .map_err(|_| ClusterSubscriptionError::BackendUnavailable)?
@@ -112,6 +118,7 @@ async fn process_checkpoint(
         return Ok(());
     };
     validate_interval(&cursor.expected, &stream)?;
+    cursor.current_certificate = Some(stream.manifest.distribution_certificate.clone());
     replay_interval(
         store,
         certificate.stream_generation,

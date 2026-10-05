@@ -874,6 +874,7 @@ async fn two_owner_scope() -> ClusterShuffleConfig {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id: NodeId(1),
     }
 }

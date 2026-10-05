@@ -13,7 +13,7 @@ impl ClusterController {
     pub fn next_recovery_fault_request(&self) -> Result<RecoveryFaultRequest, String> {
         let sequence = self
             .recovery_fault_request_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| "recovery fault request sequence exhausted".to_string())?;
@@ -413,12 +413,22 @@ impl ClusterController {
                 "stable node process lease is no longer current".into(),
             ));
         }
-        let authorized = self
+        let authority = self
             .checkpoint_authority()
-            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?
-            .authorize_recovery_release(publisher, terminal)
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
+        let authorized = if terminal.round.topology_binding().is_some() {
+            let context = self
+                .snapshot
+                .as_deref()
+                .zip(self.process_lease_authority.get().map(Arc::as_ref));
+            Box::pin(
+                authority.authorize_recovery_release_with_topology(publisher, terminal, context),
+            )
             .await
-            .map_err(RecoveryControlError::from_authority)?;
+        } else {
+            Box::pin(authority.authorize_recovery_release(publisher, terminal)).await
+        }
+        .map_err(RecoveryControlError::from_authority)?;
         if !authorized {
             return Ok(None);
         }

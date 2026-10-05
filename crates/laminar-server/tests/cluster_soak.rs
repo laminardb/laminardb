@@ -90,6 +90,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "kafka")]
+#[path = "cluster_soak/topology.rs"]
+mod topology_adoption;
+#[cfg(feature = "kafka")]
+#[path = "cluster_soak/topology_cut.rs"]
+mod topology_cut;
+#[cfg(feature = "kafka")]
+#[path = "cluster_soak/topology_migration.rs"]
+mod topology_migration;
+#[cfg(feature = "kafka")]
 mod workload_qualification;
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -2421,7 +2430,15 @@ impl Node {
         let mut response = String::new();
         stream.read_to_string(&mut response).ok()?;
         let (headers, body) = response.split_once("\r\n\r\n")?;
-        if !headers.lines().next()?.contains(" 200 ") {
+        let status = headers.lines().next()?;
+        if !status.contains(" 200 ") && !status.contains(" 202 ") {
+            if method == "POST" {
+                eprintln!(
+                    "soak: node{} {method} {path} returned {status}: {}",
+                    self.id,
+                    body.chars().take(4096).collect::<String>()
+                );
+            }
             return None;
         }
         Some(body.to_owned())
@@ -6130,6 +6147,7 @@ fn wait_for_minimum_offset_rate(
 // Native CI runners have delivered up to three spontaneous recoveries inside one
 // durable-progress window (runs 34785105619, 35068174540, 35099393770); each consumes up
 // to the full recovery ceiling.
+#[cfg(feature = "kafka")]
 const SPONTANEOUS_RECOVERY_ALLOWANCE: u32 = 3;
 
 #[cfg(feature = "kafka")]
@@ -13735,6 +13753,48 @@ fn three_node_alo_join_kill9_soak() {
 }
 
 #[test]
+#[ignore = "spawns 3 real processes with Kafka/S3, adopts legacy authority, and restarts all nodes"]
+#[cfg(all(feature = "kafka", feature = "aws"))]
+fn three_node_alo_legacy_topology_adoption_restart_soak() {
+    run_three_node_join_kill9_soak_with_adoption(
+        JoinDelivery::AtLeastOnce,
+        false,
+        None,
+        true,
+        false,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "spawns 3 real Kafka/S3 processes, prepares an old-graph cut, aborts by restart, and checks stateful output oracles"]
+#[cfg(all(feature = "kafka", feature = "aws"))]
+fn three_node_alo_topology_cut_abort_restart_soak() {
+    run_three_node_join_kill9_soak_with_adoption(
+        JoinDelivery::AtLeastOnce,
+        false,
+        None,
+        true,
+        true,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "spawns 3 real Kafka/S3 processes; public additions/replacement/reset, paused-input oracle, hard kills and full namespace restart"]
+#[cfg(all(feature = "kafka", feature = "aws"))]
+fn three_node_alo_public_topology_migration_restart_soak() {
+    run_three_node_join_kill9_soak_with_adoption(
+        JoinDelivery::AtLeastOnce,
+        false,
+        None,
+        true,
+        false,
+        true,
+    );
+}
+
+#[test]
 #[ignore = "spawns 3 real laminardb processes with a durable WebSocket subscription"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_cluster_subscription_kill9_soak() {
@@ -13760,6 +13820,25 @@ fn run_three_node_join_kill9_soak(
     delivery: JoinDelivery,
     subscription_soak: bool,
     forced_fault_role: Option<&str>,
+) {
+    run_three_node_join_kill9_soak_with_adoption(
+        delivery,
+        subscription_soak,
+        forced_fault_role,
+        false,
+        false,
+        false,
+    );
+}
+
+#[cfg(feature = "kafka")]
+fn run_three_node_join_kill9_soak_with_adoption(
+    delivery: JoinDelivery,
+    subscription_soak: bool,
+    forced_fault_role: Option<&str>,
+    adopt_legacy: bool,
+    prepare_topology_cut: bool,
+    migrate_topology: bool,
 ) {
     let delivery_label = delivery.label();
     let executable = Arc::new(
@@ -14038,7 +14117,7 @@ fn run_three_node_join_kill9_soak(
             fault_trigger_path: fault_role
                 .as_ref()
                 .map(|_| dir.path().join(format!("fault-node-{id}.trigger"))),
-            checkpoint_gate_path: (max_kills > 0)
+            checkpoint_gate_path: (max_kills > 0 || migrate_topology)
                 .then(|| dir.path().join(format!("checkpoint-node-{id}.arm"))),
         })
         .collect();
@@ -14108,6 +14187,13 @@ fn run_three_node_join_kill9_soak(
         cluster_metric(&nodes, "laminardb_events_ingested_total"),
         commit_oracle.committed_offset_sum().unwrap_or(0)
     );
+    let adopted_topology = adopt_legacy.then(|| {
+        if migrate_topology {
+            topology_migration::adopt_inventory(&checkpoint_url, &mut nodes)
+        } else {
+            topology_adoption::adopt_inventory(&checkpoint_url, &mut nodes, recovery_ceiling)
+        }
+    });
     exact_timing_evidence.capture_nodes_unbound(
         &nodes,
         Instant::now() + Duration::from_secs(10),
@@ -14158,6 +14244,30 @@ fn run_three_node_join_kill9_soak(
         latest_checkpoint,
     );
     observe_live_core_window_state(&nodes, &mut window_state_high_water);
+    let mut migration_probe = migrate_topology.then(|| {
+        let (probe, checkpoint) = topology_migration::exercise(
+            &checkpoint_url,
+            &brokers,
+            &mut nodes,
+            recovery_ceiling,
+            &log_dir,
+        );
+        assert!(checkpoint.checkpoint_id > latest_checkpoint.checkpoint_id);
+        latest_checkpoint = checkpoint;
+        local_convergence = wait_for_local_assignment_convergence(
+            &mut nodes,
+            &all_live_nodes,
+            Instant::now() + recovery_ceiling,
+            "local assignment after public topology migrations",
+        );
+        exact_timing_evidence.capture_nodes_bound(
+            &nodes,
+            &local_convergence,
+            Instant::now() + Duration::from_secs(10),
+            "public topology migrations",
+        );
+        probe
+    });
     let mut explicit_fault_evidence = None;
     if let Some(role) = fault_role.as_deref() {
         assert_no_unsolicited_cold_start_recovery(&nodes);
@@ -14388,6 +14498,65 @@ fn run_three_node_join_kill9_soak(
         }
         kills += 1;
         eprintln!("soak round {round}: kill -9 delivered to {victim_role} node {victim}");
+        if let Some(probe) = migration_probe.as_ref() {
+            // Topology recovery currently certifies a complete unchanged owner map. Replace the
+            // failed process before asking for progress; the ordinary soak below also exercises
+            // survivor resharding, which remains outside this topology contract.
+            probe.recover_replaced_process(
+                &mut nodes,
+                victim,
+                remaining_progress_window(failover_deadline, "topology process replacement"),
+                failover_started,
+                round,
+            );
+            latest_checkpoint = assert_progress(
+                &mut nodes,
+                Some(&mut producer),
+                Some(&commit_oracle),
+                remaining_progress_window(failover_deadline, "topology process replacement"),
+                "target progress after process replacement",
+                Some(latest_checkpoint),
+            );
+            let replaced = wait_for_local_assignment_convergence(
+                &mut nodes,
+                &all_live_nodes,
+                failover_deadline,
+                "topology replacement local assignment",
+            );
+            assert_eq!(
+                replaced.snapshot.vnodes, local_convergence.snapshot.vnodes,
+                "topology replacement changed the certified owner map"
+            );
+            let current = &replaced.evidence_by_node[&victim];
+            assert_eq!(
+                current.participant.node_id,
+                previous_victim_evidence.participant.node_id
+            );
+            assert_ne!(
+                current.participant.boot_incarnation,
+                previous_victim_evidence.participant.boot_incarnation
+            );
+            assert!(current.process_term > previous_victim_evidence.process_term);
+            exact_timing_evidence.capture_nodes_bound(
+                &nodes,
+                &replaced,
+                Instant::now() + Duration::from_secs(10),
+                &format!("topology kill-{round} replacement"),
+            );
+            let elapsed = assert_recovery_within(
+                failover_started,
+                recovery_ceiling,
+                "kill-9 to full target Release and durable stateful progress",
+            );
+            eprintln!("soak round {round}: replaced {victim_role} node {victim}, full target Release and checkpoint {} epoch {} in {elapsed:?}", latest_checkpoint.checkpoint_id, latest_checkpoint.epoch);
+            local_convergence = replaced;
+            observe_live_join_state(
+                &nodes,
+                &mut live_state_high_water,
+                &mut temporal_state_high_water,
+            );
+            continue;
+        }
         latest_checkpoint = assert_progress(
             &mut nodes,
             Some(&mut producer),
@@ -14576,6 +14745,80 @@ fn run_three_node_join_kill9_soak(
         );
     }
 
+    if let Some(baseline) = adopted_topology.as_ref() {
+        let restart_fence = local_convergence
+            .snapshot
+            .assignment_fence()
+            .expect("pre-restart converged assignment is canonical");
+        let old_cut = prepare_topology_cut.then(|| {
+            topology_cut::prepare_old_cut(
+                &checkpoint_url,
+                &brokers,
+                &mut nodes,
+                baseline,
+                &restart_fence,
+                recovery_ceiling,
+                &log_dir,
+            )
+        });
+        for node in &nodes {
+            let evidence = local_convergence
+                .evidence_by_node
+                .get(&node.id)
+                .unwrap_or_else(|| panic!("pre-restart authority omitted node{}", node.id));
+            let timing_authority = checkpoint_barrier_timing_authority(evidence, &restart_fence)
+                .unwrap_or_else(|error| {
+                    panic!("pre-restart node{} timing authority: {error}", node.id)
+                });
+            exact_timing_evidence
+                .finalize_node(
+                    node,
+                    timing_authority,
+                    &mut latency_evidence,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "pre-restart node{} timing evidence did not stabilize: {error}",
+                        node.id
+                    )
+                });
+        }
+        if let Some(probe) = migration_probe.as_mut() {
+            probe.restart_all(&mut nodes, recovery_ceiling);
+        } else {
+            topology_adoption::restart_all(&mut nodes, baseline, recovery_ceiling);
+        }
+        if let Some(cut) = old_cut.as_ref() {
+            topology_cut::assert_aborted_after_restart(
+                &checkpoint_url,
+                &mut nodes,
+                cut,
+                recovery_ceiling,
+                &log_dir,
+            );
+        }
+        latest_checkpoint = assert_progress(
+            &mut nodes,
+            Some(&mut producer),
+            Some(&commit_oracle),
+            recovery_ceiling,
+            "full restart after legacy topology adoption",
+            Some(latest_checkpoint),
+        );
+        local_convergence = wait_for_local_assignment_convergence(
+            &mut nodes,
+            &all_live_nodes,
+            Instant::now() + recovery_ceiling,
+            "local assignment after adopted-catalog full restart",
+        );
+        exact_timing_evidence.capture_nodes_bound(
+            &nodes,
+            &local_convergence,
+            Instant::now() + Duration::from_secs(10),
+            "adopted-catalog full restart",
+        );
+    }
     let steady_deadline = Instant::now() + Duration::from_secs(soak_secs);
     while remaining_at(steady_deadline, Instant::now()).is_some() {
         round += 1;

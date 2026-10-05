@@ -221,7 +221,7 @@ impl FaultyReadyReadKv {
 
     fn should_fail_ready_read(&self) -> bool {
         self.remaining_failures
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 (remaining != 0).then(|| remaining.saturating_sub(1))
             })
             .is_ok()

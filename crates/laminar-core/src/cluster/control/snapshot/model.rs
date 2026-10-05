@@ -347,6 +347,22 @@ impl AssignmentSnapshot {
                 "recovery proposal must be a committed successor generation".into(),
             ));
         }
+        self.encode_proposal()
+    }
+
+    pub(in crate::cluster::control) fn encode_drain_proposal(
+        &self,
+    ) -> Result<(Vec<u8>, AssignmentSnapshotRef), SnapshotError> {
+        self.validate()?;
+        if !self.draining || self.drain_transition.is_none() || self.version < 2 {
+            return Err(SnapshotError::Invalid(
+                "drain proposal must be an exact draining successor".into(),
+            ));
+        }
+        self.encode_proposal()
+    }
+
+    fn encode_proposal(&self) -> Result<(Vec<u8>, AssignmentSnapshotRef), SnapshotError> {
         let encoded = serde_json::to_vec(self)?;
         if encoded.len() > MAX_RECOVERY_PROPOSAL_BYTES {
             return Err(SnapshotError::Invalid(format!(

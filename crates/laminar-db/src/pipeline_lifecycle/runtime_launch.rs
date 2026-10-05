@@ -72,10 +72,11 @@ impl LaminarDB {
         setup: PipelineRuntimeSetup,
         shutdown: Arc<tokio::sync::Notify>,
         runtime_shutdown: tokio_util::sync::CancellationToken,
-        #[cfg(feature = "cluster")] mut startup_generation_fence: Option<
+        #[cfg(feature = "cluster")] startup_generation_fence: Option<
             tokio::sync::OwnedRwLockWriteGuard<()>,
         >,
     ) -> Result<(), DbError> {
+        let readiness_timeout = setup.config.checkpoint_timeout;
         #[cfg(feature = "cluster")]
         let runtime_mode = setup.runtime_mode;
         let (coordinator, callback) = self
@@ -111,6 +112,8 @@ impl LaminarDB {
         let compute_fault_runtime_shutdown = runtime_shutdown.clone();
         #[cfg(all(test, feature = "cluster"))]
         let compute_before_ready_panic = Arc::clone(&self.compute_before_ready_panic);
+        // Acquire DB ownership before spawning: readiness cancellation cannot orphan compute.
+        let mut runtime_owner = self.runtime_handle.lock().await;
         let compute_thread = std::thread::Builder::new().name("laminar-compute".into());
         #[cfg(feature = "cluster")]
         // The local and clustered runtimes share the cluster-enabled coordinator state machine.
@@ -303,36 +306,6 @@ impl LaminarDB {
             }
         }
 
-        match startup_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) if runtime_shutdown.is_cancelled() || self.is_closed() => {
-                #[cfg(feature = "cluster")]
-                drop(startup_generation_fence.take());
-                let _ = done_rx.await;
-                return Err(DbError::Shutdown);
-            }
-            Ok(Err(e)) => {
-                #[cfg(feature = "cluster")]
-                drop(startup_generation_fence.take());
-                let _ = done_rx.await;
-                return Err(DbError::Config(e));
-            }
-            Err(_) => {
-                #[cfg(feature = "cluster")]
-                drop(startup_generation_fence.take());
-                let _ = done_rx.await;
-                return Err(DbError::Config(
-                    "compute thread exited before entering the runtime control loop".into(),
-                ));
-            }
-        }
-
-        // Readiness transfers the recovered MV image and fully wired graph to the live loop. The
-        // caller installed any pre-audited no-work success marker before launch, so an immediate
-        // runtime fault can only clear it, never race a post-ready write that resurrects it.
-        #[cfg(feature = "cluster")]
-        drop(startup_generation_fence);
-
         let watcher_state = Arc::clone(&self.state);
         let watcher_shutdown = Arc::clone(&self.shutdown_signal);
         let watcher_fault = Arc::clone(&self.last_fault);
@@ -474,8 +447,30 @@ impl LaminarDB {
             }
         });
 
-        *self.runtime_handle.lock().await = Some(handle);
-        Ok(())
+        *runtime_owner = Some(handle);
+        drop(runtime_owner);
+        let readiness = tokio::time::timeout(readiness_timeout, startup_rx).await;
+        #[cfg(feature = "cluster")]
+        drop(startup_generation_fence);
+        let result = match readiness {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Err(_) => Err(DbError::Config(
+                "compute control-loop readiness timed out".into(),
+            )),
+            Ok(Err(_)) => Err(DbError::Config(
+                "compute thread exited before entering the runtime control loop".into(),
+            )),
+            Ok(Ok(Err(message))) => Err(DbError::Config(message)),
+        };
+        if result.is_err() {
+            runtime_shutdown.cancel();
+            shutdown.notify_one();
+            // Failed-start cleanup joins the watcher retained in the DB's existing registry.
+            if self.is_closed() {
+                return Err(DbError::Shutdown);
+            }
+        }
+        result
     }
 
     fn install_stream_schemas(&self, resolved: &HashMap<String, arrow_schema::SchemaRef>) {
@@ -512,6 +507,7 @@ impl LaminarDB {
         temporal_source_roles: FxHashMap<String, TemporalSourceRole>,
         ordered_interval_admissions: OrderedIntervalAdmissions,
         runtime_shutdown: tokio_util::sync::CancellationToken,
+        #[cfg(feature = "cluster")] topology: Option<crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
         use crate::pipeline::{CheckpointSchedule, PipelineConfig};
 
@@ -575,13 +571,34 @@ impl LaminarDB {
         let stream_output_schemas = &resolved_stream_outputs.schemas;
         self.install_stream_schemas(stream_output_schemas);
 
-        let mut graph = self.build_connector_operator_graph(
+        #[cfg(feature = "cluster")]
+        let (restored_graph, topology_metadata) = match topology {
+            Some(image) => {
+                let (graph, metadata) = image.into_runtime()?;
+                (Some(graph), Some(metadata))
+            }
+            None => (None, None),
+        };
+        #[cfg(feature = "cluster")]
+        let graph = match restored_graph {
+            Some(graph) => graph,
+            None => self.build_connector_operator_graph(
+                &stream_regs,
+                &table_regs,
+                &resolved_stream_outputs.changelog_carrying,
+                &ordered_interval_admissions.joins,
+                pipeline_identity.as_ref(),
+            )?,
+        };
+        #[cfg(not(feature = "cluster"))]
+        let graph = self.build_connector_operator_graph(
             &stream_regs,
             &table_regs,
             &resolved_stream_outputs.changelog_carrying,
             &ordered_interval_admissions.joins,
             pipeline_identity.as_ref(),
         )?;
+        let mut graph = graph;
         for (name, schema) in stream_output_schemas {
             graph.register_intermediate_schema(name, schema);
         }
@@ -590,6 +607,14 @@ impl LaminarDB {
                 .pipeline_max_managed_state_bytes
                 .expect("managed-state budget must be resolved at database construction"),
         );
+
+        #[cfg(feature = "cluster")]
+        let graph = if topology_metadata.is_some() {
+            graph
+        } else {
+            graph.initialize_managed_state().await?
+        };
+        #[cfg(not(feature = "cluster"))]
         let graph = graph.initialize_managed_state().await?;
 
         let prom_registry = self.prometheus_registry.lock().clone();
@@ -601,6 +626,10 @@ impl LaminarDB {
             runtime_mode,
             prom_registry.as_ref(),
         )?;
+        #[cfg(feature = "cluster")]
+        if let Some(metadata) = topology_metadata.as_ref() {
+            self.prepare_topology_runtime_sources(&mut sources, metadata)?;
+        }
 
         let sink_setup = self
             .prepare_pipeline_sinks(
@@ -614,6 +643,19 @@ impl LaminarDB {
                 prom_registry.as_ref(),
             )
             .await?;
+        #[cfg(feature = "cluster")]
+        let recovery = if let Some(metadata) = topology_metadata.as_ref() {
+            self.install_topology_runtime_state(graph, metadata).await?
+        } else {
+            self.recover_pipeline_state(
+                graph,
+                &mut sources,
+                runtime_mode,
+                pipeline_checkpoint_timeout,
+            )
+            .await?
+        };
+        #[cfg(not(feature = "cluster"))]
         let recovery = self
             .recover_pipeline_state(
                 graph,
@@ -656,8 +698,14 @@ impl LaminarDB {
             }
         }
 
-        self.initialize_reference_tables(&table_regs, &stream_regs, restored_reference_tables)
-            .await?;
+        #[cfg(feature = "cluster")]
+        let defer_topology_sink_epoch = topology_metadata.is_some();
+        #[cfg(not(feature = "cluster"))]
+        let defer_topology_sink_epoch = false;
+        if !defer_topology_sink_epoch {
+            self.initialize_reference_tables(&table_regs, &stream_regs, restored_reference_tables)
+                .await?;
+        }
         let watermarks = self.prepare_pipeline_watermarks(
             &sources,
             &stream_regs,
@@ -752,6 +800,30 @@ impl LaminarDB {
             }
         });
         launch?;
+        #[cfg(feature = "cluster")]
+        if let Some(metadata) = topology_metadata {
+            self.validate_topology_runtime_metadata(&metadata).await?;
+            self.ensure_topology_runtime_live(
+                &metadata.input,
+                metadata
+                    .recovery
+                    .as_ref()
+                    .map(|recovery| recovery.selection.as_ref()),
+            )
+            .await?;
+            if let Some(recovery) = &metadata.recovery {
+                self.ensure_topology_recovery_runtime_held(&recovery.start)?;
+            } else {
+                self.ensure_topology_runtime_held()?;
+            }
+            *self.installed_topology_runtime.lock() = Some(crate::db::InstalledTopologyRuntime {
+                input: metadata.input,
+                runtime_id: uuid::Uuid::new_v4(),
+                shutdown: self.runtime_shutdown.read().clone(),
+                released_sequence: None,
+                recovery: metadata.recovery,
+            });
+        }
         #[cfg(feature = "cluster")]
         if let Some(guard) = vnode_transition_launch.as_mut() {
             guard.complete();

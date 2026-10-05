@@ -86,7 +86,7 @@ impl SubscriptionMemoryBudget {
 
     fn try_reserve(&self, bytes: usize) -> bool {
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 (bytes <= self.limit.saturating_sub(used)).then(|| used.saturating_add(bytes))
             })
             .is_ok()
@@ -98,7 +98,7 @@ impl SubscriptionMemoryBudget {
         }
         let released = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_sub(bytes)
             });
         debug_assert!(released.is_ok(), "subscription memory released twice");

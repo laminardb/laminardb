@@ -17,6 +17,56 @@ impl LaminarDB {
         >,
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
     ) -> Result<crate::operator_graph::OperatorGraph, DbError> {
+        self.build_connector_operator_graph_inner(
+            stream_regs,
+            table_regs,
+            changelog_carrying,
+            ordered_interval_joins,
+            pipeline_identity,
+            None,
+        )
+    }
+
+    /// Same constructor with a fenced parent transport context for private channel-state decoding.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn build_topology_restore_operator_graph(
+        &self,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+        changelog_carrying: &rustc_hash::FxHashSet<String>,
+        ordered_interval_joins: &FxHashMap<
+            String,
+            [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+        >,
+        pipeline_identity: &laminar_core::checkpoint::PipelineIdentity,
+        scope: crate::operator::sql_query::ClusterShuffleConfig,
+    ) -> Result<crate::operator_graph::OperatorGraph, DbError> {
+        self.build_connector_operator_graph_inner(
+            stream_regs,
+            table_regs,
+            changelog_carrying,
+            ordered_interval_joins,
+            Some(pipeline_identity),
+            Some(scope),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing graph inputs plus one private restore context.
+    fn build_connector_operator_graph_inner(
+        &self,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+        changelog_carrying: &rustc_hash::FxHashSet<String>,
+        ordered_interval_joins: &FxHashMap<
+            String,
+            [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+        >,
+        pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
+        #[cfg(feature = "cluster")] restore_scope: Option<
+            crate::operator::sql_query::ClusterShuffleConfig,
+        >,
+        #[cfg(not(feature = "cluster"))] _restore_scope: Option<()>,
+    ) -> Result<crate::operator_graph::OperatorGraph, DbError> {
         use crate::operator_graph::OperatorGraph;
 
         #[cfg(not(feature = "cluster"))]
@@ -73,31 +123,41 @@ impl LaminarDB {
 
         #[cfg(feature = "cluster")]
         {
-            let sender = self.shuffle_sender.lock().clone();
-            let receiver = self.shuffle_receiver.lock().clone();
-            let registry = self.vnode_registry.lock().clone();
-            let controller = self.cluster_controller.lock().clone();
-            if let (Some(sender), Some(receiver), Some(registry), Some(controller)) =
-                (sender, receiver, registry, controller)
-            {
-                let self_id = laminar_core::state::NodeId(controller.instance_id().0);
-                graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
-                    registry,
-                    sender,
-                    receiver,
-                    self_id,
-                });
-                let pipeline_identity = pipeline_identity.cloned().ok_or_else(|| {
+            if let Some(scope) = restore_scope {
+                graph.set_cluster_shuffle(scope);
+                graph.set_pipeline_identity(pipeline_identity.cloned().ok_or_else(|| {
                     DbError::Checkpoint(
-                        "[LDB-6051] cluster graph has no bound pipeline identity".into(),
+                        "private restore graph has no certified target identity".into(),
                     )
-                })?;
-                graph.set_pipeline_identity(pipeline_identity);
-                graph.set_pending_vnode_transition_handle(Arc::clone(
-                    &self.pending_vnode_transition,
-                ));
-                graph.set_installed_vnode_state_handle(Arc::clone(&self.installed_vnode_state));
-                graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
+                })?);
+            } else {
+                let sender = self.shuffle_sender.lock().clone();
+                let receiver = self.shuffle_receiver.lock().clone();
+                let registry = self.vnode_registry.lock().clone();
+                let controller = self.cluster_controller.lock().clone();
+                if let (Some(sender), Some(receiver), Some(registry), Some(controller)) =
+                    (sender, receiver, registry, controller)
+                {
+                    let self_id = laminar_core::state::NodeId(controller.instance_id().0);
+                    graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+                        topology: sender.topology_fence(),
+                        registry,
+                        sender,
+                        receiver,
+                        self_id,
+                    });
+                    let pipeline_identity = pipeline_identity.cloned().ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "[LDB-6051] cluster graph has no bound pipeline identity".into(),
+                        )
+                    })?;
+                    graph.set_pipeline_identity(pipeline_identity);
+                    graph.set_pending_vnode_transition_handle(Arc::clone(
+                        &self.pending_vnode_transition,
+                    ));
+                    graph.set_installed_vnode_state_handle(Arc::clone(&self.installed_vnode_state));
+                    graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
+                }
             }
         }
 
@@ -129,15 +189,25 @@ impl LaminarDB {
         // Seed changelog producers up front so consumer admission is independent of build order.
         graph.set_changelog_tables(changelog_carrying.clone());
 
-        let mut process_functions = self
+        self.install_registered_operators(&mut graph, stream_regs)?;
+
+        Ok(graph)
+    }
+
+    fn install_registered_operators(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    ) -> Result<(), DbError> {
+        let mut registrations = self
             .connector_manager
             .lock()
             .process_functions()
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        process_functions.sort_unstable_by(|left, right| left.output_name.cmp(&right.output_name));
-        for registration in &process_functions {
+        registrations.sort_unstable_by(|left, right| left.output_name.cmp(&right.output_name));
+        for registration in &registrations {
             graph.add_process_function(registration)?;
         }
 
@@ -156,7 +226,7 @@ impl LaminarDB {
         }
         graph.take_build_errors()?;
 
-        Ok(graph)
+        Ok(())
     }
 
     fn install_operator_graph_catalog_context(

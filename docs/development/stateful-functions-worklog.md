@@ -604,6 +604,24 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
+### Main integration — 2026-10-05 (validation in progress)
+
+Resumed the clean `codex/stateful-process-functions` branch at
+`d75233d08ad0f334dbcb1443aea355b43999dd09` after finding the checkout on `main`.
+Fetched and merged `origin/main` at
+`f62931d7cc6502caea2e2af200b9eadf7366eb39` (topology migrations and dependency
+updates). Five conflicts combined the new startup lifecycle with process package
+identity binding, process-only startup, and the explicit unqualified transfer
+rejection. Existing setup/authority phases moved into concept owners to respect
+main's reduced readability baselines; no baseline exception increased.
+
+Current toolchain: rustc 1.99.0 (`b940084d7`, 2026-09-28), cargo 1.99.0
+(`5f94df478`, 2026-08-27). Formatting passes; readability passes with 18 module
+and 214 function exceptions. The first all-feature Clippy attempt failed in
+`aws-lc-sys` 0.45.0's build script with Windows PermissionDenied under the sandbox.
+The build is being repeated with normal native-build access. Evidence is retained
+under `target/process-cluster-authority-20261005/`.
+
 Continue original Phase E with process-lease and assignment fencing through the
 existing graph lifecycle. The shared-cut fixture above verifies same-owner frame
 restoration and isolated graph generations; it is not an admission certificate.

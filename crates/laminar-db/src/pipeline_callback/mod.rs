@@ -5,6 +5,9 @@ mod backpressure;
 mod checkpoint_publication;
 mod checkpoint_tail;
 
+#[cfg(feature = "cluster")]
+mod admission;
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
@@ -358,7 +361,7 @@ impl HandoffCapture {
     }
 
     const fn terminal(self) -> bool {
-        crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
+        crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_cut(
             self.flags,
             self.replay_pending,
         )
@@ -1281,7 +1284,7 @@ pub(crate) struct ConnectorPipelineCallback {
     #[cfg(feature = "cluster")]
     pub(crate) pending_follower_checkpoint:
         Option<laminar_core::cluster::control::BarrierAnnouncement>,
-    /// Exact authority retained between successful `Prepare` publication and durable-tail handoff.
+    /// Exact authority retained from checkpoint reservation until cleanup or durable-tail handoff.
     #[cfg(feature = "cluster")]
     pub(crate) checkpoint_leader_proofs:
         FxHashMap<CheckpointAttempt, laminar_core::cluster::control::LeaderProof>,
@@ -1311,25 +1314,38 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_committable_sinks: bool,
     /// Cluster startup/recovery fence. While set, neither source nor shuffle input may be folded.
     pub(crate) intake_gate: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "cluster")]
+    pub(crate) topology_cut_hold: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "cluster")]
+    pub(crate) intake_gate_transition: Arc<parking_lot::Mutex<()>>,
 }
 
-/// Freeze graph intake at the exact portable handoff cut.
+/// Freeze graph intake after a terminal handoff or old-topology cut.
 ///
 /// A HANDOFF checkpoint with retained replay is only an intermediate cut: the coordinator must
 /// remain open so the replay can reach the fixed point. Once the same capture proves that no
 /// replay remains, closing this gate before mutable state capture prevents any predecessor-scoped
-/// channel work from being staged between the portable cut and assignment publication.
+/// channel work from being staged between the portable cut and a coordinated transition. The
+/// source barriers must already have arrived; topology cuts reject intermediate replay cuts.
 #[cfg(feature = "cluster")]
-pub(crate) fn fence_intake_after_terminal_handoff_capture(
+pub(crate) fn fence_intake_after_terminal_cut_capture(
     intake_gate: &std::sync::atomic::AtomicBool,
+    topology_cut_hold: &std::sync::atomic::AtomicBool,
+    transition: &parking_lot::Mutex<()>,
     flags: u64,
     handoff_replay_pending: bool,
 ) -> bool {
-    let terminal_handoff = crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
+    let terminal_handoff = crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_cut(
         flags,
         handoff_replay_pending,
     );
     if terminal_handoff {
+        // Serialize with assignment/source release using the existing authority transition
+        // lock. This synchronous control section contains only gate stores, never an await.
+        let _transition = transition.lock();
+        if flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT != 0 {
+            topology_cut_hold.store(true, std::sync::atomic::Ordering::Release);
+        }
         intake_gate.store(true, std::sync::atomic::Ordering::Release);
     }
     terminal_handoff
@@ -1373,20 +1389,6 @@ impl ConnectorPipelineCallback {
             self.last_checkpoint_admission_failure = None;
         }
         recovering
-    }
-
-    #[cfg(feature = "cluster")]
-    fn require_process_authority(&self, boundary: &str) -> Result<(), crate::pipeline::CycleError> {
-        if self
-            .cluster_controller
-            .as_ref()
-            .is_none_or(|controller| controller.process_lease_is_live())
-        {
-            return Ok(());
-        }
-        let error = format!("cluster process lease expired before {boundary}");
-        set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-        Err(crate::pipeline::CycleError::Recovery(error))
     }
 
     #[cfg(feature = "cluster")]
@@ -1975,7 +1977,7 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Build the follower's durable tail (ack → prepare → decision wait → 2PC).
+    /// Build the follower's durable tail (ack â†’ prepare â†’ decision wait â†’ 2PC).
     #[cfg(feature = "cluster")]
     fn follower_tail_future(
         &mut self,
@@ -2268,11 +2270,10 @@ impl ConnectorPipelineCallback {
         let full_vnode_capture_needed = Arc::clone(&tail.full_vnode_capture_needed);
         let attempt_started = tail.attempt_started;
         let checkpoint_cleanup_timeout = tail.checkpoint_cleanup_timeout;
-        let terminal_handoff =
-            crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
-                tail.identity.flags,
-                tail.handoff_replay_pending,
-            );
+        let terminal_handoff = crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_cut(
+            tail.identity.flags,
+            tail.handoff_replay_pending,
+        );
         if local_prepare == FollowerPrepareOutcome::InDoubt {
             tracing::debug!(
                 checkpoint_id = attempt.checkpoint_id,
@@ -2337,6 +2338,24 @@ impl ConnectorPipelineCallback {
     #[cfg(feature = "cluster")]
     async fn complete_follower_tail(mut tail: FollowerDurableTail, outcome: Result<bool, DbError>) {
         let attempt = tail.attempt;
+        let outcome = if outcome.as_ref().is_ok_and(|committed| *committed) {
+            let deadline = tokio::time::Instant::now() + tail.checkpoint_cleanup_timeout;
+            match Self::publish_topology_cut_completion_until(
+                tail.controller.as_deref(),
+                Some(&tail.identity.leader_proof),
+                attempt,
+                tail.identity.flags,
+                tail.handoff_replay_pending,
+                deadline,
+            )
+            .await
+            {
+                Ok(()) => outcome,
+                Err(error) => Err(error),
+            }
+        } else {
+            outcome
+        };
         let committed = match tail.state.finish_resolved(&tail.identity, &outcome) {
             Ok(Some(committed)) => committed,
             Ok(None) => {
@@ -2372,11 +2391,10 @@ impl ConnectorPipelineCallback {
                 return;
             }
         };
-        let terminal_handoff =
-            crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
-                tail.identity.flags,
-                tail.handoff_replay_pending,
-            );
+        let terminal_handoff = crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_cut(
+            tail.identity.flags,
+            tail.handoff_replay_pending,
+        );
         let sink_transition_resolved = if committed {
             if terminal_handoff {
                 true
@@ -2642,7 +2660,7 @@ impl ConnectorPipelineCallback {
     /// Hold the pipeline until the leader announces `Aligned` (or `Commit`/`Abort`/newer epoch).
     ///
     /// Prevents epoch-N+1 shuffle rows from reaching a peer still snapshotting epoch-N.
-    /// No-op without a cross-node shuffle; bounded — on timeout the epoch aborts via the leader.
+    /// No-op without a cross-node shuffle; bounded â€” on timeout the epoch aborts via the leader.
     #[cfg(feature = "cluster")]
     async fn wait_for_newer_terminal_outcome(
         controller: &laminar_core::cluster::control::ClusterController,
@@ -3076,11 +3094,18 @@ impl ConnectorPipelineCallback {
                 "[LDB-6055] leader authority owner does not match the checkpoint roster".into(),
             );
         }
-        let unsupported = announcement.flags & !laminar_core::checkpoint::flags::HANDOFF;
+        let unsupported = announcement.flags
+            & !(laminar_core::checkpoint::flags::HANDOFF
+                | laminar_core::checkpoint::flags::TOPOLOGY_CUT);
         if unsupported != 0 {
             return Some(format!(
                 "leader Prepare carried unsupported checkpoint flags {unsupported:#x}"
             ));
+        }
+        if announcement.flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT != 0
+            && announcement.flags != laminar_core::checkpoint::flags::TOPOLOGY_CUT
+        {
+            return Some("topology cut Prepare carries conflicting checkpoint flags".into());
         }
         if announcement.flags & laminar_core::checkpoint::flags::HANDOFF != 0 {
             let Some(transition) = controller.checkpoint_drain_transition() else {
@@ -3566,7 +3591,7 @@ impl ConnectorPipelineCallback {
                 return self.cancel_pending_follower_control(attempt).await;
             }
             Err(error) => {
-                tracing::warn!(%error, "follower shuffle alignment failed — skipping");
+                tracing::warn!(%error, "follower shuffle alignment failed â€” skipping");
                 self.record_checkpoint_alignment_error(&error);
                 let error = error.to_string();
                 return self.fail_pending_follower_control(attempt, error).await;
@@ -3979,15 +4004,27 @@ impl ConnectorPipelineCallback {
                 "follower operator-state capture exhausted the checkpoint deadline".to_string(),
             );
         }
-        let handoff_replay_pending = flags & laminar_core::checkpoint::flags::HANDOFF != 0
+        let handoff_replay_pending = flags
+            & (laminar_core::checkpoint::flags::HANDOFF
+                | laminar_core::checkpoint::flags::TOPOLOGY_CUT)
+            != 0
             && !self.graph.handoff_is_quiescent();
-        if fence_intake_after_terminal_handoff_capture(
+        if flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT != 0 && handoff_replay_pending {
+            return Err(
+                "topology cut cannot capture retained replay; coordinated recovery is required"
+                    .into(),
+            );
+        }
+        if fence_intake_after_terminal_cut_capture(
             &self.intake_gate,
+            &self.topology_cut_hold,
+            &self.intake_gate_transition,
             flags,
             handoff_replay_pending,
         ) {
             tracing::info!(
-                "terminal HANDOFF capture fenced graph intake until assignment transition"
+                flags,
+                "terminal checkpoint cut fenced graph intake until coordinated transition"
             );
         }
         let operator_state = self.capture_operator_state_until(deadline)?;
@@ -4006,19 +4043,43 @@ impl ConnectorPipelineCallback {
             DbError::Checkpoint("checkpoint attempt allocator is not initialized".into())
         })?;
         #[cfg(feature = "cluster")]
-        if let Some(cc) = self.cluster_controller.clone() {
+        let leader_proof = if let Some(cc) = self.cluster_controller.as_ref() {
             if !cc.is_leader() {
                 return Err(DbError::Checkpoint(
                     "only the cluster leader may reserve checkpoint attempts".into(),
                 ));
             }
-        }
+            if !self.checkpoint_leader_proofs.is_empty() {
+                return Err(DbError::Checkpoint(
+                    "another reserved checkpoint still owns its leader proof".into(),
+                ));
+            }
+            let proof = cc.capture_leader_proof().ok_or_else(|| {
+                DbError::Checkpoint("checkpoint reservation has no live leader proof".into())
+            })?;
+            if !proof.is_canonical() || !cc.proof_is_live(&proof) {
+                return Err(DbError::Checkpoint(
+                    "checkpoint reservation captured an invalid leader proof".into(),
+                ));
+            }
+            Some(proof)
+        } else {
+            None
+        };
 
-        if self.checkpoint_committable_sinks {
+        let attempt = if self.checkpoint_committable_sinks {
             allocator.consume_sink_epoch_until(deadline).await
         } else {
             allocator.allocate_until(deadline).await
+        }?;
+        // Once the exact ID exists, every subsequent failure must retire it under this proof.
+        // Retain it before returning to deadline, process and Prepare-time admission rechecks.
+        // A leadership change must fence cleanup rather than substitute a replacement proof.
+        #[cfg(feature = "cluster")]
+        if let Some(proof) = leader_proof {
+            self.checkpoint_leader_proofs.insert(attempt, proof);
         }
+        Ok(attempt)
     }
 
     async fn abandon_reserved_attempt(
@@ -4179,51 +4240,6 @@ impl ConnectorPipelineCallback {
                 Ok(Some(admitted.clone()))
             }
         }
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn checkpoint_flags_for_assignment(
-        controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
-        assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
-        deadline: tokio::time::Instant,
-    ) -> Result<u64, String> {
-        let Some(controller) = controller else {
-            return if assignment_fence.is_none() {
-                Ok(laminar_core::checkpoint::flags::NONE)
-            } else {
-                Err("local checkpoint received a cluster assignment fence".into())
-            };
-        };
-        let Some(transition) = controller.checkpoint_drain_transition() else {
-            return Ok(laminar_core::checkpoint::flags::NONE);
-        };
-        let fence = assignment_fence.as_ref().ok_or_else(|| {
-            "active assignment drain has no admitted predecessor fence".to_string()
-        })?;
-        let leader = controller
-            .capture_leader_proof()
-            .ok_or_else(|| "active assignment drain has no live leader proof".to_string())?;
-        if transition.predecessor != *fence || transition.leader != leader {
-            return Err("checkpoint admission does not match the active assignment drain".into());
-        }
-        let quorum_ready =
-            tokio::time::timeout_at(deadline, controller.drain_ack_quorum_reached(&transition))
-                .await
-                .map_err(|_| "HANDOFF readiness audit timed out".to_string())?
-                .map_err(|error| format!("HANDOFF readiness audit failed: {error}"))?;
-        if !quorum_ready {
-            return Err("active assignment drain is not HANDOFF-ready".into());
-        }
-        // The readiness audit performs durable I/O. Re-read the process-local transition and
-        // lease afterward so a concurrent watcher clear or leadership change cannot authorize a
-        // checkpoint from the stale observation.
-        if controller.checkpoint_drain_transition().as_ref() != Some(&transition)
-            || controller.capture_leader_proof().as_ref() != Some(&transition.leader)
-            || !controller.proof_is_live(&transition.leader)
-        {
-            return Err("assignment drain authority changed during HANDOFF readiness audit".into());
-        }
-        Ok(laminar_core::checkpoint::flags::HANDOFF)
     }
 
     /// Acquire the existing graph/assignment read fence only for shuffle alignment and mutable
@@ -4586,7 +4602,7 @@ impl ConnectorPipelineCallback {
     }
 
     /// A shuffle frame a peer sent never arrived, so this node's state is missing records that
-    /// only exist upstream. Sealing here would commit the gap permanently — the rewind target
+    /// only exist upstream. Sealing here would commit the gap permanently â€” the rewind target
     /// would sit at or above the corrupt epoch. Fault instead: the round rewinds to the last
     /// committed cut and the replay regenerates them (CL-2).
     #[cfg(feature = "cluster")]
@@ -5100,7 +5116,7 @@ impl ConnectorPipelineCallback {
                     round_epoch = attempt.epoch,
                     pending_checkpoint_id = announcement.checkpoint_id,
                     pending_epoch = announcement.epoch,
-                    "stale follower barrier round — its epoch was abandoned"
+                    "stale follower barrier round â€” its epoch was abandoned"
                 );
                 set_checkpoint_fault(&self.checkpoint_fault, error);
                 return Err(BarrierOutcome::Failed);
@@ -5289,6 +5305,15 @@ impl ConnectorPipelineCallback {
 #[cfg_attr(not(feature = "cluster"), allow(unknown_lints))]
 #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
+    #[cfg(feature = "cluster")]
+    async fn checkpoint_assignment_for_admission(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> crate::pipeline::CheckpointAssignmentAdmission {
+        self.checkpoint_assignment_for_admission_inner(deadline)
+            .await
+    }
+
     fn prepare_source_intake(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -5544,7 +5569,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 continue;
             }
             // A changelog MV (batches carry `__weight`) must not put the raw Z-set changelog on the
-            // SUBSCRIBE wire — subscribers get plain rows. Apply to the store, then broadcast the
+            // SUBSCRIBE wire â€” subscribers get plain rows. Apply to the store, then broadcast the
             // consolidated snapshot instead (only when someone is listening). A full-emit MV keeps
             // forwarding its per-cycle batch verbatim (that batch already IS its full state).
             let changelog = batches.iter().any(|b| {
@@ -6074,7 +6099,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             });
             if current_wm > i64::MIN {
                 let before = batch.num_rows();
-                // Null timestamps are data-quality, not lateness — count separately.
+                // Null timestamps are data-quality, not lateness â€” count separately.
                 let null_ts = batch
                     .column_by_name(&wm_state.column)
                     .map_or(0, |c| c.null_count());
@@ -6233,7 +6258,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 assignment_fence.clone(),
                 deadline,
             )
-            .await?;
+            .await?.ok_or_else(|| "checkpoint flags no longer match admission while participant preparation is pending or cut is held".to_string())?;
             if flags != expected_flags {
                 return Err(format!(
                     "checkpoint flags {flags:#x} no longer match admission {expected_flags:#x}"
@@ -6255,17 +6280,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if !controller.is_leader() {
                 return Err("leadership changed before checkpoint Prepare publication".into());
             }
-            let leader_proof = controller.capture_leader_proof().ok_or_else(|| {
-                "no exact durable leader proof is live for checkpoint Prepare".to_string()
-            })?;
+            let leader_proof = self
+                .checkpoint_leader_proofs
+                .get(&attempt)
+                .cloned()
+                .or_else(|| controller.capture_leader_proof())
+                .ok_or_else(|| {
+                    "no exact durable leader proof is live for checkpoint Prepare".to_string()
+                })?;
             if !leader_proof.is_canonical() || !controller.proof_is_live(&leader_proof) {
                 return Err("checkpoint Prepare captured an invalid leader proof".into());
-            }
-            if self.checkpoint_leader_proofs.contains_key(&attempt) {
-                return Err(format!(
-                    "checkpoint {} epoch {} already owns a leader proof",
-                    attempt.checkpoint_id, attempt.epoch
-                ));
             }
             let assignment_fence = assignment_fence.ok_or_else(|| {
                 "[LDB-6055] clustered checkpoint lost its assignment certificate before Prepare"
@@ -6277,10 +6301,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if quorum_window.is_zero() {
                 return Err("checkpoint Prepare has no remaining quorum window".into());
             }
-            // Publication failure is ambiguous: retain the proof before issuing I/O so cleanup
-            // can resolve this exact attempt instead of assuming Prepare was absent.
+            // Reservation already owns this proof. Direct Prepare callers also retain it before
+            // issuing artifact/announcement I/O, whose failure may have an unknown outcome.
             self.checkpoint_leader_proofs
-                .insert(attempt, leader_proof.clone());
+                .entry(attempt)
+                .or_insert_with(|| leader_proof.clone());
             {
                 let mut guard = tokio::time::timeout_at(deadline, self.coordinator.lock())
                     .await
@@ -6289,10 +6314,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     "cluster checkpoint artifact admission has no coordinator".to_string()
                 })?;
                 coordinator
-                    .begin_checkpoint_artifacts_until(
+                    .begin_checkpoint_artifacts_for_flags_until(
                         attempt,
                         Some(assignment_fence.clone()),
                         Some(&leader_proof),
+                        flags,
                         deadline,
                     )
                     .await
@@ -6303,7 +6329,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 Some(assignment_fence.clone()),
                 deadline,
             )
-            .await?;
+            .await?.ok_or_else(|| "checkpoint flags no longer match admission while participant preparation is pending or cut is held".to_string())?;
             if flags != publish_flags {
                 return Err(format!(
                     "checkpoint flags {flags:#x} changed before Prepare publication to {publish_flags:#x}"
@@ -6364,86 +6390,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> Result<(), String> {
         self.abandon_reserved_attempt(attempt, reason.to_owned(), flags, assignment_fence)
             .await
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn checkpoint_assignment_for_admission(
-        &mut self,
-        deadline: tokio::time::Instant,
-    ) -> crate::pipeline::CheckpointAssignmentAdmission {
-        use crate::pipeline::CheckpointAssignmentAdmission;
-
-        let Some(controller) = self.cluster_controller.clone() else {
-            return CheckpointAssignmentAdmission::Ready {
-                assignment_fence: None,
-                flags: laminar_core::checkpoint::flags::NONE,
-                assignment_guard: None,
-            };
-        };
-        let Ok(assignment_guard) = tokio::time::timeout_at(
-            deadline,
-            Arc::clone(&self.assignment_adoption_lock).lock_owned(),
-        )
-        .await
-        else {
-            return CheckpointAssignmentAdmission::Deferred(
-                "checkpoint admission timed out waiting for assignment serialization".into(),
-            );
-        };
-        let Some(registry) = self.vnode_registry.clone() else {
-            tracing::error!(
-                "cluster checkpoint admission has no vnode registry; failing assignment fence"
-            );
-            return CheckpointAssignmentAdmission::Fault(
-                "cluster checkpoint admission has no vnode registry".into(),
-            );
-        };
-        let publication = registry.versioned_snapshot();
-        // The snapshot watcher performs the gossip scan off the hot path. Retain the exact
-        // certificate so later capture/quorum/durable phases cannot silently switch generations.
-        let Some(fence) = controller.checkpoint_assignment_fence(publication.version()) else {
-            return CheckpointAssignmentAdmission::Deferred(format!(
-                "assignment {} is not checkpoint-ready",
-                publication.version()
-            ));
-        };
-        let verified = registry.versioned_snapshot();
-        if verified.version() != publication.version() {
-            return CheckpointAssignmentAdmission::Deferred(
-                "assignment changed while checkpoint admission was being certified".into(),
-            );
-        }
-        let drain_was_active = controller.checkpoint_drain_transition().is_some();
-        let flags = match Self::checkpoint_flags_for_assignment(
-            Some(Arc::clone(&controller)),
-            Some(fence.clone()),
-            deadline,
-        )
-        .await
-        {
-            Ok(flags) => flags,
-            Err(error)
-                if drain_was_active || controller.checkpoint_drain_transition().is_some() =>
-            {
-                return CheckpointAssignmentAdmission::Deferred(error);
-            }
-            Err(error) => return CheckpointAssignmentAdmission::Fault(error),
-        };
-        if registry.assignment_version() != publication.version()
-            || controller
-                .checkpoint_assignment_fence(publication.version())
-                .as_ref()
-                != Some(&fence)
-        {
-            return CheckpointAssignmentAdmission::Deferred(
-                "assignment changed during HANDOFF readiness audit".into(),
-            );
-        }
-        CheckpointAssignmentAdmission::Ready {
-            assignment_fence: Some(fence),
-            flags,
-            assignment_guard: Some(assignment_guard),
-        }
     }
 
     fn checkpoint_control_wake(&self) -> Option<crate::pipeline::callback::CheckpointControlWake> {
@@ -6777,21 +6723,23 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         #[cfg(not(feature = "cluster"))]
         let reassignment_portable = false;
 
+        let Some(handoff) = self.capture_terminal_cut(flags) else {
+            return BarrierOutcome::Failed;
+        };
         #[cfg(feature = "cluster")]
-        let handoff_replay_pending = flags & laminar_core::checkpoint::flags::HANDOFF != 0
-            && !self.graph.handoff_is_quiescent();
-        #[cfg(not(feature = "cluster"))]
-        let handoff_replay_pending = false;
-        let handoff = HandoffCapture::new(flags, handoff_replay_pending);
+        let handoff_replay_pending = handoff.replay_pending;
 
         #[cfg(feature = "cluster")]
-        if fence_intake_after_terminal_handoff_capture(
+        if fence_intake_after_terminal_cut_capture(
             &self.intake_gate,
+            &self.topology_cut_hold,
+            &self.intake_gate_transition,
             flags,
             handoff_replay_pending,
         ) {
             tracing::info!(
-                "terminal HANDOFF capture fenced graph intake until assignment transition"
+                flags,
+                "terminal checkpoint cut fenced graph intake until coordinated transition"
             );
         }
 
@@ -7219,6 +7167,27 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 /// Encode an Arrow schema as a hex-encoded IPC flatbuffer.
 pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
     laminar_connectors::config::encode_arrow_schema_ipc(schema)
+}
+
+impl ConnectorPipelineCallback {
+    fn capture_terminal_cut(&self, flags: u64) -> Option<HandoffCapture> {
+        #[cfg(feature = "cluster")]
+        let handoff_replay_pending = flags
+            & (laminar_core::checkpoint::flags::HANDOFF
+                | laminar_core::checkpoint::flags::TOPOLOGY_CUT)
+            != 0
+            && !self.graph.handoff_is_quiescent();
+        #[cfg(not(feature = "cluster"))]
+        let handoff_replay_pending = false;
+        if flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT != 0 && handoff_replay_pending {
+            set_checkpoint_fault(
+                &self.checkpoint_fault,
+                "topology cut cannot retain replay; coordinated recovery is required",
+            );
+            return None;
+        }
+        Some(HandoffCapture::new(flags, handoff_replay_pending))
+    }
 }
 
 #[cfg(test)]

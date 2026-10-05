@@ -16,13 +16,14 @@ impl KafkaSource {
         config: &KafkaSourceConfig,
         delivery: DeliveryGuarantee,
         vnode_assigned: bool,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_input_channels: Option<&[Vec<u8>]>,
         resume_baselines: &KafkaPartitionBaselines,
     ) -> Result<bool, ConnectorError> {
         let local_guaranteed_assignment = delivery != DeliveryGuarantee::BestEffort
             && !vnode_assigned
-            && matches!(&config.startup_mode, StartupMode::Earliest);
+            && (matches!(&config.startup_mode, StartupMode::Earliest)
+                || (has_saved_position && matches!(&config.startup_mode, StartupMode::Latest)));
         if local_guaranteed_assignment {
             let TopicSubscription::Topics(topics) = &config.subscription else {
                 return Err(ConnectorError::ConfigurationError(
@@ -63,7 +64,7 @@ impl KafkaSource {
                 &assigned_set,
             )
             .await?;
-            let baselines = if is_resume {
+            let baselines = if has_saved_position {
                 validate_resume_input_channels(
                     self.source_name.as_ref(),
                     resume_input_channels,
@@ -108,7 +109,7 @@ impl KafkaSource {
         kafka_config: &KafkaSourceConfig,
         vnode_assigned: bool,
         local_guaranteed_assignment: bool,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_input_channels: Option<&[Vec<u8>]>,
         resume_baselines: &KafkaPartitionBaselines,
     ) -> Result<(), ConnectorError> {
@@ -124,7 +125,7 @@ impl KafkaSource {
                     consumer,
                     kafka_config,
                     offsets,
-                    is_resume,
+                    has_saved_position,
                     resume_input_channels,
                     resume_baselines,
                 )
@@ -135,7 +136,7 @@ impl KafkaSource {
                     consumer,
                     kafka_config,
                     *timestamp_ms,
-                    is_resume,
+                    has_saved_position,
                     resume_input_channels,
                     resume_baselines,
                 )
@@ -177,7 +178,7 @@ impl KafkaSource {
         consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
         kafka_config: &KafkaSourceConfig,
         offsets: &std::collections::HashMap<i32, i64>,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_input_channels: Option<&[Vec<u8>]>,
         resume_baselines: &KafkaPartitionBaselines,
     ) -> Result<(), ConnectorError> {
@@ -210,7 +211,7 @@ impl KafkaSource {
                     .map(move |(&partition, &next)| ((topic.clone(), partition), next))
             })
             .collect();
-        let baselines = if is_resume {
+        let baselines = if has_saved_position {
             validate_resume_input_channels(
                 self.source_name.as_ref(),
                 resume_input_channels,
@@ -254,7 +255,7 @@ impl KafkaSource {
         consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
         kafka_config: &KafkaSourceConfig,
         ts_ms: i64,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_input_channels: Option<&[Vec<u8>]>,
         resume_baselines: &KafkaPartitionBaselines,
     ) -> Result<(), ConnectorError> {
@@ -287,7 +288,7 @@ impl KafkaSource {
                 &assigned,
                 &assigned_set,
                 ts_ms,
-                is_resume,
+                has_saved_position,
                 resume_input_channels,
                 resume_baselines,
             )
@@ -317,11 +318,11 @@ impl KafkaSource {
         assigned: &[(String, i32)],
         assigned_set: &KafkaPartitionSet,
         ts_ms: i64,
-        is_resume: bool,
+        has_saved_position: bool,
         resume_input_channels: Option<&[Vec<u8>]>,
         resume_baselines: &KafkaPartitionBaselines,
     ) -> Result<KafkaPartitionBaselines, ConnectorError> {
-        if is_resume {
+        if has_saved_position {
             validate_resume_input_channels(
                 self.source_name.as_ref(),
                 resume_input_channels,

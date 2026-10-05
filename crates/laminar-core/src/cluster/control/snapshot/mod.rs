@@ -686,6 +686,8 @@ impl AssignmentSnapshotStore {
     /// `prior_version`. Returns [`RotateOutcome::Conflict`] carrying
     /// the winner's snapshot if a racer produced `prior_version + 1`
     /// first.
+    /// Cluster drain writers must use `LeaderLeaseStore::publish_assignment_drain` so migration
+    /// admission observes the intent before this storage-only materialization can occur.
     ///
     /// # Errors
     /// Object-store I/O, JSON encode, or a non-monotonic version bump

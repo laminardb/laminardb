@@ -474,6 +474,11 @@ impl IcebergSource {
 impl SourceConnector for IcebergSource {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        if matches!(&position, SourcePosition::Initialized { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg has no sealed topology startup contract".into(),
+            ));
+        }
         #[cfg(feature = "iceberg-core")]
         let declared_schema = if config.get("_arrow_schema").is_some() {
             let schema = config.arrow_schema().ok_or_else(|| {
@@ -506,6 +511,11 @@ impl SourceConnector for IcebergSource {
         {
             let recovered_cursor = match &position {
                 SourcePosition::Initial => None,
+                SourcePosition::Initialized { .. } => {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Iceberg has no sealed topology startup contract".into(),
+                    ));
+                }
                 SourcePosition::Resume { checkpoint, .. } => {
                     Some(IcebergSourceCursorV1::from_checkpoint(checkpoint)?)
                 }
@@ -557,6 +567,11 @@ impl SourceConnector for IcebergSource {
 
             match position {
                 SourcePosition::Initial => self.start_initial_scan()?,
+                SourcePosition::Initialized { .. } => {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Iceberg has no sealed topology startup contract".into(),
+                    ));
+                }
                 SourcePosition::Resume { .. } => {
                     self.install_cursor(recovered_cursor.ok_or_else(|| {
                         ConnectorError::Internal(

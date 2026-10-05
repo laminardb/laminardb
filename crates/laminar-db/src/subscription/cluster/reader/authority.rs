@@ -17,6 +17,7 @@ use crate::subscription::{ClusterSubscriptionError, SubscribeStart};
 pub(super) struct GatewayCursor {
     pub(super) current: Option<CommittedCheckpointRef>,
     pub(super) current_index: Option<CommittedCheckpointIndex>,
+    pub(super) current_certificate: Option<OutputDistributionCertificate>,
     pub(super) expected: BTreeMap<OutputPartitionId, PartitionSequence>,
     pub(super) generation_seen: bool,
     pub(super) delivery_sequence: u64,
@@ -32,6 +33,7 @@ impl GatewayCursor {
         let mut cursor = Self {
             current: None,
             current_index: None,
+            current_certificate: None,
             expected: initial_frontiers(certificate)?,
             generation_seen: false,
             delivery_sequence: 0,
@@ -87,7 +89,7 @@ impl GatewayCursor {
         let Some(index) = index else {
             return Err(ClusterSubscriptionError::EpochNotCommitted { requested: epoch }.into());
         };
-        let loaded = load_index_for_outcome(store, certificate, &outcome, index).await?;
+        let loaded = load_index_for_outcome(authority, store, certificate, &outcome, index).await?;
         if loaded.stream.is_none() {
             return Err(ClusterSubscriptionError::GenerationMismatch.into());
         }
@@ -106,6 +108,7 @@ impl GatewayCursor {
         );
         if let Some(stream) = loaded.stream.as_ref() {
             replace_frontiers(&mut self.expected, stream)?;
+            self.current_certificate = Some(stream.manifest.distribution_certificate.clone());
             self.generation_seen = true;
         }
         self.current = Some(loaded.reference);
@@ -167,20 +170,23 @@ pub(super) async fn next_committed_indexes(
         }
     }
     reverse.reverse();
-    validate_index_chain(cursor.current_index.as_ref(), &reverse)?;
+    validate_index_chain(authority, cursor.current_index.as_ref(), &reverse).await?;
     Ok(reverse)
 }
 
-fn validate_index_chain(
+async fn validate_index_chain(
+    authority: &LeaderLeaseStore,
     predecessor: Option<&CommittedCheckpointIndex>,
     indexes: &[CommittedCheckpointIndex],
 ) -> Result<(), DbError> {
     let mut predecessor = predecessor;
     for index in indexes {
         match predecessor {
-            Some(previous) => index
-                .validate_predecessor_index(previous)
-                .map_err(manifest_error)?,
+            Some(previous) => {
+                Box::pin(authority.validate_cluster_checkpoint_predecessor(index, previous))
+                    .await
+                    .map_err(map_authority_error)?;
+            }
             None if index.predecessor.is_none() => {}
             None => return Err(ClusterSubscriptionError::RetentionLost.into()),
         }
@@ -203,10 +209,11 @@ async fn load_outcome_checkpoint(
         .load_committed_checkpoint(reference)
         .await
         .map_err(map_authority_error)?;
-    load_index_for_outcome(store, certificate, outcome, index).await
+    load_index_for_outcome(authority, store, certificate, outcome, index).await
 }
 
 async fn load_index_for_outcome(
+    authority: &LeaderLeaseStore,
     store: &Arc<dyn CheckpointStore>,
     certificate: &OutputDistributionCertificate,
     outcome: &laminar_core::checkpoint_decision::CheckpointOutcome,
@@ -216,7 +223,7 @@ async fn load_index_for_outcome(
         .committed_checkpoint
         .as_ref()
         .ok_or_else(|| manifest_error("cluster Commit has no committed checkpoint reference"))?;
-    let loaded = load_checkpoint(store, index, certificate).await?;
+    let loaded = load_checkpoint(authority, store, index, certificate).await?;
     if &loaded.reference != expected {
         return Err(manifest_error(
             "committed checkpoint does not match its authoritative outcome",

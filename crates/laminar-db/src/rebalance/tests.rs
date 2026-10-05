@@ -44,7 +44,7 @@ impl GetBarrier {
         }
         if self
             .reads_before_wait
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -6087,4 +6087,41 @@ async fn takeover_materializes_decision_written_before_snapshot_cas() {
         .unwrap();
     assert_eq!(winner.verdict, AssignmentDrainVerdict::Commit);
     assert_eq!(winner.leader_proof, old_proof);
+}
+
+#[tokio::test]
+async fn topology_cold_created_recovery_stop_observes_runtime_ownership_before_drain_settlement() {
+    let (db, controller, _registry, current, target, _checkpoint_dir) =
+        stopped_recovery_topology_fixture(true, true, AssignmentDrainVerdict::Abort).await;
+    let _round = install_stopped_recovery_prepare(&controller, &current, true).await;
+    db.pending_recovery_fault
+        .store(0, std::sync::atomic::Ordering::Release);
+    assert_eq!(DbState::load(&db.state), DbState::Created);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    *db.runtime_shutdown.write() = shutdown.clone();
+    let retired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&retired);
+    *db.runtime_handle.lock().await = Some(tokio::spawn(async move {
+        shutdown.cancelled().await;
+        observed.store(true, std::sync::atomic::Ordering::Release);
+    }));
+
+    db.stop_pipeline_for_coordinated_recovery().await.unwrap();
+    assert!(db.runtime_shutdown.read().is_cancelled());
+    assert!(retired.load(std::sync::atomic::Ordering::Acquire));
+    assert!(db.runtime_handle.lock().await.is_none());
+    assert!(db.cluster_intake_fenced());
+    assert!(db.coordinated_recovery_in_progress());
+    assert_eq!(DbState::load(&db.state), DbState::Created);
+    assert_eq!(
+        settle_stopped_source_drain_after_recovery_quorum(
+            &db,
+            &controller,
+            &current.assignment_fence().unwrap(),
+            RebalanceConfig::test_defaults(),
+        )
+        .await
+        .unwrap(),
+        Some(target.version)
+    );
 }

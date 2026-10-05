@@ -91,6 +91,14 @@ pub struct CatalogManifest {
 }
 
 impl CatalogManifest {
+    /// Compute the canonical content reference without publishing or changing authority.
+    ///
+    /// # Errors
+    /// Rejects a malformed or oversized inventory.
+    pub fn reference(&self) -> Result<CatalogManifestRef, CatalogManifestError> {
+        self.encode_and_reference().map(|(_, reference)| reference)
+    }
+
     /// Construct and validate a complete inventory.
     ///
     /// # Errors
@@ -155,7 +163,7 @@ pub struct CatalogManifestRef {
 }
 
 impl CatalogManifestRef {
-    pub(super) fn validate(&self) -> Result<(), CatalogManifestError> {
+    pub(crate) fn validate(&self) -> Result<(), CatalogManifestError> {
         if self.version != CATALOG_MANIFEST_FORMAT_VERSION {
             return Err(CatalogManifestError::Invalid(format!(
                 "unsupported catalog manifest version {}",
@@ -242,10 +250,110 @@ pub enum CatalogManifestError {
 }
 
 impl CatalogManifestStore {
+    /// Read the definitive payload-bound status of a reserved topology request.
+    ///
+    /// # Errors
+    /// Fails on unavailable/corrupt evidence or the bounded read deadline.
+    pub async fn operation_status(
+        &self,
+        operation_id: super::topology::TopologyOperationId,
+    ) -> Result<Option<super::topology::TopologyAdmissionStatus>, super::topology::TopologyError>
+    {
+        self.authority.topology_operation_status(operation_id).await
+    }
+
     /// Share the exact append-only authority used by the leader lease manager.
     #[must_use]
     pub fn new(authority: Arc<LeaderLeaseStore>) -> Self {
         Self { authority }
+    }
+
+    /// Read explicit logical topology metadata from the same catalog/leader authority.
+    ///
+    /// # Errors
+    /// Fails closed when the authority or referenced catalog/deployment is invalid.
+    pub async fn topology_state(
+        &self,
+    ) -> Result<super::topology::TopologyCatalogState, super::topology::TopologyError> {
+        self.authority.topology_catalog_state().await
+    }
+
+    /// Load the catalog and its topology metadata from one immutable authority snapshot.
+    ///
+    /// # Errors
+    /// Fails closed on missing/corrupt content or inconsistent adoption/deployment authority.
+    pub async fn load_with_topology(
+        &self,
+    ) -> Result<
+        Option<(CatalogManifest, super::topology::TopologyCatalogState)>,
+        super::topology::TopologyError,
+    > {
+        self.authority.catalog_with_topology().await
+    }
+
+    /// Load the exact parent catalog while checking the current committed inventory.
+    ///
+    /// # Errors
+    /// Rejects changed authority, invalid retained evidence or the bounded read deadline.
+    pub async fn parent_topology_catalog(
+        &self,
+        expected_current: &CatalogManifestRef,
+    ) -> Result<Option<CatalogManifest>, super::topology::TopologyError> {
+        self.authority
+            .parent_topology_catalog(expected_current)
+            .await
+    }
+
+    /// Load the complete adopted startup catalog while checking the exact current inventory.
+    /// Removed objects remain startup assertions and are never recreated.
+    ///
+    /// # Errors
+    /// Rejects changed authority, invalid retained evidence or the bounded read deadline.
+    pub async fn original_topology_catalog(
+        &self,
+        expected_current: &CatalogManifestRef,
+    ) -> Result<Option<CatalogManifest>, super::topology::TopologyError> {
+        self.authority
+            .original_topology_catalog(expected_current)
+            .await
+    }
+
+    /// Read object names retired by the bounded, retained committed topology journal.
+    ///
+    /// # Errors
+    /// Rejects invalid retained evidence, changed committed authority or the read deadline.
+    pub async fn retired_topology_names(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, super::topology::TopologyError> {
+        self.authority.retired_topology_names().await
+    }
+
+    /// Read the latest retired incarnation of each name for safe future-only recreation.
+    ///
+    /// # Errors
+    /// Rejects invalid retained evidence, changed committed authority or the read deadline.
+    pub async fn retired_topology_generations(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, u64>, super::topology::TopologyError> {
+        self.authority.retired_topology_generations().await
+    }
+
+    /// Explicitly adopt a sealed legacy inventory without changing the processing graph.
+    ///
+    /// Requires a coordinated binary upgrade; this is not runtime migration admission.
+    ///
+    /// # Errors
+    /// Rejects stale leader proof, divergent reference/deployment, invalid data or authority I/O.
+    pub async fn adopt_legacy_topology(
+        &self,
+        proof: &LeaderProof,
+        operation_id: super::topology::TopologyOperationId,
+        expected_manifest: &CatalogManifestRef,
+        expected_deployment: &str,
+    ) -> Result<super::topology::TopologyAdoptionOutcome, super::topology::TopologyError> {
+        self.authority
+            .adopt_legacy_topology(proof, operation_id, expected_manifest, expected_deployment)
+            .await
     }
 
     /// Load the sealed catalog, or `None` before the first successful seal.
@@ -253,18 +361,16 @@ impl CatalogManifestStore {
     /// # Errors
     /// Fails on object-store I/O, malformed JSON, or an invalid inventory.
     pub async fn load(&self) -> Result<Option<CatalogManifest>, CatalogManifestError> {
-        let Some(reference) = self
-            .authority
-            .load()
-            .await?
-            .and_then(|lease| lease.catalog_manifest)
-        else {
-            return Ok(None);
-        };
-        self.authority
-            .load_catalog_manifest(&reference)
+        self.load_with_topology()
             .await
-            .map(Some)
+            .map(|snapshot| snapshot.map(|(manifest, _)| manifest))
+            .map_err(|error| match error {
+                super::topology::TopologyError::Authority(error) => {
+                    CatalogManifestError::Authority(error)
+                }
+                super::topology::TopologyError::Catalog(error) => error,
+                error => CatalogManifestError::Invalid(error.to_string()),
+            })
     }
 
     /// CAS-append the first inventory under an exact leader proof.

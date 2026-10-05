@@ -361,7 +361,13 @@ impl CheckpointCoordinator {
             .is_some_and(|manifest| {
                 manifest.checkpoint_id == attempt.checkpoint_id
                     && manifest.epoch == attempt.epoch
-                    && manifest.referenced_chunks.len() >= REFERENCED_CHUNK_REBASE_THRESHOLD
+                    && (manifest.referenced_chunks.len() >= REFERENCED_CHUNK_REBASE_THRESHOLD
+                        // A migration retains its historical parent reference. The first target
+                        // checkpoint must capture full state under its own pipeline identity.
+                        || self
+                            .pipeline_identity
+                            .as_ref()
+                            .is_some_and(|bound| bound != &manifest.pipeline_identity))
             })
     }
 

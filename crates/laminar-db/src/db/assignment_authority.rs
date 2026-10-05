@@ -392,6 +392,19 @@ impl LaminarDB {
             return Ok(self.withdraw_inactive_assignment(controller));
         }
 
+        // Assignment readiness cannot release a topology cut or open its successor sink epoch.
+        // Preserve the exact assignment certificate needed by the still-running cut tails.
+        if self
+            .topology_cut_hold
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(AssignmentAuthorityActivation {
+                installed: true,
+                intake_open: false,
+                revision: expected_revision,
+            });
+        }
+
         // A terminal HANDOFF closes the predecessor sink epoch without reserving a successor.
         // The target certificate is installed while intake remains closed, so this is the first
         // point where an exact successor can be admitted against the target assignment.
@@ -422,7 +435,7 @@ impl LaminarDB {
         }
         Ok(AssignmentAuthorityActivation {
             installed: true,
-            intake_open: true,
+            intake_open: !self.source_gate.load(std::sync::atomic::Ordering::Acquire),
             revision: expected_revision,
         })
     }

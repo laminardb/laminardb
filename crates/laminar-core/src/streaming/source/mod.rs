@@ -148,6 +148,10 @@ pub struct Source<T: Record> {
 impl<T: Record> Source<T> {
     /// Creates a new Source/Sink pair.
     pub(crate) fn new(config: SourceConfig) -> (Self, Sink<T>) {
+        Self::new_with_drain(config, true)
+    }
+
+    fn new_with_drain(config: SourceConfig, start_drain: bool) -> (Self, Sink<T>) {
         let channel_config = config.channel;
         let (producer, consumer) = channel_with_config::<SourceMessage<T>>(&channel_config);
 
@@ -170,7 +174,12 @@ impl<T: Record> Source<T> {
         });
 
         let source = Self { inner };
-        let sink = Sink::new(consumer, schema);
+        let sink = if start_drain {
+            Sink::new(consumer, schema)
+        } else {
+            drop(consumer);
+            Sink::schema_only(schema)
+        };
 
         (source, sink)
     }
@@ -460,6 +469,16 @@ pub fn create<T: Record>(buffer_size: usize) -> (Source<T>, Sink<T>) {
 #[must_use]
 pub fn create_with_config<T: Record>(config: SourceConfig) -> (Source<T>, Sink<T>) {
     Source::new(config)
+}
+
+/// Creates schema-planning endpoints without a drain task or a Tokio runtime.
+///
+/// The source is disconnected immediately and rejects all input. This is only for private,
+/// unstarted catalogs used to compile schemas; it cannot execute or publish streaming data.
+#[cfg(feature = "cluster")]
+#[must_use]
+pub fn create_for_schema_planning<T: Record>(config: SourceConfig) -> (Source<T>, Sink<T>) {
+    Source::new_with_drain(config, false)
 }
 
 #[cfg(test)]

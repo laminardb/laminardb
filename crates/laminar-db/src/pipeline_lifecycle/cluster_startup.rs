@@ -3,6 +3,35 @@ use super::{Arc, ClusterStartupDisposition, StartupCheckpointArtifactAudit};
 use super::{DbError, LaminarDB, StartupAttempt};
 
 impl LaminarDB {
+    pub(super) async fn join_runtime_watcher_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let mut owned = tokio::time::timeout_at(deadline, self.runtime_handle.lock())
+            .await
+            .map_err(|_| {
+                DbError::Pipeline(
+                    "runtime watcher ownership deadline expired; generation remains fenced".into(),
+                )
+            })?;
+        if let Some(watcher) = owned.as_mut() {
+            let result = tokio::time::timeout_at(deadline, watcher)
+                .await
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "runtime watcher is still draining; generation remains fenced".into(),
+                    )
+                })?;
+            owned.take();
+            result.map_err(|error| {
+                DbError::Pipeline(format!(
+                    "runtime watcher failed during startup cleanup: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "cluster")]
     pub(super) fn should_defer_initial_sink_epoch_for_artifact_recovery(
         &self,
@@ -56,6 +85,13 @@ impl LaminarDB {
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("cluster startup has no recovery controller".into())
         })?;
+        if self.coordinated_recovery_in_progress()
+            && self
+                .topology_cut_hold
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(ClusterStartupDisposition::RecoveryFenced);
+        }
         let registry =
             self.vnode_registry.lock().clone().ok_or_else(|| {
                 DbError::Checkpoint("cluster startup has no vnode assignment".into())
@@ -519,6 +555,20 @@ impl LaminarDB {
         // has no live generation and a partially launched task observes the same terminal signal.
         self.runtime_shutdown.read().cancel();
         self.shutdown_signal.notify_one();
+        self.join_runtime_watcher_until(deadline).await?;
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime() {
+            super::retire_cluster_compute_generation_until(
+                &self.rotation_execution_fence,
+                &self.pending_vnode_transition,
+                &self.installed_vnode_state,
+                deadline,
+            )
+            .await
+            .map_err(|_| {
+                DbError::Pipeline("failed-start graph retirement deadline expired".into())
+            })?;
+        }
         self.quiesce_checkpoint_decision_until(deadline).await?;
         {
             let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
@@ -546,6 +596,13 @@ impl LaminarDB {
         *self.control_tx.lock() = None;
         *self.force_ckpt_tx.lock() = None;
         self.quiesce_connector_generation_until(deadline).await?;
+        #[cfg(feature = "cluster")]
+        if self
+            .topology_cut_hold
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         *self.checkpoint_namespace_lock.lock() = None;
         Ok(())
     }

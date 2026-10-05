@@ -8,6 +8,8 @@
 #![allow(clippy::disallowed_types)] // cold path: SQL parsing and query planning only
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::uninlined_format_args)]
+// Assert cardinality without requiring equality on fixture elements.
+#![cfg_attr(test, allow(clippy::assert_is_empty))]
 
 pub mod datafusion;
 pub mod error;
