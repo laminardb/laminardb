@@ -1634,6 +1634,158 @@ mod vnode_transition {
     }
 
     #[tokio::test]
+    async fn startup_assignment_binds_restored_state_without_changing_its_cut() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        operator
+            .restore(OperatorCheckpoint {
+                data: fixture.donor_metadata.clone(),
+            })
+            .unwrap();
+        for (vnode, frame) in &fixture.original {
+            operator.restore_vnode(*vnode, 256, frame).unwrap();
+        }
+        let before = image(&mut operator);
+        let accounting = operator.managed_state_accounting();
+        let owned = (0..256)
+            .filter(|slot| *slot != vnode("c"))
+            .collect::<Vec<_>>();
+        operator
+            .bind_startup_assignment(&fixture.installed, &owned)
+            .unwrap();
+        operator
+            .bind_startup_assignment(&fixture.installed, &owned)
+            .unwrap();
+        assert_eq!(image(&mut operator), before);
+        assert_eq!(operator.managed_state_accounting(), accounting);
+        assert!(operator
+            .bind_startup_assignment(&fixture.target, &owned)
+            .is_err());
+        fixture.transfer(&mut operator).unwrap();
+        operator.abort_vnode_transition();
+        operator.finish_vnode_transition();
+        let output = operator
+            .process_with_frontiers(
+                &[],
+                &[InputFrontier {
+                    watermark: Some(112),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            activity_rows(&output),
+            vec![
+                ("b".into(), "inactive".into(), 5, false, 111_000),
+                ("a".into(), "inactive".into(), 110, false, 112_000),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_assignment_rejects_foreign_state_and_invalid_rosters_atomically() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        operator
+            .restore(OperatorCheckpoint {
+                data: fixture.donor_metadata.clone(),
+            })
+            .unwrap();
+        for (vnode, frame) in &fixture.original {
+            operator.restore_vnode(*vnode, 256, frame).unwrap();
+        }
+        let before = image(&mut operator);
+        let mut owned = vec![vnode("a"), vnode("b")];
+        owned.sort_unstable();
+        for invalid in [
+            vec![],
+            vec![vnode("a")],
+            vec![vnode("b")],
+            vec![256],
+            vec![0, 0],
+        ] {
+            assert!(operator
+                .bind_startup_assignment(&fixture.installed, &invalid)
+                .is_err());
+            assert_eq!(image(&mut operator), before);
+        }
+        let mut reversed = owned.clone();
+        reversed.reverse();
+        assert!(operator
+            .bind_startup_assignment(&fixture.installed, &reversed)
+            .is_err());
+        assert!(operator
+            .bind_startup_assignment(&fence(7, &[NodeId(7); 4]), &owned)
+            .is_err());
+        let mut malformed = fixture.installed.clone();
+        malformed.participants.clear();
+        assert!(operator
+            .bind_startup_assignment(&malformed, &owned)
+            .is_err());
+        assert_eq!(image(&mut operator), before);
+        operator
+            .bind_startup_assignment(&fixture.installed, &owned)
+            .unwrap();
+        assert_eq!(image(&mut operator), before);
+        fixture.transfer(&mut operator).unwrap();
+        operator.abort_vnode_transition();
+        operator.finish_vnode_transition();
+    }
+
+    #[tokio::test]
+    async fn startup_assignment_requires_fresh_state_and_finished_transition_cleanup() {
+        let fixture = Fixture::new(descriptor()).await;
+        let owned = (0..256)
+            .filter(|slot| *slot != vnode("c"))
+            .collect::<Vec<_>>();
+        let mut operator =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        let before = image(&mut operator);
+        fixture.bootstrap(&mut operator).unwrap();
+        assert!(operator
+            .bind_startup_assignment(&fixture.installed, &owned)
+            .is_err());
+        operator.abort_vnode_transition();
+        assert!(operator
+            .bind_startup_assignment(&fixture.installed, &owned)
+            .is_err());
+        operator.finish_vnode_transition();
+        operator
+            .bind_startup_assignment(&fixture.installed, &owned)
+            .unwrap();
+        assert_eq!(image(&mut operator), before);
+        let mut running =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        assert!(operator
+            .restore(OperatorCheckpoint {
+                data: before.0.clone()
+            })
+            .is_err());
+        assert!(operator
+            .restore_vnode(before.1[0].0, 256, &before.1[0].1)
+            .is_err());
+        assert_eq!(image(&mut operator), before);
+        running
+            .process_with_frontiers(
+                &[vec![input_batch(&[("a", 1, 100_000)])]],
+                &[InputFrontier {
+                    watermark: Some(95),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        let before = image(&mut running);
+        assert!(running
+            .bind_startup_assignment(&fixture.installed, &owned)
+            .is_err());
+        assert_eq!(image(&mut running), before);
+    }
+
+    #[tokio::test]
     async fn live_transfer_preserves_retained_key_and_retires_revoked_timer() {
         let fixture = Fixture::new(descriptor()).await;
         let mut operator = fixture.installed_operator(descriptor());
@@ -3136,6 +3288,10 @@ def handle(activations):
                 CheckpointAssignmentFence::from_owner_map(1, &[7; 4], vec![participant]).unwrap();
             let target =
                 CheckpointAssignmentFence::from_owner_map(2, &[7; 4], vec![participant]).unwrap();
+            let error = operator
+                .bind_startup_assignment(&predecessor, &[0, 1, 2, 3])
+                .unwrap_err();
+            assert!(error.to_string().contains("drained invocations"), "{error}");
             let error = operator
                 .prepare_vnode_transition(ManagedVnodeTransition {
                     predecessor: &predecessor,

@@ -37,6 +37,7 @@ use laminar_sql::translator::{
 
 mod catalog_context;
 mod input_admission;
+mod process;
 mod state_restore;
 
 use input_admission::retained_input_bytes;
@@ -465,6 +466,17 @@ pub(crate) trait GraphOperator: Send {
     /// Whether a successful empty-input step may advance this operator's output frontier.
     fn advances_frontier_without_input(&self) -> bool {
         false
+    }
+
+    /// Bind fresh or restored process state to the verified startup assignment and local roster.
+    /// The graph calls this before compute launch and drops the entire image on failure.
+    #[cfg(feature = "cluster")]
+    fn bind_startup_assignment(
+        &mut self,
+        _assignment: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        _owned_vnodes: &[u32],
+    ) -> Result<(), DbError> {
+        Ok(())
     }
 
     /// Bind a privately restored operator's future transport to the exact target generation.
@@ -2500,57 +2512,6 @@ impl OperatorGraph {
         }
         self.output_map.insert(Arc::from(name), node_id);
         self.topo_dirty = true;
-    }
-
-    pub(crate) fn add_process_function(
-        &mut self,
-        registration: &crate::process_function::ProcessFunctionRegistration,
-    ) -> Result<(), DbError> {
-        let operator = match &registration.handler {
-            crate::process_function::ProcessHandler::Native(handler) => {
-                crate::process_function::ProcessFunctionOperator::new(
-                    registration.descriptor.clone(),
-                    Arc::clone(handler),
-                    u32::from(self.key_group_count),
-                )?
-            }
-            #[cfg(feature = "process-remote")]
-            crate::process_function::ProcessHandler::Remote(client) => {
-                let runtime = self.main_runtime_handle.clone().ok_or_else(|| {
-                    DbError::Config("process worker requires a main runtime handle".into())
-                })?;
-                let wake = Arc::clone(
-                    self.process_work_wake
-                        .get_or_insert_with(|| Arc::new(tokio::sync::Notify::new())),
-                );
-                crate::process_function::ProcessFunctionOperator::new_remote(
-                    registration.descriptor.clone(),
-                    client,
-                    runtime,
-                    wake,
-                    registration.output_name.clone(),
-                    u32::from(self.key_group_count),
-                )?
-            }
-        };
-        let source = self.ensure_source_node(&registration.source_name);
-        let node =
-            self.place_prepared_operator_node(&registration.output_name, Box::new(operator), 1);
-        self.add_edge(source, node, 0);
-        self.output_map
-            .insert(Arc::from(registration.output_name.as_str()), node);
-        self.register_intermediate_schema(
-            &registration.output_name,
-            &registration.descriptor.output_schema,
-        );
-        self.topo_dirty = true;
-        Ok(())
-    }
-
-    /// Wake for completed remote process calls retained by this graph.
-    #[cfg(feature = "process-remote")]
-    pub(crate) fn process_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
-        self.process_work_wake.clone()
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

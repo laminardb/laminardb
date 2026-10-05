@@ -41,6 +41,10 @@ pub(crate) struct InstalledVnodeStateBinding {
 }
 
 impl InstalledVnodeStateBinding {
+    pub(crate) fn assignment(&self) -> &CheckpointAssignmentFence {
+        &self.assignment
+    }
+
     pub(crate) fn new(
         assignment: CheckpointAssignmentFence,
         pipeline_identity: PipelineIdentity,

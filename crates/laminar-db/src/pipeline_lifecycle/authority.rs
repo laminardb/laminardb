@@ -3,6 +3,33 @@ use super::latch_cluster_terminal_data_plane;
 use super::{Arc, DbError, LaminarDB, PipelineLifecycleAuthority};
 
 impl LaminarDB {
+    #[cfg(feature = "cluster")]
+    pub(super) async fn prepare_graph_ready_runtime(
+        &self,
+        mut runtime: super::PipelineRuntimeSetup,
+        deadline: tokio::time::Instant,
+    ) -> Result<
+        (
+            super::PipelineRuntimeSetup,
+            Option<crate::vnode_transition_staging::InstalledVnodeStateBinding>,
+        ),
+        DbError,
+    > {
+        let binding = self
+            .prepare_graph_ready_vnode_state_binding(deadline)
+            .await?;
+        if let Some(binding) = &binding {
+            let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint("cluster graph readiness has no process authority".into())
+            })?;
+            runtime.callback.graph = runtime
+                .callback
+                .graph
+                .bind_startup_assignment(binding, &controller)?;
+        }
+        Ok((runtime, binding))
+    }
+
     /// Permanently fence this process after a deterministic pipeline halt. This is process-local;
     /// remote durable terminal evidence uses [`Self::latch_durable_terminal_recovery_fence`].
     #[cfg(feature = "cluster")]

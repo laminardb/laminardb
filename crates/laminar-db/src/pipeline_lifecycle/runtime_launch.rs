@@ -767,15 +767,15 @@ impl LaminarDB {
             .await?;
 
         #[cfg(feature = "cluster")]
-        let graph_ready_vnode_state = if runtime_mode == RuntimeMode::Cluster {
+        let (runtime, graph_ready_vnode_state) = if runtime_mode == RuntimeMode::Cluster {
             let graph_ready_deadline = checked_pipeline_deadline(
                 pipeline_checkpoint_timeout,
                 "pipeline graph-ready checkpoint",
             )?;
-            self.prepare_graph_ready_vnode_state_binding(graph_ready_deadline)
+            self.prepare_graph_ready_runtime(runtime, graph_ready_deadline)
                 .await?
         } else {
-            None
+            (runtime, None)
         };
         #[cfg(feature = "cluster")]
         if let Some(installed) = graph_ready_vnode_state.as_ref() {

@@ -2,6 +2,7 @@
 
 mod authority;
 mod preparation;
+mod startup;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

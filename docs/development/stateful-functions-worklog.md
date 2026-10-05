@@ -602,9 +602,7 @@ remain unqualified; these operator-hook tests do not open cluster admission.
 
 One-node cluster execution uses the cluster lifecycle and cannot be treated as an embedded shortcut. Keep cluster admission closed until actual ownership and recovery tests pass. Exact delivery additionally requires the repository's certified source/sink composition; deterministic handler results alone do not certify it.
 
-## Next executable task
-
-### Main integration — 2026-10-05 (validation in progress)
+### Continuation: main integration (2026-10-05)
 
 Resumed the clean `codex/stateful-process-functions` branch at
 `d75233d08ad0f334dbcb1443aea355b43999dd09` after finding the checkout on `main`.
@@ -615,23 +613,103 @@ identity binding, process-only startup, and the explicit unqualified transfer
 rejection. Existing setup/authority phases moved into concept owners to respect
 main's reduced readability baselines; no baseline exception increased.
 
-Current toolchain: rustc 1.99.0 (`b940084d7`, 2026-09-28), cargo 1.99.0
-(`5f94df478`, 2026-08-27). Formatting passes; readability passes with 18 module
-and 214 function exceptions. The first all-feature Clippy attempt failed in
-`aws-lc-sys` 0.45.0's build script with Windows PermissionDenied under the sandbox.
-The build is being repeated with normal native-build access. Evidence is retained
-under `target/process-cluster-authority-20261005/`.
+Merge commit: `1d5f3f29ae1b7f6991e12601c39e2b97e455a5dd`. Current toolchain:
+rustc 1.99.0 (`b940084d7`, 2026-09-28), cargo 1.99.0 (`5f94df478`, 2026-08-27).
+The merged lockfile resolves Arrow 58.4.0, DataFusion 53.1.0, object_store 0.13.2,
+tonic 0.14.6 and prost 0.14.4; this increment makes no further dependency edits.
+The first all-feature Clippy attempt failed in `aws-lc-sys` 0.45.0's build script
+with Windows PermissionDenied under the sandbox. Normal native-build access
+then exposed three integration errors: the moved checkpoint module's
+`StorageProvider` import, topology's exhaustive process-contract name, and the
+test replay source's unsupported `SourcePosition::Initialized` case. After those
+repairs, all-feature Clippy passed in 1,195.16 seconds including Cargo lock wait.
+
+The unchanged feature-specific process baseline passed 57 tests, failed one,
+and ignored one in 92.33 seconds (1,573.53 seconds including compilation).
+`at_least_once_native_republishes_file_after_host_termination` timed out waiting
+five seconds for its killed child to exit. The unchanged test passed its
+isolated rerun in 8.58 seconds; the timeout and assertions were not weakened.
+No real-Python environment was selected. Evidence is retained under
+`target/process-cluster-authority-20261005/`.
+
+### Continuation: process startup assignment binding (2026-10-05)
+
+Starting from merge commit `1d5f3f29`, fresh and same-assignment restored process
+state now receives the graph-ready assignment before compute launch. The
+existing durable history audit supplies the binding. For process participants,
+the graph verifies its pipeline and vnode domain, captures the live local process
+identity and exact registry/transport binding, derives the local vnode roster,
+invokes participant hooks, then revalidates the authority. Startup accepts both
+shuffle endpoints fenced or both certified for the target; live transitions keep
+their active-certificate requirement. The private state binding does not open
+record intake. A failed hook or changed authority drops the private graph image.
+
+The process hook rejects pending calls, unfinished transitions, changed bindings,
+invalid rosters, state outside local ownership, and prior execution without
+restored metadata. It preserves the saved state/timer cut and accounting. Once
+bound, raw metadata and vnode restore are sealed. Existing staged transitions
+retain their prepare/publish/abort/finish ownership. Registration and capability
+admission still reject both cluster forms; this increment changes cold startup
+and restore checks, without changing coordinator cycles, record dispatch, worker
+generation fields, protocol, SDK or dependency versions.
+
+Focused qualification: the feature-specific process suite passed 61 tests (one
+manual stress test ignored) in 24.97 seconds, 222.97 seconds including Cargo.
+Five graph tests passed in 0.05 seconds, 94.81 seconds including compilation.
+They use real process-lease CAS acquisition and monotonic takeover, loopback
+shuffle certificates, lease loss before/during hooks, and a replacement boot at
+term two. Initial fixture failures required installing the shared shuffle lease,
+using observed takeover rather than timestamp-only acquisition, and constructing
+an actual domain mismatch rather than using a rejected late topology setter.
+The first full workspace run took 2,018.01 seconds, including 25m01s compilation.
+Connectors passed 1,989 tests (two ignored) in 161.72 seconds and core passed
+1,126 in 204.48 seconds. The db suite passed 2,192, failed ten, and ignored two
+in 149.13 seconds; Cargo did not reach derive/SQL execution. Nine failures exposed
+an overly broad startup hook: SQL and source-only graphs activate transport later
+or have no shuffle. Binding now selects only `ProcessFunctionV1`; its cold
+authority constructor explicitly permits fenced startup transport. Two added
+regressions cover the existing no-process lifecycle and prove that private
+binding leaves transport fenced while live transfer remains rejected.
+
+The tenth failure was the Python quickstart's strict canonical-byte test after
+the Windows checkout converted its JSON and handler to CRLF. The example now
+uses the account example's existing two-file `.gitattributes` policy to retain LF.
+The files' logical Git contents and the test are unchanged; the original binary's
+unchanged artifact test passes after byte normalization. No assertion or runtime
+admission was weakened.
+
+These cold authority tests do not qualify process record intake, lease-loss
+recovery, assignment publication or distributed transfer. Both final Clippy gates
+pass: all features/targets in 38.32 seconds and without defaults in 7.77 seconds.
+Final `cargo test --workspace --lib -- --test-threads=1 --quiet` passed 6,189
+tests: connectors 1,989 in 157.66 seconds (two ignored), core 1,126 in 204.30
+seconds, db 2,204 in 278.99 seconds (two ignored), derive zero, and SQL 870 in
+0.64 seconds. The whole command took 835.84 seconds, including 3m11s recompilation.
+It includes all seven final graph tests, the native state/timer and pending-RPC
+regressions, and all ten repaired workspace regressions. Both workspace test runs
+used the existing Windows `RUST_MIN_STACK=8388608` setting and two build jobs;
+the unadjusted stack boundary is not newly qualified.
+
+Nightly formatting, diff checks, and readability pass with 18 module and 214
+function exceptions without growth. Existing OpenSSL debug-symbol and proc-macro
+future-compatibility warnings remain. No coordinator-cycle, core-operator or
+record dispatch code changed; the mandatory record-path Criterion/IPC gate was
+not triggered and no performance claim is added. Real-Python, SDK and container
+suites are not rerun in this increment; Rust/native transport tests do not add
+Python qualification. Evidence is retained in
+`target/process-cluster-authority-20261005/`.
+
+## Next executable task
 
 Continue original Phase E with process-lease and assignment fencing through the
 existing graph lifecycle. The shared-cut fixture above verifies same-owner frame
 restoration and isolated graph generations; it is not an admission certificate.
-The process participant now implements staged state/timer replacement through
-the existing prepare/publish/abort/finish hooks. Next bind it to the existing
-cluster graph/control authority at initial and same-assignment startup, route
-canonical keyed input through the existing shuffle, and bind remote attempts to
-authoritative assignment/recovery generations. The current hook fixtures do not
-acquire leases or validate record intake against ownership; remote invocation
-scope generations remain local zero values. Qualify actual one-owner lease
+The process participant now implements staged state/timer replacement and cold
+startup assignment binding through the existing graph/control authority. Next
+route canonical keyed input through the existing shuffle and bind remote attempts
+to authoritative assignment/recovery generations. The current cold-hook tests
+do not validate record intake against ownership; remote invocation scope
+generations remain local zero values. Qualify actual one-owner lease
 loss/restart and stale results before admitting distributed acquisition/revocation.
 Keep both cluster forms
 closed until their actual ownership/loss/stale-response tests pass. Do not add a

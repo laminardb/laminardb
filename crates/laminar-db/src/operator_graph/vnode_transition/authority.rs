@@ -7,6 +7,11 @@ use rustc_hash::FxHashSet;
 use crate::error::DbError;
 use crate::operator::sql_query::ClusterShuffleConfig;
 
+enum AssignmentCapturePhase {
+    Active,
+    Startup,
+}
+
 pub(super) struct VnodeTransitionAuthoritySnapshot {
     registry: Arc<laminar_core::state::VnodeRegistry>,
     pub(super) self_id: laminar_core::state::NodeId,
@@ -20,6 +25,23 @@ impl VnodeTransitionAuthoritySnapshot {
     pub(super) fn capture(
         config: &ClusterShuffleConfig,
         target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> Result<Self, DbError> {
+        Self::capture_for_phase(config, target, AssignmentCapturePhase::Active)
+    }
+
+    /// Bind a private startup image while transport is fenced or already matches its target.
+    /// This does not authorize record intake; live transitions still require active certificates.
+    pub(super) fn capture_startup(
+        config: &ClusterShuffleConfig,
+        target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> Result<Self, DbError> {
+        Self::capture_for_phase(config, target, AssignmentCapturePhase::Startup)
+    }
+
+    fn capture_for_phase(
+        config: &ClusterShuffleConfig,
+        target: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        phase: AssignmentCapturePhase,
     ) -> Result<Self, DbError> {
         let assignment = config.registry.versioned_snapshot();
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
@@ -36,12 +58,19 @@ impl VnodeTransitionAuthoritySnapshot {
         }
         let transport_digest = if target.contains(config.self_id.0) {
             match (
+                phase,
                 config.sender.assignment_version(),
                 config.receiver.assignment_version(),
                 config.sender.active_assignment_digest(),
                 config.receiver.active_assignment_digest(),
             ) {
-                (sender_version, receiver_version, Some(sender), Some(receiver))
+                (AssignmentCapturePhase::Startup, 0, 0, None, None)
+                    if target.participant_incarnation(config.self_id.0)
+                        == Some(config.sender.incarnation()) =>
+                {
+                    None
+                }
+                (_, sender_version, receiver_version, Some(sender), Some(receiver))
                     if target.participant_incarnation(config.self_id.0)
                         == Some(config.sender.incarnation())
                         && sender_version == assignment.version()

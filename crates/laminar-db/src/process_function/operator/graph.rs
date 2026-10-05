@@ -31,6 +31,67 @@ impl GraphOperator for ProcessFunctionOperator {
         })
     }
 
+    #[cfg(feature = "cluster")]
+    fn bind_startup_assignment(
+        &mut self,
+        assignment: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        owned_vnodes: &[u32],
+    ) -> Result<(), DbError> {
+        if !self.vnode_transition.is_idle() || self.checkpoint_drain_pending() {
+            return Err(DbError::Checkpoint(
+                "process assignment binding requires drained invocations and no staged transition"
+                    .into(),
+            ));
+        }
+        if !assignment.is_canonical()
+            || assignment.vnode_count != self.vnode_count.get()
+            || owned_vnodes.windows(2).any(|pair| pair[0] >= pair[1])
+            || owned_vnodes
+                .iter()
+                .any(|vnode| *vnode >= self.vnode_count.get())
+        {
+            return Err(DbError::Checkpoint(
+                "process startup assignment or owned vnode roster is invalid".into(),
+            ));
+        }
+        if self
+            .assignment_fence
+            .as_ref()
+            .is_some_and(|current| current != assignment)
+        {
+            return Err(DbError::Checkpoint(
+                "process startup cannot replace an installed assignment".into(),
+            ));
+        }
+        if !self.metadata_restored
+            && (self.next_activation_id != 0
+                || self.next_timer_generation != 0
+                || self.watermark_us != i64::MIN
+                || self.key_count != 0
+                || self.timer_count != 0)
+        {
+            return Err(DbError::Checkpoint(
+                "process startup assignment requires fresh or restored state".into(),
+            ));
+        }
+        for (slot, state) in self.state.iter().enumerate() {
+            if state.is_empty() {
+                continue;
+            }
+            let vnode = u32::try_from(slot)
+                .map_err(|_| DbError::Checkpoint("process vnode is out of range".into()))?;
+            if owned_vnodes.binary_search(&vnode).is_err() {
+                return Err(DbError::Checkpoint(
+                    "process startup image contains state outside local ownership".into(),
+                ));
+            }
+        }
+        if self.assignment_fence.is_none() {
+            self.assignment_fence = Some(assignment.clone());
+        }
+        Ok(())
+    }
+
     fn set_managed_state_budget(&mut self, bytes: usize) {
         self.graph_budget = bytes;
     }
@@ -173,9 +234,10 @@ impl GraphOperator for ProcessFunctionOperator {
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         #[cfg(feature = "cluster")]
-        if !self.vnode_transition.is_idle() {
+        if !self.vnode_transition.is_idle() || self.assignment_fence.is_some() {
             return Err(DbError::Checkpoint(
-                "process metadata restore overlaps a vnode transition".into(),
+                "process metadata restore requires an unbound operator without a vnode transition"
+                    .into(),
             ));
         }
         if self.metadata_restored
@@ -248,9 +310,10 @@ impl GraphOperator for ProcessFunctionOperator {
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, bytes: &[u8]) -> Result<(), DbError> {
         #[cfg(feature = "cluster")]
-        if !self.vnode_transition.is_idle() {
+        if !self.vnode_transition.is_idle() || self.assignment_fence.is_some() {
             return Err(DbError::Checkpoint(
-                "process vnode restore overlaps a vnode transition".into(),
+                "process vnode restore requires an unbound operator without a vnode transition"
+                    .into(),
             ));
         }
         // RECOVERY: vnode bytes do not repeat the descriptor binding. Validate it in the whole
