@@ -44,7 +44,7 @@ fn output_schema() -> SchemaRef {
     ]))
 }
 
-fn descriptor() -> ProcessFunctionDescriptor {
+pub(crate) fn descriptor() -> ProcessFunctionDescriptor {
     ProcessFunctionDescriptor {
         version: 1,
         runtime: ProcessRuntime::NativeRust,
@@ -288,7 +288,7 @@ fn checkpoint_restore_rejects_oversized_metadata_before_decode() {
     assert_eq!(replacement.checkpoint().unwrap().unwrap().data, before);
 }
 
-fn input_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
+pub(crate) fn input_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
     RecordBatch::try_new(
         input_schema(),
         vec![
@@ -361,7 +361,7 @@ fn output_row(account: &str, kind: &str, total: i64, crossed: bool, ts: i64) -> 
     .unwrap()
 }
 
-struct AccountActivity;
+pub(crate) struct AccountActivity;
 
 impl NativeProcessFunction for AccountActivity {
     fn invoke(
@@ -463,7 +463,7 @@ fn source(rows: &[(&str, i64, i64)]) -> FxHashMap<Arc<str>, Vec<RecordBatch>> {
     source
 }
 
-fn materialize(
+pub(crate) fn materialize(
     capture: GraphStateCapture,
 ) -> (
     Vec<(String, bytes::Bytes)>,
@@ -509,7 +509,7 @@ fn totals(output: &[RecordBatch]) -> Vec<i64> {
         .collect()
 }
 
-fn activity_rows(output: &[RecordBatch]) -> Vec<(String, String, i64, bool, i64)> {
+pub(crate) fn activity_rows(output: &[RecordBatch]) -> Vec<(String, String, i64, bool, i64)> {
     let mut rows = Vec::new();
     for batch in output {
         let account = batch

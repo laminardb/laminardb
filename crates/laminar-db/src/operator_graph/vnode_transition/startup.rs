@@ -1,5 +1,7 @@
 //! Bind a private startup image to its verified assignment before compute owns it.
 
+use std::sync::Arc;
+
 use laminar_core::cluster::control::ClusterController;
 
 use crate::operator::capability::ManagedStateContract;
@@ -54,6 +56,9 @@ impl OperatorGraph {
             ));
         }
         let authority = VnodeTransitionAuthoritySnapshot::capture_startup(config, assignment)?;
+        let deadline = controller.process_lease_deadline().ok_or_else(|| {
+            DbError::Checkpoint("process execution has no shared lease deadline".into())
+        })?;
         let owned = authority
             .assignment
             .owners()
@@ -69,6 +74,8 @@ impl OperatorGraph {
                 && node.capability.managed_state == Some(ManagedStateContract::ProcessFunctionV1)
         }) {
             node.operator.bind_startup_assignment(assignment, &owned)?;
+            node.operator
+                .bind_process_execution_authority(config, Arc::clone(&deadline))?;
         }
         // Hooks may fail or run arbitrary trusted native code. A partial image is dropped on
         // error; readiness is published only after the same lease and transport are revalidated.

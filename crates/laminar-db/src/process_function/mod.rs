@@ -20,6 +20,9 @@ mod registration;
 pub mod remote;
 mod schema;
 
+#[cfg(feature = "benchmark-internals")]
+pub mod benchmark;
+
 pub(crate) use operator::ProcessFunctionOperator;
 pub(crate) use schema::canonical_fields;
 
@@ -259,4 +262,4 @@ pub struct ProcessFunctionInfo {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

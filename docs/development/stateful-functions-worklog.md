@@ -1,6 +1,6 @@
 # Stateful Process Functions worklog
 
-**Status/date:** Active implementation, 2026-09-30. This is a resumable engineering log, not a support claim.
+**Status/date:** Active implementation, 2026-10-05. This is a resumable engineering log, not a support claim.
 
 ## Baseline
 
@@ -699,22 +699,138 @@ suites are not rerun in this increment; Rust/native transport tests do not add
 Python qualification. Evidence is retained in
 `target/process-cluster-authority-20261005/`.
 
+### Continuation: single-owner process execution fencing (2026-10-05)
+
+Starting from `262ecab0dde146c3fbcd6efa2694ee465119ce53`, this increment connects
+the private startup binding to actual process input and result application.
+Cluster graph construction selects an awaiting-authority execution state. Startup
+then pins the existing registry snapshot, transport incarnation, shared process
+lease deadline and recovery generation. Multi-owner assignments fail before
+intake until ordered cross-node input and frontier handling are qualified.
+Both cluster forms remain rejected by registration and operator capability.
+
+The single-owner path validates accepted input, derives canonical vnodes with the
+cached key codec, and reuses `route_checkpointed_batch`. Routed Arrow input and
+key/vnode scratch are checked against the declared input and temporary graph
+budgets before state application. This is not a full process-RSS measurement of
+the routing helper's internal metadata. Native callbacks and completed worker
+proposals require current authority immediately before applying state. Worker
+opens carry the pinned assignment/recovery generations for data and timers;
+completion guards retain that scope. Local execution retains zero generations.
+The record path uses the existing monotonic deadline and atomic versions, without
+registry/certificate locks, network or storage work. No coordinator, core,
+protocol, SDK, Python, dependency or runtime-admission change is included.
+
+Nine focused tests pass in 3.36 seconds, 92.74 seconds including compilation:
+canonical vnode routing and per-key order through the real graph, frame reopen
+and timers, unbound/fenced transport, native loss before input and during the
+handler, natural expiry, input/temporary-budget rejection, multi-owner rejection,
+actual Rust worker generation fields, delayed assignment/recovery replies, and
+a replacement boot after monotonic process-lease CAS takeover at term two. The
+replacement restores the selected state/timer frames and rejects the old reply
+and boot binding. These tests use real lease managers and loopback transports;
+private hooks leave public cluster admission closed. They do not certify a
+committed distributed checkpoint, live vnode publication or cross-node transfer.
+The first focused compile required keeping metadata as bytes rather than cloning
+`OperatorCheckpoint`; two new timer assertions then needed the fixture's actual
+`inactive` output label. Existing behavior and assertions were unchanged.
+
+Unchanged process baseline: 61 passed, one ignored, in 29.74 seconds using the
+existing all-feature binary. Both Clippy gates pass, all features/targets
+in 391.92 seconds including build-lock wait and without defaults in 37.54 seconds.
+The first Clippy attempt found one unnecessary `String::to_string` in the new
+benchmark-only fixture; the constructor now moves that error into `DbError`.
+Nightly formatting, diff checks and readability pass with 18 module and 214
+function exceptions without growth. The first workspace run passed connectors
+(1,989, two ignored) and core (1,126), then db passed 2,212, failed one and ignored
+two. The unchanged native pending-input host-loss test reached the existing
+five-second child-exit timeout; its isolated rerun passed in 4.64 seconds. A second
+workspace run encountered the same timeout while optimized compilation was
+active. The private native/worker tests now use `tests/mod.rs` and `tests/remote.rs`;
+their final test build and all-feature Clippy rerun pass (272.71 seconds including
+lock wait). The final full workspace run, without simultaneous compilation,
+measurement or profiling, passed all 6,198 tests: 1,989 connectors (two ignored),
+1,126 core, 2,213 database (two ignored) and 870 SQL. The command completed in
+649.37 seconds; the database suite took 284.03 seconds. The five-second host-exit
+assertion and production behavior were unchanged. All runs use two build jobs
+and `RUST_MIN_STACK=8388608`;
+the unadjusted Windows stack boundary is not newly qualified. No real-Python
+environment is selected.
+
+Criterion before/after runs use 30 samples, three-second warm-up and seven-second
+measurement, without concurrent tests or compilation. The no-default-feature
+reference excludes cluster guards, so a matching cluster-enabled reference was
+also built from a Git archive of the exact starting commit. Cargo reused the same
+executable name across source trees; the final binary was preserved, the unchanged
+reference rebuilt, and both case lists verified before measurement. Their separate
+executables and hashes are retained in the evidence directory. The cluster-enabled
+comparison's largest point regression is 2.91%; no existing-path point regression
+exceeds 5%. The unchanged handler's measured variation is not an implementation
+improvement claim. Core window assignment is unchanged and does not measure the
+process operator.
+
+| Existing path | Before mean | After mean | Criterion relative mean change |
+|---|---:|---:|---:|
+| Cluster feature enabled, one-row source/subscription | 31.038 us | 31.202 us | +0.53% |
+| Cluster feature enabled, 64 distinct keys | 105.338 us | 108.403 us | +2.91% |
+| Cluster feature enabled, 64 rows sharing a key | 108.604 us | 107.417 us | -1.09% |
+| No defaults, one-row source/subscription | 31.336 us | 30.469 us | -2.77% |
+| No defaults, 64 distinct keys | 108.465 us | 105.807 us | -2.45% |
+| No defaults, 64 rows sharing a key | 114.774 us | 108.999 us | -5.03% |
+| No defaults, prepared one-row handler | 424.804 ns | 438.341 ns | +3.19% |
+| Core 60-second tumbling-window assignment | 1.412 ns | 1.402 ns | -0.69% |
+
+The benchmark-only direct fixture compares identical prepared inputs through the
+production operator; it excludes connector, coordinator and subscription work.
+
+| Prepared input | Local mean | Private single-owner mean |
+|---|---:|---:|
+| One row | 1.691 us | 2.876 us |
+| 64 distinct keys | 70.575 us | 176.626 us |
+| 64 rows sharing one key | 73.005 us | 85.135 us |
+
+This new path has measurable routing cost, especially per-vnode Arrow grouping
+and repeated operator key encoding for distinct keys. There was no admitted
+cluster process path to compare before this increment. These numbers are not a
+cluster throughput qualification; the dev-host distinct-key mean falls short of
+the 500 K events/s reference target. Keep that cost visible when qualifying
+cross-node input, without adding an alternative router or speculative optimizer.
+Measurements are on Windows x86_64 MSVC, Ryzen 9 7900X, 12 cores/24 logical
+processors, Rust 1.99.0 with thin LTO, without a product or tail-latency claim.
+
+Hardware counter capture completed after Windows administrator consent. WPR
+recorded retired instructions and total cycles on context switches during two
+30-second profiles of the preserved final binary: prepared local and private
+single-owner execution with 64 distinct keys. Both benchmarks exited successfully;
+the task-owned recorder saved a 122,683,392-byte trace and stopped without cleanup
+failure. Capture and cleanup took 76.59 seconds. The pre-existing NT Kernel Logger
+was left running. The first non-elevated attempt had returned `0x80070005`
+(`Access is denied`).
+
+IPC counter analysis remains unverified. The installed Microsoft TraceProcessor
+libraries throw `NullReferenceException` in `SymbolFlyweightDataSource` when
+registering `UseProcessorCounters`, before trace processing. The trace and actual
+benchmark PIDs/digests are retained for analysis; no IPC value or successful IPC
+qualification is claimed. The user requested committing this increment with that
+unresolved analysis recorded. Complete the counter analysis before further
+record-path qualification or cluster admission. Primary references checked on 2026-10-05:
+[PMU recording](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/recording-pmu-events)
+and [TraceProcessor](https://learn.microsoft.com/en-us/windows/apps/trace-processing/tutorial).
+Evidence is under `target/process-owner-execution-20261005/`.
+
 ## Next executable task
 
-Continue original Phase E with process-lease and assignment fencing through the
-existing graph lifecycle. The shared-cut fixture above verifies same-owner frame
-restoration and isolated graph generations; it is not an admission certificate.
-The process participant now implements staged state/timer replacement and cold
-startup assignment binding through the existing graph/control authority. Next
-route canonical keyed input through the existing shuffle and bind remote attempts
-to authoritative assignment/recovery generations. The current cold-hook tests
-do not validate record intake against ownership; remote invocation scope
-generations remain local zero values. Qualify actual one-owner lease
-loss/restart and stale results before admitting distributed acquisition/revocation.
-Keep both cluster forms
-closed until their actual ownership/loss/stale-response tests pass. Do not add a
-second scheduler or state backend. Coordinator/core changes require the
-repository's before/after Criterion and IPC gates.
+Resolve the pending hardware counter analysis for this record-path increment.
+Then continue original Phase E through the existing graph
+lifecycle: ordered cross-node process input and frontiers, followed by actual
+ownership transfer, rescale, node loss and delayed old-owner replies restored
+from a committed shared checkpoint. The process participant now implements
+staged state/timer replacement, cold startup assignment binding and private
+single-owner intake/result fencing. Its frame-restoration and CAS-takeover tests
+do not certify a committed distributed cut or live vnode publication. Keep both
+cluster forms closed until their actual lifecycle tests pass. Do not add a second
+scheduler or state backend. Coordinator/core changes require the repository's
+before/after Criterion and IPC gates.
 
 Complete Python dependency/effect binding, host-loss and cleanup-failure
 qualification before stronger Python delivery. Longer resource qualification

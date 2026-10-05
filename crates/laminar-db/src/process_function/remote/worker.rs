@@ -30,6 +30,8 @@ pub struct RustReferenceWorker {
     digest: [u8; 32],
     handler: Arc<dyn NativeProcessFunction>,
     credits: Arc<Semaphore>,
+    #[cfg(all(test, feature = "cluster"))]
+    scope_observer: Option<tokio::sync::mpsc::Sender<wire::Open>>,
 }
 
 impl RustReferenceWorker {
@@ -57,7 +59,18 @@ impl RustReferenceWorker {
             digest,
             handler,
             credits: Arc::new(Semaphore::new(max_in_flight)),
+            #[cfg(all(test, feature = "cluster"))]
+            scope_observer: None,
         })
+    }
+
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn with_scope_observer(
+        mut self,
+        observer: tokio::sync::mpsc::Sender<wire::Open>,
+    ) -> Self {
+        self.scope_observer = Some(observer);
+        self
     }
 
     /// Serve an already bound loopback listener until shutdown. TLS and authentication are
@@ -102,6 +115,12 @@ impl RustReferenceWorker {
             return Err(Status::invalid_argument("process open must be first"));
         };
         self.validate_open(&open)?;
+        #[cfg(all(test, feature = "cluster"))]
+        if let Some(observer) = &self.scope_observer {
+            observer
+                .try_send(open.clone())
+                .map_err(|_| Status::internal("test scope observer is full or closed"))?;
+        }
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| Status::internal("system clock precedes Unix epoch"))?

@@ -112,6 +112,8 @@ pub(crate) struct ProcessFunctionOperator {
     assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
     #[cfg(feature = "cluster")]
     vnode_transition: transition::ProcessVnodeTransition,
+    #[cfg(feature = "cluster")]
+    execution: execution::ProcessExecution,
 }
 
 impl ProcessFunctionOperator {
@@ -194,6 +196,8 @@ impl ProcessFunctionOperator {
             assignment_fence: None,
             #[cfg(feature = "cluster")]
             vnode_transition: transition::ProcessVnodeTransition::Idle,
+            #[cfg(feature = "cluster")]
+            execution: execution::ProcessExecution::Local,
         })
     }
 
@@ -320,6 +324,8 @@ impl ProcessFunctionOperator {
         output_rows: &mut usize,
         output_bytes: &mut usize,
     ) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        self.require_execution_current()?;
         let response = match &self.handler {
             ProcessHandler::Native(handler) => handler.invoke(activations)?,
             #[cfg(feature = "process-remote")]
@@ -329,6 +335,8 @@ impl ProcessFunctionOperator {
                 ));
             }
         };
+        #[cfg(feature = "cluster")]
+        self.require_execution_current()?;
         if response.len() != activations.len() {
             return Err(DbError::InvalidOperation(
                 "process function response count differs from activation count".into(),
@@ -355,6 +363,8 @@ impl ProcessFunctionOperator {
             .next_activation_id
             .checked_add(u64::try_from(activations.len()).unwrap_or(u64::MAX))
             .ok_or_else(|| DbError::Pipeline("process activation ID exhausted".into()))?;
+        #[cfg(feature = "cluster")]
+        self.require_execution_current()?;
         self.commit_results(std::mem::take(&mut staged.keys));
         self.live_bytes = staged.live_bytes;
         self.key_count = staged.key_count;
@@ -732,6 +742,8 @@ fn validate_time_column(schema: &arrow_schema::Schema, name: &str) -> Result<usi
     Ok(index)
 }
 
+#[cfg(feature = "cluster")]
+mod execution;
 mod graph;
 #[cfg(feature = "process-remote")]
 mod remote;

@@ -34,6 +34,14 @@ impl OperatorGraph {
                 )?
             }
         };
+        #[cfg(feature = "cluster")]
+        let operator = {
+            let mut operator = operator;
+            if self.cluster_shuffle.is_some() {
+                operator.require_cluster_execution()?;
+            }
+            operator
+        };
         let source = self.ensure_source_node(&registration.source_name);
         let node =
             self.place_prepared_operator_node(&registration.output_name, Box::new(operator), 1);

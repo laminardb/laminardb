@@ -479,6 +479,17 @@ pub(crate) trait GraphOperator: Send {
         Ok(())
     }
 
+    /// Bind process execution to the same lease and transport as its startup state image.
+    /// This grants no cluster admission or source intake authority.
+    #[cfg(feature = "cluster")]
+    fn bind_process_execution_authority(
+        &mut self,
+        _config: &crate::operator::sql_query::ClusterShuffleConfig,
+        _deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
     /// Bind a privately restored operator's future transport to the exact target generation.
     /// The graph invokes this only before execution, without rebuilding or changing saved state.
     #[cfg(feature = "cluster")]

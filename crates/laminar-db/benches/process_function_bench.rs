@@ -167,6 +167,82 @@ fn native_one_row_end_to_end(criterion: &mut Criterion) {
 fn native_batch_end_to_end(criterion: &mut Criterion) {
     native_end_to_end(criterion, "native_process_64_distinct_keys", 64, 64);
     native_end_to_end(criterion, "native_process_64_same_key", 64, 1);
+    #[cfg(feature = "benchmark-internals")]
+    native_operator_routing(criterion);
+}
+
+#[cfg(feature = "benchmark-internals")]
+fn native_operator_routing(criterion: &mut Criterion) {
+    use laminar_db::process_function::benchmark::{
+        NativeProcessBenchmark, NativeProcessBenchmarkMode,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let output_schema = output_schema();
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    for (path, mode) in [
+        ("local", NativeProcessBenchmarkMode::Local),
+        ("single_owner", NativeProcessBenchmarkMode::SingleOwner),
+    ] {
+        for (shape, rows, keys) in [
+            ("one_row", 1, 1),
+            ("64_distinct", 64, 64),
+            ("64_same_key", 64, 1),
+        ] {
+            let descriptor = ProcessFunctionDescriptor {
+                runtime: laminar_db::process_function::ProcessRuntime::NativeRust,
+                version: 1,
+                function_id: "running_total".into(),
+                pipeline_state_id: "routing_latency_v1".into(),
+                implementation_digest: "a".repeat(64),
+                python_environment: None,
+                input_schema: Arc::clone(&input_schema),
+                output_schema: Arc::clone(&output_schema),
+                key_columns: vec!["account".into()],
+                event_time_column: "ts".into(),
+                output_event_time_column: "ts".into(),
+                value_state_name: "total".into(),
+                timer_names: Vec::new(),
+                limits: ProcessFunctionLimits::default(),
+            };
+            let mut fixture = runtime
+                .block_on(NativeProcessBenchmark::new(
+                    descriptor,
+                    Arc::new(RunningTotal {
+                        output_schema: Arc::clone(&output_schema),
+                    }),
+                    mode,
+                ))
+                .unwrap();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&input_schema),
+                vec![
+                    Arc::new(StringArray::from(
+                        (0..rows)
+                            .map(|row| format!("account-{}", row % keys))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(vec![1; rows])),
+                    Arc::new(TimestampMicrosecondArray::from(vec![1_000_000; rows])),
+                ],
+            )
+            .unwrap();
+            criterion.bench_function(&format!("native_operator_{path}_{shape}"), |bench| {
+                bench
+                    .iter(|| black_box(runtime.block_on(fixture.step(black_box(&batch))).unwrap()));
+            });
+        }
+    }
 }
 
 fn native_handler_only(criterion: &mut Criterion) {

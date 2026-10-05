@@ -24,11 +24,15 @@ struct QueuedInput {
 
 struct CompletedCall {
     activations: Vec<ProcessActivation>,
+    #[cfg(feature = "cluster")]
+    generations: (u64, u64),
     result: Result<Vec<ProcessActivationResult>, DbError>,
 }
 
 struct CompletionGuard {
     activations: Option<Vec<ProcessActivation>>,
+    #[cfg(feature = "cluster")]
+    generations: (u64, u64),
     sender: mpsc::Sender<CompletedCall>,
     wake: Arc<Notify>,
     send_failed: Arc<AtomicBool>,
@@ -43,6 +47,8 @@ impl CompletionGuard {
             .sender
             .try_send(CompletedCall {
                 activations,
+                #[cfg(feature = "cluster")]
+                generations: self.generations,
                 result,
             })
             .is_err()
@@ -328,14 +334,16 @@ impl RemoteExecution {
         if attempt_id == batch_id {
             attempt_id = Uuid::from_u128(batch_id.as_u128() ^ 1);
         }
+        #[cfg(feature = "cluster")]
+        let (owner_generation, recovery_generation) = operator.execution_generations()?;
+        #[cfg(not(feature = "cluster"))]
+        let (owner_generation, recovery_generation) = (0, 0);
         let scope = RemoteInvocationScope {
             operator_id: self.operator_id.clone(),
             vnode,
             vnode_count: operator.vnode_count.get(),
-            // Local execution has no cluster owner or recovery generation. UUID attempts and a
-            // fresh graph generation fence late replies before state application.
-            owner_generation: 0,
-            recovery_generation: 0,
+            owner_generation,
+            recovery_generation,
             batch_id,
             attempt_id,
             input_watermark_us: (operator.watermark_us != i64::MIN)
@@ -344,6 +352,8 @@ impl RemoteExecution {
         let client = Arc::clone(client);
         let guard = CompletionGuard {
             activations: Some(activations),
+            #[cfg(feature = "cluster")]
+            generations: (owner_generation, recovery_generation),
             sender: self.completed_tx.clone(),
             wake: Arc::clone(&self.wake),
             send_failed: Arc::clone(&self.send_failed),
@@ -373,6 +383,13 @@ impl RemoteExecution {
             ));
         }
         while let Ok(completed) = self.completed_rx.try_recv() {
+            #[cfg(feature = "cluster")]
+            if operator.execution_generations()? != completed.generations {
+                return Err(DbError::StatefulOperatorPartialApply(
+                    "process worker response belongs to a stale assignment or recovery generation"
+                        .into(),
+                ));
+            }
             self.running = self.running.checked_sub(1).ok_or_else(|| {
                 DbError::StatefulOperatorPartialApply(
                     "process invocation accounting underflow".into(),
@@ -412,6 +429,8 @@ impl RemoteExecution {
                         ))
                     }
                 })?;
+            #[cfg(feature = "cluster")]
+            operator.require_execution_current()?;
             operator.commit_results(std::mem::take(&mut staged.keys));
             operator.live_bytes = staged.live_bytes;
             operator.key_count = staged.key_count;

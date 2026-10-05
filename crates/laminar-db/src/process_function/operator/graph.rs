@@ -96,6 +96,31 @@ impl GraphOperator for ProcessFunctionOperator {
         self.graph_budget = bytes;
     }
 
+    #[cfg(feature = "cluster")]
+    fn bind_process_execution_authority(
+        &mut self,
+        config: &crate::operator::sql_query::ClusterShuffleConfig,
+        deadline: std::sync::Arc<laminar_core::cluster::control::LeaseDeadline>,
+    ) -> Result<(), DbError> {
+        if !matches!(
+            self.execution,
+            super::execution::ProcessExecution::AwaitingAssignment
+        ) || !self.vnode_transition.is_idle()
+            || self.checkpoint_drain_pending()
+        {
+            return Err(DbError::Checkpoint(
+                "process execution binding requires a private startup graph".into(),
+            ));
+        }
+        let assignment = self.assignment_fence.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("process execution requires bound startup state".into())
+        })?;
+        let authority =
+            super::execution::ProcessExecutionAuthority::bind(config, assignment, deadline)?;
+        self.execution = super::execution::ProcessExecution::SingleOwner(authority);
+        Ok(())
+    }
+
     async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
         Ok(())
     }
@@ -121,14 +146,32 @@ impl GraphOperator for ProcessFunctionOperator {
         inputs: &[Vec<RecordBatch>],
         frontiers: &[InputFrontier],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        #[cfg(feature = "process-remote")]
-        if matches!(&self.handler, ProcessHandler::Remote(_)) {
-            return self.process_remote(inputs, frontiers);
-        }
         if inputs.len() > 1 || frontiers.len() != 1 {
             return Err(DbError::InvalidOperation(
                 "process function requires exactly one input frontier".into(),
             ));
+        }
+        #[cfg(feature = "cluster")]
+        let routed = self
+            .route_owned_input(inputs)
+            .map_err(|error| {
+                if error.requires_pipeline_halt()
+                    || error.requires_pipeline_recovery()
+                    || error.is_shuffle_not_ready()
+                {
+                    error
+                } else {
+                    DbError::PipelineTerminal(format!(
+                        "process function rejected routed input: {error}"
+                    ))
+                }
+            })?
+            .map(|batches| [batches]);
+        #[cfg(feature = "cluster")]
+        let inputs = routed.as_ref().map_or(inputs, |ports| ports.as_slice());
+        #[cfg(feature = "process-remote")]
+        if matches!(&self.handler, ProcessHandler::Remote(_)) {
+            return self.process_remote(inputs, frontiers);
         }
         let start_id = self.next_activation_id;
         let old_watermark = self.watermark_us;
