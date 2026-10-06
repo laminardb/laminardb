@@ -1487,18 +1487,110 @@ qualification results. The final suites execute the actual named cases. The owne
 MinIO container is removed after checking its exact ID and task label; it has no
 host mounts, and existing Docker services are left running.
 
+## 2026-10-06 — Independent database recovery from a committed shared cut
+
+Status: completed and validated. This continues
+original Phase E from `0f3b841d`. Public cluster process-function registration and
+graph admission remain closed. Production runtime code is unchanged.
+
+An ignored server test starts two independent database processes from the actual
+cluster test binary. Each owns its database, recovery monitor, renewable leases,
+leased control RPC endpoint and loopback shuffle transport. It reuses the existing
+server test fixture for namespace proof, catalog bootstrap and assignment setup,
+and the server's real `ObjectStoreClusterKv` over loopback MinIO. The existing
+GENESIS suite moves into a module family so these resources are shared without
+duplicating a control backend.
+
+The admitted SQL pipeline is a direct-source keyed aggregate. Two bounded input
+partitions carry deterministic row positions, explicit watermarks and independent
+cursors. Initial input crosses the shuffle mesh and updates one key on each vnode.
+The database commits checkpoint 1 with totals 32 and 30, two participant manifests
+and both source cursors at 2. Further input reaches totals 63 and 60 without another
+checkpoint. The parent forcibly kills the second process, then supplies the
+survivor's controlled discovery watch with the remaining member. The production
+snapshot watcher and rebalance controller authorize assignment 2 with both vnodes
+owned by the survivor; the database monitor selects the committed cut, restores
+both source cursors and holds Start behind closed intake.
+
+The held Start checks the exact handoff reference, including its index digest and
+length, the new owner fence, both restored cursors and the retained prior Release.
+Making the remaining input available while Start is held leaves poll counts and
+output unchanged. Only the matching durable `ReleaseCommitted` opens intake.
+Replaying the uncommitted suffix and one further row per partition then produces
+totals 104 and 100, demonstrating donor-state continuity and rewind of the
+survivor's uncommitted state. The observation sink appends and syncs a bounded
+local log before acknowledging each batch, satisfying its at-least-once fixture
+contract. It does not certify an external connector or exactly-once delivery.
+
+Commands and messages have explicit byte/count/deadline bounds. Child cleanup
+releases the source hold, cancels and joins the existing rebalance tasks, shuts
+down the database and joins lease renewal. The parent joins normal exits and the
+intentional forced exit, preserving primary and cleanup errors. A failure in the
+older same-process GENESIS fixture exposed a teardown transport race; both
+databases now receive close intent before either shared-client runtime retires.
+Initial fixture attempts also preserve the sink-durability and reserved-channel
+checks rather than relaxing runtime admission. The older phase wait is now 90
+seconds: its previous 40-second bound excluded the monitor's existing 60-second
+orphan-Start retry after leader-proof replacement. The final suite completes that
+slower production path without injecting another test fault or clearing retained control.
+
+The first successful independent case completes in 19.06 seconds (66.60 seconds
+including compilation) with PIDs 102460 and 102444, committed epoch 1 and recovery
+generation 2. The final suite below also checks the exact handoff digest added
+during review. With the pinned local MinIO image running on `127.0.0.1:19010` and
+bucket `process-db-recovery`:
+
+```powershell
+$env:CARGO_BUILD_JOBS='2'
+$env:RUST_MIN_STACK='8388608'
+$env:LAMINAR_PROCESS_TEST_S3_ENDPOINT='http://127.0.0.1:19010'
+$env:LAMINAR_PROCESS_TEST_S3_BUCKET='process-db-recovery'
+cargo test -p laminar-server --bin laminardb --no-default-features --features cluster,aws cluster::recovery_round_tests::committed::surviving_database_recovers_lost_vnodes_and_replays_the_committed_source_cut -- --exact --ignored --nocapture
+```
+
+This is cluster aggregate/control qualification with an injected discovery
+snapshot after a real OS-process kill. It does not certify gossip failure
+detection, process-function database restore, independent-channel callback order,
+external sink delivery, replacement of the last owner or autonomous final-owner
+drain. Embedded and single-node server behavior is unchanged. No hot-path
+production bodies change, so new Criterion and IPC capture are not required.
+Evidence is retained in `target/process-db-recovery-20261006/`.
+
+### Validation
+
+The final cluster server suite includes both live ignored cases and passes all
+55 tests in 105.41 seconds (128.81 seconds including compilation). The final
+`laminardb-5e7a97b809aa37fa.exe` SHA-256 is
+`6C199BE420D7CB2A1844D15C4C552A658BB13BB164F5E1AB21D4D62B450DB327`.
+
+All required gates pass with `CARGO_BUILD_JOBS=2` and `RUST_MIN_STACK=8388608`:
+
+| Gate | Result | Command seconds |
+|---|---|---:|
+| `cargo test --workspace --lib` | 1,989 connector, 1,127 core, 2,241 database and 870 SQL tests pass; five ignored | 162.65 |
+| `cargo clippy --workspace --all-features --all-targets -- -D warnings` | Pass | 26.75 |
+| `cargo clippy --workspace --no-default-features -- -D warnings` | Pass | 1.14 |
+| `cargo +nightly fmt --all -- --check` | Pass | 5.20 |
+| `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | Pass; 18 module and 214 function exceptions unchanged | 9.82 |
+
+The workspace suite passes on its first run; no connector retry is needed. Earlier
+server runs retain the failed fixture attempts, the teardown race and the phase
+timeout before the lifecycle-bound correction. No dependency, lockfile,
+readability baseline, production runtime body or admission check changes. The
+source/binary hashes, commands, durations and owned-fixture identity are retained
+with the logs. The owned MinIO container is removed after verifying its exact ID,
+task label and absence of mounts; existing Docker services remain running.
+
 ## Next executable task
 
-Continue original Phase E through database-owned recovery from a committed shared
-cut with independently failed and surviving peer processes and the server's
-durable recovery KV. GENESIS rounds now qualify held Start, stale Release and
-same-process leader-proof interruption; committed stateful database recovery and
-autonomous final-owner drain remain pending. Independent private graph owners
-already qualify replacement, membership entry/exit and committed-cut replay.
+Continue original Phase E by binding the process-function replay profile to an
+explicitly admitted source-order contract, then integrate process functions with
+database-owned committed-cut recovery under that contract. The existing
+independent database aggregate case now covers the control prerequisite; it does
+not open process-function admission. Reuse its real recovery/assignment lifecycle
+for process-specific crash qualification after the ordering boundary is enforced.
 
-Bind the controlled source-order and timer-rescheduling profile to an explicitly
-admitted source-order contract before opening either public cluster form. Fixture
-positions do not certify connector/sink delivery or independent-channel replay
+Fixture positions do not certify connector/sink delivery or independent-channel replay
 equivalence. Keep both public cluster admission paths closed through these gates.
 Do not add a second scheduler or state backend. Coordinator/core changes require
 the repository's before/after Criterion and IPC gates.

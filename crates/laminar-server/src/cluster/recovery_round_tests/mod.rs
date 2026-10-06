@@ -32,9 +32,13 @@ use uuid::Uuid;
 
 use super::control_kv::ObjectStoreClusterKv;
 
+mod committed;
+
 const DEADLINE: Duration = Duration::from_secs(40);
 const TTL: Duration = Duration::from_secs(60);
 const LEADER_TTL: Duration = Duration::from_secs(6);
+// A retained restored round has a 60-second production orphan timeout before retry.
+const ROUND_DEADLINE: Duration = Duration::from_secs(90);
 const SOURCE: &str = "recovery-round-probe";
 
 #[derive(Default)]
@@ -101,6 +105,25 @@ impl SourceConnector for HeldSource {
     }
 }
 
+fn held_connector(
+    probe: Arc<SourceProbe>,
+) -> impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError> {
+    move |registry| {
+        registry.register_source(
+            SOURCE,
+            ConnectorInfo {
+                name: SOURCE.into(),
+                display_name: SOURCE.into(),
+                version: "1".into(),
+                is_source: true,
+                is_sink: false,
+                config_keys: Vec::new(),
+            },
+            Arc::new(move |_| Ok(Box::new(HeldSource(Arc::clone(&probe))))),
+        )
+    }
+}
+
 struct Peer {
     controller: Arc<ClusterController>,
     kv: Arc<dyn ClusterKv>,
@@ -111,6 +134,7 @@ struct Peer {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     leader_watch: watch::Receiver<Option<LeaderLease>>,
     _membership: watch::Sender<Vec<NodeInfo>>,
+    lease: laminar_core::cluster::control::ProcessLease,
 }
 
 fn participants() -> Vec<CheckpointParticipant> {
@@ -138,8 +162,12 @@ fn membership() -> Vec<NodeInfo> {
 }
 
 impl Peer {
-    async fn acquire(node: u64, objects: Arc<dyn object_store::ObjectStore>) -> Result<Self> {
-        let authority = Arc::new(ProcessLeaseAuthority::new(Arc::clone(&objects), TTL)?);
+    async fn acquire(
+        node: u64,
+        objects: Arc<dyn object_store::ObjectStore>,
+        ttl: Duration,
+    ) -> Result<Self> {
+        let authority = Arc::new(ProcessLeaseAuthority::new(Arc::clone(&objects), ttl)?);
         let store = authority.store_for(NodeId(node));
         let boot = Uuid::from_u128(u128::from(node));
         let started = Instant::now();
@@ -150,8 +178,8 @@ impl Peer {
             store,
             boot,
             ProcessLeaseConfig {
-                ttl: TTL,
-                renew_interval: Duration::from_secs(5),
+                ttl,
+                renew_interval: ttl / 12,
             },
             started,
             &lease,
@@ -160,7 +188,7 @@ impl Peer {
         let kv: Arc<dyn ClusterKv> = Arc::new(ObjectStoreClusterKv::new(
             lease.clone(),
             process.deadline(),
-            60_000,
+            i64::try_from(ttl.as_millis())?,
             Arc::clone(&objects),
             members_rx.clone(),
         ));
@@ -217,6 +245,7 @@ impl Peer {
             tasks,
             leader_watch,
             _membership: membership,
+            lease,
         })
     }
 
@@ -225,7 +254,10 @@ impl Peer {
         objects: Arc<dyn object_store::ObjectStore>,
         snapshot: &AssignmentSnapshot,
         assignments: Arc<AssignmentSnapshotStore>,
-    ) -> Result<(Arc<ShuffleSender>, std::net::SocketAddr)> {
+        register: impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError>
+            + Send
+            + 'static,
+    ) -> Result<(Arc<ShuffleSender>, std::net::SocketAddr, Arc<VnodeRegistry>)> {
         let local = CheckpointParticipant {
             node_id: self.controller.instance_id().0,
             boot_incarnation: self.controller.recovery_incarnation(),
@@ -252,11 +284,10 @@ impl Peer {
             )
             .await?,
         );
-        let probe = Arc::clone(&self.probe);
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&self.controller))
             .verified_cluster_namespaces(verified)
-            .vnode_registry(registry)
+            .vnode_registry(Arc::clone(&registry))
             .assignment_snapshot_store(assignments)
             .catalog_manifest_store(Arc::clone(&self.catalog))
             .shuffle_sender(Arc::clone(&sender))
@@ -265,27 +296,13 @@ impl Peer {
                 interval_ms: None,
                 ..Default::default()
             })
-            .register_connector(move |registry| {
-                let probe = Arc::clone(&probe);
-                registry.register_source(
-                    SOURCE,
-                    ConnectorInfo {
-                        name: SOURCE.into(),
-                        display_name: SOURCE.into(),
-                        version: "1".into(),
-                        is_source: true,
-                        is_sink: false,
-                        config_keys: Vec::new(),
-                    },
-                    Arc::new(move |_| Ok(Box::new(HeldSource(Arc::clone(&probe))))),
-                )
-            })
+            .register_connector(register)
             .build()
             .await?;
         self.db = Some(Arc::clone(&db));
         self.controller
             .publish_checkpoint_assignment_fence(Some(snapshot.assignment_fence()?));
-        Ok((sender, receiver.local_addr()))
+        Ok((sender, receiver.local_addr(), registry))
     }
 
     async fn close(&mut self) -> Vec<String> {
@@ -321,7 +338,7 @@ impl Peer {
 async fn cleanup_reports_a_completed_failed_task_without_polling_it_twice() {
     let objects: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
-    let mut peer = Peer::acquire(7, objects).await.unwrap();
+    let mut peer = Peer::acquire(7, objects, TTL).await.unwrap();
     let failed = tokio::spawn(std::future::pending::<()>());
     failed.abort();
     peer.tasks.push(failed);
@@ -331,7 +348,7 @@ async fn cleanup_reports_a_completed_failed_task_without_polling_it_twice() {
     assert!(peer.tasks.is_empty());
 }
 
-fn shared_store() -> Result<Arc<dyn object_store::ObjectStore>> {
+fn shared_store(namespace: &str) -> Result<Arc<dyn object_store::ObjectStore>> {
     let endpoint = std::env::var("LAMINAR_PROCESS_TEST_S3_ENDPOINT")?;
     let address: std::net::SocketAddr = endpoint
         .strip_prefix("http://")
@@ -349,8 +366,7 @@ fn shared_store() -> Result<Arc<dyn object_store::ObjectStore>> {
         .with_allow_http(true)
         .build()?;
     Ok(Arc::new(object_store::prefix::PrefixStore::new(
-        store,
-        format!("rounds/{}", Uuid::new_v4()),
+        store, namespace,
     )))
 }
 
@@ -359,7 +375,7 @@ async fn wait_phase(
     phase: RecoverPhase,
     after: u64,
 ) -> Result<RecoveryAnnouncement> {
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(ROUND_DEADLINE, async {
         loop {
             let observed = match phase {
                 RecoverPhase::ReleaseCommitted { .. } => {
@@ -384,19 +400,26 @@ async fn wait_phase(
     .context("database monitor did not reach the expected recovery phase")?
 }
 
-async fn qualify(
+async fn bootstrap_held_round(
     peers: &mut [Peer; 2],
     objects: Arc<dyn object_store::ObjectStore>,
     snapshot: &AssignmentSnapshot,
     assignments: Arc<AssignmentSnapshotStore>,
 ) -> Result<()> {
     let [driver, follower] = peers;
+    let driver_connectors = held_connector(Arc::clone(&driver.probe));
+    let follower_connectors = held_connector(Arc::clone(&follower.probe));
     let (left, right) = tokio::join!(
-        driver.initialize(Arc::clone(&objects), snapshot, Arc::clone(&assignments)),
-        follower.initialize(objects, snapshot, assignments)
+        driver.initialize(
+            Arc::clone(&objects),
+            snapshot,
+            Arc::clone(&assignments),
+            driver_connectors
+        ),
+        follower.initialize(objects, snapshot, assignments, follower_connectors)
     );
-    let (driver_sender, driver_address) = left?;
-    let (follower_sender, follower_address) = right?;
+    let (driver_sender, driver_address, _) = left?;
+    let (follower_sender, follower_address, _) = right?;
     driver_sender.register_peer(follower.controller.instance_id().0, follower_address);
     follower_sender.register_peer(driver.controller.instance_id().0, driver_address);
     let driver_db = driver.db.as_ref().unwrap();
@@ -439,6 +462,19 @@ async fn qualify(
     follower.probe.hold_start.store(true, Ordering::Release);
     driver_db.enable_coordinated_recovery()?;
     follower_db.enable_coordinated_recovery()?;
+    Ok(())
+}
+
+async fn qualify(
+    peers: &mut [Peer; 2],
+    objects: Arc<dyn object_store::ObjectStore>,
+    snapshot: &AssignmentSnapshot,
+    assignments: Arc<AssignmentSnapshotStore>,
+) -> Result<()> {
+    bootstrap_held_round(peers, objects, snapshot, assignments).await?;
+    let [driver, follower] = peers;
+    let driver_db = driver.db.as_ref().unwrap();
+    let follower_db = follower.db.as_ref().unwrap();
     let first = wait_phase(&driver.controller, RecoverPhase::Start { epoch: 0 }, 0).await?;
     tokio::time::timeout(DEADLINE, async {
         while follower.probe.starts.load(Ordering::Acquire) < 2 {
@@ -602,7 +638,7 @@ async fn database_rounds_hold_intake_until_exact_durable_release() {
         .with_max_level(tracing::Level::WARN)
         .with_test_writer()
         .try_init();
-    let objects = shared_store().unwrap();
+    let objects = shared_store(&format!("rounds/{}", Uuid::new_v4())).unwrap();
     let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&objects)));
     let snapshot = AssignmentSnapshot::empty()
         .next_for_participants(
@@ -611,8 +647,8 @@ async fn database_rounds_hold_intake_until_exact_durable_release() {
         )
         .unwrap();
     assignments.save_if_absent(&snapshot).await.unwrap();
-    let driver = Peer::acquire(7, Arc::clone(&objects)).await.unwrap();
-    let mut peers = match Peer::acquire(8, Arc::clone(&objects)).await {
+    let driver = Peer::acquire(7, Arc::clone(&objects), TTL).await.unwrap();
+    let mut peers = match Peer::acquire(8, Arc::clone(&objects), TTL).await {
         Ok(follower) => [driver, follower],
         Err(error) => {
             let mut driver = driver;
@@ -626,6 +662,10 @@ async fn database_rounds_hold_intake_until_exact_durable_release() {
             .await;
     for peer in &peers {
         peer.probe.hold_start.store(false, Ordering::Release);
+        // Both databases share a transport client; close both before retiring either runtime.
+        if let Some(db) = &peer.db {
+            db.close();
+        }
     }
     let mut cleanup = Vec::new();
     for peer in &mut peers {
