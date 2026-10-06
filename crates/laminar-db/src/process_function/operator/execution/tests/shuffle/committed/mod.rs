@@ -2,6 +2,8 @@ use super::*;
 use crate::recovery_manager::{ClusterRecoveryTarget, RecoveredState};
 
 mod node_loss;
+#[cfg(not(target_arch = "wasm32"))]
+mod peers;
 #[cfg(feature = "process-remote")]
 mod remote;
 mod replay;

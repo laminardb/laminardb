@@ -80,7 +80,7 @@ async fn delayed_lost_owner_reply_cannot_apply_after_committed_shared_checkpoint
     let owners = [9; 4];
     let target = target_fence(8, owners);
     let nodes = target_nodes(&pair, &target, owners).await;
-    cut.publish_target(&target, owners).await;
+    cut.publish_target([7, 8, 7, 8], &target, owners).await;
     for node in &pair.nodes {
         node.controller.fence_process_lease();
     }

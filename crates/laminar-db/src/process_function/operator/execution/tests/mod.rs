@@ -28,6 +28,7 @@ struct Fixture {
     controller: Arc<ClusterController>,
     scope: ClusterShuffleConfig,
     binding: InstalledVnodeStateBinding,
+    lease_manager: Option<ProcessLeaseManager>,
 }
 
 impl Fixture {
@@ -136,6 +137,7 @@ impl Fixture {
                 topology: None,
             },
             binding: InstalledVnodeStateBinding::new(fence, PipelineIdentity::empty()).unwrap(),
+            lease_manager: Some(manager),
         }
     }
 
@@ -193,6 +195,7 @@ impl Fixture {
         graph
     }
 
+    #[cfg(feature = "process-remote")]
     async fn takeover(&self, boot: Uuid, version: u64, recovery: u64) -> Self {
         let store = self.authority.store_for(NodeId(7));
         let observation = store

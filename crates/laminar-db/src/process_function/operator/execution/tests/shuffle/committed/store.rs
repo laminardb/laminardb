@@ -55,6 +55,7 @@ impl SharedCut {
 
     pub(super) async fn publish_target(
         &self,
+        predecessor_owners: [u64; 4],
         target: &CheckpointAssignmentFence,
         owners: [u64; 4],
     ) {
@@ -62,12 +63,7 @@ impl SharedCut {
         let mut snapshot = AssignmentSnapshot {
             version: 1,
             partitioning_abi_version: self.fence.partitioning_abi_version,
-            vnodes: AssignmentSnapshot::vnodes_from_vec(&[
-                NodeId(7),
-                NodeId(8),
-                NodeId(7),
-                NodeId(8),
-            ]),
+            vnodes: AssignmentSnapshot::vnodes_from_vec(&predecessor_owners.map(NodeId)),
             participants: self.fence.participants.clone(),
             updated_at_ms: 0,
             draining: false,
@@ -159,107 +155,15 @@ impl SharedCut {
                 .unwrap();
             assert!(graph.checkpoint_is_quiescent());
         }
-        let objects = Arc::clone(&pair.objects);
-        let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
-        let deployment = decisions.load_or_create_deployment_id().await.unwrap();
-        let leader = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 60_000));
-        let owner = LeaderLeaseOwner {
-            node: NodeId(7),
-            boot: Uuid::from_u128(7),
-            process_term: 1,
-        };
-        let LeaseOutcome::Acquired(lease) = leader.begin_new_term(&owner, 0).await.unwrap() else {
-            panic!("fixture leader must acquire its shared CAS term");
-        };
-        let proof = lease.proof();
-        leader
-            .begin_cluster_checkpoint_artifacts(
-                &proof,
-                CheckpointArtifactInventory {
-                    deployment_id: deployment.clone(),
-                    pipeline_identity: PipelineIdentity::empty(),
-                    attempt: CheckpointAttempt::canonical(1),
-                    assignment_fence: Some(fence.clone()),
-                    sink_artifact_intent_protocol: true,
-                },
-            )
-            .await
-            .unwrap();
+        let writer = CheckpointWriter::begin(Arc::clone(&pair.objects), fence).await;
         let mut manifests = Vec::new();
-        let mut participants = Vec::new();
         for (graph, node) in graphs.iter_mut().zip(&pair.nodes) {
-            let (manifest, payload) = capture(graph, node, &deployment);
-            let store = checkpoint_store(Arc::clone(&objects), node.scope.self_id.0);
+            let (manifest, payload) = capture(graph, node, &writer.deployment);
+            let store = checkpoint_store(Arc::clone(&pair.objects), node.scope.self_id.0);
             let encoded = store.save_checkpoint(&manifest, &[payload]).await.unwrap();
-            participants.push(CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap());
             manifests.push((manifest, encoded));
         }
-        let mut offsets = HashMap::new();
-        for (manifest, _) in &manifests {
-            offsets.extend(manifest.source_offsets["events"].offsets.clone());
-        }
-        let index = CommittedCheckpointIndex {
-            version: COMMITTED_CHECKPOINT_INDEX_VERSION,
-            deployment_id: deployment.clone(),
-            pipeline_identity: PipelineIdentity::empty(),
-            epoch: 1,
-            checkpoint_id: 1,
-            predecessor: None,
-            scope: CheckpointScope::Cluster,
-            vnode_count: 4,
-            assignment_fence: Some(fence.clone()),
-            reassignment_portable: true,
-            participants,
-            source_names: vec!["events".into()],
-            source_offsets: BTreeMap::from([(
-                "events".into(),
-                ConnectorCheckpoint::with_offsets(offsets),
-            )]),
-            channel_progress: manifests
-                .iter()
-                .flat_map(|(manifest, _)| manifest.channel_progress.clone())
-                .collect(),
-            source_watermarks: BTreeMap::from([("events".into(), 105)]),
-            checkpoint_watermark: Some(105),
-        };
-        index
-            .validate_participant_manifests(
-                &manifests
-                    .iter()
-                    .map(|(manifest, bytes)| (manifest, bytes.as_ref()))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-        let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
-        leader
-            .record_cluster_outcome(
-                &proof,
-                1,
-                1,
-                fence.clone(),
-                CheckpointVerdict::Commit,
-                Some(reference.clone()),
-            )
-            .await
-            .unwrap();
-        let cut = Self {
-            objects,
-            decisions,
-            leader,
-            proof,
-            reference,
-            fence,
-            deployment,
-        };
-        assert_eq!(
-            cut.leader
-                .highest_cluster_committed_outcome()
-                .await
-                .unwrap()
-                .unwrap()
-                .committed_checkpoint,
-            Some(cut.reference.clone())
-        );
+        let cut = writer.commit(manifests).await;
         for node in &pair.nodes {
             node.scope
                 .receiver
@@ -342,7 +246,142 @@ impl SharedCut {
     }
 }
 
-fn checkpoint_store(
+pub(super) struct CheckpointWriter {
+    objects: Arc<dyn object_store::ObjectStore>,
+    decisions: Arc<CheckpointDecisionStore>,
+    leader: Arc<LeaderLeaseStore>,
+    proof: laminar_core::checkpoint::LeaderProof,
+    pub(super) deployment: String,
+    fence: CheckpointAssignmentFence,
+}
+
+impl CheckpointWriter {
+    pub(super) async fn begin(
+        objects: Arc<dyn object_store::ObjectStore>,
+        fence: CheckpointAssignmentFence,
+    ) -> Self {
+        let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
+        let deployment = decisions.load_or_create_deployment_id().await.unwrap();
+        let leader = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 60_000));
+        let participant = fence.participants.last().unwrap();
+        let owner = LeaderLeaseOwner {
+            node: NodeId(participant.node_id),
+            boot: participant.boot_incarnation,
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = leader.begin_new_term(&owner, 0).await.unwrap() else {
+            panic!("fixture leader must acquire its shared CAS term");
+        };
+        let proof = lease.proof();
+        leader
+            .begin_cluster_checkpoint_artifacts(
+                &proof,
+                CheckpointArtifactInventory {
+                    deployment_id: deployment.clone(),
+                    pipeline_identity: PipelineIdentity::empty(),
+                    attempt: CheckpointAttempt::canonical(1),
+                    assignment_fence: Some(fence.clone()),
+                    sink_artifact_intent_protocol: true,
+                },
+            )
+            .await
+            .unwrap();
+        Self {
+            objects,
+            decisions,
+            leader,
+            proof,
+            deployment,
+            fence,
+        }
+    }
+
+    pub(super) async fn commit(self, manifests: Vec<(CheckpointManifest, Bytes)>) -> SharedCut {
+        let Self {
+            objects,
+            decisions,
+            leader,
+            proof,
+            deployment,
+            fence,
+        } = self;
+        let participants = manifests
+            .iter()
+            .map(|(manifest, encoded)| {
+                CommittedParticipantRef::from_manifest(manifest, encoded).unwrap()
+            })
+            .collect();
+        let mut offsets = HashMap::new();
+        for (manifest, _) in &manifests {
+            offsets.extend(manifest.source_offsets["events"].offsets.clone());
+        }
+        let index = CommittedCheckpointIndex {
+            version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+            deployment_id: deployment.clone(),
+            pipeline_identity: PipelineIdentity::empty(),
+            epoch: 1,
+            checkpoint_id: 1,
+            predecessor: None,
+            scope: CheckpointScope::Cluster,
+            vnode_count: 4,
+            assignment_fence: Some(fence.clone()),
+            reassignment_portable: true,
+            participants,
+            source_names: vec!["events".into()],
+            source_offsets: BTreeMap::from([(
+                "events".into(),
+                ConnectorCheckpoint::with_offsets(offsets),
+            )]),
+            channel_progress: manifests
+                .iter()
+                .flat_map(|(manifest, _)| manifest.channel_progress.clone())
+                .collect(),
+            source_watermarks: BTreeMap::from([("events".into(), 105)]),
+            checkpoint_watermark: Some(105),
+        };
+        index
+            .validate_participant_manifests(
+                &manifests
+                    .iter()
+                    .map(|(manifest, bytes)| (manifest, bytes.as_ref()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+        leader
+            .record_cluster_outcome(
+                &proof,
+                1,
+                1,
+                fence.clone(),
+                CheckpointVerdict::Commit,
+                Some(reference.clone()),
+            )
+            .await
+            .unwrap();
+        let cut = SharedCut {
+            objects,
+            decisions,
+            leader,
+            proof,
+            reference,
+            fence,
+            deployment,
+        };
+        assert_eq!(
+            cut.leader
+                .highest_cluster_committed_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .committed_checkpoint,
+            Some(cut.reference.clone())
+        );
+        cut
+    }
+}
+
+pub(super) fn checkpoint_store(
     objects: Arc<dyn object_store::ObjectStore>,
     participant: u64,
 ) -> ObjectStoreCheckpointStore {
@@ -351,7 +390,7 @@ fn checkpoint_store(
         .with_participant_id(participant)
 }
 
-fn capture(
+pub(super) fn capture(
     graph: &mut OperatorGraph,
     node: &Fixture,
     deployment: &str,

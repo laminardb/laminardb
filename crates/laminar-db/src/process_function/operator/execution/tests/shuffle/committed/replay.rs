@@ -1,8 +1,8 @@
 use super::*;
 use crate::process_function::ProcessCallback;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct CallbackIdentity {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(super) struct CallbackIdentity {
     key: String,
     event_time_us: i64,
     timer: bool,
@@ -10,8 +10,8 @@ struct CallbackIdentity {
 }
 
 #[derive(Default)]
-struct RecordingActivity {
-    callbacks: parking_lot::Mutex<Vec<CallbackIdentity>>,
+pub(super) struct RecordingActivity {
+    pub(super) callbacks: parking_lot::Mutex<Vec<CallbackIdentity>>,
 }
 
 impl NativeProcessFunction for RecordingActivity {
@@ -76,7 +76,7 @@ async fn qualify_committed_replay(
     let owners = [7, 9, 8, 9];
     let fence = target_fence(8, owners);
     let nodes = target_nodes(&pair, &fence, owners).await;
-    cut.publish_target(&fence, owners).await;
+    cut.publish_target([7, 8, 7, 8], &fence, owners).await;
     let mut graphs = Vec::new();
     for node in &nodes {
         let recovered = cut.recover(node).await.unwrap();

@@ -1,6 +1,6 @@
 # Stateful Process Functions worklog
 
-**Status/date:** Active implementation, 2026-10-05. This is a resumable engineering log, not a support claim.
+**Status/date:** Active implementation, 2026-10-06. This is a resumable engineering log, not a support claim.
 
 ## Baseline
 
@@ -1271,17 +1271,135 @@ The manifest binds each benchmark PID to the final executable hash above.
 Capture results, strict counter analysis, recorder status and artifact hashes
 remain in `target/process-replay-20261006/`.
 
+## 2026-10-06 — Independent graph-owner recovery over shared S3 checkpoints
+
+Status: completed and validated. Public cluster
+registration and graph admission remain closed. This is the next Phase E fault
+qualification increment from `06802e96`.
+
+An ignored integration case extends the existing private process-graph fixtures
+with independent owner processes and a live loopback MinIO store. It exercises
+native Rust and the actual loopback Rust worker separately. Each fault starts in
+a fresh UUID namespace with a committed cut bound to its own predecessor
+assignment. Owners align actual shuffle barriers and save their own participant
+manifests and state objects. The parent publishes the index through the existing
+checkpoint decision and leader authority stores. Restoration uses the existing
+`RecoveryManager`, donor range/digest validation, startup binding and shuffle
+execution fences. No durability backend, scheduler, dependency or production
+runtime code is added.
+
+The three scenarios cover replacement of a killed owner while another owner
+survives and renews its lease, entry of a third owner with rescaled vnode
+ownership, graceful exit to one surviving owner, and loss of the sole owner
+before its replacement is ready. Replacement uses a full-TTL observation and the
+real shared process-lease takeover, with a new boot incarnation and process term.
+The sole-owner case publishes its predecessor-bound handoff before killing the
+old owner. All scenarios first apply additional uncommitted work, restore the
+selected committed cut, change input batches from four rows to one, and compare
+eight input callbacks, four timer callbacks, callback IDs and output rows against
+uninterrupted execution. The surviving graph rejects an attempted activation
+after its execution authority changes.
+
+Every scenario then damages a selected committed donor object. Restoration must
+report the range/length error, retain the same committed reference and leave no
+restored graph; it cannot select another checkpoint. Fixture control messages
+are capped at 1 MiB, callback/output inventories at 64, command inventory at
+4,096, and each response/lifecycle wait at 20 seconds. Each fault has a 90-second
+parent deadline and each child a 120-second lifetime. Cleanup owns the exact
+spawned child handles, joins graceful exits, and kills/joins survivors after
+failure while preserving the primary failure and cleanup diagnostics.
+
+These are graph lifecycle tests driven by a test parent. Their source positions
+are controlled fixture cursors, and their per-owner recovery KV is the existing
+in-memory fixture. They do not exercise the database-owned `RecoveryMonitor`
+Prepare/Start/Release intake gates, server durable recovery KV, connector/sink
+certification, autonomous final-owner drain, arbitrary timer rescheduling or a
+deterministic merge of independent source channels. The remote Rust worker runs
+inside its owner process. Separate worker-host placement and target-hardware
+latency are not qualified here. Both public cluster forms continue to reject
+process-function registration and startup.
+
+The local service uses the repository's pinned MinIO fixture image
+`laminardb-minio-test:2024-10-13` (image SHA-256
+`03c59f175c68c3543d35c9df483ae49aa9d187eff096a54db07268b12e9c4180`), bound
+only to `127.0.0.1:19010`. The dedicated bucket is `process-peers`. With that
+fixture running, the executable command is:
+
+```powershell
+$env:CARGO_BUILD_JOBS='2'
+$env:RUST_MIN_STACK='8388608'
+$env:LAMINAR_PROCESS_TEST_S3_ENDPOINT='http://127.0.0.1:19010'
+$env:LAMINAR_PROCESS_TEST_S3_BUCKET='process-peers'
+cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files process_function::operator::execution::tests::shuffle::committed::peers::independent_owners_restore_the_committed_cut_after_host_loss_and_rescale -- --exact --ignored --nocapture
+```
+
+The explicit ignored test passes all six runtime/fault combinations in 45.47
+seconds; the command takes 265.51 seconds including compilation. The qualified
+`laminar_db-0dc6c3690381aaf6.exe` has SHA-256
+`2AE28E21C6A30CA0F7786FAB151AD68681DA0E1DA8767B43371D5ECE3A2D552B`.
+The run starts 16 owner processes in six independent namespaces. All spawned
+owners are joined, including the four deliberately killed owners. The owned
+MinIO container is removed after its exact ID and task label are checked;
+existing Docker services are left running. Binary/source hashes, commands,
+timings, failed attempts and cleanup evidence remain in
+`target/process-peers-20261006/`.
+
+The only later Rust edit adds `#[cfg(feature = "process-remote")]` to the existing
+remote-only takeover helper, removing its unused-code warning in the native
+feature set. Its body and all qualified runtime paths are unchanged. The
+qualification source snapshot is preserved separately from the final source
+hashes. Only test code changes; before/after hot-path benchmarks and new IPC
+capture are not required for this increment.
+
+### Validation
+
+The baseline remote-enabled focused suite passes 122 tests, with one ignored,
+in 34.09 seconds. After this increment it passes 122 tests, with two ignored, in
+34.66 seconds. The native-only final build passes 63 tests, with two ignored, in
+108.47 seconds including compilation (7.75 seconds of tests), without the
+takeover helper's unused-code warning.
+
+The first workspace run fails in one mocked Kafka startup test and four Iceberg
+OAuth tests. All five pass in isolation from that exact
+`laminar_connectors-143397847506616c.exe` binary (SHA-256
+`D2E5733E0E94E30E0819FA5A67DC5465363BE91459458714CE724E64ADA3A4C6`).
+The unchanged workspace command then passes with compilation idle. No connector
+source, feature selection or test behavior is changed. The failed run, isolated
+commands and successful retry remain in the evidence directory.
+
+All required gates pass with `CARGO_BUILD_JOBS=2` and `RUST_MIN_STACK=8388608`:
+
+| Gate | Result | Command seconds |
+|---|---|---:|
+| `cargo test --workspace --lib` | 1,989 connector, 1,127 core, 2,238 database and 870 SQL tests pass; five ignored | 164.07 |
+| `cargo clippy --workspace --all-features --all-targets -- -D warnings` | Pass | 37.37 |
+| `cargo clippy --workspace --no-default-features -- -D warnings` | Pass | 9.66 |
+| `cargo +nightly fmt --all -- --check` | Pass | 8.44 |
+| `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | Pass; 18 module and 214 function exceptions unchanged | 11.21 |
+
+Earlier fixture attempts expose an already-installed assignment-version update
+and an invalid chained handoff proof. The final fixture accepts an identical
+installed assignment and gives each fault a fresh namespace and a committed cut
+bound to that fault's actual predecessor. The existing canonical authority checks
+continue to reject the invalid chained proof. Compile and Clippy findings are
+resolved before the six-case run. The readability baselines and lockfile are
+unchanged.
+
 ## Next executable task
 
-Continue original Phase E through coordinated recovery with independently failed
-and surviving peer processes. Qualify process replacement and membership entry/
-exit, including final-owner exit, through the existing recovery rounds and a
-committed shared cut. Bind the private reproducible callback-order profile to an
-explicitly admitted source-order contract, including timer rescheduling, before
-opening either public cluster form. The private graph now supports committed
-vnode handoff and rescaled restoration with transferred callback sequences;
-its tests do not certify source/sink delivery or independent-channel replay
-equivalence.
+Continue original Phase E through the database-owned `RecoveryMonitor`
+Prepare/Start/Release rounds and intake fences, using independently failed and
+surviving peer processes and the server's durable recovery KV. Qualify interrupted
+and stale rounds and autonomous final-owner drain. Independent private graph
+owners now qualify process replacement, membership entry/exit, sole-owner loss
+during a published handoff, and replay from their committed shared cut. They do
+not yet qualify those database-controlled recovery rounds.
+
+Bind the private reproducible callback-order profile to an explicitly admitted
+source-order contract, including timer rescheduling, before opening either
+public cluster form. Its controlled source cursors do not certify connector/sink
+delivery or independent-channel replay equivalence. Keep both public cluster
+admission paths closed through these remaining gates.
 Do not add a second scheduler or state backend. Coordinator/core changes require
 the repository's before/after Criterion and IPC gates.
 

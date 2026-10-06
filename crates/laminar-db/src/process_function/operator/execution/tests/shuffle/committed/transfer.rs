@@ -21,7 +21,7 @@ async fn committed_shared_cut_restores_rescaled_owners_with_state_timers_and_sou
     let owners = [7, 9, 8, 9];
     let fence = target_fence(8, owners);
     let nodes = target_nodes(&pair, &fence, owners).await;
-    cut.publish_target(&fence, owners).await;
+    cut.publish_target([7, 8, 7, 8], &fence, owners).await;
     let mut graphs = Vec::new();
     for node in &nodes {
         let recovered = cut.recover(node).await.unwrap();
@@ -93,7 +93,7 @@ async fn live_graph_transfer_publishes_committed_donor_state_and_replaces_execut
     let cut = SharedCut::persist(&pair, &mut graphs).await;
     let owners = [8, 7, 8, 7];
     let target = target_fence(8, owners);
-    cut.publish_target(&target, owners).await;
+    cut.publish_target([7, 8, 7, 8], &target, owners).await;
     let rotation = Arc::new(tokio::sync::RwLock::new(()));
     let mut installed_slots = Vec::new();
     let mut pending_slots = Vec::new();
@@ -207,7 +207,7 @@ async fn committed_restore_rejects_missing_wrong_and_inconsistent_donor_metadata
     let owners = [9; 4];
     let target = target_fence(8, owners);
     let nodes = target_nodes(&pair, &target, owners).await;
-    cut.publish_target(&target, owners).await;
+    cut.publish_target([7, 8, 7, 8], &target, owners).await;
     for case in 0..6 {
         let mut recovered = cut.recover(&nodes[0]).await.unwrap();
         let position = recovered
