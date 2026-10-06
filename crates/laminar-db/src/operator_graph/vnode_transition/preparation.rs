@@ -369,7 +369,7 @@ impl OperatorGraph {
         Ok(())
     }
 
-    fn validated_transition_operator_indices(&self) -> Result<Vec<usize>, DbError> {
+    fn transition_operator_indices(&self) -> Vec<usize> {
         let mut indices = Vec::new();
         for (node_idx, node) in self.nodes.iter().enumerate() {
             if node.removed {
@@ -381,13 +381,9 @@ impl OperatorGraph {
                     ManagedStateContract::SqlAggregateV1
                     | ManagedStateContract::CoreWindowV1
                     | ManagedStateContract::BoundedIntervalJoinV3
-                    | ManagedStateContract::TemporalJoinV1,
+                    | ManagedStateContract::TemporalJoinV1
+                    | ManagedStateContract::ProcessFunctionV1,
                 ) => indices.push(node_idx),
-                Some(ManagedStateContract::ProcessFunctionV1) => {
-                    return Err(DbError::Unsupported(
-                        "process function vnode transfer is not cluster-qualified".into(),
-                    ));
-                }
                 #[cfg(test)]
                 Some(ManagedStateContract::TestVnodeStateV1) => indices.push(node_idx),
             }
@@ -398,7 +394,7 @@ impl OperatorGraph {
                 .cmp(&self.nodes[*right].name)
                 .then_with(|| left.cmp(right))
         });
-        Ok(indices)
+        indices
     }
 
     fn prepare_transition_frames<'a>(
@@ -408,7 +404,7 @@ impl OperatorGraph {
     ) -> Result<(usize, Vec<usize>, Vec<ProjectedTransitionFrames<'a>>), DbError> {
         let payload_bytes = self.transition_payload_bytes(state_frames)?;
         self.validate_transition_state_budget(payload_bytes, "vnode transition staged payload")?;
-        let mut node_indices = self.validated_transition_operator_indices()?;
+        let mut node_indices = self.transition_operator_indices();
         node_indices.retain(|&index| !empty_at_cut.contains(&self.nodes[index].name.as_ref()));
         let projected = self.project_transition_frames(&node_indices, state_frames)?;
         Ok((payload_bytes, node_indices, projected))
@@ -484,6 +480,7 @@ impl OperatorGraph {
                         | ManagedStateContract::BoundedIntervalJoinV3
                         | ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::TemporalJoinV1
+                        | ManagedStateContract::ProcessFunctionV1
                 );
             if !relevant {
                 continue;

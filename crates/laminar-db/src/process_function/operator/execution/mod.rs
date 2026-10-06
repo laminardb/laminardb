@@ -6,7 +6,7 @@ use arrow::array::{Array, RecordBatch, TimestampMicrosecondArray};
 use laminar_core::checkpoint::CheckpointAssignmentFence;
 use laminar_core::cluster::control::LeaseDeadline;
 use laminar_core::shuffle::route_checkpointed_batch;
-use laminar_core::state::{PartitionKeyCodecV1, VnodeAssignmentSnapshot};
+use laminar_core::state::{NodeId, PartitionKeyCodecV1, VnodeAssignmentSnapshot};
 
 use super::ProcessFunctionOperator;
 use crate::error::DbError;
@@ -17,6 +17,7 @@ pub(super) enum ProcessExecution {
     AwaitingAssignment {
         stage: String,
         runtime: tokio::runtime::Handle,
+        self_id: NodeId,
     },
     SingleOwner(ProcessExecutionAuthority),
     Distributed(ProcessExecutionAuthority),
@@ -27,6 +28,8 @@ pub(super) struct ProcessExecutionAuthority {
     assignment: VnodeAssignmentSnapshot,
     deadline: Arc<LeaseDeadline>,
     recovery_generation: u64,
+    stage: String,
+    runtime: tokio::runtime::Handle,
 }
 
 impl ProcessExecutionAuthority {
@@ -41,6 +44,8 @@ impl ProcessExecutionAuthority {
         config: &ClusterShuffleConfig,
         fence: &CheckpointAssignmentFence,
         deadline: Arc<LeaseDeadline>,
+        stage: String,
+        runtime: tokio::runtime::Handle,
     ) -> Result<Self, DbError> {
         let assignment = config.topology_snapshot()?;
         let owners = assignment
@@ -89,6 +94,8 @@ impl ProcessExecutionAuthority {
             assignment,
             deadline,
             recovery_generation: config.sender.recovery_gen(),
+            stage,
+            runtime,
         })
     }
 
@@ -116,6 +123,7 @@ impl ProcessFunctionOperator {
         &mut self,
         stage: &str,
         runtime: tokio::runtime::Handle,
+        self_id: NodeId,
     ) -> Result<(), DbError> {
         if !matches!(self.execution, ProcessExecution::Local) || self.next_activation_id != 0 {
             return Err(DbError::Checkpoint(
@@ -125,6 +133,7 @@ impl ProcessFunctionOperator {
         self.execution = ProcessExecution::AwaitingAssignment {
             stage: stage.to_owned(),
             runtime,
+            self_id,
         };
         Ok(())
     }
@@ -305,3 +314,4 @@ impl ProcessFunctionOperator {
 mod tests;
 
 pub(super) mod shuffle;
+mod transition;

@@ -89,8 +89,8 @@ struct StagedResponse {
     next_generation: u64,
 }
 
-/// Vnode-partitioned authoritative state for one trusted native function. Cluster deployment is
-/// rejected until this participant has assignment-fenced transfer and shuffle semantics.
+/// Vnode-partitioned authoritative state for one process function. Public cluster admission
+/// remains closed until distributed replay and delivery are qualified.
 pub(crate) struct ProcessFunctionOperator {
     descriptor: ProcessFunctionDescriptor,
     descriptor_sha256: String,

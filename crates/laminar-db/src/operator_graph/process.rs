@@ -37,11 +37,15 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let operator = {
             let mut operator = operator;
-            if self.cluster_shuffle.is_some() {
+            if let Some(scope) = &self.cluster_shuffle {
                 let runtime = self.main_runtime_handle.clone().ok_or_else(|| {
                     DbError::Config("process shuffle requires a main runtime handle".into())
                 })?;
-                operator.require_cluster_execution(&registration.output_name, runtime)?;
+                operator.require_cluster_execution(
+                    &registration.output_name,
+                    runtime,
+                    scope.self_id,
+                )?;
             }
             operator
         };

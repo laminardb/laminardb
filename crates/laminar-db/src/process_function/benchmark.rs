@@ -196,7 +196,11 @@ async fn cluster_operator(
         .map_err(|error| DbError::Config(error.to_string()))?;
     sender.set_recovery_gen(3);
     receiver.set_recovery_gen(3);
-    operator.require_cluster_execution("activity", tokio::runtime::Handle::current())?;
+    operator.require_cluster_execution(
+        "activity",
+        tokio::runtime::Handle::current(),
+        NodeId(node),
+    )?;
     operator.bind_startup_assignment(
         assignment,
         &owners

@@ -27,6 +27,7 @@ impl GraphOperator for ProcessFunctionOperator {
         #[cfg(feature = "cluster")]
         let live = self
             .live_bytes
+            .saturating_add(self.execution.retained_bytes())
             .saturating_add(self.shuffle.retained_bytes());
         #[cfg(not(feature = "cluster"))]
         let live = self.live_bytes;
@@ -121,8 +122,26 @@ impl GraphOperator for ProcessFunctionOperator {
         let assignment = self.assignment_fence.as_ref().ok_or_else(|| {
             DbError::Checkpoint("process execution requires bound startup state".into())
         })?;
-        let authority =
-            super::execution::ProcessExecutionAuthority::bind(config, assignment, deadline)?;
+        let super::execution::ProcessExecution::AwaitingAssignment {
+            stage,
+            runtime,
+            self_id,
+        } = &self.execution
+        else {
+            unreachable!("validated unbound process execution");
+        };
+        if *self_id != config.self_id {
+            return Err(DbError::Checkpoint(
+                "process startup names another local node".into(),
+            ));
+        }
+        let authority = super::execution::ProcessExecutionAuthority::bind(
+            config,
+            assignment,
+            deadline,
+            stage.clone(),
+            runtime.clone(),
+        )?;
         if authority.is_distributed() {
             if self.metadata_restored
                 && matches!(
@@ -134,11 +153,6 @@ impl GraphOperator for ProcessFunctionOperator {
                     "distributed process restore requires persisted shuffle frontiers".into(),
                 ));
             }
-            let super::execution::ProcessExecution::AwaitingAssignment { stage, runtime } =
-                &self.execution
-            else {
-                unreachable!("validated unbound process execution");
-            };
             let shuffle = super::execution::shuffle::ProcessShuffle::new(
                 stage.clone(),
                 runtime.clone(),
@@ -147,6 +161,7 @@ impl GraphOperator for ProcessFunctionOperator {
             )?;
             if self
                 .live_bytes
+                .saturating_add(self.execution.retained_bytes())
                 .saturating_add(self.shuffle.retained_bytes())
                 .saturating_add(shuffle.retained_bytes())
                 > self.graph_budget

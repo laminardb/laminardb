@@ -4,17 +4,19 @@ use laminar_core::shuffle::{ReceivedShuffle, ShuffleMessage};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
+mod committed;
+
 struct Pair {
     nodes: [Fixture; 2],
+    objects: Arc<dyn object_store::ObjectStore>,
 }
 
 impl Pair {
     async fn new() -> Self {
+        let objects: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
         let ttl = Duration::from_secs(60);
-        let authority = Arc::new(
-            ProcessLeaseAuthority::new(Arc::new(object_store::memory::InMemory::new()), ttl)
-                .unwrap(),
-        );
+        let authority = Arc::new(ProcessLeaseAuthority::new(Arc::clone(&objects), ttl).unwrap());
         let owners = [7, 8, 7, 8];
         let fence = CheckpointAssignmentFence::from_owner_map(
             7,
@@ -51,6 +53,7 @@ impl Pair {
             .register_peer(7, first.scope.receiver.local_addr());
         Self {
             nodes: [first, second],
+            objects,
         }
     }
 

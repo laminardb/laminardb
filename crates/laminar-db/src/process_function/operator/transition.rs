@@ -4,12 +4,15 @@ use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant}
 use laminar_core::state::PartitionKeyCodecV1;
 use rustc_hash::FxHashMap;
 
-use super::restoration::MAX_OPERATOR_FRAME_BYTES;
+use super::execution::{shuffle::ShuffleState, ProcessExecution};
+use super::restoration::MAX_LOCAL_METADATA_FRAME_BYTES;
 use super::{
     charged_key, DueTimer, KeyState, OperatorFrame, ProcessFunctionOperator, TIMER_CHARGE,
 };
 use crate::error::DbError;
-use crate::operator_graph::{GraphOperator, ManagedVnodeTransition, ManagedVnodeTransitionMode};
+use crate::operator_graph::{
+    GraphOperator, InputFrontier, ManagedVnodeTransition, ManagedVnodeTransitionMode,
+};
 
 pub(super) enum ProcessVnodeTransition {
     Idle,
@@ -22,6 +25,8 @@ pub(super) struct PreparedProcessTransition {
     slots: Vec<(usize, FxHashMap<Vec<u8>, KeyState>)>,
     due: BTreeSet<DueTimer>,
     metadata: OperatorFrame,
+    execution: Option<ProcessExecution>,
+    shuffle: ShuffleState,
     assignment_fence: Option<CheckpointAssignmentFence>,
     live_bytes: usize,
     key_count: usize,
@@ -63,12 +68,6 @@ impl ProcessVnodeTransition {
 
 impl ProcessFunctionOperator {
     fn validate_transition(&self, transition: &ManagedVnodeTransition<'_>) -> Result<(), DbError> {
-        if !matches!(
-            self.shuffle,
-            super::execution::shuffle::ShuffleState::Unbound
-        ) {
-            return Err(DbError::Unsupported("distributed process frontier transfer requires coordinated reassignment qualification".into()));
-        }
         if !self.vnode_transition.is_idle() || self.checkpoint_drain_pending() {
             return Err(DbError::Checkpoint(
                 "process vnode transition requires finished cleanup and drained invocations".into(),
@@ -159,7 +158,7 @@ impl ProcessFunctionOperator {
     fn transition_metadata(
         &self,
         transition: &ManagedVnodeTransition<'_>,
-    ) -> Result<(OperatorFrame, BTreeMap<u64, OperatorFrame>), DbError> {
+    ) -> Result<(OperatorFrame, BTreeMap<u64, OperatorFrame>, InputFrontier), DbError> {
         let expected = transition
             .restores
             .iter()
@@ -167,8 +166,12 @@ impl ProcessFunctionOperator {
             .collect::<BTreeSet<_>>();
         let mut donors = BTreeMap::new();
         let mut metadata = self.checkpoint_frame();
-        let mut watermark = match transition.mode {
-            ManagedVnodeTransitionMode::Live => Some(self.watermark_us),
+        let mut frontier = match transition.mode {
+            ManagedVnodeTransitionMode::Live => Some(self.transition_frontier(
+                &metadata,
+                transition.predecessor,
+                self.execution.local_id().map(|node| node.0),
+            )?),
             ManagedVnodeTransitionMode::CheckpointBootstrap { .. } => None,
         };
         for restore in transition.whole_restores {
@@ -180,15 +183,17 @@ impl ProcessFunctionOperator {
                 ));
             }
             let frame = self.decode_metadata(restore.state)?;
-            if frame.shuffle.is_some() {
-                return Err(DbError::Unsupported("distributed process donor frontier transfer requires coordinated reassignment qualification".into()));
-            }
-            if watermark.is_some_and(|watermark| watermark != frame.watermark_us) {
+            let donor_frontier = self.transition_frontier(
+                &frame,
+                transition.predecessor,
+                Some(restore.participant_id),
+            )?;
+            if frontier.is_some_and(|frontier| frontier != donor_frontier) {
                 return Err(DbError::Checkpoint(
-                    "process donor watermarks do not describe one drained cut".into(),
+                    "process donor watermarks/frontiers do not describe one drained cut".into(),
                 ));
             }
-            watermark = Some(frame.watermark_us);
+            frontier = Some(donor_frontier);
             metadata.next_activation_id = metadata.next_activation_id.max(frame.next_activation_id);
             metadata.next_timer_generation = metadata
                 .next_timer_generation
@@ -200,15 +205,54 @@ impl ProcessFunctionOperator {
                 "process vnode transition requires every donor's bound metadata".into(),
             ));
         }
-        metadata.watermark_us = watermark.unwrap_or(self.watermark_us);
-        Ok((metadata, donors))
+        let frontier = frontier.ok_or_else(|| {
+            DbError::Checkpoint("process transition has no drained frontier cut".into())
+        })?;
+        metadata.watermark_us = frontier
+            .watermark
+            .map_or(i64::MIN, |ms| ms.saturating_mul(1_000));
+        metadata.shuffle = None;
+        Ok((metadata, donors, frontier))
     }
 
-    pub(super) fn prepare_transition(
+    fn transition_frontier(
+        &self,
+        frame: &OperatorFrame,
+        predecessor: &CheckpointAssignmentFence,
+        participant: Option<u64>,
+    ) -> Result<InputFrontier, DbError> {
+        match (&frame.shuffle, self.execution.local_id()) {
+            (Some(shuffle), Some(_)) => shuffle.frontier_at_cut(
+                predecessor,
+                participant.ok_or_else(|| {
+                    DbError::Checkpoint("process cut has no local participant".into())
+                })?,
+            ),
+            (Some(_), None) => Err(DbError::Checkpoint(
+                "distributed process transition requires cluster execution selection".into(),
+            )),
+            (None, Some(_)) if predecessor.participants.len() > 1 => Err(DbError::Checkpoint(
+                "distributed process donor is missing its shuffle frontier cut".into(),
+            )),
+            (None, _) if frame.watermark_us != i64::MIN && frame.watermark_us % 1_000 != 0 => {
+                // Saturated microseconds do not identify the original millisecond cut.
+                Err(DbError::Checkpoint(
+                    "process transfer cannot reconstruct an exact frontier from its watermark"
+                        .into(),
+                ))
+            }
+            (None, _) => Ok(InputFrontier {
+                watermark: (frame.watermark_us != i64::MIN)
+                    .then_some(frame.watermark_us.div_euclid(1_000)),
+                idle: false,
+            }),
+        }
+    }
+
+    fn transition_preflight_bytes(
         &self,
         transition: &ManagedVnodeTransition<'_>,
-    ) -> Result<PreparedProcessTransition, DbError> {
-        self.validate_transition(transition)?;
+    ) -> Result<(usize, usize), DbError> {
         let retained_live_bytes = self
             .state
             .iter()
@@ -219,7 +263,9 @@ impl ProcessFunctionOperator {
                         .saturating_mul(std::mem::size_of::<(Vec<u8>, KeyState)>()),
                 )
             })
-            .saturating_add(due_charge(self.due.iter()));
+            .saturating_add(due_charge(self.due.iter()))
+            .saturating_add(self.shuffle.retained_bytes())
+            .saturating_add(self.execution.retained_bytes());
         let payload_bytes = transition
             .restores
             .iter()
@@ -232,13 +278,47 @@ impl ProcessFunctionOperator {
             )
             .try_fold(0usize, usize::checked_add)
             .unwrap_or(usize::MAX)
-            .saturating_add(transition.whole_restores.len().saturating_mul(
-                MAX_OPERATOR_FRAME_BYTES + std::mem::size_of::<OperatorFrame>() + 64,
-            ));
-        self.check_transition_budget(retained_live_bytes.saturating_add(payload_bytes))?;
-        let (metadata, donors) = self.transition_metadata(transition)?;
+            .saturating_add(
+                transition
+                    .whole_restores
+                    .iter()
+                    .fold(0usize, |bytes, restore| {
+                        bytes
+                            .saturating_add(restore.state.len().saturating_mul(6))
+                            .saturating_add(std::mem::size_of::<OperatorFrame>() + 64)
+                    }),
+            );
+        // Bound the replacement channel tree and its temporary decoded frontier roster.
+        let topology_bytes = if self.execution.local_id().is_some() {
+            transition
+                .target
+                .participants
+                .len()
+                .saturating_mul(256)
+                .saturating_add(4_096)
+                .saturating_add(self.execution.retained_bytes().saturating_mul(2))
+        } else {
+            0
+        };
+        self.check_transition_budget(
+            retained_live_bytes
+                .saturating_add(payload_bytes)
+                .saturating_add(topology_bytes),
+        )?;
+        Ok((retained_live_bytes, payload_bytes))
+    }
+
+    pub(super) fn prepare_transition(
+        &self,
+        transition: &ManagedVnodeTransition<'_>,
+    ) -> Result<PreparedProcessTransition, DbError> {
+        self.validate_transition(transition)?;
+        let (retained_live_bytes, payload_bytes) = self.transition_preflight_bytes(transition)?;
+        let (metadata, donors, frontier) = self.transition_metadata(transition)?;
+        let (execution, shuffle) =
+            self.prepare_transition_execution(transition.target, frontier)?;
         let slot_count = transition.revoked.len() + transition.restores.len();
-        let fixed_bytes = std::mem::size_of::<PreparedProcessTransition>()
+        let scaffold_bytes = std::mem::size_of::<PreparedProcessTransition>()
             .saturating_add(
                 slot_count
                     .saturating_mul(std::mem::size_of::<(usize, FxHashMap<Vec<u8>, KeyState>)>()),
@@ -251,22 +331,39 @@ impl ProcessFunctionOperator {
                     .max(transition.predecessor.participants.len())
                     .saturating_mul(std::mem::size_of::<CheckpointParticipant>()),
             )
-            .saturating_add(MAX_OPERATOR_FRAME_BYTES);
+            .saturating_add(MAX_LOCAL_METADATA_FRAME_BYTES);
+        let fixed_bytes = scaffold_bytes
+            .saturating_add(
+                execution
+                    .as_ref()
+                    .map_or(0, ProcessExecution::retained_bytes),
+            )
+            .saturating_add(shuffle.retained_bytes());
         self.check_transition_budget(
             retained_live_bytes
                 .saturating_add(fixed_bytes)
                 .saturating_add(payload_bytes),
         )?;
+        let retired_bytes = scaffold_bytes
+            .saturating_add(due_charge(self.due.iter()))
+            .saturating_add(self.shuffle.retained_bytes())
+            .saturating_add(
+                execution
+                    .as_ref()
+                    .map_or(0, |_| self.execution.retained_bytes()),
+            );
         let mut prepared = PreparedProcessTransition {
             slots: Vec::with_capacity(slot_count),
             due: BTreeSet::new(),
             metadata,
+            execution,
+            shuffle,
             assignment_fence: Some(transition.target.clone()),
             live_bytes: self.live_bytes,
             key_count: self.key_count,
             timer_count: self.timer_count,
             prepared_bytes: fixed_bytes,
-            retired_bytes: fixed_bytes.saturating_add(due_charge(self.due.iter())),
+            retired_bytes,
         };
         for &vnode in transition.revoked {
             let state = &self.state[vnode as usize];
@@ -421,6 +518,10 @@ impl ProcessFunctionOperator {
         }
         std::mem::swap(&mut self.due, &mut prepared.due);
         std::mem::swap(&mut self.assignment_fence, &mut prepared.assignment_fence);
+        std::mem::swap(&mut self.shuffle, &mut prepared.shuffle);
+        if let Some(execution) = &mut prepared.execution {
+            std::mem::swap(&mut self.execution, execution);
+        }
         std::mem::swap(
             &mut self.next_activation_id,
             &mut prepared.metadata.next_activation_id,

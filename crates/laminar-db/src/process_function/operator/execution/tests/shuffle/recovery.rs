@@ -38,7 +38,7 @@ async fn drained_restore_rebroadcasts_frontiers_and_retains_timer_and_activation
     let mut restored =
         ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
     restored
-        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .require_cluster_execution("activity", tokio::runtime::Handle::current(), NodeId(7))
         .unwrap();
     restored.restore(whole).unwrap();
     for (vnode, frame) in frames {
@@ -150,7 +150,7 @@ async fn restore_rejects_inconsistent_frontiers_and_a_different_assignment() {
     let mut candidate =
         ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
     candidate
-        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .require_cluster_execution("activity", tokio::runtime::Handle::current(), NodeId(7))
         .unwrap();
     candidate
         .restore(OperatorCheckpoint {

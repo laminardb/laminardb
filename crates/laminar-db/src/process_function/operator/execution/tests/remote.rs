@@ -4,7 +4,7 @@ use crate::process_function::ProcessRuntime;
 use tokio_util::sync::CancellationToken;
 
 pub(super) struct Worker {
-    client: Arc<RemoteProcessClient>,
+    pub(super) client: Arc<RemoteProcessClient>,
     pub(super) scopes: tokio::sync::mpsc::Receiver<wire::Open>,
     shutdown: CancellationToken,
     task: tokio::task::JoinHandle<Result<(), DbError>>,
@@ -262,7 +262,7 @@ async fn lost_owner_reply_is_rejected_and_new_boot_restores_the_selected_state_a
     )
     .unwrap();
     operator
-        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .require_cluster_execution("activity", tokio::runtime::Handle::current(), NodeId(7))
         .unwrap();
     operator
         .restore(OperatorCheckpoint {
@@ -314,7 +314,7 @@ async fn lost_owner_reply_is_rejected_and_new_boot_restores_the_selected_state_a
     )
     .unwrap();
     restored
-        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .require_cluster_execution("activity", tokio::runtime::Handle::current(), NodeId(7))
         .unwrap();
     restored
         .restore(OperatorCheckpoint {
@@ -343,7 +343,7 @@ async fn lost_owner_reply_is_rejected_and_new_boot_restores_the_selected_state_a
     )
     .unwrap();
     restored
-        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .require_cluster_execution("activity", tokio::runtime::Handle::current(), NodeId(7))
         .unwrap();
     restored
         .restore(OperatorCheckpoint { data: metadata })

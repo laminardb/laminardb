@@ -1,3 +1,4 @@
+use laminar_core::checkpoint::CheckpointAssignmentFence;
 use serde::{Deserialize, Serialize};
 
 use super::{PeerFrontiers, ProcessShuffle};
@@ -40,6 +41,57 @@ impl From<SavedFrontier> for InputFrontier {
 }
 
 impl Checkpoint {
+    pub(in super::super::super::super) fn frontier_at_cut(
+        &self,
+        assignment: &CheckpointAssignmentFence,
+        participant: u64,
+    ) -> Result<InputFrontier, DbError> {
+        if self.assignment_version != assignment.assignment_version
+            || self.assignment_digest != assignment.digest()
+            || self.self_id != participant
+            || !assignment.contains(participant)
+            || !assignment
+                .participants
+                .iter()
+                .filter(|owner| owner.node_id != participant)
+                .map(|owner| owner.node_id)
+                .eq(self.peers.iter().map(|(peer, _)| *peer))
+        {
+            return Err(DbError::Checkpoint(
+                "process donor shuffle does not match its predecessor assignment and participant"
+                    .into(),
+            ));
+        }
+        Ok(self.effective.into())
+    }
+
+    pub(in super::super::super::super) fn reassigned(
+        assignment: &CheckpointAssignmentFence,
+        participant: u64,
+        cut: InputFrontier,
+    ) -> Option<Self> {
+        if assignment.participants.len() == 1 || !assignment.contains(participant) {
+            return None;
+        }
+        // RECOVERY: the rotation fence drains the predecessor channels. New channels start
+        // active at the common cut; idleness must be established by the target roster.
+        let frontier = SavedFrontier::from(InputFrontier { idle: false, ..cut });
+        Some(Self {
+            version: 1,
+            assignment_version: assignment.assignment_version,
+            assignment_digest: assignment.digest(),
+            self_id: participant,
+            local: frontier,
+            effective: frontier,
+            peers: assignment
+                .participants
+                .iter()
+                .filter(|owner| owner.node_id != participant)
+                .map(|owner| (owner.node_id, frontier))
+                .collect(),
+        })
+    }
+
     pub(in super::super::super::super) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(
             self.peers

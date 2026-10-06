@@ -988,18 +988,151 @@ binary. Evidence, exact commands, durations, hashes, Criterion means/intervals
 and capture scripts are under `target/process-shuffle-20261005/`; the partial
 trace, capture failure and its counter analysis remain under `ipc-first-partial/`.
 
+## 2026-10-05 — committed process ownership transfer and host-loss restore
+
+Status: private graph implementation, correctness gates, Criterion validation
+and hardware IPC profiling complete. Starting commit:
+`d921dfc893aa742d23bb1bc046b783351ba9772a`.
+
+This increment applies to private single-owner and multi-owner cluster graphs.
+Both public cluster admission forms remain closed. It reuses the existing
+assignment drain, graph participant lifecycle, checkpoint stores, range handoff,
+and `RecoveryManager`.
+
+Process transitions now validate each donor's exact predecessor assignment,
+participant and peer roster, and require one drained effective frontier, including
+idleness. State and timers are prepared together with replacement execution and
+shuffle authority. Publication swaps prepared values under the graph rotation
+fence; the existing finish phase releases displaced allocations. New channels
+begin active at the committed cut and re-establish idleness using the target
+roster. A single-owner watermark that cannot reconstruct an exact millisecond
+frontier is rejected before mutation.
+
+The shared-cut fixture aligns real peer barriers, persists participant manifests
+and state frames, creates an immutable committed index, and records the exact
+shared CAS outcome. It records and finalizes a real assignment-drain decision
+before live publication and loads acquired frames through checkpoint range
+handoff. Focused qualification covers:
+
+- Two-owner live transfer with retained timers and continued routed input.
+- Two-owner committed restore onto three owners with exact donor vnode selection,
+  checkpoint source positions and one timer application per key.
+- Missing, wrong-assignment, wrong-participant, wrong-roster and inconsistent
+  donor metadata; damaged selected donor objects fail recovery.
+- A delayed remote Rust reply from a lost owner, rejected after a replacement
+  restores and executes from the committed cut.
+- An actual killed child host after it applies an uncommitted input; the fresh
+  owner restores committed totals, source positions and timers.
+
+The host-kill test preserves a real in-memory CAS-committed object namespace as a
+read-only filesystem restart image before applying the uncommitted input. The
+native `LocalFileSystem` backend has no conditional update; the fixture does not
+emulate that authority protocol. Both donor graphs run in the killed child. This
+does not qualify a cloud store, independent failed/surviving peer processes,
+coordinated recovery-round publication, certified source/sink delivery or replay
+ordering between independent source channels. Existing activation counters are
+merged from the committed donors; stable callback identifiers across a changed
+source merge remain unqualified.
+
+Evidence is under `target/process-handoff-20261005/`. The unchanged baseline has
+110 passing process tests and one ignored opt-in test. The final focused command,
+`cargo test -p laminar-db --lib --no-default-features --features
+cluster,process-remote,files process_function:: -- --test-threads=1 --quiet`,
+passes 117 tests with that same ignored test in 183.01 seconds including the
+build. All-feature/all-target workspace Clippy passes in 28.37 seconds. Workspace
+library tests pass 6,219 tests with four ignored tests in 166.79 seconds. The first
+workspace run has five unchanged OAuth/Kafka mock-service failures; all pass from
+the exact same connector binary in isolation and the original workspace command
+then passes unchanged. No connector production code or test expectations change.
+No-default-feature workspace Clippy passes in 11.15 seconds; nightly formatting
+passes in 7.03 seconds. Readability passes in 10.14 seconds with the same 18 module
+and 214 function exceptions.
+
+### Hot-path validation
+
+Host: AMD Ryzen 9 7900X, 12 cores/24 logical processors, Windows build 26200 x64.
+Toolchain: Rust 1.99.0 (`b940084d7`), Cargo 1.99.0 (`5f94df478`); `object_store`
+0.13.2. No dependency changes. The optimized benchmark build uses
+`cargo bench -p laminar-db --bench process_function_bench --no-default-features
+--features benchmark-internals --no-run --message-format=json` and finishes in
+803.88 seconds. The preserved baseline executable has SHA-256
+`B3F606AD68E06B55BD5AD1D8BD0B8838A4BAD992D016958E12AEFFC2DA408445`;
+the current executable has SHA-256
+`64B74E76E2D504DDC7DBA207175936AE5CE63369C8E1909E374121D6E3E27DAF`.
+
+Both full process runs use 30 samples, 3-second warm-up and 7-second measurement.
+The baseline saves `handoff-before`; the current run compares that baseline. Runs
+take 165.16 and 161.76 seconds respectively. Criterion mean estimates follow;
+confidence intervals, outliers and samples remain in the evidence.
+
+| Case | Before (us) | Current (us) | Change |
+|---|---:|---:|---:|
+| Source/subscription, one row | 33.627 | 32.637 | -2.94% |
+| Source/subscription, 64 distinct keys | 115.496 | 109.579 | -5.12% |
+| Source/subscription, 64 rows sharing a key | 117.557 | 111.792 | -4.90% |
+| Local operator, one row | 1.580 | 1.691 | +7.03% |
+| Local operator, 64 distinct keys | 68.454 | 69.926 | +2.15% |
+| Local operator, 64 rows sharing a key | 73.542 | 72.964 | -0.79% |
+| Single-owner operator, one row | 2.773 | 2.864 | +3.31% |
+| Single-owner operator, 64 distinct keys | 177.022 | 191.742 | +8.31% |
+| Single-owner operator, 64 rows sharing a key | 77.762 | 80.244 | +3.19% |
+| Two-owner operator, one row | 61.845 | 62.600 | +1.22% |
+| Two-owner operator, 64 distinct keys | 204.280 | 213.185 | +4.36% |
+| Two-owner operator, 64 rows sharing a key | 146.029 | 148.790 | +1.89% |
+| Handler only, one row | 0.459 | 0.453 | -1.27% |
+| Handler only, 64 rows | 30.510 | 29.486 | -3.36% |
+
+The two first-pass means above 5% are investigated with the same immutable
+binaries, same parameters and separate preserved samples. The order is baseline,
+current, current, baseline; no Rust or benchmark code changes between runs.
+
+| Case | Pair 1 before/current (us) | Change | Pair 2 before/current (us) | Change |
+|---|---:|---:|---:|---:|
+| Local operator, one row | 1.509 / 1.564 | +3.64% | 1.637 / 1.549 | -5.34% |
+| Single-owner operator, 64 distinct keys | 184.820 / 185.581 | +0.41% | 183.278 / 184.213 | +0.51% |
+
+All paired increases stay below 5%; the changed baseline measurements demonstrate
+run variance behind the first-pass comparisons. No speculative optimization is
+added. The four paired runs take 21.06, 24.16, 20.80 and 20.92 seconds.
+`cargo bench -p laminar-core --bench latency_bench` with the same sample/timing
+parameters measures 1.436 to 1.450 ns (+0.95%) in 14.73/12.90 seconds. These dev-host
+means do not qualify cloud recovery, real multi-process network latency,
+representative tail latency or target-hardware throughput.
+
+Fresh hardware profiling on 2026-10-06 completes all three 30-second distinct-key
+cases from the current executable, each with exit code zero, in 105.42 seconds
+including recording and cleanup. WPR confirms the task-owned recorder is stopped.
+The `Microsoft.Windows.EventTracing.Processing.All` 1.12.10 reader accepts the trace
+with lost events and time inversion disallowed; analysis takes 2.44 seconds.
+Weighted IPC is the sum of retired instructions divided by the sum of cycles for
+each actual benchmark PID's scheduling intervals.
+
+| Profile | PID | Retired instructions | Cycles | Intervals | Weighted IPC |
+|---|---:|---:|---:|---:|---:|
+| Local, 64 distinct keys | 41368 | 554,494,155,234 | 158,375,555,796 | 595 | 3.501 |
+| Private single-owner, 64 distinct keys | 23268 | 522,259,723,447 | 157,050,612,042 | 437 | 3.325 |
+| Private two-owner, 64 distinct keys | 29424 | 377,036,566,957 | 165,214,085,222 | 478 | 2.282 |
+
+All three meet the IPC > 2.0 guideline. The counters include initialization and
+the benchmark harness; the two-owner case uses real loopback endpoints in one
+runtime. These measurements do not certify independent-process cluster load or
+target-hardware tail latency. The final ETL has SHA-256
+`52C02396556EB2528870A45203DD89D3BD4A2AE4906DC2F25C51E509534DCFE5`.
+Its manifest binds every benchmark PID to the current executable hash above.
+The capture result, strict counter analysis, recorder status, scripts and artifact
+hashes remain in `target/process-handoff-20261005/`.
+
 ## Next executable task
 
-Continue original Phase E through the existing graph lifecycle: actual
-ownership transfer, rescale, node loss and delayed old-owner replies restored
-from a committed shared checkpoint. The process participant now implements
-staged state/timer replacement, cold startup assignment binding and private
-single-owner intake/result fencing and private ordered cross-node input. Its
-frame-restoration and CAS-takeover tests
-do not certify a committed distributed cut or live vnode publication. Keep both
-cluster forms closed until their actual lifecycle tests pass. Do not add a second
-scheduler or state backend. Coordinator/core changes require the repository's
-before/after Criterion and IPC gates.
+Continue original Phase E through coordinated recovery with independently failed
+and surviving peer processes. Qualify process replacement and membership entry/
+exit, including final-owner exit, through the existing recovery rounds and a
+committed shared cut. Define and test the admitted source ordering and logical
+activation replay profile before opening either public cluster form. The private
+graph now supports committed vnode handoff and rescaled restoration; its tests
+do not certify source/sink delivery or independent-channel replay equivalence.
+Do not add a second scheduler or state backend. Coordinator/core changes require
+the repository's before/after Criterion and IPC gates.
 
 Complete Python dependency/effect binding, host-loss and cleanup-failure
 qualification before stronger Python delivery. Longer resource qualification

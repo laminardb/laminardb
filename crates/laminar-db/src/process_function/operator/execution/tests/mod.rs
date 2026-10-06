@@ -142,7 +142,11 @@ impl Fixture {
     fn bind_operator(&self, operator: &mut ProcessFunctionOperator) {
         if matches!(operator.execution, ProcessExecution::Local) {
             operator
-                .require_cluster_execution("activity", tokio::runtime::Handle::current())
+                .require_cluster_execution(
+                    "activity",
+                    tokio::runtime::Handle::current(),
+                    self.scope.self_id,
+                )
                 .unwrap();
         }
         operator
@@ -315,7 +319,7 @@ async fn cluster_process_cannot_execute_before_authority_binding_or_transport_ac
     let mut operator =
         ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
     operator
-        .require_cluster_execution("activity", tokio::runtime::Handle::current())
+        .require_cluster_execution("activity", tokio::runtime::Handle::current(), NodeId(7))
         .unwrap();
     let before = state_image(&operator);
     assert!(operator
@@ -358,6 +362,38 @@ async fn cluster_process_cannot_execute_before_authority_binding_or_transport_ac
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn transfer_rejects_saturated_single_owner_frontier_without_changing_state() {
+    let fixture = Fixture::new(Uuid::from_u128(7), 7, 3, TTL).await;
+    let mut operator =
+        ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
+    fixture.bind_operator(&mut operator);
+    operator
+        .process_with_frontiers(&[], &frontier(i64::MAX))
+        .await
+        .unwrap();
+    let before = state_image(&operator);
+    let target = CheckpointAssignmentFence::from_owner_map(
+        8,
+        &[7; 4],
+        fixture.binding.assignment().participants.clone(),
+    )
+    .unwrap();
+    let error = operator
+        .prepare_vnode_transition(crate::operator_graph::ManagedVnodeTransition {
+            predecessor: fixture.binding.assignment(),
+            target: &target,
+            revoked: &rustc_hash::FxHashSet::default(),
+            restores: &[],
+            whole_restores: &[],
+            mode: crate::operator_graph::ManagedVnodeTransitionMode::Live,
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("exact frontier"), "{error}");
+    assert_eq!(state_image(&operator), before);
+    assert!(operator.vnode_transition.is_idle());
 }
 
 #[tokio::test]

@@ -36,6 +36,7 @@ fn accepts_portable_whole_state(contract: ManagedStateContract) -> bool {
             | ManagedStateContract::BoundedIntervalJoinV3
             | ManagedStateContract::CoreWindowV1
             | ManagedStateContract::TemporalJoinV1
+            | ManagedStateContract::ProcessFunctionV1
     )
 }
 
