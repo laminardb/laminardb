@@ -3,9 +3,11 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
-use arrow_schema::{Field, Schema};
+use arrow_schema::{Field, Schema, SchemaRef};
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::{SourceInputMode, SourceRowPositionCapability};
+use laminar_connectors::connector::{
+    SourceContract, SourceInputMode, SourceReplayOrder, SourceRowPositionCapability,
+};
 use laminar_connectors::registry::ConnectorRegistry;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -58,6 +60,9 @@ struct CanonicalSource {
     options: BTreeMap<String, String>,
     input_mode: &'static str,
     row_positions: &'static str,
+    // COMPAT: undeclared order leaves existing non-process pipeline identities unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_order: Option<SourceReplayOrder>,
     schema: Option<CanonicalSchema>,
     primary_key: Vec<String>,
     watermark_column: Option<String>,
@@ -243,24 +248,26 @@ fn canonical_sources(
 ) -> Result<Vec<CanonicalSource>, DbError> {
     let mut sources = Vec::with_capacity(registrations.sources.len());
     for reg in registrations.sources.values() {
-        let (connector_type, options, input_mode, row_positions) = if reg.connector_type.is_some() {
-            canonical_source_connector(&build_source_config(reg)?, connector_registry)?
+        let entry = catalog.get_source(&reg.name);
+        let (connector_type, options, contract) = if reg.connector_type.is_some() {
+            canonical_source_connector(
+                &build_source_config(reg)?,
+                connector_registry,
+                entry.as_ref().map(|entry| &entry.schema),
+            )?
         } else {
             (
                 "catalog-bridge".into(),
                 BTreeMap::new(),
-                SourceInputMode::AppendOnly,
-                SourceRowPositionCapability::Unavailable,
+                SourceContract::default(),
             )
         };
-        let entry = catalog.get_source(&reg.name);
         sources.push(canonical_source(
             reg.name.clone(),
             reg.catalog_generation,
             connector_type,
             options,
-            input_mode,
-            row_positions,
+            contract,
             entry.as_deref(),
         ));
     }
@@ -277,8 +284,7 @@ fn canonical_sources(
             1,
             "catalog-bridge".into(),
             BTreeMap::new(),
-            SourceInputMode::AppendOnly,
-            SourceRowPositionCapability::Unavailable,
+            SourceContract::default(),
             entry.as_deref(),
         ));
     }
@@ -291,8 +297,7 @@ fn canonical_source(
     catalog_generation: u64,
     connector_type: String,
     options: BTreeMap<String, String>,
-    input_mode: SourceInputMode,
-    row_positions: SourceRowPositionCapability,
+    contract: SourceContract,
     entry: Option<&SourceEntry>,
 ) -> CanonicalSource {
     CanonicalSource {
@@ -300,8 +305,12 @@ fn canonical_source(
         catalog_generation,
         connector_type,
         options,
-        input_mode: canonical_source_input_mode(input_mode),
-        row_positions: canonical_source_row_positions(row_positions),
+        input_mode: canonical_source_input_mode(contract.input_mode),
+        row_positions: canonical_source_row_positions(contract.row_positions),
+        replay_order: match contract.replay_order {
+            SourceReplayOrder::Unspecified => None,
+            SourceReplayOrder::SingleChannel => Some(SourceReplayOrder::SingleChannel),
+        },
         schema: entry.map(|entry| canonical_schema(&entry.schema)),
         primary_key: entry.map_or_else(Vec::new, |entry| entry.primary_key.clone()),
         watermark_column: entry.and_then(|entry| entry.watermark_column.clone()),
@@ -445,34 +454,30 @@ fn canonical_connector(config: &ConnectorConfig) -> (String, BTreeMap<String, St
 fn canonical_source_connector(
     config: &ConnectorConfig,
     connector_registry: &ConnectorRegistry,
-) -> Result<
-    (
-        String,
-        BTreeMap<String, String>,
-        SourceInputMode,
-        SourceRowPositionCapability,
-    ),
-    DbError,
-> {
+    schema: Option<&SchemaRef>,
+) -> Result<(String, BTreeMap<String, String>, SourceContract), DbError> {
+    // INVARIANT: Inspect startup's schema; CanonicalSource binds it separately from raw options.
+    let mut admitted_config = config.clone();
+    if let Some(schema) = schema {
+        admitted_config.set(
+            "_arrow_schema",
+            crate::pipeline_callback::encode_arrow_schema(schema),
+        );
+    }
     let source = connector_registry
-        .create_source(config, None)
+        .create_source(&admitted_config, None)
         .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
     let contract = source
-        .contract(config)
+        .contract(&admitted_config)
         .map_err(|error| DbError::Checkpoint(format!("source contract identity: {error}")))?;
     let options = source
-        .recovery_identity_options(config)
+        .recovery_identity_options(&admitted_config)
         .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
     let (connector_type, options) = options.map_or_else(
         || canonical_connector(config),
         |options| (config.connector_type().to_string(), options),
     );
-    Ok((
-        connector_type,
-        options,
-        contract.input_mode,
-        contract.row_positions,
-    ))
+    Ok((connector_type, options, contract))
 }
 
 const fn canonical_source_input_mode(input_mode: SourceInputMode) -> &'static str {

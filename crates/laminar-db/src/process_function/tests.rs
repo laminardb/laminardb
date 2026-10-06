@@ -2850,7 +2850,7 @@ def handle(activations):
             checkpoint_dir,
             input_dir,
             "account",
-            DeliveryGuarantee::AtLeastOnce,
+            DeliveryGuarantee::BestEffort,
         )
         .await;
         db.register_native_process_function("activity", "events", descriptor(), handler)
@@ -2983,7 +2983,7 @@ def handle(activations):
                 &input_dir,
                 &output_dir,
                 "account",
-                DeliveryGuarantee::AtLeastOnce,
+                DeliveryGuarantee::BestEffort,
                 Arc::clone(client),
             )
             .await
@@ -4538,7 +4538,7 @@ for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
                 &input_dir,
                 &output_dir,
                 "account",
-                DeliveryGuarantee::AtLeastOnce,
+                DeliveryGuarantee::BestEffort,
                 Arc::clone(client),
             )
             .await
@@ -4567,44 +4567,44 @@ for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
 
     #[cfg(feature = "files")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn at_least_once_file_source_and_sink_replay_same_activation_after_host_termination() {
+    async fn best_effort_file_source_and_sink_replay_same_activation_after_host_termination() {
         assert_file_replay_after_host_termination(
             HostFailureCut::PendingInvocation,
             FileHostRuntime::RemoteRust,
-            "process_function::tests::remote_pipeline::at_least_once_file_source_and_sink_replay_same_activation_after_host_termination",
+            "process_function::tests::remote_pipeline::best_effort_file_source_and_sink_replay_same_activation_after_host_termination",
         )
         .await;
     }
 
     #[cfg(feature = "files")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn at_least_once_file_sink_republishes_after_uncheckpointed_host_termination() {
+    async fn best_effort_file_sink_republishes_after_uncheckpointed_host_termination() {
         assert_file_replay_after_host_termination(
             HostFailureCut::PublishedOutput,
             FileHostRuntime::RemoteRust,
-            "process_function::tests::remote_pipeline::at_least_once_file_sink_republishes_after_uncheckpointed_host_termination",
+            "process_function::tests::remote_pipeline::best_effort_file_sink_republishes_after_uncheckpointed_host_termination",
         )
         .await;
     }
 
     #[cfg(feature = "files")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn at_least_once_native_replays_pending_file_after_host_termination() {
+    async fn best_effort_native_replays_pending_file_after_host_termination() {
         assert_file_replay_after_host_termination(
             HostFailureCut::PendingInvocation,
             FileHostRuntime::NativeRust,
-            "process_function::tests::remote_pipeline::at_least_once_native_replays_pending_file_after_host_termination",
+            "process_function::tests::remote_pipeline::best_effort_native_replays_pending_file_after_host_termination",
         )
         .await;
     }
 
     #[cfg(feature = "files")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn at_least_once_native_republishes_file_after_host_termination() {
+    async fn best_effort_native_republishes_file_after_host_termination() {
         assert_file_replay_after_host_termination(
             HostFailureCut::PublishedOutput,
             FileHostRuntime::NativeRust,
-            "process_function::tests::remote_pipeline::at_least_once_native_republishes_file_after_host_termination",
+            "process_function::tests::remote_pipeline::best_effort_native_republishes_file_after_host_termination",
         )
         .await;
     }

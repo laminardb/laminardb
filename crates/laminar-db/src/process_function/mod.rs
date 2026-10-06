@@ -4,7 +4,9 @@
 //! returns proposed changes; its private memory is never authoritative. Native handlers execute
 //! on the compute thread and must be trusted, bounded, and nonblocking. The optional remote
 //! transport is restricted to local loopback pipelines. At-least-once delivery currently admits
-//! trusted native Rust and remote Rust with replayable sources; Python remains best-effort.
+//! trusted native Rust and remote Rust with replayable sources that explicitly reproduce one
+//! channel's row order; Python remains best-effort. Timer replay also depends on matching
+//! watermark cuts and is not certified by that source contract.
 
 use std::sync::Arc;
 
@@ -19,6 +21,7 @@ mod registration;
 #[cfg(feature = "process-remote")]
 pub mod remote;
 mod schema;
+mod source_order;
 
 #[cfg(feature = "benchmark-internals")]
 pub mod benchmark;

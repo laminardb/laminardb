@@ -43,11 +43,15 @@ alone do not imply exactly-once delivery.
 Embedded databases can register a trusted native Rust handler or a connected loopback Rust or
 Python worker before `start()`. Each function consumes one append-only event-time source and
 uses engine-owned keyed state and timers. Local `AtLeastOnce` delivery admits native and remote
-Rust handlers with a replayable connector source and checkpointing. The existing startup checks
+Rust handlers with checkpointing and an append-only singleton connector source declaring
+`SourceReplayOrder::SingleChannel`. Per-partition row positions alone do not qualify; built-in
+connectors currently leave replay order unspecified, including FILES, whose discovery order is
+not retained. The existing startup checks
 require durable checkpoint storage and a durable sink when a sink is configured. Replaying input
 after a crash may publish an output again. Python process functions and the single-node server's
 Python startup binding remain `BestEffort` while imported dependencies are not bound to the
-worker package. Both one-node and distributed cluster modes reject process functions.
+worker package. The row-order contract does not certify timer replay: matching watermark cuts
+are also required. Both one-node and distributed cluster modes reject process functions.
 
 Local subscriptions use in-memory replay history; cluster subscriptions expose committed,
 partition-ordered output only for certified non-windowed keyed aggregates. Neither a separate

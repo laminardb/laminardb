@@ -1581,14 +1581,88 @@ source/binary hashes, commands, durations and owned-fixture identity are retaine
 with the logs. The owned MinIO container is removed after verifying its exact ID,
 task label and absence of mounts; existing Docker services remain running.
 
+## 2026-10-06 — Source-order contract integration
+
+Status: completed and validated. This continues original Phase E from `3812b721` on
+`codex/stateful-process-functions`.
+
+`SourceContract` now separates `SourceReplayOrder` from per-partition row
+positions. The default is `Unspecified`; `SingleChannel` requires the same
+ordered suffix, including different keys, independent of poll timing and size,
+with a retained physical channel identity. It does not certify watermark cuts
+or timer replay. Local native and remote Rust `AtLeastOnce` process registration
+requires this declaration on a replayable, append-only singleton source.
+Registration checks before reserving the output; startup checks its immutable
+registration snapshot before source I/O, then checks the instantiated source.
+
+Checkpoint identity includes a declared source order. Undeclared sources retain
+their previous canonical bytes. Contract identity inspection now supplies the
+same Arrow schema as startup, including when the declaration depends on that
+schema. The schema remains structurally fingerprinted; its injected encoding
+does not become a raw identity option. A regression test covers both declarations
+and unchanged raw options.
+
+Built-in connectors remain undeclared. FILES retains processed paths and partial
+file cursors, but not the discovery order of an uncommitted suffix. Its four
+native/remote host-loss cases now use `BestEffort` with checkpoints and retain
+every original cursor, callback-ID, state and duplicate-output assertion. A new
+FILES admission test proves that its replayability alone does not qualify it.
+
+The focused tests cover rejection without output-name reservation or source
+startup, startup revalidation, instantiated-source validation, best-effort
+admission and the same native/remote rule. A timer-free native case commits total
+60 and source cursor 1, faults on the next invocation, restores the committed
+state and cursor, then replays callback ID 1 to produce total 110.
+
+Final validation used `CARGO_BUILD_JOBS=2`, `RUST_MIN_STACK=8388608`, rustc
+1.99.0 (`b940084d7`) and cargo 1.99.0 (`5f94df478`). Command times include
+compilation. All rows below ran after the schema inspection fix.
+
+| Command | Result | Seconds |
+| --- | --- | ---: |
+| `cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files process_function:: -- --quiet` | 132 passed, 2 ignored | 10.21 |
+| `cargo test -p laminar-db --lib --no-default-features process_function:: -- --quiet` | 31 passed, 1 ignored | 84.52 |
+| `cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files pipeline_identity::tests:: -- --quiet` | 10 passed | 148.62 |
+| `cargo test --workspace --lib` | 6236 passed, 5 ignored | 393.79 |
+| `cargo clippy --workspace --all-features --all-targets -- -D warnings` | passed | 49.60 |
+| `cargo clippy --workspace --no-default-features -- -D warnings` | passed | 9.83 |
+| `cargo +nightly fmt --all -- --check` | passed | 6.89 |
+| `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | passed; 18 module and 214 function exceptions unchanged | 9.96 |
+
+The unchanged baseline passed 125 remote-enabled process tests with two ignored.
+The first new-test compilation failed on fixture field names and a trait import;
+both were corrected. Final review then aligned schema-dependent identity and
+reran every affected suite and required gate. Minimal-feature tests retain the
+existing unused `ExternalOutputPressure` methods warning; the workspace build
+retains the OpenSSL PDB and `proc-macro-error2` future-compatibility warnings.
+Neither Clippy gate reports a warning. Cargo.lock and readability baselines are
+unchanged.
+
+Final test binary SHA-256:
+
+- Remote-enabled `laminar_db-0dc6c3690381aaf6.exe`:
+  `9C0799FEA4F3FB40CD555711472A0E0DCCB5061CDB4C7B62C4AC89278CF06810`.
+- Native-only `laminar_db-1c55abe7ac99f2ac.exe`:
+  `59FEEE7D0E02EDA2BD84BDD2D97AEC35624A85680B52E1C731B6ABF84F819CFB`.
+
+Both public cluster process-function paths remain closed. The admitted
+single-channel/singleton profile applies to local execution, including embedded
+use. Cluster's splittable placement and reproducible input/watermark cuts still
+need qualification before database-owned process recovery can be admitted.
+Only cold admission/identity code and tests change; no coordinator cycle,
+operator record path, scheduler, state backend or dependency changes. Criterion
+and IPC capture are not required for this increment. Exact command logs, times,
+source and binary hashes are retained in `target/process-source-order-20261006/`.
+
 ## Next executable task
 
-Continue original Phase E by binding the process-function replay profile to an
-explicitly admitted source-order contract, then integrate process functions with
-database-owned committed-cut recovery under that contract. The existing
-independent database aggregate case now covers the control prerequisite; it does
-not open process-function admission. Reuse its real recovery/assignment lifecycle
-for process-specific crash qualification after the ordering boundary is enforced.
+Continue original Phase E with source-order admission compatible with cluster
+splittable placement and matching input/watermark cuts, then integrate process
+functions with database-owned committed-cut recovery under that contract. The
+existing independent database aggregate case covers the control prerequisite;
+the local singleton row-order boundary does not qualify cluster placement or
+timer replay. Reuse the real recovery/assignment lifecycle for process-specific
+crash qualification after those ordering requirements are enforced.
 
 Fixture positions do not certify connector/sink delivery or independent-channel replay
 equivalence. Keep both public cluster admission paths closed through these gates.

@@ -34,9 +34,10 @@ impl LaminarDB {
     /// caller must register the same immutable implementation when constructing a replacement
     /// database instance that restores an existing checkpoint.
     ///
-    /// Local at-least-once execution requires a replayable connector source and checkpointing.
-    /// Source and sink contracts are verified before startup I/O. A direct in-memory source is
-    /// available only with best-effort delivery.
+    /// Local at-least-once execution requires checkpointing and a replayable append-only
+    /// singleton connector that explicitly reproduces one channel's row order. Per-partition positions alone
+    /// are insufficient. Source and sink contracts are verified before startup I/O. A direct
+    /// in-memory source is available only with best-effort delivery.
     /// Native code runs in the compute process and must be trusted and nonblocking.
     ///
     /// # Errors
@@ -65,6 +66,7 @@ impl LaminarDB {
     /// Register a connected loopback Rust or Python worker for a local pipeline. At-least-once
     /// delivery currently admits the Rust worker only; Python file-tree hashes do not enforce
     /// an immutable environment throughout the worker's lifetime.
+    /// Source-order requirements match native registration.
     /// The caller owns the worker process lifecycle and must keep it available until shutdown.
     ///
     /// # Errors
@@ -131,18 +133,11 @@ impl LaminarDB {
         let source = self.catalog.get_source(source_name).ok_or_else(|| {
             DbError::InvalidOperation(format!("process source '{source_name}' does not exist"))
         })?;
-        if self.config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce
-            && self
-                .connector_manager
-                .lock()
-                .sources()
-                .get(source_name)
-                .is_none_or(|registration| registration.connector_type.is_none())
-        {
-            return Err(DbError::Unsupported(
-                "at-least-once process functions require a replayable connector source".into(),
-            ));
-        }
+        self.validate_process_source_order(
+            output_name,
+            source_name,
+            self.connector_manager.lock().sources(),
+        )?;
         if source.schema.as_ref() != descriptor.input_schema.as_ref() {
             return Err(DbError::InvalidOperation(
                 "process descriptor input schema differs from its source".into(),

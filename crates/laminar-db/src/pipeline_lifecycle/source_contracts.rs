@@ -278,7 +278,7 @@ impl LaminarDB {
             .create_source(&connector_config, None)
             .map_err(|error| {
                 DbError::Config(format!(
-                    "cannot construct interval source '{source_name}' for contract validation: {error}"
+                    "cannot construct source '{source_name}' for contract validation: {error}"
                 ))
             })?;
         let connector_schema = connector.schema();

@@ -99,6 +99,15 @@ and callbacks that register another timer. This qualifies that controlled
 profile; independent-channel merging remains uncertified. Event-time sorting
 and multi-input process functions remain unsupported.
 
+Local native and remote Rust `AtLeastOnce` registration now requires a replayable,
+append-only singleton connector declaring `SourceReplayOrder::SingleChannel`.
+Registration and startup check that declaration before source I/O, and checkpoint
+identity binds it. Built-in connectors leave it unspecified; FILES does not retain
+the discovery order of an uncommitted suffix. Its process host-loss tests therefore
+use `BestEffort` with checkpoints. The row-order contract does not retain watermark
+cuts or certify arbitrary timer replay. This example uses `BestEffort` in both
+languages, and cluster process-function admission remains closed.
+
 ## Completed-checkpoint recovery
 
 Use a fresh directory for each runtime. Native and Python descriptors differ,

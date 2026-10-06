@@ -9,8 +9,8 @@ mod task_tracking;
 
 pub use contracts::{
     DeliveryGuarantee, SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
-    SourceConsistency, SourceContract, SourceInputMode, SourceRowPositionCapability,
-    SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourceReplayOrder,
+    SourceRowPositionCapability, SourceTopology,
 };
 pub use coordinated_commit::{
     CoordinatedAbortBatch, CoordinatedAbortCleaner, CoordinatedAbortDescriptor,
@@ -366,6 +366,7 @@ mod tests {
             SourceRowPositionCapability::Unavailable
         );
         assert!(!contract.supports_replay());
+        assert_eq!(contract.replay_order, SourceReplayOrder::Unspecified);
         assert!(!contract.requires_checkpointing());
         assert!(!contract.is_exact_delivery_certified());
     }

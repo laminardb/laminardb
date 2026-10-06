@@ -1,3 +1,5 @@
+use laminar_connectors::connector::SourceConnector as _;
+
 use super::{
     admit_source_contract, admit_source_recovery_contract, admit_temporal_source_contract,
     exact_table_reference, schema_has_reserved_mutation_columns, Arc,
@@ -263,7 +265,6 @@ impl LaminarDB {
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Vec<TrackedSourceRegistration>, DbError> {
         use crate::pipeline::SourceRegistration;
-        use laminar_connectors::connector::SourceConnector as _;
         let mut sources: Vec<TrackedSourceRegistration> = Vec::new();
         for (name, reg) in source_regs {
             if reg.connector_type.is_none() {
@@ -302,6 +303,7 @@ impl LaminarDB {
                     source.with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
             }
             let contract = source.contract();
+            self.validate_instantiated_process_source_order(name, contract)?;
             let has_primary_key = source_entry
                 .as_ref()
                 .is_some_and(|entry| !entry.primary_key.is_empty());

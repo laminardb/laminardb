@@ -406,6 +406,8 @@ pub trait SourceConnector: Send {
     }
 
     /// Declare recovery and placement semantics for this exact configuration.
+    /// This hook must be deterministic, configuration-only, and free of external I/O;
+    /// admission and checkpoint identity inspect it before `start()`.
     ///
     /// # Errors
     ///

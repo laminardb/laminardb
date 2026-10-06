@@ -116,8 +116,24 @@ pub enum SourceRowPositionCapability {
     /// Every emitted row carries a replay position. Within one source run, `(order_key,
     /// sub_offset)` is nondecreasing per partition across batches; recovery may restart from an
     /// earlier position. Replaying an equal position must produce the same logical row and
-    /// mutation.
+    /// mutation. This does not define the merge order of independent partitions.
     OrderedDeterministic,
+}
+
+/// Row order reproduced when resuming a source cursor.
+///
+/// This is separate from row positions and delivery guarantees. It does not certify the
+/// runtime's watermark cuts or the order of timer callbacks relative to input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceReplayOrder {
+    /// The source does not promise a replay order.
+    #[default]
+    Unspecified,
+    /// One physical input channel reproduces the same ordered suffix from a committed cursor,
+    /// including the order of different keys. Poll size and timing must not reorder rows, and
+    /// recovery must retain the channel identity. Independent-channel merging is excluded.
+    SingleChannel,
 }
 
 /// Complete source admission contract for a concrete connector configuration.
@@ -131,6 +147,8 @@ pub struct SourceContract {
     pub input_mode: SourceInputMode,
     /// Deterministic per-row position support.
     pub row_positions: SourceRowPositionCapability,
+    /// Order reproduced from a persisted cursor; unspecified unless explicitly declared.
+    pub replay_order: SourceReplayOrder,
     exact_delivery_certified: bool,
 }
 
@@ -148,6 +166,7 @@ impl SourceContract {
             topology,
             input_mode,
             row_positions: SourceRowPositionCapability::Unavailable,
+            replay_order: SourceReplayOrder::Unspecified,
             exact_delivery_certified: false,
         }
     }
@@ -156,6 +175,14 @@ impl SourceContract {
     #[must_use]
     pub const fn with_row_positions(mut self, capability: SourceRowPositionCapability) -> Self {
         self.row_positions = capability;
+        self
+    }
+
+    /// Declare the row order reproduced from a committed cursor. Connector implementations
+    /// must uphold this for the exact configuration, independently of poll size and timing.
+    #[must_use]
+    pub const fn with_replay_order(mut self, order: SourceReplayOrder) -> Self {
+        self.replay_order = order;
         self
     }
 

@@ -20,6 +20,7 @@ fn canonical_source_digest(
             options: BTreeMap::new(),
             input_mode: canonical_source_input_mode(input_mode),
             row_positions: canonical_source_row_positions(row_positions),
+            replay_order: None,
             schema: None,
             primary_key: Vec::new(),
             watermark_column: None,
@@ -131,6 +132,111 @@ fn source_row_position_capability_changes_canonical_identity() {
             SourceRowPositionCapability::OrderedDeterministic,
         )
     );
+}
+
+#[test]
+fn source_replay_order_binds_identity_without_changing_undeclared_sources() {
+    let contract = SourceContract::new(
+        laminar_connectors::connector::SourceConsistency::Replayable,
+        laminar_connectors::connector::SourceTopology::Singleton,
+        SourceInputMode::AppendOnly,
+    );
+    let encode = |contract| {
+        serde_json::to_vec(&canonical_source(
+            "events".into(),
+            1,
+            "test".into(),
+            BTreeMap::new(),
+            contract,
+            None,
+        ))
+        .unwrap()
+    };
+    let legacy = encode(contract);
+    assert_eq!(
+        legacy,
+        br#"{"name":"events","catalog_generation":1,"connector_type":"test","options":{},"input_mode":"append_only","row_positions":"unavailable","schema":null,"primary_key":[],"watermark_column":null,"max_out_of_orderness_ms":null,"processing_time":false}"#
+    );
+    let ordered = encode(contract.with_replay_order(SourceReplayOrder::SingleChannel));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&ordered).unwrap()["replay_order"],
+        "single_channel"
+    );
+    assert_ne!(Sha256::digest(&legacy), Sha256::digest(&ordered));
+}
+
+#[test]
+fn source_order_identity_inspects_the_schema_supplied_at_startup() {
+    use std::sync::Arc;
+
+    use laminar_connectors::checkpoint::SourceCheckpoint;
+    use laminar_connectors::config::ConnectorInfo;
+    use laminar_connectors::connector::{SourceBatch, SourceConnector, SourceStart};
+    use laminar_connectors::error::ConnectorError;
+    use laminar_connectors::generator::GeneratorSource;
+
+    struct SchemaOrderedGenerator(GeneratorSource);
+
+    #[async_trait::async_trait]
+    impl SourceConnector for SchemaOrderedGenerator {
+        fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+            let contract = self.0.contract(config)?;
+            Ok(if config.arrow_schema().is_some() {
+                contract.with_replay_order(SourceReplayOrder::SingleChannel)
+            } else {
+                contract
+            })
+        }
+
+        async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+            self.0.start(request).await
+        }
+
+        async fn poll_batch(
+            &mut self,
+            limit: usize,
+        ) -> Result<Option<SourceBatch>, ConnectorError> {
+            self.0.poll_batch(limit).await
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.0.schema()
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            self.0.checkpoint()
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.0.close().await
+        }
+    }
+
+    let registry = ConnectorRegistry::new();
+    registry
+        .register_source(
+            "schema-order-test",
+            ConnectorInfo {
+                name: "schema-order-test".into(),
+                display_name: "Schema-dependent order declaration".into(),
+                version: "1".into(),
+                is_source: true,
+                is_sink: false,
+                config_keys: Vec::new(),
+            },
+            Arc::new(|_| Ok(Box::new(SchemaOrderedGenerator(GeneratorSource::default())))),
+        )
+        .unwrap();
+    let config = ConnectorConfig::new("schema-order-test");
+    let schema = GeneratorSource::default().schema();
+    let (_, original_options, undeclared) =
+        canonical_source_connector(&config, &registry, None).unwrap();
+    let (_, options, declared) =
+        canonical_source_connector(&config, &registry, Some(&schema)).unwrap();
+    assert_eq!(undeclared.replay_order, SourceReplayOrder::Unspecified);
+    assert_eq!(declared.replay_order, SourceReplayOrder::SingleChannel);
+    assert_eq!(options, original_options);
+    assert!(!options.contains_key("_arrow_schema"));
 }
 
 #[test]
