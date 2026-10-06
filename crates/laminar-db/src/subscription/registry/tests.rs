@@ -16,7 +16,9 @@ fn earliest_retained(error: SubscriptionOpenError) -> u64 {
         SubscriptionOpenError::EpochNotCommitted { .. } => {
             panic!("expected replay-pruned error")
         }
-        SubscriptionOpenError::Capacity { .. } => panic!("expected replay-pruned error"),
+        SubscriptionOpenError::SequencePruned { .. }
+        | SubscriptionOpenError::SequenceNotPublished { .. }
+        | SubscriptionOpenError::Capacity { .. } => panic!("expected replay-pruned error"),
     }
 }
 
@@ -774,4 +776,157 @@ fn subscriber_cap_is_atomic_across_65_simultaneous_attempts() {
         .count();
     assert_eq!(successes, super::super::MAX_SUBSCRIBERS_PER_MV);
     assert_eq!(capacity_failures, 1);
+}
+
+fn next_batch(reader: &mut SubscriptionReader) -> (u64, i64) {
+    let TryRead::Ready(SubscriptionRead::Update { sequence, update }) = reader.try_read() else {
+        panic!("expected a ready batch");
+    };
+    let MvUpdate::Batch(batch) = update.as_ref() else {
+        panic!("expected a batch update");
+    };
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    (sequence, values.value(0))
+}
+
+#[test]
+fn after_sequence_replays_and_continues_live() {
+    let registry = SubscriptionRegistry::new();
+    registry.configure("mv", 1 << 20);
+    for value in [10, 20, 30] {
+        registry.send_batch("mv", batch(vec![value])).unwrap();
+    }
+    let mut reader = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(0))
+        .unwrap();
+    assert_eq!(next_batch(&mut reader), (1, 20));
+    assert_eq!(next_batch(&mut reader), (2, 30));
+    assert!(matches!(reader.try_read(), TryRead::Pending));
+
+    registry.send_batch("mv", batch(vec![40])).unwrap();
+    assert_eq!(next_batch(&mut reader), (3, 40));
+    assert!(matches!(reader.try_read(), TryRead::Pending));
+}
+
+#[test]
+fn after_sequence_at_last_published_attaches_live() {
+    for retention_cap in [0, 1 << 20] {
+        let registry = SubscriptionRegistry::new();
+        registry.configure("mv", retention_cap);
+        let tail = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
+        registry.send_batch("mv", batch(vec![10])).unwrap();
+        registry.send_batch("mv", batch(vec![20])).unwrap();
+        drop(tail);
+
+        let mut reader = registry
+            .subscribe("mv", SubscribeStart::AfterSequence(1))
+            .unwrap();
+        assert!(matches!(reader.try_read(), TryRead::Pending));
+        registry.send_batch("mv", batch(vec![30])).unwrap();
+        assert_eq!(next_batch(&mut reader), (2, 30));
+    }
+}
+
+#[test]
+fn after_sequence_rejects_unpublished_values() {
+    for next_sequence in [0, 2] {
+        let registry = SubscriptionRegistry::new();
+        registry.configure("mv", 1 << 20);
+        for value in 0..next_sequence {
+            registry
+                .send_batch("mv", batch(vec![i64::try_from(value).unwrap()]))
+                .unwrap();
+        }
+        for requested in [next_sequence, next_sequence + 1, u64::MAX] {
+            let error = registry
+                .subscribe("mv", SubscribeStart::AfterSequence(requested))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SubscriptionOpenError::SequenceNotPublished {
+                    requested: actual,
+                    next_sequence: next,
+                } if actual == requested && next == next_sequence
+            ));
+        }
+    }
+}
+
+#[test]
+fn after_sequence_retention_floor_ignores_pinned_entries() {
+    let entry_bytes = approx_size(&MvUpdate::Batch(batch(vec![10])));
+    let registry = SubscriptionRegistry::with_storage_budget(1 << 20);
+    registry.configure("mv", entry_bytes);
+    registry.send_batch("mv", batch(vec![10])).unwrap();
+    let mut pinned = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
+    for value in [20, 30, 40] {
+        registry.send_batch("mv", batch(vec![value])).unwrap();
+    }
+    for requested in [0, 1] {
+        let error = registry
+            .subscribe("mv", SubscribeStart::AfterSequence(requested))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SubscriptionOpenError::SequencePruned {
+                requested: actual,
+                earliest_retained: Some(3),
+            } if actual == requested
+        ));
+    }
+    let mut replay = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(2))
+        .unwrap();
+    assert_eq!(next_batch(&mut replay), (3, 40));
+    assert_eq!(next_batch(&mut pinned), (1, 20));
+}
+
+#[test]
+fn after_sequence_reports_no_history_when_disabled_or_fully_evicted() {
+    for retention_cap in [0, 1] {
+        let registry = SubscriptionRegistry::new();
+        registry.configure("mv", retention_cap);
+        let _pinned = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
+        registry.send_batch("mv", batch(vec![10])).unwrap();
+        registry.send_batch("mv", batch(vec![20])).unwrap();
+        let error = registry
+            .subscribe("mv", SubscribeStart::AfterSequence(0))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SubscriptionOpenError::SequencePruned {
+                requested: 0,
+                earliest_retained: None,
+            }
+        ));
+    }
+}
+
+#[test]
+fn after_sequence_replays_checkpoint_markers() {
+    let registry = SubscriptionRegistry::new();
+    registry.configure("mv", 1 << 20);
+    registry.send_batch("mv", batch(vec![10])).unwrap();
+    registry.broadcast_barrier(1, 1);
+    registry.send_batch("mv", batch(vec![20])).unwrap();
+    let mut reader = registry
+        .subscribe("mv", SubscribeStart::AfterSequence(0))
+        .unwrap();
+    let TryRead::Ready(SubscriptionRead::Update { sequence, update }) = reader.try_read() else {
+        panic!("expected retained progress");
+    };
+    assert_eq!(sequence, 1);
+    assert!(matches!(
+        update.as_ref(),
+        MvUpdate::Barrier {
+            epoch: 1,
+            checkpoint_id: 1,
+            ..
+        }
+    ));
+    assert_eq!(next_batch(&mut reader), (2, 20));
 }

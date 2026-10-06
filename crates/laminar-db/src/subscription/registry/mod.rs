@@ -129,6 +129,11 @@ pub enum SubscribeStart {
     Tail,
     /// Replay entries strictly after the retained barrier with `epoch == n`.
     AsOfEpoch(u64),
+    /// Replay retained entries strictly after a local `PortalFrame` sequence, then continue live.
+    /// Sequences start at zero; values not yet published are rejected. This in-memory cursor
+    /// is invalid across recovery, restart, or stream recreation. Supported only by embedded
+    /// and single-node subscriptions; no checkpoint configuration is required.
+    AfterSequence(u64),
 }
 
 #[derive(Debug)]
@@ -140,6 +145,14 @@ pub(crate) enum SubscriptionOpenError {
     EpochNotCommitted {
         requested: u64,
         latest_committed: Option<u64>,
+    },
+    SequencePruned {
+        requested: u64,
+        earliest_retained: Option<u64>,
+    },
+    SequenceNotPublished {
+        requested: u64,
+        next_sequence: u64,
     },
     Capacity {
         attached: usize,
@@ -417,6 +430,9 @@ impl StreamLog {
                 let (cursor, barrier_sequence) = cursor_after_retained_epoch(&inner, epoch)?;
                 (cursor, Some((epoch, barrier_sequence)))
             }
+            (false, SubscribeStart::AfterSequence(sequence)) => {
+                (cursor_after_sequence(&inner, sequence)?, None)
+            }
         };
         let wake = self.wake.subscribe();
         let mut reader_id = inner.next_reader_id;
@@ -631,6 +647,28 @@ fn retain_appended_entry(inner: &mut StreamLogInner, sequence: u64, bytes: usize
     if inner.retention_bytes == 0 {
         inner.retention_floor = inner.next_sequence;
     }
+}
+
+fn cursor_after_sequence(
+    inner: &StreamLogInner,
+    requested: u64,
+) -> Result<u64, SubscriptionOpenError> {
+    if requested >= inner.next_sequence {
+        return Err(SubscriptionOpenError::SequenceNotPublished {
+            requested,
+            next_sequence: inner.next_sequence,
+        });
+    }
+    let cursor = requested + 1;
+    // A live reader may pin entries below the replay retention floor.
+    if cursor < inner.retention_floor {
+        return Err(SubscriptionOpenError::SequencePruned {
+            requested,
+            earliest_retained: (inner.retention_floor < inner.next_sequence)
+                .then_some(inner.retention_floor),
+        });
+    }
+    Ok(cursor)
 }
 
 fn cursor_after_retained_epoch(

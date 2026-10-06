@@ -13159,3 +13159,114 @@ async fn open_subscription_as_of_uncommitted_returns_structured_error() {
     assert_eq!(err.code(), laminar_core::error_codes::INVALID_OPERATION);
     assert!(err.to_string().contains("not committed"), "msg: {err}");
 }
+
+#[tokio::test]
+async fn open_subscription_after_sequence_replays_without_checkpointing() {
+    use crate::subscription::{PortalFrame, SubscribeStart};
+
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '4mb')")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    let schema = db.source_untyped("trades").unwrap().schema().clone();
+    for symbol in ["AAPL", "MSFT"] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::StringArray::from(vec![symbol]))],
+        )
+        .unwrap();
+        db.subscription_registry
+            .send_batch("all_trades", batch)
+            .unwrap();
+    }
+    let mut portal = db
+        .open_subscription("all_trades", None, SubscribeStart::AfterSequence(0))
+        .await
+        .unwrap();
+    let Some(PortalFrame::Batch {
+        sequence, batch, ..
+    }) = portal.try_next_frame()
+    else {
+        panic!("expected the retained batch after sequence zero");
+    };
+    assert_eq!(sequence, 1);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0),
+        "MSFT"
+    );
+    assert!(portal.try_next_frame().is_none());
+    portal.close();
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn open_subscription_after_sequence_reports_cursor_errors() {
+    use crate::subscription::SubscribeStart;
+
+    for retention in ["1kb", "1b"] {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+            .await
+            .unwrap();
+        db.execute(&format!("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '{retention}')")).await.unwrap();
+        db.start().await.unwrap();
+        let schema = db.source_untyped("trades").unwrap().schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec!["AAPL"]))],
+        )
+        .unwrap();
+        for _ in 0..32 {
+            db.subscription_registry
+                .send_batch("all_trades", batch.clone())
+                .unwrap();
+        }
+        let error = db
+            .open_subscription("all_trades", None, SubscribeStart::AfterSequence(0))
+            .await
+            .unwrap_err();
+        let DbError::SubscriptionSequencePruned {
+            name,
+            requested_sequence,
+            earliest_retained_sequence,
+        } = &error
+        else {
+            panic!("expected a sequence pruning error: {error}");
+        };
+        assert_eq!(name, "all_trades");
+        assert_eq!(*requested_sequence, 0);
+        assert_eq!(error.code(), laminar_core::error_codes::INVALID_OPERATION);
+        if retention == "1kb" {
+            assert!(earliest_retained_sequence.is_some_and(|earliest| earliest > 1));
+            assert!(error.to_string().contains("earliest retained sequence is"));
+        } else {
+            assert_eq!(*earliest_retained_sequence, None);
+            assert!(error.to_string().contains("no replay history is retained"));
+        }
+        for requested in [32, 33, u64::MAX] {
+            let error = db
+                .open_subscription("all_trades", None, SubscribeStart::AfterSequence(requested))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                DbError::SubscriptionSequenceNotPublished { ref name, requested_sequence, next_sequence: 32 }
+                    if name == "all_trades" && requested_sequence == requested
+            ));
+            assert_eq!(error.code(), laminar_core::error_codes::INVALID_OPERATION);
+            assert!(error
+                .to_string()
+                .contains("has not been published (next sequence is 32)"));
+        }
+        db.shutdown().await.unwrap();
+    }
+}

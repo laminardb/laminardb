@@ -907,3 +907,22 @@ async fn every_gateway_reads_the_complete_three_participant_union() {
         assert!(observed.iter().all(|batch| batch.committed_epoch == 2));
     }
 }
+
+#[tokio::test]
+async fn after_sequence_is_rejected_without_committed_history() {
+    let fixture = GatewayFixture::new().await;
+    let error = ClusterSubscriptionReader::open(
+        fixture.fresh_authority(),
+        fixture.fresh_store(),
+        Arc::clone(&fixture.certificate),
+        SubscribeStart::AfterSequence(0),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        DbError::Subscription(ClusterSubscriptionError::UnsupportedPlan { ref reason })
+            if reason.contains("sequence start-after")
+    ));
+}

@@ -5284,7 +5284,9 @@ impl LaminarDB {
     /// # Errors
     /// `StreamNotFound` for unknown `name`; `Subscription` for unsupported cluster plans or
     /// durable replay failures; `Pipeline` for subscriber-cap or filter-compile failures;
-    /// `InvalidOperation` when a local `AsOfEpoch(n)` is not committed or retained.
+    /// Local epoch and sequence replay failures return the corresponding structured
+    /// `SubscriptionEpochNotCommitted`, `SubscriptionReplayPruned`,
+    /// `SubscriptionSequenceNotPublished`, or `SubscriptionSequencePruned` error.
     pub async fn open_subscription(
         &self,
         name: &str,
@@ -5324,7 +5326,8 @@ impl LaminarDB {
                     } => {
                         let requested = match start {
                             crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
-                            crate::subscription::SubscribeStart::Tail => 0,
+                            crate::subscription::SubscribeStart::AfterSequence(_)
+                            | crate::subscription::SubscribeStart::Tail => 0,
                         };
                         DbError::SubscriptionReplayPruned {
                             name: name.to_string(),
@@ -5332,6 +5335,22 @@ impl LaminarDB {
                             earliest_retained,
                         }
                     }
+                    crate::subscription::SubscriptionOpenError::SequencePruned {
+                        requested,
+                        earliest_retained,
+                    } => DbError::SubscriptionSequencePruned {
+                        name: name.to_string(),
+                        requested_sequence: requested,
+                        earliest_retained_sequence: earliest_retained,
+                    },
+                    crate::subscription::SubscriptionOpenError::SequenceNotPublished {
+                        requested,
+                        next_sequence,
+                    } => DbError::SubscriptionSequenceNotPublished {
+                        name: name.to_string(),
+                        requested_sequence: requested,
+                        next_sequence,
+                    },
                     crate::subscription::SubscriptionOpenError::EpochNotCommitted {
                         requested,
                         latest_committed,

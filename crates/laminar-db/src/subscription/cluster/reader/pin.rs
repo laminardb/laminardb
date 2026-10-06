@@ -8,7 +8,7 @@ use laminar_core::cluster::control::{
     SUBSCRIPTION_REPLAY_PIN_RENEW_INTERVAL,
 };
 
-use super::authority::map_authority_error;
+use super::authority::{map_authority_error, unsupported_sequence_start};
 use super::GATEWAY_IO_TIMEOUT;
 use crate::error::DbError;
 use crate::subscription::{ClusterSubscriptionError, SubscribeStart};
@@ -32,8 +32,10 @@ pub(super) async fn acquire_replay_pin(
     certificate: &OutputDistributionCertificate,
     start: SubscribeStart,
 ) -> Result<Option<SubscriptionReplayPin>, DbError> {
-    let SubscribeStart::AsOfEpoch(requested) = start else {
-        return Ok(None);
+    let requested = match start {
+        SubscribeStart::Tail => return Ok(None),
+        SubscribeStart::AfterSequence(_) => return Err(unsupported_sequence_start()),
+        SubscribeStart::AsOfEpoch(requested) => requested,
     };
     let acquired = tokio::time::timeout(
         GATEWAY_IO_TIMEOUT,
