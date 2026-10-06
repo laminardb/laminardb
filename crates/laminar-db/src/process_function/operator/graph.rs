@@ -16,6 +16,13 @@ use laminar_core::serialization::BoundedBytesWriter;
 #[async_trait]
 impl GraphOperator for ProcessFunctionOperator {
     fn cluster_capability(&self) -> OperatorCapability {
+        #[cfg(all(test, feature = "cluster"))]
+        if self.qualify_cluster_recovery {
+            let mut capability = OperatorCapability::fixed(OperatorImplementation::ProcessFunction);
+            capability.cluster_status =
+                crate::operator::capability::ClusterExecutionStatus::InternalOnly;
+            return capability;
+        }
         OperatorCapability::fixed(OperatorImplementation::ProcessFunction)
     }
 

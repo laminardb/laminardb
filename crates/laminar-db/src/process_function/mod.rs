@@ -23,6 +23,9 @@ pub mod remote;
 mod schema;
 mod source_order;
 
+#[cfg(all(test, feature = "cluster"))]
+mod cluster_recovery_tests;
+
 #[cfg(feature = "benchmark-internals")]
 pub mod benchmark;
 

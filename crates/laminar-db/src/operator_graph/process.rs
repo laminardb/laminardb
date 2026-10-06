@@ -6,6 +6,7 @@ impl OperatorGraph {
     pub(crate) fn add_process_function(
         &mut self,
         registration: &crate::process_function::ProcessFunctionRegistration,
+        #[cfg(all(test, feature = "cluster"))] qualify_recovery: bool,
     ) -> Result<(), DbError> {
         let operator = match &registration.handler {
             crate::process_function::ProcessHandler::Native(handler) => {
@@ -37,6 +38,10 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let operator = {
             let mut operator = operator;
+            #[cfg(test)]
+            {
+                operator.qualify_cluster_recovery = qualify_recovery;
+            }
             if let Some(scope) = &self.cluster_shuffle {
                 let runtime = self.main_runtime_handle.clone().ok_or_else(|| {
                     DbError::Config("process shuffle requires a main runtime handle".into())

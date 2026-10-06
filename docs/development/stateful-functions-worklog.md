@@ -1787,14 +1787,109 @@ Qualified Rust source and lockfile hashes still match after profiling. Public
 cluster process-function admission remains closed, and target-hardware workload
 and tail-latency qualification remain pending.
 
+### Continuation: database-controlled cluster process recovery (2026-10-06)
+
+This Phase E increment connects private process graphs to the existing database
+startup, shared checkpoint and coordinated Prepare/Start/Release lifecycle.
+Four unignored cases cover native Rust and the real loopback Rust worker with
+one owner of two vnodes and two owners of one vnode each. No public cluster
+registration or subscription admission changes. Private qualification fields
+and capability overrides are compiled only for tests and default to rejection.
+Embedded and single-node behavior and the production record path are unchanged.
+
+Each case compares an uninterrupted reference with recovery from checkpoint 1
+after two uncommitted state mutations and an injected indeterminate apply
+outcome. The database restores cursor 2, the deployment/pipeline binding,
+assignment, keyed state and timer state. Source starts are held while the
+test checks that intake, polling, callbacks and output remain closed, and that
+the exact selected checkpoint remains recovery authority. Opening the held
+starts produces the matching committed Release before intake resumes.
+
+The fixture declares the existing splittable fixed-batch replay contract. One
+global physical channel follows vnode zero; the other owner reports an empty
+physical inventory. Its participant-local idle checkpoint marker is checked
+separately from the physical channel. Both runs commit the same source-decision
+cuts: cursor 2/watermark 104, then cursor 7/watermark 164 (milliseconds).
+The second database checkpoint supplies the durable cut needed for pending
+timers. No watermark or recovery control is injected directly.
+
+Qualification compares all nine suffix callback IDs, keys, event times,
+callback kinds and state views, and independently specified output totals,
+threshold changes and timer timestamps. It checks that the replaced timer at
+110,000 microseconds does not fire. Callback transcripts are ordered by engine
+ID; output is grouped by key with its within-key order preserved. Independent
+worker arrival and cross-key output order remain concurrent.
+
+The controllers, database compute runtimes, leased barrier RPC and shuffle
+transport execute normally. Shared object storage and control KV are in memory,
+leases have bounded fixture deadlines, and all database owners remain in one
+OS process under the same assignment. This qualifies a recoverable compute
+fault; it does not qualify OS process loss, durable control restart, lease
+renewal or ownership change through the database. Existing graph-level process
+transfer tests and the database aggregate node-loss prerequisite remain separate.
+Private owner-local output observation makes no sink-delivery or distributed
+subscription guarantee. Cleanup is bounded and preserves the primary failure.
+
+Initial attempts exposed fixture errors in public subscription admission,
+shuffle assignment installation, SQL watermark interval units and empty-owner
+channel counting. Waiting for timers before committing the source decision also
+stalled as expected. A generic native handler error correctly became terminal;
+the final injected error uses the existing typed indeterminate-apply variant to
+exercise recoverable rounds. Production failure classification is unchanged.
+Clippy then required descriptive account variable names and inclusion of the
+test field in the existing Debug formatter. Failed commands remain in the
+evidence alongside the final results.
+
+### Validation
+
+Validation uses `CARGO_BUILD_JOBS=2`, `RUST_MIN_STACK=8388608`, rustc 1.99.0
+(`b940084d7`) and cargo 1.99.0 (`5f94df478`). The baseline is `ac2798a3`.
+Before editing, the exact `cluster,process-remote,files` feature set passes
+61 coordinated-recovery tests (141.00 command seconds) and 136 process tests
+with two ignored (35.55 seconds), each with one test thread.
+
+Before the final naming/Debug edits, the four new cases pass in 49.22 command
+seconds, including 25.28 seconds of compilation and 22.94 seconds of test
+execution. The full process suite passes 140 tests with two ignored in 59.54
+seconds; the minimal native suite passes 34 with one ignored in 81.59 seconds.
+Their exact commands are:
+
+```text
+cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files process_function::cluster_recovery_tests:: -- --quiet --test-threads=1
+cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files process_function:: -- --quiet --test-threads=1
+cargo test -p laminar-db --lib --no-default-features process_function:: -- --quiet --test-threads=1
+```
+
+The final workspace suite reruns all four new cases successfully with the
+corrected fixture names and Debug output. Final repository gates use the same
+environment above; times include compilation.
+
+| Command | Result | Seconds |
+| --- | --- | ---: |
+| `cargo test --workspace --lib` | 6,247 passed, five ignored | 292.57 |
+| `cargo clippy --workspace --all-features --all-targets -- -D warnings` | Passed | 79.19 |
+| `cargo clippy --workspace --no-default-features -- -D warnings` | Passed | 19.72 |
+| `cargo +nightly fmt --all -- --check` | Passed | 6.27 |
+| `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | Passed; 18 module and 214 function exceptions unchanged | 13.17 |
+
+The earlier workspace pass takes 452.96 seconds with the same counts. The
+minimal-test unused `ExternalOutputPressure` methods warning, OpenSSL PDB linker
+warning and `proc-macro-error2` future-compatibility warning remain as previously
+recorded. Both Clippy gates pass with warnings denied. No dependencies,
+checkpoint formats, readability baselines, coordinator-cycle or core-operator
+code change. Criterion and IPC requalification is unnecessary for qualification
+code and cold Debug formatting. Exact commands, logs, durations and qualified
+source/binary hashes are retained in `target/process-database-recovery-20261006/`.
+
 ## Next executable task
 
-Continue original Phase E with process functions in database-owned committed-cut
-cluster recovery under the fixed-batch source profile. The existing independent
-database aggregate case covers the control prerequisite; matching local
-input/timer cuts do not qualify distributed process recovery. Reuse the real
-recovery/assignment lifecycle for process-specific crash qualification, including
-the global physical channel binding and committed source-decision cut.
+Continue original Phase E with database-controlled process recovery after real
+node/process loss, using durable shared checkpoint/control authority and the
+fixed-batch global physical channel profile. Reuse the existing process-loss and
+assignment infrastructure; join the independently tested process vnode transfer
+and database recovery lifecycle without adding a second scheduler or state
+backend. Verify restored ownership, source inventory and matching source-decision
+cuts before publication and replay.
 
 Fixture positions do not certify connector/sink delivery or independent-channel replay
 equivalence. Keep both public cluster admission paths closed through these gates.

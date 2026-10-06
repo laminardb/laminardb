@@ -202,6 +202,9 @@ pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorCon
 
 /// Accumulates DDL registrations; pipeline lifecycle reads them at start.
 pub struct ConnectorManager {
+    // Private database recovery qualification; public registration and default graphs still reject.
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) qualify_process_cluster_recovery: bool,
     sources: HashMap<String, SourceRegistration>,
     sinks: HashMap<String, SinkRegistration>,
     streams: HashMap<String, StreamRegistration>,
@@ -215,6 +218,8 @@ pub struct ConnectorManager {
 impl ConnectorManager {
     pub fn new() -> Self {
         Self {
+            #[cfg(all(test, feature = "cluster"))]
+            qualify_process_cluster_recovery: false,
             sources: HashMap::new(),
             sinks: HashMap::new(),
             streams: HashMap::new(),
@@ -483,15 +488,21 @@ impl Default for ConnectorManager {
 
 impl std::fmt::Debug for ConnectorManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectorManager")
+        let mut debug = f.debug_struct("ConnectorManager");
+        debug
             .field("sources", &self.sources.len())
             .field("sinks", &self.sinks.len())
             .field("streams", &self.streams.len())
             .field("process_functions", &self.process_functions.len())
             .field("tables", &self.tables.len())
             .field("ddl_entries", &self.ddl_store.len())
-            .field("ddl_order", &self.ddl_order.len())
-            .finish()
+            .field("ddl_order", &self.ddl_order.len());
+        #[cfg(all(test, feature = "cluster"))]
+        debug.field(
+            "qualify_process_cluster_recovery",
+            &self.qualify_process_cluster_recovery,
+        );
+        debug.finish()
     }
 }
 

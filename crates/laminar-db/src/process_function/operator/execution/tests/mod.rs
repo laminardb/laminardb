@@ -185,12 +185,15 @@ impl Fixture {
         graph.set_runtime_handle(tokio::runtime::Handle::current());
         graph.register_source_schema("events".into(), Arc::clone(&binding.input_schema));
         graph
-            .add_process_function(&ProcessFunctionRegistration {
-                output_name: "activity".into(),
-                source_name: "events".into(),
-                descriptor: binding,
-                handler,
-            })
+            .add_process_function(
+                &ProcessFunctionRegistration {
+                    output_name: "activity".into(),
+                    source_name: "events".into(),
+                    descriptor: binding,
+                    handler,
+                },
+                false,
+            )
             .unwrap();
         graph
     }
