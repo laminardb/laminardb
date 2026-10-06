@@ -1385,21 +1385,121 @@ continue to reject the invalid chained proof. Compile and Clippy findings are
 resolved before the six-case run. The readability baselines and lockfile are
 unchanged.
 
+## 2026-10-06 — Database recovery rounds and controlled source order
+
+Status: completed and validated. Public cluster process-function
+registration and graph admission remain closed. This continues original Phase E
+from `57766088` without changing production runtime behavior.
+
+An ignored server integration test runs two actual `LaminarDB` instances and their
+database-owned `RecoveryMonitor` tasks against live loopback MinIO. It uses the
+server's `ObjectStoreClusterKv`, renewable process and leader leases, verified
+shared namespaces, sealed catalog bootstrap, certified assignment and actual
+shuffle mesh. Its admitted projection pipeline has an empty source that exposes
+bounded Start holds and poll counters. Recovery selects GENESIS (epoch 0); the
+test does not insert a process function into a publicly rejected cluster graph.
+
+The first held Start keeps both intake gates closed and poll counters unchanged
+after the stopped quorum. Releasing that hold allows the matching durable
+`ReleaseCommitted` and then fresh polling. A second fault rejects the old round's
+Release. With that Start held, the leader manager withdraws its grant, waits its
+full six-second TTL and acquires a new fencing proof. The old Start cannot Release;
+the database monitors retain its control and finish a later generation under the
+new proof. The durable generation agrees with the committed Release and both
+intake gates reopen. Process leases use a separate 60-second TTL. Cleanup releases
+all source holds before shutting either database down, then cancels and joins the
+fixture-owned renewal tasks while preserving primary and cleanup failures.
+A focused failure case verifies that cleanup reports an already-completed failed
+task without polling its consumed join result again; only timed-out tasks are
+aborted and subsequently joined.
+
+Companion private graph tests restore a committed cut from the existing in-memory
+shared object-store fixture, rescale from two owners to three and replay one fixed
+source order using six-row and one-row batches. Native Rust and the actual loopback
+Rust worker must reproduce 14 independently specified callback identities and
+output rows. The cases replace and cancel timers, then register one subsequent
+timer from each live timer callback. A repeated key's timestamp moves backward
+above the accepted watermark, proving arrival order rather than event-time sorting.
+Explicit watermark cuts remain unchanged. A negative permutation case produces
+equal independent-key output but different vnode callback IDs: ordered positions
+within partitions do not certify a deterministic merge of independent channels.
+Rustdoc and the example describe this boundary.
+
+These are separate control and state-replay qualifications. The database case
+uses two instances in one OS process, an empty source and GENESIS; the stateful
+case uses private graph hooks and fixture source positions. Together they do not
+qualify process-function restoration through database recovery from a committed
+cut, independent database process failures, autonomous final-owner drain,
+connector/sink delivery or a certified source-channel merge. Embedded and
+single-node server runtime behavior is unchanged; public cluster admission stays
+closed. Only tests, rustdoc and example documentation change, so new hot-path
+benchmarks and IPC capture are not required.
+
+The initial live control run passes in 20.43 seconds (43.99 seconds including compilation)
+using the pinned `laminardb-minio-test:2024-10-13` image on `127.0.0.1:19010`, bucket
+`process-rounds`, and a fresh UUID namespace. With that local fixture running:
+
+```powershell
+$env:CARGO_BUILD_JOBS='2'
+$env:RUST_MIN_STACK='8388608'
+$env:LAMINAR_PROCESS_TEST_S3_ENDPOINT='http://127.0.0.1:19010'
+$env:LAMINAR_PROCESS_TEST_S3_BUCKET='process-rounds'
+cargo test -p laminar-server --bin laminardb --no-default-features --features cluster,aws cluster::recovery_round_tests::database_rounds_hold_intake_until_exact_durable_release -- --exact --ignored --nocapture
+```
+
+### Validation
+
+The final remote-enabled stateful suite passes 125 tests with two ignored in
+39.59 seconds (178.29 seconds including compilation); the native-only suite passes
+65 with two ignored in 5.46 seconds (143.46 seconds including compilation). The
+final cluster suite explicitly includes the live ignored case and passes all 54
+tests, including cleanup failure, in 44.07 seconds (126.04 seconds including
+compilation). Its final `laminardb-5e7a97b809aa37fa.exe` SHA-256 is
+`4D212B773A1D80E83A74FA92698EA30627084FF6968066EFA9F4519346F9AC6D`.
+
+All required gates pass with `CARGO_BUILD_JOBS=2` and `RUST_MIN_STACK=8388608`:
+
+| Gate | Result | Command seconds |
+|---|---|---:|
+| `cargo test --workspace --lib` | 1,989 connector, 1,127 core, 2,241 database and 870 SQL tests pass; five ignored | 163.60 |
+| `cargo clippy --workspace --all-features --all-targets -- -D warnings` | Pass after the cleanup correction | 10.55 |
+| `cargo clippy --workspace --no-default-features -- -D warnings` | Pass | 20.28 |
+| `cargo +nightly fmt --all -- --check` | Pass | 5.07 |
+| `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | Pass; 18 module and 214 function exceptions unchanged | 9.60 |
+
+The first workspace run fails in the same five Kafka/OAuth mock cases recorded
+at the previous commit. All five pass separately from that exact connector binary
+(SHA-256 `D2E5733E0E94E30E0819FA5A67DC5465363BE91459458714CE724E64ADA3A4C6`),
+then the unchanged workspace command passes. No connector code, feature selection
+or workspace test behavior changes. The lockfile and readability baselines remain
+unchanged.
+
+Commands, timings, source/binary hashes and failed fixture attempts are retained in
+`target/process-rounds-20261006/`. The early failures preserve the assignment,
+catalog, source-placement and lifecycle checks. The fixture now initializes
+checkpointing through normal startup, accounts for Prepare's permitted shutdown
+tail poll, and observes the real leader TTL. An unchanged watermark initially
+allowed the native source-order fixture to miss a delayed peer batch; it now waits
+for every expected input output before advancing timers. No runtime admission or
+authority check is relaxed to make these cases pass.
+Two shortened exact-name attempts execute no tests and are excluded from the
+qualification results. The final suites execute the actual named cases. The owned
+MinIO container is removed after checking its exact ID and task label; it has no
+host mounts, and existing Docker services are left running.
+
 ## Next executable task
 
-Continue original Phase E through the database-owned `RecoveryMonitor`
-Prepare/Start/Release rounds and intake fences, using independently failed and
-surviving peer processes and the server's durable recovery KV. Qualify interrupted
-and stale rounds and autonomous final-owner drain. Independent private graph
-owners now qualify process replacement, membership entry/exit, sole-owner loss
-during a published handoff, and replay from their committed shared cut. They do
-not yet qualify those database-controlled recovery rounds.
+Continue original Phase E through database-owned recovery from a committed shared
+cut with independently failed and surviving peer processes and the server's
+durable recovery KV. GENESIS rounds now qualify held Start, stale Release and
+same-process leader-proof interruption; committed stateful database recovery and
+autonomous final-owner drain remain pending. Independent private graph owners
+already qualify replacement, membership entry/exit and committed-cut replay.
 
-Bind the private reproducible callback-order profile to an explicitly admitted
-source-order contract, including timer rescheduling, before opening either
-public cluster form. Its controlled source cursors do not certify connector/sink
-delivery or independent-channel replay equivalence. Keep both public cluster
-admission paths closed through these remaining gates.
+Bind the controlled source-order and timer-rescheduling profile to an explicitly
+admitted source-order contract before opening either public cluster form. Fixture
+positions do not certify connector/sink delivery or independent-channel replay
+equivalence. Keep both public cluster admission paths closed through these gates.
 Do not add a second scheduler or state backend. Coordinator/core changes require
 the repository's before/after Criterion and IPC gates.
 

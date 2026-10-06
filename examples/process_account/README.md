@@ -88,6 +88,17 @@ timestamp. It does not sort input or retain the maximum timestamp. The fixture's
 per-account times do not regress. Input behind an accepted watermark is late;
 the demo does not qualify a business policy for such records.
 
+V1 admits one direct source and preserves accepted arrival order within each
+key. Event timestamps do not sort records. Replayable offsets and ordered row
+positions describe progress within a source partition; they do not specify how
+independent channels merge. Reproducing callback IDs requires the same callback
+order within each vnode and the same watermark cuts relative to input. The
+private cluster replay tests use one fixed source order, split it into different
+batch sizes, and retain those cuts. They cover timer replacement, cancellation
+and callbacks that register another timer. This qualifies that controlled
+profile; independent-channel merging remains uncertified. Event-time sorting
+and multi-input process functions remain unsupported.
+
 ## Completed-checkpoint recovery
 
 Use a fresh directory for each runtime. Native and Python descriptors differ,

@@ -19,6 +19,8 @@ mod bootstrap;
 mod control_kv;
 mod discovery;
 mod leases;
+#[cfg(all(test, feature = "aws"))]
+mod recovery_round_tests;
 mod services;
 mod serving;
 mod shutdown;

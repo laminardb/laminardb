@@ -3,10 +3,10 @@ use crate::process_function::ProcessCallback;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub(super) struct CallbackIdentity {
-    key: String,
-    event_time_us: i64,
-    timer: bool,
-    id: u64,
+    pub(super) key: String,
+    pub(super) event_time_us: i64,
+    pub(super) timer: bool,
+    pub(super) id: u64,
 }
 
 #[derive(Default)]

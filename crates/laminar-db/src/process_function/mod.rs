@@ -57,7 +57,9 @@ pub struct ProcessFunctionDescriptor {
     /// Optional Python runtime and import-tree identity checked by the local supervisor.
     /// File hashes detect deployment drift; they do not enforce lifetime immutability.
     pub python_environment: Option<PythonEnvironmentBinding>,
-    /// Exact input schema admitted from one direct source.
+    /// Exact input schema admitted from one direct source. V1 retains accepted per-key arrival
+    /// order; timestamps do not sort input. Replayable source positions alone do not define the
+    /// merge order of independent input partitions.
     pub input_schema: SchemaRef,
     /// Exact append-only output schema.
     pub output_schema: SchemaRef,
@@ -174,6 +176,8 @@ pub enum ProcessCallback {
 /// Private cluster execution encodes a checkpointed vnode sequence and its fixed vnode index;
 /// replay identity requires the same callback order within that vnode. The key is the canonical
 /// partition ABI encoding and must never be rehashed by the handler.
+/// Preserving these IDs also requires the same watermark cuts relative to input and timer
+/// callbacks. V1 does not certify deterministic replay of an independent-channel merge.
 #[derive(Clone, Debug)]
 pub struct ProcessActivation {
     /// Logical callback identity within the pipeline and operator, subject to its replay order.
