@@ -1654,15 +1654,147 @@ operator record path, scheduler, state backend or dependency changes. Criterion
 and IPC capture are not required for this increment. Exact command logs, times,
 source and binary hashes are retained in `target/process-source-order-20261006/`.
 
+## 2026-10-06 — Splittable source ordering and matching watermark cuts
+
+Status: completed and validated.
+This continues original Phase E from `54b20be1` on
+`codex/stateful-process-functions`.
+
+`SourceReplayOrder::SingleChannelFixedBatches` requires identical ordered rows
+in identical nonempty replay batches after a committed cursor, independent of
+poll limits and timing. The bounded profile requires replayability, append-only
+input and deterministic row positions. It permits singleton or splittable
+placement with one logical source and one global physical input channel. Raw
+`SingleChannel` order no longer qualifies at-least-once process registration.
+The declaration is bound into checkpoint identity; undeclared source identity
+bytes remain unchanged. No built-in connector advertises the new profile.
+
+Cold startup configuration reuses the existing FIFO and cycle budgets to execute
+each fixed batch before its successor, overriding configured coalescing and
+source drain. Event-time cuts use the existing bounded-out-of-orderness
+generator. External watermark calls, clock-driven idleness and the future-skew
+guard cannot alter those cuts. Timers require subsequent input to advance event
+time. The source watermark owner moves from `db/mod.rs` into its own leaf module,
+with its five existing private tests; the record observation loop is unchanged.
+Its physical identity remains bound through an empty owned inventory, and
+changed identities or multiple-channel cuts fail closed. This local invariant
+does not certify a global distributed source inventory or cluster recovery.
+
+Native and real loopback Rust worker tests compare an uninterrupted reference
+with a committed-cut restore after an uncommitted callback failure. They verify
+the complete callback IDs, their assigned logical order, state, timer replacement
+and timer output, plus source cursor rewind. Different-key remote calls remain
+concurrent; callback transcripts are compared by engine ID and output by key,
+preserving emitted order within each key. Global worker arrival or cross-key
+output order is not promised. Replay uses poll target 1 instead of 1024,
+with configured coalescing and idleness and an external watermark call unable to
+change the cut. Another case accepts an atomic two-row replay batch above the
+poll target. Independent logical sources fail before source startup.
+
+The new Criterion case exercises the actual at-least-once database path with a
+splittable-declared connector, 64 distinct keys, fixed replay batches and poll
+target 1. Existing local/one-owner/two-owner operator and end-to-end cases have a
+before-change baseline. No scheduler, state backend, dependency, checkpoint
+format or public cluster process-function admission is added.
+
+### Validation
+
+Final validation uses `CARGO_BUILD_JOBS=2`, `RUST_MIN_STACK=8388608`, rustc
+1.99.0 (`b940084d7`) and cargo 1.99.0 (`5f94df478`). Command times include
+compilation.
+
+| Command | Result | Seconds |
+| --- | --- | ---: |
+| `cargo test --workspace --lib` | 6,243 passed, five ignored | 163.77 |
+| `cargo clippy --workspace --all-features --all-targets -- -D warnings` | Passed after final fixture edits | 5.67 |
+| `cargo clippy --workspace --no-default-features -- -D warnings` | Passed | 58.05 |
+| `cargo +nightly fmt --all -- --check` | Passed | 6.79 |
+| `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | Passed; 18 module and 214 function exceptions unchanged | 9.91 |
+
+The final workspace binary runs all 11 source-order cases again: 11 passed,
+none ignored, 4.55 command seconds. The exact remote matching-cut case passes
+three further runs, each executing one test, in 3.62, 3.59 and 3.60 seconds.
+Its SHA-256 (`laminar_db-a63677b7d4fa08f4.exe`) is
+`4EE6DE6CE5B894DE6392A6CAE4FC43DC22A0E36E7E3B0D5AF37619785FE0FB1A`.
+Before the final fixture comparison normalization, the production-final
+remote-enabled suite passes 136 tests with two ignored, and the minimal-feature
+native suite passes 34 with one ignored. Identity and watermark suites pass
+10 and eight tests respectively; the final workspace reruns those cases.
+
+Failed attempts remain in the evidence. Initial compilation corrected a row
+position constructor and kept private watermark tests with their owner. The
+first complete process suite exposed error precedence for a direct source and
+an incorrect assumption that concurrent worker arrival order matched engine
+callback IDs; both are corrected. Two existing FILES host-loss cases pass in
+isolation after missing their deadline under the parallel suite. The focused
+suite then passes with one test thread. The first workspace attempt fails only
+the native Kafka mock metadata timeout; that exact case passes on the same
+binary in isolation (4.91 seconds), followed by a passing unadjusted complete
+workspace retry. No connector behavior, timeout or admission is relaxed.
+
+The existing minimal-test unused `ExternalOutputPressure` methods warning,
+OpenSSL PDB linker warning and `proc-macro-error2` future-compatibility warning
+remain. Both Clippy gates pass without warnings. Cargo.lock and readability
+baselines are unchanged. Exact logs, commands, durations, source/binary hashes
+and performance evidence are retained in `target/process-replay-cuts-20261006/`.
+
+### Latency and hardware profile
+
+Before and after measurements use the same optimized feature set
+`benchmark-internals,cluster`, with default features disabled, 30 Criterion
+samples, three seconds warmup and seven seconds measurement. The baseline is
+the frozen `54b20be1` executable. Its build and run take 819.12 seconds; the final
+optimized rebuild takes 788.86 seconds, the 14-case comparison 154.31 seconds,
+and the new fixed-cut case 12.73 seconds. Core `latency_bench` runs before and
+after in 11.87 and 12.07 seconds. Measurements run without other task builds or
+tests. These are development-hardware means, not representative tail latency.
+
+The first comparison reports three means above the 5% gate. All raw results
+remain available. The frozen old one-row executable also slows from 25.44 to
+31.30 microseconds when remeasured; its sequential pair with the final executable
+is +3.69%. The local same-key pair is -5.05%. The remaining single-owner
+64-distinct-key fixture executes no source-watermark code, and its operator body
+is unchanged. A 100-sample pair on logical CPU 4 reports +5.73%; reversing the
+same pinned run order reports -0.76%. Equal-weight means across both orders are
+185.18 versus 189.67 microseconds (+2.43%). This resolves the remaining unstable
+comparison without changing production code or machine-wide settings.
+
+| Measurement | Mean / assessed change |
+| --- | --- |
+| Maximum remaining existing-case increase | +4.75%; all assessed means within the 5% gate |
+| Core tumbling assignment | 1.4373 to 1.4422 ns; +0.34% |
+| New fixed 64-row cut, poll target 1 | 119.44 microseconds per batch; 95% mean CI 115.98–124.12 |
+| Actual coordinator thread IPC | 2.1508 |
+| Whole-process IPC, including source I/O and consumer | 1.8178 |
+
+Hardware counters use the final executable SHA-256
+`14A5078E9903B8DA4DDEAB4BCDE3681278E66D3212EDDA480B3CAD3B45AC7CA2`.
+The task-owned WPR capture completes in 62.88 seconds with successful cleanup.
+The strict `Microsoft.Windows.EventTracing.Processing.All` 1.12.10 reader rejects
+lost events and time inversion; it reads 419,821,551,326 instructions and
+230,947,771,813 cycles from owned PID 143968. Thread attribution on that same
+trace identifies the active `laminar-compute` thread 144088: 364,996,212,372
+instructions and 169,702,484,467 cycles. Its IPC exceeds the hot-path rule of
+thumb. The lower whole-process ratio includes source polling and subscription
+consumption. The other three compute threads belong to filtered fixture startup
+and contribute fewer than 1.24 million cycles each.
+
+The thread reader extends the existing utility using its exact locked local
+packages; it builds without warnings and changes no repository dependency.
+The trace SHA-256 is
+`799ABFD31B37B85CAAAF31A595A144D4545B4AB86D8F9FEBCDAD7F697D13A4F7`.
+Qualified Rust source and lockfile hashes still match after profiling. Public
+cluster process-function admission remains closed, and target-hardware workload
+and tail-latency qualification remain pending.
+
 ## Next executable task
 
-Continue original Phase E with source-order admission compatible with cluster
-splittable placement and matching input/watermark cuts, then integrate process
-functions with database-owned committed-cut recovery under that contract. The
-existing independent database aggregate case covers the control prerequisite;
-the local singleton row-order boundary does not qualify cluster placement or
-timer replay. Reuse the real recovery/assignment lifecycle for process-specific
-crash qualification after those ordering requirements are enforced.
+Continue original Phase E with process functions in database-owned committed-cut
+cluster recovery under the fixed-batch source profile. The existing independent
+database aggregate case covers the control prerequisite; matching local
+input/timer cuts do not qualify distributed process recovery. Reuse the real
+recovery/assignment lifecycle for process-specific crash qualification, including
+the global physical channel binding and committed source-decision cut.
 
 Fixture positions do not certify connector/sink delivery or independent-channel replay
 equivalence. Keep both public cluster admission paths closed through these gates.

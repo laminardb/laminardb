@@ -322,6 +322,7 @@ mod authority;
 mod cluster_startup;
 mod operator_graph;
 mod reference_tables;
+mod runtime_configuration;
 mod runtime_launch;
 mod runtime_preparation;
 mod shutdown;

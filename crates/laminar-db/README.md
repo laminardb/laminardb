@@ -43,15 +43,22 @@ alone do not imply exactly-once delivery.
 Embedded databases can register a trusted native Rust handler or a connected loopback Rust or
 Python worker before `start()`. Each function consumes one append-only event-time source and
 uses engine-owned keyed state and timers. Local `AtLeastOnce` delivery admits native and remote
-Rust handlers with checkpointing and an append-only singleton connector source declaring
-`SourceReplayOrder::SingleChannel`. Per-partition row positions alone do not qualify; built-in
+Rust handlers with checkpointing and one append-only connector source declaring
+`SourceReplayOrder::SingleChannelFixedBatches` and deterministic row positions. Singleton and
+splittable placement are admitted locally, with one global physical input channel. Each fixed
+replay batch executes as one input/watermark cut, using its event timestamps and the declared
+out-of-orderness. Poll limits cannot change batch membership. The profile disables coalescing,
+wall-clock idleness, the wall-clock future-skew guard and external watermark advancement;
+inactivity timers therefore need subsequent source input to advance event time.
+Per-partition row positions or raw `SingleChannel` order alone do not qualify; built-in
 connectors currently leave replay order unspecified, including FILES, whose discovery order is
 not retained. The existing startup checks
 require durable checkpoint storage and a durable sink when a sink is configured. Replaying input
 after a crash may publish an output again. Python process functions and the single-node server's
 Python startup binding remain `BestEffort` while imported dependencies are not bound to the
-worker package. The row-order contract does not certify timer replay: matching watermark cuts
-are also required. Both one-node and distributed cluster modes reject process functions.
+worker package. This qualifies matching local input/timer cuts for that bounded source profile.
+Independent-channel merging remains unsupported. Both one-node and distributed cluster modes
+reject process functions pending database-controlled recovery qualification.
 
 Local subscriptions use in-memory replay history; cluster subscriptions expose committed,
 partition-ordered output only for certified non-windowed keyed aggregates. Neither a separate

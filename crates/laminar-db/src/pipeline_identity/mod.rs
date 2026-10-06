@@ -309,7 +309,8 @@ fn canonical_source(
         row_positions: canonical_source_row_positions(contract.row_positions),
         replay_order: match contract.replay_order {
             SourceReplayOrder::Unspecified => None,
-            SourceReplayOrder::SingleChannel => Some(SourceReplayOrder::SingleChannel),
+            order @ (SourceReplayOrder::SingleChannel
+            | SourceReplayOrder::SingleChannelFixedBatches) => Some(order),
         },
         schema: entry.map(|entry| canonical_schema(&entry.schema)),
         primary_key: entry.map_or_else(Vec::new, |entry| entry.primary_key.clone()),

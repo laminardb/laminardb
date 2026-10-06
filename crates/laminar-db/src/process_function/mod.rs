@@ -4,9 +4,9 @@
 //! returns proposed changes; its private memory is never authoritative. Native handlers execute
 //! on the compute thread and must be trusted, bounded, and nonblocking. The optional remote
 //! transport is restricted to local loopback pipelines. At-least-once delivery currently admits
-//! trusted native Rust and remote Rust with replayable sources that explicitly reproduce one
-//! channel's row order; Python remains best-effort. Timer replay also depends on matching
-//! watermark cuts and is not certified by that source contract.
+//! trusted native Rust and remote Rust with one replayable source that reproduces one physical
+//! channel in fixed batches. Each batch defines a reproducible event-time cut; independent-channel
+//! merging and cluster recovery remain unadmitted. Python remains best-effort.
 
 use std::sync::Arc;
 

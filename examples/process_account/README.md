@@ -100,13 +100,19 @@ profile; independent-channel merging remains uncertified. Event-time sorting
 and multi-input process functions remain unsupported.
 
 Local native and remote Rust `AtLeastOnce` registration now requires a replayable,
-append-only singleton connector declaring `SourceReplayOrder::SingleChannel`.
+append-only connector declaring `SourceReplayOrder::SingleChannelFixedBatches` with
+deterministic row positions. The bounded local profile permits singleton or splittable
+placement with one logical source and one global physical input channel.
 Registration and startup check that declaration before source I/O, and checkpoint
 identity binds it. Built-in connectors leave it unspecified; FILES does not retain
 the discovery order of an uncommitted suffix. Its process host-loss tests therefore
-use `BestEffort` with checkpoints. The row-order contract does not retain watermark
-cuts or certify arbitrary timer replay. This example uses `BestEffort` in both
-languages, and cluster process-function admission remains closed.
+use `BestEffort` with checkpoints. Fixed replay batches define matching input/watermark
+cuts: the engine executes one batch at a time and derives progress from event timestamps.
+Coalescing, wall-clock idleness/future-skew decisions and external watermark calls do not
+advance that profile. Timers need subsequent input to advance event time. Raw
+`SingleChannel` order and independent-channel merging remain insufficient. This example
+uses `BestEffort` in both languages, and cluster process-function admission remains closed
+pending database-controlled recovery qualification.
 
 ## Completed-checkpoint recovery
 

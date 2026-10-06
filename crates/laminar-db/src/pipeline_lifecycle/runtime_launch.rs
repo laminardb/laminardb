@@ -509,7 +509,7 @@ impl LaminarDB {
         runtime_shutdown: tokio_util::sync::CancellationToken,
         #[cfg(feature = "cluster")] topology: Option<crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
-        use crate::pipeline::{CheckpointSchedule, PipelineConfig};
+        use crate::pipeline::CheckpointSchedule;
 
         let runtime_mode = self.runtime_mode();
 
@@ -706,7 +706,7 @@ impl LaminarDB {
             self.initialize_reference_tables(&table_regs, &stream_regs, restored_reference_tables)
                 .await?;
         }
-        let watermarks = self.prepare_pipeline_watermarks(
+        let mut watermarks = self.prepare_pipeline_watermarks(
             &sources,
             &stream_regs,
             &recovered_channel_progress,
@@ -723,37 +723,13 @@ impl LaminarDB {
             "Starting event-driven connector pipeline"
         );
 
-        let drain_budget_ns = self.config.pipeline_drain_budget_ns.unwrap_or(1_000_000);
-        let query_budget_ns = self.config.pipeline_query_budget_ns.unwrap_or(8_000_000);
-        let pipeline_config = PipelineConfig {
-            max_poll_records: self.config.default_buffer_size.min(1024),
-            channel_capacity: self.config.pipeline_channel_capacity.unwrap_or(64),
-            source_queue_max_bytes: self.config.source_queue_max_bytes,
-            fallback_poll_interval: if has_external {
-                std::time::Duration::from_millis(10)
-            } else {
-                std::time::Duration::from_millis(1)
-            },
+        let pipeline_config = self.prepare_pipeline_configuration(
+            has_external,
             checkpoint_schedule,
-            batch_window: self
-                .config
-                .pipeline_batch_window
-                .unwrap_or(if has_external {
-                    std::time::Duration::from_millis(5)
-                } else {
-                    std::time::Duration::ZERO
-                }),
-            checkpoint_timeout: pipeline_checkpoint_timeout,
-            delivery_guarantee: self.config.delivery_guarantee,
-            cycle_budget_ns: 10_000_000_u64.max(drain_budget_ns + query_budget_ns),
-            drain_budget_ns,
-            query_budget_ns,
-            max_input_buf_batches: self.config.pipeline_max_input_buf_batches.unwrap_or(256),
-            max_input_buf_bytes: self.config.pipeline_max_input_buf_bytes,
-            backpressure_policy: self.config.pipeline_backpressure_policy,
-            shared_source_isolation: self.config.shared_source_isolation,
-            max_replay_buffer_bytes: 256 * 1024 * 1024,
-        };
+            pipeline_checkpoint_timeout,
+            &sources,
+            &mut watermarks,
+        )?;
 
         let PreparedPipelineRuntime { runtime } = self
             .prepare_pipeline_runtime(

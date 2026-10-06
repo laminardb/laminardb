@@ -1,9 +1,18 @@
 use std::hint::black_box;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use criterion::{criterion_group, criterion_main, Criterion};
+use laminar_connectors::checkpoint::SourceCheckpoint;
+use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
+use laminar_connectors::connector::{
+    DeliveryGuarantee, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
+    SourceInputMode, SourcePosition, SourceReplayOrder, SourceRowPositionCapability,
+    SourceRowPositions, SourceStart, SourceTopology,
+};
+use laminar_connectors::error::ConnectorError;
 use laminar_db::process_function::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessCallback,
     ProcessFunctionDescriptor, ProcessFunctionLimits, ValueMutation, ValueState,
@@ -285,10 +294,214 @@ fn native_handler_only(criterion: &mut Criterion) {
     }
 }
 
+struct ReplayBatchSource {
+    records: RecordBatch,
+    available: Arc<AtomicU64>,
+    wake: Arc<tokio::sync::Notify>,
+    cursor: u64,
+}
+
+#[async_trait::async_trait]
+impl SourceConnector for ReplayBatchSource {
+    fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Splittable,
+            SourceInputMode::AppendOnly,
+        )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        .with_replay_order(SourceReplayOrder::SingleChannelFixedBatches))
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        self.cursor = match request.into_parts().1 {
+            SourcePosition::Initial => 0,
+            SourcePosition::Resume { checkpoint, .. } => checkpoint
+                .get_offset("cursor")
+                .and_then(|cursor| cursor.parse().ok())
+                .ok_or_else(|| {
+                    ConnectorError::ConfigurationError("invalid benchmark replay cursor".into())
+                })?,
+            SourcePosition::Initialized { .. } => {
+                return Err(ConnectorError::ConfigurationError(
+                    "benchmark source has no topology initialization".into(),
+                ))
+            }
+        };
+        Ok(())
+    }
+
+    async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+        use arrow::array::{BinaryArray, UInt32Array};
+
+        if self.cursor >= self.available.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let order = self.cursor.to_be_bytes();
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from_vec(vec![b"ordered"; 64]),
+            BinaryArray::from_vec(vec![order.as_slice(); 64]),
+            UInt32Array::from((0..64).collect::<Vec<_>>()),
+        )?;
+        self.cursor = self.cursor.checked_add(1).ok_or_else(|| {
+            ConnectorError::ConfigurationError("benchmark cursor exhausted".into())
+        })?;
+        Ok(Some(
+            SourceBatch::positioned(self.records.clone(), positions)?
+                .with_checkpoint(self.checkpoint()),
+        ))
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        self.records.schema()
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("cursor", self.cursor.to_string());
+        checkpoint
+            .set_input_channels(vec![b"ordered".to_vec()])
+            .unwrap();
+        checkpoint
+    }
+
+    fn data_ready_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        Some(Arc::clone(&self.wake))
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+fn native_fixed_replay_cuts(criterion: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let available = Arc::new(AtomicU64::new(0));
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let (db, mut portal) = runtime.block_on(async {
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("account", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let keys = (0..64)
+            .map(|row| format!("account-{row}"))
+            .collect::<Vec<_>>();
+        let records = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Int64Array::from(vec![1; 64])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000; 64])),
+            ],
+        )
+        .unwrap();
+        let produced = Arc::clone(&available);
+        let notified = Arc::clone(&wake);
+        let db = LaminarDB::builder()
+            .storage_dir(directory.path())
+            .buffer_size(1)
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: None,
+                ..Default::default()
+            })
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .register_connector(move |registry| {
+                registry.register_source(
+                    "replay-cut-bench",
+                    ConnectorInfo {
+                        name: "replay-cut-bench".into(),
+                        display_name: "Fixed replay batch benchmark".into(),
+                        version: "1".into(),
+                        is_source: true,
+                        is_sink: false,
+                        config_keys: Vec::new(),
+                    },
+                    Arc::new(move |_| {
+                        Ok(Box::new(ReplayBatchSource {
+                            records: records.clone(),
+                            available: Arc::clone(&produced),
+                            wake: Arc::clone(&notified),
+                            cursor: 0,
+                        }))
+                    }),
+                )
+            })
+            .build()
+            .await
+            .unwrap();
+        db.execute(
+            "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+             FROM \"replay-cut-bench\"",
+        )
+        .await
+        .unwrap();
+        let output_schema = output_schema();
+        db.register_native_process_function(
+            "activity",
+            "events",
+            ProcessFunctionDescriptor {
+                runtime: laminar_db::process_function::ProcessRuntime::NativeRust,
+                version: 1,
+                function_id: "running_total".into(),
+                pipeline_state_id: "source_cut_latency_v1".into(),
+                implementation_digest: "a".repeat(64),
+                python_environment: None,
+                input_schema,
+                output_schema: Arc::clone(&output_schema),
+                key_columns: vec!["account".into()],
+                event_time_column: "ts".into(),
+                output_event_time_column: "ts".into(),
+                value_state_name: "total".into(),
+                timer_names: Vec::new(),
+                limits: ProcessFunctionLimits::default(),
+            },
+            Arc::new(RunningTotal { output_schema }),
+        )
+        .await
+        .unwrap();
+        db.start().await.unwrap();
+        let portal = db
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        (db, portal)
+    });
+    criterion.bench_function("native_process_fixed_cuts_64_distinct_keys", |bench| {
+        bench.iter(|| {
+            runtime.block_on(async {
+                available.fetch_add(1, Ordering::Release);
+                wake.notify_one();
+                let mut received = 0;
+                while received < 64 {
+                    match portal.next_frame().await {
+                        Some(PortalFrame::Batch { batch, .. }) => received += batch.num_rows(),
+                        Some(PortalFrame::Barrier { .. }) => {}
+                        other => panic!("replay cut benchmark output unavailable: {other:?}"),
+                    }
+                }
+                assert_eq!(received, 64);
+                black_box(received)
+            })
+        })
+    });
+    runtime.block_on(db.shutdown()).unwrap();
+}
+
 criterion_group!(
     benches,
     native_one_row_end_to_end,
     native_batch_end_to_end,
-    native_handler_only
+    native_handler_only,
+    native_fixed_replay_cuts
 );
 criterion_main!(benches);

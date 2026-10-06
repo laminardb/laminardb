@@ -120,10 +120,10 @@ pub enum SourceRowPositionCapability {
     OrderedDeterministic,
 }
 
-/// Row order reproduced when resuming a source cursor.
+/// Row order and batch boundaries reproduced when resuming a source cursor.
 ///
-/// This is separate from row positions and delivery guarantees. It does not certify the
-/// runtime's watermark cuts or the order of timer callbacks relative to input.
+/// This is separate from row positions and delivery guarantees. The runtime must enforce
+/// the declared batch boundaries before relying on them for input/timer replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceReplayOrder {
@@ -132,8 +132,18 @@ pub enum SourceReplayOrder {
     Unspecified,
     /// One physical input channel reproduces the same ordered suffix from a committed cursor,
     /// including the order of different keys. Poll size and timing must not reorder rows, and
-    /// recovery must retain the channel identity. Independent-channel merging is excluded.
+    /// recovery must retain the channel identity. Independent-channel merging is excluded;
+    /// this raw row-order promise does not reproduce watermark cuts.
     SingleChannel,
+    /// One global physical channel, with the same ordered rows in the same nonempty batches
+    /// after a committed cursor. Poll limits and timing must not change batch membership.
+    /// The channel may move between nodes under splittable placement; independent channels
+    /// are excluded. Deterministic row positions and bounded atomic batches are required.
+    ///
+    /// Process-function execution treats each batch as one input/watermark cut. The engine
+    /// derives event-time progress from that batch and excludes external and wall-clock
+    /// advancement. Transport batching may change within a cut without changing its end.
+    SingleChannelFixedBatches,
 }
 
 /// Complete source admission contract for a concrete connector configuration.
@@ -184,6 +194,26 @@ impl SourceContract {
     pub const fn with_replay_order(mut self, order: SourceReplayOrder) -> Self {
         self.replay_order = order;
         self
+    }
+
+    /// Whether the declared source shape supports replay at fixed batch boundaries.
+    /// The runtime must also enforce one physical channel and reproduce its watermark cuts.
+    #[must_use]
+    pub const fn supports_fixed_batch_replay(self) -> bool {
+        self.supports_replay()
+            && matches!(
+                self.topology,
+                SourceTopology::Singleton | SourceTopology::Splittable
+            )
+            && matches!(self.input_mode, SourceInputMode::AppendOnly)
+            && matches!(
+                self.row_positions,
+                SourceRowPositionCapability::OrderedDeterministic
+            )
+            && matches!(
+                self.replay_order,
+                SourceReplayOrder::SingleChannelFixedBatches
+            )
     }
 
     /// Mark a built-in connector whose exact-delivery suite is an engine release gate.

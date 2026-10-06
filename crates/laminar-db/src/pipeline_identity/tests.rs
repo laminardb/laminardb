@@ -163,6 +163,12 @@ fn source_replay_order_binds_identity_without_changing_undeclared_sources() {
         "single_channel"
     );
     assert_ne!(Sha256::digest(&legacy), Sha256::digest(&ordered));
+    let cut = encode(contract.with_replay_order(SourceReplayOrder::SingleChannelFixedBatches));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&cut).unwrap()["replay_order"],
+        "single_channel_fixed_batches"
+    );
+    assert_ne!(Sha256::digest(&ordered), Sha256::digest(&cut));
 }
 
 #[test]

@@ -35,8 +35,8 @@ impl LaminarDB {
     /// database instance that restores an existing checkpoint.
     ///
     /// Local at-least-once execution requires checkpointing and a replayable append-only
-    /// singleton connector that explicitly reproduces one channel's row order. Per-partition positions alone
-    /// are insufficient. Source and sink contracts are verified before startup I/O. A direct
+    /// connector that reproduces one channel in fixed replay batches with deterministic positions.
+    /// Only one logical source is admitted. Source and sink contracts are verified before startup I/O. A direct
     /// in-memory source is available only with best-effort delivery.
     /// Native code runs in the compute process and must be trusted and nonblocking.
     ///
