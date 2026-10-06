@@ -426,6 +426,10 @@ async fn native_process_rejects_lost_lease_before_input_and_after_handler_withou
             .unwrap_err();
         assert!(error.requires_pipeline_recovery(), "{error}");
         assert_eq!(state_image(&operator), before);
+        assert!(operator
+            .activation_sequences
+            .iter()
+            .all(|sequence| *sequence == 0));
     }
 }
 
@@ -541,4 +545,5 @@ async fn private_multi_owner_binding_keeps_public_cluster_admission_closed() {
 #[cfg(feature = "process-remote")]
 mod remote;
 
+mod sequencing;
 mod shuffle;

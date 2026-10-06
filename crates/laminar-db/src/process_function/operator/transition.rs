@@ -22,7 +22,7 @@ pub(super) enum ProcessVnodeTransition {
 }
 
 pub(super) struct PreparedProcessTransition {
-    slots: Vec<(usize, FxHashMap<Vec<u8>, KeyState>)>,
+    slots: Vec<VnodeSlot>,
     due: BTreeSet<DueTimer>,
     metadata: OperatorFrame,
     execution: Option<ProcessExecution>,
@@ -33,6 +33,12 @@ pub(super) struct PreparedProcessTransition {
     timer_count: usize,
     prepared_bytes: usize,
     retired_bytes: usize,
+}
+
+struct VnodeSlot {
+    vnode: usize,
+    state: FxHashMap<Vec<u8>, KeyState>,
+    activation_sequence: Option<u64>,
 }
 
 impl ProcessVnodeTransition {
@@ -264,8 +270,7 @@ impl ProcessFunctionOperator {
                 )
             })
             .saturating_add(due_charge(self.due.iter()))
-            .saturating_add(self.shuffle.retained_bytes())
-            .saturating_add(self.execution.retained_bytes());
+            .saturating_add(self.cluster_retained_bytes());
         let payload_bytes = transition
             .restores
             .iter()
@@ -319,10 +324,7 @@ impl ProcessFunctionOperator {
             self.prepare_transition_execution(transition.target, frontier)?;
         let slot_count = transition.revoked.len() + transition.restores.len();
         let scaffold_bytes = std::mem::size_of::<PreparedProcessTransition>()
-            .saturating_add(
-                slot_count
-                    .saturating_mul(std::mem::size_of::<(usize, FxHashMap<Vec<u8>, KeyState>)>()),
-            )
+            .saturating_add(slot_count.saturating_mul(std::mem::size_of::<VnodeSlot>()))
             .saturating_add(
                 transition
                     .target
@@ -388,7 +390,11 @@ impl ProcessFunctionOperator {
                 .key_count
                 .checked_sub(state.len())
                 .ok_or_else(accounting_error)?;
-            prepared.slots.push((vnode as usize, FxHashMap::default()));
+            prepared.slots.push(VnodeSlot {
+                vnode: vnode as usize,
+                state: FxHashMap::default(),
+                activation_sequence: self.activation_sequences.get(vnode as usize).map(|_| 0),
+            });
         }
         let retained = || {
             self.due.iter().filter(|(_, key, ..)| {
@@ -487,9 +493,11 @@ impl ProcessFunctionOperator {
                     .saturating_add(payload_bytes),
             )?;
             prepared.due.append(&mut restored.due);
-            prepared
-                .slots
-                .push((restore.vnode as usize, restored.state));
+            prepared.slots.push(VnodeSlot {
+                vnode: restore.vnode as usize,
+                state: restored.state,
+                activation_sequence: restored.activation_sequence,
+            });
         }
         Ok(())
     }
@@ -513,8 +521,11 @@ impl ProcessFunctionOperator {
         };
         // INVARIANT: the graph holds the rotation fence. Every slot and timer index is already
         // allocated; displaced allocations stay owned until finish runs outside authority locks.
-        for (vnode, state) in &mut prepared.slots {
-            std::mem::swap(&mut self.state[*vnode], state);
+        for slot in &mut prepared.slots {
+            std::mem::swap(&mut self.state[slot.vnode], &mut slot.state);
+            if let Some(sequence) = &mut slot.activation_sequence {
+                std::mem::swap(&mut self.activation_sequences[slot.vnode], sequence);
+            }
         }
         std::mem::swap(&mut self.due, &mut prepared.due);
         std::mem::swap(&mut self.assignment_fence, &mut prepared.assignment_fence);

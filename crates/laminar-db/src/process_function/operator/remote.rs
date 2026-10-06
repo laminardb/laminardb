@@ -215,6 +215,8 @@ impl RemoteExecution {
                 })?;
             }
         }
+        #[cfg(feature = "cluster")]
+        Self::reserve_queued_activation_ids(operator, &mut queued)?;
         operator.next_activation_id = next_id;
         self.queued = queued;
         self.held_time_us = held_time_us;
@@ -224,6 +226,26 @@ impl RemoteExecution {
             .map_or(i64::MIN, |ms| ms.saturating_mul(1_000));
         if !self.input_pending {
             operator.watermark_us = operator.watermark_us.max(self.target_watermark_us);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn reserve_queued_activation_ids(
+        operator: &mut ProcessFunctionOperator,
+        queued: &mut VecDeque<QueuedInput>,
+    ) -> Result<(), DbError> {
+        // IDs follow accepted channel order before the key-distinct scheduler changes batches.
+        for (index, row) in queued.iter_mut().enumerate() {
+            match operator.reserve_activation_id(&row.key, row.id) {
+                Ok(id) => row.id = id,
+                Err(error) => {
+                    for row in queued.iter().take(index).rev() {
+                        operator.reclaim_activation_id(row.id);
+                    }
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
@@ -307,10 +329,16 @@ impl RemoteExecution {
                 callback: ProcessCallback::Timer { name },
                 state: state.view(),
             };
-            operator.next_activation_id =
-                operator.next_activation_id.checked_add(1).ok_or_else(|| {
-                    DbError::PipelineTerminal("process activation ID exhausted".into())
-                })?;
+            let next_id = operator.next_activation_id.checked_add(1).ok_or_else(|| {
+                DbError::PipelineTerminal("process activation ID exhausted".into())
+            })?;
+            #[cfg(feature = "cluster")]
+            let activation = {
+                let mut activation = activation;
+                activation.id = operator.reserve_activation_id(&activation.key, activation.id)?;
+                activation
+            };
+            operator.next_activation_id = next_id;
             self.busy_keys.insert(key);
             self.timer_callbacks += 1;
             let vnode = operator.vnode_for(&activation.key);

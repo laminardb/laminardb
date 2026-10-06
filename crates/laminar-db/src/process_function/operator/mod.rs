@@ -52,6 +52,9 @@ struct OperatorFrame {
     watermark_us: i64,
     #[cfg(feature = "cluster")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    activation_id_abi: Option<u16>,
+    #[cfg(feature = "cluster")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     shuffle: Option<execution::shuffle::Checkpoint>,
 }
 
@@ -59,6 +62,9 @@ struct OperatorFrame {
 struct VnodeFrame {
     codec: u32,
     vnode: u32,
+    #[cfg(feature = "cluster")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activation_sequence: Option<u64>,
     entries: Vec<(Vec<u8>, KeyState)>,
 }
 
@@ -66,6 +72,9 @@ struct VnodeFrame {
 struct VnodeCapture<'a> {
     codec: u32,
     vnode: u32,
+    #[cfg(feature = "cluster")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_sequence: Option<u64>,
     entries: Vec<(&'a Vec<u8>, &'a KeyState)>,
 }
 
@@ -103,6 +112,8 @@ pub(crate) struct ProcessFunctionOperator {
     output_time_index: usize,
     vnode_count: NonZeroU32,
     state: Vec<FxHashMap<Vec<u8>, KeyState>>,
+    #[cfg(feature = "cluster")]
+    activation_sequences: Vec<u64>,
     due: BTreeSet<DueTimer>,
     next_activation_id: u64,
     next_timer_generation: u64,
@@ -194,6 +205,8 @@ impl ProcessFunctionOperator {
             output_time_index,
             vnode_count,
             state: (0..count).map(|_| FxHashMap::default()).collect(),
+            #[cfg(feature = "cluster")]
+            activation_sequences: Vec::new(),
             due: BTreeSet::new(),
             next_activation_id: 0,
             next_timer_generation: 0,
@@ -312,7 +325,7 @@ impl ProcessFunctionOperator {
                 }
                 if group_keys.contains(&key) || group.len() == self.descriptor.limits.max_batch_rows
                 {
-                    self.accept_call(&group, output, output_rows, output_bytes)?;
+                    self.accept_call(&mut group, output, output_rows, output_bytes)?;
                     group.clear();
                     group_keys.clear();
                 }
@@ -324,13 +337,30 @@ impl ProcessFunctionOperator {
                 group.push(self.activation_for_row(batch, row, key, time.value(row), id));
             }
             if !group.is_empty() {
-                self.accept_call(&group, output, output_rows, output_bytes)?;
+                self.accept_call(&mut group, output, output_rows, output_bytes)?;
             }
         }
         Ok(())
     }
 
     fn accept_call(
+        &mut self,
+        activations: &mut [ProcessActivation],
+        output: &mut Vec<RecordBatch>,
+        output_rows: &mut usize,
+        output_bytes: &mut usize,
+    ) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        self.reserve_native_activation_ids(activations)?;
+        let outcome = self.invoke_and_apply(activations, output, output_rows, output_bytes);
+        #[cfg(feature = "cluster")]
+        if outcome.is_err() {
+            self.reclaim_activation_ids(activations);
+        }
+        outcome
+    }
+
+    fn invoke_and_apply(
         &mut self,
         activations: &[ProcessActivation],
         output: &mut Vec<RecordBatch>,
@@ -609,7 +639,7 @@ impl ProcessFunctionOperator {
                 event_time_us: at_us,
                 callback: ProcessCallback::Timer { name },
             };
-            self.accept_call(&[activation], output, output_rows, output_bytes)?;
+            self.accept_call(&mut [activation], output, output_rows, output_bytes)?;
         }
         Ok(())
     }
@@ -761,5 +791,7 @@ mod graph;
 #[cfg(feature = "process-remote")]
 mod remote;
 mod restoration;
+#[cfg(feature = "cluster")]
+mod sequencing;
 #[cfg(feature = "cluster")]
 mod transition;

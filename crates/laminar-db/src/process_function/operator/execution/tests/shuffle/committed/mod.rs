@@ -4,6 +4,7 @@ use crate::recovery_manager::{ClusterRecoveryTarget, RecoveredState};
 mod node_loss;
 #[cfg(feature = "process-remote")]
 mod remote;
+mod replay;
 mod store;
 mod transfer;
 

@@ -27,8 +27,7 @@ impl GraphOperator for ProcessFunctionOperator {
         #[cfg(feature = "cluster")]
         let live = self
             .live_bytes
-            .saturating_add(self.execution.retained_bytes())
-            .saturating_add(self.shuffle.retained_bytes());
+            .saturating_add(self.cluster_retained_bytes());
         #[cfg(not(feature = "cluster"))]
         let live = self.live_bytes;
         Some(ManagedStateAccountingSnapshot {
@@ -82,7 +81,7 @@ impl GraphOperator for ProcessFunctionOperator {
             ));
         }
         for (slot, state) in self.state.iter().enumerate() {
-            if state.is_empty() {
+            if state.is_empty() && self.activation_sequences.get(slot).copied().unwrap_or(0) == 0 {
                 continue;
             }
             let vnode = u32::try_from(slot)
@@ -161,8 +160,7 @@ impl GraphOperator for ProcessFunctionOperator {
             )?;
             if self
                 .live_bytes
-                .saturating_add(self.execution.retained_bytes())
-                .saturating_add(self.shuffle.retained_bytes())
+                .saturating_add(self.cluster_retained_bytes())
                 .saturating_add(shuffle.retained_bytes())
                 > self.graph_budget
             {
@@ -447,6 +445,8 @@ impl GraphOperator for ProcessFunctionOperator {
                 &VnodeCapture {
                     codec: STATE_CODEC_VERSION,
                     vnode,
+                    #[cfg(feature = "cluster")]
+                    activation_sequence: self.activation_sequences.get(vnode as usize).copied(),
                     entries,
                 },
             )
@@ -496,12 +496,19 @@ impl GraphOperator for ProcessFunctionOperator {
         #[cfg(feature = "cluster")]
         let state_limit = state_limit.min(
             self.graph_budget
-                .saturating_sub(self.shuffle.retained_bytes()),
+                .saturating_sub(self.cluster_retained_bytes()),
         );
         let remaining_state_bytes = state_limit.checked_sub(self.live_bytes).ok_or_else(|| {
             DbError::Checkpoint("process restored state exceeds its budget".into())
         })?;
-        if !self.state[vnode as usize].is_empty() {
+        let already_restored = !self.state[vnode as usize].is_empty();
+        #[cfg(feature = "cluster")]
+        let already_restored = already_restored
+            || self
+                .activation_sequences
+                .get(vnode as usize)
+                .is_some_and(|sequence| *sequence != 0);
+        if already_restored {
             return Err(DbError::Checkpoint("process vnode restored twice".into()));
         }
         let mut restored = self.decode_vnode(
@@ -531,6 +538,10 @@ impl GraphOperator for ProcessFunctionOperator {
         }
         self.due.append(&mut restored.due);
         self.state[vnode as usize] = restored.state;
+        #[cfg(feature = "cluster")]
+        if let Some(sequence) = restored.activation_sequence {
+            self.activation_sequences[vnode as usize] = sequence;
+        }
         self.live_bytes += restored.live_bytes;
         self.key_count = key_count;
         self.timer_count = timer_count;
@@ -632,6 +643,8 @@ mod tests {
             next_timer_generation: u64::MAX,
             watermark_us: i64::MIN,
             #[cfg(feature = "cluster")]
+            activation_id_abi: Some(super::super::sequencing::CLUSTER_ACTIVATION_ID_ABI),
+            #[cfg(feature = "cluster")]
             shuffle: None,
         };
         assert!(
@@ -653,12 +666,16 @@ mod tests {
         let owned = serde_json::to_vec(&VnodeFrame {
             codec: STATE_CODEC_VERSION,
             vnode: 3,
+            #[cfg(feature = "cluster")]
+            activation_sequence: None,
             entries: entries.clone(),
         })
         .unwrap();
         let borrowed = serde_json::to_vec(&VnodeCapture {
             codec: STATE_CODEC_VERSION,
             vnode: 3,
+            #[cfg(feature = "cluster")]
+            activation_sequence: None,
             entries: entries.iter().map(|(key, state)| (key, state)).collect(),
         })
         .unwrap();

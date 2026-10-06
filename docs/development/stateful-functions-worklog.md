@@ -1122,15 +1122,166 @@ Its manifest binds every benchmark PID to the current executable hash above.
 The capture result, strict counter analysis, recorder status, scripts and artifact
 hashes remain in `target/process-handoff-20261005/`.
 
+## 2026-10-06 — Vnode-owned callback replay qualification
+
+Status: private replay profile implemented; public cluster admission remains
+closed. This continues Phase E from committed ownership transfer.
+
+An uninterrupted execution and restore from the same committed cut originally
+produced equal output values but different callback IDs after a two-to-three-owner
+rescale. The failing regression records both input and timer identities; an
+owner-wide sequence cannot transfer a vnode's identity independently of its
+other vnodes. The red run remains in
+`target/process-replay-20261006/replay-regression-red.log`.
+
+Private single-owner and distributed execution now retain one `u64` sequence per
+vnode. An ID encodes `sequence * vnode_count + vnode` in the existing pipeline /
+operator namespace. Checked arithmetic prevents wraparound. The fixed vector is
+allocated before cluster binding and charged to managed-state accounting; it
+adds no per-record allocation. It uses the existing canonical vnode lookup.
+The sequence is captured even after every key in a vnode is cleared, so clearing
+state does not reuse a callback identity or require retained key tombstones.
+Acquired and revoked sequences move with the existing prepared state slots and
+publish behind the existing rotation fence. Native call rejection rolls back
+reserved IDs in reverse order. Remote input reserves IDs in accepted input order
+before the existing key-distinct scheduler changes RPC batches; pending calls
+continue to prevent checkpoint capture.
+
+Cluster operator metadata carries activation sequencing ABI 1, and each cluster
+vnode frame carries its sequence. Missing or unknown ABI, missing counters and
+impossible counter values fail restore before state installation. Old private
+cluster cuts lack this ABI and are rejected. Cluster selection must precede
+input, restore and assignment binding; restoring local metadata first cannot
+reinterpret it as cluster state. Embedded and single-node-server execution retain
+their existing operator-wide IDs and byte-compatible local codec-2 frames.
+
+Five regressions extend the existing suite. Native and real loopback Rust worker
+runs compare uninterrupted execution against exact committed-cut restoration
+with changed batch sizes and a two-to-three-owner rescale. Each compares eight
+post-cut input callbacks, four timer callbacks, callback IDs and output rows.
+Other cases cover empty-key state restoration without identity reuse, an
+exhausted vnode rolling back earlier reservations before invoking the handler,
+and incompatible checkpoint sequencing fields. The existing native lease-loss
+test also checks that rejected calls leave all vnode sequences unchanged.
+
+The qualified profile reproduces callback order within each vnode and its
+watermark cuts. It does not establish deterministic merging of independent
+source channels, ordering of arbitrary asynchronous timer rescheduling, or full
+coordinated recovery with independently failed and surviving engine processes.
+The committed store and engine peers in these replay fixtures are in process;
+the Rust worker uses actual loopback RPC. Public registration and graph admission
+continue to reject both cluster forms. No source/sink delivery certification or
+stronger Python delivery is added.
+
+### Validation
+
+With `CARGO_BUILD_JOBS=2` and `RUST_MIN_STACK=8388608`, the final focused command
+`cargo test -p laminar-db --lib --no-default-features --features
+cluster,process-remote,files process_function:: -- --test-threads=1 --quiet`
+passes 122 tests with one existing ignored case in 210.38 seconds including
+compilation. The final `cargo test --workspace --lib` passes 1,989 connector,
+1,127 core, 2,238 database and 870 SQL tests in 161.34 seconds. Both required
+Clippy commands pass: all features/all targets in 82.16 seconds and no default
+features in 20.16 seconds. Nightly formatting passes in 6.33 seconds;
+readability passes in 9.62 seconds with the unchanged 18 module and 214 function
+exception counts.
+
+The first workspace run fails seven unchanged connector cases during concurrent
+release compilation: two FILES lifecycle deadlines and five OAuth mock cases.
+All seven pass individually from the exact workspace connector binary and
+feature set, then the unmodified workspace command passes with compilation idle.
+The first no-default Clippy attempt is denied access to Cargo's workspace
+manifest by the sandbox; rerunning with workspace build access passes. Earlier
+Clippy findings are fixed with a checked vnode conversion and a named transfer
+slot. Earlier stale-reply comparisons incorrectly include reserved, unaccepted
+IDs in an applied-state image; those comparisons are corrected, while native
+rejection explicitly checks sequence rollback. No connector production behavior
+is changed. Logs and exit codes, including failed attempts, are retained under
+`target/process-replay-20261006/`.
+
+### Hot-path validation
+
+Host: AMD Ryzen 9 7900X, 12 cores/24 logical processors, Windows build 26200 x64.
+Rust 1.99.0 (`b940084d7`), Cargo 1.99.0 (`5f94df478`), `object_store` 0.13.2;
+no dependency changes. The optimized process benchmark build uses
+`cargo bench -p laminar-db --bench process_function_bench --no-default-features
+--features benchmark-internals --no-run --message-format=json` and finishes in
+807.59 seconds. The preserved baseline executable has SHA-256
+`64B74E76E2D504DDC7DBA207175936AE5CE63369C8E1909E374121D6E3E27DAF`;
+the final executable has SHA-256
+`A2AA6ABF7CF40B676A0986EB16221A0361C4E1DCBB80787799738805713236E9`.
+
+Both process runs use 30 samples, 3-second warm-up and 7-second measurement.
+The baseline saves `replay-before`; the final run compares that baseline. Runs
+take 161.86 and 157.14 seconds. Criterion mean estimates follow; these are dev-host
+measurements, not target-hardware latency or independent-process cluster load.
+
+| Case | Before (us) | Final (us) | Change |
+|---|---:|---:|---:|
+| Source/subscription, one row | 30.455 | 29.723 | -2.40% |
+| Source/subscription, 64 distinct keys | 105.455 | 107.666 | +2.10% |
+| Source/subscription, 64 rows sharing a key | 168.472 | 107.968 | -35.91% |
+| Local operator, one row | 1.645 | 1.617 | -1.72% |
+| Local operator, 64 distinct keys | 80.499 | 66.966 | -16.81% |
+| Local operator, 64 rows sharing a key | 78.259 | 69.703 | -10.93% |
+| Single-owner operator, one row | 3.092 | 2.868 | -7.23% |
+| Single-owner operator, 64 distinct keys | 198.801 | 179.868 | -9.52% |
+| Single-owner operator, 64 rows sharing a key | 84.142 | 80.509 | -4.32% |
+| Two-owner operator, one row | 62.765 | 61.870 | -1.43% |
+| Two-owner operator, 64 distinct keys | 203.495 | 195.585 | -3.89% |
+| Two-owner operator, 64 rows sharing a key | 147.135 | 147.237 | +0.07% |
+| Handler only, one row | 0.426 | 0.424 | -0.41% |
+| Handler only, 64 rows | 29.587 | 31.884 | +7.76% |
+
+The sole first-pass increase above 5% is the unchanged handler-only 64-row case.
+Paired runs preserve the same binaries and parameters, ordered baseline, final,
+final, baseline. Pair 1 measures 28.097 / 29.331 us (+4.39%); pair 2 measures
+32.388 / 31.491 us (-2.77%). Both paired increases stay below 5%. The changed
+baseline measurements show run variance; no Rust or benchmark code changes
+between trials and no speculative optimization is added. Trials take 11.08,
+11.17, 11.36 and 11.52 seconds. The first baseline run overlaps startup of the
+task's MinIO test container; that container is removed before final measurements.
+The broad apparent improvements are not claimed as optimizations from this fix.
+
+The required core `latency_bench` uses the same sample/timing parameters. Runs
+take 13.39 and 12.28 seconds; the final mean is 2.06% below the baseline. Failed
+attempts, final source hashes, binary hashes, timings and comparison estimates
+remain in `target/process-replay-20261006/`.
+
+Fresh hardware profiling completes all three 30-second distinct-key cases from
+the final executable, each with exit code zero, in 105.59 seconds including
+recording and cleanup. WPR confirms the task-owned recorder is stopped. The
+`Microsoft.Windows.EventTracing.Processing.All` 1.12.10 reader accepts the trace
+with lost events and time inversion disallowed; analysis takes 1.86 seconds.
+Weighted IPC is the sum of retired instructions divided by the sum of cycles
+for each actual benchmark PID's scheduling intervals.
+
+| Profile | PID | Retired instructions | Cycles | Intervals | Weighted IPC |
+|---|---:|---:|---:|---:|---:|
+| Local, 64 distinct keys | 56084 | 552,267,839,501 | 157,341,723,761 | 648 | 3.510 |
+| Private single-owner, 64 distinct keys | 52996 | 520,410,325,321 | 156,465,509,386 | 418 | 3.326 |
+| Private two-owner, 64 distinct keys | 53872 | 361,976,616,319 | 155,543,144,588 | 473 | 2.327 |
+
+All three meet the IPC > 2.0 guideline. Counters include initialization and the
+benchmark harness; the two-owner case uses real loopback endpoints within one
+runtime. This does not qualify independent-process cluster load or target-hardware
+tail latency. The ETL has SHA-256
+`3C499CB86C1AC6E8C7C64C1870AC31073A762572863FC0CA43063DDCA1CD4AD5`.
+The manifest binds each benchmark PID to the final executable hash above.
+Capture results, strict counter analysis, recorder status and artifact hashes
+remain in `target/process-replay-20261006/`.
+
 ## Next executable task
 
 Continue original Phase E through coordinated recovery with independently failed
 and surviving peer processes. Qualify process replacement and membership entry/
 exit, including final-owner exit, through the existing recovery rounds and a
-committed shared cut. Define and test the admitted source ordering and logical
-activation replay profile before opening either public cluster form. The private
-graph now supports committed vnode handoff and rescaled restoration; its tests
-do not certify source/sink delivery or independent-channel replay equivalence.
+committed shared cut. Bind the private reproducible callback-order profile to an
+explicitly admitted source-order contract, including timer rescheduling, before
+opening either public cluster form. The private graph now supports committed
+vnode handoff and rescaled restoration with transferred callback sequences;
+its tests do not certify source/sink delivery or independent-channel replay
+equivalence.
 Do not add a second scheduler or state backend. Coordinator/core changes require
 the repository's before/after Criterion and IPC gates.
 

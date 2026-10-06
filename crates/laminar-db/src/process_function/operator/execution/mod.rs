@@ -125,11 +125,30 @@ impl ProcessFunctionOperator {
         runtime: tokio::runtime::Handle,
         self_id: NodeId,
     ) -> Result<(), DbError> {
-        if !matches!(self.execution, ProcessExecution::Local) || self.next_activation_id != 0 {
+        if !matches!(self.execution, ProcessExecution::Local)
+            || self.next_activation_id != 0
+            || self.metadata_restored
+            || self.watermark_us != i64::MIN
+            || self.key_count != 0
+            || self.assignment_fence.is_some()
+        {
             return Err(DbError::Checkpoint(
-                "cluster process execution must be selected before input".into(),
+                "cluster process execution must be selected before input, restore, or binding"
+                    .into(),
             ));
         }
+        let count = self.state.len();
+        if count.saturating_mul(std::mem::size_of::<u64>()) > self.graph_budget {
+            return Err(DbError::BackpressureFail(
+                "process vnode sequencing exceeds its retained-state budget".into(),
+            ));
+        }
+        self.activation_sequences
+            .try_reserve_exact(count)
+            .map_err(|_| {
+                DbError::BackpressureFail("process vnode sequencing allocation failed".into())
+            })?;
+        self.activation_sequences.resize(count, 0);
         self.execution = ProcessExecution::AwaitingAssignment {
             stage: stage.to_owned(),
             runtime,

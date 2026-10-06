@@ -18,6 +18,8 @@ pub(super) const MAX_OPERATOR_FRAME_BYTES: usize = MAX_LOCAL_METADATA_FRAME_BYTE
 
 pub(super) struct RestoredVnode {
     pub(super) state: FxHashMap<Vec<u8>, KeyState>,
+    #[cfg(feature = "cluster")]
+    pub(super) activation_sequence: Option<u64>,
     pub(super) due: BTreeSet<DueTimer>,
     pub(super) live_bytes: usize,
 }
@@ -32,6 +34,11 @@ impl ProcessFunctionOperator {
             next_activation_id: self.next_activation_id,
             next_timer_generation: self.next_timer_generation,
             watermark_us: self.watermark_us,
+            #[cfg(feature = "cluster")]
+            activation_id_abi: self
+                .execution
+                .local_id()
+                .map(|_| super::sequencing::CLUSTER_ACTIVATION_ID_ABI),
             #[cfg(feature = "cluster")]
             shuffle: self.shuffle.checkpoint(),
         }
@@ -61,9 +68,30 @@ impl ProcessFunctionOperator {
             ));
         }
         #[cfg(feature = "cluster")]
+        if frame.activation_id_abi
+            != self
+                .execution
+                .local_id()
+                .map(|_| super::sequencing::CLUSTER_ACTIVATION_ID_ABI)
+        {
+            return Err(DbError::Checkpoint(
+                if self.execution.local_id().is_some() {
+                    "process cluster activation sequencing ABI mismatch"
+                } else {
+                    "distributed process restore requires cluster execution selection"
+                }
+                .into(),
+            ));
+        }
+        #[cfg(feature = "cluster")]
         if let Some(shuffle) = &frame.shuffle {
             shuffle.validate(self.vnode_count.get(), frame.watermark_us)?;
-            if shuffle.retained_bytes().saturating_add(self.live_bytes) > self.graph_budget {
+            if shuffle
+                .retained_bytes()
+                .saturating_add(self.live_bytes)
+                .saturating_add(self.cluster_retained_bytes())
+                > self.graph_budget
+            {
                 return Err(DbError::Checkpoint(
                     "process shuffle restore exceeds its retained-state budget".into(),
                 ));
@@ -92,9 +120,25 @@ impl ProcessFunctionOperator {
                 "process vnode codec or identity mismatch".into(),
             ));
         }
+        #[cfg(feature = "cluster")]
+        if frame.activation_sequence.is_some() != self.execution.local_id().is_some()
+            || frame.activation_sequence.is_some_and(|sequence| {
+                sequence != 0
+                    && (sequence - 1)
+                        .checked_mul(u64::from(self.vnode_count.get()))
+                        .and_then(|base| base.checked_add(u64::from(vnode)))
+                        .is_none()
+            })
+        {
+            return Err(DbError::Checkpoint(
+                "process vnode activation sequence is missing, incompatible, or exhausted".into(),
+            ));
+        }
         let mut previous: Option<Vec<u8>> = None;
         let mut restored = RestoredVnode {
             state: FxHashMap::default(),
+            #[cfg(feature = "cluster")]
+            activation_sequence: frame.activation_sequence,
             due: BTreeSet::new(),
             live_bytes: 0,
         };

@@ -170,11 +170,13 @@ pub enum ProcessCallback {
     },
 }
 
-/// One engine-assigned activation. `id` is a stable sequence within the checkpointed operator;
-/// the key is the canonical partition ABI encoding and must never be rehashed by the handler.
+/// One engine-assigned activation. Local `id` values follow the checkpointed operator sequence.
+/// Private cluster execution encodes a checkpointed vnode sequence and its fixed vnode index;
+/// replay identity requires the same callback order within that vnode. The key is the canonical
+/// partition ABI encoding and must never be rehashed by the handler.
 #[derive(Clone, Debug)]
 pub struct ProcessActivation {
-    /// Stable logical activation sequence.
+    /// Logical callback identity within the pipeline and operator, subject to its replay order.
     pub id: u64,
     /// Host-assigned canonical key bytes.
     pub key: Arc<[u8]>,
