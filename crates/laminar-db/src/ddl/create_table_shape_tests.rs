@@ -15,6 +15,30 @@ fn parse_create_table(sql: &str) -> sqlparser::ast::CreateTable {
 }
 
 #[test]
+fn quoted_connector_option_names_preserve_dotted_keys_and_detect_duplicates() {
+    let db = crate::LaminarDB::open().unwrap();
+    let create = parse_create_table(
+        r#"CREATE TABLE t (id BIGINT PRIMARY KEY) WITH (
+            connector = 'postgres', "ssl.mode" = 'disable', table = 'public.t'
+        )"#,
+    );
+    let options = super::table_schema::options(&db, &create).unwrap();
+    assert_eq!(options.connector_type.as_deref(), Some("postgres"));
+    assert_eq!(options.connector_options["ssl.mode"], "disable");
+    assert_eq!(options.connector_options["table"], "public.t");
+    let duplicate = parse_create_table(
+        r#"CREATE TABLE t (id BIGINT PRIMARY KEY) WITH (
+            connector = 'postgres', "connector" = 'delta-lake'
+        )"#,
+    );
+    assert!(super::table_schema::options(&db, &duplicate)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("duplicate CREATE TABLE option 'connector'"));
+}
+
+#[test]
 fn primary_key_is_single_column_and_non_nullable() {
     for sql in [
         "CREATE TABLE t (id INT PRIMARY KEY, value VARCHAR NULL)",

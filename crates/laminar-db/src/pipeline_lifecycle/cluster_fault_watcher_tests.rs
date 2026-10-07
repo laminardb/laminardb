@@ -246,6 +246,8 @@ async fn startup_db() -> (
             registry.register_source(
                 "idle-cluster-test",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "idle-cluster-test".into(),
                     display_name: "Idle cluster test source".into(),
                     version: "1".into(),
@@ -258,6 +260,8 @@ async fn startup_db() -> (
             registry.register_source(
                 "rejecting-splittable-test",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "rejecting-splittable-test".into(),
                     display_name: "Rejecting splittable test source".into(),
                     version: "1".into(),
@@ -270,6 +274,8 @@ async fn startup_db() -> (
             registry.register_source(
                 "failing-start-cluster-test",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "failing-start-cluster-test".into(),
                     display_name: "Failing cluster start test source".into(),
                     version: "1".into(),
@@ -699,6 +705,7 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
         .seal(
             &CatalogManifest::new(vec![
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "unsafe_input".into(),
                     kind: CatalogObjectKind::Source,
                     catalog_generation: 1,
@@ -707,6 +714,7 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
                         .into(),
                 },
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "unsafe_output".into(),
                     kind: CatalogObjectKind::Stream,
                     catalog_generation: 1,
@@ -743,6 +751,7 @@ async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
         .seal(
             &CatalogManifest::new(vec![
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "failing_input".into(),
                     kind: CatalogObjectKind::Source,
                     catalog_generation: 1,
@@ -751,6 +760,7 @@ async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
                         .into(),
                 },
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "failing_output".into(),
                     kind: CatalogObjectKind::Stream,
                     catalog_generation: 1,
@@ -785,12 +795,14 @@ async fn cluster_compute_panic_before_ready_releases_the_startup_rotation_fence(
         .seal(
             &CatalogManifest::new(vec![
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "idle_input".into(),
                     kind: CatalogObjectKind::Source,
                     catalog_generation: 1,
                     ddl: "CREATE SOURCE idle_input (id BIGINT) FROM \"idle-cluster-test\"".into(),
                 },
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "idle_output".into(),
                     kind: CatalogObjectKind::Stream,
                     catalog_generation: 1,
@@ -831,12 +843,14 @@ async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
         .seal(
             &CatalogManifest::new(vec![
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "fenced".into(),
                     kind: CatalogObjectKind::Source,
                     catalog_generation: 1,
                     ddl: "CREATE SOURCE fenced (id BIGINT)".into(),
                 },
                 CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: "broken".into(),
                     kind: CatalogObjectKind::Stream,
                     catalog_generation: 1,

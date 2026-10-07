@@ -86,6 +86,8 @@ fn runtime_source(
 
 fn registration(name: &str) -> TableRegistration {
     TableRegistration {
+        catalog_generation: 1,
+        schema_binding: None,
         name: name.into(),
         primary_key: "id".into(),
         connector_type: Some("mock".into()),
@@ -173,6 +175,8 @@ async fn complete_table_restore_skips_source_construction() {
         .register_table_source(
             "mock",
             ConnectorInfo {
+                schema_capabilities:
+                    laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                 name: "mock".into(),
                 display_name: "Mock".into(),
                 version: "1".into(),
@@ -228,6 +232,8 @@ async fn later_source_construction_failure_closes_prior_sources() {
         .register_table_source(
             "mock",
             ConnectorInfo {
+                schema_capabilities:
+                    laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                 name: "mock".into(),
                 display_name: "Mock".into(),
                 version: "1".into(),

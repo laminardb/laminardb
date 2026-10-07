@@ -281,12 +281,12 @@ pub(crate) use cluster_faults::report_cluster_terminal_halt;
 #[cfg(feature = "cluster")]
 use cluster_faults::{queue_owned_cluster_compute_fault, report_cluster_compute_fault};
 mod source_admission;
-pub(crate) use source_admission::validate_source_recovery_assignment;
+pub(crate) use source_admission::{admit_sink_contract, validate_source_recovery_assignment};
 use source_admission::{
-    admit_sink_contract, admit_source_contract, admit_source_recovery_contract,
-    admit_temporal_source_contract, has_only_ordered_interval_consumers,
-    has_only_temporal_right_consumers, OrderedIntervalAdmissions, PipelineRecoveryState,
-    PipelineSinkSetup, PipelineWatermarks, PreparedSink, SinkAdmissionContext, TemporalSourceRole,
+    admit_source_contract, admit_source_recovery_contract, admit_temporal_source_contract,
+    has_only_ordered_interval_consumers, has_only_temporal_right_consumers,
+    OrderedIntervalAdmissions, PipelineRecoveryState, PipelineSinkSetup, PipelineWatermarks,
+    PreparedSink, SinkAdmissionContext, TemporalSourceRole,
 };
 mod watermarks;
 use watermarks::{

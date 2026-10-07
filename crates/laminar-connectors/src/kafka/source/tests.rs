@@ -2538,7 +2538,7 @@ fn props(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
 }
 
 #[tokio::test]
-async fn discover_schema_skips_non_avro_format() {
+async fn discover_schema_rejects_registry_for_plain_json() {
     let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
     source
         .discover_schema(&props(&[
@@ -2549,7 +2549,7 @@ async fn discover_schema_skips_non_avro_format() {
             ("schema.registry.url", "http://localhost:8081"),
         ]))
         .await
-        .expect("non-avro format is a legitimate skip");
+        .expect_err("registry URL cannot silently change the declared format");
     assert_eq!(source.schema().fields().len(), 0);
 }
 
@@ -2790,11 +2790,11 @@ async fn discover_schema_happy_path_record_name_strategy() {
 
     let sr = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/subjects/com.acme.Order-value/versions/latest"))
+        .and(path("/subjects/com.acme.Order/versions/latest"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 7,
             "version": 1,
-            "subject": "com.acme.Order-value",
+            "subject": "com.acme.Order",
             "schema": avro_schema,
             "schemaType": "AVRO",
         })))
@@ -2821,90 +2821,63 @@ async fn discover_schema_happy_path_record_name_strategy() {
     assert_eq!(schema.field(1).name(), "amount");
 }
 
-/// Drift detection: catalog has a stale 2-field schema, live SR
-/// has evolved to 3 fields. Catalog stays pinned; only
-/// `last_avro_schema` tracks the live SR shape.
 #[tokio::test]
-async fn start_logs_drift_when_sr_evolved_since_ddl() {
-    use wiremock::matchers::{method, path};
+async fn prepared_start_reuses_committed_reader_when_latest_changes() {
+    use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let evolved_schema = serde_json::json!({
-        "type": "record",
-        "name": "event",
-        "fields": [
-            {"name": "id", "type": "long"},
-            {"name": "data", "type": {"type": "map", "values": "string"}},
-            {"name": "version", "type": "int"}
-        ]
-    })
-    .to_string();
-
     let sr = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/subjects/ion_tw-value/versions/latest"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "id": 99,
-            "version": 2,
-            "subject": "ion_tw-value",
-            "schema": evolved_schema,
-            "schemaType": "AVRO",
-        })))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
         .mount(&sr)
         .await;
-
-    // Catalog schema baked at CREATE SOURCE time — only two fields,
-    // predates the `version` field that was just added in SR.
-    let stale_catalog = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new(
-            "data",
-            DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(arrow_schema::Fields::from(vec![
-                        Field::new("key", DataType::Utf8, false),
-                        Field::new("value", DataType::Utf8, true),
-                    ])),
-                    false,
-                )),
-                false,
-            ),
-            true,
-        ),
-    ]));
-
-    let mut cfg = KafkaSourceConfig::default();
-    cfg.bootstrap_servers = "localhost:9092".into();
-    cfg.group_id = "g".into();
-    cfg.subscription = TopicSubscription::Topics(vec!["ion_tw".into()]);
-    cfg.format = Format::Avro;
-    cfg.schema_registry_url = Some(sr.uri());
-    let sr_client = SchemaRegistryClient::new(sr.uri(), None).unwrap();
-    let mut source = KafkaSource::with_schema_registry(stale_catalog, cfg, sr_client);
-
-    let empty_cfg = crate::config::ConnectorConfig::new("kafka");
-    let _ = source
-        .start(
+    let native = serde_json::json!({"type":"record","name":"event","fields":[
+        {"name":"id","type":"long"},{"name":"value","type":"string"}]});
+    let schema = super::super::schema_registry::avro_to_arrow_schema(&native.to_string()).unwrap();
+    let mut config = test_config();
+    config.format = Format::Avro;
+    config.schema_registry_url = Some(sr.uri());
+    let metadata =
+        super::super::schema_configuration::source(&ConnectorConfig::new("kafka"), &config);
+    let mut binding = crate::schema::resolution::logical_binding(
+        &metadata,
+        crate::schema::resolution::SchemaDirection::Source,
+        crate::schema::resolution::SchemaOrigin::Metadata,
+        &schema,
+    )
+    .unwrap();
+    crate::schema::resolution::bind_external(&mut binding, &schema).unwrap();
+    binding.value = Some(crate::schema::resolution::NativeSchema {
+        format: "avro".into(),
+        identity: std::collections::BTreeMap::from([
+            ("registry".into(), sr.uri()),
+            ("subject".into(), "events-value".into()),
+            ("id".into(), "7".into()),
+            ("version".into(), "1".into()),
+        ]),
+        definition: serde_json::json!({"schema":native,"resolved":native}),
+        references: Vec::new(),
+    });
+    let mut startup = ConnectorConfig::new("kafka");
+    startup.set_schema_binding(binding.clone()).unwrap();
+    let registry = SchemaRegistryClient::new(sr.uri(), None).unwrap();
+    let mut source = KafkaSource::with_schema_registry(schema.clone(), config, registry);
+    source
+        .prepare_start(
             SourceStart::new(
-                empty_cfg,
+                startup,
                 SourcePosition::Initial,
                 DeliveryGuarantee::BestEffort,
             )
             .unwrap(),
         )
-        .await; // broker unreachable — later errors irrelevant
-
-    assert_eq!(
-        source.schema().fields().len(),
-        2,
-        "catalog schema must stay pinned even after SR drift"
+        .unwrap();
+    assert_eq!(source.schema(), schema);
+    assert!(
+        source.last_avro_schema.is_none(),
+        "no writer has been observed during metadata preparation"
     );
-    assert_eq!(
-        source.last_avro_schema.as_ref().map(|s| s.fields().len()),
-        Some(3),
-        "last_avro_schema should reflect the evolved SR shape"
-    );
+    assert_eq!(binding.value.unwrap().identity["id"], "7");
 }
 
 // The hook builds a TPL from a durable SourceCheckpoint and uses

@@ -33,6 +33,8 @@ mod publication;
 mod recovery_tests;
 #[cfg(feature = "iceberg-core")]
 mod schema_alignment;
+#[cfg(feature = "iceberg-core")]
+mod startup;
 #[cfg(all(test, feature = "iceberg-core"))]
 pub(crate) mod test_support;
 
@@ -398,6 +400,42 @@ impl SinkConnector for IcebergSink {
         )
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        #[cfg(feature = "iceberg-core")]
+        {
+            super::schema_resolution::iceberg_sink(config, input).await
+        }
+        #[cfg(not(feature = "iceberg-core"))]
+        {
+            let _ = (config, input);
+            Err(ConnectorError::FeatureUnsupported(
+                "Iceberg schema resolution requires the iceberg feature".into(),
+            ))
+        }
+    }
+
+    async fn prepare_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        binding: &mut crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        #[cfg(feature = "iceberg-core")]
+        {
+            super::schema_resolution::prepare_iceberg(config, binding).await
+        }
+        #[cfg(not(feature = "iceberg-core"))]
+        {
+            let _ = (config, binding);
+            Err(ConnectorError::FeatureUnsupported(
+                "Iceberg preparation requires the iceberg feature".into(),
+            ))
+        }
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         if !config.properties().is_empty() {
             self.config = IcebergSinkConfig::from_config(config)?;
@@ -411,74 +449,7 @@ impl SinkConnector for IcebergSink {
 
         #[cfg(feature = "iceberg-core")]
         {
-            let built = super::iceberg_io::build_catalog_for_access_with_metrics(
-                &self.config.catalog,
-                &self.config.storage,
-                super::iceberg_io::CatalogAccess::Write {
-                    auto_create: self.config.auto_create,
-                },
-                Some(self.metrics.credential_refresh_failures.clone()),
-            )
-            .await?;
-            let catalog = built.catalog;
-            let namespace = &self.config.catalog.namespace;
-            let table_name = &self.config.catalog.table_name;
-            if self.config.auto_create {
-                if let Some(schema) = config.arrow_schema() {
-                    tokio::time::timeout(
-                        self.config.catalog.request_timeout,
-                        super::iceberg_io::ensure_table_exists(
-                            catalog.as_ref(),
-                            &self.config,
-                            &schema,
-                        ),
-                    )
-                    .await
-                    .map_err(|_| {
-                        ConnectorError::WriteError(
-                            "[LDB-ICEBERG-CATALOG-TIMEOUT] table creation exceeded catalog.request_timeout"
-                                .into(),
-                        )
-                    })??;
-                }
-            }
-            let table = super::iceberg_io::load_table_with_timeout(
-                catalog.as_ref(),
-                namespace,
-                table_name,
-                self.config.catalog.request_timeout,
-            )
-            .await?;
-            schema_alignment::validate_identifier_fields(
-                &self.config.identifier_fields,
-                table.current_schema_ref().as_ref(),
-            )?;
-            let table_schema = Arc::new(
-                iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref()).map_err(
-                    |error| {
-                        ConnectorError::SchemaMismatch(format!(
-                            "convert Iceberg schema to Arrow: {error}"
-                        ))
-                    },
-                )?,
-            );
-            let input_schema = config
-                .arrow_schema()
-                .unwrap_or_else(|| Arc::clone(&table_schema));
-            self.alignment_plan = Some(SchemaAlignmentPlan::new(
-                table.metadata().current_schema_id(),
-                Arc::clone(&input_schema),
-                Arc::clone(&table_schema),
-            )?);
-            self.schema = Some(input_schema);
-            self.iceberg_arrow_schema = Some(table_schema);
-            self.catalog_capabilities = built.capabilities;
-            self.catalog_session = built.session;
-            self.catalog = Some(catalog);
-            self.table = Some(table);
-            self.state = ConnectorState::Running;
-            metrics::trace_sink_connected(&self.config, namespace, table_name);
-            return Ok(());
+            self.open_target(config).await
         }
 
         #[cfg(not(feature = "iceberg-core"))]

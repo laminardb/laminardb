@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::Field;
 
 use laminar_core::catalog::CatalogObjectKind;
 use laminar_sql::translator::streaming_ddl;
@@ -22,11 +22,11 @@ use crate::handle::{DdlInfo, ExecuteResult};
 
 /// Parsed `WITH (...)` clause of a `CREATE TABLE`.
 #[derive(Default)]
-struct CreateTableWith {
-    connector_type: Option<String>,
-    connector_options: HashMap<String, String>,
-    format: Option<String>,
-    format_options: HashMap<String, String>,
+pub(super) struct CreateTableWith {
+    pub(super) connector_type: Option<String>,
+    pub(super) connector_options: HashMap<String, String>,
+    pub(super) format: Option<String>,
+    pub(super) format_options: HashMap<String, String>,
     storage: Option<String>,
 }
 
@@ -284,11 +284,11 @@ fn collect_column_shape(create: &sqlparser::ast::CreateTable) -> Result<ColumnSh
     Ok((nullability, primary_keys))
 }
 
-/// Table-level `PRIMARY KEY (...)` constraints as identity lists. Decorations
+/// Table-level `PRIMARY KEY (...)` constraints as identifier lists. Decorations
 /// and key expressions are rejected — only plain column lists are supported.
-fn collect_primary_key_constraints(
+pub(super) fn collect_primary_key_constraints(
     create: &sqlparser::ast::CreateTable,
-) -> Result<Vec<Vec<String>>, DbError> {
+) -> Result<Vec<Vec<sqlparser::ast::Ident>>, DbError> {
     use sqlparser::ast::{Expr, PrimaryKeyConstraint, TableConstraint};
 
     let mut primary_keys = Vec::new();
@@ -335,7 +335,7 @@ fn collect_primary_key_constraints(
                     column.column.expr
                 )));
             };
-            key_columns.push(ident_identity(ident));
+            key_columns.push(ident.clone());
         }
         primary_keys.push(key_columns);
     }
@@ -346,7 +346,11 @@ pub(super) fn build_table_fields_and_primary_key(
     create: &sqlparser::ast::CreateTable,
 ) -> Result<(Vec<Field>, String), DbError> {
     let (nullability, mut primary_keys) = collect_column_shape(create)?;
-    primary_keys.extend(collect_primary_key_constraints(create)?);
+    primary_keys.extend(
+        collect_primary_key_constraints(create)?
+            .into_iter()
+            .map(|keys| keys.iter().map(ident_identity).collect()),
+    );
 
     let [columns] = primary_keys.as_slice() else {
         return Err(DbError::InvalidOperation(
@@ -397,7 +401,7 @@ pub(super) fn build_table_fields_and_primary_key(
     Ok((fields, primary_key_name.clone()))
 }
 
-fn parse_create_table_with(
+pub(super) fn parse_create_table_with(
     with_options: &[sqlparser::ast::SqlOption],
 ) -> Result<CreateTableWith, DbError> {
     let mut out = CreateTableWith {
@@ -412,7 +416,7 @@ fn parse_create_table_with(
                 "unsupported CREATE TABLE option: {opt}"
             )));
         };
-        let k = key.to_string().to_lowercase();
+        let k = key.value.to_ascii_lowercase();
         if !seen.insert(k.clone()) {
             return Err(DbError::InvalidOperation(format!(
                 "duplicate CREATE TABLE option '{k}'"
@@ -449,7 +453,7 @@ fn parse_create_table_with(
     Ok(out)
 }
 
-fn validate_create_table_with(opts: &CreateTableWith) -> Result<(), DbError> {
+pub(super) fn validate_create_table_with(opts: &CreateTableWith) -> Result<(), DbError> {
     if let Some(storage) = &opts.storage {
         return Err(DbError::InvalidOperation(format!(
             "CREATE TABLE storage option '{storage}' is unsupported"
@@ -474,7 +478,7 @@ fn validate_create_table_with(opts: &CreateTableWith) -> Result<(), DbError> {
 }
 
 impl LaminarDB {
-    pub(crate) fn handle_create_table(
+    pub(crate) async fn handle_create_table(
         &self,
         create: &sqlparser::ast::CreateTable,
     ) -> Result<ExecuteResult, DbError> {
@@ -482,36 +486,6 @@ impl LaminarDB {
         validate_create_table_envelope(create)?;
         let name = canonical_object_name(&create.name)?;
         reject_reserved_namespace(&name)?;
-
-        let with_options = match &create.table_options {
-            sqlparser::ast::CreateTableOptions::With(opts) => opts.as_slice(),
-            sqlparser::ast::CreateTableOptions::None => &[],
-            unsupported => {
-                return Err(DbError::InvalidOperation(format!(
-                    "unsupported CREATE TABLE options: {unsupported}"
-                )));
-            }
-        };
-        let mut opts = parse_create_table_with(with_options)?;
-        validate_create_table_with(&opts)?;
-        if let Some(connector_type) = opts.connector_type.as_mut() {
-            let normalized = normalize_connector_type(connector_type);
-            if !self.connector_registry.has_table_source(&normalized) {
-                return Err(DbError::Connector(format!(
-                    "connector '{connector_type}' is not a registered reference-table source. Available: {:?}",
-                    self.connector_registry.list_table_sources()
-                )));
-            }
-            *connector_type = normalized;
-        }
-        let (fields, primary_key) = build_table_fields_and_primary_key(create)?;
-        let schema = Arc::new(Schema::new(fields));
-        if crate::catalog::schema_has_reserved_mutation_columns(schema.as_ref()) {
-            return Err(DbError::InvalidOperation(
-                "CREATE TABLE columns _op, __op, and __weight are reserved engine mutation metadata"
-                    .into(),
-            ));
-        }
 
         let Some(reservation) =
             self.reserve_catalog_name(&name, CatalogObjectKind::Table, create.if_not_exists)?
@@ -525,6 +499,26 @@ impl LaminarDB {
             }));
         };
 
+        let mut opts = super::table_schema::options(self, create)?;
+        if let Some(connector_type) = opts.connector_type.as_mut() {
+            let normalized = normalize_connector_type(connector_type);
+            if !self.connector_registry.has_table_source(&normalized) {
+                return Err(DbError::Connector(format!(
+                    "connector '{connector_type}' is not a registered reference-table source. Available: {:?}",
+                    self.connector_registry.list_table_sources()
+                )));
+            }
+            *connector_type = normalized;
+        }
+        let (schema, primary_key, schema_binding) =
+            super::table_schema::resolve(self, create, &opts).await?;
+        if crate::catalog::schema_has_reserved_mutation_columns(schema.as_ref()) {
+            return Err(DbError::InvalidOperation(
+                "CREATE TABLE columns _op, __op, and __weight are reserved engine mutation metadata"
+                    .into(),
+            ));
+        }
+
         self.table_store
             .write()
             .create_table(&name, schema.clone(), &primary_key)?;
@@ -537,6 +531,8 @@ impl LaminarDB {
 
             let mut mgr = self.connector_manager.lock();
             mgr.register_table(crate::connector_manager::TableRegistration {
+                catalog_generation: 1,
+                schema_binding,
                 name: name.clone(),
                 primary_key: primary_key.clone(),
                 connector_type: opts.connector_type.clone(),

@@ -41,6 +41,7 @@ pub fn register_otel_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::built_in(),
         name: "otel".to_string(),
         display_name: "OpenTelemetry OTLP/gRPC Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

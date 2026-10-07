@@ -46,6 +46,8 @@ impl LaminarDB {
                 "Prometheus registry is already installed".into(),
             ));
         }
+        self.connector_registry
+            .register_schema_resolution_metrics(&registry)?;
         *slot = Some(registry);
         Ok(())
     }

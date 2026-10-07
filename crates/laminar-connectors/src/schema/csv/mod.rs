@@ -149,6 +149,22 @@ impl std::fmt::Debug for CsvDecoder {
 }
 
 impl CsvDecoder {
+    /// Validate the actual builders used by this decoder before activating a reader.
+    ///
+    /// # Errors
+    /// Rejects types the current CSV decoder cannot represent without a lossy conversion.
+    pub fn validate_schema(schema: &SchemaRef) -> SchemaResult<()> {
+        for (field, mut builder) in schema.fields().iter().zip(create_builders(schema, 0)) {
+            if builder.finish().data_type() != field.data_type() {
+                return Err(SchemaError::Incompatible(format!(
+                    "CSV reader field '{}' cannot decode {}; use a supported type or another format",
+                    field.name(), field.data_type()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a new CSV decoder for the given Arrow schema with default config.
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {

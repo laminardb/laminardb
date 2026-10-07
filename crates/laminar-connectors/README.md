@@ -1,5 +1,10 @@
 # laminar-connectors
 
+Source fields resolve from authoritative metadata, built-in protocols or explicit
+declarations before startup. Sinks bind their query schema before opening. See
+[schema resolution](../../docs/SCHEMA_RESOLUTION.md) for the direction/format matrix,
+bounded sampling, separate preparation policies and durable reader/writer contracts.
+
 External system connectors for LaminarDB. Exactly-once admission requires an exact-certified source and a checkpoint-committable sink with coordinated external publication.
 
 ## Connectors

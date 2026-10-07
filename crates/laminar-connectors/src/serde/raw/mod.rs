@@ -13,7 +13,7 @@ use super::{Format, RecordDeserializer, RecordSerializer};
 use crate::error::SerdeError;
 
 /// The default schema for raw bytes: a single `Utf8` column named "value".
-fn raw_schema() -> SchemaRef {
+pub(crate) fn raw_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "value",
         DataType::Utf8,

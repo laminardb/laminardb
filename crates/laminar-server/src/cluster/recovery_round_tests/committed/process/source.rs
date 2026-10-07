@@ -258,6 +258,8 @@ pub(in super::super) fn register(
     move |registry| {
         let source_probe = Arc::clone(&probe);
         let info = |name: &str, source| ConnectorInfo {
+            schema_capabilities:
+                laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
             name: name.into(),
             display_name: name.into(),
             version: "1".into(),

@@ -18,6 +18,7 @@
 mod attempt_error;
 mod catalog;
 mod descriptor;
+pub(in crate::lakehouse) use descriptor::sorted_protocol_features;
 #[cfg(feature = "delta-lake-gcs")]
 mod gcs_factory;
 mod merge;

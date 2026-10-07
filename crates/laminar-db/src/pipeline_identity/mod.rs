@@ -64,6 +64,8 @@ struct CanonicalSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     replay_order: Option<SourceReplayOrder>,
     schema: Option<CanonicalSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_contract: Option<String>,
     primary_key: Vec<String>,
     watermark_column: Option<String>,
     max_out_of_orderness_ms: Option<u64>,
@@ -96,6 +98,8 @@ struct CanonicalProcess {
 #[derive(Serialize)]
 struct CanonicalTable {
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_contract: Option<String>,
     primary_key: String,
     connector_type: String,
     options: BTreeMap<String, String>,
@@ -113,6 +117,8 @@ struct CanonicalSink {
     connector_type: String,
     options: BTreeMap<String, String>,
     filter_expr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_contract: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -262,14 +268,25 @@ fn canonical_sources(
                 SourceContract::default(),
             )
         };
-        sources.push(canonical_source(
+        let mut source = canonical_source(
             reg.name.clone(),
             reg.catalog_generation,
             connector_type,
             options,
             contract,
             entry.as_deref(),
-        ));
+        );
+        source.schema_contract = reg
+            .schema_binding
+            .as_ref()
+            .filter(|binding| binding.value.is_some() || binding.key.is_some())
+            .map(|binding| {
+                binding
+                    .fingerprint()
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))
+            })
+            .transpose()?;
+        sources.push(source);
     }
     // Programmatic/catalog sources do not necessarily have a connector-manager registration.
     for name in catalog.list_sources() {
@@ -313,6 +330,7 @@ fn canonical_source(
             | SourceReplayOrder::SingleChannelFixedBatches) => Some(order),
         },
         schema: entry.map(|entry| canonical_schema(&entry.schema)),
+        schema_contract: None,
         primary_key: entry.map_or_else(Vec::new, |entry| entry.primary_key.clone()),
         watermark_column: entry.and_then(|entry| entry.watermark_column.clone()),
         max_out_of_orderness_ms: entry
@@ -399,6 +417,12 @@ fn canonical_tables(
         };
         tables.push(CanonicalTable {
             name: reg.name.clone(),
+            schema_contract: reg
+                .schema_binding
+                .as_ref()
+                .map(laminar_core::schema_binding::SchemaBinding::fingerprint)
+                .transpose()
+                .map_err(|error| DbError::Config(error.to_string()))?,
             primary_key: reg.primary_key.clone(),
             connector_type,
             options,
@@ -433,6 +457,15 @@ fn canonical_sinks(
             connector_type,
             options,
             filter_expr: reg.filter_expr.as_deref().map(canonical_sql),
+            schema_contract: reg
+                .schema_binding
+                .as_ref()
+                .map(|binding| {
+                    binding
+                        .fingerprint()
+                        .map_err(|error| DbError::Checkpoint(error.to_string()))
+                })
+                .transpose()?,
         });
     }
     sinks.sort_by(|left, right| left.name.cmp(&right.name));

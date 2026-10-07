@@ -344,6 +344,15 @@ impl SourceConnector for NatsSource {
         Some(self.task_tracker.clone())
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let parsed = NatsSourceConfig::from_config(config)?;
+        crate::serde::schema_contract::reader_binding(config, parsed.format, explicit)
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         let format = match config.get("format") {
             Some(value) => serde::Format::parse(value)
@@ -386,16 +395,26 @@ impl SourceConnector for NatsSource {
         let cfg = NatsSourceConfig::from_config(config)?;
         // Keep the candidate schema local until network admission succeeds so
         // cancelling start leaves the existing instance unchanged.
-        let candidate_schema = config.arrow_schema();
+        let explicit = config
+            .arrow_schema()
+            .or_else(|| (!self.schema.fields().is_empty()).then(|| self.schema.clone()));
+        let binding = crate::serde::schema_contract::reader_binding(config, cfg.format, explicit)?;
+        if config
+            .schema_binding()
+            .is_some_and(|expected| expected.logical != binding.logical)
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "NATS reader differs from its committed contract".into(),
+            ));
+        }
+        let candidate_schema = Arc::new(binding.logical);
         let deserializer = serde::create_deserializer(cfg.format)
             .map_err(|e| err(&format!("deserializer for format {:?}: {e}", cfg.format)))?;
         match cfg.mode {
             Mode::JetStream => self.open_jetstream(&cfg, deserializer).await?,
             Mode::Core => self.open_core(&cfg, deserializer).await?,
         }
-        if let Some(schema) = candidate_schema {
-            self.schema = schema;
-        }
+        self.schema = candidate_schema;
         self.config = Some(cfg);
         Ok(())
     }

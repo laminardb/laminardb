@@ -26,6 +26,8 @@ use crate::connector::{
 use crate::error::ConnectorError;
 use crate::schema::traits::FormatEncoder;
 
+use super::output_directory::initialise_output_directory;
+
 use super::config::{FileFormat, FileSinkConfig};
 
 enum FileBlockingTaskError {
@@ -75,6 +77,8 @@ pub struct FileSink {
     config: Option<FileSinkConfig>,
     /// Output schema.
     schema: SchemaRef,
+    writer_mapping: Option<(SchemaRef, Vec<usize>)>,
+    namespace_owner: Option<Arc<std::fs::File>>,
     /// Format encoder.
     encoder: Option<Box<dyn FormatEncoder>>,
     /// Generation reserved for the next publication.
@@ -113,6 +117,8 @@ impl FileSink {
         Self {
             config: None,
             schema: Arc::new(arrow_schema::Schema::empty()),
+            writer_mapping: None,
+            namespace_owner: None,
             encoder: None,
             next_generation: 1,
             buffered_batches: Vec::new(),
@@ -140,8 +146,10 @@ impl FileSink {
             .track()
             .expect("live file sink cannot have a retired task owner");
         let retired = Arc::clone(&self.retired);
+        let namespace_owner = self.namespace_owner.clone();
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
+            let _namespace_owner = namespace_owner;
             if retired.load(Ordering::Acquire) {
                 Err(FileBlockingTaskError::Retired)
             } else {
@@ -518,6 +526,16 @@ impl SinkConnector for FileSink {
         ))
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let parsed = FileSinkConfig::from_connector_config(config)?;
+        build_encoder(parsed.format, &input, &parsed)?;
+        super::schema_resolution::resolve_sink(config, input).await
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         if self.is_open {
             return Err(ConnectorError::InvalidState {
@@ -530,18 +548,53 @@ impl SinkConnector for FileSink {
         // Validate the encoder before creating or cleaning any files.
         let schema = config
             .arrow_schema()
+            .or_else(|| {
+                config
+                    .schema_binding()
+                    .map(|binding| Arc::new(binding.logical.clone()))
+            })
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
-        let encoder = build_encoder(sink_config.format, &schema, &sink_config)?;
-
+        crate::schema::resolution::logical_binding(
+            config,
+            crate::schema::resolution::SchemaDirection::Sink,
+            crate::schema::resolution::SchemaOrigin::Query,
+            &schema,
+        )?;
         let out_dir = PathBuf::from(&sink_config.path);
         let prefix = sink_config.prefix.clone();
         let extension = sink_config.format.extension().to_string();
-        let next_generation = self
-            .run_blocking(move || initialise_output_directory(&out_dir, &prefix, &extension))
-            .await
-            .map_err(|error| {
-                blocking_task_error("output-directory initialisation failed", error)
-            })??;
+        let query = Arc::clone(&schema);
+        let original_config = config.clone();
+        let (namespace_owner, next_generation, current) = self.run_blocking(move || {
+            let next = initialise_output_directory(&out_dir, &prefix, &extension)?;
+            let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+                .open(out_dir.join(format!(".{prefix}.schema.lock"))).map_err(|error| ConnectorError::WriteError(format!("file writer lease: {error}")))?;
+            lock.try_lock().map_err(|_| ConnectorError::ConfigurationError("file sink prefix already has a writer; use a different prefix or wait for its terminal shutdown".into()))?;
+            let current = super::schema_resolution::sink_binding(&original_config, &query)?;
+            Ok::<_, ConnectorError>((Arc::new(lock), next, current))
+        }).await.map_err(|error| blocking_task_error("output-directory admission failed", error))??;
+        let writer_schema = Arc::new(current.external.unwrap_or_else(|| schema.as_ref().clone()));
+        if let Some(committed) = config.schema_binding() {
+            if committed
+                .external
+                .as_ref()
+                .is_some_and(|expected| expected != writer_schema.as_ref())
+            {
+                return Err(ConnectorError::SchemaMismatch(
+                    "file dataset layout changed before writer admission".into(),
+                ));
+            }
+        }
+        let indices = writer_schema
+            .fields()
+            .iter()
+            .map(|field| schema.index_of(field.name()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ConnectorError::SchemaMismatch(error.to_string()))?;
+        let encoder = build_encoder(sink_config.format, &writer_schema, &sink_config)?;
+        self.writer_mapping =
+            (writer_schema.as_ref() != schema.as_ref()).then_some((writer_schema, indices));
+        self.namespace_owner = Some(namespace_owner);
 
         self.config = Some(sink_config);
         self.schema = schema;
@@ -560,6 +613,25 @@ impl SinkConnector for FileSink {
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
         self.ensure_open()?;
+        if batch.schema().as_ref() != self.schema.as_ref() {
+            return Err(ConnectorError::SchemaMismatch(
+                "file sink batch differs from the frozen query schema".into(),
+            ));
+        }
+        let projected;
+        let batch = if let Some((schema, indices)) = &self.writer_mapping {
+            projected = RecordBatch::try_new(
+                Arc::clone(schema),
+                indices
+                    .iter()
+                    .map(|index| Arc::clone(batch.column(*index)))
+                    .collect(),
+            )
+            .map_err(|error| ConnectorError::SchemaMismatch(error.to_string()))?;
+            &projected
+        } else {
+            batch
+        };
         let is_bulk = self
             .config
             .as_ref()
@@ -691,6 +763,8 @@ impl SinkConnector for FileSink {
         self.is_open = false;
         self.config = None;
         self.encoder = None;
+        self.writer_mapping = None;
+        self.namespace_owner = None;
         info!("file sink closed");
         Ok(())
     }
@@ -771,78 +845,6 @@ fn final_path_for_tmp(tmp_path: &Path) -> Result<PathBuf, ConnectorError> {
         .join(final_name))
 }
 
-fn initialise_output_directory(
-    dir: &Path,
-    prefix: &str,
-    extension: &str,
-) -> Result<u64, ConnectorError> {
-    std::fs::create_dir_all(dir).map_err(|e| {
-        ConnectorError::WriteError(format!(
-            "cannot create output directory '{}': {e}",
-            dir.display()
-        ))
-    })?;
-    if !dir.is_dir() {
-        return Err(ConnectorError::WriteError(format!(
-            "file sink output '{}' is not a directory",
-            dir.display()
-        )));
-    }
-    scan_next_generation(dir, prefix, extension)
-}
-
-/// Finds a generation strictly above every existing final or temporary file
-/// for this exact prefix and format. Temporary files are deliberately retained:
-/// deleting them during `open` could destroy a still-live writer that was
-/// accidentally configured with the same target. They can be garbage-collected
-/// only by an operator after establishing exclusive ownership of the target.
-/// Malformed unrelated names are ignored; `create_new` and final-path
-/// no-overwrite checks remain authoritative at publication time.
-fn scan_next_generation(dir: &Path, prefix: &str, extension: &str) -> Result<u64, ConnectorError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| {
-        ConnectorError::WriteError(format!(
-            "cannot scan output directory '{}': {e}",
-            dir.display()
-        ))
-    })?;
-    let name_prefix = format!("{prefix}_");
-    let final_suffix = format!(".{extension}");
-    let temporary_suffix = format!(".{extension}.tmp");
-    let mut highest = None::<u64>;
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            ConnectorError::WriteError(format!(
-                "cannot read an entry in output directory '{}': {e}",
-                dir.display()
-            ))
-        })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(name) = name.strip_prefix(&name_prefix) else {
-            continue;
-        };
-        let body = name
-            .strip_suffix(&temporary_suffix)
-            .or_else(|| name.strip_suffix(&final_suffix));
-        let Some(body) = body else { continue };
-        let Some((generation, segment)) = body.rsplit_once('_') else {
-            continue;
-        };
-        if segment.parse::<usize>().is_err() {
-            continue;
-        }
-        let Ok(generation) = generation.parse::<u64>() else {
-            continue;
-        };
-        highest = Some(highest.map_or(generation, |current| current.max(generation)));
-    }
-    highest
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| ConnectorError::WriteError("file sink generation space is exhausted".into()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -904,7 +906,10 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| !path.to_string_lossy().ends_with(".tmp"))
+            .filter(|path| {
+                !path.to_string_lossy().ends_with(".tmp")
+                    && path.extension().is_none_or(|extension| extension != "lock")
+            })
             .collect::<Vec<_>>();
         files.sort();
         files

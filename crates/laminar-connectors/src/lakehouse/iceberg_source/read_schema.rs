@@ -328,6 +328,50 @@ fn schema_error(message: impl Into<String>) -> ConnectorError {
     ConnectorError::SchemaMismatch(format!("{EVOLUTION_ERROR} {}", message.into()))
 }
 
+impl super::IcebergSource {
+    pub(super) fn resolve_root_schema(
+        &self,
+        config: &crate::config::ConnectorConfig,
+        table: &iceberg::table::Table,
+        cursor: Option<&super::cursor::IcebergSourceCursorV1>,
+    ) -> Result<Arc<IcebergSchema>, ConnectorError> {
+        super::super::schema_resolution::verify_identity(
+            config.schema_binding(),
+            &super::super::schema_resolution::iceberg_native(table),
+        )?;
+        if let Some(cursor) = cursor {
+            cursor.validate_binding(&self.config, table)?;
+            super::append_lineage::validate_cursor_lineage(
+                table,
+                cursor,
+                self.config.max_snapshots_per_poll,
+            )?;
+        }
+        let root_schema = if let Some(native) = config
+            .schema_binding()
+            .and_then(|binding| binding.value.as_ref())
+        {
+            let schema: iceberg::spec::Schema =
+                serde_json::from_value(native.definition["schema"].clone()).map_err(|_| {
+                    ConnectorError::SchemaMismatch("committed Iceberg schema is malformed".into())
+                })?;
+            Arc::new(schema)
+        } else if let Some(cursor) = cursor {
+            cursor.retained_schema(table)?
+        } else {
+            match Self::selected_snapshot(table, &self.config)? {
+                Some(snapshot) => snapshot.schema(table.metadata()).map_err(|error| {
+                    super::super::iceberg_scan::connector_scan_error(
+                        "resolve initial Iceberg snapshot schema",
+                        &error,
+                    )
+                })?,
+                None => table.current_schema_ref(),
+            }
+        };
+        Ok(root_schema)
+    }
+}
 #[cfg(test)]
 mod tests {
     use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};

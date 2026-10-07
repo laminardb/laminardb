@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 #[cfg(test)]
 use parking_lot::Condvar;
@@ -117,13 +117,19 @@ fn shared_root_domain(root: &FsPath) -> io::Result<Arc<RootDomain>> {
     Ok(domain)
 }
 
+#[derive(Clone, Debug)]
+enum NamespaceOwner {
+    Exclusive(Arc<File>),
+    Shared(Weak<File>),
+}
+
 /// Local object store whose successful puts survive a host crash.
 #[derive(Clone, Debug)]
 pub(crate) struct DurableLocalObjectStore {
     root: Arc<PathBuf>,
     inner: LocalFileSystem,
     domain: Arc<RootDomain>,
-    ownership_lock: Option<Arc<File>>,
+    ownership_lock: Option<NamespaceOwner>,
 }
 
 impl DurableLocalObjectStore {
@@ -134,6 +140,11 @@ impl DurableLocalObjectStore {
     /// Returns an object-store error when the root cannot be created, synchronized, or opened.
     pub(crate) fn new(root: impl AsRef<FsPath>) -> object_store::Result<Self> {
         Self::open(root.as_ref(), None)
+    }
+
+    pub(crate) fn with_namespace_owner(mut self, owner: &Arc<File>) -> Self {
+        self.ownership_lock = Some(NamespaceOwner::Shared(Arc::downgrade(owner)));
+        self
     }
 
     /// Open a store with one live process owner for protocols that use local overwrites.
@@ -165,7 +176,7 @@ impl DurableLocalObjectStore {
                         ),
                     )
                 })?;
-                Ok::<_, io::Error>(Arc::new(lock))
+                Ok::<_, io::Error>(NamespaceOwner::Exclusive(Arc::new(lock)))
             })
             .transpose()
             .map_err(generic_io_error)?;
@@ -177,6 +188,18 @@ impl DurableLocalObjectStore {
             domain,
             ownership_lock,
         })
+    }
+
+    fn ownership_lease(&self) -> object_store::Result<Option<Arc<File>>> {
+        match &self.ownership_lock {
+            None => Ok(None),
+            Some(NamespaceOwner::Exclusive(owner)) => Ok(Some(Arc::clone(owner))),
+            Some(NamespaceOwner::Shared(owner)) => owner.upgrade().map(Some).ok_or_else(|| {
+                generic_io_error(io::Error::other(
+                    "local namespace ownership expired; this store is fenced",
+                ))
+            }),
+        }
     }
 
     fn filesystem_path(&self, location: &Path) -> object_store::Result<PathBuf> {
@@ -210,12 +233,13 @@ impl ObjectStore for DurableLocalObjectStore {
         let root = Arc::clone(&self.root);
         let domain = Arc::clone(&self.domain);
         ensure_not_poisoned(&domain.poisoned_paths, &destination).map_err(generic_io_error)?;
+        // An admitted worker retains ownership even if its caller is cancelled.
+        let ownership_lock = self.ownership_lease()?;
         let operation_order = if mode == DurableRenameMode::Replace {
             Some(Arc::clone(&domain.operation_order).lock_owned().await)
         } else {
             None
         };
-        let ownership_lock = self.ownership_lock.clone();
         let location = location.to_string();
         tokio::task::spawn_blocking(move || {
             let _operation_order = operation_order;
@@ -249,6 +273,7 @@ impl ObjectStore for DurableLocalObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let _ownership_lock = self.ownership_lease()?;
         let _operation_order = Arc::clone(&self.domain.operation_order).lock_owned().await;
         let path = self.filesystem_path(location)?;
         ensure_not_poisoned(&self.domain.poisoned_paths, &path).map_err(generic_io_error)?;
@@ -265,7 +290,10 @@ impl ObjectStore for DurableLocalObjectStore {
         let inner = self.inner.clone();
         let root = Arc::clone(&self.root);
         let domain = Arc::clone(&self.domain);
-        let ownership_lock = self.ownership_lock.clone();
+        let ownership_lock = match self.ownership_lease() {
+            Ok(owner) => owner,
+            Err(error) => return stream::once(async move { Err(error) }).boxed(),
+        };
         stream::once(async move {
             let runtime = match tokio::runtime::Handle::try_current() {
                 Ok(runtime) => runtime,
@@ -356,7 +384,10 @@ impl ObjectStore for DurableLocalObjectStore {
         let prefix = prefix.cloned();
         let root = Arc::clone(&self.root);
         let domain = Arc::clone(&self.domain);
-        let ownership_lock = self.ownership_lock.clone();
+        let ownership_lock = match self.ownership_lease() {
+            Ok(owner) => owner,
+            Err(error) => return stream::once(async move { Err(error) }).boxed(),
+        };
         // Local publication, replacement, and deletion change the visible namespace atomically;
         // object-store LIST does not promise a point-in-time snapshot. Do not hold the mutation
         // order while streaming results: delete_stream is allowed to consume a LIST from this
@@ -381,6 +412,7 @@ impl ObjectStore for DurableLocalObjectStore {
         // Like streaming LIST, delimiter inventory observes an atomic but not point-in-time
         // namespace. A large directory walk must not retain the mutation order needed by live
         // checkpoint publication.
+        let _ownership_lock = self.ownership_lease()?;
         self.inner.list_with_delimiter(prefix).await
     }
 

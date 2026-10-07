@@ -18,11 +18,16 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 const ALREADY_EXISTS_MARKER: &[u8] = b"ALREADY_EXISTS";
 
 /// Builds a shared `reqwest::Client` with a 30-second timeout.
-fn http_client() -> reqwest::Client {
+fn http_client() -> Result<reqwest::Client, ConnectorError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("failed to build reqwest client")
+        .map_err(|_| {
+            ConnectorError::ConnectionFailed(
+                "Unity Catalog HTTP client initialization failed".into(),
+            )
+        })
 }
 
 fn request_error(error: &reqwest::Error) -> ConnectorError {
@@ -176,7 +181,7 @@ pub(crate) async fn create_uc_table(
         "creating external Delta table in Unity Catalog"
     );
 
-    let client = http_client();
+    let client = http_client()?;
     let resp = client
         .post(&url)
         .bearer_auth(access_token)
@@ -241,13 +246,23 @@ pub(crate) async fn get_table_storage_location(
     access_token: &str,
     full_table_name: &str,
 ) -> Result<String, ConnectorError> {
+    find_table_storage_location(workspace_url, access_token, full_table_name).await?
+        .ok_or_else(|| ConnectorError::ConfigurationError(
+            "Unity Catalog table is absent; create it separately or explicitly authorize target preparation".into()))
+}
+
+pub(crate) async fn find_table_storage_location(
+    workspace_url: &str,
+    access_token: &str,
+    full_table_name: &str,
+) -> Result<Option<String>, ConnectorError> {
     let url = format!(
         "{}/api/2.1/unity-catalog/tables/{}",
         workspace_url.trim_end_matches('/'),
         full_table_name,
     );
 
-    let client = http_client();
+    let client = http_client()?;
     let resp = client
         .get(&url)
         .bearer_auth(access_token)
@@ -263,14 +278,29 @@ pub(crate) async fn get_table_storage_location(
         )));
     }
 
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !status.is_success() {
         return Err(ConnectorError::ConnectionFailed(format!(
             "Unity Catalog get table failed (HTTP {status})"
         )));
     }
 
-    let body: serde_json::Value = resp.json().await.map_err(|e| {
-        ConnectorError::ConnectionFailed(format!("failed to parse UC response: {e}"))
+    let mut response = resp;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        ConnectorError::ConnectionFailed("Unity Catalog metadata response failed".into())
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err(ConnectorError::SchemaMismatch(
+                "Unity Catalog metadata exceeds 1 MiB".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        ConnectorError::SchemaMismatch("Unity Catalog metadata is malformed".into())
     })?;
 
     let location = body["storage_location"]
@@ -288,7 +318,7 @@ pub(crate) async fn get_table_storage_location(
         "resolved storage location from Unity Catalog"
     );
 
-    Ok(location)
+    Ok(Some(location))
 }
 
 #[cfg(test)]

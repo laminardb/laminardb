@@ -79,17 +79,17 @@ impl LaminarDB {
                     Arc::clone(in_flight)
                 } else {
                     match DbState::load(&self.state) {
-                        DbState::Stopped => {
-                            drop(owned);
+                        DbState::Stopped if self.checkpoint_namespace_lock.lock().is_none() => {
                             return Ok(());
                         }
+                        // Offline DDL may acquire ownership after a restartable stop.
+                        DbState::Stopped | DbState::ShuttingDown => break false,
                         DbState::Starting => {
                             return Err(DbError::Pipeline(
                                 "shutdown found Starting without an incomplete owned startup attempt"
                                     .into(),
                             ));
                         }
-                        DbState::ShuttingDown => break false,
                         observed @ (DbState::Created | DbState::Running | DbState::Faulted) => {
                             if DbState::compare_exchange(
                                 observed,

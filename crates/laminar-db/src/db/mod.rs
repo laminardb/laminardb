@@ -4,6 +4,9 @@
 #[cfg(feature = "cluster")]
 mod assignment_authority;
 #[cfg(feature = "cluster")]
+mod catalog_bootstrap;
+mod checkpoint_namespace;
+#[cfg(feature = "cluster")]
 mod cluster_subscription;
 #[cfg(test)]
 mod datafusion_memory_tests;
@@ -330,7 +333,8 @@ pub struct LaminarDB {
     /// OS-released exclusive lock for a local checkpoint namespace. Deployment
     /// identity prevents reuse after reset; this lock prevents two live processes from writing
     /// divergent cuts into the same deployment.
-    pub(crate) checkpoint_namespace_lock: parking_lot::Mutex<Option<std::fs::File>>,
+    pub(crate) schema_creation_lock: tokio::sync::Mutex<()>,
+    pub(crate) checkpoint_namespace_lock: parking_lot::Mutex<Option<Arc<std::fs::File>>>,
     /// Every sink actor in the active generation, retained from spawn until terminal observation.
     /// A replacement cannot start while any prior actor can still mutate an external system.
     pub(crate) owned_sink_handles: Arc<parking_lot::Mutex<Vec<crate::sink_task::SinkTaskHandle>>>,
@@ -637,8 +641,7 @@ fn reads_catalog(statement: &StreamingStatement) -> bool {
         )
 }
 
-#[cfg(feature = "cluster")]
-fn catalog_create_identity(
+pub(crate) fn catalog_create_identity(
     statement: &StreamingStatement,
 ) -> Result<Option<(String, CatalogObjectKind, &'static str)>, DbError> {
     let identity = match statement {
@@ -725,12 +728,6 @@ fn validate_cluster_catalog_create(
             "cluster catalog DDL cannot persist secret property '{key}'; use $${{ENV_VAR}} in server TOML or ${{ENV_VAR}} through the SQL API (without a default), or omit it for a connector environment fallback"
         )));
     }
-    if connector_source_requires_schema_discovery(statement) {
-        return Err(DbError::InvalidOperation(
-            "cluster connector sources require an explicit column schema; runtime schema discovery is not a durable catalog identity"
-                .into(),
-        ));
-    }
     let identity = catalog_create_identity(statement)?.ok_or_else(|| {
         DbError::InvalidOperation(
             "cluster catalog bootstrap accepts only reversible typed CREATE statements".into(),
@@ -748,8 +745,7 @@ fn validate_cluster_catalog_create(
     Ok(identity)
 }
 
-#[cfg(feature = "cluster")]
-fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
+pub(crate) fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
     if value.contains("://") {
         return laminar_connectors::security::value_contains_uri_secret(value, allow_reference);
     }
@@ -768,8 +764,7 @@ fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
     }
 }
 
-#[cfg(feature = "cluster")]
-fn catalog_property_contains_unsupported_secret(
+pub(crate) fn catalog_property_contains_unsupported_secret(
     key: &str,
     value: &str,
     allow_reference: bool,
@@ -794,8 +789,7 @@ fn catalog_property_contains_unsupported_secret(
         && uri_contains_unsupported_secret(value, allow_reference)
 }
 
-#[cfg(feature = "cluster")]
-fn catalog_ddl_contains_comment(sql: &str) -> Result<bool, DbError> {
+pub(crate) fn catalog_ddl_contains_comment(sql: &str) -> Result<bool, DbError> {
     use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
     let tokens = Tokenizer::new(&sqlparser::dialect::GenericDialect {}, sql)
@@ -813,8 +807,7 @@ fn catalog_ddl_contains_comment(sql: &str) -> Result<bool, DbError> {
     }))
 }
 
-#[cfg(feature = "cluster")]
-fn sensitive_catalog_property(statement: &StreamingStatement) -> Option<String> {
+pub(crate) fn sensitive_catalog_property(statement: &StreamingStatement) -> Option<String> {
     fn find<'a>(
         options: impl IntoIterator<Item = (&'a String, &'a String)>,
         allow_reference: bool,
@@ -1383,7 +1376,6 @@ impl LaminarDB {
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry)?;
-        let physical_rules = extra_optimizer_rules.to_vec();
 
         Ok(Self {
             runtime_mode,
@@ -1432,6 +1424,7 @@ impl LaminarDB {
             #[cfg(all(test, feature = "cluster"))]
             compute_before_ready_panic: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: tokio::sync::Mutex::new(None),
+            schema_creation_lock: tokio::sync::Mutex::new(()),
             checkpoint_namespace_lock: parking_lot::Mutex::new(None),
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
             owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1492,7 +1485,7 @@ impl LaminarDB {
                     ))
                 },
             )),
-            physical_optimizer_rules: physical_rules.into(),
+            physical_optimizer_rules: extra_optimizer_rules.to_vec().into(),
             pipeline_target_partitions: target_partitions,
             #[cfg(feature = "cluster")]
             shuffle_sender: parking_lot::Mutex::new(None),
@@ -2276,12 +2269,14 @@ impl LaminarDB {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
             return Ok(None);
         };
-        let Some((manifest, topology)) = store.load_with_topology().await.map_err(|error| {
-            DbError::Pipeline(format!(
-                "[{}] catalog manifest load failed: {error}",
-                laminar_core::error_codes::RECOVERY_FAILED
-            ))
-        })?
+        let Some((manifest, topology)) = futures::FutureExt::boxed(store.load_with_topology())
+            .await
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "[{}] catalog manifest load failed: {error}",
+                    laminar_core::error_codes::RECOVERY_FAILED
+                ))
+            })?
         else {
             return Ok(None);
         };
@@ -2317,7 +2312,13 @@ impl LaminarDB {
                 continue;
             }
             CATALOG_MANIFEST_REPLAY
-                .scope((), self.execute_single_already_gated(&entry.ddl))
+                .scope(
+                    (),
+                    crate::ddl::schema_resolution::RESOLVED_SCHEMA.scope(
+                        entry.schema_binding.clone(),
+                        self.execute_single_already_gated(&entry.ddl),
+                    ),
+                )
                 .await
                 .map_err(|error| {
                     DbError::Pipeline(format!(
@@ -3999,7 +4000,7 @@ impl LaminarDB {
             .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
 
         if matches!(&info.properties.connector, LookupConnector::External(_)) {
-            self.register_lookup_connector(&info, &pk);
+            self.register_lookup_connector(&info, &pk)?;
         }
 
         {
@@ -4049,7 +4050,7 @@ impl LaminarDB {
         }))
     }
 
-    fn preflight_lookup_connector(
+    pub(crate) fn preflight_lookup_connector(
         &self,
         properties: &laminar_sql::parser::lookup_table::LookupTableProperties,
     ) -> Result<(), DbError> {
@@ -4094,71 +4095,6 @@ impl LaminarDB {
             )));
         }
         Ok(())
-    }
-
-    fn register_lookup_connector(&self, info: &laminar_sql::planner::LookupTableInfo, pk: &str) {
-        use laminar_sql::parser::lookup_table::LookupConnector;
-
-        let connector_type = match &info.properties.connector {
-            LookupConnector::External(name) => name.clone(),
-            LookupConnector::Static => unreachable!(),
-        };
-
-        self.table_store
-            .write()
-            .set_connector(&info.name, &connector_type);
-
-        // Keys consumed by LookupTableProperties are excluded; "format.*" keys
-        // go to format_options with the prefix stripped.
-        let consumed = [
-            "connector",
-            "strategy",
-            "cache.memory",
-            "cache.ttl",
-            "pushdown",
-            "format",
-        ];
-        let mut connector_options = HashMap::with_capacity(info.raw_options.len());
-        let mut format_options = HashMap::with_capacity(4);
-        for (k, v) in &info.raw_options {
-            let lower = k.to_lowercase();
-            if consumed.contains(&lower.as_str()) {
-                continue;
-            }
-            if let Some(suffix) = lower.strip_prefix("format.") {
-                format_options.insert(suffix.to_string(), v.clone());
-            } else {
-                connector_options.insert(k.clone(), v.clone());
-            }
-        }
-
-        // Carry as bytes; the partial lookup cache is byte-weighted, not entry-counted.
-        let cache_max_bytes = info
-            .properties
-            .cache_memory
-            .map(|m| usize::try_from(m.as_bytes()).unwrap_or(usize::MAX));
-
-        let cache_ttl = info
-            .properties
-            .cache_ttl
-            .map(std::time::Duration::from_secs);
-
-        self.connector_manager
-            .lock()
-            .register_table(crate::connector_manager::TableRegistration {
-                name: info.name.clone(),
-                primary_key: pk.to_string(),
-                connector_type: Some(connector_type),
-                connector_options,
-                format: info.raw_options.get("format").cloned(),
-                format_options,
-                on_demand: matches!(
-                    info.properties.strategy,
-                    laminar_sql::parser::lookup_table::LookupStrategy::OnDemand
-                ),
-                cache_max_bytes,
-                cache_ttl,
-            });
     }
 
     /// Rebuild the lookup optimizer rules for the current set of registered tables.
@@ -4268,142 +4204,6 @@ impl LaminarDB {
         last_result.ok_or_else(|| DbError::InvalidOperation("Empty SQL statement".into()))
     }
 
-    /// Apply and durably seal the complete startup catalog as one immutable batch.
-    /// Existing sealed catalogs accept exact replay/no-op definitions only.
-    ///
-    /// # Errors
-    /// Returns an error for a partial or divergent bootstrap, unsafe catalog mutation, lost leader
-    /// authority, or manifest sealing failure. Local creates are rolled back on every error.
-    #[cfg(feature = "cluster")]
-    pub async fn execute_cluster_bootstrap_batch(
-        &self,
-        sql: &[String],
-    ) -> Result<Vec<ExecuteResult>, DbError> {
-        self.ensure_catalog_cleanup_unfenced("cluster catalog bootstrap")?;
-        self.connector_registry.freeze();
-        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(DbError::Shutdown);
-        }
-        if DbState::load(&self.state) != DbState::Created {
-            return Err(DbError::InvalidOperation(
-                "cluster catalog bootstrap is only valid before pipeline startup".into(),
-            ));
-        }
-
-        let mut parsed = Vec::new();
-        for batch_entry in sql {
-            for stmt_sql in sql_utils::split_statements(batch_entry) {
-                let mut statements = parse_streaming_sql(stmt_sql)?;
-                if statements.len() != 1 {
-                    return Err(DbError::InvalidOperation(
-                        "cluster bootstrap entries must contain exactly one SQL statement".into(),
-                    ));
-                }
-                let statement = statements.pop().ok_or_else(|| {
-                    DbError::InvalidOperation(
-                        "cluster bootstrap entries must contain exactly one SQL statement".into(),
-                    )
-                })?;
-                let (name, kind, _) = validate_cluster_catalog_create(self, stmt_sql, &statement)?;
-                parsed.push((stmt_sql.to_owned(), statement, name, kind));
-            }
-        }
-        {
-            let mut names = std::collections::HashSet::with_capacity(parsed.len());
-            for (_, _, name, _) in &parsed {
-                if !names.insert(name.as_str()) {
-                    return Err(DbError::InvalidOperation(format!(
-                        "cluster bootstrap defines '{name}' more than once"
-                    )));
-                }
-            }
-        }
-
-        let _topology_ddl = self.topology_ddl_lock.write().await;
-        self.ensure_catalog_cleanup_unfenced("cluster catalog bootstrap")?;
-        self.ensure_coordinated_recovery_mutation_unfenced("cluster catalog bootstrap")?;
-        if DbState::load(&self.state) != DbState::Created {
-            return Err(DbError::InvalidOperation(
-                "cluster catalog bootstrap is only valid before pipeline startup".into(),
-            ));
-        }
-
-        if let Some(manifest) = self.restore_catalog_from_manifest().await? {
-            return self
-                .validate_sealed_topology_bootstrap(&manifest, &parsed)
-                .await;
-        }
-
-        if !self.catalog_manifest_inventory()?.is_empty() {
-            return Err(DbError::Pipeline(
-                "cannot seal a new cluster catalog over uncommitted local topology".into(),
-            ));
-        }
-        let store = self.catalog_manifest_store.lock().clone().ok_or_else(|| {
-            DbError::Pipeline("cluster catalog manifest store is not configured".into())
-        })?;
-        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-            DbError::Pipeline(
-                "[LDB-6043] cluster catalog bootstrap requires a cluster controller".into(),
-            )
-        })?;
-        let leader_proof = controller
-            .capture_catalog_bootstrap_proof()
-            .ok_or_else(|| {
-                DbError::Pipeline(
-                    "[LDB-6043] cluster catalog bootstrap requires the active durable leader lease"
-                        .into(),
-                )
-            })?;
-        self.validate_catalog_seal_authority(Some(&leader_proof))?;
-
-        let mut bootstrap_guard = CatalogBootstrapGuard {
-            db: self,
-            created: Vec::with_capacity(parsed.len()),
-            sealed: false,
-        };
-        let mut results = Vec::with_capacity(parsed.len());
-        for (stmt_sql, statement, name, kind) in &parsed {
-            let result = CATALOG_BOOTSTRAP
-                .scope((), self.execute_parsed_single(stmt_sql, statement))
-                .await?;
-            let ExecuteResult::Ddl(info) = &result else {
-                return Err(DbError::Pipeline(format!(
-                    "cluster catalog create '{name}' returned a non-DDL result"
-                )));
-            };
-            if !info.applied || info.object_name != *name {
-                return Err(DbError::Pipeline(format!(
-                    "cluster catalog create '{name}' did not apply exactly once"
-                )));
-            }
-            bootstrap_guard.record(name.clone(), *kind);
-            results.push(result);
-        }
-
-        let manifest = laminar_core::cluster::control::CatalogManifest::new(
-            self.catalog_manifest_inventory()?,
-        )
-        .map_err(|error| {
-            DbError::Pipeline(format!("invalid cluster catalog inventory: {error}"))
-        })?;
-
-        #[cfg(test)]
-        let catalog_seal_gate = { self.catalog_seal_gate.lock().clone() };
-        #[cfg(test)]
-        if let Some((entered, release)) = catalog_seal_gate {
-            entered.notify_one();
-            release.notified().await;
-        }
-        self.validate_catalog_seal_authority(Some(&leader_proof))?;
-        store
-            .seal(&manifest, &leader_proof)
-            .await
-            .map_err(|error| DbError::Pipeline(format!("catalog manifest seal failed: {error}")))?;
-        bootstrap_guard.sealed();
-        Ok(results)
-    }
-
     /// Apply one startup catalog definition and seal it as the complete inventory.
     /// Prefer [`Self::execute_cluster_bootstrap_batch`] for server configuration.
     ///
@@ -4439,11 +4239,7 @@ impl LaminarDB {
                 // direct-mutation write lock or invoke the startup bootstrap exception here.
                 return Box::pin(self.submit_cluster_topology_sql(sql, statement)).await;
             }
-            let _topology_ddl = self.topology_ddl_lock.write().await;
-            self.ensure_catalog_cleanup_unfenced("database mutation")?;
-            #[cfg(feature = "cluster")]
-            self.ensure_coordinated_recovery_mutation_unfenced("database mutation")?;
-            self.execute_parsed_single(sql, statement).await
+            futures::FutureExt::boxed(self.execute_schema_ddl(sql, statement)).await
         } else if reads_catalog(statement) {
             let _topology_read = self.topology_ddl_lock.read().await;
             if mutates_database(statement) {
@@ -4474,30 +4270,13 @@ impl LaminarDB {
         self.execute_parsed_single(sql, &statements[0]).await
     }
 
-    async fn execute_parsed_single(
+    pub(crate) async fn execute_parsed_single(
         &self,
         sql: &str,
         statement: &StreamingStatement,
     ) -> Result<ExecuteResult, DbError> {
         #[cfg(feature = "cluster")]
-        if is_topology_ddl(statement) && !catalog_manifest_replay_active() {
-            let store_configured = self.catalog_manifest_store.lock().is_some();
-            let cluster_runtime = self.is_cluster_runtime();
-            if store_configured || cluster_runtime {
-                validate_cluster_catalog_create(self, sql, statement)?;
-                if !store_configured {
-                    return Err(DbError::Pipeline(
-                        "cluster topology DDL requires a catalog manifest store".into(),
-                    ));
-                }
-                if !catalog_bootstrap_active() {
-                    return Err(DbError::Pipeline(
-                        "[LDB-6043] configured cluster topology can change only through startup bootstrap/replay until a replicated topology-version barrier is implemented"
-                            .into(),
-                    ));
-                }
-            }
-        }
+        self.preflight_cluster_catalog_mutation(sql, statement)?;
 
         let result = match statement {
             StreamingStatement::CreateSource(create) => {
@@ -4512,7 +4291,7 @@ impl LaminarDB {
                 Ok(result)
             }
             StreamingStatement::CreateSink(create) => {
-                let result = self.handle_create_sink(create)?;
+                let result = futures::FutureExt::boxed(self.handle_create_sink(create)).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
                     if info.applied {
                         self.connector_manager
@@ -4593,7 +4372,7 @@ impl LaminarDB {
             }
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
-                    let result = self.handle_create_table(ct)?;
+                    let result = Box::pin(self.handle_create_table(ct)).await?;
                     if let ExecuteResult::Ddl(ref info) = result {
                         if info.applied {
                             self.connector_manager
@@ -5184,9 +4963,16 @@ impl LaminarDB {
                 _ => {}
             }
             let mut planner = self.planner.lock();
-            planner
-                .plan(&statements[0])
-                .map_err(laminar_sql::Error::from)?
+            let plan = match (
+                &statements[0],
+                crate::ddl::schema_resolution::supplied_binding(),
+            ) {
+                (StreamingStatement::CreateLookupTable(create), Some(binding)) => {
+                    planner.plan_lookup_table_with_schema(create, Arc::new(binding.logical))
+                }
+                _ => planner.plan(&statements[0]),
+            };
+            plan.map_err(laminar_sql::Error::from)?
         };
 
         match plan {
@@ -5522,18 +5308,35 @@ impl LaminarDB {
         let object_store: Arc<dyn object_store::ObjectStore> = if let Some(ref url) =
             self.config.object_store_url
         {
-            laminar_core::checkpoint::object_store_builder::build_object_store(
-                url,
-                &self.config.object_store_options,
-            )
-            .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
+            let owner = self.checkpoint_namespace_lock.lock().clone();
+            match owner {
+                Some(owner)
+                    if laminar_connectors::storage::StorageProvider::detect_uri(url)
+                        == Some(laminar_connectors::storage::StorageProvider::Local) =>
+                {
+                    let root = laminar_core::checkpoint::object_store_builder::file_url_path(url)
+                        .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+                    laminar_core::checkpoint::object_store_builder::owned_durable_local_object_store(root, &owner)
+                        .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
+                }
+                _ => laminar_core::checkpoint::object_store_builder::build_object_store(
+                    url,
+                    &self.config.object_store_options,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("checkpoint object store: {error}"))
+                })?,
+            }
         } else {
             let data_dir = cp_config
                 .data_dir
                 .clone()
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-            laminar_core::checkpoint::object_store_builder::durable_local_object_store(data_dir)
+            match self.checkpoint_namespace_lock.lock().clone() {
+                Some(owner) => laminar_core::checkpoint::object_store_builder::owned_durable_local_object_store(data_dir, &owner),
+                None => laminar_core::checkpoint::object_store_builder::durable_local_object_store(data_dir),
+            }
                 .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?
         };
         Ok(Some(object_store))

@@ -77,6 +77,15 @@ impl LaminarDB {
         &self,
     ) -> Result<Vec<laminar_core::cluster::control::CatalogManifestEntry>, DbError> {
         let ordered = self.connector_manager.lock().ordered_ddl();
+        let bindings = ordered
+            .iter()
+            .map(|(name, _, _)| {
+                (
+                    name.clone(),
+                    self.connector_manager.lock().schema_binding(name).cloned(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         let namespace = self.catalog_namespace.lock();
         if ordered.len() != namespace.len() {
             return Err(DbError::Pipeline(format!(
@@ -94,6 +103,7 @@ impl LaminarDB {
                     ))
                 })?;
                 Ok(laminar_core::cluster::control::CatalogManifestEntry {
+                    schema_binding: bindings.get(&canonical_name).cloned().flatten(),
                     canonical_name,
                     kind,
                     catalog_generation,
@@ -510,7 +520,7 @@ impl LaminarDB {
         Ok(())
     }
 
-    fn terminal_catalog_cleanup_error(
+    pub(crate) fn terminal_catalog_cleanup_error(
         &self,
         context: &str,
         name: &str,

@@ -2276,6 +2276,7 @@ async fn test_auto_flush_writes_data() {
     // Configure a small buffer to trigger auto-flush.
     let mut sink_config = DeltaLakeSinkConfig::new(table_path);
     sink_config.max_buffer_records = 10;
+    sink_config.auto_create = true;
     let mut sink = DeltaLakeSink::with_schema(sink_config, test_schema());
 
     let connector_config = ConnectorConfig::new("delta-lake");

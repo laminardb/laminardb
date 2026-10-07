@@ -188,6 +188,8 @@ async fn supervised_restart_retries_transient_start_failures_within_budget() {
             registry.register_source(
                 "transient-start",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "transient-start".into(),
                     display_name: "Transient start test source".into(),
                     version: "1".into(),

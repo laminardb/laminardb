@@ -3703,6 +3703,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     assert!(uninitialized["locally_active_version"].is_null());
 
     let manifest = CatalogManifest::new(vec![CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "existing".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 7,
@@ -3757,6 +3758,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     snapshot_store.save_if_absent(&seed).await.unwrap();
     let mut target = manifest.clone();
     target.entries.push(CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "candidate".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 1,

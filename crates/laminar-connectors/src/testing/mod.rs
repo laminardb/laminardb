@@ -309,6 +309,7 @@ pub fn register_mock_source(registry: &ConnectorRegistry) -> Result<(), Connecto
     registry.register_source(
         "mock",
         ConnectorInfo {
+            schema_capabilities: crate::schema::resolution::SchemaCapabilities::declared(false),
             name: "mock".to_string(),
             display_name: "Mock Source".to_string(),
             version: "0.1.0".to_string(),
@@ -328,6 +329,7 @@ pub fn register_mock_sink(registry: &ConnectorRegistry) -> Result<(), ConnectorE
     registry.register_sink(
         "mock",
         ConnectorInfo {
+            schema_capabilities: crate::schema::resolution::SchemaCapabilities::declared(true),
             name: "mock".to_string(),
             display_name: "Mock Sink".to_string(),
             version: "0.1.0".to_string(),

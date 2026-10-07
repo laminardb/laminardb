@@ -9,6 +9,8 @@
 //! v1 limits: single-column key; declared column types Int32/Int64/Float64/
 //! Boolean/Utf8/LargeUtf8.
 
+pub(super) mod schema_resolution;
+
 #[cfg(feature = "mongodb-cdc")]
 use std::sync::Arc;
 #[cfg(feature = "mongodb-cdc")]

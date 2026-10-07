@@ -44,7 +44,9 @@ struct DeltaWriteMetadataFingerprint<'a> {
 }
 
 #[cfg(feature = "delta-lake")]
-fn sorted_protocol_features<T: ToString>(features: Option<&[T]>) -> Vec<String> {
+pub(in crate::lakehouse) fn sorted_protocol_features<T: ToString>(
+    features: Option<&[T]>,
+) -> Vec<String> {
     let mut features: Vec<String> = features
         .unwrap_or_default()
         .iter()

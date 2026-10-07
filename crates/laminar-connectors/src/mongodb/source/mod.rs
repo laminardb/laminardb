@@ -45,6 +45,7 @@ mod checkpoint;
 mod decoding;
 mod lifecycle;
 mod reader;
+mod schema_resolution;
 
 use admission::observe_mongodb_admission;
 #[cfg(test)]

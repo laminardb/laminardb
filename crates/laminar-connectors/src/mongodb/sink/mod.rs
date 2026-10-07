@@ -55,6 +55,7 @@ mod cdc;
 mod conversion;
 mod failure;
 mod lifecycle;
+mod schema_resolution;
 mod validation;
 
 #[cfg(test)]
@@ -87,6 +88,7 @@ use validation::{
 pub struct MongoDbSink {
     config: MongoDbSinkConfig,
     schema: SchemaRef,
+    binding: Option<crate::schema::resolution::SchemaBinding>,
     state: ConnectorState,
     buffer: Vec<RecordBatch>,
     buffered_rows: usize,
@@ -114,6 +116,7 @@ impl MongoDbSink {
         Self {
             config,
             schema,
+            binding: None,
             state: ConnectorState::Created,
             buffer: Vec::with_capacity(4),
             buffered_rows: 0,
@@ -443,6 +446,30 @@ impl MongoDbSink {
             return Ok(WriteResult::new(0, 0));
         }
 
+        if let Some(expected) = &self.binding {
+            let client = self.client.as_ref().ok_or_else(|| {
+                ConnectorError::ConnectionFailed("MongoDB activated client is absent".into())
+            })?;
+            let current = tokio::time::timeout(
+                self.write_timeout,
+                schema_resolution::inspect(
+                    &client.database(&self.config.database),
+                    &ConnectorConfig::new("mongodb"),
+                    &self.config,
+                    self.schema.clone(),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ConnectorError::Timeout(
+                    u64::try_from(self.write_timeout.as_millis()).unwrap_or(u64::MAX),
+                )
+            })??;
+            if expected.value.is_some() && expected.value != current.value {
+                return Err(ConnectorError::SchemaMismatch("MongoDB collection identity or validator drifted before flush; restart with a migrated contract".into()));
+            }
+            self.binding = Some(current);
+        }
         // Drain before any await. A timeout makes the bulk-write outcome unknown, retires this
         // connector generation, and replays from the last durable engine checkpoint.
         let (mut pending, retained_bytes) = self.take_buffer();

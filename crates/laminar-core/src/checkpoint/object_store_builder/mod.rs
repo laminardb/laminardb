@@ -205,6 +205,22 @@ pub fn durable_local_object_store(
     ))
 }
 
+/// Retain an existing exclusive namespace lease in every local publication worker.
+/// Idle stores do not prolong the lease; the caller retains it until shutdown.
+/// Operations admitted before release retain it through their blocking I/O.
+///
+/// # Errors
+/// Returns an error when the durable root cannot be opened. The caller must hold
+/// the exclusive OS lease for this exact root before calling this constructor.
+pub fn owned_durable_local_object_store(
+    root: impl AsRef<std::path::Path>,
+    owner: &Arc<std::fs::File>,
+) -> object_store::Result<Arc<dyn ObjectStore>> {
+    Ok(Arc::new(
+        crate::durable_local_store::DurableLocalObjectStore::new(root)?.with_namespace_owner(owner),
+    ))
+}
+
 fn provider_environment_key(provider: StorageProvider, key: &str) -> bool {
     match provider {
         StorageProvider::AwsS3 => key.starts_with("AWS_"),

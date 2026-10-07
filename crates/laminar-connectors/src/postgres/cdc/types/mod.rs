@@ -81,7 +81,7 @@ pub const TEXT_ARRAY_OID: u32 = 1009;
 pub const VARCHAR_ARRAY_OID: u32 = 1015;
 
 /// A column descriptor from a `PostgreSQL` relation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PgColumn {
     /// Column name.
     pub name: String,

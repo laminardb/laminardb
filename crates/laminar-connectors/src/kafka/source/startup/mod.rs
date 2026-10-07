@@ -5,15 +5,15 @@ use super::{
     decode_partition_baselines, deterministic_initial_offset, fetch_explicit_topic_metadata,
     fetch_partition_low_watermarks, fetch_partition_watermarks, info,
     kafka_bootstrap_is_unassigned, kafka_input_channels, kafka_partition_routes,
-    kafka_partition_set, lock_or_recover, log_schema_drift, resolve_timestamp_offsets,
-    resolve_value_subject, select_deserializer, startup_default_offset, validate_kafka_assignment,
-    validate_kafka_output_schema, validate_kafka_partition_results, validate_partition_baselines,
-    validate_positions_not_expired, validate_resume_input_channels, warn, Arc, AvroDeserializer,
-    ClientConfig, ConnectorError, ConnectorState, Consumer, DeliveryGuarantee, Format,
-    KafkaAssignmentPublication, KafkaPartitionBaselines, KafkaPartitionRoutes, KafkaPartitionSet,
-    KafkaRotationBaselines, KafkaSource, KafkaSourceConfig, KafkaStartPlan, LaminarConsumerContext,
-    OffsetTracker, Ordering, SourcePosition, SourceStart, StartupMode, StreamConsumer,
-    TopicPartitionList, TopicSubscription,
+    kafka_partition_set, lock_or_recover, resolve_timestamp_offsets, select_deserializer,
+    startup_default_offset, validate_kafka_assignment, validate_kafka_output_schema,
+    validate_kafka_partition_results, validate_partition_baselines, validate_positions_not_expired,
+    validate_resume_input_channels, Arc, AvroDeserializer, ClientConfig, ConnectorError,
+    ConnectorState, Consumer, DeliveryGuarantee, Format, KafkaAssignmentPublication,
+    KafkaPartitionBaselines, KafkaPartitionRoutes, KafkaPartitionSet, KafkaRotationBaselines,
+    KafkaSource, KafkaSourceConfig, KafkaStartPlan, LaminarConsumerContext, OffsetTracker,
+    Ordering, SourcePosition, SourceStart, StartupMode, StreamConsumer, TopicPartitionList,
+    TopicSubscription,
 };
 
 mod modes;
@@ -23,68 +23,44 @@ mod vnode;
 use validation::VnodeStartInventory;
 
 impl KafkaSource {
-    pub(super) async fn prefetch_schema_registry(
+    pub(super) async fn start_with_contract(
         &mut self,
-        config: &KafkaSourceConfig,
+        request: SourceStart,
     ) -> Result<(), ConnectorError> {
-        // Eagerly fetch the SR schema so the Arrow schema is available at
-        // plan time (before the first poll_batch).
-        if let Some(ref sr) = self.schema_registry {
-            if let TopicSubscription::Topics(topics) = &config.subscription {
-                if topics.len() > 1 {
-                    warn!("multiple topics with schema registry — using first topic's schema");
-                }
-                if let Some(topic) = topics.first() {
-                    let subject = resolve_value_subject(
-                        config.schema_registry_subject_strategy,
-                        config.schema_registry_record_name.as_deref(),
-                        topic,
-                    );
-                    match tokio::time::timeout(
-                        config.schema_registry_discovery_timeout,
-                        sr.get_latest_schema(&subject),
-                    )
-                    .await
-                    {
-                        Ok(Ok(cached)) => {
-                            if let Some(avro_deser) = self
-                                .deserializer
-                                .as_any_mut()
-                                .and_then(|any| any.downcast_mut::<AvroDeserializer>())
-                            {
-                                if let Err(error) =
-                                    avro_deser.register_schema(cached.id, &cached.schema_str)
-                                {
-                                    let error = ConnectorError::Serde(error);
-                                    return Err(error);
-                                }
-                                // Keep the catalog schema pinned — planner
-                                // plans are already built against it.
-                                log_schema_drift(&self.schema, &cached.arrow_schema, &subject);
-                                info!(%subject, schema_id = cached.id,
-                                    "SR schema fetched at start()");
-                                self.last_avro_schema = Some(cached.arrow_schema);
-                            }
-                        }
-                        Ok(Err(e)) if e.is_transient() => {
-                            warn!(%subject, error = %e, "SR unavailable at start(), will resolve lazily");
-                        }
-                        Ok(Err(e)) => {
-                            return Err(e);
-                        }
-                        Err(_elapsed) => {
-                            warn!(%subject, "SR prefetch timed out at start(), will resolve lazily");
-                        }
-                    }
-                }
+        let (mut config, position, delivery) = request.into_parts();
+        let metadata = crate::kafka::schema_configuration::source(&config, &self.config);
+        if config.schema_binding().is_none() {
+            if metadata
+                .get("format")
+                .is_some_and(|format| format.eq_ignore_ascii_case("avro"))
+                && !matches!(position, SourcePosition::Initial)
+            {
+                return Err(ConnectorError::SchemaMismatch("Kafka recovery requires its committed native reader contract; migrate legacy catalog records without rediscovering latest".into()));
             }
+            let explicit = config
+                .arrow_schema()
+                .or_else(|| (!self.schema.fields().is_empty()).then(|| Arc::clone(&self.schema)));
+            let binding = match crate::kafka::schema_resolution::resolve_source_with_registry(
+                &metadata,
+                explicit,
+                self.schema_registry.as_deref(),
+            )
+            .await
+            {
+                Ok(binding) => binding,
+                Err(error) => {
+                    if self.config.format == Format::Avro {
+                        self.fail_startup();
+                    }
+                    return Err(error);
+                }
+            };
+            config.set_schema_binding(binding)?;
         }
-
-        Ok(())
+        self.start_inner(SourceStart::new(config, position, delivery)?)
+            .await
     }
-}
 
-impl KafkaSource {
     pub(super) async fn start_inner(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         if self.state != ConnectorState::Created {
             return Err(ConnectorError::InvalidState {
@@ -180,8 +156,6 @@ impl KafkaSource {
         // Reader startup stays deferred until the first poll. Group
         // assignments are paused by the callback and explicitly seeked from
         // the position installed above before any record can enter the channel.
-
-        self.prefetch_schema_registry(&kafka_config).await?;
 
         self.state = ConnectorState::Running;
         self.start_progress();

@@ -2,6 +2,7 @@
 //! sink catalog mutation. Connector/format options are resolved and validated
 //! before any catalog mutation.
 
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use arrow::datatypes::DataType;
 use laminar_connectors::connector::{SourceContract, SourceInputMode};
 use laminar_core::catalog::CatalogObjectKind;
 use laminar_sql::parser::StreamingStatement;
-use laminar_sql::translator::streaming_ddl::{self, ColumnDefinition};
+use laminar_sql::translator::streaming_ddl;
 
 use crate::connector_manager::normalize_connector_type;
 use crate::db::{canonical_object_name, exact_table_reference, LaminarDB};
@@ -32,16 +33,23 @@ pub(crate) struct ResolvedConnector {
     pub format_options: HashMap<String, String>,
 }
 
-/// Validate that a resolved format string is known.
-pub(crate) fn validate_format(format: Option<&String>) -> Result<(), DbError> {
-    if let Some(fmt_str) = format {
-        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
-            .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
-    }
-    Ok(())
-}
-
 impl LaminarDB {
+    pub(crate) fn resolve_connector_option_values<'a>(
+        &self,
+        values: impl Iterator<Item = &'a mut String>,
+    ) -> Result<(), DbError> {
+        let lookup = |name: &str| {
+            self.config_vars
+                .get(name)
+                .cloned()
+                .or_else(|| std::env::var(name).ok())
+        };
+        for value in values {
+            *value = crate::sql_utils::substitute_vars(value, lookup)?;
+        }
+        Ok(())
+    }
+
     /// Resolve `${VAR}` in connector + format options (config vars, then env) and
     /// verify the type is registered + format known — up front, before any
     /// catalog mutation. `None` when no connector is declared.
@@ -82,19 +90,12 @@ impl LaminarDB {
             resolved.format.as_deref(),
             &resolved.format_options,
         )?;
-        let lookup = |name: &str| {
-            self.config_vars
-                .get(name)
-                .cloned()
-                .or_else(|| std::env::var(name).ok())
-        };
-        for value in resolved
-            .connector_options
-            .values_mut()
-            .chain(resolved.format_options.values_mut())
-        {
-            *value = crate::sql_utils::substitute_vars(value, lookup)?;
-        }
+        self.resolve_connector_option_values(
+            resolved
+                .connector_options
+                .values_mut()
+                .chain(resolved.format_options.values_mut()),
+        )?;
         if let Some(ref ct) = resolved.connector_type {
             let normalized = normalize_connector_type(ct);
             let registered = match kind {
@@ -110,7 +111,7 @@ impl LaminarDB {
                     "Unknown {what} connector type '{ct}'. Available: {available:?}"
                 )));
             }
-            validate_format(resolved.format.as_ref())?;
+            crate::connector_manager::validate_format(&normalized, resolved.format.as_deref())?;
         }
         Ok(Some(resolved))
     }
@@ -126,7 +127,6 @@ impl LaminarDB {
                     .to_string(),
             ));
         }
-        let has_connector = create.connector_type.is_some();
 
         let source_name = canonical_object_name(&create.name)?;
         reject_reserved_namespace(&source_name)?;
@@ -153,8 +153,9 @@ impl LaminarDB {
             ConnectorKind::Source,
         )?;
 
-        let mut source_def = self
-            .build_source_definition(create, resolved.as_ref(), has_connector, &source_name)
+        let (mut source_def, schema_binding) = self
+            .resolve_source_definition(create, resolved.as_ref(), &source_name)
+            .boxed()
             .await?;
         source_def.name.clone_from(&source_name);
         let source_contract = self.validate_source_input_schema_contract(
@@ -214,6 +215,7 @@ impl LaminarDB {
             if let Some(ct) = resolved.connector_type {
                 let mut mgr = self.connector_manager.lock();
                 mgr.register_source(crate::connector_manager::SourceRegistration {
+                    schema_binding,
                     catalog_generation: 1,
                     name: name.clone(),
                     connector_type: Some(ct),
@@ -235,69 +237,7 @@ impl LaminarDB {
         }))
     }
 
-    /// Auto-discovers the schema from the connector when no columns are declared.
-    async fn build_source_definition(
-        &self,
-        create: &laminar_sql::parser::CreateSourceStatement,
-        resolved: Option<&ResolvedConnector>,
-        has_connector: bool,
-        source_name: &str,
-    ) -> Result<streaming_ddl::SourceDefinition, DbError> {
-        if !(create.columns.is_empty() && has_connector) {
-            return streaming_ddl::translate_create_source(create.clone())
-                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)));
-        }
-
-        let resolved = resolved.expect("has_connector ⇒ Some");
-        let connector_type = resolved.connector_type.as_deref().ok_or_else(|| {
-            DbError::Config(format!(
-                "source '{source_name}': no columns declared and no connector type resolved"
-            ))
-        })?;
-        let normalized = normalize_connector_type(connector_type);
-
-        let mut props = resolved.connector_options.clone();
-        if let Some(fmt) = resolved.format.clone() {
-            props.insert("format".into(), fmt);
-        }
-        props.extend(resolved.format_options.clone());
-
-        let discovered = match self
-            .connector_registry
-            .default_source_schema(&normalized, &props)
-            .await
-        {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                return Err(DbError::Config(format!(
-                    "source '{source_name}': no columns declared and connector \
-                     '{normalized}' could not auto-discover a schema (declare \
-                     columns explicitly or check that the format supports \
-                     schema discovery)"
-                )));
-            }
-            Err(e) => {
-                return Err(DbError::Config(format!(
-                    "source '{source_name}': schema auto-discovery failed: {e}"
-                )));
-            }
-        };
-
-        let columns: Vec<ColumnDefinition> = discovered
-            .fields()
-            .iter()
-            .map(|f| ColumnDefinition {
-                name: f.name().clone(),
-                data_type: f.data_type().clone(),
-                nullable: f.is_nullable(),
-            })
-            .collect();
-
-        streaming_ddl::translate_create_source_with_columns(create.clone(), columns)
-            .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))
-    }
-
-    fn validate_source_input_schema_contract(
+    pub(super) fn validate_source_input_schema_contract(
         &self,
         source_name: &str,
         resolved: Option<&ResolvedConnector>,
@@ -328,6 +268,7 @@ impl LaminarDB {
 
         let contract = if let Some(resolved) = resolved {
             let registration = crate::connector_manager::SourceRegistration {
+                schema_binding: None,
                 catalog_generation: 1,
                 name: source_name.to_string(),
                 connector_type: resolved.connector_type.clone(),
@@ -490,7 +431,7 @@ impl LaminarDB {
         Ok(entry)
     }
 
-    pub(crate) fn handle_create_sink(
+    pub(crate) async fn handle_create_sink(
         &self,
         create: &laminar_sql::parser::CreateSinkStatement,
     ) -> Result<ExecuteResult, DbError> {
@@ -547,8 +488,14 @@ impl LaminarDB {
             planner.plan(&stmt).map_err(laminar_sql::Error::from)?;
         }
 
+        let schema_binding = match &resolved {
+            Some(resolved) => Some(self.resolve_sink_binding(create, resolved).boxed().await?),
+            None => None,
+        };
+
         let candidate = if let Some(resolved) = resolved {
             crate::connector_manager::SinkRegistration {
+                schema_binding,
                 catalog_generation: 1,
                 name: name.clone(),
                 input: input.clone(),
@@ -561,6 +508,7 @@ impl LaminarDB {
             }
         } else {
             crate::connector_manager::SinkRegistration {
+                schema_binding,
                 catalog_generation: 1,
                 name: name.clone(),
                 input: input.clone(),
@@ -572,6 +520,27 @@ impl LaminarDB {
                 filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
             }
         };
+        self.validate_sink_dependencies(&candidate)?;
+
+        self.catalog.register_sink(&name, &input)?;
+
+        self.connector_manager.lock().register_sink(candidate);
+
+        reservation.commit();
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "CREATE SINK".to_string(),
+            object_name: name,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
+            applied: true,
+        }))
+    }
+
+    pub(super) fn validate_sink_dependencies(
+        &self,
+        candidate: &crate::connector_manager::SinkRegistration,
+    ) -> Result<(), DbError> {
         let (source_regs, mut sink_regs, stream_regs) = {
             let manager = self.connector_manager.lock();
             (
@@ -594,11 +563,11 @@ impl LaminarDB {
                 .is_some_and(|(contract, _)| contract.input_mode != SourceInputMode::AppendOnly)
             {
                 return Err(DbError::Config(format!(
-                    "sink '{name}' cannot directly consume mutation source '{input}'; mutable sources are exclusive to admitted stateful routes"
+                    "sink '{}' cannot directly consume mutation source '{input}'; mutable sources are exclusive to admitted stateful routes", candidate.name
                 )));
             }
         }
-        sink_regs.insert(name.clone(), candidate.clone());
+        sink_regs.insert(candidate.name.clone(), candidate.clone());
         self.validate_persisted_temporal_source_contracts(
             &source_regs,
             &sink_regs,
@@ -606,18 +575,6 @@ impl LaminarDB {
             self.runtime_mode(),
         )?;
 
-        self.catalog.register_sink(&name, &input)?;
-
-        self.connector_manager.lock().register_sink(candidate);
-
-        reservation.commit();
-
-        Ok(ExecuteResult::Ddl(DdlInfo {
-            statement_type: "CREATE SINK".to_string(),
-            object_name: name,
-            #[cfg(feature = "cluster")]
-            topology_operation: None,
-            applied: true,
-        }))
+        Ok(())
     }
 }

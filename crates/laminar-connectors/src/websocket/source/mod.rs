@@ -409,6 +409,31 @@ impl SourceConnector for WebSocketSource {
         Some(self.task_tracker.clone())
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let parsed = WebSocketSourceConfig::from_config(config)?;
+        let schema = explicit.ok_or_else(|| {
+            ConnectorError::FeatureUnsupported(
+                "WebSocket source has no authoritative message schema; declare columns".into(),
+            )
+        })?;
+        MessageParser::validate_format_schema(&schema, &parsed.format)?;
+        match parsed.format {
+            MessageFormat::Json => crate::schema::JsonDecoder::validate_schema(&schema)?,
+            MessageFormat::Csv { .. } => crate::schema::CsvDecoder::validate_schema(&schema)?,
+            MessageFormat::Binary => {}
+        }
+        crate::schema::resolution::logical_binding(
+            config,
+            crate::schema::resolution::SchemaDirection::Source,
+            crate::schema::resolution::SchemaOrigin::Explicit,
+            &schema,
+        )
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
         if matches!(&position, SourcePosition::Initialized { .. }) {
@@ -457,6 +482,13 @@ impl SourceConnector for WebSocketSource {
             ));
         }
         MessageParser::validate_format_schema(&effective_schema, &effective_config.format)?;
+        match effective_config.format {
+            MessageFormat::Json => crate::schema::JsonDecoder::validate_schema(&effective_schema)?,
+            MessageFormat::Csv { .. } => {
+                crate::schema::CsvDecoder::validate_schema(&effective_schema)?;
+            }
+            MessageFormat::Binary => {}
+        }
         let decoder_config = if matches!(&effective_config.format, MessageFormat::Json) {
             JsonDecoderConfig::from_connector_config(config, &effective_schema)?
         } else {

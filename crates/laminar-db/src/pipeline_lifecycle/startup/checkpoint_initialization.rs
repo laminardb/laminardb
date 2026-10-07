@@ -95,39 +95,8 @@ impl LaminarDB {
             let uses_local_checkpoint_store = injected_cluster_checkpoint_store.is_none()
                 && (self.config.object_store_url.is_none()
                     || explicit_file_checkpoint_root.is_some());
-            if startup_runtime == RuntimeMode::Local
-                && uses_local_checkpoint_store
-                && self.checkpoint_namespace_lock.lock().is_none()
-            {
-                laminar_core::durable_fs::ensure_durable_directory(local_checkpoint_root).map_err(
-                    |error| {
-                        DbError::Config(format!(
-                            "create local checkpoint directory {}: {error}",
-                            local_checkpoint_root.display()
-                        ))
-                    },
-                )?;
-                let lock_path = local_checkpoint_root.join(".laminardb-checkpoint.lock");
-                let lock = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&lock_path)
-                    .map_err(|error| {
-                        DbError::Config(format!(
-                            "[LDB-0014] open checkpoint namespace lock {}: {error}",
-                            lock_path.display()
-                        ))
-                    })?;
-                lock.try_lock().map_err(|error| {
-                    DbError::Config(format!(
-                        "[LDB-0014] checkpoint namespace {} is already owned by \
-                         another live process: {error}",
-                        local_checkpoint_root.display()
-                    ))
-                })?;
-                *self.checkpoint_namespace_lock.lock() = Some(lock);
+            if startup_runtime == RuntimeMode::Local && uses_local_checkpoint_store {
+                self.ensure_local_checkpoint_namespace()?;
             }
             let participant_id = participant.unwrap_or(laminar_core::state::LOCAL_NODE_ID.0);
             let pipeline_identity = bound_pipeline_identity.clone().ok_or_else(|| {

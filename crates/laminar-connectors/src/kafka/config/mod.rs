@@ -419,7 +419,7 @@ impl std::fmt::Display for SubjectNameStrategy {
     }
 }
 
-/// Build the SR `-value` subject for a topic. `from_config` validates
+/// Build the standard registry value subject for the selected strategy. `from_config` validates
 /// that `record_name` is present for the record-based strategies, so
 /// the `expect`s are unreachable in practice.
 pub(crate) fn resolve_value_subject(
@@ -430,8 +430,8 @@ pub(crate) fn resolve_value_subject(
     let name = || record_name.expect("from_config validates record.name");
     match strategy {
         SubjectNameStrategy::TopicName => format!("{topic}-value"),
-        SubjectNameStrategy::RecordName => format!("{}-value", name()),
-        SubjectNameStrategy::TopicRecordName => format!("{topic}-{}-value", name()),
+        SubjectNameStrategy::RecordName => name().to_owned(),
+        SubjectNameStrategy::TopicRecordName => format!("{topic}-{}", name()),
     }
 }
 

@@ -7,6 +7,7 @@
 pub mod channel_derivation;
 /// Optimizer rules for lookup join rewriting.
 pub mod lookup_join;
+mod lookup_table;
 /// Predicate splitting and pushdown for lookup joins.
 pub mod predicate_split;
 /// Physical optimizer rule for streaming plan validation.
@@ -26,11 +27,11 @@ use crate::parser::analytic_parser::{
     analyze_analytic_functions, analyze_window_frames, FrameBound,
 };
 use crate::parser::join_parser::{analyze_joins, JoinAnalysis, JoinType, MultiJoinAnalysis};
-use crate::parser::lookup_table::{validate_properties, LookupTableProperties};
+use crate::parser::lookup_table::LookupTableProperties;
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
-    CreateLookupTableStatement, CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom,
-    StreamingStatement, WindowFunction, WindowRewriter,
+    CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom, StreamingStatement,
+    WindowFunction, WindowRewriter,
 };
 use crate::temporal::temporal_table_version_count;
 use crate::translator::{
@@ -679,80 +680,6 @@ impl StreamingPlanner {
             GroupByExpr::All(_) => {}
         }
         None
-    }
-
-    /// Plans a CREATE LOOKUP TABLE statement.
-    fn plan_create_lookup_table(
-        &mut self,
-        lt: &CreateLookupTableStatement,
-    ) -> Result<StreamingPlan, PlanningError> {
-        let name = object_name_to_string(&lt.name);
-
-        if !lt.or_replace && !lt.if_not_exists && self.lookup_tables.contains_key(&name) {
-            return Err(PlanningError::InvalidQuery(format!(
-                "Lookup table '{}' already exists",
-                name
-            )));
-        }
-
-        let columns: Vec<(String, String)> = lt
-            .columns
-            .iter()
-            .map(|c| (c.name.value.clone(), c.data_type.to_string()))
-            .collect();
-
-        let properties = validate_properties(&lt.with_options).map_err(|e| {
-            PlanningError::InvalidQuery(format!("Invalid lookup table properties: {e}"))
-        })?;
-
-        // Compute Arrow schema from column definitions
-        let arrow_fields: Vec<Field> = lt
-            .columns
-            .iter()
-            .map(|c| {
-                let dt = crate::translator::streaming_ddl::sql_type_to_arrow(&c.data_type)
-                    .map_err(|e| PlanningError::InvalidQuery(e.to_string()))?;
-                let nullable = !c
-                    .options
-                    .iter()
-                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
-                Ok(Field::new(&c.name.value, dt, nullable))
-            })
-            .collect::<Result<_, PlanningError>>()?;
-        let arrow_schema = Arc::new(Schema::new(arrow_fields));
-
-        let info = LookupTableInfo {
-            name: name.clone(),
-            columns,
-            primary_key: lt.primary_key.clone(),
-            properties,
-            arrow_schema,
-            raw_options: lt.with_options.clone(),
-        };
-
-        self.lookup_tables.insert(name, info.clone());
-
-        Ok(StreamingPlan::RegisterLookupTable(info))
-    }
-
-    /// Plans a DROP LOOKUP TABLE statement.
-    fn plan_drop_lookup_table(
-        &mut self,
-        name: &ObjectName,
-        if_exists: bool,
-    ) -> Result<StreamingPlan, PlanningError> {
-        let name_str = object_name_to_string(name);
-
-        if !if_exists && !self.lookup_tables.contains_key(&name_str) {
-            return Err(PlanningError::InvalidQuery(format!(
-                "Lookup table '{}' does not exist",
-                name_str
-            )));
-        }
-
-        self.lookup_tables.remove(&name_str);
-
-        Ok(StreamingPlan::DropLookupTable { name: name_str })
     }
 
     /// Gets a registered source by name.

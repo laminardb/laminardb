@@ -226,6 +226,32 @@ pub trait SourceConnector: Send {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError>;
 
+    /// Resolve an immutable reader contract before activation. Metadata adapters must
+    /// override this hook to retain native identity/definitions and validate projections.
+    /// The default preserves explicit columns and reuses pre-open discovery for fixed schemas.
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        use crate::schema::resolution::{logical_binding, SchemaDirection, SchemaOrigin};
+        if let Some(schema) = explicit {
+            return logical_binding(
+                config,
+                SchemaDirection::Source,
+                SchemaOrigin::Explicit,
+                &schema,
+            );
+        }
+        self.discover_schema(config.properties()).await?;
+        logical_binding(
+            config,
+            SchemaDirection::Source,
+            SchemaOrigin::BuiltIn,
+            &self.schema(),
+        )
+    }
+
     /// Resolve the source schema from the connector and format properties before
     /// DDL reaches the planner. Implementations that perform network I/O must
     /// bound it with a timeout. Return `Err(ConnectorError::…)` on failure so

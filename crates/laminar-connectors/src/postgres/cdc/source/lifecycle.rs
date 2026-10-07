@@ -95,6 +95,17 @@ impl SourceConnector for PostgresCdcSource {
         ])))
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let guard = self.task_owner.track().ok_or_else(|| {
+            ConnectorError::Internal("PostgreSQL CDC schema owner is retired".into())
+        })?;
+        super::super::schema_resolution::resolve(config, explicit, guard).await
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         if self.state != ConnectorState::Created {
             return Err(ConnectorError::InvalidState {
@@ -104,6 +115,10 @@ impl SourceConnector for PostgresCdcSource {
         }
         let (config, position, _) = request.into_parts();
         let prepared = prepare_source_start(&self.config, &config, position)?;
+        let relations = super::super::schema_resolution::restore_relations(
+            config.schema_binding(),
+            &prepared.checkpoint_binding,
+        )?;
 
         #[cfg(not(test))]
         {
@@ -119,6 +134,7 @@ impl SourceConnector for PostgresCdcSource {
 
         // Publish the new runtime only after all fallible startup work has
         // succeeded. A failed start remains a clean Created connector.
+        self.committed_relations = relations;
         self.config = prepared.config;
         self.confirmed_flush_lsn = prepared.start_lsn;
         self.write_lsn = prepared.start_lsn;

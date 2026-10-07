@@ -23,6 +23,7 @@ impl KafkaSource {
             .and_then(|any| any.downcast_mut::<AvroDeserializer>())
         {
             let mut new_schema_ids = Vec::new();
+            let mut prepared_records = 0_u64;
             for &(start, len) in &self.poll_payload_offsets {
                 if let Some(schema_id) = AvroDeserializer::extract_confluent_id(
                     &self.poll_payload_buf[start..start + len],
@@ -41,9 +42,13 @@ impl KafkaSource {
                         })?;
                     if is_new {
                         new_schema_ids.push(schema_id);
+                    } else {
+                        prepared_records += 1;
                     }
                 }
             }
+
+            self.metrics.schema_cache_hits.inc_by(prepared_records);
 
             // Detect schema evolution by diffing successive writer schemas.
             if !new_schema_ids.is_empty()

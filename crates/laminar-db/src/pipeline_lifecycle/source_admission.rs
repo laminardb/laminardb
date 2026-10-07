@@ -239,7 +239,7 @@ pub(crate) fn validate_source_recovery_assignment(
 }
 
 /// Validate sink durability, placement, and changelog semantics before I/O.
-pub(super) fn admit_sink_contract(
+pub(crate) fn admit_sink_contract(
     contract: SinkContract,
     delivery: DeliveryGuarantee,
     runtime: RuntimeMode,

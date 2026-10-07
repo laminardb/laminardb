@@ -59,7 +59,7 @@ fn prepare_start_position(
 }
 
 impl KafkaSource {
-    pub(super) fn prepare_start(
+    pub(in crate::kafka::source) fn prepare_start(
         &mut self,
         request: SourceStart,
     ) -> Result<KafkaStartPlan, ConnectorError> {
@@ -110,7 +110,24 @@ impl KafkaSource {
 
         self.select_start_deserializer(&kafka_config)?;
 
-        if let Some(schema) = config.arrow_schema() {
+        if let Some(binding) = config.schema_binding() {
+            self.schema = super::super::super::schema_resolution::payload_schema(
+                binding,
+                kafka_config.include_metadata,
+                kafka_config.include_headers,
+            )?;
+            if let Some(avro) = self
+                .deserializer
+                .as_any_mut()
+                .and_then(|any| any.downcast_mut::<AvroDeserializer>())
+            {
+                avro.set_schema_metrics(self.metrics.clone());
+                avro.bind_reader(binding, &self.schema)?;
+            }
+        } else if kafka_config.format == Format::Avro {
+            return Err(ConnectorError::SchemaMismatch(
+                "Kafka Avro startup requires a resolved reader contract; resolve_schema before start".into()));
+        } else if let Some(schema) = config.arrow_schema() {
             info!(
                 fields = schema.fields().len(),
                 "using SQL-defined schema for deserialization"

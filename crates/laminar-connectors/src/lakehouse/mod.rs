@@ -34,6 +34,9 @@ pub mod iceberg_reference;
 mod iceberg_scan;
 pub mod iceberg_source;
 
+#[cfg(any(feature = "delta-lake", feature = "iceberg-core"))]
+mod schema_resolution;
+
 // Common metrics
 pub mod metrics;
 #[cfg(any(test, feature = "delta-lake", feature = "iceberg-core"))]
@@ -83,6 +86,11 @@ pub fn register_delta_lake_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            true,
+            crate::schema::resolution::SchemaPreparation::ExplicitTableCreation,
+        ),
         name: "delta-lake".to_string(),
         display_name: "Delta Lake Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -112,6 +120,11 @@ pub fn register_delta_lake_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            false,
+            crate::schema::resolution::SchemaPreparation::None,
+        ),
         name: "delta-lake".to_string(),
         display_name: "Delta Lake Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -213,6 +226,11 @@ pub fn register_iceberg_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            true,
+            crate::schema::resolution::SchemaPreparation::ExplicitTableCreation,
+        ),
         name: "iceberg".to_string(),
         display_name: "Apache Iceberg Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -242,6 +260,11 @@ pub fn register_iceberg_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            false,
+            crate::schema::resolution::SchemaPreparation::None,
+        ),
         name: "iceberg".to_string(),
         display_name: "Apache Iceberg Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

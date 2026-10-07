@@ -1,6 +1,6 @@
 //! Prometheus-backed Kafka source metrics.
 
-use prometheus::{IntCounter, Registry};
+use prometheus::{IntCounter, IntGauge, Registry};
 
 use crate::prom::reg_or_local;
 
@@ -27,6 +27,16 @@ pub struct KafkaSourceMetrics {
     pub sr_discovery_failures: IntCounter,
     /// Count of Schema Registry discovery timeouts.
     pub sr_discovery_timeouts: IntCounter,
+    /// Records using a prepared writer schema, observed once per batch.
+    pub schema_cache_hits: IntCounter,
+    /// Unknown writer definitions fetched on the connector runtime.
+    pub schema_cache_misses: IntCounter,
+    /// Writer fetch failures or cancellation, before source progress publication.
+    pub schema_fetch_failures: IntCounter,
+    /// Cumulative queue/fetch latency, including cancelled unknown writer resolutions.
+    pub schema_fetch_microseconds: IntCounter,
+    /// Records currently blocked behind unresolved writer metadata.
+    pub schema_unresolved_records: IntGauge,
 }
 
 impl KafkaSourceMetrics {
@@ -71,6 +81,26 @@ impl KafkaSourceMetrics {
             sr_discovery_failures: handle.counter(
                 "kafka_source_sr_discovery_failures_total",
                 "Schema Registry discovery failures",
+            ),
+            schema_cache_hits: handle.counter(
+                "kafka_source_schema_cache_hits_total",
+                "Records decoded with a prepared writer contract",
+            ),
+            schema_cache_misses: handle.counter(
+                "kafka_source_schema_cache_misses_total",
+                "Unknown writer schema resolutions",
+            ),
+            schema_fetch_failures: handle.counter(
+                "kafka_source_schema_fetch_failures_total",
+                "Failed or cancelled writer schema resolutions",
+            ),
+            schema_fetch_microseconds: handle.counter(
+                "kafka_source_schema_fetch_microseconds_total",
+                "Cumulative unresolved writer queue and fetch latency",
+            ),
+            schema_unresolved_records: handle.gauge(
+                "kafka_source_schema_unresolved_records",
+                "Records blocked on writer metadata",
             ),
             sr_discovery_timeouts: handle.counter(
                 "kafka_source_sr_discovery_timeouts_total",

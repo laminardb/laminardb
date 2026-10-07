@@ -10,6 +10,26 @@ use crate::error::ConnectorError;
 /// A finite source used to hydrate a reference table before processing starts.
 #[async_trait::async_trait]
 pub trait ReferenceTableSource: Send {
+    /// Resolve a snapshot reader before hydration, without consuming snapshot rows.
+    ///
+    /// # Errors
+    /// The default extension contract requires explicit fields. Metadata-capable
+    /// implementations override this hook and retain native identity at hydration.
+    async fn resolve_schema(
+        &mut self,
+        config: &crate::config::ConnectorConfig,
+        explicit: Option<arrow_schema::SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let schema = explicit.ok_or_else(|| ConnectorError::FeatureUnsupported(
+            "reference-table connector requires explicit fields; no metadata resolver is implemented".into()))?;
+        crate::schema::resolution::logical_binding(
+            config,
+            crate::schema::resolution::SchemaDirection::Source,
+            crate::schema::resolution::SchemaOrigin::Explicit,
+            &schema,
+        )
+    }
+
     /// Returns the next snapshot batch, or `None` after the complete snapshot was delivered.
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError>;
 

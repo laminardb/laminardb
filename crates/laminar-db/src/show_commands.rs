@@ -317,6 +317,20 @@ impl LaminarDB {
 
     /// Build a DESCRIBE result.
     pub(crate) fn build_describe(&self, name: &str) -> Result<RecordBatch, DbError> {
+        let committed = {
+            let manager = self.connector_manager.lock();
+            manager.schema_binding(name).cloned().map(|binding| {
+                let generation = manager
+                    .ordered_ddl()
+                    .into_iter()
+                    .find(|(object, _, _)| object == name)
+                    .map_or(1, |(_, _, generation)| generation);
+                (binding, generation)
+            })
+        };
+        if let Some((binding, generation)) = committed {
+            return schema_binding_describe_batch(&binding, generation);
+        }
         let schema = if let Some(s) = self.catalog.describe_source(name) {
             s
         } else if let Some(s) = self.table_store.read().table_schema(name) {
@@ -372,4 +386,58 @@ pub(crate) fn schema_to_describe_batch(schema: &Schema) -> Result<RecordBatch, D
         ],
     )
     .map_err(|e| DbError::InvalidOperation(format!("describe metadata: {e}")))
+}
+
+fn schema_binding_describe_batch(
+    binding: &laminar_core::schema_binding::SchemaBinding,
+    generation: u64,
+) -> Result<RecordBatch, DbError> {
+    let base = schema_to_describe_batch(&binding.logical)?;
+    let origin = match binding.origin {
+        laminar_core::schema_binding::SchemaOrigin::Explicit => "explicit",
+        laminar_core::schema_binding::SchemaOrigin::BuiltIn => "built_in",
+        laminar_core::schema_binding::SchemaOrigin::Metadata => "metadata",
+        laminar_core::schema_binding::SchemaOrigin::Query => "query",
+        laminar_core::schema_binding::SchemaOrigin::Sample => "sample",
+    };
+    let identity = serde_json::to_string(&serde_json::json!({
+        "value": binding.value.as_ref().map(|native| (&native.format, &native.identity)),
+        "key": binding.key.as_ref().map(|native| (&native.format, &native.identity)),
+        "representation_version": binding.version,
+        "control_fields": binding.control_fields,
+        "policy": "frozen logical contract; exact field names; external preparation requires explicit configuration"
+    })).map_err(|error| DbError::Config(error.to_string()))?;
+    let fingerprint = binding
+        .fingerprint()
+        .map_err(|error| DbError::Config(error.to_string()))?;
+    let mappings = binding.logical.fields().iter().map(|field| {
+        binding
+            .mapping
+            .iter()
+            .find(|mapping| mapping.logical == *field.name())
+            .map(|mapping| mapping.external.as_str())
+    });
+    let mut fields = base.schema().fields().to_vec();
+    fields.extend([
+        Field::new("schema_origin", DataType::Utf8, false).into(),
+        Field::new("contract_generation", DataType::UInt64, false).into(),
+        Field::new("external_field", DataType::Utf8, true).into(),
+        Field::new("native_contract", DataType::Utf8, true).into(),
+        Field::new("schema_fingerprint", DataType::Utf8, true).into(),
+    ]);
+    let count = base.num_rows();
+    let mut columns = base.columns().to_vec();
+    columns.extend([
+        Arc::new(StringArray::from(vec![origin; count])) as arrow::array::ArrayRef,
+        Arc::new(UInt64Array::from(vec![generation; count])),
+        Arc::new(StringArray::from_iter(mappings)),
+        Arc::new(StringArray::from_iter(
+            (0..count).map(|row| (row == 0).then_some(identity.as_str())),
+        )),
+        Arc::new(StringArray::from_iter(
+            (0..count).map(|row| (row == 0).then_some(fingerprint.as_str())),
+        )),
+    ]);
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|error| DbError::Config(error.to_string()))
 }

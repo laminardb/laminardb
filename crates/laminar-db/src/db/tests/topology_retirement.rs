@@ -14,7 +14,7 @@ fn namespace_lock(db: &LaminarDB) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().unwrap();
     let owner = file.reopen().unwrap();
     owner.try_lock().unwrap();
-    *db.checkpoint_namespace_lock.lock() = Some(owner);
+    *db.checkpoint_namespace_lock.lock() = Some(Arc::new(owner));
     file
 }
 

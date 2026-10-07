@@ -7,6 +7,11 @@ pub mod json;
 pub mod traits;
 pub mod types;
 
+pub(crate) mod lookup_binding;
+/// Control-plane schema capabilities and resolution policy.
+pub mod resolution;
+pub(crate) mod resolution_metrics;
+
 #[cfg(any(feature = "parquet-lookup", feature = "files"))]
 pub mod parquet;
 

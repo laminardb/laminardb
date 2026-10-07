@@ -16,6 +16,7 @@ async fn topology_stateful_runtime_waits_for_release_and_cold_recovers_the_targe
     diagnostics();
     let mut additions = stateful_additions();
     additions.push(laminar_core::cluster::control::CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "new_result_sink".into(),
         kind: laminar_core::cluster::control::CatalogObjectKind::Sink,
         catalog_generation: 1,

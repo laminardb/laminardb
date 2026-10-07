@@ -472,6 +472,24 @@ impl IcebergSource {
 
 #[async_trait]
 impl SourceConnector for IcebergSource {
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        #[cfg(feature = "iceberg-core")]
+        {
+            super::schema_resolution::iceberg_source(config, explicit).await
+        }
+        #[cfg(not(feature = "iceberg-core"))]
+        {
+            let _ = (config, explicit);
+            Err(ConnectorError::FeatureUnsupported(
+                "Iceberg schema discovery requires the iceberg feature".into(),
+            ))
+        }
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
         if matches!(&position, SourcePosition::Initialized { .. }) {
@@ -535,25 +553,8 @@ impl SourceConnector for IcebergSource {
                 self.config.catalog.request_timeout,
             )
             .await?;
-            let root_schema = if let Some(cursor) = recovered_cursor.as_ref() {
-                cursor.validate_binding(&self.config, &table)?;
-                append_lineage::validate_cursor_lineage(
-                    &table,
-                    cursor,
-                    self.config.max_snapshots_per_poll,
-                )?;
-                cursor.retained_schema(&table)?
-            } else {
-                match Self::selected_snapshot(&table, &self.config)? {
-                    Some(snapshot) => snapshot.schema(table.metadata()).map_err(|error| {
-                        super::iceberg_scan::connector_scan_error(
-                            "resolve initial Iceberg snapshot schema",
-                            &error,
-                        )
-                    })?,
-                    None => table.current_schema_ref(),
-                }
-            };
+            let root_schema =
+                self.resolve_root_schema(&config, &table, recovered_cursor.as_ref())?;
             self.bind_read_schema(&root_schema, declared_schema)?;
             self.catalog = Some(catalog);
             let head = table

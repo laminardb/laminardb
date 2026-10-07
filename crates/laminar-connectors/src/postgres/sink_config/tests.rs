@@ -31,6 +31,15 @@ fn test_parse_required_fields() {
 }
 
 #[test]
+fn runtime_delivery_policy_is_accepted_without_changing_native_write_mode() {
+    let mut config = make_config(&required_pairs());
+    config.set("delivery.guarantee", "at-least-once");
+    let parsed = PostgresSinkConfig::from_config(&config).unwrap();
+    assert_eq!(parsed.write_mode, WriteMode::Append);
+    assert!(!parsed.auto_create_table);
+}
+
+#[test]
 fn test_missing_hostname() {
     let config = make_config(&[("database", "db"), ("username", "u"), ("table.name", "t")]);
     assert!(PostgresSinkConfig::from_config(&config).is_err());

@@ -8,12 +8,14 @@ use std::time::{Duration, Instant};
 
 use quick_cache::sync::Cache;
 
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::SchemaRef;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ConnectorError, SerdeError};
 use crate::kafka::config::{CompatibilityLevel, SrAuth};
+
+mod resolution;
 
 const SCHEMA_REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SCHEMA_REGISTRY_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -34,6 +36,7 @@ const SCHEMA_REGISTRY_HTTP_TIMEOUTS: SchemaRegistryHttpTimeouts = SchemaRegistry
 
 fn http_client_builder(timeouts: SchemaRegistryHttpTimeouts) -> reqwest::ClientBuilder {
     Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(timeouts.connect)
         .read_timeout(timeouts.read)
         .timeout(timeouts.request)
@@ -52,7 +55,8 @@ fn schema_registry_http_error(
     status: reqwest::StatusCode,
     detail: &str,
 ) -> ConnectorError {
-    let message = format!("schema registry {operation} failed: {status} {detail}");
+    let _ = detail;
+    let message = format!("schema registry {operation} failed: {status}");
     if status == reqwest::StatusCode::REQUEST_TIMEOUT
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
@@ -63,9 +67,13 @@ fn schema_registry_http_error(
     }
 }
 
-fn schema_registry_request_error(operation: &str, error: &reqwest::Error) -> ConnectorError {
-    let message = format!("schema registry {operation} failed: {error}");
-    if error.is_builder() {
+fn schema_registry_request_error(operation: &str, error: reqwest::Error) -> ConnectorError {
+    let builder_error = error.is_builder();
+    let message = format!(
+        "schema registry {operation} failed: {}",
+        error.without_url()
+    );
+    if builder_error {
         ConnectorError::ConfigurationError(message)
     } else {
         ConnectorError::ConnectionFailed(message)
@@ -139,6 +147,10 @@ impl Default for SchemaRegistryCacheConfig {
 /// A cached schema entry from the Schema Registry.
 #[derive(Debug, Clone)]
 pub struct CachedSchema {
+    /// Schema with transitive named references resolved for the selected Arrow codec.
+    pub resolved_schema_str: String,
+    /// Complete, concrete transitive reference definitions.
+    pub references: Vec<crate::schema::resolution::NativeSchemaArtifact>,
     /// Schema Registry schema ID.
     pub id: i32,
     /// Schema version within its subject.
@@ -176,12 +188,17 @@ pub struct SchemaRegistryClient {
     subject_cache: Cache<String, CachedSchema>,
     /// Cache configuration.
     cache_config: SchemaRegistryCacheConfig,
+    // INVARIANT: serialize cache misses per authenticated registry client. Reference fetches
+    // use get_json directly, so this guard never recursively acquires itself.
+    lookup_gate: tokio::sync::Mutex<()>,
 }
 
 // -- Schema Registry REST API response types --
 
 #[derive(Deserialize)]
 struct SchemaByIdResponse {
+    #[serde(default)]
+    references: Vec<resolution::SchemaReference>,
     schema: String,
     #[serde(default = "default_schema_type")]
     #[serde(rename = "schemaType")]
@@ -190,6 +207,8 @@ struct SchemaByIdResponse {
 
 #[derive(Deserialize)]
 struct SchemaVersionResponse {
+    #[serde(default)]
+    references: Vec<resolution::SchemaReference>,
     id: i32,
     version: i32,
     schema: String,
@@ -359,9 +378,9 @@ impl SchemaRegistryClient {
         cache_config: SchemaRegistryCacheConfig,
         client: Client,
     ) -> Self {
-        let cache = Cache::new(cache_config.max_entries);
+        let cache = Cache::new(cache_config.max_entries.clamp(1, 64));
         // Subject cache is small — one entry per subject
-        let subject_cache = Cache::new(256);
+        let subject_cache = Cache::new(16);
         Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -369,6 +388,7 @@ impl SchemaRegistryClient {
             cache,
             subject_cache,
             cache_config,
+            lookup_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -427,23 +447,37 @@ impl SchemaRegistryClient {
             return Ok(cached);
         }
 
-        let url = format!("{}/schemas/ids/{}", self.base_url, id);
-        let operation = format!("fetch schema ID {id}");
-        let resp: SchemaByIdResponse = self.get_json(&url, &operation).await?;
+        if id <= 0 {
+            return Err(ConnectorError::SchemaMismatch(
+                "registry schema ID must be positive".into(),
+            ));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _lookup = self.lookup_gate.lock().await;
+            if let Some(cached) = self.cache_get(id) {
+                return Ok(cached);
+            }
+            let url = format!("{}/schemas/ids/{}", self.base_url, id);
+            let operation = format!("fetch schema ID {id}");
+            let resp: SchemaByIdResponse = self.get_json(&url, &operation).await?;
+            let cached = self
+                .complete_schema(id, 0, resp.schema, &resp.schema_type, resp.references)
+                .await?;
+            self.cache_insert(id, cached.clone());
+            Ok(cached)
+        })
+        .await
+        .map_err(|_| ConnectorError::Timeout(30_000))?
+    }
 
-        let schema_type: SchemaType = resp.schema_type.parse()?;
-        let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
-
-        let cached = CachedSchema {
-            id,
-            version: 0, // not available from this endpoint
-            schema_type,
-            schema_str: resp.schema,
-            arrow_schema,
-            inserted_at: Instant::now(),
-        };
-        self.cache_insert(id, cached.clone());
-        Ok(cached)
+    pub(super) async fn fetch_registered_schema(
+        &self,
+        id: i32,
+    ) -> Result<CachedSchema, ConnectorError> {
+        // Registration echoes only an ID. Verify its definition instead of trusting
+        // the optimistic cache populated from our request body.
+        self.cache.remove(&id);
+        self.get_schema_by_id(id).await
     }
 
     /// Fetches the latest schema version for a subject.
@@ -452,26 +486,37 @@ impl SchemaRegistryClient {
     ///
     /// Returns `ConnectorError` if the HTTP request fails.
     pub async fn get_latest_schema(&self, subject: &str) -> Result<CachedSchema, ConnectorError> {
-        let url = format!("{}/subjects/{}/versions/latest", self.base_url, subject);
-        let operation = format!("fetch latest schema for subject '{subject}'");
-        let resp: SchemaVersionResponse = self.get_json(&url, &operation).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _lookup = self.lookup_gate.lock().await;
+            let url = format!(
+                "{}/subjects/{}/versions/latest",
+                self.base_url,
+                resolution::encoded_subject(subject)
+            );
+            let operation = format!("fetch latest schema for subject '{subject}'");
+            let resp: SchemaVersionResponse = self.get_json(&url, &operation).await?;
 
-        let schema_type: SchemaType = resp.schema_type.parse()?;
-        let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
-
-        let cached = CachedSchema {
-            id: resp.id,
-            version: resp.version,
-            schema_type,
-            schema_str: resp.schema,
-            arrow_schema,
-            inserted_at: Instant::now(),
-        };
-
-        self.cache_insert(resp.id, cached.clone());
-        self.subject_cache
-            .insert(subject.to_string(), cached.clone());
-        Ok(cached)
+            if resp.version <= 0 {
+                return Err(ConnectorError::SchemaMismatch(
+                    "registry returned a different or invalid concrete version".into(),
+                ));
+            }
+            let cached = self
+                .complete_schema(
+                    resp.id,
+                    resp.version,
+                    resp.schema,
+                    &resp.schema_type,
+                    resp.references,
+                )
+                .await?;
+            self.cache_insert(cached.id, cached.clone());
+            self.subject_cache
+                .insert(subject.to_string(), cached.clone());
+            Ok(cached)
+        })
+        .await
+        .map_err(|_| ConnectorError::Timeout(30_000))?
     }
 
     /// Fetches a specific schema version for a subject.
@@ -484,26 +529,36 @@ impl SchemaRegistryClient {
         subject: &str,
         version: i32,
     ) -> Result<CachedSchema, ConnectorError> {
-        let url = format!(
-            "{}/subjects/{}/versions/{}",
-            self.base_url, subject, version
-        );
-        let operation = format!("fetch version {version} for subject '{subject}'");
-        let resp: SchemaVersionResponse = self.get_json(&url, &operation).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let _lookup = self.lookup_gate.lock().await;
+            let url = format!(
+                "{}/subjects/{}/versions/{}",
+                self.base_url,
+                resolution::encoded_subject(subject),
+                version
+            );
+            let operation = format!("fetch version {version} for subject '{subject}'");
+            let resp: SchemaVersionResponse = self.get_json(&url, &operation).await?;
 
-        let schema_type: SchemaType = resp.schema_type.parse()?;
-        let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
-
-        let cached = CachedSchema {
-            id: resp.id,
-            version: resp.version,
-            schema_type,
-            schema_str: resp.schema,
-            arrow_schema,
-            inserted_at: Instant::now(),
-        };
-        self.cache_insert(resp.id, cached.clone());
-        Ok(cached)
+            if resp.version <= 0 || resp.version != version {
+                return Err(ConnectorError::SchemaMismatch(
+                    "registry returned a different or invalid concrete version".into(),
+                ));
+            }
+            let cached = self
+                .complete_schema(
+                    resp.id,
+                    resp.version,
+                    resp.schema,
+                    &resp.schema_type,
+                    resp.references,
+                )
+                .await?;
+            self.cache_insert(cached.id, cached.clone());
+            Ok(cached)
+        })
+        .await
+        .map_err(|_| ConnectorError::Timeout(30_000))?
     }
 
     /// Checks compatibility of an Avro schema against the latest version.
@@ -518,7 +573,8 @@ impl SchemaRegistryClient {
     ) -> Result<CompatibilityResult, ConnectorError> {
         let url = format!(
             "{}/compatibility/subjects/{}/versions/latest",
-            self.base_url, subject
+            self.base_url,
+            resolution::encoded_subject(subject)
         );
 
         let body = CompatibilityRequest {
@@ -535,11 +591,11 @@ impl SchemaRegistryClient {
         let resp = req
             .send()
             .await
-            .map_err(|error| schema_registry_request_error(&operation, &error))?;
+            .map_err(|error| schema_registry_request_error(&operation, error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = String::new();
             if status == reqwest::StatusCode::NOT_FOUND {
                 return Ok(CompatibilityResult {
                     is_compatible: true,
@@ -549,11 +605,12 @@ impl SchemaRegistryClient {
             return Err(schema_registry_http_error(&operation, status, &text));
         }
 
-        let result: CompatibilityResponse = resp.json().await.map_err(|e| {
-            ConnectorError::Internal(format!(
-                "schema registry {operation} returned an invalid response: {e}"
-            ))
-        })?;
+        let result: CompatibilityResponse =
+            Self::bounded_json(resp, &operation).await.map_err(|e| {
+                ConnectorError::Internal(format!(
+                    "schema registry {operation} returned an invalid response: {e}"
+                ))
+            })?;
 
         Ok(CompatibilityResult {
             is_compatible: result.is_compatible,
@@ -570,7 +627,11 @@ impl SchemaRegistryClient {
         &self,
         subject: &str,
     ) -> Result<CompatibilityLevel, ConnectorError> {
-        let url = format!("{}/config/{}", self.base_url, subject);
+        let url = format!(
+            "{}/config/{}",
+            self.base_url,
+            resolution::encoded_subject(subject)
+        );
         let operation = format!("fetch compatibility config for subject '{subject}'");
         let resp: ConfigResponse = self.get_json(&url, &operation).await?;
         resp.compatibility_level.parse()
@@ -586,7 +647,11 @@ impl SchemaRegistryClient {
         subject: &str,
         level: CompatibilityLevel,
     ) -> Result<(), ConnectorError> {
-        let url = format!("{}/config/{}", self.base_url, subject);
+        let url = format!(
+            "{}/config/{}",
+            self.base_url,
+            resolution::encoded_subject(subject)
+        );
         let body = ConfigUpdateRequest {
             compatibility: level.as_str().to_string(),
         };
@@ -600,11 +665,11 @@ impl SchemaRegistryClient {
         let resp = req
             .send()
             .await
-            .map_err(|error| schema_registry_request_error(&operation, &error))?;
+            .map_err(|error| schema_registry_request_error(&operation, error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = String::new();
             return Err(schema_registry_http_error(&operation, status, &text));
         }
 
@@ -647,7 +712,11 @@ impl SchemaRegistryClient {
             }
         }
 
-        let url = format!("{}/subjects/{}/versions", self.base_url, subject);
+        let url = format!(
+            "{}/subjects/{}/versions",
+            self.base_url,
+            resolution::encoded_subject(subject)
+        );
         let body = RegisterSchemaRequest {
             schema: schema_str.to_string(),
             schema_type: schema_type.to_string(),
@@ -662,22 +731,30 @@ impl SchemaRegistryClient {
         let resp = req
             .send()
             .await
-            .map_err(|error| schema_registry_request_error(&operation, &error))?;
+            .map_err(|error| schema_registry_request_error(&operation, error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = String::new();
             return Err(schema_registry_http_error(&operation, status, &text));
         }
 
-        let result: RegisterSchemaResponse = resp.json().await.map_err(|e| {
-            ConnectorError::Internal(format!(
-                "schema registry {operation} returned an invalid response: {e}"
-            ))
-        })?;
+        let result: RegisterSchemaResponse =
+            Self::bounded_json(resp, &operation).await.map_err(|e| {
+                ConnectorError::Internal(format!(
+                    "schema registry {operation} returned an invalid response: {e}"
+                ))
+            })?;
 
+        if result.id <= 0 {
+            return Err(ConnectorError::SchemaMismatch(
+                "registry returned a non-positive registration ID".into(),
+            ));
+        }
         let arrow_schema = avro_to_arrow_schema(schema_str)?;
         let cached = CachedSchema {
+            resolved_schema_str: schema_str.to_string(),
+            references: Vec::new(),
             id: result.id,
             version: 0,
             schema_type,
@@ -743,6 +820,39 @@ impl SchemaRegistryClient {
     ///
     /// Retries transient failures (408, 429, 5xx, and transport errors) up to
     /// 3 attempts with exponential backoff (100ms, 500ms).
+    async fn bounded_json<T: serde::de::DeserializeOwned>(
+        mut response: reqwest::Response,
+        operation: &str,
+    ) -> Result<T, ConnectorError> {
+        const LIMIT: usize = 2 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|length| length > LIMIT as u64)
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "registry response exceeds 2 MiB".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| schema_registry_request_error(operation, error))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > LIMIT {
+                return Err(ConnectorError::SchemaMismatch(
+                    "registry response exceeds 2 MiB".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            ConnectorError::SchemaMismatch(format!(
+                "registry {operation} returned malformed metadata"
+            ))
+        })
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -770,7 +880,7 @@ impl SchemaRegistryClient {
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    let error = schema_registry_request_error(operation, &e);
+                    let error = schema_registry_request_error(operation, e);
                     if !error.is_transient() {
                         return Err(error);
                     }
@@ -786,22 +896,18 @@ impl SchemaRegistryClient {
 
             let status = resp.status();
             if status.is_success() {
-                return resp.json::<T>().await.map_err(|e| {
-                    ConnectorError::Internal(format!(
-                        "schema registry {operation} returned an invalid response: {e}"
-                    ))
-                });
+                return Self::bounded_json(resp, operation).await;
             }
 
             let transient = status == reqwest::StatusCode::REQUEST_TIMEOUT
                 || status == reqwest::StatusCode::TOO_MANY_REQUESTS
                 || status.is_server_error();
             if !transient {
-                let text = resp.text().await.unwrap_or_default();
+                let text = String::new();
                 return Err(schema_registry_http_error(operation, status, &text));
             }
 
-            let text = resp.text().await.unwrap_or_default();
+            let text = String::new();
             tracing::warn!(
                 attempt = attempt + 1,
                 status = %status,
@@ -878,128 +984,14 @@ pub fn avro_to_arrow_schema(avro_schema_str: &str) -> Result<SchemaRef, Connecto
 ///
 /// Returns `SerdeError` if an Arrow type has no Avro equivalent.
 pub fn arrow_to_avro_schema(schema: &SchemaRef, record_name: &str) -> Result<String, SerdeError> {
-    let mut fields = Vec::with_capacity(schema.fields().len());
-
-    for field in schema.fields() {
-        let avro_type = arrow_to_avro_type(field.data_type())?;
-
-        let field_type = if field.is_nullable() {
-            serde_json::json!(["null", avro_type])
-        } else {
-            avro_type
-        };
-
-        fields.push(serde_json::json!({
-            "name": field.name(),
-            "type": field_type,
-        }));
-    }
-
-    // Avro record names must match [A-Za-z_][A-Za-z0-9_]*; topic names
-    // commonly contain hyphens (e.g. "my-events") which are invalid.
-    let safe_name = record_name.replace('-', "_");
-
-    let schema = serde_json::json!({
-        "type": "record",
-        "name": safe_name,
-        "fields": fields,
-    });
-
-    serde_json::to_string(&schema)
-        .map_err(|e| SerdeError::MalformedInput(format!("failed to serialize Avro schema: {e}")))
-}
-
-/// Maps an Arrow `DataType` to an Avro type JSON value.
-fn arrow_to_avro_type(data_type: &DataType) -> Result<serde_json::Value, SerdeError> {
-    match data_type {
-        DataType::Null => Ok(serde_json::json!("null")),
-        DataType::Boolean => Ok(serde_json::json!("boolean")),
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32 => Ok(serde_json::json!("int")),
-        DataType::Int64 | DataType::UInt64 => Ok(serde_json::json!("long")),
-        DataType::Float32 => Ok(serde_json::json!("float")),
-        DataType::Float64 => Ok(serde_json::json!("double")),
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(serde_json::json!("string")),
-        DataType::Binary | DataType::LargeBinary => Ok(serde_json::json!("bytes")),
-        DataType::List(item_field) => {
-            let items = arrow_to_avro_type(item_field.data_type())?;
-            Ok(serde_json::json!({
-                "type": "array",
-                "items": items,
-            }))
-        }
-        DataType::Map(entries_field, _) => {
-            // Map entries field is a Struct with "key" and "value" children.
-            if let DataType::Struct(fields) = entries_field.data_type() {
-                let value_field = fields.iter().find(|f| f.name() == "value").ok_or_else(|| {
-                    SerdeError::UnsupportedFormat(
-                        "Arrow Map missing 'value' field in entries struct".into(),
-                    )
-                })?;
-                let values = arrow_to_avro_type(value_field.data_type())?;
-                Ok(serde_json::json!({
-                    "type": "map",
-                    "values": values,
-                }))
-            } else {
-                Err(SerdeError::UnsupportedFormat(
-                    "Arrow Map entries field is not a Struct".into(),
-                ))
-            }
-        }
-        DataType::Struct(fields) => {
-            let mut avro_fields = Vec::with_capacity(fields.len());
-            for field in fields {
-                let avro_type = arrow_to_avro_type(field.data_type())?;
-                let field_type = if field.is_nullable() {
-                    serde_json::json!(["null", avro_type])
-                } else {
-                    avro_type
-                };
-                avro_fields.push(serde_json::json!({
-                    "name": field.name(),
-                    "type": field_type,
-                }));
-            }
-            Ok(serde_json::json!({
-                "type": "record",
-                "name": "nested",
-                "fields": avro_fields,
-            }))
-        }
-        DataType::Dictionary(_, value_type) if value_type.as_ref() == &DataType::Utf8 => {
-            Ok(serde_json::json!({
-                "type": "enum",
-                "name": "enum_field",
-                "symbols": [],
-            }))
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
-            Ok(serde_json::json!({"type": "long", "logicalType": "timestamp-millis"}))
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
-            Ok(serde_json::json!({"type": "long", "logicalType": "timestamp-micros"}))
-        }
-        DataType::Date32 => Ok(serde_json::json!({"type": "int", "logicalType": "date"})),
-        DataType::Time32(arrow_schema::TimeUnit::Millisecond) => {
-            Ok(serde_json::json!({"type": "int", "logicalType": "time-millis"}))
-        }
-        DataType::Time64(arrow_schema::TimeUnit::Microsecond) => {
-            Ok(serde_json::json!({"type": "long", "logicalType": "time-micros"}))
-        }
-        DataType::FixedSizeBinary(size) => Ok(serde_json::json!({
-            "type": "fixed",
-            "name": "fixed_field",
-            "size": size,
-        })),
-        other => Err(SerdeError::UnsupportedFormat(format!(
-            "no Avro equivalent for Arrow type: {other}"
-        ))),
-    }
+    let mut metadata = schema.metadata().clone();
+    metadata
+        .entry("avro.name".into())
+        .or_insert_with(|| record_name.replace('-', "_"));
+    let native_schema = schema.as_ref().clone().with_metadata(metadata);
+    arrow_avro::schema::AvroSchema::try_from(&native_schema)
+        .map(|schema| schema.json_string)
+        .map_err(|error| SerdeError::UnsupportedFormat(format!("Arrow to Avro: {error}")))
 }
 
 #[cfg(test)]

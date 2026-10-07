@@ -40,6 +40,9 @@ pub struct AvroDeserializer {
     known_ids: HashSet<i32>,
     /// Reused across batches; rebuilt when `register_schema` runs.
     decoder: Mutex<Option<Decoder>>,
+    reader_schema: Option<AvroSchema>,
+    projection: Option<Vec<usize>>,
+    schema_metrics: Option<super::KafkaSourceMetrics>,
 }
 
 impl AvroDeserializer {
@@ -53,6 +56,9 @@ impl AvroDeserializer {
             schema_registry: None,
             known_ids: HashSet::new(),
             decoder: Mutex::new(None),
+            reader_schema: None,
+            projection: None,
+            schema_metrics: None,
         }
     }
 
@@ -67,7 +73,57 @@ impl AvroDeserializer {
             schema_registry: Some(registry),
             known_ids: HashSet::new(),
             decoder: Mutex::new(None),
+            reader_schema: None,
+            projection: None,
+            schema_metrics: None,
         }
+    }
+
+    /// Bind the immutable native reader and its SQL projection before consuming records.
+    ///
+    /// # Errors
+    /// Rejects missing native content, invalid IDs, and unsupported projections.
+    pub fn bind_reader(
+        &mut self,
+        binding: &crate::schema::resolution::SchemaBinding,
+        logical: &SchemaRef,
+    ) -> Result<(), ConnectorError> {
+        let native = binding.value.as_ref().ok_or_else(|| {
+            ConnectorError::SchemaMismatch("Avro reader has no native schema".into())
+        })?;
+        let resolved = native
+            .definition
+            .get("resolved")
+            .ok_or_else(|| {
+                ConnectorError::SchemaMismatch("Avro reader has no resolved native schema".into())
+            })?
+            .to_string();
+        let external = crate::kafka::schema_registry::avro_to_arrow_schema(&resolved)?;
+        let projection = logical
+            .fields()
+            .iter()
+            .map(|field| {
+                external.index_of(field.name()).map_err(|_| {
+                    ConnectorError::SchemaMismatch(format!(
+                        "reader field '{}' is absent from the native record",
+                        field.name()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let id = crate::kafka::schema_resolution::contract_schema_id(binding)?;
+        let id = i32::try_from(id).map_err(|_| {
+            ConnectorError::SchemaMismatch("Avro schema ID exceeds the supported wire range".into())
+        })?;
+        self.register_schema(id, &resolved)
+            .map_err(ConnectorError::Serde)?;
+        self.reader_schema = Some(AvroSchema::new(resolved));
+        self.projection = Some(projection);
+        Ok(())
+    }
+
+    pub(crate) fn set_schema_metrics(&mut self, metrics: super::KafkaSourceMetrics) {
+        self.schema_metrics = Some(metrics);
     }
 
     /// Registers an Avro schema with a Confluent schema ID.
@@ -81,6 +137,16 @@ impl AvroDeserializer {
         schema_id: i32,
         avro_schema_json: &str,
     ) -> Result<(), SerdeError> {
+        if schema_id <= 0 || avro_schema_json.len() > 1024 * 1024 {
+            return Err(SerdeError::MalformedInput(
+                "invalid schema ID or schema exceeds 1 MiB".into(),
+            ));
+        }
+        if !self.known_ids.contains(&schema_id) && self.known_ids.len() >= 64 {
+            return Err(SerdeError::MalformedInput(
+                "writer schema cache limit (64) reached; controlled restart is required".into(),
+            ));
+        }
         let avro_schema = AvroSchema::new(avro_schema_json.to_string());
         // Use Fingerprint::Id directly — NOT load_fingerprint_id which
         // applies from_be byte-swap meant for raw wire bytes.
@@ -119,9 +185,11 @@ impl AvroDeserializer {
             SerdeError::SchemaNotFound { schema_id },
         ))?;
 
+        let mut observation = WriterFetchObservation::new(self.schema_metrics.clone());
         let cached = registry.resolve_confluent_id(schema_id).await?;
+        observation.succeeded = true;
 
-        self.register_schema(schema_id, &cached.schema_str)
+        self.register_schema(schema_id, &cached.resolved_schema_str)
             .map_err(ConnectorError::Serde)?;
         Ok(true)
     }
@@ -163,9 +231,16 @@ impl RecordDeserializer for AvroDeserializer {
         let decoder = if let Some(d) = guard.as_mut() {
             d
         } else {
-            let d = ReaderBuilder::new()
+            let mut builder = ReaderBuilder::new()
                 .with_batch_size(DECODER_BATCH_CAPACITY)
-                .with_writer_schema_store(self.schema_store.clone())
+                .with_writer_schema_store(self.schema_store.clone());
+            if let Some(reader) = &self.reader_schema {
+                builder = builder.with_reader_schema(reader.clone());
+            }
+            if let Some(projection) = &self.projection {
+                builder = builder.with_projection(projection.clone());
+            }
+            let d = builder
                 .build_decoder()
                 .map_err(|e| SerdeError::MalformedInput(format!("failed to build decoder: {e}")))?;
             guard.insert(d)
@@ -201,7 +276,17 @@ impl RecordDeserializer for AvroDeserializer {
 
         match partials.len() {
             0 => Err(SerdeError::MalformedInput("no records decoded".into())),
-            1 => Ok(partials.pop().unwrap()),
+            1 => {
+                let batch = partials.remove(0);
+                if batch.schema().as_ref() == schema.as_ref() {
+                    return Ok(batch);
+                }
+                RecordBatch::try_new(Arc::clone(schema), batch.columns().to_vec()).map_err(
+                    |error| {
+                        SerdeError::MalformedInput(format!("committed reader mismatch: {error}"))
+                    },
+                )
+            }
             _ => arrow_select::concat::concat_batches(schema, &partials)
                 .map_err(|e| SerdeError::MalformedInput(format!("concat: {e}"))),
         }
@@ -227,3 +312,37 @@ impl std::fmt::Debug for AvroDeserializer {
 
 #[cfg(test)]
 mod tests;
+
+struct WriterFetchObservation {
+    metrics: Option<super::KafkaSourceMetrics>,
+    started: std::time::Instant,
+    succeeded: bool,
+}
+
+impl WriterFetchObservation {
+    fn new(metrics: Option<super::KafkaSourceMetrics>) -> Self {
+        if let Some(metrics) = &metrics {
+            metrics.schema_cache_misses.inc();
+            metrics.schema_unresolved_records.inc();
+        }
+        Self {
+            metrics,
+            started: std::time::Instant::now(),
+            succeeded: false,
+        }
+    }
+}
+
+impl Drop for WriterFetchObservation {
+    fn drop(&mut self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.schema_unresolved_records.dec();
+            metrics
+                .schema_fetch_microseconds
+                .inc_by(u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            if !self.succeeded {
+                metrics.schema_fetch_failures.inc();
+            }
+        }
+    }
+}

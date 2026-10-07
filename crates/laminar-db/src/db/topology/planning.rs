@@ -93,8 +93,11 @@ impl LaminarDB {
         expected_parent: TopologyVersion,
         statements: &[String],
     ) -> Result<(ClusterTopologyValidation, CatalogManifest), DbError> {
-        let _catalog_read = self.topology_ddl_lock.read().await;
-        self.ensure_validation_catalog_available()?;
+        let active_inventory = {
+            let _catalog_read = self.topology_ddl_lock.read().await;
+            self.ensure_validation_catalog_available()?;
+            self.catalog_manifest_inventory()?
+        };
         let store = self.catalog_manifest_store.lock().clone().ok_or_else(|| {
             TopologyError::Protocol(
                 "topology validation requires a configured catalog authority".into(),
@@ -126,7 +129,7 @@ impl LaminarDB {
             ))
             .into());
         }
-        if self.catalog_manifest_inventory()? != parent.entries {
+        if active_inventory != parent.entries {
             return Err(TopologyError::Conflict("local catalog is not the exact committed parent inventory; complete catalog replay before validation".into()).into());
         }
         let active_identities = self.topology_definition_identities()?;
@@ -162,6 +165,7 @@ impl LaminarDB {
         .await?;
         let target_identities = candidate.topology_definition_identities()?;
         let target_graph = candidate.plan_topology_graph().await?;
+        super::catalog_changes::validate_prepared_targets(&candidate, &target)?;
         let objects = describe_catalog(
             &candidate,
             &target,
@@ -244,7 +248,7 @@ impl LaminarDB {
         Ok(())
     }
 
-    pub(super) fn isolated_topology_catalog(&self) -> Result<LaminarDB, DbError> {
+    pub(in crate::db) fn isolated_topology_catalog(&self) -> Result<LaminarDB, DbError> {
         let mut candidate = Self::open_with_config_and_vars_and_rules(
             self.config.clone(),
             self.config_vars.as_ref().clone(),
@@ -256,6 +260,12 @@ impl LaminarDB {
             &self.config,
         ));
         candidate.connector_registry = Arc::clone(&self.connector_registry);
+        for registration in self.connector_manager.lock().process_functions().values() {
+            candidate
+                .connector_manager
+                .lock()
+                .register_process_function(registration.clone());
+        }
         candidate.topology_planning_ownership_scope =
             Some(self.has_cluster_query_ownership_scope());
         *candidate.vnode_registry.lock() =
@@ -337,7 +347,12 @@ pub(super) async fn replay_entry(
             TopologyError::Invalid("candidate DDL and catalog identity disagree".into()).into(),
         );
     }
-    super::catalog_changes::apply_statement(candidate, &entry.ddl, &statement, &name).await
+    crate::ddl::schema_resolution::RESOLVED_SCHEMA
+        .scope(
+            entry.schema_binding.clone(),
+            super::catalog_changes::apply_statement(candidate, &entry.ddl, &statement, &name),
+        )
+        .await
 }
 
 pub(super) fn describe_catalog(

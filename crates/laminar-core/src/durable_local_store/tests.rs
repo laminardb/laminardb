@@ -520,7 +520,7 @@ fn exclusive_owner_is_held_until_background_jobs_release_it() {
 
     let directory = tempfile::tempdir().unwrap();
     let store = DurableLocalObjectStore::new_exclusive(directory.path(), LOCK).unwrap();
-    let background_owner = store.ownership_lock.clone().unwrap();
+    let background_owner = store.ownership_lease().unwrap().unwrap();
     assert!(DurableLocalObjectStore::new_exclusive(directory.path(), LOCK).is_err());
     drop(store);
     assert!(DurableLocalObjectStore::new_exclusive(directory.path(), LOCK).is_err());
@@ -684,4 +684,34 @@ async fn directory_publication_failure_is_latched() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("durability is unresolved"));
+}
+
+#[tokio::test]
+async fn idle_shared_store_releases_namespace_and_rejects_late_mutations() {
+    const LOCK: &str = ".test-shared-owner.lock";
+    let directory = tempfile::tempdir().unwrap();
+    let exclusive = DurableLocalObjectStore::new_exclusive(directory.path(), LOCK).unwrap();
+    let owner = exclusive.ownership_lease().unwrap().unwrap();
+    let shared = DurableLocalObjectStore::new(directory.path())
+        .unwrap()
+        .with_namespace_owner(&owner);
+    drop(exclusive);
+    let path = Path::from("contract");
+    shared
+        .put(&path, PutPayload::from_static(b"committed"))
+        .await
+        .unwrap();
+    drop(owner);
+    let replacement = DurableLocalObjectStore::new_exclusive(directory.path(), LOCK).unwrap();
+    let error = shared
+        .put(&path, PutPayload::from_static(b"stale"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ownership expired"));
+    let error = shared.delete(&path).await.unwrap_err();
+    assert!(error.to_string().contains("ownership expired"));
+    assert_eq!(
+        replacement.get(&path).await.unwrap().bytes().await.unwrap(),
+        b"committed".as_slice()
+    );
 }

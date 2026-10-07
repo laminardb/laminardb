@@ -74,6 +74,42 @@ impl SinkConnector for DeltaLakeSink {
         )
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        #[cfg(feature = "delta-lake")]
+        {
+            super::super::schema_resolution::delta_sink(config, input).await
+        }
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            let _ = (config, input);
+            Err(ConnectorError::FeatureUnsupported(
+                "Delta schema resolution requires the delta-lake feature".into(),
+            ))
+        }
+    }
+
+    async fn prepare_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        binding: &mut crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        #[cfg(feature = "delta-lake")]
+        {
+            super::super::schema_resolution::prepare_delta(config, binding).await
+        }
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            let _ = (config, binding);
+            Err(ConnectorError::FeatureUnsupported(
+                "Delta preparation requires the delta-lake feature".into(),
+            ))
+        }
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
@@ -87,7 +123,11 @@ impl SinkConnector for DeltaLakeSink {
                     "invalid Delta sink '_arrow_schema' encoding".into(),
                 )
             })?;
+            self.query_schema = Some(Arc::clone(&schema));
             self.schema = Some(Self::target_schema(&schema, self.config.write_mode));
+        }
+        if self.query_schema.is_none() {
+            return Err(ConnectorError::ConfigurationError("Delta sink needs its bound input schema before open; supply _arrow_schema or with_schema".into()));
         }
         #[cfg(feature = "delta-lake")]
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
@@ -104,6 +144,8 @@ impl SinkConnector for DeltaLakeSink {
                 "Delta exactly-once requires coordinated append mode".into(),
             ));
         }
+
+        self.bind_writer_contract(config).await?;
 
         if self.config.catalog_type == super::super::delta_config::DeltaCatalogType::None {
             let explicit_storage = if config.properties().is_empty() {
@@ -134,36 +176,16 @@ impl SinkConnector for DeltaLakeSink {
             );
         }
 
-        // When delta-lake feature is enabled, open/create the actual table.
-        // If Unity Catalog auto-create is configured but no schema is available
-        // yet, defer initialization to the first write_batch() call.
+        // Initialize only after the input contract and explicit creation policy are known.
         #[cfg(feature = "delta-lake")]
         {
-            let should_defer = matches!(
-                self.config.catalog_type,
-                super::super::delta_config::DeltaCatalogType::Unity { .. }
-            ) && self.config.catalog_storage_location.is_some()
-                && self.schema.is_none();
-
-            if should_defer {
-                info!(
-                    "Unity Catalog auto-create configured but pipeline schema not yet \
-                     available — deferring Delta table init to first begin_epoch"
-                );
-                self.needs_deferred_delta_init = true;
-                self.state = ConnectorState::Initializing;
-                return Ok(());
-            }
-
             let deadline = self.operation_deadline();
             self.init_delta_table(deadline).await?;
-
-            // If table still has no version after init (new table, no schema yet),
-            // defer full creation to the first write_batch() when schema is available.
-            if self.table.as_ref().is_some_and(|t| t.version().is_none()) && self.schema.is_none() {
-                self.needs_deferred_delta_init = true;
-                self.state = ConnectorState::Initializing;
-                return Ok(());
+            if let Some(table) = &self.table {
+                super::super::schema_resolution::verify_identity(
+                    self.schema_binding.as_ref(),
+                    &super::super::schema_resolution::delta_native(table)?,
+                )?;
             }
         }
 
@@ -186,8 +208,7 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
-        // Accept both Running and Initializing (deferred init in progress).
-        if self.state != ConnectorState::Running && self.state != ConnectorState::Initializing {
+        if self.state != ConnectorState::Running {
             return Err(ConnectorError::InvalidState {
                 expected: "Running".into(),
                 actual: self.state.to_string(),
@@ -206,31 +227,24 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        // Handle schema on first write. In upsert mode, strip metadata columns
-        // (_op, _ts_ms) so the Delta table isn't created with changelog columns.
-        if self.schema.is_none() {
-            self.schema = Some(Self::target_schema(&batch.schema(), self.config.write_mode));
+        if self
+            .query_schema
+            .as_ref()
+            .is_none_or(|schema| schema.as_ref() != batch.schema().as_ref())
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "Delta batch changed the frozen query-output schema".into(),
+            ));
         }
-
-        // Fallback for deferred init: if begin_epoch() couldn't complete
-        // init (schema was still None), complete it now that the first
-        // batch provides a schema.
-        #[cfg(feature = "delta-lake")]
-        if self.needs_deferred_delta_init {
-            info!("schema now available from first batch — completing deferred Delta table init");
-            match self.init_delta_table(deadline).await {
-                Ok(()) => {
-                    self.needs_deferred_delta_init = false;
-                    self.state = ConnectorState::Running;
-                    info!("Delta Lake sink connector opened successfully (deferred)");
-                }
-                Err(e) => {
-                    self.state = ConnectorState::Failed;
-                    return Err(e);
-                }
-            }
-        }
-
+        let projected;
+        let batch = if let Some(indices) = &self.writer_projection {
+            projected = batch
+                .project(indices)
+                .map_err(|error| ConnectorError::SchemaMismatch(error.to_string()))?;
+            &projected
+        } else {
+            batch
+        };
         let num_rows = batch.num_rows();
         let estimated_bytes = Self::estimate_batch_size(batch);
 
@@ -307,32 +321,6 @@ impl SinkConnector for DeltaLakeSink {
             self.ensure_coordinated_reconciled()?;
             self.ensure_write_generation_usable()?;
         }
-        #[cfg(feature = "delta-lake")]
-        let deadline = self.operation_deadline();
-
-        // Complete deferred Delta table init on the first epoch.
-        #[cfg(feature = "delta-lake")]
-        if self.needs_deferred_delta_init {
-            // Schema may not be available yet on the very first epoch.
-            // If so, buffer the epoch — the write_batch will provide it.
-            // But if the pipeline provided a schema via with_schema() or a
-            // previous epoch's write_batch set it, complete init now.
-            if self.schema.is_some() {
-                info!("schema available — completing deferred Delta table init");
-                match self.init_delta_table(deadline).await {
-                    Ok(()) => {
-                        self.needs_deferred_delta_init = false;
-                        self.state = ConnectorState::Running;
-                        info!("Delta Lake sink connector opened successfully (deferred)");
-                    }
-                    Err(e) => {
-                        self.state = ConnectorState::Failed;
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
         #[cfg(feature = "delta-lake")]
         if self.is_coordinated()
             && (!self.buffer.is_empty()

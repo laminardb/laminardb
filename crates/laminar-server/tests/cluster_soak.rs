@@ -10474,6 +10474,7 @@ connector = "delta-lake"
 [sink.properties]
 "table.path" = "{table_uri}"
 "write.mode" = "append"
+"auto.create" = "true"
 "storage.aws_endpoint" = "{endpoint}"
 "storage.aws_access_key_id" = "{access_key}"
 "storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"

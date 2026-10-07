@@ -981,6 +981,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     let catalog = CatalogManifestStore::new(Arc::clone(&leader.authority));
     let parent = CatalogManifest {
         entries: vec![CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: "existing".into(),
             kind: CatalogObjectKind::Source,
             catalog_generation: 1,
@@ -1002,6 +1003,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         .unwrap();
     let mut target = parent.clone();
     target.entries.push(CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "candidate".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 1,

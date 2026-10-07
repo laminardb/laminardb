@@ -294,6 +294,7 @@ impl Fixture {
                 ])
                 .map(
                     |(ddl, (name, kind, catalog_generation))| CatalogManifestEntry {
+                        schema_binding: None,
                         canonical_name: name.into(),
                         kind,
                         catalog_generation,
@@ -351,6 +352,7 @@ impl Fixture {
                     registry.register_source(
                         name,
                         ConnectorInfo {
+                            schema_capabilities: laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                             name: name.into(),
                             display_name: name.into(),
                             version: "1".into(),
@@ -374,6 +376,7 @@ impl Fixture {
                 registry.register_sink(
                     "planning-sink",
                     ConnectorInfo {
+                        schema_capabilities: laminar_connectors::schema::resolution::SchemaCapabilities::declared(true),
                         name: "planning-sink".into(),
                         display_name: "planning sink".into(),
                         version: "1".into(),
@@ -564,6 +567,7 @@ async fn admit_preparation_candidate(
         fixture,
         assignments,
         vec![laminar_core::cluster::control::CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: "future".into(),
             kind: laminar_core::cluster::control::CatalogObjectKind::Stream,
             catalog_generation: 1,
@@ -768,6 +772,7 @@ async fn assert_root_staging(add_source: bool) {
             ])
             .map(
                 |(ddl, (name, kind))| laminar_core::cluster::control::CatalogManifestEntry {
+                    schema_binding: None,
                     canonical_name: name.into(),
                     kind,
                     catalog_generation: 1,
@@ -983,6 +988,7 @@ fn stateful_additions() -> Vec<laminar_core::cluster::control::CatalogManifestEn
         ("new_join", "CREATE STREAM new_join AS SELECT l.id AS id, l.value AS left_value, r.value AS right_value FROM trades l JOIN added_source r ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND"),
         ("new_temporal", "CREATE STREAM new_temporal AS SELECT l.id AS id, r.value AS right_value FROM trades l LEFT JOIN added_source FOR SYSTEM_TIME AS OF l.ts AS r ON l.id = r.id"),
     ].into_iter().map(|(name, ddl)| laminar_core::cluster::control::CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: name.into(), kind: laminar_core::cluster::control::CatalogObjectKind::Stream,
         catalog_generation: 1, ddl: ddl.into(),
     }).collect()

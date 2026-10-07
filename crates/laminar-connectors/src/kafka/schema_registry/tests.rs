@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::*;
-use arrow_schema::{Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 
 #[test]
 fn test_avro_to_arrow_simple_record() {
@@ -546,7 +546,10 @@ fn test_arrow_to_avro_array_type() {
     let avro: serde_json::Value = serde_json::from_str(&avro_str).unwrap();
     let field = &avro["fields"][0];
     assert_eq!(field["type"]["type"], "array");
-    assert_eq!(field["type"]["items"], "string");
+    assert_eq!(
+        field["type"]["items"],
+        serde_json::json!(["null", "string"])
+    );
 }
 
 #[test]
@@ -571,7 +574,7 @@ fn test_arrow_to_avro_map_type() {
     let avro: serde_json::Value = serde_json::from_str(&avro_str).unwrap();
     let field = &avro["fields"][0];
     assert_eq!(field["type"]["type"], "map");
-    assert_eq!(field["type"]["values"], "long");
+    assert_eq!(field["type"]["values"], serde_json::json!(["null", "long"]));
 }
 
 #[test]
@@ -616,6 +619,10 @@ fn test_arrow_to_avro_fixed_type() {
 
 fn make_cached_schema(id: i32) -> CachedSchema {
     CachedSchema {
+        resolved_schema_str: format!(
+            r#"{{"type":"record","name":"t{id}","fields":[{{"name":"x","type":"int"}}]}}"#
+        ),
+        references: Vec::new(),
         id,
         version: 1,
         schema_type: SchemaType::Avro,

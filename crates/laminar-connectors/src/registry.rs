@@ -52,6 +52,30 @@ pub type TableSourceFactory = Arc<
 /// Factory for constructing a lookup source (async, for on-demand mode).
 #[async_trait]
 pub trait LookupSourceFactory: Send + Sync {
+    /// Resolve a lookup reader before opening its cache-miss data path.
+    ///
+    /// # Errors
+    /// The default requires explicit fields. Custom metadata-capable factories
+    /// override this hook without consuming data or creating external resources.
+    async fn resolve_schema(
+        &self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let schema = explicit.ok_or_else(|| {
+            ConnectorError::FeatureUnsupported(
+                "lookup connector needs explicit fields; no metadata resolver is implemented"
+                    .into(),
+            )
+        })?;
+        crate::schema::resolution::logical_binding(
+            config,
+            crate::schema::resolution::SchemaDirection::Source,
+            crate::schema::resolution::SchemaOrigin::Explicit,
+            &schema,
+        )
+    }
+
     /// Build a lookup source instance from the given config.
     ///
     /// `declared_schema` is the table's declared Arrow schema, when known.
@@ -78,6 +102,9 @@ pub struct ConnectorRegistry {
     /// A registration holds a read guard through insertion; `freeze` takes the write guard.
     /// This makes the freeze boundary linearizable with concurrent registration attempts.
     frozen: Arc<RwLock<bool>>,
+    resolution_slots: Arc<tokio::sync::Semaphore>,
+    resolution_metrics:
+        Arc<RwLock<Option<Arc<crate::schema::resolution_metrics::ResolutionMetrics>>>>,
 }
 
 impl ConnectorRegistry {
@@ -90,7 +117,102 @@ impl ConnectorRegistry {
             table_sources: Arc::new(RwLock::new(HashMap::new())),
             lookup_sources: Arc::new(RwLock::new(HashMap::new())),
             frozen: Arc::new(RwLock::new(false)),
+            resolution_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            resolution_metrics: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Attach bounded schema resolution metrics to the database's existing registry.
+    ///
+    /// # Errors
+    /// Rejects duplicate installation or metric-name conflicts.
+    pub fn register_schema_resolution_metrics(
+        &self,
+        registry: &prometheus::Registry,
+    ) -> Result<(), ConnectorError> {
+        let mut slot = self.resolution_metrics.write();
+        if slot.is_some() {
+            return Err(ConnectorError::Internal(
+                "schema resolution metrics are already installed".into(),
+            ));
+        }
+        *slot = Some(crate::schema::resolution_metrics::ResolutionMetrics::register(registry)?);
+        Ok(())
+    }
+
+    async fn resolve_guarded<F>(
+        &self,
+        direction: &'static str,
+        config: &ConnectorConfig,
+        requested: Option<SchemaRef>,
+        work: F,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError>
+    where
+        F: std::future::Future<
+            Output = Result<crate::schema::resolution::SchemaBinding, ConnectorError>,
+        >,
+    {
+        let observation = crate::schema::resolution_metrics::ResolutionObservation::new(
+            self.resolution_metrics.read().clone(),
+            direction,
+        );
+        let result = async {
+            let expected = if direction == "sink" {
+                crate::schema::resolution::SchemaDirection::Sink
+            } else {
+                crate::schema::resolution::SchemaDirection::Source
+            };
+            if let Some(schema) = &requested {
+                crate::schema::resolution::logical_binding(
+                    config,
+                    expected,
+                    crate::schema::resolution::SchemaOrigin::Explicit,
+                    schema,
+                )?;
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let _permit = tokio::time::timeout_at(deadline, self.resolution_slots.acquire())
+                .await
+                .map_err(|_| ConnectorError::Timeout(30_000))?
+                .map_err(|_| {
+                    ConnectorError::Internal("schema resolution admission is closed".into())
+                })?;
+            let binding = tokio::time::timeout_at(deadline, work)
+                .await
+                .map_err(|_| ConnectorError::Timeout(30_000))??;
+            if binding.direction != expected || binding.connector != config.connector_type() {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "{} {direction} resolver returned a contract for a different connector or direction",
+                    config.connector_type()
+                )));
+            }
+            if let Some(requested) = requested {
+                let fields = binding.logical.fields().get(..requested.fields().len());
+                if fields != Some(requested.fields().as_ref())
+                    || binding.logical.metadata() != requested.metadata()
+                    || (expected == crate::schema::resolution::SchemaDirection::Sink
+                        && binding.logical != *requested)
+                {
+                    return Err(ConnectorError::SchemaMismatch(format!(
+                        "{} {direction} resolver changed declared fields or the bound query schema",
+                        config.connector_type()
+                    )));
+                }
+            }
+            binding
+                .canonical_bytes()
+                .map_err(crate::schema::resolution::binding_error)?;
+            Ok(binding)
+        }
+        .await;
+        if result.is_err() {
+            tracing::warn!(
+                direction,
+                stage = "schema-resolution",
+                "connector contract resolution failed"
+            );
+        }
+        observation.finish(result)
     }
 
     /// Permanently closes this registry to factory mutation.
@@ -196,6 +318,68 @@ impl ConnectorRegistry {
         Ok((!schema.fields().is_empty()).then_some(schema))
     }
 
+    /// Resolve a source contract on the control plane, without starting a reader.
+    ///
+    /// # Errors
+    /// Rejects unsupported discovery, malformed/empty contracts and metadata failures.
+    pub async fn resolve_source_schema(
+        &self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        self.resolve_guarded("source", config, explicit.clone(), async {
+        let info = self.source_info(config.connector_type()).ok_or_else(|| {
+            ConnectorError::ConfigurationError("source factory is not registered".into())
+        })?;
+        info.schema_capabilities.validate_native_format(config)?;
+        if explicit.is_none()
+            && info.schema_capabilities.discovery
+                == crate::schema::resolution::SchemaDiscovery::Explicit
+            && !info.schema_capabilities.built_in_formats.iter().any(|format| {
+                format.eq_ignore_ascii_case(config.get("format").unwrap_or("native"))
+            })
+        {
+            return Err(ConnectorError::FeatureUnsupported(format!(
+                "{} source format '{}': authoritative schema discovery is unavailable; declare columns explicitly",
+                config.connector_type(), config.get("format").unwrap_or("native")
+            )));
+        }
+        let mut source = self.create_source(config, None)?;
+        let mut binding = source.resolve_schema(config, explicit).await?;
+        if binding.origin == crate::schema::resolution::SchemaOrigin::BuiltIn
+            && info.schema_capabilities.discovery == crate::schema::resolution::SchemaDiscovery::Metadata
+            && !info.schema_capabilities.built_in_formats.iter().any(|format| {
+                format.eq_ignore_ascii_case(config.get("format").unwrap_or("native"))
+            })
+        {
+            binding.origin = crate::schema::resolution::SchemaOrigin::Metadata;
+        }
+        Ok(binding)
+        }).await
+    }
+
+    /// Bind query output to a destination's writer contract without external mutation.
+    ///
+    /// # Errors
+    /// Rejects incompatible writer fields, unsupported codecs and metadata failures.
+    pub async fn resolve_sink_schema(
+        &self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        self.resolve_guarded("sink", config, Some(Arc::clone(&input)), async {
+            self.sink_info(config.connector_type())
+                .ok_or_else(|| {
+                    ConnectorError::ConfigurationError("sink factory is not registered".into())
+                })?
+                .schema_capabilities
+                .validate_native_format(config)?;
+            let mut sink = self.create_sink(config, None)?;
+            sink.resolve_schema(config, input).await
+        })
+        .await
+    }
+
     /// Creates a new source connector instance.
     ///
     /// The factory creates a default-configured connector. The caller forwards
@@ -213,13 +397,16 @@ impl ConnectorRegistry {
         config: &ConnectorConfig,
         registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
-        let sources = self.sources.read();
-        let (_, factory) = sources.get(config.connector_type()).ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "unknown source connector type: '{}'",
-                config.connector_type()
-            ))
-        })?;
+        let factory = {
+            let sources = self.sources.read();
+            let (_, factory) = sources.get(config.connector_type()).ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "unknown source connector type: '{}'",
+                    config.connector_type()
+                ))
+            })?;
+            Arc::clone(factory)
+        };
         factory(registry)
     }
 
@@ -257,13 +444,16 @@ impl ConnectorRegistry {
         config: &ConnectorConfig,
         registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Box<dyn SinkConnector>, ConnectorError> {
-        let sinks = self.sinks.read();
-        let (_, factory) = sinks.get(config.connector_type()).ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "unknown sink connector type: '{}'",
-                config.connector_type()
-            ))
-        })?;
+        let factory = {
+            let sinks = self.sinks.read();
+            let (_, factory) = sinks.get(config.connector_type()).ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "unknown sink connector type: '{}'",
+                    config.connector_type()
+                ))
+            })?;
+            Arc::clone(factory)
+        };
         factory(config, registry)
     }
 
@@ -298,6 +488,73 @@ impl ConnectorRegistry {
         Ok(())
     }
 
+    /// Resolve a reference-table contract without hydrating any rows.
+    ///
+    /// # Errors
+    /// Rejects unsupported discovery, invalid metadata and the bounded resolution deadline.
+    pub async fn resolve_table_schema(
+        &self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        self.resolve_guarded("reference", config, explicit.clone(), async {
+            let info = self.table_sources.read()
+                .get(config.connector_type()).map(|(info, _)| info.clone())
+                .ok_or_else(|| ConnectorError::ConfigurationError(format!(
+                    "connector type '{}' has no registered snapshot-capable table source (reference-table source)",
+                    config.connector_type()
+                )))?;
+            info.schema_capabilities.validate_native_format(config)?;
+            if info.schema_capabilities.discovery == crate::schema::resolution::SchemaDiscovery::Explicit {
+                let schema = explicit.ok_or_else(|| ConnectorError::FeatureUnsupported(
+                    "reference-table discovery is unsupported; declare explicit fields".into()
+                ))?;
+                return crate::schema::resolution::logical_binding(
+                    config, crate::schema::resolution::SchemaDirection::Source,
+                    crate::schema::resolution::SchemaOrigin::Explicit, &schema
+                );
+            }
+            let mut source = self.create_table_source(
+                config,
+                explicit
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty())),
+            )?;
+            source.resolve_schema(config, explicit).await
+        })
+        .await
+    }
+
+    /// Resolve lookup fields from native metadata or the factory's explicit reader contract.
+    ///
+    /// # Errors
+    /// Rejects unregistered factories, missing authoritative fields and incompatible metadata.
+    pub async fn resolve_lookup_schema(
+        &self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let (info, factory) = self
+            .lookup_sources
+            .read()
+            .get(config.connector_type())
+            .map(|(info, factory)| (info.clone(), Arc::clone(factory)))
+            .ok_or_else(|| {
+                ConnectorError::ConfigurationError("lookup factory is not registered".into())
+            })?;
+        if self.has_table_source(config.connector_type()) {
+            return self.resolve_table_schema(config, explicit).await;
+        }
+        info.schema_capabilities.validate_native_format(config)?;
+        self.resolve_guarded(
+            "lookup",
+            config,
+            explicit.clone(),
+            factory.resolve_schema(config, explicit),
+        )
+        .await
+    }
+
     /// Creates a new reference table source instance.
     ///
     /// The connector type is determined by `config.connector_type()`. The declared schema is the
@@ -312,13 +569,16 @@ impl ConnectorRegistry {
         config: &ConnectorConfig,
         declared_schema: SchemaRef,
     ) -> Result<Box<dyn ReferenceTableSource>, ConnectorError> {
-        let table_sources = self.table_sources.read();
-        let (_, factory) = table_sources.get(config.connector_type()).ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "connector type '{}' is not registered as a snapshot-capable table source",
-                config.connector_type()
-            ))
-        })?;
+        let factory = {
+            let table_sources = self.table_sources.read();
+            let (_, factory) = table_sources.get(config.connector_type()).ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                        "connector type '{}' has no registered snapshot-capable table source (reference-table source)",
+                        config.connector_type()
+                ))
+            })?;
+            Arc::clone(factory)
+        };
         factory(config, declared_schema)
     }
 
@@ -387,7 +647,28 @@ impl ConnectorRegistry {
             let lookup_sources = self.lookup_sources.read();
             Arc::clone(&lookup_sources.get(config.connector_type())?.1)
         };
-        Some(factory.build(config, declared_schema).await)
+        Some(
+            async {
+                let binding = match config.schema_binding() {
+                    Some(binding) => binding.clone(),
+                    None => {
+                        self.resolve_lookup_schema(&config, declared_schema.clone())
+                            .await?
+                    }
+                };
+                let source = factory
+                    .build(config.clone(), Some(Arc::new(binding.logical.clone())))
+                    .await?;
+                let bound = crate::schema::lookup_binding::BoundLookup::new(
+                    source,
+                    self.clone(),
+                    config,
+                    binding,
+                )?;
+                Ok(Arc::new(bound) as Arc<dyn laminar_core::lookup::source::LookupSourceDyn>)
+            }
+            .await,
+        )
     }
 
     /// Returns information about a registered source connector.
@@ -469,6 +750,7 @@ mod tests {
 
     fn mock_info(name: &str, is_source: bool, is_sink: bool) -> ConnectorInfo {
         ConnectorInfo {
+            schema_capabilities: crate::schema::resolution::SchemaCapabilities::declared(false),
             name: name.to_string(),
             display_name: name.to_string(),
             version: "0.1.0".to_string(),
@@ -484,6 +766,125 @@ mod tests {
             arrow_schema::DataType::Int64,
             false,
         )]))
+    }
+
+    #[tokio::test]
+    async fn malformed_declared_contracts_fail_before_polling_metadata_work() {
+        let registry = ConnectorRegistry::new();
+        let config = ConnectorConfig::new("custom");
+        let malformed = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "bad",
+            arrow_schema::DataType::Decimal128(0, 0),
+            false,
+        )]));
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let error = registry
+            .resolve_guarded("source", &config, Some(malformed), async {
+                polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                unreachable!("invalid Arrow metadata must fail before connector I/O")
+            })
+            .await
+            .unwrap_err();
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(error, ConnectorError::SchemaMismatch(_)));
+        assert_eq!(registry.resolution_slots.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn custom_resolvers_cannot_return_another_connector_or_direction() {
+        use crate::schema::resolution::{SchemaBinding, SchemaDirection, SchemaOrigin};
+        let registry = ConnectorRegistry::new();
+        let config = ConnectorConfig::new("custom");
+        for (connector, direction) in [
+            ("custom", SchemaDirection::Sink),
+            ("other", SchemaDirection::Source),
+        ] {
+            let binding = SchemaBinding::logical(
+                connector,
+                direction,
+                SchemaOrigin::Explicit,
+                declared_schema().as_ref().clone(),
+            )
+            .unwrap();
+            let error = registry
+                .resolve_guarded("source", &config, None, async { Ok(binding) })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ConnectorError::SchemaMismatch(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_resolvers_preserve_declared_fields_and_the_entire_sink_query() {
+        use crate::schema::resolution::{SchemaBinding, SchemaDirection, SchemaOrigin};
+        let registry = ConnectorRegistry::new();
+        let config = ConnectorConfig::new("custom");
+        let requested = declared_schema();
+        for direction in [SchemaDirection::Source, SchemaDirection::Sink] {
+            let changed = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Utf8,
+                false,
+            )]);
+            let binding =
+                SchemaBinding::logical("custom", direction, SchemaOrigin::Explicit, changed)
+                    .unwrap();
+            let label = if direction == SchemaDirection::Sink {
+                "sink"
+            } else {
+                "source"
+            };
+            let error = registry
+                .resolve_guarded(label, &config, Some(requested.clone()), async {
+                    Ok(binding)
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("declared fields"));
+        }
+        let extended = arrow_schema::Schema::new(vec![
+            requested.field(0).clone(),
+            arrow_schema::Field::new("extra", arrow_schema::DataType::Boolean, true),
+        ]);
+        let binding = SchemaBinding::logical(
+            "custom",
+            SchemaDirection::Sink,
+            SchemaOrigin::Query,
+            extended,
+        )
+        .unwrap();
+        assert!(registry
+            .resolve_guarded("sink", &config, Some(requested), async { Ok(binding) })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_resolution_releases_its_global_slot_and_metric() {
+        let registry = ConnectorRegistry::new();
+        let metrics = prometheus::Registry::new();
+        registry
+            .register_schema_resolution_metrics(&metrics)
+            .unwrap();
+        let config = ConnectorConfig::new("custom");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notification = started.clone();
+        {
+            let future = registry.resolve_guarded("source", &config, None, async {
+                notification.notify_one();
+                std::future::pending().await
+            });
+            tokio::pin!(future);
+            tokio::select! { result = &mut future => panic!("unexpected result: {result:?}"), () = started.notified() => {} }
+            assert_eq!(registry.resolution_slots.available_permits(), 7);
+        }
+        assert_eq!(registry.resolution_slots.available_permits(), 8);
+        let active = metrics
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == "laminar_schema_resolution_active")
+            .unwrap();
+        assert_eq!(active.get_metric()[0].get_gauge().value(), 0.0);
     }
 
     #[test]

@@ -21,6 +21,7 @@ async fn store() -> (CatalogManifestStore, Arc<InMemory>, LeaderProof) {
 
 fn entry(name: &str) -> CatalogManifestEntry {
     CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: name.to_string(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 1,
@@ -140,6 +141,7 @@ fn manifest_bounds_are_enforced_before_durable_writes() {
     ));
 
     let oversized = CatalogManifest::new(vec![CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "events".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 1,
@@ -185,4 +187,50 @@ async fn tampered_sealed_manifest_blob_fails_closed() {
     assert!(error
         .to_string()
         .contains("does not match its sealed reference"));
+}
+
+#[test]
+fn legacy_manifest_encoding_remains_byte_for_byte_stable() {
+    let manifest = CatalogManifest::new(vec![entry("events")]).unwrap();
+    let expected = br#"{"entries":[{"canonical_name":"events","kind":"source","ddl":"CREATE SOURCE events (k BIGINT)"}]}"#.to_vec();
+    let (canonical, _) = manifest.encode_and_reference().unwrap();
+    assert!(!String::from_utf8(canonical.clone())
+        .unwrap()
+        .contains("schema_binding"));
+    let decoded: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
+    assert_eq!(canonical, expected);
+    assert_eq!(
+        decoded,
+        serde_json::from_slice::<serde_json::Value>(&expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::from_slice::<CatalogManifest>(&canonical).unwrap(),
+        manifest
+    );
+}
+
+#[test]
+fn manifest_embeds_complete_native_and_arrow_contracts() {
+    use crate::schema_binding::{SchemaBinding, SchemaDirection, SchemaOrigin};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    let mut entry = entry("events");
+    entry.schema_binding = Some(
+        SchemaBinding::logical(
+            "test",
+            SchemaDirection::Source,
+            SchemaOrigin::Metadata,
+            Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("Europe/London".into())),
+                false,
+            )]),
+        )
+        .unwrap(),
+    );
+    let manifest = CatalogManifest::new(vec![entry]).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<CatalogManifest>(&manifest.encode_and_reference().unwrap().0)
+            .unwrap(),
+        manifest
+    );
 }

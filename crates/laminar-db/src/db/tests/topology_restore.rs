@@ -44,6 +44,7 @@ async fn restorable_fixture_with_additions(
         ])
         .map(
             |(ddl, (name, kind))| laminar_core::cluster::control::CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: name.into(),
                 kind,
                 catalog_generation: 1,

@@ -209,6 +209,15 @@ impl SourceConnector for OtelSource {
         Some(self.task_tracker.clone())
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        self.discover_schema(config.properties()).await?;
+        crate::schema::resolution::fixed_binding(config, explicit, &self.schema())
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
         if matches!(&position, SourcePosition::Initialized { .. }) {
@@ -232,12 +241,15 @@ impl SourceConnector for OtelSource {
 
         let candidate_config = OtelSourceConfig::from_config(&config)?;
 
-        let candidate_schema = match candidate_config.signals {
+        let protocol = match candidate_config.signals {
             OtelSignal::Traces => traces_schema(),
             OtelSignal::Metrics => metrics_schema(),
             OtelSignal::Logs => logs_schema(),
         };
 
+        let binding =
+            crate::schema::resolution::fixed_binding(&config, config.arrow_schema(), &protocol)?;
+        let candidate_schema = Arc::new(binding.logical);
         let (batch_tx, batch_rx) =
             mpsc::bounded_async::<RecordBatch>(candidate_config.channel_capacity);
 
@@ -357,7 +369,9 @@ impl SourceConnector for OtelSource {
         self.checkpoint_seq += 1;
 
         if batches.len() == 1 {
-            return Ok(Some(SourceBatch::new(batches.into_iter().next().unwrap())));
+            return Ok(Some(SourceBatch::new(
+                crate::schema::resolution::project_batch(&batches.remove(0), &self.schema)?,
+            )));
         }
 
         let schema = batches[0].schema();
@@ -366,7 +380,9 @@ impl SourceConnector for OtelSource {
                 ConnectorError::ReadError(format!("failed to concatenate OTel batches: {e}"))
             })?;
 
-        Ok(Some(SourceBatch::new(combined)))
+        Ok(Some(SourceBatch::new(
+            crate::schema::resolution::project_batch(&combined, &self.schema)?,
+        )))
     }
 
     async fn discover_schema(

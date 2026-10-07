@@ -6,6 +6,8 @@ pub mod cdc;
 pub mod lookup;
 #[cfg(feature = "postgres-cdc")]
 pub mod reference;
+#[cfg(any(feature = "postgres-cdc", feature = "postgres-sink"))]
+mod schema_metadata;
 #[cfg(feature = "postgres-sink")]
 pub mod sink;
 #[cfg(feature = "postgres-sink")]
@@ -72,6 +74,11 @@ pub fn register_postgres_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            true,
+            crate::schema::resolution::SchemaPreparation::ExplicitTableCreation,
+        ),
         name: "postgres-sink".to_string(),
         display_name: "PostgreSQL Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

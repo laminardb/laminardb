@@ -55,18 +55,21 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
     ];
     let manifest = CatalogManifest::new(vec![
         CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: "trades".into(),
             kind: CatalogObjectKind::Source,
             catalog_generation: 1,
             ddl: statements[0].clone(),
         },
         CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: "totals".into(),
             kind: CatalogObjectKind::Stream,
             catalog_generation: 1,
             ddl: statements[1].clone(),
         },
         CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: "totals_sink".into(),
             kind: CatalogObjectKind::Sink,
             catalog_generation: 1,

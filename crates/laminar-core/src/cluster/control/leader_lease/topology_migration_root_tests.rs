@@ -95,6 +95,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         parent
             .entries
             .push(crate::cluster::control::CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: name.into(),
                 kind,
                 catalog_generation: 7,
@@ -150,6 +151,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         target
             .entries
             .push(crate::cluster::control::CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: "later".into(),
                 kind: CatalogObjectKind::Stream,
                 catalog_generation: 1,
@@ -163,6 +165,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
             ("added_sink", CatalogObjectKind::Sink, "CREATE SINK added_sink FROM added_stream INTO kafka ('topic' = 'new-output')"),
         ] {
             target.entries.push(crate::cluster::control::CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: name.into(), kind, catalog_generation: 1, ddl: ddl.into(),
             });
         }

@@ -102,6 +102,14 @@ impl LaminarDB {
             )
             .await
             .map_err(|_| laminar_core::cluster::control::TopologyError::Contended)??;
+            let _schema_creation =
+                tokio::time::timeout_at(deadline, self.schema_creation_lock.lock())
+                    .await
+                    .map_err(|_| {
+                        DbError::Pipeline(
+                            "schema preparation exceeded the recovery deadline".into(),
+                        )
+                    })?;
             return Box::pin(self.start_with_runtime_image(
                 PipelineLifecycleAuthority::CoordinatedRecovery,
                 Some(TopologyStartup { image, deadline }),
@@ -147,6 +155,7 @@ impl LaminarDB {
                 }
             }
         }
+        let _schema_creation = self.schema_creation_lock.lock().await;
         self.start_with_runtime_image(
             authority,
             #[cfg(feature = "cluster")]
@@ -161,6 +170,13 @@ impl LaminarDB {
         image: crate::db::PreparedTopologyRestore,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        let _schema_creation = tokio::time::timeout_at(deadline, self.schema_creation_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::Pipeline(
+                    "schema preparation exceeded the topology installation deadline".into(),
+                )
+            })?;
         self.start_with_runtime_image(
             PipelineLifecycleAuthority::TopologyInstallation,
             Some(TopologyStartup { image, deadline }),

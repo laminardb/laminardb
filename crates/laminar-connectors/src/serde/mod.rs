@@ -5,6 +5,14 @@ pub mod csv;
 pub mod debezium;
 pub mod json;
 pub mod raw;
+#[cfg(any(
+    test,
+    feature = "kafka",
+    feature = "nats",
+    feature = "websocket",
+    feature = "files"
+))]
+pub(crate) mod schema_contract;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;

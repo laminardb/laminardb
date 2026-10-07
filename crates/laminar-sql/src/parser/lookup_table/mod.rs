@@ -286,9 +286,9 @@ pub fn parse_create_lookup_table(
         }
     }
 
-    if columns.is_empty() {
+    if columns.is_empty() && primary_key.is_empty() {
         return Err(ParseError::StreamingError(
-            "LOOKUP TABLE must have at least one column".to_string(),
+            "omitted LOOKUP TABLE fields require a separately declared PRIMARY KEY and a metadata-capable connector".to_string(),
         ));
     }
 

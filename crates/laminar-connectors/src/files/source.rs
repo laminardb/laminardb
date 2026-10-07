@@ -109,6 +109,7 @@ pub struct FileSource {
     config: Option<FileSourceConfig>,
     /// Output Arrow schema (resolved in `start()`).
     schema: SchemaRef,
+    schema_contract: Option<String>,
     /// Format decoder (created in `start()`).
     decoder: Option<Box<dyn FormatDecoder>>,
     /// File discovery engine (started in `start()` after cursor validation).
@@ -147,6 +148,7 @@ impl FileSource {
         Self {
             config: None,
             schema: empty_schema,
+            schema_contract: None,
             decoder: None,
             discovery: None,
             manifest: FileIngestionManifest::new(),
@@ -214,6 +216,14 @@ impl SourceConnector for FileSource {
         Some(self.task_tracker.clone())
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        super::schema_resolution::resolve(config, explicit).await
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         if self.is_open || self.discovery.is_some() || self.restart_forbidden {
             return Err(ConnectorError::InvalidState {
@@ -226,51 +236,51 @@ impl SourceConnector for FileSource {
             });
         }
 
-        let (config, position, _) = request.into_parts();
-        let src_config = FileSourceConfig::from_connector_config(&config)?;
-
-        // Decode and validate the durable manifest before discovery can observe a
-        // single path. A corrupt engine checkpoint is fatal: starting from an empty
-        // manifest would rediscover and duplicate every previously ingested file.
-        let (manifest, progress) = restore_ingestion_position(position)?;
-
-        // Resolve format (explicit or auto-detect from path).
-        let format = match src_config.format {
-            Some(f) => f,
-            None => FileFormat::from_extension(&src_config.path).ok_or_else(|| {
-                ConnectorError::ConfigurationError(
-                    "cannot detect format from path; specify 'format' explicitly".into(),
-                )
-            })?,
+        let (mut config, position, _) = request.into_parts();
+        let saved = match &position {
+            SourcePosition::Resume { checkpoint, .. } => checkpoint
+                .get_metadata("schema.contract")
+                .map(str::to_owned),
+            _ => None,
         };
-
+        let resumed = !matches!(position, SourcePosition::Initial);
+        let src_config = FileSourceConfig::from_connector_config(&config)?;
+        // Validate cursor evidence before metadata I/O. Never repair corrupt progress by discovery.
+        let (manifest, progress) = restore_ingestion_position(position)?;
+        self.prepare_reader_contract(&mut config, saved, resumed, &src_config)
+            .await?;
+        let format = src_config
+            .format
+            .or_else(|| FileFormat::from_extension(&src_config.path))
+            .ok_or_else(|| {
+                ConnectorError::ConfigurationError(
+                    "cannot detect file format; specify format explicitly".into(),
+                )
+            })?;
+        let committed = config
+            .schema_binding()
+            .map(|binding| Arc::new(binding.logical.clone()));
+        if let Some(schema) = &committed {
+            let payload = if src_config.include_metadata {
+                Arc::new(
+                    schema
+                        .project(&(0..schema.fields().len().saturating_sub(1)).collect::<Vec<_>>())
+                        .map_err(|error| ConnectorError::SchemaMismatch(error.to_string()))?,
+                )
+            } else {
+                Arc::clone(schema)
+            };
+            config.set(
+                "_arrow_schema",
+                crate::config::encode_arrow_schema_ipc(&payload),
+            );
+        }
         // Build decoder and resolve schema.
         let (decoder, schema) = build_decoder_and_schema(format, &src_config, &config)?;
 
-        // Optionally append _metadata struct column.
-        let final_schema = if src_config.include_metadata {
-            let mut fields: Vec<Field> =
-                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-            fields.push(Field::new(
-                "_metadata",
-                DataType::Struct(
-                    vec![
-                        Field::new("file_path", DataType::Utf8, false),
-                        Field::new("file_name", DataType::Utf8, false),
-                        Field::new("file_size", DataType::UInt64, false),
-                        Field::new(
-                            "file_modification_time",
-                            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
-                            true,
-                        ),
-                    ]
-                    .into(),
-                ),
-                false,
-            ));
-            Arc::new(Schema::new(fields))
-        } else {
-            schema
+        let final_schema = match committed {
+            Some(schema) => schema,
+            None => super::schema_resolution::output_schema(&schema, src_config.include_metadata)?,
         };
 
         // Start discovery engine with a snapshot of the current manifest for dedup.
@@ -395,80 +405,9 @@ impl SourceConnector for FileSource {
                 continue;
             }
 
-            if pending.discovered.size > config.max_file_bytes as u64 {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "file '{}' size {} exceeds max_file_bytes {}",
-                    pending.discovered.path, pending.discovered.size, config.max_file_bytes
-                )));
-            }
-
-            let read_guard = self
-                .task_owner
-                .track()
-                .expect("live file source cannot have a retired task owner");
-            let bytes = Arc::clone(&self.reader)
-                .read(&pending.discovered.path, read_guard)
-                .await?;
-            if bytes.len() > config.max_file_bytes {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "file '{}' actual size {} exceeds max_file_bytes {}",
-                    pending.discovered.path,
-                    bytes.len(),
-                    config.max_file_bytes
-                )));
-            }
-            if u64::try_from(bytes.len()).ok() != Some(pending.discovered.size) {
-                return Err(ConnectorError::ReadError(format!(
-                    "file '{}' changed size after discovery (expected {}, read {})",
-                    pending.discovered.path,
-                    pending.discovered.size,
-                    bytes.len()
-                )));
-            }
-
-            let content_sha256 = sha256_hex(&bytes);
-            let next_row = if let Some(progress) = &pending.resume {
-                if progress.content_sha256 != content_sha256 {
-                    return Err(ConnectorError::ConfigurationError(format!(
-                        "file '{}' changed content since its checkpointed partial read",
-                        pending.discovered.path
-                    )));
-                }
-                usize::try_from(progress.next_row).map_err(|_| {
-                    ConnectorError::ConfigurationError(format!(
-                        "file '{}' checkpoint row {} exceeds this runtime's address space",
-                        pending.discovered.path, progress.next_row
-                    ))
-                })?
-            } else {
-                0
-            };
-
-            let mut records = self
-                .decoder
-                .as_ref()
-                .expect("decoder checked above")
-                .decode_batch(&[RawRecord::new(bytes)])
-                .map_err(ConnectorError::from)?;
-            if config.include_metadata {
-                records = append_metadata_column(
-                    &records,
-                    &pending.discovered.path,
-                    pending.discovered.size,
-                    pending.discovered.modified_ms,
-                )?;
-            }
-            if pending.resume.is_some() && next_row >= records.num_rows() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "file '{}' checkpoint row {} is outside decoded row count {}",
-                    pending.discovered.path,
-                    next_row,
-                    records.num_rows()
-                )));
-            }
-
+            let decoded = self.load_file(&pending, &config).await?;
             self.pending_files.pop_front();
-            if records.num_rows() == 0 {
+            if decoded.records.num_rows() == 0 {
                 debug!(
                     "file source: empty batch from '{}'",
                     pending.discovered.path
@@ -476,12 +415,7 @@ impl SourceConnector for FileSource {
                 self.manifest.insert(pending.discovered.path);
                 return Ok(None);
             }
-            self.current_file = Some(DecodedFile {
-                discovered: pending.discovered,
-                content_sha256,
-                records,
-                next_row,
-            });
+            self.current_file = Some(decoded);
             // Loop once without awaiting to publish the first bounded slice.
         }
     }
@@ -494,6 +428,9 @@ impl SourceConnector for FileSource {
         let mut cp = SourceCheckpoint::new();
         cp.set_metadata("connector", FILE_CHECKPOINT_CONNECTOR);
         cp.set_metadata(CHECKPOINT_VERSION_METADATA, FILE_CHECKPOINT_VERSION);
+        if let Some(binding) = &self.schema_contract {
+            cp.set_metadata("schema.contract", binding);
+        }
         self.manifest.to_checkpoint(&mut cp);
         if let Some(file) = &self.current_file {
             let progress = FileProgress {
@@ -526,6 +463,151 @@ impl SourceConnector for FileSource {
             SourceTopology::Singleton,
             SourceInputMode::AppendOnly,
         ))
+    }
+}
+
+impl FileSource {
+    async fn prepare_reader_contract(
+        &mut self,
+        config: &mut ConnectorConfig,
+        saved: Option<String>,
+        resumed: bool,
+        src_config: &FileSourceConfig,
+    ) -> Result<(), ConnectorError> {
+        if let Some(saved) = saved {
+            if saved.len() > laminar_core::schema_binding::MAX_SCHEMA_BINDING_BYTES {
+                return Err(ConnectorError::SchemaMismatch(
+                    "file checkpoint schema exceeds its bound".into(),
+                ));
+            }
+            let binding: crate::schema::resolution::SchemaBinding = serde_json::from_str(&saved)
+                .map_err(|_| {
+                    ConnectorError::SchemaMismatch(
+                        "file checkpoint reader contract is malformed".into(),
+                    )
+                })?;
+            if config
+                .schema_binding()
+                .is_some_and(|committed| committed != &binding)
+            {
+                return Err(ConnectorError::SchemaMismatch(
+                    "file checkpoint belongs to a different schema contract".into(),
+                ));
+            }
+            config.set_schema_binding(binding)?;
+        }
+        if config.schema_binding().is_none() {
+            if resumed
+                && config.arrow_schema().is_none()
+                && src_config.format != Some(FileFormat::Text)
+            {
+                return Err(ConnectorError::SchemaMismatch("legacy file recovery needs explicit fields or a saved reader contract; metadata/inference cannot run on resume".into()));
+            }
+            let binding = self.resolve_schema(config, config.arrow_schema()).await?;
+            config.set_schema_binding(binding)?;
+        }
+        self.schema_contract = config
+            .schema_binding()
+            .map(laminar_core::schema_binding::SchemaBinding::canonical_bytes)
+            .transpose()
+            .map_err(crate::schema::resolution::binding_error)?
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|_| ConnectorError::Internal("schema encoding is not UTF8".into()))?;
+
+        Ok(())
+    }
+
+    async fn load_file(
+        &mut self,
+        pending: &PendingFile,
+        config: &FileSourceConfig,
+    ) -> Result<DecodedFile, ConnectorError> {
+        if pending.discovered.size > config.max_file_bytes as u64 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "file '{}' size {} exceeds max_file_bytes {}",
+                pending.discovered.path, pending.discovered.size, config.max_file_bytes
+            )));
+        }
+
+        let read_guard = self
+            .task_owner
+            .track()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "live file task owner".into(),
+                actual: "retired".into(),
+            })?;
+        let bytes = Arc::clone(&self.reader)
+            .read(&pending.discovered.path, read_guard)
+            .await?;
+        if bytes.len() > config.max_file_bytes {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "file '{}' actual size {} exceeds max_file_bytes {}",
+                pending.discovered.path,
+                bytes.len(),
+                config.max_file_bytes
+            )));
+        }
+        if u64::try_from(bytes.len()).ok() != Some(pending.discovered.size) {
+            return Err(ConnectorError::ReadError(format!(
+                "file '{}' changed size after discovery (expected {}, read {})",
+                pending.discovered.path,
+                pending.discovered.size,
+                bytes.len()
+            )));
+        }
+
+        let content_sha256 = sha256_hex(&bytes);
+        let next_row = if let Some(progress) = &pending.resume {
+            if progress.content_sha256 != content_sha256 {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "file '{}' changed content since its checkpointed partial read",
+                    pending.discovered.path
+                )));
+            }
+            usize::try_from(progress.next_row).map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "file '{}' checkpoint row {} exceeds this runtime's address space",
+                    pending.discovered.path, progress.next_row
+                ))
+            })?
+        } else {
+            0
+        };
+
+        let mut records = self
+            .decoder
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "prepared file decoder".into(),
+                actual: "missing".into(),
+            })?
+            .decode_batch(&[RawRecord::new(bytes)])
+            .map_err(ConnectorError::from)?;
+        if config.include_metadata {
+            records = append_metadata_column(
+                &records,
+                &pending.discovered.path,
+                pending.discovered.size,
+                pending.discovered.modified_ms,
+            )?;
+        }
+        records = crate::schema::resolution::project_batch(&records, &self.schema)?;
+        if pending.resume.is_some() && next_row >= records.num_rows() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "file '{}' checkpoint row {} is outside decoded row count {}",
+                pending.discovered.path,
+                next_row,
+                records.num_rows()
+            )));
+        }
+
+        Ok(DecodedFile {
+            discovered: pending.discovered.clone(),
+            content_sha256,
+            records,
+            next_row,
+        })
     }
 }
 
@@ -605,7 +687,7 @@ async fn read_file_bytes(
     .map_err(|e| ConnectorError::ReadError(format!("cannot read file '{error_path}': {e}")))
 }
 
-fn append_metadata_column(
+pub(super) fn append_metadata_column(
     batch: &RecordBatch,
     file_path: &str,
     file_size: u64,
@@ -673,8 +755,14 @@ fn append_metadata_column(
         false,
     ));
 
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| ConnectorError::ReadError(format!("metadata append error: {e}")))
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            batch.schema().metadata().clone(),
+        )),
+        columns,
+    )
+    .map_err(|e| ConnectorError::ReadError(format!("metadata append error: {e}")))
 }
 
 fn restore_ingestion_position(

@@ -104,6 +104,32 @@ pub trait SinkConnector: Send {
         Ok(SinkContract::default())
     }
 
+    /// Resolve a writer contract from already-bound query output before activation.
+    /// Destinations with authoritative schemas override this read-only hook.
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        crate::schema::resolution::logical_binding(
+            config,
+            crate::schema::resolution::SchemaDirection::Sink,
+            crate::schema::resolution::SchemaOrigin::Query,
+            &input,
+        )
+    }
+
+    /// Perform only explicitly configured, idempotent external preparation after
+    /// read-only resolution and deployment/delivery admission. The returned binding
+    /// must contain the concrete identity used during subsequent activation/replay.
+    async fn prepare_schema(
+        &mut self,
+        _config: &ConnectorConfig,
+        _binding: &mut crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
     /// Open the connection and prepare to accept writes.
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
 

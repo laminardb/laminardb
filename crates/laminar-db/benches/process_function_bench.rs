@@ -418,6 +418,10 @@ fn native_fixed_replay_cuts(criterion: &mut Criterion) {
                 registry.register_source(
                     "replay-cut-bench",
                     ConnectorInfo {
+                        schema_capabilities:
+                            laminar_connectors::schema::resolution::SchemaCapabilities::declared(
+                                false,
+                            ),
                         name: "replay-cut-bench".into(),
                         display_name: "Fixed replay batch benchmark".into(),
                         version: "1".into(),

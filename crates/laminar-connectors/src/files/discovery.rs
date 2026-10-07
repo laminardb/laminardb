@@ -499,7 +499,7 @@ fn candidate_size(
 }
 
 /// Splits a path like `/data/logs/*.csv` into `("/data/logs", Some("*.csv"))`.
-fn split_dir_and_glob(path: &str) -> (String, Option<String>) {
+pub(super) fn split_dir_and_glob(path: &str) -> (String, Option<String>) {
     // If path contains glob characters, split at the last directory separator before them.
     if path.contains('*') || path.contains('?') || path.contains('[') {
         if let Some(sep) = path.rfind(['/', '\\']) {

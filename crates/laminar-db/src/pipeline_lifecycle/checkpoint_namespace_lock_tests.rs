@@ -230,7 +230,11 @@ async fn local_exact_file_url_uses_the_durable_locked_namespace() {
         .await
         .unwrap();
     install_generator_pipeline(&first).await;
-    install_generator_pipeline(&second).await;
+    let error = second
+        .execute("CREATE SOURCE generated_source FROM GENERATOR")
+        .await
+        .expect_err("durable creation must reject a second namespace owner");
+    assert!(error.to_string().contains("[LDB-0014]"), "{error}");
 
     first.start().await.unwrap();
     assert!(first.checkpoint_namespace_lock.lock().is_some());
@@ -256,6 +260,7 @@ async fn local_exact_file_url_uses_the_durable_locked_namespace() {
     assert!(decisions.load_or_create_deployment_id().await.is_ok());
 
     first.shutdown().await.unwrap();
+    install_generator_pipeline(&second).await;
     second.start().await.unwrap();
     second.shutdown().await.unwrap();
 }

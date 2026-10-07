@@ -37,6 +37,7 @@ async fn fixture() -> Fixture {
     };
     let catalog = CatalogManifestStore::new(authority.clone());
     let inventory = CatalogManifest::new(vec![CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "events".into(),
         kind: CatalogObjectKind::Source,
         catalog_generation: 1,

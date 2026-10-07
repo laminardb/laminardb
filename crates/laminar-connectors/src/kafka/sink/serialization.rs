@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use tracing::{debug, info};
 
 use super::super::avro_serializer::AvroSerializer;
 use super::super::schema_registry::SchemaRegistryClient;
@@ -12,58 +11,74 @@ use crate::error::ConnectorError;
 use crate::serde::{self, Format, RecordSerializer};
 
 impl KafkaSink {
-    /// Ensures the sink schema and registry entry match the incoming batch.
-    pub(super) async fn ensure_schema_ready(
+    pub(super) async fn install_schema_contract(
         &mut self,
-        batch_schema: &SchemaRef,
+        config: &crate::config::ConnectorConfig,
     ) -> Result<(), ConnectorError> {
-        let schema_changed = self.schema != *batch_schema;
-        let needs_registration = self.config.format == Format::Avro
-            && (schema_changed
-                || self
-                    .avro_schema_id
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == 0);
-
-        // Register before advancing the serializer so a failure cannot leave a new serializer
-        // paired with the old registry ID.
-        if needs_registration {
-            if let Some(ref registry) = self.schema_registry {
-                let subject = format!("{}-value", self.config.topic);
-                let avro_schema = super::super::schema_registry::arrow_to_avro_schema(
-                    batch_schema,
-                    &self.config.topic,
-                )
-                .map_err(ConnectorError::Serde)?;
-                let schema_id = registry
-                    .register_schema(
-                        &subject,
-                        &avro_schema,
-                        super::super::schema_registry::SchemaType::Avro,
-                    )
-                    .await?;
-                #[allow(clippy::cast_sign_loss)]
-                self.avro_schema_id
-                    .store(schema_id as u32, std::sync::atomic::Ordering::Relaxed);
-                info!(subject = %subject, schema_id, "registered Avro schema");
-            }
-        }
-
-        if schema_changed {
-            debug!(
-                old = ?self.schema.fields().iter().map(|field| field.name()).collect::<Vec<_>>(),
-                new = ?batch_schema.fields().iter().map(|field| field.name()).collect::<Vec<_>>(),
-                "sink schema updated from incoming batch"
+        let input = config
+            .arrow_schema()
+            .unwrap_or_else(|| Arc::clone(&self.schema));
+        let binding = if let Some(binding) = config.schema_binding() {
+            binding.clone()
+        } else {
+            let metadata = super::super::schema_configuration::sink(config, &self.config);
+            let mut binding = super::super::schema_resolution::resolve_sink_with_registry(
+                &metadata,
+                input,
+                self.schema_registry.as_deref(),
+            )
+            .await?;
+            super::super::schema_resolution::prepare_sink(&metadata, &mut binding).await?;
+            binding
+        };
+        self.schema = Arc::new(binding.logical.clone());
+        self.writer_schema = None;
+        self.writer_projection.clear();
+        if self.config.format == Format::Avro {
+            let writer = super::super::schema_resolution::writer_schema(&binding)?;
+            let values = super::super::schema_resolution::sink_value_schema(&binding)?;
+            let projection = writer
+                .fields()
+                .iter()
+                .map(|field| {
+                    values.index_of(field.name()).map_err(|_| {
+                        ConnectorError::SchemaMismatch(format!(
+                            "writer field '{}' has no query output",
+                            field.name()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.avro_schema_id.store(
+                super::super::schema_resolution::contract_schema_id(&binding)?,
+                std::sync::atomic::Ordering::Relaxed,
             );
-            self.schema = batch_schema.clone();
+            self.serializer = select_serializer(
+                self.config.format,
+                &writer,
+                Arc::clone(&self.avro_schema_id),
+                None,
+            )?;
+            self.writer_projection = projection;
+            self.writer_schema = Some(writer);
+        } else {
             self.serializer = select_serializer(
                 self.config.format,
                 &self.schema,
                 Arc::clone(&self.avro_schema_id),
-                self.schema_registry.clone(),
+                None,
             )?;
         }
+        Ok(())
+    }
 
+    pub(super) fn ensure_schema_ready(&mut self, schema: &SchemaRef) -> Result<(), ConnectorError> {
+        if schema.fields() != self.schema.fields() {
+            return Err(ConnectorError::SchemaMismatch(
+                "Kafka sink input differs from its committed query schema; migrate the catalog"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -76,11 +91,14 @@ pub(super) fn select_serializer(
     registry: Option<Arc<SchemaRegistryClient>>,
 ) -> Result<Box<dyn RecordSerializer>, ConnectorError> {
     match format {
-        Format::Avro => Ok(Box::new(AvroSerializer::with_shared_schema_id(
-            schema.clone(),
-            schema_id,
-            registry,
-        ))),
+        Format::Avro => {
+            let serializer =
+                AvroSerializer::with_shared_schema_id(Arc::clone(schema), schema_id, registry);
+            if serializer.schema_id() > 0 {
+                serializer.prepare().map_err(ConnectorError::Serde)?;
+            }
+            Ok(Box::new(serializer))
+        }
         other => serde::create_serializer(other).map_err(|error| {
             ConnectorError::ConfigurationError(format!(
                 "unsupported sink format '{other}': {error}"

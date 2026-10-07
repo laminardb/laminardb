@@ -175,8 +175,18 @@ impl SourceConnector for GeneratorSource {
         .with_exact_delivery_certification())
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        crate::schema::resolution::fixed_binding(config, explicit, &Self::generator_schema())
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        let binding = self.resolve_schema(&config, config.arrow_schema()).await?;
+        self.schema = Arc::new(binding.logical);
         let source_name = config
             .get("laminar.source.name")
             .filter(|name| !name.is_empty())
@@ -291,6 +301,7 @@ impl SourceConnector for GeneratorSource {
 /// Returns the registry error when the name is already registered or the registry is frozen.
 pub fn register_generator_source(registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::built_in(),
         name: "generator".to_string(),
         display_name: "Synthetic Data Generator".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

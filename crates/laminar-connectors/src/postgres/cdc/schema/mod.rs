@@ -13,7 +13,7 @@ use crate::error::ConnectorError;
 use super::types::PgColumn;
 
 /// Cached information about a `PostgreSQL` relation (table).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelationInfo {
     /// The relation OID from `pgoutput`.
     pub relation_id: u32,

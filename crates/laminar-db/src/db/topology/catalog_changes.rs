@@ -83,7 +83,10 @@ pub(super) async fn apply_statement(
     }
     // The exception belongs to this unstarted catalog. Active runtime DDL uses admission.
     let result = super::super::CATALOG_MANIFEST_REPLAY
-        .scope((), candidate.execute_parsed_single(&ddl, &create))
+        .scope(
+            (),
+            futures::FutureExt::boxed(candidate.execute_parsed_single(&ddl, &create)),
+        )
         .await?;
     if !matches!(result, crate::handle::ExecuteResult::Ddl(ref info) if info.applied && info.object_name == name)
     {
@@ -155,6 +158,11 @@ pub(super) async fn apply_catalog_changes(
             candidate.rollback_catalog_create(&name, kind, "isolated topology replacement")?;
             apply_statement(candidate, sql, &statement, &name).await?;
             entries[index].ddl = create_definition(sql, &statement)?;
+            entries[index].schema_binding = candidate
+                .connector_manager
+                .lock()
+                .schema_binding(&name)
+                .cloned();
         } else {
             changed.insert(name.clone());
             let previous_generation = parent
@@ -188,6 +196,11 @@ pub(super) async fn apply_catalog_changes(
             }
             apply_statement(candidate, sql, &statement, &name).await?;
             entries.push(laminar_core::cluster::control::CatalogManifestEntry {
+                schema_binding: candidate
+                    .connector_manager
+                    .lock()
+                    .schema_binding(&name)
+                    .cloned(),
                 canonical_name: name,
                 kind,
                 catalog_generation: generation,
@@ -267,9 +280,11 @@ pub(in crate::db) fn validate_manifest_ddl(manifest: &CatalogManifest) -> Result
                 entry.canonical_name
             )));
         }
-        if crate::db::connector_source_requires_schema_discovery(&statements[0]) {
+        if crate::db::connector_source_requires_schema_discovery(&statements[0])
+            && entry.schema_binding.is_none()
+        {
             return Err(DbError::Pipeline(format!(
-                "[{}] catalog manifest source '{}' lacks an explicit durable schema",
+                "[{}] legacy catalog source '{}' lacks an explicit durable schema and a committed schema contract; resolve it through a controlled catalog migration before activation",
                 laminar_core::error_codes::RECOVERY_FAILED,
                 entry.canonical_name
             )));
@@ -350,4 +365,36 @@ impl LaminarDB {
         }
         Ok(())
     }
+}
+
+pub(super) fn validate_prepared_targets(
+    candidate: &LaminarDB,
+    target: &CatalogManifest,
+) -> Result<(), DbError> {
+    use laminar_connectors::schema::resolution::SchemaPreparation;
+    for entry in &target.entries {
+        if entry.kind != CatalogObjectKind::Sink {
+            continue;
+        }
+        let Some(binding) = &entry.schema_binding else {
+            continue;
+        };
+        let Some(info) = candidate.connector_registry.sink_info(&binding.connector) else {
+            continue;
+        };
+        let pending = match info.schema_capabilities.preparation {
+            SchemaPreparation::None => false,
+            SchemaPreparation::ExplicitTableCreation => binding.value.is_none(),
+            SchemaPreparation::ExplicitRegistration => binding
+                .value
+                .as_ref()
+                .is_some_and(|native| !native.identity.contains_key("id")),
+        };
+        if pending {
+            return Err(TopologyError::Unsupported(format!(
+                "sink '{}' requires external schema preparation; topology validation is read-only. Prepare the table/registry subject separately, then resolve the concrete target",
+                entry.canonical_name)).into());
+        }
+    }
+    Ok(())
 }

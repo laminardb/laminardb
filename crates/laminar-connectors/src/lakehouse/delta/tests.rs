@@ -1,5 +1,3 @@
-#[cfg(feature = "delta-lake")]
-use super::super::delta_config::DeltaCatalogType;
 use super::*;
 use arrow_array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -295,105 +293,53 @@ fn test_schema_empty_when_none() {
 }
 
 #[cfg(feature = "delta-lake")]
-#[test]
-fn test_deferred_init_flag_default_false() {
-    let sink = DeltaLakeSink::new(test_config(), None);
-    assert!(!sink.needs_deferred_delta_init);
-}
-
-#[cfg(feature = "delta-lake")]
-fn unity_config() -> DeltaLakeSinkConfig {
-    let mut config = test_config();
-    config.catalog_type = DeltaCatalogType::Unity {
-        workspace_url: "https://test.azuredatabricks.net".to_string(),
-        access_token: "dapi123".to_string(),
-    };
-    config.catalog_name = Some("main".to_string());
-    config.catalog_schema = Some("default".to_string());
-    config.catalog_storage_location = Some("abfss://c@acct.dfs.core.windows.net/t".to_string());
-    config
-}
-
-#[cfg(feature = "delta-lake")]
 #[tokio::test]
-async fn test_open_defers_init_for_unity_no_schema() {
-    use crate::config::ConnectorConfig;
-
-    let config = unity_config();
+async fn unbound_input_is_rejected_before_table_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unbound");
+    let mut config = DeltaLakeSinkConfig::new(path.to_string_lossy().as_ref());
+    config.auto_create = true;
     let mut sink = DeltaLakeSink::new(config, None);
-
-    // open() with empty ConnectorConfig (simulates factory path)
-    let connector_config = ConnectorConfig::new("delta-lake");
-    // open() will re-parse but table.path is "/tmp/delta_test" (local),
-    // so it won't actually reach UC REST. However from_config requires
-    // table.path, so we use the sink's existing config by passing empty.
-    // The sink skips re-parse when properties are empty.
-    let result = sink.open(&connector_config).await;
-    assert!(result.is_ok());
-
-    // Should be in Initializing state with deferred flag set.
-    assert!(sink.needs_deferred_delta_init);
-    assert_eq!(sink.state(), ConnectorState::Initializing);
+    let error = sink
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("bound input schema"));
+    assert!(!path.exists());
     assert!(sink.schema.is_none());
+    assert!(sink.table.is_none());
 }
 
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-async fn test_deferred_init_transitions_to_failed_on_error() {
-    // When deferred init fails, the sink must transition to Failed
-    // to prevent an unbounded retry storm.
+async fn initializing_sink_cannot_learn_schema_from_first_batch() {
     let mut sink = DeltaLakeSink::new(test_config(), None);
     sink.state = ConnectorState::Initializing;
-    sink.needs_deferred_delta_init = true;
-    sink.schema = Some(test_schema());
-
-    // begin_epoch will try init_delta_table() which will fail
-    // (no real Delta table at /tmp/delta_test). The sink should
-    // transition to Failed.
-    let result = sink.begin_epoch(1).await;
-    assert!(result.is_err());
-    assert_eq!(sink.state(), ConnectorState::Failed);
-    // Flag may still be set, but Failed state prevents further usage.
+    assert!(matches!(
+        sink.write_batch(&test_batch(5)).await,
+        Err(ConnectorError::InvalidState { .. })
+    ));
+    assert!(sink
+        .write_batch(&RecordBatch::new_empty(test_schema()))
+        .await
+        .is_err());
+    assert!(sink.schema.is_none());
+    assert_eq!(sink.buffered_rows(), 0);
 }
 
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-async fn test_write_batch_accepts_initializing_state() {
-    // During deferred init, write_batch must accept Initializing state
-    // so the first batch can provide the schema.
-    let mut sink = DeltaLakeSink::new(test_config(), None);
-    sink.state = ConnectorState::Initializing;
-    sink.needs_deferred_delta_init = true;
-
-    let batch = test_batch(5);
-    // write_batch sets schema, then tries init_delta_table which fails.
-    // Sink transitions to Failed.
-    let result = sink.write_batch(&batch).await;
-    assert!(result.is_err());
-    assert_eq!(sink.state(), ConnectorState::Failed);
-    // Schema was set before init was attempted.
-    assert!(sink.schema.is_some());
-}
-
-#[cfg(feature = "delta-lake")]
-#[test]
-fn test_no_deferred_init_without_catalog_storage_location() {
-    // Unity catalog without catalog.storage.location should NOT defer.
-    let mut config = unity_config();
-    config.catalog_storage_location = None;
-    let sink = DeltaLakeSink::new(config, None);
-
-    assert!(!sink.needs_deferred_delta_init);
-}
-
-#[cfg(feature = "delta-lake")]
-#[test]
-fn test_no_deferred_init_with_schema() {
-    // Unity catalog with schema already set should NOT defer.
-    let config = unity_config();
-    let sink = DeltaLakeSink::with_schema(config, test_schema());
-
-    assert!(!sink.needs_deferred_delta_init);
+async fn missing_target_creation_requires_explicit_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let config = DeltaLakeSinkConfig::new(path.to_string_lossy().as_ref());
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+    let error = sink
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("auto.create=true"), "{error}");
+    assert!(!path.join("_delta_log").exists());
 }
 
 // ── Batch size estimation ──
@@ -451,7 +397,7 @@ async fn test_at_least_once_failed_flush_backpressure() {
     let mut config = test_config();
     config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
     config.max_buffer_records = 10;
-    let mut sink = DeltaLakeSink::new(config, None);
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.state = ConnectorState::Running;
     sink.staged_rows = 50;
 
@@ -474,7 +420,7 @@ async fn test_at_least_once_failed_flush_backpressure() {
 async fn test_write_batch_buffering() {
     let mut config = test_config();
     config.max_buffer_records = 100;
-    let mut sink = DeltaLakeSink::new(config, None);
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.state = ConnectorState::Running;
 
     let batch = test_batch(10);
@@ -508,22 +454,22 @@ async fn test_write_batch_not_running() {
 }
 
 #[tokio::test]
-async fn test_write_batch_sets_schema() {
+async fn test_write_batch_rejects_unbound_schema() {
     let mut sink = DeltaLakeSink::new(test_config(), None);
     sink.state = ConnectorState::Running;
     assert!(sink.schema.is_none());
 
     let batch = test_batch(5);
-    sink.write_batch(&batch).await.unwrap();
-    assert!(sink.schema.is_some());
-    assert_eq!(sink.schema.as_ref().unwrap().fields().len(), 3);
+    assert!(sink.write_batch(&batch).await.is_err());
+    assert!(sink.schema.is_none());
+    assert_eq!(sink.buffered_rows(), 0);
 }
 
 #[tokio::test]
 async fn test_multiple_write_batches_accumulate() {
     let mut config = test_config();
     config.max_buffer_records = 100;
-    let mut sink = DeltaLakeSink::new(config, None);
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.state = ConnectorState::Running;
 
     let batch = test_batch(10);
@@ -550,7 +496,7 @@ async fn coordinated_artifact_intent_does_not_authorize_delta_file_deletion() {
 async fn test_rollback_clears_buffer() {
     let mut config = test_config();
     config.max_buffer_records = 1000;
-    let mut sink = DeltaLakeSink::new(config, None);
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.state = ConnectorState::Running;
 
     let batch = test_batch(50);
@@ -568,7 +514,7 @@ async fn test_rollback_clears_buffer() {
 async fn test_rollback_after_pre_commit_discards_staged() {
     let mut config = test_config();
     config.max_buffer_records = 1000;
-    let mut sink = DeltaLakeSink::new(config, None);
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.state = ConnectorState::Running;
 
     sink.begin_epoch(1).await.unwrap();
@@ -596,7 +542,7 @@ async fn test_rollback_after_pre_commit_discards_staged() {
 async fn test_staged_data_preserved_until_commit_or_rollback() {
     let mut config = test_config();
     config.max_buffer_records = 1000;
-    let mut sink = DeltaLakeSink::new(config, None);
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.state = ConnectorState::Running;
 
     sink.begin_epoch(1).await.unwrap();
@@ -932,10 +878,9 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
     cfg.merge_key_columns = vec!["region".to_string()];
     cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
 
-    // No explicit schema: the schema (and table) is derived from the first
-    // batch, exactly like the production pipeline — exercising the
-    // `target_schema` strip of `__weight`.
-    let mut sink = DeltaLakeSink::new(cfg, None);
+    cfg.auto_create = true;
+    // Activation binds the full query output and strips only the admitted control field.
+    let mut sink = DeltaLakeSink::with_schema(cfg, zset_changelog(&[]).schema());
     sink.open(&ConnectorConfig::new("delta-lake"))
         .await
         .unwrap();
@@ -1001,6 +946,7 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
 #[cfg(feature = "delta-lake")]
 fn coordinated_config(path: &str) -> DeltaLakeSinkConfig {
     let mut cfg = DeltaLakeSinkConfig::new(path);
+    cfg.auto_create = true;
     cfg.write_mode = DeltaWriteMode::Append;
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
     cfg

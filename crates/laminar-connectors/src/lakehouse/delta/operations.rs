@@ -27,6 +27,10 @@ impl DeltaLakeSink {
             task_tracker,
             config,
             schema: None,
+            query_schema: None,
+            writer_projection: None,
+            #[cfg(feature = "delta-lake")]
+            schema_binding: None,
             state: ConnectorState::Created,
             current_epoch: 0,
             buffer: Vec::with_capacity(16),
@@ -53,8 +57,6 @@ impl DeltaLakeSink {
             #[cfg(feature = "delta-lake")]
             resolved_storage_options: std::collections::HashMap::new(),
             #[cfg(feature = "delta-lake")]
-            needs_deferred_delta_init: false,
-            #[cfg(feature = "delta-lake")]
             cached_writer_properties: None,
             #[cfg(feature = "delta-lake")]
             merge_session: None,
@@ -68,12 +70,13 @@ impl DeltaLakeSink {
     /// Creates a new Delta Lake sink with an explicit schema.
     ///
     /// In upsert mode the changelog metadata columns (`_op`, `_ts_ms`,
-    /// `__weight`) are stripped, matching the deferred first-write path, so the
+    /// `__weight`) are stripped, so the
     /// target table holds only user data regardless of how the schema arrives.
     #[must_use]
     pub fn with_schema(config: DeltaLakeSinkConfig, schema: SchemaRef) -> Self {
         let write_mode = config.write_mode;
         let mut sink = Self::new(config, None);
+        sink.query_schema = Some(Arc::clone(&schema));
         sink.schema = Some(if write_mode == DeltaWriteMode::Upsert {
             Self::target_schema(&schema, write_mode)
         } else {
@@ -83,9 +86,7 @@ impl DeltaLakeSink {
     }
 
     /// Initializes the Delta table: auto-creates in Unity Catalog if needed,
-    /// resolves the catalog path, and opens or creates the Delta table. Called
-    /// from `open()` or deferred to the first
-    /// `write_batch()` when the schema is not yet available at open time.
+    /// resolves the catalog path, and opens or creates the Delta table before activation.
     #[cfg(feature = "delta-lake")]
     pub(super) async fn init_delta_table(
         &mut self,
@@ -100,16 +101,18 @@ impl DeltaLakeSink {
         // For uc:// tables, pre-create in Unity Catalog if needed.
         // Must run before resolve_catalog_options which calls GET on the table.
         #[cfg(feature = "delta-lake-unity")]
-        tokio::time::timeout_at(
-            deadline,
-            ensure_uc_table_exists(&self.config, self.schema.as_ref()),
-        )
-        .await
-        .map_err(|_| {
-            ConnectorError::ConnectionFailed(
-                "Delta Unity table initialization exceeded the write deadline".into(),
+        if self.schema_binding.is_none() && self.config.auto_create {
+            tokio::time::timeout_at(
+                deadline,
+                ensure_uc_table_exists(&self.config, self.schema.as_ref()),
             )
-        })??;
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(
+                    "Delta Unity table initialization exceeded the write deadline".into(),
+                )
+            })??;
+        }
 
         // Resolve catalog path: for Unity this calls GET to get the
         // storage_location, bypassing delta-rs credential vending.
@@ -163,7 +166,10 @@ impl DeltaLakeSink {
         {
             delta_io::verify_custom_s3_conditional_create(&table, deadline).await?;
         }
-        if table.version().is_none() && self.schema.is_some() {
+        if table.version().is_none() {
+            if self.schema_binding.is_some() || !self.config.auto_create {
+                return Err(ConnectorError::SchemaMismatch("Delta target is absent; a committed table cannot be recreated, and creation requires auto.create=true".into()));
+            }
             table = tokio::time::timeout_at(
                 deadline,
                 delta_io::open_or_create_table(
@@ -182,6 +188,10 @@ impl DeltaLakeSink {
         }
 
         if table.version().is_some() {
+            super::super::schema_resolution::verify_identity(
+                self.schema_binding.as_ref(),
+                &super::super::schema_resolution::delta_native(&table)?,
+            )?;
             let table_schema = delta_io::get_table_schema(&table)?;
             if let Some(pipeline_schema) = self.schema.as_ref() {
                 Self::validate_existing_table_schema(
@@ -280,7 +290,10 @@ impl DeltaLakeSink {
     const CHANGELOG_METADATA_COLUMNS: &'static [&'static str] =
         &["_op", "_ts_ms", laminar_core::changelog::WEIGHT_COLUMN];
 
-    pub(super) fn target_schema(batch_schema: &SchemaRef, write_mode: DeltaWriteMode) -> SchemaRef {
+    pub(in crate::lakehouse) fn target_schema(
+        batch_schema: &SchemaRef,
+        write_mode: DeltaWriteMode,
+    ) -> SchemaRef {
         if write_mode == DeltaWriteMode::Upsert {
             let fields: Vec<_> = batch_schema
                 .fields()

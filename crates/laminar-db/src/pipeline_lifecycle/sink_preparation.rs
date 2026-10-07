@@ -16,7 +16,6 @@ impl LaminarDB {
         pipeline_checkpoint_timeout: std::time::Duration,
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<PipelineSinkSetup, DbError> {
-        use crate::connector_manager::build_sink_config;
         let (sink_event_tx, sink_event_rx) =
             laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
                 crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
@@ -27,16 +26,7 @@ impl LaminarDB {
             if reg.connector_type.is_none() {
                 continue;
             }
-            let mut config = build_sink_config(reg, self.config.delivery_guarantee)?;
-            let upstream_schema = stream_output_schemas.get(&reg.input).cloned().or_else(|| {
-                self.catalog
-                    .get_source(&reg.input)
-                    .map(|e| e.schema.clone())
-            });
-            if let Some(schema) = upstream_schema {
-                let schema_str = crate::pipeline_callback::encode_arrow_schema(&schema);
-                config.set("_arrow_schema".to_string(), schema_str);
-            }
+            let config = pipeline_sink_config(self, reg, stream_output_schemas)?;
             let mut sink = self
                 .connector_registry
                 .create_sink(&config, prom_registry)
@@ -228,6 +218,34 @@ impl LaminarDB {
             callback_controller,
         })
     }
+}
+
+fn pipeline_sink_config(
+    database: &LaminarDB,
+    reg: &crate::connector_manager::SinkRegistration,
+    stream_output_schemas: &HashMap<String, arrow_schema::SchemaRef>,
+) -> Result<laminar_connectors::config::ConnectorConfig, DbError> {
+    use crate::connector_manager::build_sink_config;
+    let mut config = build_sink_config(reg, database.config.delivery_guarantee)?;
+    let upstream_schema = stream_output_schemas
+        .get(&reg.input)
+        .cloned()
+        .or_else(|| {
+            database
+                .catalog
+                .get_source(&reg.input)
+                .map(|e| e.schema.clone())
+        })
+        .or_else(|| {
+            reg.schema_binding
+                .as_ref()
+                .map(|binding| Arc::new(binding.logical.clone()))
+        });
+    if let Some(schema) = upstream_schema {
+        let schema_str = crate::pipeline_callback::encode_arrow_schema(&schema);
+        config.set("_arrow_schema".to_string(), schema_str);
+    }
+    Ok(config)
 }
 
 fn sink_checkpoint_storage_scope(database: &LaminarDB) -> CheckpointStorageScope {

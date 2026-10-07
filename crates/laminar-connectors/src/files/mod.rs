@@ -9,6 +9,8 @@ pub mod arrow_ipc_codec;
 pub mod config;
 pub mod discovery;
 pub mod manifest;
+mod output_directory;
+mod schema_resolution;
 pub mod sink;
 pub mod source;
 pub mod text_decoder;
@@ -33,6 +35,15 @@ pub fn register_file_source(
 ) -> Result<(), crate::error::ConnectorError> {
     use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities {
+            bounded_sampling: true,
+            built_in_formats: vec!["text".into(), "txt".into()],
+            ..crate::schema::resolution::SchemaCapabilities::metadata(
+                &["parquet", "arrow_ipc", "arrow"],
+                false,
+                crate::schema::resolution::SchemaPreparation::None,
+            )
+        },
         name: "files".to_string(),
         display_name: "File Source (AutoLoader)".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -49,6 +60,11 @@ pub fn register_file_source(
                 "glob_pattern",
                 "Optional glob pattern to filter files by name",
                 "*",
+            ),
+            ConfigKeySpec::optional(
+                "schema.inference",
+                "Opt-in bounded CSV/JSON inference (4 files, 1 MiB, 1000 rows)",
+                "false",
             ),
         ],
     };
@@ -75,6 +91,7 @@ pub fn register_file_sink(
 ) -> Result<(), crate::error::ConnectorError> {
     use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::declared(true),
         name: "files".to_string(),
         display_name: "File Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

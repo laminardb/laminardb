@@ -770,7 +770,7 @@ fn resolve_subject_record_name() {
             Some("com.acme.Order"),
             "orders"
         ),
-        "com.acme.Order-value"
+        "com.acme.Order"
     );
 }
 
@@ -782,7 +782,7 @@ fn resolve_subject_topic_record_name() {
             Some("com.acme.Order"),
             "orders"
         ),
-        "orders-com.acme.Order-value"
+        "orders-com.acme.Order"
     );
 }
 

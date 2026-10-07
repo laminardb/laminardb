@@ -22,6 +22,33 @@ pub struct JsonEncoder {
 }
 
 impl JsonEncoder {
+    /// Compile the installed Arrow writer against an empty array of each field type.
+    ///
+    /// # Errors
+    /// Rejects unsupported native encodings without serializing or publishing a record.
+    pub fn validate_schema(schema: &SchemaRef) -> SchemaResult<()> {
+        laminar_core::schema_binding::SchemaBinding::logical(
+            "json",
+            laminar_core::schema_binding::SchemaDirection::Sink,
+            laminar_core::schema_binding::SchemaOrigin::Query,
+            schema.as_ref().clone(),
+        )
+        .map_err(|error| SchemaError::Incompatible(error.to_string()))?;
+        let options =
+            EncoderOptions::default().with_encoder_factory(Arc::new(JsonbPassthroughFactory));
+        for field in schema.fields() {
+            let array = arrow_array::new_empty_array(field.data_type());
+            arrow_json::writer::make_encoder(field, array.as_ref(), &options).map_err(|error| {
+                SchemaError::Incompatible(format!(
+                    "JSON writer field '{}' cannot encode {}: {error}",
+                    field.name(),
+                    field.data_type()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Creates a new JSON encoder for the given schema.
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {

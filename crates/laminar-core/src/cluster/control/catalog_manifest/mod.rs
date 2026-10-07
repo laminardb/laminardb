@@ -46,6 +46,27 @@ fn validate_entries(entries: &[CatalogManifestEntry]) -> Result<(), CatalogManif
                 entry.canonical_name
             )));
         }
+        if let Some(binding) = &entry.schema_binding {
+            binding
+                .canonical_bytes()
+                .map_err(|error| CatalogManifestError::Invalid(error.to_string()))?;
+            let matches_direction = match binding.direction {
+                crate::schema_binding::SchemaDirection::Source => matches!(
+                    entry.kind,
+                    CatalogObjectKind::Source
+                        | CatalogObjectKind::Table
+                        | CatalogObjectKind::LookupTable
+                ),
+                crate::schema_binding::SchemaDirection::Sink => {
+                    entry.kind == CatalogObjectKind::Sink
+                }
+            };
+            if !matches_direction {
+                return Err(CatalogManifestError::Invalid(
+                    "schema binding has the wrong catalog direction".into(),
+                ));
+            }
+        }
         if !names.insert(entry.canonical_name.as_str()) {
             return Err(CatalogManifestError::Invalid(format!(
                 "catalog manifest repeats canonical name '{}'",
@@ -60,6 +81,9 @@ fn validate_entries(entries: &[CatalogManifestEntry]) -> Result<(), CatalogManif
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogManifestEntry {
+    /// Resolved connector contract. Absent only in legacy or non-connector entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_binding: Option<crate::schema_binding::SchemaBinding>,
     /// Canonical catalog identifier.
     pub canonical_name: String,
     /// Exact namespace owner.
@@ -119,7 +143,19 @@ impl CatalogManifest {
         &self,
     ) -> Result<(Vec<u8>, CatalogManifestRef), CatalogManifestError> {
         self.validate()?;
-        let encoded = serde_json::to_vec(self)?;
+        // COMPAT: preserve byte-for-byte legacy manifest references. New bindings contain
+        // Arrow metadata maps, which must be canonical across nodes and process restarts.
+        let encoded = if self
+            .entries
+            .iter()
+            .any(|entry| entry.schema_binding.is_some())
+        {
+            let mut value = serde_json::to_value(self)?;
+            value.sort_all_objects();
+            serde_json::to_vec(&value)?
+        } else {
+            serde_json::to_vec(self)?
+        };
         if encoded.len() > MAX_CATALOG_MANIFEST_BYTES {
             return Err(CatalogManifestError::Invalid(format!(
                 "encoded catalog manifest is {} bytes; maximum is {MAX_CATALOG_MANIFEST_BYTES}",

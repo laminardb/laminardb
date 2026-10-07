@@ -18,7 +18,11 @@ pub mod sink_config;
 pub mod sink_metrics;
 
 // Shared modules
+mod schema_configuration;
+#[cfg(test)]
+mod schema_contract_tests;
 pub mod schema_registry;
+mod schema_resolution;
 
 // Source re-exports
 pub use avro::AvroDeserializer;
@@ -82,6 +86,14 @@ pub fn register_kafka_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities {
+            built_in_formats: vec!["raw".into(), "bytes".into()],
+            ..crate::schema::resolution::SchemaCapabilities::metadata(
+                &["avro"],
+                false,
+                crate::schema::resolution::SchemaPreparation::None,
+            )
+        },
         name: "kafka".to_string(),
         display_name: "Apache Kafka Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -115,6 +127,11 @@ pub fn register_kafka_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &["avro"],
+            true,
+            crate::schema::resolution::SchemaPreparation::ExplicitRegistration,
+        ),
         name: "kafka".to_string(),
         display_name: "Apache Kafka Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

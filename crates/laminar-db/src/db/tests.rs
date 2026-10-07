@@ -5531,7 +5531,7 @@ async fn create_source_surfaces_kafka_config_error_in_ddl_message() {
         "DDL error must name the offending key, got: {msg}"
     );
     assert!(
-        msg.contains("schema auto-discovery failed"),
+        msg.contains("schema resolution"),
         "DDL error must use the new framing, got: {msg}"
     );
 }
@@ -5657,6 +5657,8 @@ async fn test_builder_register_connector() {
             registry.register_source(
                 "test-source",
                 laminar_connectors::config::ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "test-source".to_string(),
                     display_name: "Test Source".to_string(),
                     version: "0.1.0".to_string(),
@@ -5683,6 +5685,8 @@ async fn test_builder_register_connector() {
     let replacement = registry.register_source(
         "test-source",
         laminar_connectors::config::ConnectorInfo {
+            schema_capabilities:
+                laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
             name: "replacement".into(),
             display_name: "Replacement".into(),
             version: "9.9.9".into(),
@@ -5710,6 +5714,8 @@ async fn builder_rejects_custom_replacement_of_builtin_connector() {
             registry.register_source(
                 "generator",
                 laminar_connectors::config::ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "replacement".into(),
                     display_name: "Replacement".into(),
                     version: "1".into(),
@@ -5810,7 +5816,7 @@ async fn test_sql_create_source_errors_when_discovery_yields_empty() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("could not auto-discover a schema"),
+        err.to_string().contains("schema resolution") && err.to_string().contains("field count"),
         "expected actionable discovery-failure error, got: {err}"
     );
 }
@@ -5888,6 +5894,12 @@ async fn fake_source_db(
             registry.register_source(
                 name,
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::metadata(
+                            &[],
+                            false,
+                            laminar_connectors::schema::resolution::SchemaPreparation::None,
+                        ),
                     name: name.into(),
                     display_name: name.into(),
                     version: "0.1.0".into(),
@@ -5990,6 +6002,12 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
                 registry.register_source(
                     "gated-source",
                     ConnectorInfo {
+                        schema_capabilities:
+                            laminar_connectors::schema::resolution::SchemaCapabilities::metadata(
+                                &[],
+                                false,
+                                laminar_connectors::schema::resolution::SchemaPreparation::None,
+                            ),
                         name: "gated-source".into(),
                         display_name: "gated-source".into(),
                         version: "0.1.0".into(),
@@ -6027,7 +6045,7 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
         tokio::spawn(async move { db.start().await })
     };
     tokio::task::yield_now().await;
-    assert_eq!(DbState::load(&db.state), DbState::Starting);
+    assert_eq!(DbState::load(&db.state), DbState::Created);
     assert!(!start.is_finished());
 
     release.notify_one();
@@ -7622,13 +7640,18 @@ async fn feature_disabled_lookup_connectors_leave_no_residue() {
 #[tokio::test]
 async fn postgres_lookup_registration_preserves_canonical_name() {
     let db = LaminarDB::open().unwrap();
-    db.execute(
-        "CREATE LOOKUP TABLE customers (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)) \
+    // Exercise catalog registration from an already committed legacy reader.
+    crate::ddl::schema_resolution::RESOLVED_SCHEMA
+        .scope(
+            None,
+            db.execute(
+                "CREATE LOOKUP TABLE customers (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id)) \
          WITH ('connector' = 'postgres', 'connection' = 'host=localhost', \
          'table' = 'customers')",
-    )
-    .await
-    .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
 
     assert!(db.table_store.read().has_table("customers"));
     assert_eq!(
@@ -7689,13 +7712,18 @@ async fn postgres_lookup_registration_preserves_canonical_name() {
 async fn postgres_on_demand_admission_uses_lookup_factory() {
     let db = LaminarDB::open().unwrap();
     assert!(db.connector_registry().has_lookup_source("postgres"));
-    db.execute(
-        "CREATE LOOKUP TABLE pg_direct (id INT NOT NULL, PRIMARY KEY (id)) \
+    // Exercise catalog registration from an already committed legacy reader.
+    crate::ddl::schema_resolution::RESOLVED_SCHEMA
+        .scope(
+            None,
+            db.execute(
+                "CREATE LOOKUP TABLE pg_direct (id INT NOT NULL, PRIMARY KEY (id)) \
          WITH ('connector' = 'postgres', 'strategy' = 'on-demand', \
          'connection' = 'host=localhost', 'table' = 'pg_direct')",
-    )
-    .await
-    .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
     assert!(db
         .connector_manager
         .lock()
@@ -7710,14 +7738,19 @@ async fn mongodb_on_demand_admission_does_not_require_table_source() {
     let db = LaminarDB::open().unwrap();
     assert!(db.connector_registry().has_lookup_source("mongodb"));
     assert!(!db.connector_registry().has_table_source("mongodb"));
-    db.execute(
-        "CREATE LOOKUP TABLE mongo_direct (id VARCHAR NOT NULL, PRIMARY KEY (id)) \
+    // Admission is independent of metadata I/O; exercise an explicit legacy reader.
+    crate::ddl::schema_resolution::RESOLVED_SCHEMA
+        .scope(
+            None,
+            db.execute(
+                "CREATE LOOKUP TABLE mongo_direct (id VARCHAR NOT NULL, PRIMARY KEY (id)) \
          WITH ('connector' = 'mongodb', 'strategy' = 'on-demand', \
          'connection.uri' = 'mongodb://localhost:27017', 'database' = 'test', \
          'collection' = 'dimensions')",
-    )
-    .await
-    .unwrap();
+            ),
+        )
+        .await
+        .unwrap();
     assert!(db
         .connector_manager
         .lock()
@@ -7818,6 +7851,8 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
             registry.register_lookup_source(
                 "mock-direct",
                 laminar_connectors::config::ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "mock-direct".into(),
                     display_name: "Mock direct lookup".into(),
                     version: "0.1.0".into(),
@@ -8477,6 +8512,8 @@ async fn db_with_mock_table_source(snapshot_batches: Vec<RecordBatch>) -> Arc<La
             registry.register_table_source(
                 "mock",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "mock".to_string(),
                     display_name: "Mock Table Source".to_string(),
                     version: "0.1.0".to_string(),
@@ -8558,6 +8595,8 @@ async fn test_table_source_multiple_tables() {
             registry.register_table_source(
                 "mock",
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: "mock".to_string(),
                     display_name: "Mock".to_string(),
                     version: "0.1.0".to_string(),
@@ -10370,8 +10409,11 @@ async fn query_cannot_observe_catalog_create_while_manifest_seal_is_pending() {
     tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
         .await
         .unwrap();
-    assert!(db.catalog.get_source("tentative").is_some());
-    assert!(db.ctx.table_exist("tentative").unwrap());
+    assert!(
+        db.catalog.get_source("tentative").is_none(),
+        "uncommitted schemas must be invisible"
+    );
+    assert!(!db.ctx.table_exist("tentative").unwrap());
 
     let query = {
         let db = Arc::clone(&db);
@@ -10382,16 +10424,27 @@ async fn query_cannot_observe_catalog_create_while_manifest_seal_is_pending() {
         tokio::spawn(async move { db.collect_local_table("tentative").await })
     };
     tokio::task::yield_now().await;
-    assert!(!query.is_finished());
-    assert!(!local_scan.is_finished());
+    let query_error = tokio::time::timeout(std::time::Duration::from_secs(2), query)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let scan_error = tokio::time::timeout(std::time::Duration::from_secs(2), local_scan)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(query_error.to_string().contains("tentative"));
+    assert!(scan_error.to_string().contains("tentative"));
+    assert!(
+        !create.is_finished(),
+        "the catalog read must not wait for metadata publication"
+    );
 
     *db.catalog_seal_gate.lock() = None;
     release.notify_one();
     assert!(create.await.unwrap().is_err());
-    let query_error = query.await.unwrap().unwrap_err();
-    assert!(query_error.to_string().contains("tentative"));
-    let scan_error = local_scan.await.unwrap().unwrap_err();
-    assert!(scan_error.to_string().contains("tentative"));
+
     assert!(db.catalog.get_source("tentative").is_none());
     assert!(!db.ctx.table_exist("tentative").unwrap());
 }
@@ -11074,6 +11127,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
     manifest_store
         .seal(
             &CatalogManifest::new(vec![CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: "secured".into(),
                 kind: CatalogObjectKind::Source,
                 catalog_generation: 1,
@@ -11119,6 +11173,10 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
                 registry.register_source(
                     "capture-secret",
                     ConnectorInfo {
+                        schema_capabilities:
+                            laminar_connectors::schema::resolution::SchemaCapabilities::declared(
+                                false,
+                            ),
                         name: "capture-secret".into(),
                         display_name: "capture-secret".into(),
                         version: "1".into(),
@@ -11165,6 +11223,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
     manifest_store
         .seal(
             &CatalogManifest::new(vec![CatalogManifestEntry {
+                schema_binding: None,
                 canonical_name: "unstable".into(),
                 kind: CatalogObjectKind::Source,
                 catalog_generation: 1,
@@ -11188,6 +11247,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
                     registry.register_source(
                         "changing-discovery",
                         ConnectorInfo {
+                            schema_capabilities: laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                             name: "changing-discovery".into(),
                             display_name: "changing-discovery".into(),
                             version: "1".into(),
@@ -11424,6 +11484,7 @@ async fn cluster_manifest_invalid_entry_fails_before_any_replay() {
 
     fn entry(name: &str, kind: CatalogObjectKind, ddl: &str) -> CatalogManifestEntry {
         CatalogManifestEntry {
+            schema_binding: None,
             canonical_name: name.to_string(),
             kind,
             catalog_generation: 1,
@@ -12015,7 +12076,7 @@ async fn connector_options_resolve_vars() {
         .build()
         .await
         .unwrap();
-    db.execute("CREATE SOURCE s (id BIGINT) FROM GENERATOR ('topic' = '${TOPIC}')")
+    db.execute("CREATE SOURCE s FROM GENERATOR ('topic' = '${TOPIC}')")
         .await
         .unwrap();
     {
@@ -12975,3 +13036,9 @@ async fn open_subscription_after_sequence_reports_cursor_errors() {
         db.shutdown().await.unwrap();
     }
 }
+
+mod schema_resolution;
+
+mod schema_resolution_races;
+
+mod schema_preparation_recovery;

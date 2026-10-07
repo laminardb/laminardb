@@ -2,7 +2,6 @@
 
 #[cfg(not(test))]
 use super::lsn::Lsn;
-#[cfg(not(test))]
 use crate::connector::ConnectorTaskGuard;
 use crate::error::ConnectorError;
 use sha2::{Digest, Sha256};
@@ -12,7 +11,7 @@ pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const MINIMUM_SERVER_VERSION_NUM: u32 = 170_000;
 
 /// Database-side identity that makes an engine checkpoint safe to resume.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct PostgresCheckpointBinding {
     pub system_identifier: u64,
     pub timeline_id: u32,
@@ -26,8 +25,8 @@ pub(super) struct PostgresCheckpointBinding {
 }
 
 /// Read-only projection of the recovery fields on an existing slot.
-#[cfg(not(test))]
 pub(super) struct InspectedReplicationSlot {
+    #[cfg(not(test))]
     pub confirmed_flush_lsn: Option<Lsn>,
     pub binding: PostgresCheckpointBinding,
 }
@@ -65,13 +64,11 @@ pub(super) fn source_config_digest(config: &super::config::PostgresCdcConfig) ->
 }
 
 /// Cancellation-safe control-plane connection and driver task.
-#[cfg(not(test))]
 pub(super) struct ControlConnection {
     client: tokio_postgres::Client,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-#[cfg(not(test))]
 impl ControlConnection {
     #[must_use]
     pub(super) fn client(&self) -> &tokio_postgres::Client {
@@ -86,7 +83,6 @@ impl ControlConnection {
     }
 }
 
-#[cfg(not(test))]
 impl Drop for ControlConnection {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
@@ -100,7 +96,6 @@ impl Drop for ControlConnection {
 /// # Errors
 ///
 /// Returns an error when TLS configuration is invalid or the connection cannot be opened.
-#[cfg(not(test))]
 pub(super) async fn connect(
     config: &super::config::PostgresCdcConfig,
     driver_guard: ConnectorTaskGuard,
@@ -168,7 +163,6 @@ pub(super) async fn connect(
 /// # Errors
 ///
 /// Returns an error when slot lookup, identity validation, or LSN parsing fails.
-#[cfg(not(test))]
 pub(super) async fn inspect_replication_slot(
     client: &tokio_postgres::Client,
     slot_name: &str,
@@ -177,45 +171,7 @@ pub(super) async fn inspect_replication_slot(
     publication: &str,
     source_config_sha256: String,
 ) -> Result<Option<InspectedReplicationSlot>, ConnectorError> {
-    let version_row = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        client.query_one("SELECT current_setting('server_version_num')", &[]),
-    )
-    .await
-    .map_err(|_| {
-        ConnectorError::ConnectionFailed(
-            "query PostgreSQL server version timed out after 10 seconds".into(),
-        )
-    })?
-    .map_err(|error| {
-        ConnectorError::ConnectionFailed(format!("query PostgreSQL server version: {error}"))
-    })?;
-    let version_text: &str = version_row.get(0);
-    let version_num = version_text.parse::<u32>().map_err(|error| {
-        ConnectorError::ReadError(format!(
-            "invalid PostgreSQL server_version_num '{version_text}': {error}"
-        ))
-    })?;
-    validate_server_version_num(version_num)?;
-
-    let control_row = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        client.query_one(
-            "SELECT control_system.system_identifier::text, control_checkpoint.timeline_id::text \
-             FROM pg_catalog.pg_control_system() AS control_system \
-             CROSS JOIN pg_catalog.pg_control_checkpoint() AS control_checkpoint",
-            &[],
-        ),
-    )
-    .await
-    .map_err(|_| {
-        ConnectorError::ConnectionFailed(
-            "query PostgreSQL system identifier and timeline timed out after 10 seconds".into(),
-        )
-    })?
-    .map_err(|error| map_control_system_query_error(&error))?;
-    let system_identifier = parse_decimal_identity::<u64>(control_row.get(0), "system identifier")?;
-    let timeline_id = parse_decimal_identity::<u32>(control_row.get(1), "timeline ID")?;
+    let (system_identifier, timeline_id) = read_system_identity(client).await?;
 
     // Keep the database, publication, and slot projection in one statement so
     // its catalog rows come from one PostgreSQL snapshot. The JSONB rendering
@@ -288,6 +244,46 @@ pub(super) async fn inspect_replication_slot(
         temporary,
         invalidation_reason,
     )?;
+    let (database_oid, publication_oid, publication_definition_sha256) =
+        read_publication_identity(&row, publication)?;
+    tracing::info!(
+        slot = slot_name,
+        two_phase,
+        failover,
+        "using logical replication slot"
+    );
+
+    #[cfg(not(test))]
+    let confirmed_flush_lsn = {
+        let lsn: Option<&str> = row.get(0);
+        lsn.map(|value| {
+            value.parse().map_err(|error| {
+                ConnectorError::ReadError(format!("invalid confirmed_flush_lsn: {error}"))
+            })
+        })
+        .transpose()?
+    };
+    Ok(Some(InspectedReplicationSlot {
+        #[cfg(not(test))]
+        confirmed_flush_lsn,
+        binding: PostgresCheckpointBinding {
+            system_identifier,
+            timeline_id,
+            database_oid,
+            publication_oid,
+            publication_definition_sha256,
+            source_config_sha256,
+            slot_plugin: configured_plugin.unwrap_or_default().to_string(),
+            slot_two_phase: two_phase,
+            slot_failover: failover,
+        },
+    }))
+}
+
+fn read_publication_identity(
+    row: &tokio_postgres::Row,
+    publication: &str,
+) -> Result<(u32, u32, String), ConnectorError> {
     let database_oid = parse_decimal_identity::<u32>(row.get(8), "database OID")?;
     let publication_oid_text: Option<&str> = row.get(9);
     let publication_oid = publication_oid_text
@@ -312,35 +308,69 @@ pub(super) async fn inspect_replication_slot(
     let mut publication_digest = Sha256::new();
     publication_digest.update(b"laminardb-postgres-publication-v1\0");
     digest_field(&mut publication_digest, publication_definition.as_bytes());
-    tracing::info!(
-        slot = slot_name,
-        two_phase,
-        failover,
-        "using logical replication slot"
-    );
+    Ok((
+        database_oid,
+        publication_oid,
+        format!("{:x}", publication_digest.finalize()),
+    ))
+}
 
-    let lsn: Option<&str> = row.get(0);
-    let confirmed_flush_lsn = lsn
-        .map(|value| {
-            value.parse().map_err(|error| {
-                ConnectorError::ReadError(format!("invalid confirmed_flush_lsn: {error}"))
-            })
-        })
-        .transpose()?;
-    Ok(Some(InspectedReplicationSlot {
-        confirmed_flush_lsn,
-        binding: PostgresCheckpointBinding {
-            system_identifier,
-            timeline_id,
-            database_oid,
-            publication_oid,
-            publication_definition_sha256: format!("{:x}", publication_digest.finalize()),
-            source_config_sha256,
-            slot_plugin: configured_plugin.unwrap_or_default().to_string(),
-            slot_two_phase: two_phase,
-            slot_failover: failover,
-        },
-    }))
+async fn read_system_identity(
+    client: &tokio_postgres::Client,
+) -> Result<(u64, u32), ConnectorError> {
+    let version_row = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.query_one("SELECT current_setting('server_version_num')", &[]),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::ConnectionFailed(
+            "query PostgreSQL server version timed out after 10 seconds".into(),
+        )
+    })?
+    .map_err(|error| {
+        ConnectorError::ConnectionFailed(format!("query PostgreSQL server version: {error}"))
+    })?;
+    let version_text: &str = version_row.try_get(0).map_err(|error| {
+        ConnectorError::ReadError(format!("read PostgreSQL server version: {error}"))
+    })?;
+    let version_num = version_text.parse::<u32>().map_err(|error| {
+        ConnectorError::ReadError(format!(
+            "invalid PostgreSQL server_version_num '{version_text}': {error}"
+        ))
+    })?;
+    validate_server_version_num(version_num)?;
+
+    let control_row = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.query_one(
+            "SELECT control_system.system_identifier::text, control_checkpoint.timeline_id::text \
+             FROM pg_catalog.pg_control_system() AS control_system \
+             CROSS JOIN pg_catalog.pg_control_checkpoint() AS control_checkpoint",
+            &[],
+        ),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::ConnectionFailed(
+            "query PostgreSQL system identifier and timeline timed out after 10 seconds".into(),
+        )
+    })?
+    .map_err(|error| map_control_system_query_error(&error))?;
+    let system_identifier = parse_decimal_identity::<u64>(
+        control_row.try_get(0).map_err(|error| {
+            ConnectorError::ReadError(format!("read PostgreSQL system identifier: {error}"))
+        })?,
+        "system identifier",
+    )?;
+    let timeline_id = parse_decimal_identity::<u32>(
+        control_row.try_get(1).map_err(|error| {
+            ConnectorError::ReadError(format!("read PostgreSQL timeline: {error}"))
+        })?,
+        "timeline ID",
+    )?;
+
+    Ok((system_identifier, timeline_id))
 }
 
 fn validate_server_version_num(version_num: u32) -> Result<(), ConnectorError> {
@@ -352,7 +382,6 @@ fn validate_server_version_num(version_num: u32) -> Result<(), ConnectorError> {
     Ok(())
 }
 
-#[cfg(not(test))]
 fn parse_decimal_identity<T>(value: &str, label: &str) -> Result<T, ConnectorError>
 where
     T: std::str::FromStr,
@@ -363,7 +392,6 @@ where
     })
 }
 
-#[cfg(not(test))]
 fn map_control_system_query_error(error: &tokio_postgres::Error) -> ConnectorError {
     if error.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) {
         return ConnectorError::ConfigurationError(

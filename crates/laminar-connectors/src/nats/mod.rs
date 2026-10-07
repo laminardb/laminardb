@@ -28,6 +28,10 @@ pub fn register_nats_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities {
+            built_in_formats: vec!["raw".into(), "bytes".into()],
+            ..crate::schema::resolution::SchemaCapabilities::declared(false)
+        },
         name: "nats".to_string(),
         display_name: "NATS Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -56,6 +60,7 @@ pub fn register_nats_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::declared(true),
         name: "nats".to_string(),
         display_name: "NATS Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

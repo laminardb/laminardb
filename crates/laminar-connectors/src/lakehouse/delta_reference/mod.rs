@@ -29,6 +29,7 @@ pub struct DeltaReferenceTableSource {
     phase: Phase,
     table: Option<DeltaTable>,
     pending_batches: VecDeque<RecordBatch>,
+    binding: Option<crate::schema::resolution::SchemaBinding>,
 }
 
 impl DeltaReferenceTableSource {
@@ -41,6 +42,7 @@ impl DeltaReferenceTableSource {
             phase: Phase::Ready,
             table: None,
             pending_batches: VecDeque::new(),
+            binding: None,
         }
     }
 
@@ -53,10 +55,10 @@ impl DeltaReferenceTableSource {
         config: &ConnectorConfig,
         declared_schema: SchemaRef,
     ) -> Result<Self, ConnectorError> {
-        Ok(Self::from_source_config(
-            DeltaSourceConfig::from_config(config)?,
-            declared_schema,
-        ))
+        let mut source =
+            Self::from_source_config(DeltaSourceConfig::from_config(config)?, declared_schema);
+        source.binding = config.schema_binding().cloned();
+        Ok(source)
     }
 
     async fn open_table(&mut self) -> Result<(), ConnectorError> {
@@ -73,6 +75,12 @@ impl DeltaReferenceTableSource {
         .await?;
         self.table =
             Some(delta_io::open_or_create_table(&resolved_path, resolved_options, None).await?);
+        if let Some(table) = &self.table {
+            super::schema_resolution::verify_identity(
+                self.binding.as_ref(),
+                &super::schema_resolution::delta_native(table)?,
+            )?;
+        }
         Ok(())
     }
 
@@ -120,6 +128,14 @@ impl DeltaReferenceTableSource {
 
 #[async_trait::async_trait]
 impl ReferenceTableSource for DeltaReferenceTableSource {
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        super::schema_resolution::delta_reference(config, explicit).await
+    }
+
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         match self.phase {
             Phase::Closed => {

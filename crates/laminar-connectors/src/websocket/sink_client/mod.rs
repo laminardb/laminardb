@@ -276,6 +276,20 @@ impl SinkConnector for WebSocketSinkClient {
         ))
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        crate::serde::schema_contract::validate_writer(crate::serde::Format::Json, &input)?;
+        crate::schema::resolution::logical_binding(
+            config,
+            crate::schema::resolution::SchemaDirection::Sink,
+            crate::schema::resolution::SchemaOrigin::Query,
+            &input,
+        )
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         if !matches!(self.state, ConnectorState::Created | ConnectorState::Closed) {
             return Err(ConnectorError::InvalidState {
@@ -290,6 +304,25 @@ impl SinkConnector for WebSocketSinkClient {
             WebSocketSinkConfig::from_config(config)?
         };
         effective_config.validate()?;
+        let schema = config
+            .arrow_schema()
+            .or_else(|| {
+                config
+                    .schema_binding()
+                    .map(|binding| Arc::new(binding.logical.clone()))
+            })
+            .unwrap_or_else(|| self.schema.clone());
+        crate::schema::JsonEncoder::validate_schema(&schema)?;
+        if config
+            .schema_binding()
+            .is_some_and(|binding| binding.logical != *schema)
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "WebSocket writer differs from its committed query".into(),
+            ));
+        }
+        self.serializer = BatchSerializer::new(schema.clone());
+        self.schema = schema;
 
         let url = match &effective_config {
             WebSocketSinkConfig::Client { url } => url.clone(),

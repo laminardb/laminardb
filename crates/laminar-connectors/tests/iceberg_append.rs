@@ -434,3 +434,158 @@ async fn coordinated_multi_participant_checkpoint_is_one_snapshot() {
     assert_eq!(snapshots, 1);
     assert_eq!(rows, 4);
 }
+
+#[tokio::test]
+#[ignore = "requires Docker: tests/docker/iceberg-compose.yml"]
+async fn registered_contracts_preserve_field_ids_map_query_names_and_fence_replacement() {
+    use arrow_array::StringArray;
+    use laminar_connectors::registry::ConnectorRegistry;
+    use laminar_connectors::schema::resolution::SchemaOrigin;
+
+    require_catalog();
+    let name = format!("schema_{}", uuid::Uuid::new_v4().simple());
+    let mut config = config(&name);
+    let native_input = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+    config.set("_arrow_schema", encode_arrow_schema_ipc(&native_input));
+    let registry = ConnectorRegistry::new();
+    laminar_connectors::lakehouse::register_iceberg_source(&registry).unwrap();
+    laminar_connectors::lakehouse::register_iceberg_sink(&registry).unwrap();
+    let mut pending = registry
+        .resolve_sink_schema(&config, native_input.clone())
+        .await
+        .unwrap();
+    assert!(pending.value.is_none());
+    let parsed = IcebergSinkConfig::from_config(&config).unwrap();
+    let catalog = iceberg_io::build_catalog(&parsed.catalog, &parsed.storage)
+        .await
+        .unwrap();
+    let identifier = iceberg::TableIdent::new(
+        iceberg::NamespaceIdent::from_strs(["laminar_test"]).unwrap(),
+        name.clone(),
+    );
+    assert!(!catalog.table_exists(&identifier).await.unwrap());
+    let mut preparation = registry.create_sink(&config, None).unwrap();
+    preparation
+        .prepare_schema(&config, &mut pending)
+        .await
+        .unwrap();
+    assert!(catalog.table_exists(&identifier).await.unwrap());
+    let source_binding = registry.resolve_source_schema(&config, None).await.unwrap();
+    assert_eq!(source_binding.origin, SchemaOrigin::Metadata);
+    assert_eq!(source_binding.logical.fields().len(), 2);
+    let id_metadata = source_binding.logical.field(0).metadata();
+    assert!(id_metadata.contains_key(parquet::arrow::PARQUET_FIELD_ID_META_KEY));
+    assert!(source_binding
+        .value
+        .as_ref()
+        .unwrap()
+        .definition
+        .get("partition_spec")
+        .is_some());
+    assert_eq!(
+        source_binding.value.as_ref().unwrap().identity,
+        pending.value.as_ref().unwrap().identity
+    );
+    let reference = registry.resolve_table_schema(&config, None).await.unwrap();
+    let lookup = registry.resolve_lookup_schema(&config, None).await.unwrap();
+    assert_eq!(reference.logical, source_binding.logical);
+    assert_eq!(lookup.logical, source_binding.logical);
+
+    let query = Arc::new(Schema::new(vec![
+        Field::new("label", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let writer_binding = registry
+        .resolve_sink_schema(&config, query.clone())
+        .await
+        .unwrap();
+    assert_eq!(writer_binding.logical, *query);
+    assert_eq!(
+        writer_binding
+            .external
+            .as_ref()
+            .unwrap()
+            .field(0)
+            .metadata(),
+        source_binding.logical.field(0).metadata()
+    );
+    config.set("_arrow_schema", encode_arrow_schema_ipc(&query));
+    config.set_schema_binding(writer_binding.clone()).unwrap();
+    let mut writer = registry.create_sink(&config, None).unwrap();
+    writer.open(&config).await.unwrap();
+    writer
+        .write_batch(
+            &RecordBatch::try_new(
+                query.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["named"])),
+                    Arc::new(Int64Array::from(vec![73])),
+                ],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    writer.flush().await.unwrap();
+    writer.close().await.unwrap();
+
+    let mut read_config = config.clone();
+    read_config
+        .set_schema_binding(source_binding.clone())
+        .unwrap();
+    let mut reader = registry.create_source(&read_config, None).unwrap();
+    reader
+        .start(
+            SourceStart::new(
+                read_config.clone(),
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let batch = reader.poll_batch(16).await.unwrap().unwrap().records;
+    let id = batch
+        .column(batch.schema().index_of("id").unwrap())
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let label = batch
+        .column(batch.schema().index_of("label").unwrap())
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(id.value(0), 73);
+    assert_eq!(label.value(0), "named");
+    reader.close().await.unwrap();
+
+    catalog.drop_table(&identifier).await.unwrap();
+    iceberg_io::ensure_table_exists(catalog.as_ref(), &parsed, &native_input)
+        .await
+        .unwrap();
+    let replacement = registry.resolve_source_schema(&config, None).await.unwrap();
+    assert_ne!(
+        replacement.value.as_ref().unwrap().identity["table_uuid"],
+        source_binding.value.as_ref().unwrap().identity["table_uuid"]
+    );
+    let mut recovered = registry.create_source(&read_config, None).unwrap();
+    assert!(recovered
+        .start(
+            SourceStart::new(
+                read_config,
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce
+            )
+            .unwrap()
+        )
+        .await
+        .is_err());
+    let mut recovered_sink = registry.create_sink(&config, None).unwrap();
+    assert!(recovered_sink.open(&config).await.is_err());
+    catalog.drop_table(&identifier).await.unwrap();
+}

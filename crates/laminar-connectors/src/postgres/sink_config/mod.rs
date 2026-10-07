@@ -21,6 +21,7 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "changelog.mode",
     "connect.timeout.ms",
     "database",
+    "delivery.guarantee",
     "flush.interval.ms",
     "hostname",
     "password",

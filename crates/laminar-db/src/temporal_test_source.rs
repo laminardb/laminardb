@@ -66,6 +66,8 @@ pub(crate) fn register(
     registry.register_source(
         CONNECTOR_NAME,
         ConnectorInfo {
+            schema_capabilities:
+                laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
             name: CONNECTOR_NAME.into(),
             display_name: "Temporal positioned test source".into(),
             version: "1".into(),

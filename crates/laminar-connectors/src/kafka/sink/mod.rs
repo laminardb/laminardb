@@ -19,7 +19,7 @@ use crate::connector::{
     SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
-use crate::serde::{Format, RecordSerializer};
+use crate::serde::RecordSerializer;
 
 use super::metadata_error::{fetch_error, invalid_response, topic_error};
 use super::partitioner::{
@@ -83,6 +83,8 @@ pub struct KafkaSink {
     metrics: KafkaSinkMetrics,
     /// Arrow schema for input batches.
     schema: SchemaRef,
+    writer_schema: Option<SchemaRef>,
+    writer_projection: Vec<usize>,
     /// Optional Schema Registry client.
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     /// Shared Avro schema ID (updated after SR registration).
@@ -124,6 +126,8 @@ impl KafkaSink {
             dlq_producer: None,
             metrics: KafkaSinkMetrics::new(registry),
             schema,
+            writer_schema: None,
+            writer_projection: Vec::new(),
             schema_registry: None,
             avro_schema_id,
             topic_partition_count: None,
@@ -165,6 +169,8 @@ impl KafkaSink {
             dlq_producer: None,
             metrics: KafkaSinkMetrics::new(None),
             schema,
+            writer_schema: None,
+            writer_projection: Vec::new(),
             schema_registry: Some(sr),
             avro_schema_id,
             topic_partition_count: None,
@@ -189,6 +195,20 @@ impl KafkaSink {
         &self,
         batch: &arrow_array::RecordBatch,
     ) -> Result<Vec<Vec<u8>>, ConnectorError> {
+        let projected;
+        let batch = if let Some(writer) = &self.writer_schema {
+            let columns = self
+                .writer_projection
+                .iter()
+                .map(|index| Arc::clone(batch.column(*index)))
+                .collect();
+            projected = arrow_array::RecordBatch::try_new(Arc::clone(writer), columns).map_err(
+                |error| ConnectorError::SchemaMismatch(format!("writer projection: {error}")),
+            )?;
+            &projected
+        } else {
+            batch
+        };
         let payloads = self.serializer.serialize(batch).map_err(|error| {
             self.metrics.record_serialization_error();
             ConnectorError::Serde(error)
@@ -353,6 +373,7 @@ impl KafkaSink {
         &mut self,
         batch: &arrow_array::RecordBatch,
     ) -> Result<WriteResult, ConnectorError> {
+        self.ensure_schema_ready(&batch.schema())?;
         let collapsed = self.collapse_upsert_changelog(batch)?;
         let rows = collapsed.num_rows();
         if rows == 0 {
@@ -360,7 +381,6 @@ impl KafkaSink {
         }
         let (value_batch, ops) = project_upsert_values(&collapsed)?;
 
-        self.ensure_schema_ready(&value_batch.schema()).await?;
         let payloads = self.serialize_payloads(&value_batch)?;
         let keys = self.extract_keys(&collapsed)?;
         // Reject empty/NULL merge keys before producing ANY record: a compacted topic can't
@@ -505,6 +525,22 @@ impl SinkConnector for KafkaSink {
         Ok(SinkContract::new(consistency, topology, input_mode))
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        super::schema_resolution::resolve_sink(config, input).await
+    }
+
+    async fn prepare_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        binding: &mut crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        super::schema_resolution::prepare_sink(config, binding).await
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
@@ -527,32 +563,7 @@ impl SinkConnector for KafkaSink {
             "opening Kafka sink connector"
         );
 
-        if let Some(ref url) = self.config.schema_registry_url {
-            if self.schema_registry.is_none() {
-                let sr = if let Some(ref ca_path) = self.config.schema_registry_ssl_ca_location {
-                    SchemaRegistryClient::with_tls(
-                        url,
-                        self.config.schema_registry_auth.clone(),
-                        ca_path,
-                    )?
-                } else {
-                    SchemaRegistryClient::new(url, self.config.schema_registry_auth.clone())?
-                };
-                self.schema_registry = Some(Arc::new(sr));
-            }
-        }
-
-        // Schema registration is deferred to the first write_batch(), where the real pipeline
-        // output schema is known — the factory default is a placeholder that would pollute the
-        // registry and break compat checks.
-        if self.config.format == Format::Avro {
-            if let Some(ref sr) = self.schema_registry {
-                if let Some(ref compat) = self.config.schema_compatibility {
-                    let subject = format!("{}-value", self.config.topic);
-                    sr.set_compatibility_level(&subject, *compat).await?;
-                }
-            }
-        }
+        self.install_schema_contract(config).await?;
 
         let rdkafka_config: ClientConfig = self.config.to_rdkafka_config();
         let producer: FutureProducer = rdkafka_config
@@ -657,7 +668,7 @@ impl SinkConnector for KafkaSink {
             return self.write_upsert_batch(batch).await;
         }
 
-        self.ensure_schema_ready(&batch.schema()).await?;
+        self.ensure_schema_ready(&batch.schema())?;
 
         let payloads = self.serialize_payloads(batch)?;
 

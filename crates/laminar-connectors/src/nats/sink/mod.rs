@@ -24,9 +24,10 @@ use crate::connector::{
     SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
-use crate::serde::{self, RecordSerializer};
+use crate::serde::RecordSerializer;
 
 mod message;
+mod schema_binding;
 
 #[cfg(test)]
 use message::encoded_header_len;
@@ -417,6 +418,14 @@ impl SinkConnector for NatsSink {
         Some(self.task_tracker.clone())
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        schema_binding::resolve(config, &input)
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         let cfg = NatsSinkConfig::from_config(config)?;
         let consistency = match cfg.mode {
@@ -438,10 +447,7 @@ impl SinkConnector for NatsSink {
             });
         }
         let cfg = NatsSinkConfig::from_config(config)?;
-        self.serializer = Some(
-            serde::create_serializer(cfg.format)
-                .map_err(|e| err(&format!("serializer for format {:?}: {e}", cfg.format)))?,
-        );
+        self.prepare_writer(config, &cfg)?;
         let setup_timeout = cfg.ack_timeout;
         let setup_deadline = tokio::time::Instant::now() + setup_timeout;
         let connect_options = track_connection_tasks(

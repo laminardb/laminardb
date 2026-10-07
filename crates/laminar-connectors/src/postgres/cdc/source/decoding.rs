@@ -486,6 +486,14 @@ impl PostgresCdcSource {
     }
 
     pub(super) fn admit_relation(&mut self, info: RelationInfo) -> Result<(), ConnectorError> {
+        super::super::schema_resolution::validate_relation(
+            self.committed_relations.as_ref(),
+            &info,
+            &self.config,
+        )
+        .inspect_err(|_| {
+            self.state = ConnectorState::Failed;
+        })?;
         let existing_bytes = self
             .relation_cache
             .get(info.relation_id)

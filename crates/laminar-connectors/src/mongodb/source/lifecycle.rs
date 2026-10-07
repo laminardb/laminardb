@@ -53,6 +53,14 @@ impl SourceConnector for MongoDbCdcSource {
         ])))
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        super::schema_resolution::resolve(config, explicit).await
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         if self.state != ConnectorState::Created {
             return Err(ConnectorError::InvalidState {
@@ -73,8 +81,8 @@ impl SourceConnector for MongoDbCdcSource {
             checkpoint_resume_token,
             checkpoint_requires_start_after,
             initial_resume_position,
-            expected_collection_uuid,
-            expected_deployment_identity,
+            mut expected_collection_uuid,
+            mut expected_deployment_identity,
         ) = match position {
             SourcePosition::Initial => (None, false, None, None, None),
             SourcePosition::Initialized { .. } => {
@@ -130,6 +138,21 @@ impl SourceConnector for MongoDbCdcSource {
             }
         };
 
+        if let Some((collection, deployment)) =
+            super::schema_resolution::committed_identity(config.schema_binding())?
+        {
+            if expected_collection_uuid.is_some_and(|expected| expected != collection)
+                || expected_deployment_identity
+                    .as_ref()
+                    .is_some_and(|expected| expected != &deployment)
+            {
+                return Err(ConnectorError::SchemaMismatch(
+                    "MongoDB checkpoint and committed collection identity disagree".into(),
+                ));
+            }
+            expected_collection_uuid = Some(collection);
+            expected_deployment_identity = Some(deployment);
+        }
         self.start_change_stream_reader(
             parsed_config,
             checkpoint_resume_token,

@@ -722,7 +722,7 @@ pub(super) fn kafka_row_positions(
 const KAFKA_METADATA_COLUMNS: [&str; 3] = ["_partition", "_offset", "_timestamp"];
 const KAFKA_HEADERS_COLUMN: &str = "_headers";
 
-pub(super) fn validate_kafka_output_schema(
+pub(crate) fn validate_kafka_output_schema(
     payload_schema: &SchemaRef,
     include_metadata: bool,
     include_headers: bool,
@@ -743,7 +743,7 @@ pub(super) fn validate_kafka_output_schema(
     Ok(())
 }
 
-pub(super) fn kafka_output_schema(
+pub(crate) fn kafka_output_schema(
     payload_schema: &SchemaRef,
     include_metadata: bool,
     include_headers: bool,

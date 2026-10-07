@@ -114,7 +114,7 @@ fn create_builder(data_type: &DataType, capacity: usize) -> Box<dyn ColumnBuilde
             Box::new(builder)
         }
         DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
-            Box::new(ListBuilder::new(StringBuilder::new()))
+            Box::new(ListBuilder::new(StringBuilder::new()).with_field(Arc::clone(field)))
         }
         // Fallback: serialize as JSON string.
         _ => Box::new(StringBuilder::with_capacity(capacity, capacity * 32)),

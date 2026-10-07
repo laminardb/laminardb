@@ -36,6 +36,9 @@ pub struct DeltaLakeSinkConfig {
     /// Whether to enable schema evolution (auto-merge new columns).
     pub schema_evolution: bool,
 
+    /// Explicitly authorize creating a missing destination before activation.
+    pub auto_create: bool,
+
     /// Write mode: Append, Overwrite, or Upsert (CDC merge).
     pub write_mode: DeltaWriteMode,
 
@@ -82,6 +85,7 @@ impl Default for DeltaLakeSinkConfig {
             max_buffer_records: 100_000,
             max_buffer_duration: Duration::from_secs(60),
             schema_evolution: false,
+            auto_create: false,
             write_mode: DeltaWriteMode::Append,
             merge_key_columns: Vec::new(),
             storage_options: HashMap::new(),
@@ -147,9 +151,9 @@ impl DeltaLakeSinkConfig {
             })?;
             cfg.max_buffer_duration = Duration::from_millis(ms);
         }
-        if let Some(v) = config.get("schema.evolution") {
-            cfg.schema_evolution = v.eq_ignore_ascii_case("true");
-        }
+        cfg.schema_evolution = config
+            .get_parsed::<bool>("schema.evolution")?
+            .unwrap_or(false);
         if let Some(v) = config.get("write.mode") {
             cfg.write_mode = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
@@ -190,15 +194,9 @@ impl DeltaLakeSinkConfig {
                 ))
             })?;
         }
-        if let Some(v) = config.get("catalog.database") {
-            cfg.catalog_database = Some(v.to_string());
-        }
-        if let Some(v) = config.get("catalog.name") {
-            cfg.catalog_name = Some(v.to_string());
-        }
-        if let Some(v) = config.get("catalog.schema") {
-            cfg.catalog_schema = Some(v.to_string());
-        }
+        cfg.catalog_database = config.get("catalog.database").map(str::to_owned);
+        cfg.catalog_name = config.get("catalog.name").map(str::to_owned);
+        cfg.catalog_schema = config.get("catalog.schema").map(str::to_owned);
         // Unity-specific: populate workspace_url and access_token into the enum variant.
         if let DeltaCatalogType::Unity {
             ref mut workspace_url,
@@ -215,6 +213,9 @@ impl DeltaLakeSinkConfig {
         if let Some(v) = config.get("catalog.storage.location") {
             cfg.catalog_storage_location = Some(v.to_string());
         }
+        cfg.auto_create = config
+            .get_parsed::<bool>("auto.create")?
+            .unwrap_or(cfg.catalog_storage_location.is_some());
         if let Some(v) = config.get("write.timeout.ms") {
             let ms: u64 = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!("invalid write.timeout.ms: '{v}'"))
@@ -269,8 +270,10 @@ impl DeltaLakeSinkConfig {
         }
 
         // Resolve storage credentials: explicit options + environment variable fallbacks.
-        let explicit_storage = config.properties_with_prefix("storage.");
-        let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);
+        let resolved = StorageCredentialResolver::resolve(
+            &cfg.table_path,
+            &config.properties_with_prefix("storage."),
+        );
         cfg.storage_options = resolved.options;
 
         // Map LogStore configuration keys to delta-rs storage options.

@@ -79,6 +79,7 @@ pub struct PostgresCdcSource {
 
     /// Cached relation (table) schemas from Relation messages.
     relation_cache: RelationCache,
+    committed_relations: Option<BTreeMap<u32, RelationInfo>>,
 
     /// Committed transactions awaiting `poll_batch()` in WAL order.
     committed_transactions: VecDeque<CommittedTransaction>,
@@ -224,6 +225,7 @@ impl PostgresCdcSource {
             schema: cdc_envelope_schema(),
             metrics: Arc::new(PostgresCdcMetrics::new(registry)),
             relation_cache: RelationCache::new(),
+            committed_relations: None,
             committed_transactions: VecDeque::new(),
             buffered_event_count: 0,
             buffered_event_bytes: 0,

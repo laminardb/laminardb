@@ -106,6 +106,7 @@ pub fn register_websocket_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::declared(false),
         name: "websocket".to_string(),
         display_name: "WebSocket Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -147,6 +148,7 @@ pub fn register_websocket_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::declared(true),
         name: "websocket".to_string(),
         display_name: "WebSocket Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

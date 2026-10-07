@@ -202,6 +202,7 @@ See the [deployment guide](deploy/README.md) for setup and operational details.
 ## More documentation
 
 - [SQL reference](docs/SQL_REFERENCE.md)
+- [Connector schema resolution and recovery](docs/SCHEMA_RESOLUTION.md)
 - [Server configuration](crates/laminar-server/README.md)
 - [Connector guide](crates/laminar-connectors/README.md)
 - [Rust API](https://docs.rs/laminar-db)

@@ -7,6 +7,7 @@ pub mod lsn;
 pub mod metrics;
 pub mod postgres_io;
 pub mod schema;
+mod schema_resolution;
 pub mod source;
 pub mod types;
 
@@ -30,6 +31,11 @@ pub fn register_postgres_cdc_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            false,
+            crate::schema::resolution::SchemaPreparation::None,
+        ),
         name: "postgres-cdc".to_string(),
         display_name: "PostgreSQL CDC Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -51,6 +57,11 @@ pub fn register_postgres_cdc_source(
 
     // Register standalone finite snapshots (no replication slot required).
     let pg_info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            false,
+            crate::schema::resolution::SchemaPreparation::None,
+        ),
         name: "postgres".to_string(),
         display_name: "PostgreSQL Lookup Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),

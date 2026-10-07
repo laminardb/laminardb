@@ -36,6 +36,7 @@ pub struct IcebergReferenceTableSource {
     snapshot_stream: Option<ArrowRecordBatchStream>,
     snapshot_id: Option<i64>,
     emitted_rows: u64,
+    binding: Option<crate::schema::resolution::SchemaBinding>,
 }
 
 impl IcebergReferenceTableSource {
@@ -77,6 +78,7 @@ impl IcebergReferenceTableSource {
             snapshot_stream: None,
             snapshot_id: None,
             emitted_rows: 0,
+            binding: None,
         })
     }
 
@@ -89,7 +91,9 @@ impl IcebergReferenceTableSource {
         config: &ConnectorConfig,
         declared_schema: SchemaRef,
     ) -> Result<Self, ConnectorError> {
-        Self::new(IcebergSourceConfig::from_config(config)?, declared_schema)
+        let mut source = Self::new(IcebergSourceConfig::from_config(config)?, declared_schema)?;
+        source.binding = config.schema_binding().cloned();
+        Ok(source)
     }
 
     async fn load_initial_snapshot(&mut self) -> Result<(), ConnectorError> {
@@ -103,6 +107,10 @@ impl IcebergReferenceTableSource {
         )
         .await?;
 
+        super::schema_resolution::verify_identity(
+            self.binding.as_ref(),
+            &super::schema_resolution::iceberg_native(&table),
+        )?;
         let snapshot = selected_snapshot(&table, &self.config)?;
         let snapshot_schema = match &snapshot {
             Some(snapshot) => snapshot
@@ -236,6 +244,14 @@ fn selected_snapshot(
 
 #[async_trait]
 impl ReferenceTableSource for IcebergReferenceTableSource {
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        super::schema_resolution::iceberg_source(config, explicit).await
+    }
+
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         match self.phase {
             Phase::Closed => {

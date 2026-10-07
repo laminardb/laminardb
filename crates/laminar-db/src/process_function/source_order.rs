@@ -193,6 +193,8 @@ mod tests {
             registry.register_source(
                 SOURCE,
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: SOURCE.into(),
                     display_name: "Ordered replay probe".into(),
                     version: "1".into(),

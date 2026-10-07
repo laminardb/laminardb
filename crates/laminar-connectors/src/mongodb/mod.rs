@@ -4,6 +4,7 @@ pub mod change_event;
 pub mod config;
 pub mod lookup;
 pub mod metrics;
+mod schema_metadata;
 pub mod sink;
 pub mod source;
 pub mod timeseries;
@@ -39,6 +40,11 @@ pub fn register_mongodb_cdc_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            false,
+            crate::schema::resolution::SchemaPreparation::None,
+        ),
         name: "mongodb-cdc".to_string(),
         display_name: "MongoDB CDC Source".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -62,6 +68,11 @@ pub fn register_mongodb_cdc_source(
     registry.register_lookup_source(
         "mongodb",
         ConnectorInfo {
+            schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+                &[],
+                false,
+                crate::schema::resolution::SchemaPreparation::None,
+            ),
             name: "mongodb".to_string(),
             display_name: "MongoDB Lookup Source".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -77,6 +88,15 @@ struct MongoLookupFactory;
 
 #[async_trait::async_trait]
 impl crate::registry::LookupSourceFactory for MongoLookupFactory {
+    async fn resolve_schema(
+        &self,
+        config: &crate::config::ConnectorConfig,
+        explicit: Option<arrow_schema::SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, crate::error::ConnectorError> {
+        config.reject_unknown_properties(MONGODB_LOOKUP_PROPERTIES, "MongoDB lookup")?;
+        lookup::schema_resolution::resolve(config, explicit).await
+    }
+
     async fn build(
         &self,
         config: crate::config::ConnectorConfig,
@@ -127,6 +147,11 @@ pub fn register_mongodb_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
+        schema_capabilities: crate::schema::resolution::SchemaCapabilities::metadata(
+            &[],
+            true,
+            crate::schema::resolution::SchemaPreparation::ExplicitTableCreation,
+        ),
         name: "mongodb-sink".to_string(),
         display_name: "MongoDB Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -173,6 +198,11 @@ fn mongodb_sink_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::required("connection.uri", "MongoDB connection URI"),
         ConfigKeySpec::required("database", "Target database name"),
         ConfigKeySpec::required("collection", "Target collection name"),
+        ConfigKeySpec::optional(
+            "auto.create",
+            "Explicit permission to create a missing standard collection",
+            "false",
+        ),
         ConfigKeySpec::optional("flush.interval.ms", "Max time between flushes (ms)", "250"),
         ConfigKeySpec::optional(
             "write.mode",

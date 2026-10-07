@@ -22,6 +22,11 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 
 ## Sources
 
+Columns can be omitted for metadata-capable or built-in source formats. Creation
+resolves a validated contract, and durable deployments commit it before activation.
+Explicit columns remain authoritative. See [connector schema resolution](SCHEMA_RESOLUTION.md)
+for format policies, query-derived sinks, sampling and recovery/migration behavior.
+
 Create data sources using `CREATE SOURCE`. Event-time columns must be
 declared as `TIMESTAMP`. LaminarDB uses Arrow `Timestamp(_)` internally
 at any precision and rescales to milliseconds via the Arrow cast kernel.

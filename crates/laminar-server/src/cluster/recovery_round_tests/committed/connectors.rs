@@ -321,6 +321,8 @@ pub(super) fn register(
         registry.register_source(
             "recovery-cut-probe",
             ConnectorInfo {
+                schema_capabilities:
+                    laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                 name: "recovery-cut-probe".into(),
                 display_name: "Recovery cut probe".into(),
                 version: "1".into(),
@@ -341,6 +343,8 @@ pub(super) fn register(
         registry.register_sink(
             "recovery-output-probe",
             ConnectorInfo {
+                schema_capabilities:
+                    laminar_connectors::schema::resolution::SchemaCapabilities::declared(true),
                 name: "recovery-output-probe".into(),
                 display_name: "Recovery output probe".into(),
                 version: "1".into(),

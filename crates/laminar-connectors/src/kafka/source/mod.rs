@@ -10,7 +10,6 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
-use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,8 +29,7 @@ use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
 use super::config::{
-    resolve_value_subject, KafkaSourceConfig, OffsetReset, SchemaEvolutionStrategy, StartupMode,
-    TopicSubscription,
+    KafkaSourceConfig, OffsetReset, SchemaEvolutionStrategy, StartupMode, TopicSubscription,
 };
 use super::metadata_error::{fetch_error, invalid_response, topic_error};
 use super::metrics::KafkaSourceMetrics;
@@ -63,12 +61,13 @@ use background::{
 use checkpoint::{
     acquired_numeric_position, assignment_seek_tpl, build_vnode_assignment_tpl,
     consumer_creation_error, decode_partition_baselines, deterministic_initial_offset,
-    kafka_input_channels, kafka_output_schema, kafka_reader_error_is_transient,
-    kafka_row_positions, retire_accepted_rotation_baselines, rotation_baselines_len,
-    rotation_partition_baseline, startup_default_offset, tpl_of, update_rotation_baselines,
-    validate_kafka_output_schema, validate_partition_baselines, validate_positions_not_expired,
-    validate_resume_input_channels, vnode_payload_is_current, NormalizedDebeziumBatch,
+    kafka_input_channels, kafka_reader_error_is_transient, kafka_row_positions,
+    retire_accepted_rotation_baselines, rotation_baselines_len, rotation_partition_baseline,
+    startup_default_offset, tpl_of, update_rotation_baselines, validate_partition_baselines,
+    validate_positions_not_expired, validate_resume_input_channels, vnode_payload_is_current,
+    NormalizedDebeziumBatch,
 };
+pub(crate) use checkpoint::{kafka_output_schema, validate_kafka_output_schema};
 use debezium::normalize_kafka_debezium_batch;
 use drain::{
     cached_partition_vnode, kafka_bootstrap_is_unassigned, kafka_drain_partitions,
@@ -501,26 +500,6 @@ impl std::fmt::Debug for KafkaSource {
             .field("partitions", &self.offsets.partition_count())
             .finish_non_exhaustive()
     }
-}
-
-/// Warn if the CREATE-SOURCE catalog schema has drifted from the live
-/// Schema Registry schema. Empty `declared` means nothing was declared.
-fn log_schema_drift(declared: &arrow_schema::Schema, live: &arrow_schema::Schema, subject: &str) {
-    if declared.fields().is_empty() || declared.fields() == live.fields() {
-        return;
-    }
-    let decl: BTreeSet<&str> = declared
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-    let lv: BTreeSet<&str> = live.fields().iter().map(|f| f.name().as_str()).collect();
-    warn!(
-        %subject,
-        missing_in_sr = ?decl.difference(&lv).collect::<Vec<_>>(),
-        added_in_sr = ?lv.difference(&decl).collect::<Vec<_>>(),
-        "schema drift: re-apply CREATE SOURCE DDL to pick up the current SR schema"
-    );
 }
 
 fn select_deserializer(format: Format) -> Box<dyn RecordDeserializer> {

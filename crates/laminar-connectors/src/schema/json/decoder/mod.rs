@@ -345,6 +345,27 @@ impl std::fmt::Debug for JsonDecoder {
 }
 
 impl JsonDecoder {
+    /// Validate that the installed decoder can produce every declared Arrow type.
+    ///
+    /// # Errors
+    /// Rejects layouts that would otherwise fall back to incompatible UTF-8 builders.
+    pub fn validate_schema(schema: &SchemaRef) -> SchemaResult<()> {
+        for (field, mut builder) in schema
+            .fields()
+            .iter()
+            .zip(value::create_builders(schema, 0))
+        {
+            if builder.finish().data_type() != field.data_type() {
+                return Err(SchemaError::Incompatible(format!(
+                    "JSON reader field '{}' cannot decode {} with the installed codec",
+                    field.name(),
+                    field.data_type()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a new JSON decoder for the given Arrow schema.
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {

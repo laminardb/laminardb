@@ -1,13 +1,12 @@
 //! Source contract, drain lifecycle, polling, checkpointing, and shutdown.
 
 use super::{
-    async_trait, info, join_background_task, kafka_output_schema, reap_last_arc_off_runtime,
-    resolve_value_subject, warn, Arc, CommitMode, ConnectorConfig, ConnectorError, ConnectorState,
-    ConnectorTaskTracker, Consumer, Format, KafkaReaderDrainCommand, KafkaSource,
-    KafkaSourceConfig, KafkaSourceDrain, Notify, OffsetTracker, Ordering, SchemaRef, SourceBatch,
-    SourceCheckpoint, SourceConnector, SourceConsistency, SourceContract, SourceDrainRequest,
-    SourceDrainResolution, SourceInputMode, SourceRowPositionCapability, SourceStart,
-    SourceTopology, TopicSubscription, KAFKA_BACKGROUND_CLOSE_BUDGET,
+    async_trait, info, join_background_task, kafka_output_schema, reap_last_arc_off_runtime, warn,
+    Arc, CommitMode, ConnectorConfig, ConnectorError, ConnectorState, ConnectorTaskTracker,
+    Consumer, Format, KafkaReaderDrainCommand, KafkaSource, KafkaSourceConfig, KafkaSourceDrain,
+    Notify, OffsetTracker, Ordering, SchemaRef, SourceBatch, SourceCheckpoint, SourceConnector,
+    SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainResolution, SourceInputMode,
+    SourceRowPositionCapability, SourceStart, SourceTopology, KAFKA_BACKGROUND_CLOSE_BUDGET,
 };
 
 #[async_trait]
@@ -195,72 +194,39 @@ impl SourceConnector for KafkaSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let result = self.start_inner(request).await;
+        if self.state != ConnectorState::Created {
+            return Err(ConnectorError::InvalidState {
+                expected: ConnectorState::Created.to_string(),
+                actual: self.state.to_string(),
+            });
+        }
+        let result = self.start_with_contract(request).await;
         if result.is_err() && self.state == ConnectorState::Initializing {
             self.fail_startup();
         }
         result
     }
+    async fn resolve_schema(
+        &mut self,
+        config: &crate::config::ConnectorConfig,
+        explicit: Option<arrow_schema::SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        super::super::schema_resolution::resolve_source(config, explicit).await
+    }
+
     async fn discover_schema(
         &mut self,
         properties: &std::collections::HashMap<String, String>,
     ) -> Result<(), ConnectorError> {
-        let cfg = crate::config::ConnectorConfig::with_properties("kafka", properties.clone());
-        let kafka_config = KafkaSourceConfig::from_config(&cfg)?;
-        if kafka_config.format != Format::Avro {
-            return Ok(());
-        }
-
-        let topic = match &kafka_config.subscription {
-            TopicSubscription::Topics(topics) => match topics.first() {
-                Some(t) => {
-                    if topics.len() > 1 {
-                        warn!(topics = ?topics, chosen = %t,
-                            "multi-topic source: using first topic's SR schema");
-                    }
-                    t.clone()
-                }
-                None => return Ok(()),
-            },
-            TopicSubscription::Pattern(pattern) => {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "topic.pattern '{pattern}' cannot auto-discover a schema; \
-                     declare columns explicitly"
-                )));
-            }
-        };
-
-        let Some(sr_client) = Self::build_sr_client(&kafka_config)? else {
-            return Ok(());
-        };
-
-        let subject = resolve_value_subject(
-            kafka_config.schema_registry_subject_strategy,
-            kafka_config.schema_registry_record_name.as_deref(),
-            &topic,
-        );
-        let timeout = kafka_config.schema_registry_discovery_timeout;
-
-        match tokio::time::timeout(timeout, sr_client.get_latest_schema(&subject)).await {
-            Ok(Ok(cached)) => {
-                self.metrics.record_sr_discovery_success();
-                info!(%subject, schema_id = cached.id,
-                    fields = cached.arrow_schema.fields().len(),
-                    "discovered Avro schema from Schema Registry");
-                self.schema = cached.arrow_schema;
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                self.metrics.record_sr_discovery_failure();
-                Err(e)
-            }
-            Err(_) => {
-                self.metrics.record_sr_discovery_timeout();
-                Err(ConnectorError::Timeout(
-                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                ))
-            }
-        }
+        let config = crate::config::ConnectorConfig::with_properties("kafka", properties.clone());
+        let binding = super::super::schema_resolution::resolve_source(&config, None).await?;
+        let parsed = KafkaSourceConfig::from_config(&config)?;
+        self.schema = super::super::schema_resolution::payload_schema(
+            &binding,
+            parsed.include_metadata,
+            parsed.include_headers,
+        )?;
+        Ok(())
     }
 
     async fn poll_batch(

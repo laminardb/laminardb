@@ -98,6 +98,7 @@ pub(super) fn prepare_old_cut(
     // Validate through the public, authenticated read-only API on every running process. The
     // admission below binds this descriptor; every process independently recompiles to certify it.
     candidate.entries.push(CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "topology_cut_probe".into(),
         kind: CatalogObjectKind::Stream,
         catalog_generation: 1,
@@ -117,7 +118,7 @@ pub(super) fn prepare_old_cut(
             brokers.replace('\'', "''"), probe_output_topic,
         )),
     ] {
-        candidate.entries.push(CatalogManifestEntry { canonical_name: name.into(), kind, catalog_generation: 1, ddl });
+        candidate.entries.push(CatalogManifestEntry { schema_binding: None, canonical_name: name.into(), kind, catalog_generation: 1, ddl });
     }
     let request = serde_json::json!({
         "expected_parent_version": baseline.topology_version.get(),

@@ -46,6 +46,7 @@ const MAX_READER_CHANNEL_ITEMS: usize = 4096;
 const MAX_CURSOR_BATCH_ITEMS: u32 = 1000;
 
 const SINK_CONFIG_KEYS: &[&str] = &[
+    "auto.create",
     "connection.uri",
     "database",
     "collection",
@@ -340,6 +341,27 @@ impl MongoDbSourceConfig {
     }
 }
 
+fn validate_sink_properties(config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    if let Some(key) = REMOVED_SINK_CONFIG_KEYS
+        .iter()
+        .find(|key| config.get(key).is_some())
+    {
+        let replacement = match *key {
+            "batch.size" => "fixed memory and MongoDB wire limits govern batching",
+            "write_concern.timeout_ms" => {
+                "sink.write.timeout.ms governs the complete write deadline"
+            }
+            _ => unreachable!("removed sink key must have a migration message"),
+        };
+        return Err(ConnectorError::ConfigurationError(format!(
+            "MongoDB sink property '{key}' is not supported; {replacement}"
+        )));
+    }
+    config.reject_unknown_properties(SINK_CONFIG_KEYS, "MongoDB sink")?;
+
+    Ok(())
+}
+
 /// Configuration for the `MongoDB` sink connector.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -356,6 +378,10 @@ pub struct MongoDbSinkConfig {
     /// Whether the target is a standard or time series collection.
     #[serde(default)]
     pub collection_kind: CollectionKind,
+
+    /// Explicit permission to create a missing standard collection during preparation.
+    #[serde(default)]
+    pub auto_create: bool,
 
     /// Write operation mode.
     #[serde(default)]
@@ -377,6 +403,7 @@ impl Default for MongoDbSinkConfig {
             database: String::new(),
             collection: String::new(),
             collection_kind: CollectionKind::default(),
+            auto_create: false,
             write_mode: WriteMode::default(),
             flush_interval_ms: default_flush_interval_ms(),
         }
@@ -467,22 +494,7 @@ impl MongoDbSinkConfig {
     ///
     /// Returns `ConnectorError` if required keys are missing or invalid.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        if let Some(key) = REMOVED_SINK_CONFIG_KEYS
-            .iter()
-            .find(|key| config.get(key).is_some())
-        {
-            let replacement = match *key {
-                "batch.size" => "fixed memory and MongoDB wire limits govern batching",
-                "write_concern.timeout_ms" => {
-                    "sink.write.timeout.ms governs the complete write deadline"
-                }
-                _ => unreachable!("removed sink key must have a migration message"),
-            };
-            return Err(ConnectorError::ConfigurationError(format!(
-                "MongoDB sink property '{key}' is not supported; {replacement}"
-            )));
-        }
-        config.reject_unknown_properties(SINK_CONFIG_KEYS, "MongoDB sink")?;
+        validate_sink_properties(config)?;
 
         let mut cfg = Self {
             connection_uri: config.require("connection.uri")?.to_string(),
@@ -491,6 +503,7 @@ impl MongoDbSinkConfig {
             ..Self::default()
         };
 
+        cfg.auto_create = config.get_parsed::<bool>("auto.create")?.unwrap_or(false);
         if let Some(interval) = config.get_parsed::<u64>("flush.interval.ms")? {
             cfg.flush_interval_ms = interval;
         }

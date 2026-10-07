@@ -12,6 +12,7 @@ use crate::error::DbError;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SourceRegistration {
+    pub schema_binding: Option<laminar_core::schema_binding::SchemaBinding>,
     pub catalog_generation: u64,
     pub name: String,
     pub connector_type: Option<String>,
@@ -22,6 +23,7 @@ pub(crate) struct SourceRegistration {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SinkRegistration {
+    pub schema_binding: Option<laminar_core::schema_binding::SchemaBinding>,
     pub catalog_generation: u64,
     pub name: String,
     pub input: String,
@@ -59,7 +61,9 @@ pub(crate) struct StreamRegistration {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TableRegistration {
+    pub catalog_generation: u64,
     pub name: String,
+    pub schema_binding: Option<laminar_core::schema_binding::SchemaBinding>,
     pub primary_key: String,
     pub connector_type: Option<String>,
     pub connector_options: HashMap<String, String>,
@@ -128,6 +132,26 @@ pub(crate) fn validate_connector_format_options(
     Ok(())
 }
 
+/// Validate a format using its connector's codec family.
+pub(crate) fn validate_format(connector: &str, format: Option<&str>) -> Result<(), DbError> {
+    if let Some(fmt_str) = format {
+        if connector == "websocket" && fmt_str.eq_ignore_ascii_case("binary") {
+            return Ok(());
+        }
+        #[cfg(feature = "files")]
+        if connector == "files" {
+            return laminar_connectors::files::FileFormat::parse(fmt_str)
+                .map(|_| ())
+                .map_err(DbError::from);
+        }
+        #[cfg(not(feature = "files"))]
+        let _ = connector;
+        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
+            .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
+    }
+    Ok(())
+}
+
 /// Build a `ConnectorConfig` from any registration that has connector fields.
 fn build_connector_config(
     kind: &str,
@@ -146,7 +170,7 @@ fn build_connector_config(
     }
     if let Some(fmt_str) = format {
         let lower = fmt_str.to_lowercase();
-        laminar_connectors::serde::Format::parse(&lower).map_err(|e| {
+        validate_format(config.connector_type(), Some(&lower)).map_err(|e| {
             DbError::Connector(format!(
                 "Invalid format '{fmt_str}' for {kind} '{name}': {e}"
             ))
@@ -169,6 +193,9 @@ pub(crate) fn build_source_config(reg: &SourceRegistration) -> Result<ConnectorC
         &reg.format_options,
     )?;
     config.set("laminar.source.name", reg.name.clone());
+    if let Some(binding) = &reg.schema_binding {
+        config.set_schema_binding(binding.clone())?;
+    }
     Ok(config)
 }
 
@@ -186,18 +213,25 @@ pub(crate) fn build_sink_config(
     )?;
     // Internal connector behavior follows the one pipeline-wide delivery contract.
     config.set("delivery.guarantee", delivery_guarantee.to_string());
+    if let Some(binding) = &reg.schema_binding {
+        config.set_schema_binding(binding.clone())?;
+    }
     Ok(config)
 }
 
 pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorConfig, DbError> {
-    build_connector_config(
+    let mut config = build_connector_config(
         "Table",
         &reg.name,
         reg.connector_type.as_deref(),
         &reg.connector_options,
         reg.format.as_deref(),
         &reg.format_options,
-    )
+    )?;
+    if let Some(binding) = &reg.schema_binding {
+        config.set_schema_binding(binding.clone())?;
+    }
+    Ok(config)
 }
 
 /// Accumulates DDL registrations; pipeline lifecycle reads them at start.
@@ -213,6 +247,50 @@ pub struct ConnectorManager {
 }
 
 impl ConnectorManager {
+    pub(crate) fn schema_binding(
+        &self,
+        name: &str,
+    ) -> Option<&laminar_core::schema_binding::SchemaBinding> {
+        self.sources
+            .get(name)
+            .and_then(|reg| reg.schema_binding.as_ref())
+            .or_else(|| {
+                self.sinks
+                    .get(name)
+                    .and_then(|reg| reg.schema_binding.as_ref())
+            })
+            .or_else(|| {
+                self.tables
+                    .get(name)
+                    .and_then(|reg| reg.schema_binding.as_ref())
+            })
+    }
+    pub(crate) fn set_local_schema_generation(&mut self, name: &str, generation: u64) {
+        if let Some(source) = self.sources.get_mut(name) {
+            source.catalog_generation = generation;
+        }
+        if let Some(sink) = self.sinks.get_mut(name) {
+            sink.catalog_generation = generation;
+        }
+        if let Some(table) = self.tables.get_mut(name) {
+            table.catalog_generation = generation;
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_schema_binding(
+        &mut self,
+        name: &str,
+        binding: laminar_core::schema_binding::SchemaBinding,
+    ) -> Result<(), DbError> {
+        let registration = self
+            .sinks
+            .get_mut(name)
+            .ok_or_else(|| DbError::Config(format!("sink '{name}' has no registration")))?;
+        registration.schema_binding = Some(binding);
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             sources: HashMap::new(),
@@ -247,7 +325,6 @@ impl ConnectorManager {
     }
 
     /// Returns stored DDL in creation order for catalog manifest replay.
-    #[cfg(feature = "cluster")]
     pub fn ordered_ddl(&self) -> Vec<(String, String, u64)> {
         self.ddl_order
             .iter()
@@ -263,6 +340,7 @@ impl ConnectorManager {
                                 .map(|source| source.catalog_generation)
                         })
                         .or_else(|| self.sinks.get(name).map(|sink| sink.catalog_generation))
+                        .or_else(|| self.tables.get(name).map(|table| table.catalog_generation))
                         .unwrap_or(1);
                     (name.clone(), ddl.clone(), generation)
                 })
@@ -296,6 +374,7 @@ impl ConnectorManager {
         &mut self,
         entries: &[laminar_core::cluster::control::CatalogManifestEntry],
     ) -> Result<(), DbError> {
+        use laminar_core::catalog::CatalogObjectKind;
         if entries.len() != self.ddl_store.len()
             || entries
                 .iter()
@@ -306,7 +385,16 @@ impl ConnectorManager {
             ));
         }
         for entry in entries {
-            use laminar_core::catalog::CatalogObjectKind;
+            if let Some(source) = self.sources.get_mut(&entry.canonical_name) {
+                source.schema_binding.clone_from(&entry.schema_binding);
+            }
+            if let Some(sink) = self.sinks.get_mut(&entry.canonical_name) {
+                sink.schema_binding.clone_from(&entry.schema_binding);
+            }
+            if let Some(table) = self.tables.get_mut(&entry.canonical_name) {
+                table.schema_binding.clone_from(&entry.schema_binding);
+                table.catalog_generation = entry.catalog_generation;
+            }
             if entry.kind == CatalogObjectKind::Stream
                 && self.process_functions.contains_key(&entry.canonical_name)
             {

@@ -12,6 +12,8 @@ use crate::reference::ReferenceTableSource;
 
 use super::await_owned_driver;
 
+mod schema_resolution;
+
 const SNAPSHOT_ROWS_PER_BATCH: usize = 4_096;
 const MAX_SNAPSHOT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -330,15 +332,14 @@ impl PostgresReferenceTableSource {
             .map(std::option::Option::unwrap_or_default)
     }
 
-    async fn start_snapshot(&mut self) -> Result<(), ConnectorError> {
+    async fn connect_session(&self) -> Result<PostgresSession, ConnectorError> {
         let pg_config = self.postgres_config()?;
         let ssl_mode = self.ssl_mode()?;
-        let probe_query = self.snapshot_query()?;
         let ca_path = self
             .config
             .get("ssl.ca.cert.path")
             .map(std::path::Path::new);
-        let session = match ssl_mode {
+        match ssl_mode {
             crate::postgres::SslMode::Disable => {
                 await_reference_driver("connect", async move {
                     let (client, connection) = tokio::time::timeout(
@@ -357,7 +358,7 @@ impl PostgresReferenceTableSource {
                         connection: spawn_connection(connection),
                     })
                 })
-                .await?
+                .await
             }
             crate::postgres::SslMode::VerifyFull => {
                 let tls = crate::postgres::make_rustls_connector(ca_path)?;
@@ -376,16 +377,49 @@ impl PostgresReferenceTableSource {
                         connection: spawn_connection(connection),
                     })
                 })
-                .await?
+                .await
             }
-        };
+        }
+    }
 
+    async fn validate_native_binding(
+        &mut self,
+        session: &PostgresSession,
+    ) -> Result<(), ConnectorError> {
+        let current = schema_resolution::resolve(
+            &session.client,
+            &self.config,
+            Some(self.declared_schema.clone()),
+        )
+        .await?;
+        if self
+            .config
+            .schema_binding()
+            .is_some_and(|expected| expected.value != current.value)
+        {
+            return Err(ConnectorError::SchemaMismatch("PostgreSQL reference relation identity or layout changed; migrate the committed contract".into()));
+        }
+        self.config.set_schema_binding(current)?;
+        Ok(())
+    }
+
+    async fn start_snapshot(&mut self) -> Result<(), ConnectorError> {
+        let probe_query = self.snapshot_query()?;
+        let session = self.connect_session().await?;
         let session = owned_batch_execute(
             session,
             "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY".into(),
             "begin snapshot",
         )
         .await?;
+        let qualified = quote_qualified_identifier(self.config.require("table")?)?;
+        let session = owned_batch_execute(
+            session,
+            format!("LOCK TABLE {qualified} IN ACCESS SHARE MODE"),
+            "lock snapshot relation",
+        )
+        .await?;
+        self.validate_native_binding(&session).await?;
         let (session, probe) =
             owned_prepare(session, probe_query, "prepare snapshot probe").await?;
         let query = self.projected_snapshot_query(probe.columns())?;
@@ -453,6 +487,22 @@ impl PostgresReferenceTableSource {
 
 #[async_trait::async_trait]
 impl ReferenceTableSource for PostgresReferenceTableSource {
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        let session = self.connect_session().await?;
+        let binding = tokio::time::timeout(
+            QUERY_TIMEOUT,
+            schema_resolution::resolve(&session.client, config, explicit),
+        )
+        .await
+        .map_err(|_| timeout_error(QUERY_TIMEOUT))??;
+        drop(session);
+        Ok(binding)
+    }
+
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         match self.state {
             State::Done => return Ok(None),
@@ -702,7 +752,7 @@ where
         .collect()
 }
 
-fn postgres_type_to_arrow(pg_type: &tokio_postgres::types::Type) -> Option<DataType> {
+pub(super) fn postgres_type_to_arrow(pg_type: &tokio_postgres::types::Type) -> Option<DataType> {
     use tokio_postgres::types::Type;
 
     match *pg_type {

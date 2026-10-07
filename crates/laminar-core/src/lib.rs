@@ -26,6 +26,7 @@
 
 /// Feature-neutral catalog identity types.
 pub mod catalog;
+
 /// Z-set changelog `__weight` column name, shared between the MV producer and
 /// upsert-sink consumers.
 pub mod changelog;
@@ -43,6 +44,8 @@ pub mod gcs_credentials;
 pub mod lookup;
 pub mod mv;
 pub mod operator;
+/// Versioned, immutable connector schema contracts stored with catalog definitions.
+pub mod schema_binding;
 /// Shared Arrow IPC serialization for `RecordBatch` ↔ bytes.
 pub mod serialization;
 /// Cross-instance shuffle: message codec, credit flow, wire protocol.

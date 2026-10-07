@@ -3153,6 +3153,7 @@ async fn pruning_lists_once_and_preserves_pointer_and_recent_records() {
 
 fn catalog(name: &str) -> CatalogManifest {
     CatalogManifest::new(vec![super::super::CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: name.to_owned(),
         kind: crate::catalog::CatalogObjectKind::Source,
         catalog_generation: 1,
@@ -6636,6 +6637,7 @@ async fn renewals_copy_only_the_bounded_catalog_reference() {
         unreachable!()
     };
     let manifest = CatalogManifest::new(vec![super::super::CatalogManifestEntry {
+        schema_binding: None,
         canonical_name: "events".into(),
         kind: crate::catalog::CatalogObjectKind::Source,
         catalog_generation: 1,

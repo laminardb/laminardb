@@ -23,6 +23,7 @@
 mod lifecycle;
 mod operations;
 mod publication;
+mod schema_binding;
 
 #[cfg(feature = "delta-lake")]
 use std::future::Future;
@@ -86,6 +87,10 @@ pub struct DeltaLakeSink {
     config: DeltaLakeSinkConfig,
     /// Arrow schema for input batches (set on first write or from existing table).
     schema: Option<SchemaRef>,
+    query_schema: Option<SchemaRef>,
+    writer_projection: Option<Vec<usize>>,
+    #[cfg(feature = "delta-lake")]
+    schema_binding: Option<crate::schema::resolution::SchemaBinding>,
     /// Connector lifecycle state.
     state: ConnectorState,
     /// Current epoch being written.
@@ -138,11 +143,6 @@ pub struct DeltaLakeSink {
     /// Resolved storage options after catalog lookup.
     #[cfg(feature = "delta-lake")]
     resolved_storage_options: std::collections::HashMap<String, String>,
-    /// When true, Delta table init is deferred until the first `write_batch()`
-    /// provides a schema. This happens when Unity Catalog auto-create is
-    /// configured but the pipeline schema is not yet available at `open()` time.
-    #[cfg(feature = "delta-lake")]
-    needs_deferred_delta_init: bool,
     /// Pre-built Parquet writer properties for hot-path writes. Built once
     /// in `init_delta_table()` from `config.parquet`; cloning this is far
     /// cheaper than rebuilding (string parsing, bloom-filter column setup)
@@ -169,7 +169,7 @@ pub struct DeltaLakeSink {
 /// `catalog.storage.location` is configured and a schema is available.
 /// Idempotent: treats "already exists" (HTTP 409 / `ALREADY_EXISTS`) as success.
 #[cfg(all(feature = "delta-lake", feature = "delta-lake-unity"))]
-async fn ensure_uc_table_exists(
+pub(super) async fn ensure_uc_table_exists(
     config: &DeltaLakeSinkConfig,
     schema: Option<&SchemaRef>,
 ) -> Result<(), ConnectorError> {

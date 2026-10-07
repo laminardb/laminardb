@@ -51,6 +51,8 @@ pub struct ConnectorConfig {
 
     /// Configuration properties.
     properties: HashMap<String, String>,
+    /// Trusted catalog binding; deliberately not a user-settable string property.
+    schema_binding: Option<Arc<crate::schema::resolution::SchemaBinding>>,
 }
 
 impl ConnectorConfig {
@@ -60,6 +62,7 @@ impl ConnectorConfig {
         Self {
             connector_type: connector_type.into(),
             properties: HashMap::new(),
+            schema_binding: None,
         }
     }
 
@@ -72,6 +75,7 @@ impl ConnectorConfig {
         Self {
             connector_type: connector_type.into(),
             properties,
+            schema_binding: None,
         }
     }
 
@@ -133,6 +137,32 @@ impl ConnectorConfig {
         value.parse::<T>().map_err(|e| {
             ConnectorError::ConfigurationError(format!("invalid value for '{key}': {e}"))
         })
+    }
+
+    /// Install a validated committed reader/writer contract for connector activation.
+    ///
+    /// # Errors
+    /// Rejects malformed contracts and a different connector type.
+    pub fn set_schema_binding(
+        &mut self,
+        binding: crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        binding
+            .canonical_bytes()
+            .map_err(crate::schema::resolution::binding_error)?;
+        if binding.connector != self.connector_type {
+            return Err(ConnectorError::SchemaMismatch(
+                "schema contract belongs to another connector".into(),
+            ));
+        }
+        self.schema_binding = Some(Arc::new(binding));
+        Ok(())
+    }
+
+    /// Read the prepared immutable contract without re-resolving external metadata.
+    #[must_use]
+    pub fn schema_binding(&self) -> Option<&crate::schema::resolution::SchemaBinding> {
+        self.schema_binding.as_deref()
     }
 
     /// Returns all properties as a reference.
@@ -294,6 +324,8 @@ impl ConfigKeySpec {
 /// Metadata about a connector implementation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectorInfo {
+    /// Direction- and format-specific schema authority and explicit preparation policy.
+    pub schema_capabilities: crate::schema::resolution::SchemaCapabilities,
     /// Unique connector type name (e.g., "kafka", "postgres-cdc").
     pub name: String,
 

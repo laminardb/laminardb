@@ -112,6 +112,8 @@ fn held_connector(
         registry.register_source(
             SOURCE,
             ConnectorInfo {
+                schema_capabilities:
+                    laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                 name: SOURCE.into(),
                 display_name: SOURCE.into(),
                 version: "1".into(),

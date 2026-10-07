@@ -1,5 +1,8 @@
 //! Delta Lake source connector.
 
+#[cfg(feature = "delta-lake")]
+mod reader_contract;
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -66,6 +69,8 @@ pub struct DeltaSource {
     known_latest_version: i64,
     /// Buffered batches from the last version load.
     pending_batches: VecDeque<RecordBatch>,
+    #[cfg(feature = "delta-lake")]
+    schema_binding: Option<crate::schema::resolution::SchemaBinding>,
     /// Total records read so far.
     records_read: u64,
     /// Delta Lake table handle.
@@ -89,23 +94,6 @@ fn initial_current_version(starting_version: Option<i64>, latest_version: i64) -
     starting_version.map_or(latest_version, |first_version| first_version - 1)
 }
 
-#[cfg(feature = "delta-lake")]
-fn cdf_output_matches(expected: &SchemaRef, batch: &RecordBatch) -> bool {
-    use laminar_core::changelog::WEIGHT_COLUMN;
-
-    let actual = batch.schema();
-    actual.fields().len() == expected.fields().len() + 1
-        && actual
-            .fields()
-            .iter()
-            .take(expected.fields().len())
-            .eq(expected.fields().iter())
-        && actual
-            .fields()
-            .last()
-            .is_some_and(|field| field.name() == WEIGHT_COLUMN)
-}
-
 impl DeltaSource {
     /// Creates a new Delta Lake source with the given configuration.
     #[must_use]
@@ -120,6 +108,8 @@ impl DeltaSource {
             #[cfg(feature = "delta-lake")]
             known_latest_version: -1,
             pending_batches: VecDeque::new(),
+            #[cfg(feature = "delta-lake")]
+            schema_binding: None,
             records_read: 0,
             #[cfg(feature = "delta-lake")]
             table: None,
@@ -170,8 +160,59 @@ impl DeltaSource {
             delta_io::open_or_create_table(&self.resolved_table_path, storage_options, None)
                 .await?;
 
+        super::schema_resolution::verify_identity(
+            self.schema_binding.as_ref(),
+            &super::schema_resolution::delta_native(&table)?,
+        )?;
         self.table = Some(table);
         Ok(())
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+impl DeltaSource {
+    async fn refresh_latest_version(&mut self) -> Result<bool, ConnectorError> {
+        let needs_refresh = self.known_latest_version <= self.current_version;
+        if needs_refresh {
+            if let Some(last_check) = self.last_version_check {
+                if last_check.elapsed() < self.config.poll_interval {
+                    return Ok(false);
+                }
+            }
+            self.last_version_check = Some(Instant::now());
+            self.reopen_table().await?;
+
+            let table = self
+                .table
+                .as_mut()
+                .ok_or_else(|| ConnectorError::InvalidState {
+                    expected: "table initialized".into(),
+                    actual: "table not initialized".into(),
+                })?;
+            let latest_version = match super::delta_io::get_latest_version(table).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "Delta Lake source: version check failed, will retry");
+                    return Ok(false);
+                }
+            };
+            if latest_version < self.current_version {
+                return Err(ConnectorError::SchemaMismatch(
+                        "Delta log regressed behind the reader cursor; resource replacement or history loss requires migration".into()));
+            }
+            self.known_latest_version = latest_version;
+
+            if latest_version <= self.current_version {
+                return Ok(false); // No new data
+            }
+
+            debug!(
+                current_version = self.current_version,
+                latest_version, "Delta Lake source: new version(s) available"
+            );
+        }
+
+        Ok(true)
     }
 }
 
@@ -190,6 +231,24 @@ impl SourceConnector for DeltaSource {
             SourceTopology::Singleton,
             SourceInputMode::FullChangelog,
         ))
+    }
+
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        explicit: Option<SchemaRef>,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        #[cfg(feature = "delta-lake")]
+        {
+            super::schema_resolution::delta_source(config, explicit).await
+        }
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            let _ = (config, explicit);
+            Err(ConnectorError::FeatureUnsupported(
+                "Delta schema discovery requires the delta-lake feature".into(),
+            ))
+        }
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -241,7 +300,7 @@ impl SourceConnector for DeltaSource {
             let table =
                 delta_io::open_or_create_table(&resolved_path, resolved_options, None).await?;
 
-            self.schema = Some(delta_io::get_table_schema(&table)?);
+            self.install_reader_contract(config, &table)?;
             let table_version = table.version().ok_or_else(|| {
                 ConnectorError::ReadError("opened Delta table has no committed version".into())
             })?;
@@ -331,39 +390,8 @@ impl SourceConnector for DeltaSource {
             // get_latest_version() on every source-adapter tick (10ms).
             // In incremental mode, skip the throttle if we already know
             // there are more versions to process (catch-up).
-            let needs_refresh = self.known_latest_version <= self.current_version;
-            if needs_refresh {
-                if let Some(last_check) = self.last_version_check {
-                    if last_check.elapsed() < self.config.poll_interval {
-                        return Ok(None);
-                    }
-                }
-                self.last_version_check = Some(Instant::now());
-
-                let table = self
-                    .table
-                    .as_mut()
-                    .ok_or_else(|| ConnectorError::InvalidState {
-                        expected: "table initialized".into(),
-                        actual: "table not initialized".into(),
-                    })?;
-                let latest_version = match delta_io::get_latest_version(table).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(error = %e, "Delta Lake source: version check failed, will retry");
-                        return Ok(None);
-                    }
-                };
-                self.known_latest_version = latest_version;
-
-                if latest_version <= self.current_version {
-                    return Ok(None); // No new data
-                }
-
-                debug!(
-                    current_version = self.current_version,
-                    latest_version, "Delta Lake source: new version(s) available"
-                );
+            if !self.refresh_latest_version().await? {
+                return Ok(None);
             }
 
             let target_version = self.current_version.checked_add(1).ok_or_else(|| {
@@ -413,12 +441,10 @@ impl SourceConnector for DeltaSource {
             let mut batches = Vec::with_capacity(cdf_batches.len());
             for batch in cdf_batches {
                 let mapped = delta_io::map_cdf_to_changelog(&batch)?;
-                if !cdf_output_matches(expected_schema, &mapped) {
-                    return Err(ConnectorError::SchemaMismatch(format!(
-                        "Delta CDF schema evolved at version {target_version}"
-                    )));
-                }
-                batches.push(mapped);
+                batches.push(crate::schema::resolution::project_batch(
+                    &mapped,
+                    expected_schema,
+                )?);
             }
 
             // Buffer all batches. Do NOT advance current_version yet —

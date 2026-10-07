@@ -11,8 +11,9 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_avro::schema::FingerprintStrategy;
 use arrow_avro::writer::format::AvroSoeFormat;
-use arrow_avro::writer::WriterBuilder;
+use arrow_avro::writer::{Encoder, WriterBuilder};
 use arrow_schema::SchemaRef;
+use parking_lot::Mutex;
 
 use crate::error::SerdeError;
 use crate::kafka::schema_registry::SchemaRegistryClient;
@@ -29,6 +30,7 @@ pub struct AvroSerializer {
     schema: SchemaRef,
     /// Optional Schema Registry client for schema registration.
     schema_registry: Option<Arc<SchemaRegistryClient>>,
+    encoder: Mutex<Option<(u32, Encoder)>>,
 }
 
 impl AvroSerializer {
@@ -41,6 +43,7 @@ impl AvroSerializer {
             schema_id: Arc::new(AtomicU32::new(schema_id)),
             schema,
             schema_registry: None,
+            encoder: Mutex::new(None),
         }
     }
 
@@ -58,6 +61,7 @@ impl AvroSerializer {
             schema_id,
             schema,
             schema_registry: registry,
+            encoder: Mutex::new(None),
         }
     }
 
@@ -72,6 +76,7 @@ impl AvroSerializer {
             schema_id: Arc::new(AtomicU32::new(schema_id)),
             schema,
             schema_registry: Some(registry),
+            encoder: Mutex::new(None),
         }
     }
 
@@ -93,84 +98,67 @@ impl AvroSerializer {
         self.schema_registry.is_some()
     }
 
-    /// Serializes a `RecordBatch` into per-row Avro payloads with
-    /// Confluent wire format prefix.
+    /// Prepare the native writer once, before activation.
     ///
-    /// Each output `Vec<u8>` is: `0x00` | `schema_id` (4-byte BE) | Avro body.
-    ///
-    /// Serializes one row at a time to produce exact record boundaries.
-    /// This avoids the unsound byte-scanning approach where Avro data values
-    /// could contain the magic byte + schema ID pattern.
-    fn serialize_with_confluent_prefix(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<Vec<Vec<u8>>, SerdeError> {
-        let num_rows = batch.num_rows();
-        if num_rows == 0 {
-            return Ok(Vec::new());
+    /// # Errors
+    /// Rejects invalid wire IDs and native schemas unsupported by the installed codec.
+    pub fn prepare(&self) -> Result<(), SerdeError> {
+        let id = self.schema_id();
+        let mut prepared = self.encoder.lock();
+        if prepared
+            .as_ref()
+            .is_some_and(|(existing, _)| *existing == id)
+        {
+            return Ok(());
         }
-
-        let id = self.schema_id.load(Ordering::Relaxed);
-        // Clone schema once, outside the loop.
-        let arrow_schema = (*self.schema).clone();
-        let mut records = Vec::with_capacity(num_rows);
-
-        // Serialize each row individually to get exact record boundaries.
-        // batch.slice() is zero-copy (Arc offset adjustment only).
-        for row_idx in 0..num_rows {
-            let mut buf = Vec::new();
-            let row_batch = batch.slice(row_idx, 1);
-
-            let mut writer = WriterBuilder::new(arrow_schema.clone())
-                .with_fingerprint_strategy(FingerprintStrategy::Id(id))
-                .build::<_, AvroSoeFormat>(&mut buf)
-                .map_err(|e| {
-                    SerdeError::MalformedInput(format!("failed to build Avro writer: {e}"))
-                })?;
-
-            writer
-                .write(&row_batch)
-                .map_err(|e| SerdeError::MalformedInput(format!("Avro encode error: {e}")))?;
-
-            writer
-                .finish()
-                .map_err(|e| SerdeError::MalformedInput(format!("Avro flush error: {e}")))?;
-
-            records.push(buf);
+        if id == 0 || id > i32::MAX as u32 {
+            return Err(SerdeError::MalformedInput(
+                "Avro writer requires a positive signed schema ID".into(),
+            ));
         }
+        let encoder = WriterBuilder::new(self.schema.as_ref().clone())
+            .with_fingerprint_strategy(FingerprintStrategy::Id(id))
+            .build_encoder::<AvroSoeFormat>()
+            .map_err(|error| {
+                SerdeError::MalformedInput(format!("unsupported Avro writer: {error}"))
+            })?;
+        *prepared = Some((id, encoder));
+        Ok(())
+    }
 
-        Ok(records)
+    fn encode(&self, batch: &RecordBatch) -> Result<arrow_avro::writer::EncodedRows, SerdeError> {
+        self.prepare()?;
+        let mut prepared = self.encoder.lock();
+        let (_, encoder) = prepared
+            .as_mut()
+            .ok_or_else(|| SerdeError::MalformedInput("Avro writer was not prepared".into()))?;
+        let result = encoder.encode(batch);
+        // Drain partial output on failure so a later call cannot publish bytes from a failed batch.
+        let rows = encoder.flush();
+        result
+            .map_err(|error| SerdeError::MalformedInput(format!("Avro encode error: {error}")))?;
+        Ok(rows)
     }
 }
 
 impl RecordSerializer for AvroSerializer {
     fn serialize(&self, batch: &RecordBatch) -> Result<Vec<Vec<u8>>, SerdeError> {
-        self.serialize_with_confluent_prefix(batch)
+        if batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(self.encode(batch)?.iter().map(|row| row.to_vec()).collect())
     }
 
     fn serialize_batch(&self, batch: &RecordBatch) -> Result<Vec<u8>, SerdeError> {
         if batch.num_rows() == 0 {
             return Ok(Vec::new());
         }
-
-        let mut buf = Vec::new();
-        let arrow_schema = (*self.schema).clone();
-        let id = self.schema_id.load(Ordering::Relaxed);
-
-        let mut writer = WriterBuilder::new(arrow_schema)
-            .with_fingerprint_strategy(FingerprintStrategy::Id(id))
-            .build::<_, AvroSoeFormat>(&mut buf)
-            .map_err(|e| SerdeError::MalformedInput(format!("failed to build Avro writer: {e}")))?;
-
-        writer
-            .write(batch)
-            .map_err(|e| SerdeError::MalformedInput(format!("Avro encode error: {e}")))?;
-
-        writer
-            .finish()
-            .map_err(|e| SerdeError::MalformedInput(format!("Avro flush error: {e}")))?;
-
-        Ok(buf)
+        let rows = self.encode(batch)?;
+        let mut output = Vec::new();
+        for row in rows.iter() {
+            output.extend_from_slice(&row);
+        }
+        Ok(output)
     }
 
     fn format(&self) -> Format {

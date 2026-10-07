@@ -114,6 +114,8 @@ async fn ordered_full_changelog_test_db() -> Arc<LaminarDB> {
             registry.register_source(
                 ORDERED_FULL_CHANGELOG_CONNECTOR,
                 laminar_connectors::config::ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: ORDERED_FULL_CHANGELOG_CONNECTOR.into(),
                     display_name: "Ordered full changelog test source".into(),
                     version: "1".into(),
@@ -1408,6 +1410,8 @@ async fn persisted_mutable_enrich_rejects_on_demand_lookup_provenance() {
     db.connector_manager
         .lock()
         .register_table(crate::connector_manager::TableRegistration {
+            catalog_generation: 1,
+            schema_binding: None,
             name: "dimensions".into(),
             primary_key: "id".into(),
             connector_type: Some("static".into()),
@@ -1830,6 +1834,7 @@ async fn persisted_temporal_preflight_requires_direct_event_time_sources() {
             .unwrap();
     }
     let source = |name: &str, mode: &str| crate::connector_manager::SourceRegistration {
+        schema_binding: None,
         catalog_generation: 1,
         name: name.into(),
         connector_type: Some(crate::temporal_test_source::CONNECTOR_NAME.into()),

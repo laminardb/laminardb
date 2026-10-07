@@ -2647,6 +2647,8 @@ def handle(activations):
             registry.register_source(
                 REPLAY_SOURCE,
                 ConnectorInfo {
+                    schema_capabilities:
+                        laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                     name: REPLAY_SOURCE.into(),
                     display_name: "Process replay test source".into(),
                     version: "1".into(),

@@ -21,7 +21,7 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use tracing::{debug, info};
+use tracing::info;
 
 #[cfg(feature = "postgres-sink")]
 use crate::changelog::collapse_changelog;
@@ -35,6 +35,8 @@ use super::sink_config::{PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
 
 mod input;
+#[cfg(feature = "postgres-sink")]
+mod schema_resolution;
 mod statements;
 
 use input::{build_user_schema, validate_sink_schema};
@@ -153,6 +155,8 @@ pub struct PostgresSink {
     schema: SchemaRef,
     /// User-visible schema (metadata columns stripped).
     user_schema: SchemaRef,
+    #[cfg(feature = "postgres-sink")]
+    target_binding: Option<crate::schema::resolution::SchemaBinding>,
     /// Connector lifecycle state.
     state: ConnectorState,
     /// Buffered records awaiting flush.
@@ -189,6 +193,8 @@ impl PostgresSink {
             config,
             schema,
             user_schema,
+            #[cfg(feature = "postgres-sink")]
+            target_binding: None,
             state: ConnectorState::Created,
             buffer: Vec::with_capacity(4),
             buffered_rows: 0,
@@ -325,7 +331,7 @@ impl PostgresSink {
     #[cfg(feature = "postgres-sink")]
     async fn flush_append(
         &mut self,
-        client: &tokio_postgres::Client,
+        client: &tokio_postgres::Transaction<'_>,
         buffer: &[RecordBatch],
     ) -> Result<WriteResult, ConnectorError> {
         let user_batch = self.concat_buffer(buffer)?;
@@ -384,7 +390,7 @@ impl PostgresSink {
     #[allow(clippy::cast_possible_truncation)]
     async fn flush_upsert(
         &mut self,
-        client: &mut tokio_postgres::Client,
+        client: &tokio_postgres::Transaction<'_>,
         buffer: &[RecordBatch],
     ) -> Result<WriteResult, ConnectorError> {
         if self.config.changelog_mode {
@@ -418,7 +424,7 @@ impl PostgresSink {
     #[allow(clippy::cast_possible_truncation)]
     async fn flush_changelog(
         &mut self,
-        client: &mut tokio_postgres::Client,
+        client: &tokio_postgres::Transaction<'_>,
         buffer: &[RecordBatch],
     ) -> Result<WriteResult, ConnectorError> {
         if buffer.is_empty() {
@@ -462,11 +468,6 @@ impl PostgresSink {
             }
         }
 
-        let transaction = client.transaction().await.map_err(|error| {
-            ConnectorError::ConnectionFailed(format!(
-                "begin PostgreSQL changelog transaction: {error}"
-            ))
-        })?;
         let mutation = async {
             let mut upserted = 0_u64;
             let mut deleted = 0_usize;
@@ -480,7 +481,7 @@ impl PostgresSink {
                     .upsert_sql
                     .as_deref()
                     .ok_or_else(|| ConnectorError::Internal("upsert SQL not prepared".into()))?;
-                upserted = execute_unnest(&transaction, upsert_sql, &insert_batch).await?;
+                upserted = execute_unnest(client, upsert_sql, &insert_batch).await?;
                 bytes = retained_batch_bytes_u64(&insert_batch);
             }
 
@@ -489,30 +490,14 @@ impl PostgresSink {
                     arrow_select::concat::concat_batches(&self.user_schema, &all_deletes)
                         .map_err(|e| ConnectorError::Internal(format!("concat deletes: {e}")))?;
                 bytes = bytes.saturating_add(retained_batch_bytes_u64(&delete_batch));
-                deleted = self.execute_deletes(&transaction, &delete_batch).await?;
+                deleted = self.execute_deletes(client, &delete_batch).await?;
             }
 
             Ok::<_, ConnectorError>((upserted, deleted, bytes))
         }
         .await;
 
-        let (upserted, deleted, total_bytes) = match mutation {
-            Ok(result) => {
-                transaction.commit().await.map_err(|error| {
-                    postgres_dispatched_write_error("transaction COMMIT", &error)
-                })?;
-                result
-            }
-            Err(error) => {
-                if let Err(rollback_error) = transaction.rollback().await {
-                    tracing::warn!(
-                        %rollback_error,
-                        "PostgreSQL changelog rollback failed after a mutation error; no COMMIT was dispatched"
-                    );
-                }
-                return Err(resolve_uncommitted_transaction_error(error));
-            }
-        };
+        let (upserted, deleted, total_bytes) = mutation?;
 
         let total_rows = upserted.saturating_add(deleted as u64);
         if total_rows != 0 {
@@ -582,9 +567,35 @@ impl PostgresSink {
         client: &mut tokio_postgres::Client,
         buffer: &[RecordBatch],
     ) -> Result<WriteResult, ConnectorError> {
-        match self.config.write_mode {
-            WriteMode::Append => self.flush_append(client, buffer).await,
-            WriteMode::Upsert => self.flush_upsert(client, buffer).await,
+        let transaction = client.transaction().await.map_err(|error| {
+            ConnectorError::ConnectionFailed(format!("begin PostgreSQL write transaction: {error}"))
+        })?;
+        let mutation = async {
+            schema_resolution::lock_target(
+                &transaction,
+                &self.config,
+                self.target_binding.as_ref(),
+            )
+            .await?;
+            match self.config.write_mode {
+                WriteMode::Append => self.flush_append(&transaction, buffer).await,
+                WriteMode::Upsert => self.flush_upsert(&transaction, buffer).await,
+            }
+        }
+        .await;
+        match mutation {
+            Ok(result) => {
+                transaction.commit().await.map_err(|error| {
+                    postgres_dispatched_write_error("transaction COMMIT", &error)
+                })?;
+                Ok(result)
+            }
+            Err(error) => {
+                if let Err(rollback) = transaction.rollback().await {
+                    tracing::warn!(%rollback, "PostgreSQL write rollback failed; no COMMIT was dispatched");
+                }
+                Err(resolve_uncommitted_transaction_error(error))
+            }
         }
     }
 
@@ -592,6 +603,12 @@ impl PostgresSink {
     /// cancellation path. The empty vector allocation is recovered after non-cancelled I/O.
     #[cfg(feature = "postgres-sink")]
     async fn flush_buffer(&mut self) -> Result<WriteResult, ConnectorError> {
+        if self.state == ConnectorState::Failed {
+            return Err(ConnectorError::InvalidState {
+                expected: "unfailed writer; retire and replay from committed progress".into(),
+                actual: "Failed".into(),
+            });
+        }
         let mut pending = self.take_buffer();
         if pending.is_empty() {
             self.buffer = pending;
@@ -610,6 +627,9 @@ impl PostgresSink {
 
         pending.clear();
         self.buffer = pending;
+        if result.is_err() {
+            self.state = ConnectorState::Failed;
+        }
         result
     }
 
@@ -687,6 +707,23 @@ impl SinkConnector for PostgresSink {
         ))
     }
 
+    async fn resolve_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        input: SchemaRef,
+    ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
+        self.apply_connector_config(config)?;
+        schema_resolution::resolve(config, &self.config, input).await
+    }
+
+    async fn prepare_schema(
+        &mut self,
+        config: &ConnectorConfig,
+        binding: &mut crate::schema::resolution::SchemaBinding,
+    ) -> Result<(), ConnectorError> {
+        schema_resolution::prepare(self, config, binding).await
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         if config.properties().is_empty() {
             // Direct programmatic construction supplies the schema to `new`.
@@ -708,20 +745,18 @@ impl SinkConnector for PostgresSink {
         );
 
         // Validate connectivity.
-        let client = pool.get().await.map_err(|e| {
+        let _client = pool.get().await.map_err(|e| {
             ConnectorError::ConnectionFailed(format!("initial connection failed: {e}"))
         })?;
 
-        // Auto-create target table.
-        if self.config.auto_create_table {
-            if let Some(ddl) = &self.create_table_sql {
-                client.batch_execute(ddl.as_str()).await.map_err(|e| {
-                    ConnectorError::Internal(format!("auto-create table failed: {e}"))
-                })?;
-                debug!(table = %self.config.qualified_table_name(), "target table ensured");
-            }
+        let mut resolved =
+            schema_resolution::resolve(config, &self.config, self.schema.clone()).await?;
+        schema_resolution::verify_binding(config.schema_binding(), &resolved)?;
+        if resolved.value.is_none() {
+            schema_resolution::prepare(self, config, &mut resolved).await?;
         }
 
+        self.target_binding = Some(resolved);
         self.pool = Some(pool);
         self.state = ConnectorState::Running;
 

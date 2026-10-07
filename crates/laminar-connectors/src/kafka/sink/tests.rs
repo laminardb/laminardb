@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::SerdeError;
+use crate::serde::Format;
 use arrow_array::Int64Array;
 use arrow_schema::{DataType, Field, Schema};
 
@@ -115,6 +116,16 @@ async fn schema_registration_preserves_terminal_registry_error() {
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
+        .and(path(
+            "/compatibility/subjects/output-events-value/versions/latest",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"is_compatible":true})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
         .and(path("/subjects/output-events-value/versions"))
         .respond_with(ResponseTemplate::new(422).set_body_string("invalid schema"))
         .mount(&server)
@@ -125,7 +136,16 @@ async fn schema_registration_preserves_terminal_registry_error() {
     let registry = SchemaRegistryClient::new(server.uri(), None).unwrap();
     let mut sink = KafkaSink::with_schema_registry(test_schema(), config, registry);
 
-    let error = sink.ensure_schema_ready(&test_schema()).await.unwrap_err();
+    let mut resolved =
+        super::super::schema_configuration::sink(&ConnectorConfig::new("kafka"), &sink.config);
+    resolved.set("schema.registry.auto.register", "true");
+    let mut binding = sink.resolve_schema(&resolved, test_schema()).await.unwrap();
+    let error = sink
+        .prepare_schema(&resolved, &mut binding)
+        .await
+        .unwrap_err();
+    assert!(!binding.value.unwrap().identity.contains_key("id"));
+    assert!(sink.producer.is_none());
     assert!(matches!(error, ConnectorError::ConfigurationError(_)));
     assert!(!error.is_transient());
     assert!(error.to_string().contains("output-events-value"));
@@ -137,6 +157,16 @@ async fn compatibility_put_preserves_terminal_registry_error() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/compatibility/subjects/output-events-value/versions/latest",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"is_compatible":true})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("PUT"))
         .and(path("/config/output-events-value"))
         .respond_with(ResponseTemplate::new(401).set_body_string("invalid credentials"))
@@ -149,7 +179,11 @@ async fn compatibility_put_preserves_terminal_registry_error() {
     let registry = SchemaRegistryClient::new(server.uri(), None).unwrap();
     let mut sink = KafkaSink::with_schema_registry(test_schema(), config, registry);
 
-    let error = sink.open(&ConnectorConfig::new("kafka")).await.unwrap_err();
+    let mut resolved =
+        super::super::schema_configuration::sink(&ConnectorConfig::new("kafka"), &sink.config);
+    resolved.set("schema.registry.auto.register", "true");
+    let error = sink.open(&resolved).await.unwrap_err();
+    assert!(sink.producer.is_none());
     assert!(matches!(error, ConnectorError::ConfigurationError(_)));
     assert!(!error.is_transient());
     assert!(error.to_string().contains("output-events-value"));

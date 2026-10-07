@@ -15,10 +15,15 @@ mod catalog;
 mod cluster_checks;
 mod control;
 mod drop;
+pub(crate) mod lookup_schema;
 mod materialized_view;
+mod schema_creation;
+mod schema_journal;
+pub(crate) mod schema_resolution;
 mod source_sink;
 mod stream;
 mod table;
+mod table_schema;
 mod topology;
 
 pub(crate) use stream::{

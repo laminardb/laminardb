@@ -21,6 +21,7 @@ fn canonical_source_digest(
             input_mode: canonical_source_input_mode(input_mode),
             row_positions: canonical_source_row_positions(row_positions),
             replay_order: None,
+            schema_contract: None,
             schema: None,
             primary_key: Vec::new(),
             watermark_column: None,
@@ -223,6 +224,8 @@ fn source_order_identity_inspects_the_schema_supplied_at_startup() {
         .register_source(
             "schema-order-test",
             ConnectorInfo {
+                schema_capabilities:
+                    laminar_connectors::schema::resolution::SchemaCapabilities::declared(false),
                 name: "schema-order-test".into(),
                 display_name: "Schema-dependent order declaration".into(),
                 version: "1".into(),

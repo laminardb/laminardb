@@ -197,7 +197,8 @@ impl MongoDbSink {
         match &self.config.collection_kind {
             CollectionKind::Standard => self.validate_standard_collection(&db).await?,
             CollectionKind::TimeSeries(ts_config) => {
-                self.ensure_timeseries_collection(&db, ts_config).await?;
+                self.validate_existing_timeseries_collection(&db, ts_config)
+                    .await?;
             }
         }
 
