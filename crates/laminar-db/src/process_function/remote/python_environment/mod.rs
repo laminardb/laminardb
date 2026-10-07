@@ -16,7 +16,7 @@ pub(super) struct VerifiedEnvironment {
     pub(super) python: PathBuf,
     pub(super) runtime_root: Option<PathBuf>,
     pub(super) import_roots: Vec<PathBuf>,
-    pub(super) guards: FileGuards,
+    pub(super) _guards: FileGuards,
 }
 
 impl PythonEnvironmentBinding {
@@ -121,7 +121,7 @@ pub(super) fn verify(
             python: config.python.clone(),
             runtime_root: None,
             import_roots,
-            guards,
+            _guards: guards,
         }),
         (Some(expected), Some(root)) => {
             let runtime_root = canonical_directory(root, &mut guards)?;
@@ -149,7 +149,7 @@ pub(super) fn verify(
                 python,
                 runtime_root: Some(runtime_root),
                 import_roots,
-                guards,
+                _guards: guards,
             })
         }
         _ => Err(DbError::Config(

@@ -415,7 +415,7 @@ async fn supervise(
             Ok(())
         }
     };
-    drop(binding.environment.guards);
+    drop(binding.environment);
     alive.store(false, Ordering::Release);
     exited.cancel();
     outcome

@@ -3423,23 +3423,37 @@ def handle(activations):
             .initialize_managed_state()
             .await
             .unwrap();
-        worker.abort();
-        assert!(worker.await.is_err());
         graph
             .execute_cycle(&source(&[("a", 7, 100_000)]), 95, None)
             .await
             .unwrap();
-        assert!(!graph.checkpoint_is_quiescent());
-        let wake = graph.process_work_wake().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+        assert_eq!(totals(&drain(&mut graph, 95).await), vec![7]);
+        // Aborting the accept loop can leave tonic's connection tasks alive. Its shutdown
+        // signal closes those accepted connections before the server task completes.
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        graph
+            .execute_cycle(&source(&[("a", 1, 101_000)]), 95, None)
             .await
             .unwrap();
+        assert!(!graph.checkpoint_is_quiescent());
+        let wake = graph.process_work_wake().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !graph.has_runnable_deferred_work() {
+                wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
         let error = graph
             .execute_cycle(&FxHashMap::default(), 95, None)
             .await
             .unwrap_err();
         assert!(error.requires_pipeline_recovery(), "{error}");
-        shutdown.cancel();
     }
 
     #[tokio::test]

@@ -2022,3 +2022,42 @@ The task-owned MinIO container was stopped and removed after qualification.
 Cluster admission is resolved for the qualified Rust profile above. The explicit
 unsupported profiles remain closed and need their own acceptance evidence before
 admission can widen.
+
+### Continuation: PR worker cleanup and loss qualification (2026-10-07)
+
+PR #558 at `e27efc91` includes the upstream subscription merge. CI run
+`37591021693` exposed Unix `drop_non_drop` in Python supervision and a race in
+`lost_worker_fences_unaccepted_remote_result`. The Unix lint is reproduced with
+the exact workspace/all-features/all-targets command on Rust 1.99.0 in a local
+Linux container.
+
+The supervisor now drops the complete verified environment after reaping the
+child and before publishing exit. Its retained file guards remain owned for that
+lifetime, including on Windows; no lint suppression or shutdown-order change is
+needed. The loss fixture verifies a successful RPC, signals the existing worker
+shutdown API and waits for accepted connections to close before the next call.
+It waits for an actual deferred outcome rather than a notification alone. The
+pipeline recovery-error and non-quiescent checkpoint assertions remain intact.
+No production record execution, public API or admission profile changes.
+
+Final validation (`CARGO_BUILD_JOBS=2`, `RUST_MIN_STACK=8388608`):
+
+- Windows all-feature loss fixture: one passed (232.68 command seconds, including
+  compilation; 2.07 test seconds).
+- Linux `cargo test -p laminar-db --all-features --lib process_function:: -- --test-threads=1`:
+  133 passed, two ignored (471.98 command seconds; 92.53 test seconds). Optional
+  Python process fixtures retain their existing dependency checks; Python was not
+  installed in this Rust-only build container.
+- Linux workspace Clippy passes with `-D warnings` for all features/targets
+  (64.47 seconds) and no default features (83.05 seconds).
+- Windows `cargo test --workspace --lib` with `RUST_TEST_THREADS=2`: 6,258 passed,
+  five ignored (361.45 seconds). The initial unrestricted run hit seven connector
+  timeout/mock failures; their code is unchanged and the bounded rerun passes
+  every affected case. Failed logs are retained, including an intermediate patch
+  syntax error corrected before final qualification.
+- Nightly formatting, readability (18 module/213 function exceptions) and diff
+  checks pass. This fix does not change readability baselines; the upstream merge
+  removed one existing function exception.
+
+Evidence is retained in `target/process-pr-ci-20261007/`. The change is cold
+supervisor cleanup and test code; no new Criterion/IPC qualification is required.
