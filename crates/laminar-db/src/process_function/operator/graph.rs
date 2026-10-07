@@ -16,11 +16,11 @@ use laminar_core::serialization::BoundedBytesWriter;
 #[async_trait]
 impl GraphOperator for ProcessFunctionOperator {
     fn cluster_capability(&self) -> OperatorCapability {
-        #[cfg(all(test, feature = "cluster"))]
-        if self.qualify_cluster_recovery {
+        if self.descriptor.runtime == crate::process_function::ProcessRuntime::RemotePython {
             let mut capability = OperatorCapability::fixed(OperatorImplementation::ProcessFunction);
-            capability.cluster_status =
-                crate::operator::capability::ClusterExecutionStatus::InternalOnly;
+            capability.cluster_status = crate::operator::capability::ClusterExecutionStatus::Rejected {
+                reason: "Python process functions have no immutable lifetime dependency/effect binding",
+            };
             return capability;
         }
         OperatorCapability::fixed(OperatorImplementation::ProcessFunction)

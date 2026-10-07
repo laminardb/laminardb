@@ -30,7 +30,7 @@ impl LaminarDB {
     }
 
     /// Register a trusted native keyed process function over one append-only source.
-    /// Registration is offline: call it after creating the source and before `start()`. The
+    /// Registration is offline: call it after creating a local source and before `start()`. The
     /// caller must register the same immutable implementation when constructing a replacement
     /// database instance that restores an existing checkpoint.
     ///
@@ -38,6 +38,10 @@ impl LaminarDB {
     /// connector that reproduces one channel in fixed replay batches with deterministic positions.
     /// Only one logical source is admitted. Source and sink contracts are verified before startup I/O. A direct
     /// in-memory source is available only with best-effort delivery.
+    /// Cluster execution admits at-least-once delivery with a splittable fixed-batch source.
+    /// Register the binding on every owner before catalog bootstrap, then include
+    /// `process_function_bootstrap_sql()` after the source in the ordered startup batch.
+    /// Process bindings cannot be changed through live catalog mutations.
     /// Native code runs in the compute process and must be trusted and nonblocking.
     ///
     /// # Errors
@@ -54,7 +58,7 @@ impl LaminarDB {
                 "native registration requires the trusted native Rust runtime".into(),
             ));
         }
-        self.register_local_process_function(
+        self.register_process_function(
             output_name,
             source_name,
             descriptor,
@@ -63,10 +67,10 @@ impl LaminarDB {
         .await
     }
 
-    /// Register a connected loopback Rust or Python worker for a local pipeline. At-least-once
+    /// Register a connected loopback Rust or Python worker. At-least-once
     /// delivery currently admits the Rust worker only; Python file-tree hashes do not enforce
     /// an immutable environment throughout the worker's lifetime.
-    /// Source-order requirements match native registration.
+    /// Source-order and cluster-bootstrap requirements match native registration.
     /// The caller owns the worker process lifecycle and must keep it available until shutdown.
     ///
     /// # Errors
@@ -89,7 +93,7 @@ impl LaminarDB {
                 "connected process worker descriptor differs from registration".into(),
             ));
         }
-        self.register_local_process_function(
+        self.register_process_function(
             output_name,
             source_name,
             descriptor,
@@ -98,7 +102,7 @@ impl LaminarDB {
         .await
     }
 
-    async fn register_local_process_function(
+    async fn register_process_function(
         &self,
         output_name: &str,
         source_name: &str,
@@ -107,9 +111,9 @@ impl LaminarDB {
     ) -> Result<(), DbError> {
         let _topology = self.topology_ddl_lock.write().await;
         self.ensure_topology_ddl_allowed("REGISTER PROCESS FUNCTION")?;
-        if self.is_cluster_runtime() || DbState::load(&self.state) != DbState::Created {
+        if DbState::load(&self.state) != DbState::Created {
             return Err(DbError::Unsupported(
-                "process functions currently require an offline local pipeline".into(),
+                "process functions require registration before pipeline startup".into(),
             ));
         }
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
@@ -130,6 +134,41 @@ impl LaminarDB {
                 "process source and output require distinct lowercase SQL identifiers".into(),
             ));
         }
+        descriptor.to_manifest_json()?;
+        let registration = ProcessFunctionRegistration {
+            output_name: output_name.into(),
+            source_name: source_name.into(),
+            descriptor,
+            handler,
+        };
+        if self.is_cluster_runtime() {
+            if self.config.delivery_guarantee != DeliveryGuarantee::AtLeastOnce {
+                return Err(DbError::Unsupported(
+                    "cluster process functions require at-least-once delivery".into(),
+                ));
+            }
+            let mut manager = self.connector_manager.lock();
+            if manager.process_functions().contains_key(output_name) {
+                return Err(DbError::InvalidOperation(
+                    "process binding already exists".into(),
+                ));
+            }
+            manager.register_process_function(registration);
+            return Ok(());
+        }
+        self.install_process_function(&registration)
+    }
+
+    pub(crate) fn install_process_function(
+        &self,
+        registration: &ProcessFunctionRegistration,
+    ) -> Result<(), DbError> {
+        let ProcessFunctionRegistration {
+            output_name,
+            source_name,
+            descriptor,
+            ..
+        } = registration;
         let source = self.catalog.get_source(source_name).ok_or_else(|| {
             DbError::InvalidOperation(format!("process source '{source_name}' does not exist"))
         })?;
@@ -154,19 +193,13 @@ impl LaminarDB {
                     .into(),
             ));
         }
-        descriptor.to_manifest_json()?;
         let reservation = self
             .reserve_catalog_name(output_name, CatalogObjectKind::Stream, false)?
             .ok_or_else(|| DbError::InvalidOperation("process output already exists".into()))?;
         self.catalog.register_stream(output_name)?;
         self.connector_manager
             .lock()
-            .register_process_function(ProcessFunctionRegistration {
-                output_name: output_name.to_string(),
-                source_name: source_name.to_string(),
-                descriptor: descriptor.clone(),
-                handler,
-            });
+            .register_process_function(registration.clone());
         self.ctx
             .register_table(
                 exact_table_reference(output_name),
@@ -179,7 +212,7 @@ impl LaminarDB {
             })?;
         self.stream_schemas
             .write()
-            .insert(output_name.to_string(), descriptor.output_schema);
+            .insert(output_name.clone(), Arc::clone(&descriptor.output_schema));
         reservation.commit();
         Ok(())
     }

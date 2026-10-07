@@ -1,5 +1,5 @@
-//! Private process graphs owned by the normal database startup, checkpoint and recovery rounds.
-//! Test control and shared storage are in memory; no public cluster admission is enabled.
+//! Public process bindings owned by database startup, checkpoint and recovery rounds.
+//! Test control and shared storage are in memory; owner-local output observation is private.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use super::tests::{descriptor, input_batch, AccountActivity};
 use super::ProcessRuntime;
 use super::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessCallback,
-    ProcessFunctionDescriptor, ProcessFunctionRegistration, ProcessHandler, ValueState,
+    ProcessFunctionDescriptor, ProcessHandler, ValueState,
 };
 use crate::{DbError, LaminarDB};
 

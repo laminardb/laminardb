@@ -1,6 +1,6 @@
 use super::*;
 
-struct Process {
+pub(super) struct Process {
     node: u64,
     pid: u32,
     root: PathBuf,
@@ -37,14 +37,14 @@ impl Process {
         .context("database response deadline expired")?
     }
 
-    async fn request(&mut self, command: &Command) -> Result<Response> {
+    pub(super) async fn request(&mut self, command: &Command) -> Result<Response> {
         let sequence = self.sequence;
         self.sequence += 1;
         write_message(&self.root.join(format!("request-{sequence}.json")), command)?;
         self.response(&format!("response-{sequence}.json")).await
     }
 
-    async fn done(&mut self, command: &Command) -> Result<()> {
+    pub(super) async fn done(&mut self, command: &Command) -> Result<()> {
         let response = self.request(command).await?;
         match response {
             Response::Done => Ok(()),
@@ -54,14 +54,14 @@ impl Process {
         }
     }
 
-    async fn observe(&mut self) -> Result<Observation> {
+    pub(super) async fn observe(&mut self) -> Result<Observation> {
         match self.request(&Command::Observe).await? {
             Response::Observed(observed) => Ok(*observed),
             response => Err(anyhow!("expected database observation: {response:?}")),
         }
     }
 
-    async fn kill(&mut self) -> Result<()> {
+    pub(super) async fn kill(&mut self) -> Result<()> {
         self.child.start_kill()?;
         let status = tokio::time::timeout(DEADLINE, self.child.wait()).await??;
         if status.success() {
@@ -126,7 +126,7 @@ fn spawn(root: &Path, config: &PeerConfig) -> Result<Process> {
     })
 }
 
-async fn ready(process: &mut Process) -> Result<std::net::SocketAddr> {
+pub(super) async fn ready(process: &mut Process) -> Result<std::net::SocketAddr> {
     match process.response("ready.json").await? {
         Response::Ready { pid, address } if pid == process.pid && pid != std::process::id() => {
             println!("database {} ready in PID {pid} at {address}", process.node);
@@ -136,7 +136,7 @@ async fn ready(process: &mut Process) -> Result<std::net::SocketAddr> {
     }
 }
 
-async fn wait_open(process: &mut Process, epoch: u64) -> Result<RecoveryAnnouncement> {
+pub(super) async fn wait_open(process: &mut Process, epoch: u64) -> Result<RecoveryAnnouncement> {
     tokio::time::timeout(DEADLINE, async {
         loop {
             let observed = process.observe().await?;
@@ -187,7 +187,7 @@ async fn wait_totals(processes: &mut [Process], expected: &BTreeMap<i64, i64>) -
     .with_context(|| format!("database output did not reach {expected:?}; last totals: {last:?}"))?
 }
 
-async fn held_start(
+pub(super) async fn held_start(
     survivor: &mut Process,
     reference: &CommittedCheckpointRef,
     generation: u64,
@@ -222,7 +222,7 @@ async fn held_start(
     })?
 }
 
-async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
+pub(super) async fn start_pair(processes: &mut [Process; 2]) -> Result<RecoveryAnnouncement> {
     let [survivor, failed] = processes;
     let (left, right) = tokio::join!(ready(survivor), ready(failed));
     let left = left?;
@@ -237,6 +237,12 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     right?;
     let first = wait_open(survivor, 0).await?;
     assert_eq!(wait_open(failed, 0).await?.round, first.round);
+    Ok(first)
+}
+
+async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
+    let first = start_pair(processes).await?;
+    let [survivor, failed] = processes;
     survivor.done(&Command::Prefix(2)).await?;
     failed.done(&Command::Prefix(2)).await?;
     let keys = connectors::keys()?;
@@ -246,6 +252,7 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
         reference,
         offsets,
         participants,
+        ..
     } = processes[0].request(&Command::Checkpoint).await?
     else {
         return Err(anyhow!("expected committed checkpoint"));
@@ -263,7 +270,7 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     wait_totals(processes, &BTreeMap::from([(keys[0], 63), (keys[1], 60)])).await?;
     processes[0].done(&Command::HoldRecovery).await?;
     processes[1].kill().await?;
-    processes[0].done(&Command::RemoveFailedPeer).await?;
+    processes[0].done(&Command::RemoveFailedPeer(8)).await?;
     qualify_recovered_owner(&mut processes[0], &reference, &cursors, &first).await?;
     wait_totals(
         &mut processes[..1],
@@ -313,6 +320,10 @@ async fn qualify_recovered_owner(
 }
 
 pub(super) async fn run() -> Result<()> {
+    run_process(Runtime::Aggregate, 8).await.map(|_| ())
+}
+
+pub(super) async fn run_process(runtime: Runtime, failed: u64) -> Result<process::Transcript> {
     let root = tempfile::tempdir()?;
     let namespace = format!("committed-database/{}", Uuid::new_v4());
     let objects = shared_store(&namespace)?;
@@ -328,6 +339,7 @@ pub(super) async fn run() -> Result<()> {
             namespace: namespace.clone(),
             node: 7,
             assignment: assignment.clone(),
+            runtime,
         },
     )?;
     let second = spawn(
@@ -336,6 +348,7 @@ pub(super) async fn run() -> Result<()> {
             namespace,
             node: 8,
             assignment,
+            runtime,
         },
     );
     let mut processes = match second {
@@ -346,9 +359,18 @@ pub(super) async fn run() -> Result<()> {
             return Err(error.context(format!("first database cleanup: {cleanup:?}")));
         }
     };
-    let outcome = std::panic::AssertUnwindSafe(qualify(&mut processes))
-        .catch_unwind()
-        .await;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        match runtime {
+            Runtime::Aggregate => qualify(&mut processes)
+                .await
+                .map(|()| (Vec::new(), Vec::new())),
+            Runtime::Native => process::qualify(&mut processes, failed).await,
+            #[cfg(feature = "process-remote")]
+            Runtime::RemoteRust => process::qualify(&mut processes, failed).await,
+        }
+    })
+    .catch_unwind()
+    .await;
     let mut cleanup = Vec::new();
     for process in &mut processes {
         if let Err(error) = process.close().await {
@@ -356,8 +378,8 @@ pub(super) async fn run() -> Result<()> {
         }
     }
     match outcome {
-        Ok(Ok(())) if cleanup.is_empty() => Ok(()),
-        Ok(Ok(())) => Err(anyhow!(
+        Ok(Ok(transcript)) if cleanup.is_empty() => Ok(transcript),
+        Ok(Ok(_)) => Err(anyhow!(
             "database qualification cleanup failed: {cleanup:?}"
         )),
         Ok(Err(error)) => {

@@ -69,6 +69,13 @@ impl LaminarDB {
             )
             .into());
         }
+        if !self.connector_manager.lock().process_functions().is_empty() {
+            return Err(TopologyError::Unsupported(
+                "process bindings are immutable; catalog changes require a new checkpoint namespace"
+                    .into(),
+            )
+            .into());
+        }
         let _compiler = self
             .topology_validation_lock
             .try_lock()

@@ -16,6 +16,8 @@ pub(super) struct ReplayProbe {
     pub polls: AtomicU64,
     pub starts: parking_lot::Mutex<Vec<Resume>>,
     pub output: parking_lot::Mutex<BTreeMap<i64, i64>>,
+    pub callbacks: parking_lot::Mutex<Vec<process::Callback>>,
+    pub activity: parking_lot::Mutex<Vec<process::ActivityRow>>,
 }
 
 pub(super) fn keys() -> Result<[i64; 2]> {
@@ -141,6 +143,7 @@ impl SourceConnector for ReplaySource {
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
+                channels: self.checkpoint.input_channels().unwrap_or(&[]).to_vec(),
             });
         }
         tokio::time::timeout(DEADLINE, async {
@@ -307,8 +310,12 @@ impl SinkConnector for ObservedSink {
 pub(super) fn register(
     probe: Arc<ReplayProbe>,
     path: PathBuf,
+    runtime: Runtime,
 ) -> impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError> {
     move |registry| {
+        if runtime != Runtime::Aggregate {
+            return process::register(probe, path)(registry);
+        }
         let keys = keys().map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
         let source_probe = Arc::clone(&probe);
         registry.register_source(

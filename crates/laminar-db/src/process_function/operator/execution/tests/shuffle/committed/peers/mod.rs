@@ -101,8 +101,14 @@ fn shared_objects(namespace: &str) -> Arc<dyn ObjectStore> {
         .with_endpoint(endpoint)
         .with_bucket_name(std::env::var(BUCKET_ENV).expect("set the MinIO test bucket"))
         .with_region("us-east-1")
-        .with_access_key_id("minioadmin")
-        .with_secret_access_key("minioadmin")
+        .with_access_key_id(
+            std::env::var("LAMINAR_PROCESS_TEST_S3_ACCESS_KEY")
+                .unwrap_or_else(|_| "minioadmin".into()),
+        )
+        .with_secret_access_key(
+            std::env::var("LAMINAR_PROCESS_TEST_S3_SECRET_KEY")
+                .unwrap_or_else(|_| "minioadmin".into()),
+        )
         .with_allow_http(true)
         .build()
         .unwrap();

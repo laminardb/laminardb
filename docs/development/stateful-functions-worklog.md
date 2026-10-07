@@ -1881,7 +1881,7 @@ code change. Criterion and IPC requalification is unnecessary for qualification
 code and cold Debug formatting. Exact commands, logs, durations and qualified
 source/binary hashes are retained in `target/process-database-recovery-20261006/`.
 
-## Next executable task
+## Next executable task (2026-10-06; completed below)
 
 Continue original Phase E with database-controlled process recovery after real
 node/process loss, using durable shared checkpoint/control authority and the
@@ -1903,3 +1903,122 @@ increments; target-hardware CPU/IPC and representative tail latency remain
 required before product latency claims. The atomic-only idle watermark boundary
 observed by this example is documented above; it has not been changed or qualified
 as autonomous idle timer progress.
+
+### Continuation: qualified cluster admission (2026-10-07)
+
+This completes the bounded Rust cluster profile in original Phase E. Native Rust
+and real loopback remote Rust use public registration in single-owner and
+multi-owner clusters with at-least-once delivery. Admission requires one logical
+append-only, replayable source declaring deterministic row positions,
+`SingleChannelFixedBatches` and splittable placement of one global physical
+channel. Both declared and instantiated source contracts are checked. Built-in
+connectors still leave this replay profile unspecified; this qualification does
+not certify Kafka partition merging or FILES discovery order.
+
+Cluster registration binds deployment-supplied code before source DDL. The new
+`process_function_bootstrap_sql()` API returns one canonical `CREATE STREAM ...
+AS SELECT * FROM laminar_process(source, manifest)` statement for the existing
+ordered bootstrap batch. The existing parser, typed catalog namespace, immutable
+manifest, rollback and replay machinery own it. SQL never loads code. Changed
+predicates, limits, source or package descriptors cannot reinterpret that binding.
+Fresh-owner replay installs the same source and process output; process catalog
+generation remains one. Live topology mutations reject process pipelines instead
+of attempting an uncertified package/state upgrade.
+
+The test-only database admission switch and operator capability override have
+been removed. Public one-owner and two-owner database recovery-round cases pass
+for both Rust runtimes. The second owner reconstructs its catalog from the sealed
+manifest. Additional admission tests reject exactly-once delivery, package/SQL
+drift, duplicate bindings, unsupported source placement and live topology changes.
+An unbound graph retains its input, emits nothing and cannot take a quiescent
+checkpoint. Local native/Rust at-least-once and local Python best-effort behavior
+retain their existing contracts.
+
+The existing server process-loss harness now also runs the account-activity
+function. Each runtime compares an uninterrupted run with actual OS process
+termination of either node 7 (leader/global-source owner) or node 8 (other vnode
+owner). Durable MinIO checkpoint/control storage, renewable process and leader
+leases, ordinary database checkpoints, leased barrier RPC, rebalance watchers and
+Prepare/Start/Release rounds execute normally. Discovery loss is injected through
+the existing membership watch; this is not a gossip/network-partition certificate.
+The remote Rust worker uses real loopback gRPC in each database process.
+
+Before publication, the survivor verifies the committed checkpoint reference,
+assignment two, restored vnode ownership, replay cursor two and the unchanged
+global physical channel. Held source starts keep intake, polling, callbacks and
+output closed until the exact new Release is committed. Uncommitted changes are
+replayed from the old cut. Callback IDs, keys, timestamps, state views, totals,
+threshold transitions and four timer firings match the uninterrupted run at
+cursor two/watermark 104 and cursor seven/watermark 164. The replaced timer at
+110,000 microseconds never fires. Output observation follows fsynced fixture sink
+writes; clearing observation does not erase durable output or claim exactly-once
+publication. Existing independent-owner host-loss/rescale and damaged-donor
+qualification also passes with public capability metadata.
+
+The weekly/manual checkpoint fault workflow now includes these process node-loss
+and committed ownership-transfer gates using its existing MinIO service. Explicit
+loopback fixture credentials support that job without inheriting cloud credentials.
+The workflow itself has not been dispatched from this branch.
+
+Cluster Python, exactly-once process delivery, independent-channel merging,
+distributed subscriptions over process output and live package/catalog upgrades
+remain explicit rejections. The stock server's Python binding remains local
+best-effort; Rust cluster applications register through the Rust API. Stronger
+Python delivery still needs enforced lifetime dependency/effect binding. Arbitrary
+native code remains trusted; digest negotiation establishes compatibility, not
+cryptographic attestation. Target-hardware throughput and tail latency are not
+newly certified here.
+
+### Validation
+
+Evidence is retained in `target/process-cluster-admission-20261007/`. The baseline
+is `c6980f4a`; rustc is 1.99.0 (`b940084d7`), cargo is 1.99.0 (`5f94df478`), with
+`CARGO_BUILD_JOBS=2` and `RUST_MIN_STACK=8388608`. The pre-change process suite
+passes 140 tests with two ignored in 162.55 command seconds.
+
+Initial failures exposed missing process catalog-generation reconciliation,
+fixture timer/timeout API mistakes, initial shuffle certificate/deadline setup,
+and two assertions that still assumed blanket cluster rejection or an error
+instead of the existing deferred-input behavior. These were corrected without
+changing record execution or recovery failure classification; failed logs remain.
+
+Public database recovery rounds pass four cases in 121.28 seconds. The corrected
+full process suite passes 142 tests with two ignored in 182.42 seconds. Live native
+and remote Rust database node-loss cases pass in 314.92 seconds, including 123.80
+test seconds. The existing independent-owner shared-checkpoint host-loss/rescale
+gate passes in 168.06 seconds, including 54.53 test seconds. Exact commands are:
+
+```text
+cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files process_function:: -- --quiet --test-threads=1
+cargo test -p laminar-server --bin laminardb --no-default-features --features cluster,aws,process-remote cluster::recovery_round_tests::committed::process:: -- --ignored --nocapture --test-threads=1
+cargo test -p laminar-db --lib --no-default-features --features cluster,process-remote,files process_function::operator::execution::tests::shuffle::committed::peers::independent_owners_restore_the_committed_cut_after_host_loss_and_rescale -- --exact --ignored --nocapture
+```
+
+The production changes are cold registration, catalog and admission checks.
+Coordinator-cycle, core operators, process record execution, dependencies,
+checkpoint codecs and readability baselines are unchanged. Criterion and IPC
+requalification is unnecessary for these cold changes. Readability passes with
+the same 18 module and 214 function exceptions.
+
+All required gates pass on the final source:
+
+| Gate | Result | Command seconds |
+| --- | --- | ---: |
+| `cargo test --workspace --lib` | 6,249 passed; five ignored | 308.10 |
+| `cargo test -p laminar-server --bin laminardb --no-default-features --features cluster,aws,process-remote cluster:: -- --include-ignored --nocapture --test-threads=1` | 57 passed; none ignored, including the MinIO fixtures | 466.68 |
+| `cargo clippy --workspace --all-features --all-targets -- -D warnings` | Passed | 57.39 |
+| `cargo clippy --workspace --no-default-features -- -D warnings` | Passed | 22.53 |
+| `cargo +nightly fmt --all -- --check` | Passed | 5.29 |
+| `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | Passed; baselines unchanged | 12.64 |
+
+The all-feature Clippy run required an explicit `String::clone()` in cold
+registration; the corresponding formatter adjustment also passed on retry.
+The workspace tests were rerun after that correction. This equivalent copy and
+formatting are the only source changes after the external recovery qualification.
+Failed lint/format logs are retained with the passing retries. Final source hashes
+match all 1,207 recorded Rust/Cargo/workflow files; `Cargo.lock` is unchanged.
+The task-owned MinIO container was stopped and removed after qualification.
+
+Cluster admission is resolved for the qualified Rust profile above. The explicit
+unsupported profiles remain closed and need their own acceptance evidence before
+admission can widen.

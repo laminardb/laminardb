@@ -161,6 +161,9 @@ impl LaminarDB {
         self.ensure_topology_ddl_allowed("CREATE STREAM")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
+        if let Some(result) = self.create_bound_process_stream(sql, &name_str)? {
+            return Ok(result);
+        }
         if crate::sql_analysis::has_temporal_query(query_sql) {
             self.ensure_temporal_stream_offline(&name_str)?;
         }

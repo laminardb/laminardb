@@ -3,10 +3,12 @@
 //! The engine owns every value and timer. A handler receives immutable activation snapshots and
 //! returns proposed changes; its private memory is never authoritative. Native handlers execute
 //! on the compute thread and must be trusted, bounded, and nonblocking. The optional remote
-//! transport is restricted to local loopback pipelines. At-least-once delivery currently admits
+//! transport is restricted to loopback workers on each database host. At-least-once delivery admits
 //! trusted native Rust and remote Rust with one replayable source that reproduces one physical
 //! channel in fixed batches. Each batch defines a reproducible event-time cut; independent-channel
-//! merging and cluster recovery remain unadmitted. Python remains best-effort.
+//! merging remains unadmitted. Cluster execution additionally requires splittable placement and
+//! the same immutable binding in every owner's sealed startup catalog. Python remains local
+//! best-effort; exactly-once process delivery is unsupported.
 
 use std::sync::Arc;
 
@@ -15,6 +17,7 @@ use arrow_schema::SchemaRef;
 
 use crate::error::DbError;
 
+mod catalog;
 mod descriptor;
 mod operator;
 mod registration;

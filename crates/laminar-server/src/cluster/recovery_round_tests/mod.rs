@@ -284,6 +284,20 @@ impl Peer {
             )
             .await?,
         );
+        let fence = snapshot.assignment_fence()?;
+        sender.bind_process_lease_deadline_pair(
+            &receiver,
+            self.controller
+                .process_lease_deadline()
+                .ok_or_else(|| anyhow!("fixture process lease deadline is absent"))?,
+        )?;
+        let owners = snapshot
+            .to_vnode_vec(2)?
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<Vec<_>>();
+        sender.install_assignment_fence(&fence, &owners)?;
+        receiver.install_assignment_fence(&fence, &owners)?;
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&self.controller))
             .verified_cluster_namespaces(verified)
@@ -361,8 +375,14 @@ fn shared_store(namespace: &str) -> Result<Arc<dyn object_store::ObjectStore>> {
         .with_endpoint(endpoint)
         .with_bucket_name(std::env::var("LAMINAR_PROCESS_TEST_S3_BUCKET")?)
         .with_region("us-east-1")
-        .with_access_key_id("minioadmin")
-        .with_secret_access_key("minioadmin")
+        .with_access_key_id(
+            std::env::var("LAMINAR_PROCESS_TEST_S3_ACCESS_KEY")
+                .unwrap_or_else(|_| "minioadmin".into()),
+        )
+        .with_secret_access_key(
+            std::env::var("LAMINAR_PROCESS_TEST_S3_SECRET_KEY")
+                .unwrap_or_else(|_| "minioadmin".into()),
+        )
         .with_allow_http(true)
         .build()?;
     Ok(Arc::new(object_store::prefix::PrefixStore::new(

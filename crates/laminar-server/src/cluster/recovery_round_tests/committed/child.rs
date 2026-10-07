@@ -9,9 +9,76 @@ struct DatabasePeer {
     assignments: Arc<AssignmentSnapshotStore>,
     rebalance_shutdown: CancellationToken,
     rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
+    runtime: Runtime,
+    #[cfg(feature = "process-remote")]
+    worker: Option<tokio::task::JoinHandle<Result<(), laminar_db::DbError>>>,
 }
 
 impl DatabasePeer {
+    fn clear_process_observation(&self) {
+        self.probe.callbacks.lock().clear();
+        self.probe.activity.lock().clear();
+    }
+
+    async fn install_process_catalog(&mut self) -> Result<()> {
+        use laminar_db::process_function::NativeProcessFunction;
+        let binding = process::descriptor();
+        let handler: Arc<dyn NativeProcessFunction> =
+            Arc::new(process::Activity(Arc::clone(&self.probe)));
+        match self.runtime {
+            Runtime::Native => {
+                self.db()?
+                    .register_native_process_function(
+                        "recovery_output",
+                        "recovery_input",
+                        binding,
+                        handler,
+                    )
+                    .await?
+            }
+            #[cfg(feature = "process-remote")]
+            Runtime::RemoteRust => {
+                let mut binding = binding;
+                use laminar_db::process_function::{
+                    remote::{RemoteProcessClient, RustReferenceWorker},
+                    ProcessRuntime,
+                };
+                binding.runtime = ProcessRuntime::RemoteRust;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let address = listener.local_addr()?;
+                let worker = RustReferenceWorker::new(binding.clone(), handler, 4)?;
+                self.worker = Some(tokio::spawn(
+                    worker.serve_loopback(listener, self.peer.shutdown.clone()),
+                ));
+                let client = RemoteProcessClient::connect_loopback(
+                    &format!("http://{address}"),
+                    binding.clone(),
+                    4,
+                    Duration::from_secs(5),
+                )
+                .await?;
+                self.db()?
+                    .register_remote_process_function(
+                        "recovery_output",
+                        "recovery_input",
+                        binding,
+                        Arc::new(client),
+                    )
+                    .await?;
+            }
+            Runtime::Aggregate => {
+                return Err(anyhow!("aggregate fixture cannot install process code"))
+            }
+        }
+        let ddl = [
+            "CREATE SOURCE recovery_input (account VARCHAR NOT NULL, amount BIGINT NOT NULL, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' MILLISECOND) FROM \"recovery-cut-probe\" ('fixture' = 'process-fixed-v1')".into(),
+            self.db()?.process_function_bootstrap_sql("recovery_output")?,
+            "CREATE SINK recovery_probe FROM recovery_output INTO \"recovery-output-probe\" ('fixture' = 'process-fixed-v1')".into(),
+        ];
+        self.db()?.execute_cluster_bootstrap_batch(&ddl).await?;
+        Ok(())
+    }
+
     async fn initialize(
         &mut self,
         config: &PeerConfig,
@@ -30,7 +97,11 @@ impl DatabasePeer {
                 objects,
                 &config.assignment,
                 Arc::clone(&self.assignments),
-                connectors::register(Arc::clone(&self.probe), root.join("output.jsonl")),
+                connectors::register(
+                    Arc::clone(&self.probe),
+                    root.join("output.jsonl"),
+                    self.runtime,
+                ),
             )
             .await?;
         self.sender = Some(sender);
@@ -81,6 +152,8 @@ impl DatabasePeer {
                 .map_err(anyhow::Error::msg)?,
             release: controller.latest_committed_recover_release().await?,
             fault: self.db()?.last_fault(),
+            callbacks: self.probe.callbacks.lock().clone(),
+            activity: self.probe.activity.lock().clone(),
         })
     }
 
@@ -115,11 +188,21 @@ impl DatabasePeer {
                 .iter()
                 .map(|participant| participant.participant_id)
                 .collect(),
+            channels: index.source_offsets["recovery_input"]
+                .input_channels
+                .clone()
+                .unwrap_or_default(),
+            watermark: index
+                .channel_progress
+                .iter()
+                .find(|channel| channel.input_channel == process::CHANNEL)
+                .and_then(|channel| channel.watermark),
         })
     }
 
-    fn remove_failed_peer(&mut self) -> Result<()> {
-        if self.peer.controller.instance_id() != NodeId(7) || !self.rebalance_tasks.is_empty() {
+    fn remove_failed_peer(&mut self, failed: u64) -> Result<()> {
+        if self.peer.controller.instance_id() == NodeId(failed) || !self.rebalance_tasks.is_empty()
+        {
             return Err(anyhow!(
                 "fixture accepts one failed-peer transition on the survivor"
             ));
@@ -133,7 +216,7 @@ impl DatabasePeer {
         self.peer._membership.send(
             membership()
                 .into_iter()
-                .filter(|member| member.id == NodeId(7))
+                .filter(|member| member.id != NodeId(failed))
                 .collect(),
         )?;
         let config = laminar_db::rebalance::RebalanceConfig::test_defaults();
@@ -166,6 +249,10 @@ impl DatabasePeer {
                 .ok_or_else(|| anyhow!("fixture sender is absent"))?
                 .register_peer(node, address),
             Command::Catalog => {
+                if self.runtime != Runtime::Aggregate {
+                    self.install_process_catalog().await?;
+                    return Ok(Response::Done);
+                }
                 let ddl = [
                     "CREATE SOURCE recovery_input (account BIGINT, amount BIGINT, ts TIMESTAMP, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) FROM \"recovery-cut-probe\" ('fixture' = 'bounded-replay-v1')".into(),
                     "CREATE STREAM recovery_output AS SELECT account, SUM(amount) AS total FROM recovery_input GROUP BY account".into(),
@@ -196,16 +283,24 @@ impl DatabasePeer {
                 self.db()?.enable_coordinated_recovery()?;
             }
             Command::Prefix(prefix) => {
-                if prefix > 4 {
-                    return Err(anyhow!("fixture source prefix exceeds four records"));
+                if prefix
+                    > if self.runtime == Runtime::Aggregate {
+                        4
+                    } else {
+                        7
+                    }
+                {
+                    return Err(anyhow!("fixture source prefix exceeds its record bound"));
                 }
                 self.probe.prefix.store(prefix, Ordering::Release);
             }
             Command::HoldRecovery => {
                 self.probe.hold.store(true, Ordering::Release);
                 self.probe.output.lock().clear();
+                self.clear_process_observation();
             }
-            Command::RemoveFailedPeer => self.remove_failed_peer()?,
+            Command::RemoveFailedPeer(failed) => self.remove_failed_peer(failed)?,
+            Command::ClearProcessObservation => self.clear_process_observation(),
             Command::Observe => return Ok(Response::Observed(Box::new(self.observe().await?))),
             Command::Checkpoint => return self.checkpoint().await,
             Command::Release => self.probe.hold.store(false, Ordering::Release),
@@ -245,6 +340,22 @@ impl DatabasePeer {
             errors.push("rebalance task cleanup failed".into());
         }
         errors.extend(self.peer.close().await);
+        #[cfg(feature = "process-remote")]
+        if let Some(mut worker) = self.worker.take() {
+            match tokio::time::timeout(DEADLINE, &mut worker).await {
+                Ok(Ok(Ok(()))) => {}
+                result @ Ok(_) => errors.push(format!("process worker cleanup: {result:?}")),
+                Err(error) => {
+                    errors.push(format!("process worker cleanup: {error}"));
+                    worker.abort();
+                    if let Err(error) = worker.await {
+                        if !error.is_cancelled() {
+                            errors.push(error.to_string());
+                        }
+                    }
+                }
+            }
+        }
         errors
     }
 }
@@ -265,6 +376,9 @@ pub(super) async fn run(root: &Path) -> Result<()> {
         assignments: Arc::new(AssignmentSnapshotStore::new(Arc::clone(&objects))),
         rebalance_shutdown: CancellationToken::new(),
         rebalance_tasks: Vec::new(),
+        runtime: config.runtime,
+        #[cfg(feature = "process-remote")]
+        worker: None,
     };
     let outcome = std::panic::AssertUnwindSafe(async {
         owner.initialize(&config, objects, root).await?;

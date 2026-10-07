@@ -22,7 +22,7 @@ const VNODE_COUNT: u32 = 1_024;
 pub enum NativeProcessBenchmarkMode {
     /// Existing in-process operator execution without cluster authority.
     Local,
-    /// Private single-owner routing and result fencing; cluster admission remains rejected.
+    /// Single-owner routing and result fencing under a cluster assignment.
     SingleOwner,
     /// Private input routing across two loopback shuffle endpoints. Admission remains closed.
     TwoOwners,

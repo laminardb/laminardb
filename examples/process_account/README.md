@@ -93,7 +93,7 @@ key. Event timestamps do not sort records. Replayable offsets and ordered row
 positions describe progress within a source partition; they do not specify how
 independent channels merge. Reproducing callback IDs requires the same callback
 order within each vnode and the same watermark cuts relative to input. The
-private cluster replay tests use one fixed source order, split it into different
+cluster replay tests use one fixed source order, split it into different
 batch sizes, and retain those cuts. They cover timer replacement, cancellation
 and callbacks that register another timer. This qualifies that controlled
 profile; independent-channel merging remains uncertified. Event-time sorting
@@ -111,8 +111,50 @@ cuts: the engine executes one batch at a time and derives progress from event ti
 Coalescing, wall-clock idleness/future-skew decisions and external watermark calls do not
 advance that profile. Timers need subsequent input to advance event time. Raw
 `SingleChannel` order and independent-channel merging remain insufficient. This example
-uses `BestEffort` in both languages, and cluster process-function admission remains closed
-pending database-controlled recovery qualification.
+uses `BestEffort` in both languages.
+
+## Cluster admission
+
+Native Rust and loopback remote Rust admit `AtLeastOnce` in both single-owner and
+multi-owner clusters. The source must declare the fixed-batch contract above with
+`SourceTopology::Splittable`: one global physical channel follows its assigned
+owner, including after node loss. Independent partition merges remain rejected.
+No built-in connector currently certifies this profile; applications must supply
+a connector that implements it. Durable output uses the existing sink contracts.
+This FILES example does not become a cluster replay source.
+
+Each database owner registers the same immutable descriptor and trusted code
+before replaying or sealing the startup catalog. After registration, obtain the
+canonical invocation and place it between source and consumer DDL:
+
+```rust,ignore
+db.register_native_process_function("activity", "events", descriptor, handler).await?;
+let process_sql = db.process_function_bootstrap_sql("activity")?;
+db.execute_cluster_bootstrap_batch(&[source_sql, process_sql, sink_sql]).await?;
+```
+
+The generated statement uses `CREATE STREAM activity AS SELECT * FROM
+laminar_process('events', '<manifest>')`. SQL references deployment-supplied code;
+it never downloads or loads a package. Modified predicates, limits, projection,
+manifest, or source bindings are rejected. Fresh owners replay the exact sealed
+statement. Descriptor/checkpoint compatibility is checked before state restore.
+Live catalog changes involving process pipelines require a new checkpoint namespace.
+
+The database process-loss tests use durable shared control/checkpoint storage,
+renewable leases, public bindings and a durable at-least-once fixture sink. They
+kill either the leader/source owner or the other vnode owner, restore the committed
+cursor and timer state, and hold intake through matching Prepare/Start/Release
+rounds. Native and real loopback Rust worker callbacks and output match an
+uninterrupted run at the same committed watermark cuts. Existing transfer tests
+cover reassignment, rescale, network interruption and delayed old-owner replies.
+
+Cluster Python, exactly-once process delivery, distributed subscriptions over
+process output, and live package/catalog upgrades remain explicitly rejected.
+Python still needs immutable lifetime dependency/effect binding for replay-capable
+delivery. The stock server's Python configuration remains local best-effort;
+native and remote Rust cluster bindings use the Rust API. Trusted native handlers
+must be bounded, deterministic and nonblocking. Remote worker digest negotiation
+checks compatibility; deployment code identity remains the operator's responsibility.
 
 ## Completed-checkpoint recovery
 

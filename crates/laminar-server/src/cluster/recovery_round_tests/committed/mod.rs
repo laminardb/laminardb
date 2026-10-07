@@ -1,5 +1,5 @@
-//! Independent database processes recover an admitted aggregate through the existing cluster
-//! lifecycle. This qualifies the shared recovery prerequisite, not process-function admission.
+//! Independent database processes recover aggregates and process functions through the existing
+//! shared checkpoint, assignment and recovery lifecycle.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use laminar_core::checkpoint::{CheckpointAssignmentFence, CommittedCheckpointRef
 
 mod child;
 mod connectors;
+mod process;
 mod scenario;
 
 const CHILD_ENV: &str = "LAMINAR_DATABASE_RECOVERY_PEER";
@@ -23,6 +24,15 @@ struct PeerConfig {
     namespace: String,
     node: u64,
     assignment: AssignmentSnapshot,
+    runtime: Runtime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Runtime {
+    Aggregate,
+    Native,
+    #[cfg(feature = "process-remote")]
+    RemoteRust,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -32,7 +42,8 @@ enum Command {
     Start,
     Prefix(u64),
     HoldRecovery,
-    RemoveFailedPeer,
+    RemoveFailedPeer(u64),
+    ClearProcessObservation,
     Observe,
     Checkpoint,
     Release,
@@ -44,6 +55,7 @@ struct Resume {
     checkpoint_id: u64,
     assignment: u64,
     offsets: BTreeMap<String, String>,
+    channels: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +69,8 @@ struct Observation {
     intent: Option<RecoveryAnnouncement>,
     release: Option<RecoveryAnnouncement>,
     fault: Option<String>,
+    callbacks: Vec<process::Callback>,
+    activity: Vec<process::ActivityRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,6 +85,8 @@ enum Response {
         reference: CommittedCheckpointRef,
         offsets: BTreeMap<String, String>,
         participants: Vec<u64>,
+        channels: Vec<Vec<u8>>,
+        watermark: Option<i64>,
     },
 }
 

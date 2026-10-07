@@ -185,15 +185,12 @@ impl Fixture {
         graph.set_runtime_handle(tokio::runtime::Handle::current());
         graph.register_source_schema("events".into(), Arc::clone(&binding.input_schema));
         graph
-            .add_process_function(
-                &ProcessFunctionRegistration {
-                    output_name: "activity".into(),
-                    source_name: "events".into(),
-                    descriptor: binding,
-                    handler,
-                },
-                false,
-            )
+            .add_process_function(&ProcessFunctionRegistration {
+                output_name: "activity".into(),
+                source_name: "events".into(),
+                descriptor: binding,
+                handler,
+            })
             .unwrap();
         graph
     }
@@ -241,23 +238,15 @@ fn state_image(operator: &ProcessFunctionOperator) -> serde_json::Value {
 #[tokio::test]
 async fn graph_routes_single_owner_input_to_canonical_vnodes_and_preserves_key_order() {
     let fixture = Fixture::new(Uuid::from_u128(7), 7, 3, TTL).await;
-    let raw = fixture.graph(
-        descriptor(),
-        ProcessHandler::Native(Arc::new(AccountActivity)),
-    );
-    assert!(raw
-        .initialize_managed_state()
-        .await
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("not cluster"));
-    // This exercises private execution hooks. The shipped cluster admission remains rejected.
+    // Exercise the assignment hooks separately from database bootstrap.
     let mut graph = fixture
         .graph(
             descriptor(),
             ProcessHandler::Native(Arc::new(AccountActivity)),
         )
+        .initialize_managed_state()
+        .await
+        .unwrap()
         .bind_startup_assignment(&fixture.binding, &fixture.controller)
         .unwrap();
     let input = input_batch(&[
@@ -496,7 +485,7 @@ async fn routing_rejects_input_and_temporary_budget_overflow_before_state_applic
 }
 
 #[tokio::test]
-async fn private_multi_owner_binding_keeps_public_cluster_admission_closed() {
+async fn admitted_multi_owner_graph_still_requires_startup_authority() {
     let fixture = Fixture::new(Uuid::from_u128(7), 7, 3, TTL).await;
     let owners = [7, 7, 8, 8];
     let fence = CheckpointAssignmentFence::from_owner_map(
@@ -529,21 +518,34 @@ async fn private_multi_owner_binding_keeps_public_cluster_admission_closed() {
         .install_assignment_fence(&fence, &owners)
         .unwrap();
     let binding = InstalledVnodeStateBinding::new(fence, PipelineIdentity::empty()).unwrap();
-    let rejected = fixture
+    let mut unbound = fixture
         .graph(
             descriptor(),
             ProcessHandler::Native(Arc::new(AccountActivity)),
         )
         .initialize_managed_state()
         .await
-        .err()
         .unwrap();
-    assert!(rejected.to_string().contains("not cluster"), "{rejected}");
-    let _private_graph = fixture
+    let input = rustc_hash::FxHashMap::from_iter([(
+        Arc::from("events"),
+        vec![input_batch(&[("a", 1, 100_000)])],
+    )]);
+    assert!(unbound
+        .execute_cycle(&input, 100, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(unbound.has_deferred_work());
+    assert!(!unbound.checkpoint_is_quiescent());
+    let admitted = fixture
         .graph(
             descriptor(),
             ProcessHandler::Native(Arc::new(AccountActivity)),
         )
+        .initialize_managed_state()
+        .await
+        .unwrap();
+    let _bound_graph = admitted
         .bind_startup_assignment(&binding, &fixture.controller)
         .unwrap();
 }

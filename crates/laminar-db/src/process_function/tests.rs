@@ -447,16 +447,12 @@ fn build_graph(
     graph.set_query_budget_ns(5_000_000_000);
     graph.register_source_schema("events".into(), input_schema());
     graph
-        .add_process_function(
-            &ProcessFunctionRegistration {
-                output_name: "activity".into(),
-                source_name: "events".into(),
-                descriptor,
-                handler: ProcessHandler::Native(handler),
-            },
-            #[cfg(feature = "cluster")]
-            false,
-        )
+        .add_process_function(&ProcessFunctionRegistration {
+            output_name: "activity".into(),
+            source_name: "events".into(),
+            descriptor,
+            handler: ProcessHandler::Native(handler),
+        })
         .unwrap();
     graph
 }
@@ -728,16 +724,12 @@ async fn same_function_identity_in_two_pipelines_has_independent_state() {
     let mut second = descriptor();
     second.pipeline_state_id = "other_pipeline_v1".into();
     graph
-        .add_process_function(
-            &ProcessFunctionRegistration {
-                output_name: "other_activity".into(),
-                source_name: "events".into(),
-                descriptor: second,
-                handler: ProcessHandler::Native(Arc::new(AccountActivity)),
-            },
-            #[cfg(feature = "cluster")]
-            false,
-        )
+        .add_process_function(&ProcessFunctionRegistration {
+            output_name: "other_activity".into(),
+            source_name: "events".into(),
+            descriptor: second,
+            handler: ProcessHandler::Native(Arc::new(AccountActivity)),
+        })
         .unwrap();
     let mut graph = graph.initialize_managed_state().await.unwrap();
     let first = graph
@@ -2462,16 +2454,12 @@ mod remote_pipeline {
         graph.set_query_budget_ns(5_000_000_000);
         graph.register_source_schema("events".into(), input_schema());
         graph
-            .add_process_function(
-                &ProcessFunctionRegistration {
-                    output_name: "activity".into(),
-                    source_name: "events".into(),
-                    descriptor: binding,
-                    handler: ProcessHandler::Remote(client),
-                },
-                #[cfg(feature = "cluster")]
-                false,
-            )
+            .add_process_function(&ProcessFunctionRegistration {
+                output_name: "activity".into(),
+                source_name: "events".into(),
+                descriptor: binding,
+                handler: ProcessHandler::Remote(client),
+            })
             .unwrap();
         graph
     }

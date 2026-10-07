@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use laminar_connectors::connector::{DeliveryGuarantee, SourceContract};
+use laminar_connectors::connector::{DeliveryGuarantee, SourceContract, SourceTopology};
 
 use super::ProcessFunctionRegistration;
 use crate::connector_manager::SourceRegistration;
@@ -31,7 +31,12 @@ impl LaminarDB {
                 "at-least-once process functions require one logical source; independent-source watermark cuts are not replayable".into(),
             ));
         }
-        admit_process_replay_source(output_name, source_name, contract)
+        admit_process_replay_source(
+            output_name,
+            source_name,
+            contract,
+            self.is_cluster_runtime(),
+        )
     }
 
     pub(crate) fn validate_process_source_orders(
@@ -42,6 +47,17 @@ impl LaminarDB {
         let mut registrations = registrations.iter().collect::<Vec<_>>();
         registrations.sort_unstable_by_key(|registration| &registration.output_name);
         for registration in registrations {
+            if self.is_cluster_runtime()
+                && self
+                    .connector_manager
+                    .lock()
+                    .get_ddl(&registration.output_name)
+                    .is_none()
+            {
+                return Err(DbError::Unsupported(
+                    "cluster process binding must be included in startup catalog bootstrap".into(),
+                ));
+            }
             self.validate_process_source_order(
                 &registration.output_name,
                 &registration.source_name,
@@ -66,7 +82,12 @@ impl LaminarDB {
             .filter(|registration| registration.source_name == source_name)
             .min_by_key(|registration| &registration.output_name);
         if let Some(registration) = registration {
-            admit_process_replay_source(&registration.output_name, source_name, contract)?;
+            admit_process_replay_source(
+                &registration.output_name,
+                source_name,
+                contract,
+                self.is_cluster_runtime(),
+            )?;
         }
         Ok(())
     }
@@ -76,7 +97,13 @@ fn admit_process_replay_source(
     output_name: &str,
     source_name: &str,
     contract: SourceContract,
+    cluster: bool,
 ) -> Result<(), DbError> {
+    if cluster && contract.topology != SourceTopology::Splittable {
+        return Err(DbError::Unsupported(
+            "cluster process functions require a splittable global physical channel".into(),
+        ));
+    }
     if !contract.supports_replay() {
         return Err(DbError::Unsupported(format!(
             "process function '{output_name}' source '{source_name}' must be replayable"
@@ -398,15 +425,18 @@ mod tests {
             node_local,
             upsert,
         ] {
-            assert!(admit_process_replay_source("activity", "events", contract).is_err());
+            assert!(admit_process_replay_source("activity", "events", contract, false).is_err());
+            assert!(admit_process_replay_source("activity", "events", contract, true).is_err());
         }
-        assert!(admit_process_replay_source("activity", "events", ordered).is_ok());
+        assert!(admit_process_replay_source("activity", "events", ordered, false).is_ok());
+        assert!(admit_process_replay_source("activity", "events", ordered, true).is_err());
         let mut splittable = ordered;
         splittable.topology = SourceTopology::Splittable;
-        assert!(admit_process_replay_source("activity", "events", splittable).is_ok());
+        assert!(admit_process_replay_source("activity", "events", splittable, false).is_ok());
+        assert!(admit_process_replay_source("activity", "events", splittable, true).is_ok());
         let mut coupled = ordered;
         coupled.consistency = SourceConsistency::CommitCoupled;
-        assert!(admit_process_replay_source("activity", "events", coupled).is_ok());
+        assert!(admit_process_replay_source("activity", "events", coupled, false).is_ok());
     }
 
     #[tokio::test]

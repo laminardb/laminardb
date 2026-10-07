@@ -400,6 +400,23 @@ jobs:
           LAMINAR_SOAK_S3_REGION: us-east-1
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
 
+      - name: Qualify process node loss and committed ownership transfer
+        if: matrix.role == 'leader' && matrix.discovery == 'static'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --profile soak -p laminar-server --bin laminardb --no-default-features --features cluster,aws,process-remote cluster::recovery_round_tests::committed:: -- --ignored --nocapture --test-threads=1 --color never 2>&1 | tee process-node-loss.log
+          grep -Eq '^test result: ok\. 3 passed; 0 failed;' process-node-loss.log
+          cargo test --profile soak -p laminar-db --lib --no-default-features --features cluster,process-remote process_function::operator::execution::tests::shuffle::committed::peers::independent_owners_restore_the_committed_cut_after_host_loss_and_rescale -- --exact --ignored --nocapture --color never 2>&1 | tee process-owner-transfer.log
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' process-owner-transfer.log
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          RUST_MIN_STACK: "8388608"
+          LAMINAR_PROCESS_TEST_S3_ENDPOINT: http://127.0.0.1:19000
+          LAMINAR_PROCESS_TEST_S3_BUCKET: laminardb-soak
+          LAMINAR_PROCESS_TEST_S3_ACCESS_KEY: laminar
+          LAMINAR_PROCESS_TEST_S3_SECRET_KEY: laminar-test-secret
+
       - name: Upload coordinated-recovery node logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -407,6 +424,8 @@ jobs:
           name: cluster-recovery-${{ matrix.role }}-${{ matrix.discovery }}-logs
           path: |
             coordinated-recovery-soak.log
+            process-node-loss.log
+            process-owner-transfer.log
             target/tmp/**/soak-*/*.log
           if-no-files-found: warn
           retention-days: 14

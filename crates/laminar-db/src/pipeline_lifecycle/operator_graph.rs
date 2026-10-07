@@ -210,13 +210,7 @@ impl LaminarDB {
             .collect::<Vec<_>>();
         registrations.sort_unstable_by(|left, right| left.output_name.cmp(&right.output_name));
         for registration in &registrations {
-            graph.add_process_function(
-                registration,
-                #[cfg(all(test, feature = "cluster"))]
-                self.connector_manager
-                    .lock()
-                    .qualify_process_cluster_recovery,
-            )?;
+            graph.add_process_function(registration)?;
         }
 
         let mut ordered_streams: Vec<_> = stream_regs.values().collect();

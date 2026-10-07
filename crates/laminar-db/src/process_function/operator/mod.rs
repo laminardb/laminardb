@@ -98,11 +98,8 @@ struct StagedResponse {
     next_generation: u64,
 }
 
-/// Vnode-partitioned authoritative state for one process function. Public cluster admission
-/// remains closed until distributed replay and delivery are qualified.
+/// Vnode-partitioned authoritative state for one process function.
 pub(crate) struct ProcessFunctionOperator {
-    #[cfg(all(test, feature = "cluster"))]
-    pub(crate) qualify_cluster_recovery: bool,
     descriptor: ProcessFunctionDescriptor,
     descriptor_sha256: String,
     handler: ProcessHandler,
@@ -196,8 +193,6 @@ impl ProcessFunctionOperator {
             DbError::Config("process function vnode count exceeds addressable memory".into())
         })?;
         Ok(Self {
-            #[cfg(all(test, feature = "cluster"))]
-            qualify_cluster_recovery: false,
             descriptor,
             descriptor_sha256,
             handler,

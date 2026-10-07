@@ -1,6 +1,5 @@
 use super::*;
 use async_trait::async_trait;
-use datafusion::datasource::empty::EmptyTable;
 use laminar_core::checkpoint::CheckpointParticipant;
 use laminar_core::cluster::control::{
     CatalogManifestStore, ClusterKv, InMemoryKv, LeaderLease, LeaderLeaseOwner, LeaderLeaseStore,
@@ -264,20 +263,26 @@ impl Rig {
                 .await
                 .unwrap();
             self.peers[index].db = Some(Arc::clone(&db));
-            db.execute_cluster_bootstrap_batch(&[format!(
+            self.register_process(&db, binding.clone(), handler.clone())
+                .await;
+            let statements = [format!(
                 "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' MILLISECOND) FROM \"{}\" ('fixture' = 'process')", source::SOURCE
-            )]).await.unwrap();
-            assert!(matches!(
-                db.register_native_process_function(
-                    "rejected",
-                    "events",
-                    descriptor(),
-                    Arc::new(AccountActivity),
-                )
-                .await,
-                Err(DbError::Unsupported(_))
-            ));
-            self.install_private_process(&db, binding.clone(), handler.clone());
+            ), db.process_function_bootstrap_sql("activity").unwrap()];
+            if index == 0 {
+                db.execute_cluster_bootstrap_batch(&statements)
+                    .await
+                    .unwrap();
+            } else {
+                let manifest = db.restore_catalog_from_manifest().await.unwrap().unwrap();
+                assert_eq!(
+                    manifest
+                        .entries
+                        .iter()
+                        .map(|entry| &entry.ddl)
+                        .collect::<Vec<_>>(),
+                    statements.iter().collect::<Vec<_>>()
+                );
+            }
             self.peers[index]
                 .controller
                 .publish_checkpoint_assignment_fence(Some(
@@ -353,30 +358,23 @@ impl Rig {
         self.output.len() == expected
     }
 
-    fn install_private_process(
+    async fn register_process(
         &self,
         db: &LaminarDB,
         binding: ProcessFunctionDescriptor,
         handler: ProcessHandler,
     ) {
-        db.catalog.register_stream("activity").unwrap();
-        db.ctx
-            .register_table(
-                "activity",
-                Arc::new(EmptyTable::new(Arc::clone(&binding.output_schema))),
-            )
-            .unwrap();
-        db.stream_schemas
-            .write()
-            .insert("activity".into(), Arc::clone(&binding.output_schema));
-        let mut manager = db.connector_manager.lock();
-        manager.qualify_process_cluster_recovery = true;
-        manager.register_process_function(ProcessFunctionRegistration {
-            output_name: "activity".into(),
-            source_name: "events".into(),
-            descriptor: binding,
-            handler,
-        });
+        match handler {
+            ProcessHandler::Native(handler) => db
+                .register_native_process_function("activity", "events", binding, handler)
+                .await
+                .unwrap(),
+            #[cfg(feature = "process-remote")]
+            ProcessHandler::Remote(client) => db
+                .register_remote_process_function("activity", "events", binding, client)
+                .await
+                .unwrap(),
+        }
     }
 
     async fn handler(

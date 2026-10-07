@@ -55,10 +55,14 @@ connectors currently leave replay order unspecified, including FILES, whose disc
 not retained. The existing startup checks
 require durable checkpoint storage and a durable sink when a sink is configured. Replaying input
 after a crash may publish an output again. Python process functions and the single-node server's
-Python startup binding remain `BestEffort` while imported dependencies are not bound to the
-worker package. This qualifies matching local input/timer cuts for that bounded source profile.
-Independent-channel merging remains unsupported. Both one-node and distributed cluster modes
-reject process functions pending database-controlled recovery qualification.
+Python startup binding remain local `BestEffort` until their dependency/effect environment is
+immutable throughout the worker lifetime. Independent-channel merging remains unsupported.
+Single-owner and multi-owner clusters admit native and loopback remote Rust at-least-once with
+splittable placement and the same fixed-batch source profile. Register the deployment binding
+on every owner, then include `process_function_bootstrap_sql()` after source DDL and before
+consumers in the sealed startup catalog. Package drift, live catalog changes, cluster Python,
+exactly-once process delivery and distributed subscriptions over process output are rejected.
+See the [cluster bootstrap and recovery contract](../../examples/process_account/README.md#cluster-admission).
 
 Local subscriptions use in-memory replay history; cluster subscriptions expose committed,
 partition-ordered output only for certified non-windowed keyed aggregates. Neither a separate

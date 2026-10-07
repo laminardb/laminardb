@@ -1,7 +1,7 @@
 //! Ordered input retention for the existing graph shuffle lifecycle.
 //!
 //! FIFO order is the order delivered by the graph. This does not certify replay ordering
-//! between independent source channels; public cluster admission remains closed.
+//! between independent source channels; admission requires one fixed-batch replay channel.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;

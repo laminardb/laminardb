@@ -217,12 +217,8 @@ impl OperatorCapability {
                 State::LocalOnly,
                 "retained analytic-frame history has no vnode ownership lifecycle",
             ),
-            Implementation::ProcessFunction => Self::rejected(
-                implementation,
-                State::VnodeKeyed,
-                "process functions have no assignment-fenced cluster transfer contract",
-            )
-            .with_managed_state(ManagedStateContract::ProcessFunctionV1),
+            Implementation::ProcessFunction => Self::ddl_guarded(implementation, State::VnodeKeyed)
+                .with_managed_state(ManagedStateContract::ProcessFunctionV1),
             Implementation::SqlQuery => Self::rejected(
                 implementation,
                 State::LocalOnly,
