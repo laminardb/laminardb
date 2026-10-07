@@ -40,6 +40,7 @@ mod input_admission;
 mod process;
 mod state_restore;
 
+#[cfg(test)]
 use input_admission::retained_input_bytes;
 #[cfg(feature = "cluster")]
 mod execution_poison;
@@ -326,6 +327,12 @@ pub(crate) trait GraphOperator: Send {
     /// This method is intentionally mandatory: a new physical operator must be classified before
     /// it compiles. Cluster DDL admission does not consume this descriptor yet.
     fn cluster_capability(&self) -> OperatorCapability;
+
+    /// Whether raw input batches may be concatenated before this operator evaluates them.
+    /// The default preserves boundaries; only initialized, batch-invariant plans opt in.
+    fn certifies_input_batch_coalescing(&self) -> bool {
+        false
+    }
 
     /// Return cached retained-state accounting for cold-cadence metrics publication.
     ///
@@ -3198,63 +3205,6 @@ impl OperatorGraph {
                 .with_label_values(&[name])
                 .set(watermark);
         }
-    }
-
-    fn route_output(
-        &mut self,
-        node_id: usize,
-        batches: Vec<RecordBatch>,
-        results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
-    ) -> Result<(), DbError> {
-        if batches.is_empty() {
-            return Ok(());
-        }
-        let node_name = Arc::clone(&self.nodes[node_id].name);
-        if let Some(expected) = self.intermediate_schemas.get(node_name.as_ref()).cloned() {
-            for (batch_index, batch) in batches.iter().enumerate() {
-                let actual = batch.schema();
-                let exact_fields =
-                    expected.fields().len() == actual.fields().len()
-                        && expected.fields().iter().zip(actual.fields()).all(
-                            |(expected, actual)| {
-                                expected.name() == actual.name()
-                                    && expected.data_type() == actual.data_type()
-                                    && expected.is_nullable() == actual.is_nullable()
-                            },
-                        );
-                if !exact_fields {
-                    self.poison_after_terminal_error();
-                    return Err(DbError::PipelineTerminal(format!(
-                        "stream '{}' emitted batch {batch_index} with fields {:?}; startup resolved fields {:?}",
-                        node_name,
-                        actual.fields(),
-                        expected.fields()
-                    )));
-                }
-            }
-        }
-        let bytes = retained_input_bytes(&batches);
-        self.preflight_output(node_id, batches.len(), bytes)?;
-        let is_output = self.output_node_ids.contains(&node_id);
-
-        if is_output {
-            results.insert(node_name, batches.clone());
-        }
-
-        let route_count = self.nodes[node_id].output_routes.len();
-        if route_count == 1 {
-            let (target, port) = self.nodes[node_id].output_routes[0];
-            self.push_to_port(target, port, batches, bytes);
-        } else if route_count > 1 {
-            // Clone batches N-1 times; the last route takes ownership.
-            for i in 0..route_count - 1 {
-                let (target, port) = self.nodes[node_id].output_routes[i];
-                self.push_to_port(target, port, batches.clone(), bytes);
-            }
-            let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
-            self.push_to_port(target, port, batches, bytes);
-        }
-        Ok(())
     }
 
     pub(crate) async fn execute_cycle(

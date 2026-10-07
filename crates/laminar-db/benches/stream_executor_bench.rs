@@ -592,6 +592,67 @@ fn bench_graph_admission(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_catalog_creation(c: &mut Criterion) {
+    #[cfg(feature = "files")]
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fixture = |durable| {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = laminar_db::LaminarConfig::default();
+            if durable {
+                config.checkpoint = Some(laminar_core::streaming::StreamCheckpointConfig {
+                    data_dir: Some(directory.path().into()),
+                    ..Default::default()
+                });
+            }
+            (LaminarDB::open_with_config(config).unwrap(), directory)
+        };
+        let create = |(db, directory): (Arc<LaminarDB>, tempfile::TempDir)| {
+            const SOURCE: &str = "CREATE SOURCE generated (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, value VARCHAR NOT NULL) FROM GENERATOR";
+            const STREAM: &str = "CREATE STREAM output AS SELECT value, seq AS id FROM generated";
+            rt.block_on(async {
+                db.execute(SOURCE).await.unwrap();
+                db.execute(STREAM).await.unwrap();
+                let path = directory
+                    .path()
+                    .join("output")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let sink = format!(
+                    "CREATE SINK files_out FROM output INTO FILES ('path' = '{path}') FORMAT JSON"
+                );
+                db.execute(&sink).await.unwrap();
+            });
+            (db, directory)
+        };
+        let mut group = c.benchmark_group("catalog_creation");
+        for (label, durable) in [("ephemeral", false), ("local_durable", true)] {
+            let mut samples = Vec::with_capacity(200);
+            for index in 0..220 {
+                let input = fixture(durable);
+                let start = Instant::now();
+                let output = create(input);
+                let elapsed = start.elapsed().as_nanos();
+                if index >= 20 {
+                    samples.push(elapsed);
+                }
+                drop(output);
+            }
+            samples.sort_unstable();
+            println!("catalog_creation_distribution {label}: elapsed_ns p50={} p95={} p99={}; samples=200; context/directory setup and cleanup excluded; source+stream+sink DDL; local_durable includes schema publication when implemented", samples[99], samples[189], samples[197]);
+            group.bench_function(label, |b| {
+                b.iter_batched(|| fixture(durable), create, BatchSize::PerIteration)
+            });
+        }
+        group.finish();
+    }
+    #[cfg(not(feature = "files"))]
+    let _ = c;
+}
+
 criterion_group!(
     benches,
     bench_plain_select,
@@ -602,5 +663,6 @@ criterion_group!(
     bench_source_queue,
     bench_embedded_push,
     bench_graph_admission,
+    bench_catalog_creation,
 );
 criterion_main!(benches);

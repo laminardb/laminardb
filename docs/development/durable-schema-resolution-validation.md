@@ -1,6 +1,6 @@
 # Durable schema resolution validation
 
-Status: in progress, 2026-10-07. This report records executed results; pending
+Status: in progress, 2026-10-08. This report records executed results; pending
 checks are not passes. Implementation and migration rules are in
 [SCHEMA_RESOLUTION.md](../SCHEMA_RESOLUTION.md), including the complete registered
 connector/direction/format matrix and SQL examples.
@@ -33,8 +33,10 @@ separate from publication and can leave unused authorized artifacts after failur
 | Connector schema benchmark; README, SQL reference, connector README and guides | Baseline comparisons, tested syntax, capabilities, configuration, migration and limitations |
 | Readability function baseline | Remove only exceptions whose extracted functions no longer exist |
 
-No coordinator-cycle or core-operator production code has been changed. The
-existing graph input budget and terminal recovery policy remain enforced.
+Graph output admission now reuses the bounded aggregate coalescer under interval-join
+batch-count pressure, conditional on every live downstream plan certifying raw
+batch concatenation. The 256-batch limit, retained-byte limit, atomic fanout and
+terminal recovery policy remain enforced. Core operator algorithms are unchanged.
 
 ## Commands and environment
 
@@ -52,10 +54,12 @@ approved sandbox escalation. Docker access likewise requires escalation.
 | Exact Cargo command (plus stated environment) | Executed outcome |
 | --- | --- |
 | `cargo +1.99.0 test --workspace --lib --offline -- --color never` | PASS: 6,302 tests (2,009 connectors, 1,140 core, 2,283 DB, 870 SQL), five existing ignored; log `linux-workspace-tests-14.txt`. |
-| `cargo +1.99.0 clippy --workspace --all-features --all-targets --offline -- -D warnings` | PASS: log `linux-clippy-all-7.txt`. Earlier benchmark mutability/unit-value and test-module ordering errors were corrected. |
+| `cargo +1.99.0 clippy --workspace --all-features --all-targets --offline -- -D warnings` | PASS after schema and replay edits: logs `linux-clippy-all-7.txt` and `linux-clippy-all-8.txt`. Earlier benchmark mutability/unit-value and test-module ordering errors were corrected. |
 | `cargo +1.99.0 clippy --workspace --no-default-features --offline -- -D warnings` | PASS: log `linux-clippy-minimal-3.txt`. |
 | `cargo +nightly fmt --all -- --check` | PASS after the final schema edits. |
 | `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | PASS: 18 module and 208 function exceptions; no exception grows. |
+| `cargo +1.99.0 test --workspace --lib --offline interval_output_admission -- --color never --nocapture` | PASS: all five real-operator replay admission regressions; log `linux-graph-focused-2.txt`. The first run exposed an incomplete event-time fixture, corrected without changing production validation. |
+| Current DB library test binary with filter `terminal --test-threads=1 --nocapture --color never` | PASS 76/76 in 1.58 s, including durable terminal authority and reopen prevention; log `linux-terminal-regressions-1.txt`. |
 | `cargo clippy -p laminar-connectors --no-default-features --features FEATURE --lib --offline --target-dir target/schema-kafka -- -D warnings` | All 13 executed isolated feature sets passed: `iceberg-core`, `iceberg-catalog-rest`, `iceberg-storage-fs`, `iceberg-gcs`, `iceberg-azure`, `delta-lake`, `delta-lake-s3`, `delta-lake-azure`, `delta-lake-gcs`, `kafka`, `postgres-cdc`, `postgres-sink`, `mongodb-cdc`. |
 
 Logs are in `target/schema-resolution/` and `target/schema-kafka/`.
@@ -116,7 +120,7 @@ resolution costs about 13.6% on this warm fixture: 53.433 M versus 47.048 M
 rows/s, with unchanged measured allocation requests. This is not zero overhead.
 The metadata-only cold comparator uses the current bounded HTTP client, rather
 than the original HTTP client. These stage measurements exclude filesystem/CAS
-publication; whole-catalog cold creation and graph benchmarks remain pending.
+publication; the whole-catalog comparison below measures that additional phase.
 
 Warm process RSS observations were 10,692-10,800 KiB; no growth occurred during
 either decode percentile loop. Cold-run HWM reached 60,488 KiB. These are cumulative,
@@ -124,6 +128,74 @@ order-dependent process observations, not isolated peak memory per operation.
 Allocation bytes count requests, including reallocations, and are not live memory.
 Criterion intervals and percentile samples differ; cold mocks and a development
 WSL2 machine do not establish production latency or an external-service SLO.
+
+## Full creation and graph performance
+
+The new `catalog_creation` fixture executes an explicit generator source, a
+projection stream and a JSON file sink. Runtime/context/directory construction
+and cleanup are outside the timer. The same fixture ran against archived
+`009d8d5` production sources and the implementation. The first attempted Parquet
+control failed because the starting commit rejected the native format during
+creation; JSON provides a supported common workload. The published Parquet example
+is independently exercised by `schema_sql_examples`.
+
+| Whole creation, 200 samples | Original p50 / p95 / p99 | Current p50 / p95 / p99 |
+| --- | --- | --- |
+| Ephemeral | 0.364384 / 0.479782 / 0.609330 ms | 0.441509 / 0.547994 / 0.611570 ms |
+| Local checkpoint configuration | 0.499822 / 0.603727 / 0.924368 ms | 40.792474 / 43.422456 / 46.146588 ms |
+
+Criterion means were 464.73 / 458.44 us for ephemeral creation and 0.52042 /
+65.973 ms with local checkpoint configuration. The original does not durably
+publish resolved contracts at creation; current creation pays for publication
+before activation. The current durable mean's interval was 54.187-78.941 ms,
+showing filesystem variability distinct from the separate percentile sample.
+Fixtures use the container's `/tmp` filesystem. These whole-creation measurements
+do not isolate per-operation allocation or peak memory.
+
+Both trees ran `cargo +1.99.0 bench --profile soak -p laminar-db
+--no-default-features --features files,cluster --bench stream_executor_bench
+--offline -- catalog_creation --sample-size 40 --measurement-time 3
+--warm-up-time 1 --save-baseline NAME`, with `NAME=original-catalog` and
+`schema-json-after`. Logs: `linux-original-catalog-bench-2.txt` and
+`linux-catalog-bench-after-1.txt`.
+
+Graph measurements bracket the replay change, after schema commit `31071aaf`.
+They use that same Cargo prefix with filter `graph_admission|agg_group_by`,
+40 samples, three-second measurements and one-second warmup. The before run
+saves `schema-before`; the after run selects `--baseline schema-before`.
+
+| Graph / aggregate benchmark | Before mean | After mean | Criterion conclusion |
+| --- | --- | --- | --- |
+| Aggregation, 1,024 rows / four groups | 159.03 us | 156.21 us | No significant change |
+| Single admission path | 167.39 us | 167.79 us | No significant change |
+| Four-way fanout | 177.22 us | 175.05 us | No significant change |
+| Wide four-way fanout | 1.5217 ms | 1.4226 ms | No significant change |
+| Two-input union | 184.59 us | 182.33 us | No significant change |
+
+Relevant core checks use `cargo +1.99.0 bench --profile soak -p laminar-core
+--features cluster --bench latency_bench --bench streaming_bench --offline --
+--sample-size 40 --measurement-time 3 --warm-up-time 1`, saving/selecting
+`schema-before`. Window assignment measured 1.3926 / 1.4019 ns. One unchanged
+core case, `accepted_push/typed_4096`, reported +11.159%, then +6.8728% on a longer
+isolated repeat. Consecutive 60-sample five-second controls on the identical binary
+measured 15.715 / 17.709 us (+11.081%). Its SHA-256 is
+`0c872de640cbe9fba70e89236860ad94e0ef956005a2c5c93bf771eca7224672`, with
+modification time 21:57:09 UTC, preceding both measurements. Neither core code nor
+that binary changed. This explains the timing outlier as demonstrated runner
+variation; it does not turn it into a claimed throughput improvement. Logs include
+`linux-core-bench-before-1.txt`, `linux-core-bench-after-1.txt`,
+`linux-core-typed-repeat-1.txt`, `linux-core-control-before.txt` and
+`linux-core-control-after.txt`. The original baseline is retained.
+
+Linux `perf stat -e cycles:u,instructions:u` measured window-kernel IPC 5.18 / 5.20.
+The broader DB profiles measured 0.86 / 0.88 and include runtime/subscription and
+untimed DDL distribution work, so they do not establish record-loop IPC.
+User-space 99-Hz sampling succeeded with data stored on the Linux filesystem;
+the before run captured 1,122 samples without loss, with aggregate application at
+13.17% of sampled CPU time. DWARF and Windows bind-mount recording attempts failed;
+frame-pointer sampling provides function symbols with limited unwinding depth.
+The graph change adds no ordinary-path allocations, locks, hashing or async
+boundaries. Pressure-driven concatenation reuses the existing bounded coalescer.
 
 ## Recovery and failed runs
 
@@ -137,7 +209,7 @@ the repository REST/MinIO stack. It verified one snapshot per checkpoint,
 reconciliation and exact output after restart. This does not qualify an external
 AWS catalog/storage deployment.
 
-The full default Delta exact four-kill soak is currently failing. Two executions
+Before the replay fix, two full default Delta exact four-kill soak executions
 recovered from the first two kill/rejoin rounds, then halted during the third
 round when replay emitted 259 and 264 batches against the existing 256-batch
 graph input budget. The terminal fault remained durable and intake stayed shut.
@@ -150,6 +222,57 @@ Its optimized server digest is
 The archived baseline production sources were unchanged; the current existing
 soak harness selected that prebuilt server through its supported verified override.
 This establishes a pre-existing failure, but does not turn the failed gate into a pass.
+
+The first full replay-fix run completed all four kill/rejoin rounds (two leaders
+and two followers), without a graph budget failure. It failed at 624.01 s on the
+unchanged ten-second temporal ASOF Delta visibility boundary: version 129 exposed
+229,998 of 236,237 expected pairs; the frozen input prefix later became durable
+through checkpoint 136. The bounded join boundary was exact with 847,052 rows;
+nullable temporal/probe canaries and all four CoreWindow rows passed. All 331
+pipeline-stall observations were within 1,024 ms, with zero exact timing SLO
+violations. The default zero retained-state floor makes state-capture timing
+observational. This execution is a failed full gate. Log:
+`linux-cluster-eo-replay-1.txt`; server SHA-256:
+`456254a5f0fd945630bb5a873756da9dc763ca2ec28cddc871ec8c48f9403c6d`.
+
+The identical quiet repeat on a fresh broker also completed all four recovery
+rounds without graph budget failure, then failed at 681.61 s on the same output
+boundary: version 125 contained 253,886 of 258,223 temporal pairs. Its bounded
+join boundary was exact with 927,689 rows. Temporal/probe and CoreWindow canaries
+passed, all 321 pipeline-stall observations were within 1,024 ms, and exact timing
+reported zero SLO violations. Log: `linux-cluster-eo-replay-3.txt`; the binary
+digest was unchanged. The intervening second attempt stopped before the workload
+on the retained broker's partition limit (`linux-cluster-eo-replay-2.txt`).
+
+An independent read with installed PyArrow 20.0.0 reconstructed the retained
+append logs and read every referenced Parquet file. The latest temporal snapshots
+at runner termination were versions 132 and 128, with 234,377 and 257,330 unique
+pairs, zero duplicates and zero unexpected pairs. They still lacked 1,860 and
+893 expected pairs. The failed harness had stopped its nodes, so this inspection
+does not establish eventual completion or classify the remaining probes as lost.
+Log: `temporal-output-independent.txt`. The full Delta output visibility gate
+remains failed and is a release/merge limitation; it is not downgraded to an
+observational pass.
+
+The exact replay-fix soak command is:
+
+```text
+cargo +1.99.0 test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3,iceberg --test cluster_soak --offline three_node_eo_join_kill9_soak -- --ignored --exact --test-threads=1 --nocapture --color never
+```
+
+Its environment supplies `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS=127.0.0.1:19092`,
+`LAMINAR_SOAK_CHECKPOINT_URL=s3://laminardb-soak/schema-resolution-replay`,
+`LAMINAR_SOAK_S3_ENDPOINT=http://127.0.0.1:19000`, task fixture access/secret keys,
+`LAMINAR_SOAK_S3_REGION=us-east-1` and `LAMINAR_SOAK_DELTA_BUCKET=laminardb-soak`.
+Checkpoint, hot-path and output visibility SLO modes retain their default
+`certify` settings, including the default workload and unchanged timeouts.
+
+The first optimized replay rebuild reused incompatible internal artifacts after
+the archived baseline shared the same Cargo target cache. It failed on APIs that
+exist in the current source. Updating current crate-root modification times,
+without changing contents, forced the current internal crates to rebuild. The
+second build passed in 16 m 19 s. No feature admission or dependency was changed
+to resolve this cache issue, and all earlier binaries/logs are preserved.
 
 Earlier workspace runs overlapped heavy optimized compilation. One filesystem
 listing/delete test, six conditional-store probes and one timed AI test exceeded

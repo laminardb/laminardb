@@ -192,6 +192,20 @@ code alone is insufficient after publishing new contracts; coordinate catalog an
 state compatibility before returning to the saved cut. There is no automatic
 latest-based migration or silent fallback to a different checkpoint.
 
+Replay can produce many small interval-join batches. When this exceeds a graph
+port's batch-count budget, LaminarDB uses its existing bounded coalescer only if
+every downstream consumer is an initialized COUNT/MIN/MAX aggregate whose input
+projection contains columns or literals without a filter. Rows retain their
+order and schema. Weighted input and unsupported Arrow representations preserve
+their original batch boundaries. Newly combined batches are bounded at 1,024
+rows and 256 KiB of logical data, and all destinations still pass the original
+count and retained byte limits before publication.
+
+Other plans and output that still cannot fit retain terminal admission failure.
+The graph generation is fenced against retry and checkpoint drain, and durable
+terminal authority continues to keep intake closed across recovery and leadership
+changes. Upgrading does not erase terminal faults from an earlier run.
+
 External creation/registration and catalog publication do not share a transaction.
 Failure or lost leadership can leave an unused authorized external table, collection
 or schema. LaminarDB does not delete it automatically. Fencing prevents local

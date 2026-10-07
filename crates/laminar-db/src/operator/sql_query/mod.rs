@@ -56,7 +56,7 @@ mod batch_coalescing;
 mod subscription_output;
 
 use apply_failure::stateful_apply_outcome_unknown;
-use batch_coalescing::{coalesce_aggregate_batches, AggregateBatchCoalescing};
+pub(crate) use batch_coalescing::{coalesce_aggregate_batches, AggregateBatchCoalescing};
 #[cfg(test)]
 use batch_coalescing::{LOCAL_AGG_COALESCE_MAX_BATCH_ROWS, LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES};
 
@@ -1216,21 +1216,6 @@ impl SqlQueryOperator {
             )));
         };
         Ok(batches)
-    }
-
-    fn prepare_local_aggregate_batches(
-        &self,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        match &self.state {
-            QueryState::Agg(aggregate) if aggregate.certifies_local_input_coalescing() => {
-                coalesce_aggregate_batches(&self.op_name, batches, AggregateBatchCoalescing::Input)
-            }
-            QueryState::Agg(_) => Ok(batches),
-            _ => Err(DbError::Pipeline(
-                "internal: local aggregate input preparation targeted non-aggregate state".into(),
-            )),
-        }
     }
 
     fn apply_routed_aggregate(
@@ -2637,6 +2622,21 @@ impl GraphOperator for SqlQueryOperator {
         if let Some(scope) = &mut self.cluster_shuffle {
             scope.topology = Some(topology);
         }
+    }
+
+    fn certifies_input_batch_coalescing(&self) -> bool {
+        use datafusion::physical_expr::expressions::{Column, Literal};
+        let QueryState::Agg(aggregate) = &self.state else {
+            return false;
+        };
+        aggregate.certifies_local_input_coalescing()
+            && aggregate.compiled_projection().is_some_and(|projection| {
+                projection.filter.is_none()
+                    && projection
+                        .exprs
+                        .iter()
+                        .all(|expr| expr.as_any().is::<Column>() || expr.as_any().is::<Literal>())
+            })
     }
 
     fn cluster_capability(&self) -> OperatorCapability {

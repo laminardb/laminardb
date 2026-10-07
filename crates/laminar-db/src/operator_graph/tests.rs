@@ -7267,3 +7267,247 @@ async fn aggregate_record_growth_halts_before_output_routing() {
         "the rejected aggregate output crossed the downstream routing boundary"
     );
 }
+async fn interval_aggregate_admission_graph(
+    schema: Arc<Schema>,
+    queries: &[&str],
+) -> (OperatorGraph, usize, Vec<usize>) {
+    use crate::operator::interval_join::IntervalJoinOperator;
+    use crate::operator::sql_query::SqlQueryOperator;
+    use laminar_sql::parser::join_parser::JoinType;
+    use laminar_sql::translator::StreamJoinConfig;
+
+    let mut graph = test_graph();
+    graph.set_max_input_buf_batches(256);
+    graph.register_intermediate_schema("joined", &schema);
+    let mut config = StreamJoinConfig::new(
+        JoinType::Inner,
+        vec!["symbol".into()],
+        vec!["symbol".into()],
+        std::time::Duration::from_millis(100),
+    );
+    config.left_time_column = "ts".into();
+    config.right_time_column = "ts".into();
+    let mut join = IntervalJoinOperator::new("joined", config, None, graph.ctx.clone());
+    join.set_input_schemas(test_schema(), test_schema());
+    let producer = graph
+        .place_operator_node("joined", Box::new(join), 2)
+        .unwrap();
+    graph.output_map.insert(Arc::from("joined"), producer);
+    let mut consumers = Vec::new();
+    for (index, query) in queries.iter().enumerate() {
+        let name = format!("aggregate_{index}");
+        let aggregate = SqlQueryOperator::new(&name, query, graph.ctx.clone(), None, false);
+        let consumer = graph
+            .place_operator_node(&name, Box::new(aggregate), 1)
+            .unwrap();
+        graph.add_edge(producer, consumer, 0);
+        graph.output_map.insert(Arc::from(name.as_str()), consumer);
+        consumers.push(consumer);
+    }
+    graph.compute_topo_order();
+    (
+        graph.initialize_managed_state().await.unwrap(),
+        producer,
+        consumers,
+    )
+}
+
+#[tokio::test]
+async fn interval_output_admission_compacts_273_batches_without_changing_aggregate_results() {
+    let query = "SELECT symbol, COUNT(*) AS matches, MIN(price) AS low, MAX(price) AS high FROM joined GROUP BY symbol";
+    for buffered in [0, 255] {
+        let (mut graph, producer, consumers) =
+            interval_aggregate_admission_graph(test_schema(), &[query]).await;
+        let consumer = consumers[0];
+        assert!(graph.nodes[consumer]
+            .operator
+            .certifies_input_batch_coalescing());
+        prefill_port(&mut graph, consumer, 0, vec![test_batch(); buffered]);
+        let incoming = vec![test_batch(); 273];
+        let expected = arrow::compute::concat_batches(&test_schema(), &incoming).unwrap();
+        let mut results = FxHashMap::default();
+        graph
+            .route_output(producer, incoming, &mut results)
+            .unwrap();
+        assert_eq!(graph.max_input_buf_batches, 256);
+        assert_eq!(graph.input_bufs[consumer][0].len(), buffered + 1);
+        assert_eq!(results["joined"], vec![expected]);
+        assert!(graph.execution_poison_reason().is_none());
+        graph.debug_assert_byte_sums();
+
+        let results = graph
+            .execute_cycle(&FxHashMap::default(), 0, None)
+            .await
+            .unwrap();
+        let aggregate = &results["aggregate_0"][0];
+        let symbols = aggregate
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let counts = aggregate
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let lows = aggregate
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let highs = aggregate
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(aggregate.num_rows(), 2);
+        for row in 0..2 {
+            assert_eq!(counts.value(row), i64::try_from(buffered + 273).unwrap());
+            let price = match symbols.value(row) {
+                "AAPL" => 150.0,
+                "GOOG" => 2800.0,
+                other => panic!("unexpected group {other}"),
+            };
+            assert_eq!(lows.value(row), price);
+            assert_eq!(highs.value(row), price);
+        }
+        assert!(graph.checkpoint_is_quiescent());
+    }
+}
+
+#[tokio::test]
+async fn interval_output_admission_preserves_terminal_rejection_for_boundary_sensitive_plans() {
+    for query in [
+        "SELECT SUM(price) FROM joined",
+        "SELECT AVG(price) FROM joined",
+        "SELECT COUNT(price + 1.0) FROM joined",
+        "SELECT COUNT(random()) FROM joined",
+        "SELECT COUNT(*) FROM joined WHERE price > 0.0",
+        "SELECT symbol FROM joined",
+    ] {
+        let (mut graph, producer, consumers) =
+            interval_aggregate_admission_graph(test_schema(), &[query]).await;
+        assert!(
+            !graph.nodes[consumers[0]]
+                .operator
+                .certifies_input_batch_coalescing(),
+            "{query}"
+        );
+        let mut results = FxHashMap::default();
+        let error = graph
+            .route_output(producer, vec![test_batch(); 273], &mut results)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DbError::GraphBufferBudgetExceeded {
+                    batches: 273,
+                    max_batches: 256,
+                    ..
+                }
+            ),
+            "{query}: {error}"
+        );
+        assert!(error.requires_pipeline_halt());
+        assert!(results.is_empty());
+        assert!(graph.input_bufs[consumers[0]][0].is_empty());
+        assert!(graph.capture_state(u64::MAX).is_err());
+        let retry = graph
+            .execute_cycle(&FxHashMap::default(), 0, None)
+            .await
+            .unwrap_err();
+        assert_graph_execution_poison(&retry);
+        let drain = graph
+            .execute_checkpoint_drain_cycle(0, None)
+            .await
+            .unwrap_err();
+        assert_graph_execution_poison(&drain);
+    }
+}
+
+#[tokio::test]
+async fn interval_output_admission_rejects_unsafe_fanout_atomically() {
+    let queries = [
+        "SELECT COUNT(*) FROM joined",
+        "SELECT SUM(price) FROM joined",
+    ];
+    let (mut graph, producer, consumers) =
+        interval_aggregate_admission_graph(test_schema(), &queries).await;
+    assert!(graph.nodes[consumers[0]]
+        .operator
+        .certifies_input_batch_coalescing());
+    let mut results = FxHashMap::default();
+    let error = graph
+        .route_output(producer, vec![test_batch(); 273], &mut results)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DbError::GraphBufferBudgetExceeded { batches: 273, .. }
+    ));
+    assert!(results.is_empty());
+    for consumer in consumers {
+        assert!(graph.input_bufs[consumer][0].is_empty());
+        assert_eq!(graph.input_buf_bytes[consumer][0], 0);
+    }
+    assert!(graph.execution_poison_reason().is_some());
+}
+
+#[tokio::test]
+async fn interval_output_admission_still_enforces_retained_bytes_after_compaction() {
+    let (mut graph, producer, consumers) =
+        interval_aggregate_admission_graph(test_schema(), &["SELECT COUNT(*) FROM joined"]).await;
+    graph.set_max_input_buf_bytes(Some(1));
+    let mut results = FxHashMap::default();
+    let error = graph
+        .route_output(producer, vec![test_batch(); 273], &mut results)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DbError::GraphBufferBudgetExceeded {
+            batches: 1,
+            max_bytes: Some(1),
+            ..
+        }
+    ));
+    assert!(error.requires_pipeline_halt());
+    assert!(results.is_empty());
+    assert!(graph.input_bufs[consumers[0]][0].is_empty());
+    assert!(graph.execution_poison_reason().is_some());
+}
+
+#[tokio::test]
+async fn interval_output_admission_preserves_weighted_and_oversized_boundaries() {
+    let batch = test_batch();
+    let mut fields: Vec<_> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.push(Field::new(
+        laminar_core::changelog::WEIGHT_COLUMN,
+        DataType::Int64,
+        false,
+    ));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(Int64Array::from(vec![1; batch.num_rows()])));
+    let weighted = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let oversized =
+        arrow::compute::concat_batches(&test_schema(), vec![batch; 513].iter()).unwrap();
+    for batch in [weighted, oversized] {
+        let (mut graph, producer, consumers) =
+            interval_aggregate_admission_graph(batch.schema(), &["SELECT COUNT(*) FROM joined"])
+                .await;
+        let mut results = FxHashMap::default();
+        let error = graph
+            .route_output(producer, vec![batch; 273], &mut results)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::GraphBufferBudgetExceeded { batches: 273, .. }
+        ));
+        assert!(results.is_empty());
+        assert!(graph.input_bufs[consumers[0]][0].is_empty());
+        assert!(graph.execution_poison_reason().is_some());
+    }
+}

@@ -4,7 +4,7 @@ use laminar_core::streaming::retained_arrow_bytes;
 
 use super::{
     Arc, BackpressurePolicy, DbError, FxHashMap, GateDecision, InputFrontier, OperatorGraph,
-    Ordering, RecordBatch, SourceBatchView,
+    OperatorImplementation, Ordering, RecordBatch, SourceBatchView,
 };
 
 pub(super) fn retained_input_bytes(batches: &[RecordBatch]) -> usize {
@@ -14,6 +14,110 @@ pub(super) fn retained_input_bytes(batches: &[RecordBatch]) -> usize {
 }
 
 impl OperatorGraph {
+    fn prepare_output_admission(
+        &self,
+        node: usize,
+        mut batches: Vec<RecordBatch>,
+    ) -> Result<(Vec<RecordBatch>, usize), DbError> {
+        let cap = self.max_input_buf_batches;
+        let routes = &self.nodes[node].output_routes;
+        // PERF: Inspect downstream plans only for interval-join batch-count pressure.
+        // Ordinary output keeps its existing roster, without concatenation or new allocations.
+        if cap > 0
+            && batches.len() > 1
+            && self.backpressure_policy != BackpressurePolicy::ShedOldest
+            && self.nodes[node].capability.implementation == OperatorImplementation::IntervalJoin
+            && routes.iter().any(|&(target, port)| {
+                self.input_bufs[target][usize::from(port)]
+                    .len()
+                    .saturating_add(batches.len())
+                    > cap
+            })
+            && routes.iter().all(|&(target, port)| {
+                port == 0
+                    && self.nodes[target]
+                        .operator
+                        .certifies_input_batch_coalescing()
+            })
+        {
+            use crate::operator::sql_query::{
+                coalesce_aggregate_batches, AggregateBatchCoalescing,
+            };
+            batches = coalesce_aggregate_batches(
+                &self.nodes[node].name,
+                batches,
+                AggregateBatchCoalescing::Input,
+            )
+            .map_err(|error| {
+                self.execution_poisoned.store(true, Ordering::Release);
+                self.poison_after_terminal_error();
+                DbError::PipelineTerminal(format!(
+                    "interval join '{}' output admission failed: {error}",
+                    self.nodes[node].name
+                ))
+            })?;
+        }
+        let bytes = retained_input_bytes(&batches);
+        self.preflight_output(node, batches.len(), bytes)?;
+        Ok((batches, bytes))
+    }
+
+    pub(super) fn route_output(
+        &mut self,
+        node_id: usize,
+        batches: Vec<RecordBatch>,
+        results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Result<(), DbError> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let node_name = Arc::clone(&self.nodes[node_id].name);
+        if let Some(expected) = self.intermediate_schemas.get(node_name.as_ref()).cloned() {
+            for (batch_index, batch) in batches.iter().enumerate() {
+                let actual = batch.schema();
+                let exact_fields =
+                    expected.fields().len() == actual.fields().len()
+                        && expected.fields().iter().zip(actual.fields()).all(
+                            |(expected, actual)| {
+                                expected.name() == actual.name()
+                                    && expected.data_type() == actual.data_type()
+                                    && expected.is_nullable() == actual.is_nullable()
+                            },
+                        );
+                if !exact_fields {
+                    self.poison_after_terminal_error();
+                    return Err(DbError::PipelineTerminal(format!(
+                        "stream '{}' emitted batch {batch_index} with fields {:?}; startup resolved fields {:?}",
+                        node_name,
+                        actual.fields(),
+                        expected.fields()
+                    )));
+                }
+            }
+        }
+        let (batches, bytes) = self.prepare_output_admission(node_id, batches)?;
+        let is_output = self.output_node_ids.contains(&node_id);
+
+        if is_output {
+            results.insert(node_name, batches.clone());
+        }
+
+        let route_count = self.nodes[node_id].output_routes.len();
+        if route_count == 1 {
+            let (target, port) = self.nodes[node_id].output_routes[0];
+            self.push_to_port(target, port, batches, bytes);
+        } else if route_count > 1 {
+            // Clone batches N-1 times; the last route takes ownership.
+            for i in 0..route_count - 1 {
+                let (target, port) = self.nodes[node_id].output_routes[i];
+                self.push_to_port(target, port, batches.clone(), bytes);
+            }
+            let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
+            self.push_to_port(target, port, batches, bytes);
+        }
+        Ok(())
+    }
+
     fn port_usage_fits(&self, batches: usize, bytes: usize) -> bool {
         (self.max_input_buf_batches == 0 || batches <= self.max_input_buf_batches)
             && self.max_input_buf_bytes.is_none_or(|max| bytes <= max)

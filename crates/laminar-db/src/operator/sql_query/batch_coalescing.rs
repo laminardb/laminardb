@@ -21,7 +21,7 @@ pub(super) const LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES: usize = 256 * 1024;
 pub(super) const LOCAL_AGG_COALESCE_MAX_BATCH_ROWS: usize = 1_024;
 
 #[derive(Clone, Copy)]
-pub(super) enum AggregateBatchCoalescing {
+pub(crate) enum AggregateBatchCoalescing {
     Input,
     #[cfg(feature = "cluster")]
     PublishedOutput,
@@ -151,7 +151,7 @@ fn batch_logical_bytes(
 ///
 /// The input is consumed so concatenation overlaps new Arrow buffers with only the current group.
 /// Existing oversized batches are preserved: these limits constrain only batches created here.
-pub(super) fn coalesce_aggregate_batches(
+pub(crate) fn coalesce_aggregate_batches(
     op_name: &str,
     batches: Vec<RecordBatch>,
     mode: AggregateBatchCoalescing,
@@ -214,4 +214,21 @@ pub(super) fn coalesce_aggregate_batches(
     }
     flush_group(op_name, &mut group, &mut output, mode)?;
     Ok(output)
+}
+
+impl super::SqlQueryOperator {
+    pub(super) fn prepare_local_aggregate_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        match &self.state {
+            super::QueryState::Agg(aggregate) if aggregate.certifies_local_input_coalescing() => {
+                coalesce_aggregate_batches(&self.op_name, batches, AggregateBatchCoalescing::Input)
+            }
+            super::QueryState::Agg(_) => Ok(batches),
+            _ => Err(DbError::Pipeline(
+                "internal: local aggregate input preparation targeted non-aggregate state".into(),
+            )),
+        }
+    }
 }
