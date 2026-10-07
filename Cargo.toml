@@ -127,7 +127,7 @@ prometheus = { version = "0.14", features = ["process"] }
 object_store = "=0.13.2"
 # `object_store` 0.13 cannot parse external-account ADC files. Keep its data
 # client pinned and inject Google's refreshable WIF credential provider.
-google-cloud-auth = { version = "=1.16.0", default-features = false, features = ["default-rustls-provider"] }
+google-cloud-auth = { version = "=1.17.0", default-features = false, features = ["default-rustls-provider"] }
 
 # Delta 0.32 aligns with Arrow 58, DataFusion 53, and object_store 0.13.
 deltalake = { version = "=0.32.4", default-features = false }
@@ -146,7 +146,7 @@ chitchat = "0.13"
 tokio-util = { version = "0.7", features = ["rt"] }
 # xxh3 output is part of the partitioning ABI; upgrade only with an ABI version
 # bump and updated golden vectors.
-xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
+xxhash-rust = { version = "=0.8.19", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
