@@ -7,8 +7,9 @@
 //! trusted native Rust and remote Rust with one replayable source that reproduces one physical
 //! channel in fixed batches. Each batch defines a reproducible event-time cut; independent-channel
 //! merging remains unadmitted. Cluster execution additionally requires splittable placement and
-//! the same immutable binding in every owner's sealed startup catalog. Python remains local
-//! best-effort; exactly-once process delivery is unsupported.
+//! the same immutable binding in every owner's sealed startup catalog. Supervised replay-safe
+//! Python also requires an unprivileged Linux worker in a read-only root image. Exactly-once
+//! process delivery is unsupported.
 
 use std::sync::Arc;
 
@@ -49,6 +50,19 @@ pub enum ProcessRuntime {
     RemotePython,
 }
 
+/// Reviewed handler contract, independent of the pipeline's delivery guarantee.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessDeterminism {
+    /// No replay equivalence declaration. Existing native and Rust worker profiles are unchanged.
+    #[default]
+    Undeclared,
+    /// Trusted code derives results only from activations and their managed state. External
+    /// reads/writes, wall clock, randomness and worker-local business state are prohibited.
+    /// This is a reviewed code contract, not a sandbox or code-attestation claim.
+    ReplaySafe,
+}
+
 /// Immutable, versioned binding for one process function. The initial state codec is an
 /// optional signed 64-bit value; a present null is distinct from absent state.
 #[derive(Clone, Debug)]
@@ -63,6 +77,8 @@ pub struct ProcessFunctionDescriptor {
     pub pipeline_state_id: String,
     /// Hex SHA-256 of the trusted native build or other immutable implementation identity.
     pub implementation_digest: String,
+    /// Effects contract bound into the canonical manifest and checkpoint identity.
+    pub determinism: ProcessDeterminism,
     /// Optional Python runtime and import-tree identity checked by the local supervisor.
     /// File hashes detect deployment drift; they do not enforce lifetime immutability.
     pub python_environment: Option<PythonEnvironmentBinding>,
@@ -263,6 +279,24 @@ pub(crate) enum ProcessHandler {
     Native(Arc<dyn NativeProcessFunction>),
     #[cfg(feature = "process-remote")]
     Remote(Arc<remote::RemoteProcessClient>),
+}
+
+impl ProcessHandler {
+    pub(crate) fn supports_replay(&self, descriptor: &ProcessFunctionDescriptor) -> bool {
+        if descriptor.runtime != ProcessRuntime::RemotePython {
+            return true;
+        }
+        if descriptor.determinism != ProcessDeterminism::ReplaySafe
+            || descriptor.python_environment.is_none()
+        {
+            return false;
+        }
+        match self {
+            #[cfg(feature = "process-remote")]
+            Self::Remote(client) => client.has_python_replay_binding(),
+            Self::Native(_) => false,
+        }
+    }
 }
 
 /// Registered function and its input/output stream binding.

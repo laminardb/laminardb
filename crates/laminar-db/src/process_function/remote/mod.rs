@@ -1,7 +1,8 @@
 //! Bounded Arrow IPC over a versioned gRPC control stream.
 //!
-//! Local best-effort pipelines can use connected loopback workers. Authenticated nonlocal
-//! deployment and cluster ownership remain outside this transport's admission profile.
+//! Each cluster owner connects to its own loopback worker. Replay admission requires the
+//! source-order contract; Python additionally requires a live supervised replay-safe binding.
+//! Authenticated nonlocal worker transport is unsupported.
 
 mod client;
 mod codec;
@@ -16,6 +17,9 @@ mod tests;
 pub use client::RemoteProcessClient;
 pub use local_python::{LocalPythonWorker, LocalPythonWorkerConfig};
 pub use worker::RustReferenceWorker;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use python_environment::read_only_fixture_config;
 
 #[allow(clippy::doc_markdown, clippy::default_trait_access)] // Generated tonic stubs.
 pub(crate) mod wire {

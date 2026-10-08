@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 
 use super::schema::{schema_from_canonical_fields, CanonicalField};
 use super::{
-    canonical_fields, ProcessFunctionDescriptor, ProcessFunctionLimits, ProcessRuntime,
-    PythonEnvironmentBinding, STATE_CODEC_VERSION,
+    canonical_fields, ProcessDeterminism, ProcessFunctionDescriptor, ProcessFunctionLimits,
+    ProcessRuntime, PythonEnvironmentBinding, STATE_CODEC_VERSION,
 };
 use crate::error::DbError;
 
@@ -40,7 +40,7 @@ struct Manifest {
     value_state_name: String,
     state_codec_version: u32,
     timer_names: Vec<String>,
-    determinism: String,
+    determinism: ProcessDeterminism,
     limits: ProcessFunctionLimits,
 }
 
@@ -71,7 +71,7 @@ impl Manifest {
             value_state_name: descriptor.value_state_name.clone(),
             state_codec_version: STATE_CODEC_VERSION,
             timer_names: descriptor.timer_names.clone(),
-            determinism: "undeclared".into(),
+            determinism: descriptor.determinism,
             limits: descriptor.limits,
         })
     }
@@ -84,7 +84,6 @@ impl Manifest {
             || self.input_changelog != "append_only"
             || self.output_changelog != "append_only"
             || self.state_codec_version != STATE_CODEC_VERSION
-            || self.determinism != "undeclared"
         {
             return Err(DbError::Unsupported(
                 "unsupported process function manifest contract".into(),
@@ -106,6 +105,7 @@ impl Manifest {
             function_id: self.function_id,
             pipeline_state_id: self.pipeline_state_id,
             implementation_digest: self.implementation_digest,
+            determinism: self.determinism,
             python_environment: self.python_environment,
             input_schema: schema_from_canonical_fields(self.input_schema)?,
             output_schema: schema_from_canonical_fields(self.output_schema)?,

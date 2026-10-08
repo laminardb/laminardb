@@ -54,15 +54,19 @@ Per-partition row positions or raw `SingleChannel` order alone do not qualify; b
 connectors currently leave replay order unspecified, including FILES, whose discovery order is
 not retained. The existing startup checks
 require durable checkpoint storage and a durable sink when a sink is configured. Replaying input
-after a crash may publish an output again. Python process functions and the single-node server's
-Python startup binding remain local `BestEffort` until their dependency/effect environment is
-immutable throughout the worker lifetime. Independent-channel merging remains unsupported.
+after a crash may publish an output again. Supervised Python also admits `AtLeastOnce` in the
+Rust library when reviewed code declares `replay_safe` and its complete package belongs to an
+unprivileged Linux deployment's read-only root image. A separately connected matching client
+does not establish the required lifetime binding. See the
+[Python replay profile](../../python/laminardb_process/README.md#replay-safe-linux-deployment).
+Undeclared Python remains `BestEffort`. Independent-channel merging remains unsupported.
 Single-owner and multi-owner clusters admit native and loopback remote Rust at-least-once with
 splittable placement and the same fixed-batch source profile. Register the deployment binding
 on every owner, then include `process_function_bootstrap_sql()` after source DDL and before
-consumers in the sealed startup catalog. Package drift, live catalog changes, cluster Python,
+consumers in the sealed startup catalog. Qualified supervised Python uses the same state and
+ownership lifecycle. Package drift, live catalog changes,
 exactly-once process delivery and distributed subscriptions over process output are rejected.
-See the [cluster bootstrap and recovery contract](../../examples/process_account/README.md#cluster-admission).
+See the [account activity example](../../examples/process_account).
 
 Local subscriptions use in-memory replay history; cluster subscriptions expose committed,
 partition-ordered output only for certified non-windowed keyed aggregates. Neither a separate

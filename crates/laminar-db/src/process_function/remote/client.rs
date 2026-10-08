@@ -7,6 +7,7 @@ use laminar_core::state::PartitionKeyCodecV1;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 
@@ -32,9 +33,20 @@ pub struct RemoteProcessClient {
     credits: Arc<Semaphore>,
     max_in_flight: usize,
     timeout: Duration,
+    python_replay_lifetime: Option<CancellationToken>,
 }
 
 impl RemoteProcessClient {
+    pub(super) fn bind_python_replay_lifetime(&mut self, exited: CancellationToken) {
+        self.python_replay_lifetime = Some(exited);
+    }
+
+    pub(crate) fn has_python_replay_binding(&self) -> bool {
+        self.python_replay_lifetime
+            .as_ref()
+            .is_some_and(|exited| !exited.is_cancelled())
+    }
+
     /// Immutable descriptor negotiated when this client connected.
     #[must_use]
     pub fn descriptor(&self) -> &ProcessFunctionDescriptor {
@@ -91,6 +103,7 @@ impl RemoteProcessClient {
             credits: Arc::new(Semaphore::new(max_in_flight)),
             max_in_flight,
             timeout,
+            python_replay_lifetime: None,
         })
     }
 
@@ -104,6 +117,15 @@ impl RemoteProcessClient {
         scope: &RemoteInvocationScope,
         activations: &[ProcessActivation],
     ) -> Result<Vec<ProcessActivationResult>, DbError> {
+        if self
+            .python_replay_lifetime
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(DbError::Pipeline(
+                "replay-bound Python worker has exited".into(),
+            ));
+        }
         // Bounded admission: callers retry on backpressure rather than queueing unbounded RPCs.
         let _permit = self.credits.try_acquire().map_err(|_| {
             DbError::BackpressureFail("process worker invocation slots full".into())

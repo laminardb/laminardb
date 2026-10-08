@@ -21,6 +21,7 @@ pub(in super::super) fn descriptor() -> ProcessFunctionDescriptor {
         pipeline_state_id: "cluster_activity_state_v1".into(),
         implementation_digest: "c".repeat(64),
         python_environment: None,
+        determinism: laminar_db::process_function::ProcessDeterminism::Undeclared,
         input_schema: Arc::new(Schema::new(vec![
             Field::new("account", DataType::Utf8, false),
             Field::new("amount", DataType::Int64, false),

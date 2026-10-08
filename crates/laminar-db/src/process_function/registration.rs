@@ -67,9 +67,10 @@ impl LaminarDB {
         .await
     }
 
-    /// Register a connected loopback Rust or Python worker. At-least-once
-    /// delivery currently admits the Rust worker only; Python file-tree hashes do not enforce
-    /// an immutable environment throughout the worker's lifetime.
+    /// Register a connected loopback Rust or Python worker. At-least-once Python requires a
+    /// replay-safe descriptor and the live binding supplied by `LocalPythonWorker` on Linux.
+    /// Its complete package must belong to the read-only root image; a standalone connected
+    /// client does not supply that binding. Undeclared Python supports best-effort delivery.
     /// Source-order and cluster-bootstrap requirements match native registration.
     /// The caller owns the worker process lifecycle and must keep it available until shutdown.
     ///
@@ -122,10 +123,10 @@ impl LaminarDB {
             ));
         }
         if self.config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce
-            && descriptor.runtime == ProcessRuntime::RemotePython
+            && !handler.supports_replay(&descriptor)
         {
             return Err(DbError::Unsupported(
-                "at-least-once Python process functions require immutable dependency binding"
+                "at-least-once Python process functions require immutable dependency binding from a supervised replay-safe worker"
                     .into(),
             ));
         }

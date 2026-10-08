@@ -16,10 +16,10 @@ use laminar_core::serialization::BoundedBytesWriter;
 #[async_trait]
 impl GraphOperator for ProcessFunctionOperator {
     fn cluster_capability(&self) -> OperatorCapability {
-        if self.descriptor.runtime == crate::process_function::ProcessRuntime::RemotePython {
+        if !self.handler.supports_replay(&self.descriptor) {
             let mut capability = OperatorCapability::fixed(OperatorImplementation::ProcessFunction);
             capability.cluster_status = crate::operator::capability::ClusterExecutionStatus::Rejected {
-                reason: "Python process functions have no immutable lifetime dependency/effect binding",
+                reason: "Python process functions require replay-safe code and an immutable supervised dependency binding",
             };
             return capability;
         }

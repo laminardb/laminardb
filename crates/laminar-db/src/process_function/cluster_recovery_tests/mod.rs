@@ -24,6 +24,8 @@ use super::{
 };
 use crate::{DbError, LaminarDB};
 
+#[cfg(all(feature = "process-remote", target_os = "linux"))]
+mod python;
 mod runtime;
 mod source;
 

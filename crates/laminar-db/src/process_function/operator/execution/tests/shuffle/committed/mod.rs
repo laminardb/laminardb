@@ -5,6 +5,8 @@ mod node_loss;
 mod ordering;
 #[cfg(not(target_arch = "wasm32"))]
 mod peers;
+#[cfg(all(feature = "process-remote", target_os = "linux"))]
+mod python;
 #[cfg(feature = "process-remote")]
 mod remote;
 mod replay;

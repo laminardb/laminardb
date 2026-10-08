@@ -9,14 +9,48 @@ use crate::error::DbError;
 pub(in crate::process_function::remote) struct FileGuards {
     #[cfg(windows)]
     files: Vec<File>,
+    #[cfg(target_os = "linux")]
+    replay_filesystem: Option<libc::c_ulong>,
 }
 
 impl FileGuards {
+    pub(in crate::process_function::remote) fn for_replay() -> Result<Self, DbError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(DbError::Unsupported(
+                "replay-bound Python requires a Linux read-only deployment".into(),
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                replay_filesystem: Some(read_only_filesystem(Path::new("/"))?),
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn verify_filesystem(&self, path: &Path) -> Result<(), DbError> {
+        if let Some(expected) = self.replay_filesystem {
+            // Read-only bind mounts may expose files a writer can change through another mount.
+            // Runtime, imports and manifest must belong to the sealed root image itself.
+            if read_only_filesystem(path)? != expected {
+                return Err(DbError::Unsupported(format!(
+                    "replay-bound Python path is outside the read-only root image: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::process_function::remote) fn canonical_file(
         &mut self,
         path: &Path,
     ) -> Result<PathBuf, DbError> {
         let path = self.retain_ancestors(path)?;
+        #[cfg(target_os = "linux")]
+        self.verify_filesystem(&path)?;
         self.retain(Self::open_file(&path)?);
         path.canonicalize().map_err(|error| {
             DbError::Config(format!(
@@ -64,6 +98,8 @@ impl FileGuards {
     }
 
     pub(super) fn retain_directory(&mut self, path: &Path) -> Result<(), DbError> {
+        #[cfg(target_os = "linux")]
+        self.verify_filesystem(path)?;
         #[cfg(windows)]
         {
             let file = open(path)?;
@@ -84,6 +120,34 @@ impl FileGuards {
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn read_only_filesystem(path: &Path) -> Result<libc::c_ulong, DbError> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_bytes = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| DbError::Config("Python path contains a NUL byte".into()))?;
+    let mut status = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: the C path is NUL-terminated and status points to writable, aligned storage.
+    if unsafe { libc::statvfs(path_bytes.as_ptr(), status.as_mut_ptr()) } != 0 {
+        return Err(DbError::Config(format!(
+            "inspect Python filesystem '{}': {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: a successful statvfs call initialized the complete structure.
+    let status = unsafe { status.assume_init() };
+    if status.f_flag & libc::ST_RDONLY == 0 {
+        return Err(DbError::Unsupported(format!(
+            "replay-bound Python path must be on a read-only filesystem: {}",
+            path.display()
+        )));
+    }
+    Ok(status.f_fsid)
 }
 
 fn open(path: &Path) -> Result<File, DbError> {

@@ -191,6 +191,23 @@ class WorkerBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             serve(manifest, lambda _: (), "0.0.0.0:0")
 
+    def test_replay_contract_requires_environment_and_changes_binding(self) -> None:
+        data = json.loads(manifest_bytes())
+        data["determinism"] = "replay_safe"
+        with self.assertRaises(ValueError):
+            Manifest.from_bytes(json.dumps(data).encode())
+        data["python_environment"] = {
+            "version": 1, "executable": "bin/python3.13", "handler": "handler:handle",
+            "runtime_sha256": "b" * 64, "import_roots_sha256": ["c" * 64],
+        }
+        replay = Manifest.from_bytes(json.dumps(data).encode())
+        self.assertTrue(replay.replay_safe)
+        data["determinism"] = "undeclared"
+        self.assertNotEqual(replay.digest, Manifest.from_bytes(json.dumps(data).encode()).digest)
+        data["determinism"] = "unknown"
+        with self.assertRaises(ValueError):
+            Manifest.from_bytes(json.dumps(data).encode())
+
     def test_manifest_binds_optional_python_environment_and_rejects_invalid_fields(self) -> None:
         original = json.loads(manifest_bytes())
         original["python_environment"] = {

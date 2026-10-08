@@ -704,6 +704,14 @@ pub(super) fn validate_descriptor(
         ));
     }
     let limits = descriptor.limits;
+    if descriptor.runtime == super::ProcessRuntime::RemotePython
+        && descriptor.determinism == super::ProcessDeterminism::ReplaySafe
+        && descriptor.python_environment.is_none()
+    {
+        return Err(DbError::Unsupported(
+            "replay-safe Python requires a complete environment binding".into(),
+        ));
+    }
     if let Some(environment) = &descriptor.python_environment {
         if descriptor.runtime != super::ProcessRuntime::RemotePython {
             return Err(DbError::Unsupported(

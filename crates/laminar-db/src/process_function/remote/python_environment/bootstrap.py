@@ -11,6 +11,15 @@ import runpy
 
 runtime_root = Path(sys.argv[1]).resolve(strict=True)
 
+# Replay launches have a cleared environment and a fixed interpreter hash seed.
+if not sys.flags.isolated:
+    import os
+    status = Path("/proc/self/status").read_text().splitlines()
+    if (sys.platform != "linux" or os.geteuid() == 0 or sys.flags.hash_randomization
+            or "NoNewPrivs:\t1" not in status
+            or "CapEff:\t0000000000000000" not in status):
+        raise ValueError("replay-bound Python requires an unprivileged Linux process with no_new_privs")
+
 
 def within_runtime(path: str) -> bool:
     resolved = Path(path).resolve()

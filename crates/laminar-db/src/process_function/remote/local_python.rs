@@ -15,10 +15,11 @@ use super::python_environment::{self, FileGuards, VerifiedEnvironment};
 use super::{RemoteProcessClient, MAX_IN_FLIGHT};
 use crate::error::DbError;
 use crate::process_function::descriptor::{valid_python_identifier, MAX_MANIFEST_BYTES};
-use crate::process_function::{ProcessFunctionDescriptor, ProcessRuntime};
+use crate::process_function::{ProcessDeterminism, ProcessFunctionDescriptor, ProcessRuntime};
 
 /// Explicit local Python worker launch. The handler file is the direct digest-bound artifact;
-/// an optional environment binding checks deployment drift without certifying replay equivalence.
+/// an optional environment binding checks deployment drift. A replay-safe descriptor additionally
+/// requires Linux, an unprivileged child, and a package on the read-only root filesystem.
 /// Bound paths reject links in their ancestry before canonicalization. On Windows, bound launches
 /// also retain read-share handles to inventoried files and configured path ancestors.
 /// Bound launches compile filesystem source modules without reading their bytecode caches.
@@ -134,6 +135,12 @@ impl VerifiedBinding {
                 "local Python worker requires a Python process descriptor".into(),
             ));
         }
+        if descriptor.determinism == ProcessDeterminism::ReplaySafe {
+            guards = FileGuards::for_replay()?;
+            // Reopen under the stronger filesystem contract before using the binding.
+            guards.canonical_file(&manifest)?;
+            guards.canonical_file(&handler_file)?;
+        }
         if python_environment::file_sha256(&handler_file)? != descriptor.implementation_digest {
             return Err(DbError::InvalidOperation(
                 "Python handler file digest differs from its manifest".into(),
@@ -170,8 +177,19 @@ impl VerifiedBinding {
             // before bootstrap. The inventoried executable is already guarded on Windows.
             let mut cache_prefix = OsString::from("pycache_prefix=");
             cache_prefix.push(&self.environment.python);
+            command.args(
+                if self.descriptor.determinism == ProcessDeterminism::ReplaySafe {
+                    ["-s", "-P", "-S", "-B"]
+                } else {
+                    ["-I", "-S", "-B", "-X"]
+                },
+            );
+            if self.descriptor.determinism == ProcessDeterminism::ReplaySafe {
+                command.env_clear().env("PYTHONHASHSEED", "0").arg("-X");
+                #[cfg(target_os = "linux")]
+                command.env("LD_LIBRARY_PATH", root.join("lib"));
+            }
             command
-                .args(["-I", "-S", "-B", "-X"])
                 .arg(cache_prefix)
                 .arg("-c")
                 .arg(include_str!("python_environment/bootstrap.py"))
@@ -204,6 +222,27 @@ impl VerifiedBinding {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        if self.descriptor.determinism == ProcessDeterminism::ReplaySafe {
+            // SAFETY: the child hook performs only the async-signal-safe prctl syscall. All
+            // other replay checks run before spawn or in the initialized Python bootstrap.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(
+                        libc::PR_SET_NO_NEW_PRIVS,
+                        1 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    ) == 0
+                    {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
         Ok(command)
     }
 }
@@ -374,17 +413,22 @@ async fn connect_child(
     child: &mut Child,
     descriptor: ProcessFunctionDescriptor,
     config: &LocalPythonWorkerConfig,
+    exited: CancellationToken,
 ) -> StartupResult {
     let port = tokio::time::timeout(config.timeout, read_ready(child))
         .await
         .map_err(|_| DbError::Pipeline("Python process worker readiness timed out".into()))??;
-    let client = RemoteProcessClient::connect_loopback(
+    let replay_safe = descriptor.determinism == ProcessDeterminism::ReplaySafe;
+    let mut client = RemoteProcessClient::connect_loopback(
         &format!("http://127.0.0.1:{port}"),
         descriptor,
         config.max_in_flight,
         config.timeout,
     )
     .await?;
+    if replay_safe {
+        client.bind_python_replay_lifetime(exited);
+    }
     Ok((Arc::new(client), port))
 }
 
@@ -400,7 +444,7 @@ async fn supervise(
     let startup = tokio::select! {
         biased;
         () = cancel.cancelled() => Err(DbError::Pipeline("Python worker startup cancelled".into())),
-        result = connect_child(&mut child, binding.descriptor, &config) => result,
+        result = connect_child(&mut child, binding.descriptor, &config, exited.clone()) => result,
     };
     let outcome = match startup {
         Ok(client) => {

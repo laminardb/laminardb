@@ -101,6 +101,8 @@ fn inventory(
                 return Err(DbError::Config("unsupported Python tree path".into()));
             }
             let path = child.path();
+            #[cfg(target_os = "linux")]
+            guards.verify_filesystem(&path)?;
             let metadata = regular_metadata(&path)?;
             let directory = metadata.is_dir();
             let bytes = if directory { 0 } else { metadata.len() };

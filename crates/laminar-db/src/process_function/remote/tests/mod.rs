@@ -55,6 +55,7 @@ fn descriptor() -> ProcessFunctionDescriptor {
         pipeline_state_id: "remote_test_pipeline".into(),
         implementation_digest: "b".repeat(64),
         python_environment: None,
+        determinism: crate::process_function::ProcessDeterminism::Undeclared,
         input_schema: input_schema(),
         output_schema: output_schema(),
         key_columns: vec!["key".into()],
@@ -64,6 +65,35 @@ fn descriptor() -> ProcessFunctionDescriptor {
         timer_names: vec!["flush".into()],
         limits: ProcessFunctionLimits::default(),
     }
+}
+
+#[tokio::test]
+async fn supervised_binding_is_revoked_for_every_client_clone() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let shutdown = CancellationToken::new();
+    let worker = RustReferenceWorker::new(descriptor(), Arc::new(ReferenceHandler), 1).unwrap();
+    let server = tokio::spawn(worker.serve_loopback(listener, shutdown.clone()));
+    let mut client =
+        RemoteProcessClient::connect_loopback(&endpoint, descriptor(), 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+    assert!(!client.has_python_replay_binding());
+    let exited = CancellationToken::new();
+    client.bind_python_replay_lifetime(exited.clone());
+    let clone = client.clone();
+    assert!(clone.has_python_replay_binding());
+    exited.cancel();
+    assert!(!client.has_python_replay_binding());
+    assert!(!clone.has_python_replay_binding());
+    assert!(clone
+        .invoke(&scope(), &[])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("exited"));
+    shutdown.cancel();
+    server.await.unwrap().unwrap();
 }
 
 fn activation(id: u64, key: &str, amount: i64, state: ValueState) -> ProcessActivation {

@@ -222,6 +222,16 @@ impl Rig {
     }
 
     pub async fn setup(&mut self, remote: bool) {
+        let mut binding = descriptor();
+        let handler = self.handler(&mut binding, remote).await;
+        self.setup_process(binding, handler).await;
+    }
+
+    pub(super) async fn setup_process(
+        &mut self,
+        binding: ProcessFunctionDescriptor,
+        handler: ProcessHandler,
+    ) {
         let objects: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         self.prepare_peers(Arc::clone(&objects)).await;
@@ -231,8 +241,7 @@ impl Rig {
             .await
             .unwrap()
             .unwrap();
-        let mut binding = descriptor();
-        let handler = self.handler(&mut binding, remote).await;
+        let remote = binding.runtime != crate::process_function::ProcessRuntime::NativeRust;
         let owners = self.assignment.to_vnode_vec(2).unwrap();
         for index in 0..self.peers.len() {
             let peer = &self.peers[index];

@@ -32,7 +32,10 @@ impl NativeProcessFunction for RecordingActivity {
     }
 }
 
-async fn replay_input(graphs: &mut [OperatorGraph], batch_rows: usize) -> Vec<RecordBatch> {
+pub(super) async fn replay_input(
+    graphs: &mut [OperatorGraph],
+    batch_rows: usize,
+) -> Vec<RecordBatch> {
     let keys = [key_for(0), key_for(1), key_for(2), key_for(3)];
     let rows = (0..8)
         .map(|index| {

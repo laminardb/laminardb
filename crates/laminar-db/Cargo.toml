@@ -54,7 +54,7 @@ checkpoint-aws = ["aws"]
 checkpoint-gcs = ["gcs"]
 checkpoint-azure = ["azure"]
 remote = ["dep:reqwest", "dep:governor"]
-process-remote = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:windows-sys"]
+process-remote = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:windows-sys", "dep:libc"]
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
@@ -143,6 +143,9 @@ object_store = { workspace = true }
 # Kafka producer/admin client used by `kafka_docker_scenarios.rs`.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }

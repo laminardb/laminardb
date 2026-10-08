@@ -5327,6 +5327,7 @@ dependencies = [
  "laminar-core",
  "laminar-derive",
  "laminar-sql",
+ "libc",
  "object_store",
  "ort",
  "parking_lot 0.12.5",

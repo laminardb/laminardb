@@ -4,18 +4,17 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use laminar_db::process_function::{
-    ProcessFunctionDescriptor, ProcessRuntime, PythonEnvironmentBinding,
+    ProcessDeterminism, ProcessFunctionDescriptor, ProcessRuntime, PythonEnvironmentBinding,
 };
 use sha2::{Digest, Sha256};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args = std::env::args_os()
-        .skip(1)
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
+    let mut arguments = std::env::args_os().skip(1).peekable();
+    let replay_safe = arguments.next_if(|arg| arg == "--replay-safe").is_some();
+    let args = arguments.map(PathBuf::from).collect::<Vec<_>>();
     let [input, output, runtime, python, handler, function, roots @ ..] = args.as_slice() else {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
-            "usage: package_process_python INPUT_MANIFEST OUTPUT_MANIFEST RUNTIME_ROOT PYTHON HANDLER_FILE FUNCTION [IMPORT_ROOT ...]").into());
+            "usage: package_process_python [--replay-safe] INPUT_MANIFEST OUTPUT_MANIFEST RUNTIME_ROOT PYTHON HANDLER_FILE FUNCTION [IMPORT_ROOT ...]").into());
     };
     let mut raw = Vec::new();
     std::fs::File::open(input)?
@@ -90,6 +89,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     descriptor.implementation_digest = format!("{:x}", digest.finalize());
+    if replay_safe {
+        descriptor.determinism = ProcessDeterminism::ReplaySafe;
+    }
     let manifest = descriptor.to_manifest_json()?;
     // A new output path preserves the reviewed input manifest and any earlier package.
     OpenOptions::new()

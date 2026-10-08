@@ -126,6 +126,7 @@ class Manifest:
     timer_names: frozenset[str]
     limits: dict[str, int]
     environment_handler: str | None = None
+    replay_safe: bool = False
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> Manifest:
@@ -153,8 +154,10 @@ class Manifest:
             raise ValueError("worker requires the remote_python protocol v1 manifest")
         if (type(data["partitioning_abi"]) is not int or data["partitioning_abi"] != 2
                 or type(data["state_codec_version"]) is not int or data["state_codec_version"] != 2
-                or data["late_event_policy"] != "reject" or data["determinism"] != "undeclared"):
+                or data["late_event_policy"] != "reject" or data["determinism"] not in ("undeclared", "replay_safe")):
             raise ValueError("unsupported process state or late-event policy")
+        if data["determinism"] == "replay_safe" and "python_environment" not in data:
+            raise ValueError("replay-safe Python requires a complete environment binding")
         if data["input_changelog"] != "append_only" or data["output_changelog"] != "append_only":
             raise ValueError("unsupported process changelog mode")
         identity = (data["function_id"], data["pipeline_state_id"], data["value_state_name"])
@@ -199,6 +202,7 @@ class Manifest:
             digest=sha256(raw).digest(),
             implementation_digest=bytes.fromhex(digest),
             environment_handler=data.get("python_environment", {}).get("handler"),
+            replay_safe=data["determinism"] == "replay_safe",
             input_schema=input_schema,
             output_schema=output_schema,
             key_column=key_column,

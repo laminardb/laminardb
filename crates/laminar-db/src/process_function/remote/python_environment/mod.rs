@@ -12,6 +12,24 @@ pub(super) use file_guards::FileGuards;
 pub(super) use tree::file_sha256;
 use tree::{canonical_directory, fingerprint_guarded, InventoryBudget};
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn read_only_fixture_config() -> LocalPythonWorkerConfig {
+    let package = std::path::PathBuf::from(
+        std::env::var_os("LAMINAR_PROCESS_REPLAY_PACKAGE")
+            .expect("set LAMINAR_PROCESS_REPLAY_PACKAGE to the read-only qualification package"),
+    );
+    LocalPythonWorkerConfig {
+        python: package.join("runtime/bin/python3.13"),
+        runtime_root: Some(package.join("runtime")),
+        manifest: package.join("manifest.json"),
+        handler_file: package.join("handler/replay_handler.py"),
+        function: "handle".into(),
+        python_paths: vec![package.join("runtime/lib/python3.13/site-packages")],
+        max_in_flight: 4,
+        timeout: std::time::Duration::from_secs(10),
+    }
+}
+
 pub(super) struct VerifiedEnvironment {
     pub(super) python: PathBuf,
     pub(super) runtime_root: Option<PathBuf>,
@@ -223,6 +241,16 @@ mod tests {
             "handler",
             FileGuards::default(),
         )
+    }
+
+    #[test]
+    fn replay_binding_rejects_writable_deployment() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, _) = deployment(root.path());
+        let result = FileGuards::for_replay()
+            .and_then(|mut guards| guards.canonical_file(&config.python).map(|_| ()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("read-only"));
     }
 
     #[test]

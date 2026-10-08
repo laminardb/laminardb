@@ -52,6 +52,7 @@ pub(crate) fn descriptor() -> ProcessFunctionDescriptor {
         pipeline_state_id: "test_pipeline_v1".into(),
         implementation_digest: "a".repeat(64),
         python_environment: None,
+        determinism: crate::process_function::ProcessDeterminism::Undeclared,
         input_schema: input_schema(),
         output_schema: output_schema(),
         key_columns: vec!["account".into()],
@@ -61,6 +62,23 @@ pub(crate) fn descriptor() -> ProcessFunctionDescriptor {
         timer_names: vec!["inactive".into()],
         limits: ProcessFunctionLimits::default(),
     }
+}
+
+#[test]
+fn effects_contract_is_bound_into_manifest_and_checkpoint_identity() {
+    let mut binding = descriptor();
+    let original = binding.to_manifest_json().unwrap();
+    binding.determinism = super::ProcessDeterminism::ReplaySafe;
+    let replay = binding.to_manifest_json().unwrap();
+    assert_ne!(original, replay);
+    assert_eq!(
+        ProcessFunctionDescriptor::from_manifest_json(&replay)
+            .unwrap()
+            .determinism,
+        super::ProcessDeterminism::ReplaySafe
+    );
+    binding.runtime = ProcessRuntime::RemotePython;
+    assert!(binding.to_manifest_json().is_err());
 }
 
 #[test]
@@ -3020,7 +3038,13 @@ def handle(activations):
                 }
             })
             .await
-            .expect("second file output was not durably published");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "second file output was not durably published: {error}; totals={:?}; fault={:?}",
+                    published_file_totals(&output_dir),
+                    db.last_fault()
+                )
+            });
             std::fs::write(root.join("output-published"), b"ready").unwrap();
         }
         tokio::time::sleep(Duration::from_secs(20)).await;
