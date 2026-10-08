@@ -52,7 +52,14 @@ impl KafkaSource {
             })?
             .to_owned();
         let sealed_baselines = sealed
-            .map(|checkpoint| validate_sealed_position(checkpoint, &source_name, &topics))
+            .map(|checkpoint| {
+                validate_sealed_position(
+                    checkpoint,
+                    &source_name,
+                    &topics,
+                    kafka_config.replay_order,
+                )
+            })
             .transpose()?;
         let deadline = tokio::time::Instant::now() + INITIAL_POSITION_BUDGET;
         let permit = tokio::time::timeout_at(deadline, INITIALIZATION_SLOT.acquire())
@@ -73,46 +80,8 @@ impl KafkaSource {
             let consumer: BaseConsumer = client_config
                 .create()
                 .map_err(|error| consumer_creation_error(&error))?;
-            let mut inventory = KafkaPartitionSet::new();
-            for topic in topics {
-                let metadata = consumer
-                    .fetch_metadata(Some(&topic), remaining(deadline)?)
-                    .map_err(|e| fetch_error(&topic, &e))?;
-                let topic_metadata = metadata
-                    .topics()
-                    .iter()
-                    .find(|m| m.name() == topic)
-                    .ok_or_else(|| invalid_response(&topic, "metadata omitted the topic"))?;
-                if let Some(error) = topic_metadata.error() {
-                    return Err(topic_error(&topic, error.into()));
-                }
-                if topic_metadata.partitions().is_empty()
-                    || inventory
-                        .len()
-                        .saturating_add(topic_metadata.partitions().len())
-                        > MAX_INITIAL_PARTITIONS
-                {
-                    return Err(invalid_response(
-                        &topic,
-                        "initial inventory must contain 1..=4096 partitions in total",
-                    ));
-                }
-                for partition in topic_metadata.partitions() {
-                    if let Some(error) = partition.error() {
-                        return Err(topic_error(&topic, error.into()));
-                    }
-                    if partition.id() < 0
-                        || usize::try_from(partition.id())
-                            .map_or(true, |id| id >= topic_metadata.partitions().len())
-                        || !inventory.insert((topic.clone(), partition.id()))
-                    {
-                        return Err(invalid_response(
-                            &topic,
-                            "invalid or duplicate partition identity",
-                        ));
-                    }
-                }
-            }
+            let inventory = fetch_initial_inventory(&consumer, topics, deadline)?;
+            super::validate_round_inventory(&kafka_config, &inventory)?;
             let mut baselines = KafkaPartitionBaselines::with_capacity(inventory.len());
             if sealed_baselines.as_ref().is_some_and(|sealed| {
                 sealed.len() != inventory.len() || inventory.iter().any(|partition| !sealed.contains_key(partition))
@@ -142,7 +111,7 @@ impl KafkaSource {
                     .map(|(topic, partition)| (topic.as_str(), *partition)),
             );
             attach_partition_baselines(&mut checkpoint, &baselines, &inventory);
-            checkpoint.set_input_channels(kafka_input_channels(&source_name, &inventory)?)?;
+            checkpoint.set_input_channels(kafka_input_channels(&source_name, &inventory, kafka_config.replay_order)?)?;
             Ok(checkpoint)
         });
         tokio::time::timeout_at(deadline, task)
@@ -152,6 +121,54 @@ impl KafkaSource {
                 ConnectorError::Internal(format!("Kafka initialization worker failed: {e}"))
             })?
     }
+}
+
+fn fetch_initial_inventory(
+    consumer: &BaseConsumer,
+    topics: Vec<String>,
+    deadline: std::time::Instant,
+) -> Result<KafkaPartitionSet, ConnectorError> {
+    let mut inventory = KafkaPartitionSet::new();
+    for topic in topics {
+        let metadata = consumer
+            .fetch_metadata(Some(&topic), remaining(deadline)?)
+            .map_err(|e| fetch_error(&topic, &e))?;
+        let topic_metadata = metadata
+            .topics()
+            .iter()
+            .find(|m| m.name() == topic)
+            .ok_or_else(|| invalid_response(&topic, "metadata omitted the topic"))?;
+        if let Some(error) = topic_metadata.error() {
+            return Err(topic_error(&topic, error.into()));
+        }
+        if topic_metadata.partitions().is_empty()
+            || inventory
+                .len()
+                .saturating_add(topic_metadata.partitions().len())
+                > MAX_INITIAL_PARTITIONS
+        {
+            return Err(invalid_response(
+                &topic,
+                "initial inventory must contain 1..=4096 partitions in total",
+            ));
+        }
+        for partition in topic_metadata.partitions() {
+            if let Some(error) = partition.error() {
+                return Err(topic_error(&topic, error.into()));
+            }
+            if partition.id() < 0
+                || usize::try_from(partition.id())
+                    .map_or(true, |id| id >= topic_metadata.partitions().len())
+                || !inventory.insert((topic.clone(), partition.id()))
+            {
+                return Err(invalid_response(
+                    &topic,
+                    "invalid or duplicate partition identity",
+                ));
+            }
+        }
+    }
+    Ok(inventory)
 }
 
 fn remaining(deadline: std::time::Instant) -> Result<std::time::Duration, ConnectorError> {
@@ -166,6 +183,7 @@ fn validate_sealed_position(
     checkpoint: &SourceCheckpoint,
     source_name: &str,
     topics: &[String],
+    replay_order: super::KafkaReplayOrder,
 ) -> Result<KafkaPartitionBaselines, ConnectorError> {
     if checkpoint.offsets().is_empty() || checkpoint.offsets().len() > MAX_INITIAL_PARTITIONS {
         return Err(ConnectorError::ConfigurationError(
@@ -190,7 +208,8 @@ fn validate_sealed_position(
         return Err(ConnectorError::ConfigurationError("invalid sealed Kafka initialization cursor/ABI; processed offsets and assignment ownership are not new-source positions".into()));
     }
     let inventory = baselines.keys().cloned().collect::<KafkaPartitionSet>();
-    if checkpoint.input_channels() != Some(kafka_input_channels(source_name, &inventory)?.as_ref())
+    if checkpoint.input_channels()
+        != Some(kafka_input_channels(source_name, &inventory, replay_order)?.as_ref())
     {
         return Err(ConnectorError::ConfigurationError(
             "sealed Kafka initialization channels differ from the exact source inventory".into(),

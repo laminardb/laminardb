@@ -121,6 +121,9 @@ impl KafkaSourceConfig {
         self.max_poll_records = config
             .get_parsed::<usize>("max.poll.records")?
             .unwrap_or(1000);
+        self.replay_order = config
+            .get("replay.order")
+            .map_or(Ok(super::KafkaReplayOrder::default()), str::parse)?;
         self.partition_assignment_strategy = config
             .get("partition.assignment.strategy")
             .map_or(Ok(AssignmentStrategy::Range), str::parse)?;

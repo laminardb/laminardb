@@ -151,6 +151,7 @@ pub(super) fn partition_vnodes(
 /// # Errors
 /// Returns a configuration error when the external inventory or owner map is
 /// not canonical.
+#[cfg(test)]
 pub(super) fn owned_partitions_in_assignment(
     source_identity: &str,
     topic: &str,

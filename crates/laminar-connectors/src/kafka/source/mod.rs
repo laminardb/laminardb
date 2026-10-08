@@ -21,7 +21,7 @@ use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee, SourceBatch,
     SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourceInputMode, SourceMutation, SourcePosition,
+    SourceDrainResolution, SourceInputMode, SourceMutation, SourcePosition, SourceReplayOrder,
     SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
@@ -29,7 +29,8 @@ use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
 use super::config::{
-    KafkaSourceConfig, OffsetReset, SchemaEvolutionStrategy, StartupMode, TopicSubscription,
+    KafkaReplayOrder, KafkaSourceConfig, OffsetReset, SchemaEvolutionStrategy, StartupMode,
+    TopicSubscription,
 };
 use super::metadata_error::{fetch_error, invalid_response, topic_error};
 use super::metrics::KafkaSourceMetrics;
@@ -49,6 +50,9 @@ mod drain;
 mod initialization;
 mod lifecycle;
 mod metadata;
+#[cfg(test)]
+mod partition_round_tests;
+mod partition_rounds;
 mod polling;
 mod progress;
 mod reader;
@@ -84,6 +88,7 @@ use metadata::{
     fetch_explicit_topic_metadata, fetch_partition_low_watermarks, fetch_partition_watermarks,
     resolve_timestamp_offsets,
 };
+use partition_rounds::{round_input_channels, round_row_positions, validate_round_inventory};
 use progress::KafkaProgress;
 
 /// Kafka source connector that consumes messages and produces Arrow batches.

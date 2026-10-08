@@ -5,8 +5,8 @@
 //! on the compute thread and must be trusted, bounded, and nonblocking. The optional remote
 //! transport is restricted to loopback workers on each database host. At-least-once delivery admits
 //! trusted native Rust and remote Rust with one replayable source that reproduces one physical
-//! channel in fixed batches. Each batch defines a reproducible event-time cut; independent-channel
-//! merging remains unadmitted. Cluster execution additionally requires splittable placement and
+//! channel in fixed batches. Each batch defines a reproducible event-time cut. Kafka's opt-in
+//! partition rounds merge its fixed inventory into this channel. Cluster execution requires splittable placement and
 //! the same immutable binding in every owner's sealed startup catalog. Supervised replay-safe
 //! Python also requires an unprivileged Linux worker in a read-only root image. Exactly-once
 //! process delivery is unsupported.
@@ -20,6 +20,8 @@ use crate::error::DbError;
 
 mod catalog;
 mod descriptor;
+#[cfg(all(test, feature = "kafka"))]
+mod kafka_round_tests;
 mod operator;
 mod registration;
 #[cfg(feature = "process-remote")]

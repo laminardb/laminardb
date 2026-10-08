@@ -167,7 +167,11 @@ fn prepare_rotation(
     }
 
     let owned_set = Arc::new(owned_set);
-    let input_channels = match kafka_input_channels(context.source_name.as_ref(), &owned_set) {
+    let input_channels = match kafka_input_channels(
+        context.source_name.as_ref(),
+        &owned_set,
+        context.replay_order,
+    ) {
         Ok(input_channels) => input_channels,
         Err(error) => {
             publish_reader_fault(

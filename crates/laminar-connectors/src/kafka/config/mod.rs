@@ -9,7 +9,10 @@ use rdkafka::config::ClientConfig;
 use crate::error::ConnectorError;
 use crate::serde::Format;
 
+mod replay_order;
 mod source_options;
+
+pub use replay_order::KafkaReplayOrder;
 
 /// Kafka security protocol for broker connections.
 ///
@@ -541,6 +544,8 @@ pub struct KafkaSourceConfig {
     pub isolation_level: IsolationLevel,
     /// Maximum records per poll batch.
     pub max_poll_records: usize,
+    /// Opt-in replay ordering. Partition rounds require guaranteed delivery and JSON records.
+    pub replay_order: KafkaReplayOrder,
     /// Partition assignment strategy.
     pub partition_assignment_strategy: AssignmentStrategy,
     /// Minimum bytes to return from a fetch (allows batching).
@@ -611,6 +616,7 @@ impl std::fmt::Debug for KafkaSourceConfig {
             .field("group_id", &self.group_id)
             .field("subscription", &self.subscription)
             .field("format", &self.format)
+            .field("replay_order", &self.replay_order)
             .field("security_protocol", &self.security_protocol)
             .field("sasl_mechanism", &self.sasl_mechanism)
             .field("sasl_username", &self.sasl_username)
@@ -655,6 +661,7 @@ impl Default for KafkaSourceConfig {
             auto_offset_reset: OffsetReset::Earliest,
             isolation_level: IsolationLevel::default(),
             max_poll_records: 1000,
+            replay_order: KafkaReplayOrder::Unspecified,
             partition_assignment_strategy: AssignmentStrategy::Range,
             fetch_min_bytes: None,
             fetch_max_bytes: None,
@@ -681,6 +688,7 @@ impl KafkaSourceConfig {
     ///
     /// Returns `ConnectorError::ConfigurationError` if the configuration is invalid.
     pub fn validate(&self) -> Result<(), ConnectorError> {
+        self.replay_order.validate(self)?;
         if self.bootstrap_servers.is_empty() {
             return Err(ConnectorError::ConfigurationError(
                 "bootstrap.servers cannot be empty".into(),

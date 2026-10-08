@@ -27,8 +27,8 @@ mod schema_resolution;
 // Source re-exports
 pub use avro::AvroDeserializer;
 pub use config::{
-    AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
-    SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
+    AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaReplayOrder, KafkaSourceConfig,
+    OffsetReset, SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
     TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
@@ -156,9 +156,8 @@ pub fn register_kafka_sink(
 }
 
 /// Returns the configuration key specifications for the Kafka source.
-#[allow(clippy::too_many_lines)]
 fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
-    vec![
+    let mut keys = vec![
         // Required
         ConfigKeySpec::required("bootstrap.servers", "Kafka broker addresses"),
         ConfigKeySpec::required("group.id", "Consumer group identifier"),
@@ -196,95 +195,9 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional("ssl.key.location", "Client SSL private key file path", ""),
         ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
-        // Consumer tuning
-        ConfigKeySpec::optional(
-            "startup.mode",
-            "Startup mode (group-offsets/earliest/latest)",
-            "group-offsets",
-        ),
-        ConfigKeySpec::optional(
-            "startup.specific.offsets",
-            "Start from specific offsets (format: 'partition:offset,...')",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "startup.timestamp.ms",
-            "Start from timestamp (milliseconds since epoch)",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "auto.offset.reset",
-            "Fallback when no committed offset (earliest/latest/none)",
-            "earliest",
-        ),
-        ConfigKeySpec::optional(
-            "isolation.level",
-            "Transaction isolation (read_uncommitted/read_committed)",
-            "read_committed",
-        ),
-        ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
-        ConfigKeySpec::optional(
-            "partition.assignment.strategy",
-            "Partition assignment (range/roundrobin/cooperative-sticky)",
-            "range",
-        ),
-        // Consumer group timing
-        ConfigKeySpec::optional(
-            "session.timeout.ms",
-            "Consumer session timeout in milliseconds (production-safe default)",
-            "45000",
-        ),
-        ConfigKeySpec::optional(
-            "heartbeat.interval.ms",
-            "Consumer heartbeat interval in milliseconds",
-            "10000",
-        ),
-        ConfigKeySpec::optional(
-            "queued.max.messages.kbytes",
-            "Max per-partition pre-fetch queue size in kbytes",
-            "16384",
-        ),
-        // Fetch tuning
-        ConfigKeySpec::optional("fetch.min.bytes", "Minimum bytes per fetch request", "1"),
-        ConfigKeySpec::optional(
-            "fetch.max.bytes",
-            "Maximum bytes per fetch request",
-            "52428800",
-        ),
-        ConfigKeySpec::optional(
-            "fetch.max.wait.ms",
-            "Max wait time for fetch.min.bytes",
-            "500",
-        ),
-        ConfigKeySpec::optional(
-            "max.partition.fetch.bytes",
-            "Max bytes per partition per fetch",
-            "1048576",
-        ),
-        // Metadata
-        ConfigKeySpec::optional(
-            "include.metadata",
-            "Include _partition/_offset/_timestamp columns",
-            "false",
-        ),
-        ConfigKeySpec::optional("include.headers", "Include _headers column", "false"),
-        // Backpressure
-        ConfigKeySpec::optional(
-            "backpressure.high.watermark",
-            "Channel fill ratio to pause",
-            "0.8",
-        ),
-        ConfigKeySpec::optional(
-            "backpressure.low.watermark",
-            "Channel fill ratio to resume",
-            "0.25",
-        ),
-        // Error handling
-        ConfigKeySpec::optional(
-            "max.deser.error.rate",
-            "Max tolerated deserialization error rate per batch (0.0-1.0)",
-            "0.5",
-        ),
+    ];
+    keys.extend(kafka_source_consumer_config_keys());
+    keys.extend([
         // Schema Registry
         ConfigKeySpec::optional(
             "schema.registry.url",
@@ -347,6 +260,106 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "reader.channel.capacity",
             "Bounded reader channel capacity in records",
             "8192",
+        ),
+    ]);
+    keys
+}
+
+fn kafka_source_consumer_config_keys() -> Vec<ConfigKeySpec> {
+    vec![
+        // Consumer tuning
+        ConfigKeySpec::optional(
+            "startup.mode",
+            "Startup mode (group-offsets/earliest/latest)",
+            "group-offsets",
+        ),
+        ConfigKeySpec::optional(
+            "startup.specific.offsets",
+            "Start from specific offsets (format: 'partition:offset,...')",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "startup.timestamp.ms",
+            "Start from timestamp (milliseconds since epoch)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "auto.offset.reset",
+            "Fallback when no committed offset (earliest/latest/none)",
+            "earliest",
+        ),
+        ConfigKeySpec::optional(
+            "isolation.level",
+            "Transaction isolation (read_uncommitted/read_committed)",
+            "read_committed",
+        ),
+        ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
+        ConfigKeySpec::optional(
+            "replay.order",
+            "Replay merge profile (unspecified/partition_rounds)",
+            "unspecified",
+        ),
+        ConfigKeySpec::optional(
+            "partition.assignment.strategy",
+            "Partition assignment (range/roundrobin/cooperative-sticky)",
+            "range",
+        ),
+        // Consumer group timing
+        ConfigKeySpec::optional(
+            "session.timeout.ms",
+            "Consumer session timeout in milliseconds (production-safe default)",
+            "45000",
+        ),
+        ConfigKeySpec::optional(
+            "heartbeat.interval.ms",
+            "Consumer heartbeat interval in milliseconds",
+            "10000",
+        ),
+        ConfigKeySpec::optional(
+            "queued.max.messages.kbytes",
+            "Max per-partition pre-fetch queue size in kbytes",
+            "16384",
+        ),
+        // Fetch tuning
+        ConfigKeySpec::optional("fetch.min.bytes", "Minimum bytes per fetch request", "1"),
+        ConfigKeySpec::optional(
+            "fetch.max.bytes",
+            "Maximum bytes per fetch request",
+            "52428800",
+        ),
+        ConfigKeySpec::optional(
+            "fetch.max.wait.ms",
+            "Max wait time for fetch.min.bytes",
+            "500",
+        ),
+        ConfigKeySpec::optional(
+            "max.partition.fetch.bytes",
+            "Max bytes per partition per fetch",
+            "1048576",
+        ),
+        // Metadata
+        ConfigKeySpec::optional(
+            "include.metadata",
+            "Include _partition/_offset/_timestamp columns",
+            "false",
+        ),
+        ConfigKeySpec::optional("include.headers", "Include _headers column", "false"),
+        // Backpressure
+        ConfigKeySpec::optional(
+            "backpressure.high.watermark",
+            "Channel fill ratio to pause",
+            "0.8",
+        ),
+        ConfigKeySpec::optional(
+            "backpressure.low.watermark",
+            "Channel fill ratio to resume",
+            "0.25",
+        ),
+        // Error handling
+        ConfigKeySpec::optional(
+            "max.deser.error.rate",
+            "Max tolerated deserialization error rate per batch (0.0-1.0)",
+            "0.5",
         ),
     ]
 }

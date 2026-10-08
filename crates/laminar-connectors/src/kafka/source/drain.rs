@@ -258,6 +258,7 @@ pub(super) fn kafka_partition_routes(
     source_identity: &str,
     vnode_count: u32,
     topic_meta: &[(Arc<str>, i32)],
+    replay_order: super::KafkaReplayOrder,
 ) -> Result<KafkaPartitionRoutes, ConnectorError> {
     let mut routes = KafkaPartitionRoutes::with_capacity(topic_meta.len());
     for (topic, count) in topic_meta {
@@ -266,12 +267,15 @@ pub(super) fn kafka_partition_routes(
                 "Kafka topic '{topic}' reported a negative partition count {count}"
             )));
         }
-        let topic_routes = super::super::vnode_routing::partition_vnodes(
+        let mut topic_routes = super::super::vnode_routing::partition_vnodes(
             source_identity,
             topic,
             *count,
             vnode_count,
         )?;
+        if replay_order == super::KafkaReplayOrder::PartitionRounds {
+            topic_routes.fill(0);
+        }
         if routes
             .insert(Arc::clone(topic), topic_routes.into())
             .is_some()
@@ -530,6 +534,7 @@ pub(super) async fn resolve_kafka_reader_drain(
     globally_paused: bool,
     deadline: tokio::time::Instant,
     execution: &Arc<AtomicU8>,
+    replay_order: super::KafkaReplayOrder,
 ) -> Result<(), String> {
     if resolution.round != active.request.round {
         return Err("Kafka drain resolution does not match the active round".into());
@@ -547,7 +552,11 @@ pub(super) async fn resolve_kafka_reader_drain(
     let assignment = consumer
         .assignment()
         .map_err(|error| format!("Kafka drain could not inspect target assignment: {error}"))?;
-    if resolution.outcome == SourceDrainOutcome::Abort {
+    // A committed round cut excludes prefetched partial rounds too. Retained owners must rewind
+    // that consumption before intake resumes; acquired partitions already use donor positions.
+    if resolution.outcome == SourceDrainOutcome::Abort
+        || replay_order == super::KafkaReplayOrder::PartitionRounds
+    {
         let assigned = kafka_partition_set(&assignment)
             .map_err(|error| format!("Kafka drain target assignment is invalid: {error}"))?;
         let mut seek = TopicPartitionList::new();
@@ -562,7 +571,7 @@ pub(super) async fn resolve_kafka_reader_drain(
             )
             .map_err(|error| {
                 format!(
-                    "Kafka drain could not build abort seek for '{}-{}': {error}",
+                    "Kafka drain could not build cut seek for '{}-{}': {error}",
                     position.topic, position.partition
                 )
             })?;
@@ -578,17 +587,17 @@ pub(super) async fn resolve_kafka_reader_drain(
                         .saturating_duration_since(tokio::time::Instant::now())
                         .min(std::time::Duration::from_secs(5));
                     if timeout.is_zero() {
-                        return Err("Kafka drain deadline expired before abort seek".into());
+                        return Err("Kafka drain deadline expired before cut seek".into());
                     }
                     seek_consumer
                         .seek_partitions(seek, timeout)
-                        .map_err(|error| format!("Kafka drain abort seek failed: {error}"))
+                        .map_err(|error| format!("Kafka drain cut seek failed: {error}"))
                 }),
             )
             .await
-            .map_err(|_| "Kafka drain deadline expired during abort seek".to_string())?
-            .map_err(|error| format!("Kafka drain abort seek task failed: {error}"))??;
-            validate_kafka_partition_results("drain abort seek", &positioned)?;
+            .map_err(|_| "Kafka drain deadline expired during cut seek".to_string())?
+            .map_err(|error| format!("Kafka drain cut seek task failed: {error}"))??;
+            validate_kafka_partition_results("drain cut seek", &positioned)?;
         } else {
             claim_kafka_drain_execution(execution, deadline)?;
         }

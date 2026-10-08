@@ -32,13 +32,22 @@ fn assignment_publication(
     owned_partitions: Arc<KafkaPartitionSet>,
     baselines: KafkaRotationBaselines,
 ) -> KafkaAssignmentPublication {
-    let input_channels = kafka_input_channels(source_name, &owned_partitions).unwrap();
+    let input_channels = kafka_input_channels(
+        source_name,
+        &owned_partitions,
+        KafkaReplayOrder::Unspecified,
+    )
+    .unwrap();
     KafkaAssignmentPublication::new(version, owned_partitions, input_channels, baselines)
 }
 
 fn install_manual_partitions(source: &mut KafkaSource, partitions: KafkaPartitionSet) {
-    source.manual_input_channels =
-        kafka_input_channels(source.source_name.as_ref(), &partitions).unwrap();
+    source.manual_input_channels = kafka_input_channels(
+        source.source_name.as_ref(),
+        &partitions,
+        source.config.replay_order,
+    )
+    .unwrap();
     source.manual_topic_partitions = partitions;
 }
 
@@ -375,8 +384,12 @@ async fn decoded_batch_retains_the_assignment_cut_pinned_during_drain() {
     source.applied_rotation_baseline_version = Some(1);
 
     let previous_partitions = Arc::new(KafkaPartitionSet::from([("events".to_string(), 0)]));
-    let old_channels =
-        kafka_input_channels(source.source_name.as_ref(), &previous_partitions).unwrap();
+    let old_channels = kafka_input_channels(
+        source.source_name.as_ref(),
+        &previous_partitions,
+        source.config.replay_order,
+    )
+    .unwrap();
     let baselines = KafkaRotationBaselines::from([(
         Arc::from("events"),
         std::collections::HashMap::from([(0, 10)]),
@@ -1793,7 +1806,13 @@ fn owner_generation_detects_self_other_self_before_reader_turn() {
     registry.set_assignment_and_version(vec![self_id].into(), 3);
 
     let published = registry.versioned_snapshot();
-    let routes = kafka_partition_routes("events_source", 1, &[(Arc::from("events"), 1)]).unwrap();
+    let routes = kafka_partition_routes(
+        "events_source",
+        1,
+        &[(Arc::from("events"), 1)],
+        KafkaReplayOrder::Unspecified,
+    )
+    .unwrap();
     let (owned, reacquired) = kafka_owned_partition_sets(&routes, &published, self_id, 1).unwrap();
     assert_eq!(owned, KafkaPartitionSet::from([("events".to_string(), 0)]));
     assert_eq!(reacquired, owned);
@@ -1812,7 +1831,13 @@ fn vnode_reconciliation_rejects_noncanonical_unassigned_maps() {
     let published = registry.versioned_snapshot();
     let error = kafka_bootstrap_is_unassigned(&published, self_id).unwrap_err();
     assert!(error.to_string().contains("unassigned owner at vnode 1"));
-    let routes = kafka_partition_routes("events_source", 2, &[(Arc::from("events"), 2)]).unwrap();
+    let routes = kafka_partition_routes(
+        "events_source",
+        2,
+        &[(Arc::from("events"), 2)],
+        KafkaReplayOrder::Unspecified,
+    )
+    .unwrap();
     let error = kafka_owned_partition_sets(&routes, &published, self_id, 0).unwrap_err();
     assert!(error.to_string().contains("unassigned owner at vnode 1"));
 }
@@ -1824,7 +1849,8 @@ fn cached_routes_define_exact_multi_topic_assignment() {
     let registry = laminar_core::state::VnodeRegistry::new(8);
     registry.set_assignment([node1, node2, node2, node1, node1, node2, node1, node2].into());
     let topics = [(Arc::from("events"), 7), (Arc::from("orders"), 5)];
-    let routes = kafka_partition_routes("source", 8, &topics).unwrap();
+    let routes =
+        kafka_partition_routes("source", 8, &topics, KafkaReplayOrder::Unspecified).unwrap();
     let published = registry.versioned_snapshot();
     let (owned, reacquired) = kafka_owned_partition_sets(&routes, &published, node1, 0).unwrap();
     assert!(reacquired.is_empty());
@@ -2179,6 +2205,7 @@ fn manual_checkpoint_captures_input_channels_before_first_record() {
         source.source_name.as_ref(),
         checkpoint.input_channels(),
         &source.manual_topic_partitions,
+        source.config.replay_order,
     )
     .unwrap();
     let positions = kafka_row_positions(
@@ -2208,6 +2235,7 @@ fn manual_checkpoint_captures_input_channels_before_first_record() {
         source.source_name.as_ref(),
         checkpoint.input_channels(),
         &expanded,
+        source.config.replay_order,
     )
     .unwrap_err();
     assert!(error
@@ -2255,10 +2283,15 @@ fn build_vnode_assignment_uses_checkpoint_offset_then_baseline() {
         (("events".to_string(), 2), 999),
     ]);
     let tpl = build_vnode_assignment_tpl(
-        "events_source",
+        &kafka_partition_routes(
+            "events_source",
+            4,
+            &topic_meta,
+            KafkaReplayOrder::Unspecified,
+        )
+        .unwrap(),
         &registry.snapshot(),
         node1,
-        &topic_meta,
         &offsets,
         &baselines,
         rdkafka::Offset::Beginning,

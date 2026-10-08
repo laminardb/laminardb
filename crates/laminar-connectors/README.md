@@ -35,6 +35,35 @@ checks its reader contract. That contract is not an admitted append-only streami
 covers the ordinary route's rejection, and the positioned mutable join routes require ordering
 and recovery capabilities that this reader lacks. Finite reference/lookup reads are separate.
 
+### Kafka partition rounds
+
+Kafka JSON sources can declare `'replay.order' = 'partition_rounds'` for process
+functions that need reproducible input order and event-time cuts. The default is
+`unspecified`. Use an explicit topic list with guaranteed delivery and `earliest`
+startup, or a previously sealed numeric `latest` initialization position.
+Group offsets, topic patterns, specific-offset and timestamp startup, and other
+formats are not admitted by this profile.
+
+A complete round contains one non-null message from each partition, sorted by
+topic and partition. Tombstones do not occupy a round slot. An idle partition
+holds the entire round and its watermark cut. Poll timing and poll limits cannot
+split or combine rounds. The canonical channel ID binds the fixed partition
+inventory; native offset vectors remain the checkpoint and recovery cursor.
+An unfinished round publishes no offsets and is reread after recovery or drain.
+
+The full inventory must fit `max.poll.records`, `reader.channel.capacity`, and
+the engine's requested poll capacity. Round payloads, including encoded headers,
+must fit `fetch.max.bytes` (50 MiB by default). Messages already buffered before
+native partition queues are split have a separate buffer bounded by
+`reader.channel.capacity` and `fetch.max.bytes`; exceeding a bound stops the
+source generation for recovery. Inventory changes fail closed on recovery.
+
+Embedded and single-node runtimes own the complete inventory. In a cluster,
+intake follows vnode zero as one global input channel; keyed processing and
+shuffle use the assigned owners. This concentrates input decoding on one owner.
+At-least-once process delivery may replay output. Exactly-once process delivery
+remains unsupported.
+
 ### On-demand lookup sources (partial cache mode)
 
 `CREATE LOOKUP TABLE ... WITH ('strategy' = 'on-demand', 'cache.memory' = '64mb')`

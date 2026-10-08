@@ -79,10 +79,9 @@ impl KafkaSource {
             TopicPartitionList::new()
         } else {
             build_vnode_assignment_tpl(
-                self.source_name.as_ref(),
+                &inventory.routes,
                 published.owners(),
                 self_id,
-                &inventory.topics,
                 &self.offsets,
                 &self.manual_partition_baselines,
                 inventory.default_offset,
@@ -107,7 +106,11 @@ impl KafkaSource {
         validate_kafka_assignment(&owned_partitions, &active)
             .map_err(ConnectorError::ConnectionFailed)?;
         self.vnode_partition_routes = inventory.routes;
-        let input_channels = kafka_input_channels(self.source_name.as_ref(), &owned_partitions)?;
+        let input_channels = kafka_input_channels(
+            self.source_name.as_ref(),
+            &owned_partitions,
+            config.replay_order,
+        )?;
         *lock_or_recover(&self.assignment_publication) = Arc::new(KafkaAssignmentPublication::new(
             assignment_version,
             Arc::clone(&owned_partitions),
@@ -144,14 +147,19 @@ impl KafkaSource {
             topics.to_vec(),
         )
         .await?;
-        let partition_routes =
-            kafka_partition_routes(self.source_name.as_ref(), vnode_count, &topic_meta)?;
+        let partition_routes = kafka_partition_routes(
+            self.source_name.as_ref(),
+            vnode_count,
+            &topic_meta,
+            config.replay_order,
+        )?;
         let all_partitions: KafkaPartitionSet = topic_meta
             .iter()
             .flat_map(|(topic, count)| {
                 (0..*count).map(move |partition| (topic.to_string(), partition))
             })
             .collect();
+        super::super::validate_round_inventory(config, &all_partitions)?;
         if let Some(unexpected) = self
             .offsets
             .to_topic_partition_list()
@@ -206,7 +214,6 @@ impl KafkaSource {
             startup_default_offset(&config.startup_mode)
         };
         Ok(VnodeStartInventory {
-            topics: topic_meta,
             routes: partition_routes,
             default_offset,
         })

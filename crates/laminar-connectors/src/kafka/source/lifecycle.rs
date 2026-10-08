@@ -3,10 +3,11 @@
 use super::{
     async_trait, info, join_background_task, kafka_output_schema, reap_last_arc_off_runtime, warn,
     Arc, CommitMode, ConnectorConfig, ConnectorError, ConnectorState, ConnectorTaskTracker,
-    Consumer, Format, KafkaReaderDrainCommand, KafkaSource, KafkaSourceConfig, KafkaSourceDrain,
-    Notify, OffsetTracker, Ordering, SchemaRef, SourceBatch, SourceCheckpoint, SourceConnector,
-    SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainResolution, SourceInputMode,
-    SourceRowPositionCapability, SourceStart, SourceTopology, KAFKA_BACKGROUND_CLOSE_BUDGET,
+    Consumer, Format, KafkaReaderDrainCommand, KafkaReplayOrder, KafkaSource, KafkaSourceConfig,
+    KafkaSourceDrain, Notify, OffsetTracker, Ordering, SchemaRef, SourceBatch, SourceCheckpoint,
+    SourceConnector, SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainResolution,
+    SourceInputMode, SourceReplayOrder, SourceRowPositionCapability, SourceStart, SourceTopology,
+    KAFKA_BACKGROUND_CLOSE_BUDGET,
 };
 
 #[async_trait]
@@ -37,11 +38,12 @@ impl SourceConnector for KafkaSource {
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        let format = if config.properties().is_empty() {
+        let (format, replay_order) = if config.properties().is_empty() {
             self.config.validate()?;
-            self.config.format
+            (self.config.format, self.config.replay_order)
         } else {
-            KafkaSourceConfig::from_config(config)?.format
+            let parsed = KafkaSourceConfig::from_config(config)?;
+            (parsed.format, parsed.replay_order)
         };
         let input_mode = if format == Format::Debezium {
             SourceInputMode::KeyedUpsert
@@ -54,6 +56,10 @@ impl SourceConnector for KafkaSource {
             input_mode,
         )
         .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        .with_replay_order(match replay_order {
+            KafkaReplayOrder::Unspecified => SourceReplayOrder::Unspecified,
+            KafkaReplayOrder::PartitionRounds => SourceReplayOrder::SingleChannelFixedBatches,
+        })
         .with_exact_delivery_certification())
     }
 

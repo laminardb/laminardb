@@ -43,6 +43,7 @@ impl KafkaSource {
                 })
                 .collect();
             let assigned_set: KafkaPartitionSet = assigned.iter().cloned().collect();
+            super::super::validate_round_inventory(config, &assigned_set)?;
             if let Some(unexpected) = self
                 .offsets
                 .to_topic_partition_list()
@@ -69,6 +70,7 @@ impl KafkaSource {
                     self.source_name.as_ref(),
                     resume_input_channels,
                     &assigned_set,
+                    config.replay_order,
                 )?;
                 validate_partition_baselines(resume_baselines, &assigned_set)?;
                 resume_baselines.clone()
@@ -88,8 +90,11 @@ impl KafkaSource {
                     "failed to install local guaranteed Kafka assignment: {error}"
                 ))
             })?;
-            self.manual_input_channels =
-                kafka_input_channels(self.source_name.as_ref(), &assigned_set)?;
+            self.manual_input_channels = kafka_input_channels(
+                self.source_name.as_ref(),
+                &assigned_set,
+                config.replay_order,
+            )?;
             self.manual_topic_partitions = assigned_set;
             self.manual_partition_baselines = baselines;
             info!(
@@ -216,6 +221,7 @@ impl KafkaSource {
                 self.source_name.as_ref(),
                 resume_input_channels,
                 &assigned_set,
+                self.config.replay_order,
             )?;
             validate_partition_baselines(resume_baselines, &assigned_set)?;
             if resume_baselines != &configured_baselines {
@@ -239,8 +245,11 @@ impl KafkaSource {
         consumer.assign(&assignment).map_err(|e| {
             ConnectorError::ConnectionFailed(format!("failed to assign specific offsets: {e}"))
         })?;
-        self.manual_input_channels =
-            kafka_input_channels(self.source_name.as_ref(), &assigned_set)?;
+        self.manual_input_channels = kafka_input_channels(
+            self.source_name.as_ref(),
+            &assigned_set,
+            self.config.replay_order,
+        )?;
         self.manual_topic_partitions = assigned_set;
         self.manual_partition_baselines = baselines;
         info!(
@@ -300,8 +309,11 @@ impl KafkaSource {
                 "failed to assign timestamp/checkpoint offsets: {e}"
             ))
         })?;
-        self.manual_input_channels =
-            kafka_input_channels(self.source_name.as_ref(), &assigned_set)?;
+        self.manual_input_channels = kafka_input_channels(
+            self.source_name.as_ref(),
+            &assigned_set,
+            self.config.replay_order,
+        )?;
         self.manual_topic_partitions = assigned_set;
         self.manual_partition_baselines = baselines;
         info!(
@@ -327,6 +339,7 @@ impl KafkaSource {
                 self.source_name.as_ref(),
                 resume_input_channels,
                 assigned_set,
+                self.config.replay_order,
             )?;
             validate_partition_baselines(resume_baselines, assigned_set)?;
             let low_watermarks = fetch_partition_low_watermarks(

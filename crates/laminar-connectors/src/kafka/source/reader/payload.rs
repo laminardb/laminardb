@@ -76,9 +76,7 @@ pub(super) fn build_reader_payload(
     capture_headers: bool,
     cached_topic: &mut Arc<str>,
     cached_topic_routes: &mut Option<Arc<[u32]>>,
-    reader_fault: &Arc<Mutex<Option<Arc<str>>>>,
-    data_ready: &Arc<Notify>,
-) -> Result<Option<KafkaPayload>, ()> {
+) -> Result<Option<KafkaPayload>, super::super::ConnectorError> {
     let Some(payload) = message.payload() else {
         return Ok(None);
     };
@@ -86,16 +84,9 @@ pub(super) fn build_reader_payload(
     if cached_topic.as_ref() != topic {
         if vnode_routing {
             let Some((canonical_topic, topic_routes)) = routes.get_key_value(topic) else {
-                warn!(
-                    topic,
-                    "Kafka reader received a topic outside its activated vnode inventory"
-                );
-                publish_reader_fault(
-                    reader_fault,
-                    data_ready,
-                    "payload topic is outside the activated inventory",
-                );
-                return Err(());
+                return Err(super::super::ConnectorError::Internal(
+                    "payload topic is outside the activated inventory".into(),
+                ));
             };
             *cached_topic = Arc::clone(canonical_topic);
             *cached_topic_routes = Some(Arc::clone(topic_routes));
@@ -105,23 +96,13 @@ pub(super) fn build_reader_payload(
         }
     }
     let partition_vnode =
-        match cached_partition_vnode(cached_topic_routes.as_deref(), message.partition()) {
-            Ok(vnode) => vnode,
-            Err(error) => {
-                warn!(
-                    topic,
-                    partition = message.partition(),
-                    %error,
-                    "Kafka reader rejected a payload outside its activated vnode inventory"
-                );
-                publish_reader_fault(
-                    reader_fault,
-                    data_ready,
-                    format!("payload route is outside the activated inventory: {error}"),
-                );
-                return Err(());
-            }
-        };
+        cached_partition_vnode(cached_topic_routes.as_deref(), message.partition()).map_err(
+            |error| {
+                super::super::ConnectorError::Internal(format!(
+                    "payload route is outside the activated inventory: {error}"
+                ))
+            },
+        )?;
     let timestamp_ms = match message.timestamp() {
         rdkafka::Timestamp::CreateTime(timestamp)
         | rdkafka::Timestamp::LogAppendTime(timestamp) => Some(timestamp),

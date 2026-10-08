@@ -24,7 +24,14 @@ pub(super) fn sealed_position() -> SourceCheckpoint {
         &inventory,
     );
     checkpoint
-        .set_input_channels(kafka_input_channels("added_source", &inventory).unwrap())
+        .set_input_channels(
+            kafka_input_channels(
+                "added_source",
+                &inventory,
+                super::super::KafkaReplayOrder::Unspecified,
+            )
+            .unwrap(),
+        )
         .unwrap();
     checkpoint
 }
@@ -32,8 +39,13 @@ pub(super) fn sealed_position() -> SourceCheckpoint {
 #[test]
 fn topology_restore_kafka_preserves_sealed_offsets_as_the_log_advances() {
     let checkpoint = sealed_position();
-    let baselines =
-        validate_sealed_position(&checkpoint, "added_source", &["events".into()]).unwrap();
+    let baselines = validate_sealed_position(
+        &checkpoint,
+        "added_source",
+        &["events".into()],
+        super::super::KafkaReplayOrder::Unspecified,
+    )
+    .unwrap();
     assert_eq!(baselines[&("events".into(), 0)], 91);
     assert_eq!(baselines[&("events".into(), 1)], 0);
     for (next, low, high) in [(91, 7, 123), (0, 0, 0), (91, 91, 123)] {
@@ -67,7 +79,13 @@ async fn topology_restore_kafka_rejects_malformed_or_owned_cursors_before_native
     request.set("topic", "events");
     request.set("startup.mode", "latest");
     for checkpoint in checkpoints {
-        assert!(validate_sealed_position(&checkpoint, "added_source", &["events".into()]).is_err());
+        assert!(validate_sealed_position(
+            &checkpoint,
+            "added_source",
+            &["events".into()],
+            super::super::KafkaReplayOrder::Unspecified
+        )
+        .is_err());
         assert!(source
             .validate_initial_position(&request, &checkpoint)
             .await

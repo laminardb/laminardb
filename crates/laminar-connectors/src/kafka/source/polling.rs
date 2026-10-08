@@ -32,6 +32,11 @@ impl KafkaSource {
         let Some(drained) = self.drain_reader_queue(limit)? else {
             return Ok(None);
         };
+        if self.config.replay_order == super::KafkaReplayOrder::PartitionRounds
+            && self.poll_payloads.len() != limit
+        {
+            return Ok(None);
+        }
         // Decode can await, so retain the immutable assignment cut by value and release its locks.
         let total_bytes = self.stage_poll_payloads(include_metadata, include_headers);
         self.reconcile_reader_control_state();
@@ -41,7 +46,11 @@ impl KafkaSource {
         }
 
         let output = self
-            .decode_poll_output(include_metadata, include_headers)
+            .decode_poll_output(
+                include_metadata,
+                include_headers,
+                drained.assignment.as_deref(),
+            )
             .await?;
         let num_rows = output.num_rows();
 
@@ -97,7 +106,7 @@ impl KafkaSource {
             let rotation_baselines = assignment
                 .as_deref()
                 .filter(|publication| !publication.baselines.is_empty());
-            self.apply_rotation_baseline_fence(rotation_baselines);
+            self.apply_rotation_baseline_fence(assignment.as_deref());
             let vnode_ownership = vnode_publication
                 .as_ref()
                 .map(|(published, self_id)| (published.owners(), *self_id));
@@ -140,6 +149,13 @@ impl KafkaSource {
         if self.applied_rotation_baseline_version == Some(publication.assignment_version) {
             return;
         }
+        if self.config.replay_order == super::KafkaReplayOrder::PartitionRounds {
+            self.poll_payloads.clear();
+        }
+        self.applied_rotation_baseline_version = Some(publication.assignment_version);
+        if publication.baselines.is_empty() {
+            return;
+        }
         let mut snapshot = lock_or_recover(&self.offset_snapshot);
         for (topic, partitions) in &publication.baselines {
             for partition in partitions.keys() {
@@ -147,7 +163,6 @@ impl KafkaSource {
                 snapshot.remove(topic, *partition);
             }
         }
-        self.applied_rotation_baseline_version = Some(publication.assignment_version);
     }
 
     fn try_take_reader_item(&mut self) -> Result<Option<KafkaReaderItem>, ConnectorError> {
@@ -196,6 +211,9 @@ impl KafkaSource {
                 ));
             }
             active.boundary = Some(boundary);
+            if self.config.replay_order == super::KafkaReplayOrder::PartitionRounds {
+                self.poll_payloads.clear();
+            }
             return Ok(QueueItemDecision::Boundary);
         };
 
@@ -244,7 +262,9 @@ impl KafkaSource {
         self.check_reader_health("polling source data")?;
 
         // Preserve allocations across polls and discard cursor state left by failed finalization.
-        self.poll_payloads.clear();
+        if self.config.replay_order == super::KafkaReplayOrder::Unspecified {
+            self.poll_payloads.clear();
+        }
         self.poll_payload_buf.clear();
         self.poll_payload_offsets.clear();
         self.poll_staged_offsets.clear();
@@ -252,13 +272,24 @@ impl KafkaSource {
         self.poll_meta_offsets.clear();
         self.poll_meta_timestamps.clear();
         self.poll_meta_headers.clear();
-        Ok(max_records.min(self.config.max_poll_records))
+        let limit = max_records.min(self.config.max_poll_records);
+        if self.config.replay_order == super::KafkaReplayOrder::PartitionRounds {
+            let count = self.manual_topic_partitions.len();
+            if count == 0 || count > limit {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "Kafka partition_rounds requires a poll capacity of at least {count} records (received {limit})"
+                )));
+            }
+            return Ok(count);
+        }
+        Ok(limit)
     }
 
     async fn decode_poll_output(
         &mut self,
         include_metadata: bool,
         include_headers: bool,
+        assignment: Option<&KafkaAssignmentPublication>,
     ) -> Result<SourceBatch, ConnectorError> {
         let (batch, good_indices) = self.decode_polled_payloads().await?;
         let (batch, mutations) = if self.config.format == Format::Debezium {
@@ -274,11 +305,24 @@ impl KafkaSource {
         } else {
             (batch, None)
         };
-        let row_positions = kafka_row_positions(
-            self.source_name.as_ref(),
-            &self.poll_staged_offsets,
-            good_indices.as_deref(),
-        )
+        let row_positions = match self.config.replay_order {
+            super::KafkaReplayOrder::Unspecified => kafka_row_positions(
+                self.source_name.as_ref(),
+                &self.poll_staged_offsets,
+                good_indices.as_deref(),
+            ),
+            super::KafkaReplayOrder::PartitionRounds => {
+                let channels = assignment.map_or(self.manual_input_channels.as_ref(), |cut| {
+                    cut.input_channels.as_ref()
+                });
+                let [channel] = channels else {
+                    return Err(ConnectorError::Internal(
+                        "Kafka partition_rounds has no single input channel".into(),
+                    ));
+                };
+                super::round_row_positions(channel, &self.poll_staged_offsets)
+            }
+        }
         .map_err(|error| {
             terminalize_guaranteed_poll_error(
                 self.delivery,

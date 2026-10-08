@@ -280,7 +280,12 @@ every owner and across recovery; the package hash does not attest system librari
 The code review must include native extension dependencies and lazy imports.
 
 The source must reproduce one physical channel in fixed replay batches with
-deterministic row positions and watermark cuts. Cluster startup registers the
+deterministic row positions and watermark cuts. Kafka JSON supplies this profile
+with `'replay.order' = 'partition_rounds'`, an explicit topic inventory and
+engine-owned numeric positions. Each complete round waits for one non-null record
+from every partition. Cluster input follows vnode zero; keyed computation remains
+distributed. See the [Kafka round profile](../../crates/laminar-connectors/README.md#kafka-partition-rounds).
+Cluster startup registers the
 same package on every owner before sealing its invocation DDL; source ownership
 must follow the certified assignment. Replay tests cover matching callback IDs,
 managed state and timers after worker restart and committed vnode rescale.
