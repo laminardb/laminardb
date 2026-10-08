@@ -678,9 +678,20 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
         ],
     );
     removal.expected_parent_version = TopologyVersion::new(2).unwrap();
-    Box::pin(fixture.db.submit_cluster_topology_change(&removal))
-        .await
-        .unwrap();
+    // The recovery monitor can still own the compiler after publishing Active.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match Box::pin(fixture.db.submit_cluster_topology_change(&removal)).await {
+                Err(DbError::Topology(TopologyError::PlanningBusy)) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("topology compiler did not become available for the removal")
+    .unwrap();
     active(&fixture, removal.operation_id).await;
     assert_eq!(fixture.db.catalog.list_sources(), ["added_source"]);
     assert!(!fixture
