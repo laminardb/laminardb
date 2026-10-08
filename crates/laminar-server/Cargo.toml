@@ -33,9 +33,9 @@ required-features = ["cluster", "aws", "kafka", "iceberg"]
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
-laminar-core = { path = "../laminar-core", version = "0.31.0" }
-laminar-db = { path = "../laminar-db", version = "0.31.0", default-features = false, features = ["api", "remote", "local"] }
-laminar-sql = { path = "../laminar-sql", version = "0.31.0" }
+laminar-core = { path = "../laminar-core", version = "0.32.0" }
+laminar-db = { path = "../laminar-db", version = "0.32.0", default-features = false, features = ["api", "remote", "local"] }
+laminar-sql = { path = "../laminar-sql", version = "0.32.0" }
 # Read-only Delta snapshot oracle for the ignored end-to-end EO soak.
 deltalake = { workspace = true, optional = true, features = ["rustls"] }
 
@@ -83,7 +83,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
 # pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
 # extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
-pgwire = { package = "laminardb-pgwire", path = "../../vendor/pgwire", version = "=0.31.0", default-features = false, features = [
+pgwire = { package = "laminardb-pgwire", path = "../../vendor/pgwire", version = "=0.32.0", default-features = false, features = [
     "server-api",
     "_aws-lc-rs",
     "pg-type-chrono",
@@ -143,7 +143,7 @@ rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 
 [dev-dependencies]
 # Exercise the existing Kafka initialization contract from the real-process soak.
-laminar-connectors = { path = "../laminar-connectors", version = "0.31.0", default-features = false }
+laminar-connectors = { path = "../laminar-connectors", version = "0.32.0", default-features = false }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
 sha2 = { workspace = true }

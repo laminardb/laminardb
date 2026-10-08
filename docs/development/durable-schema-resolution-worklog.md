@@ -1,6 +1,7 @@
 # Durable connector schema resolution
 
-Status: schema committed; replay validation complete with a remaining output gate, 2026-10-08.
+Status: 0.32.0 implementation ready for review; Delta temporal visibility gate
+remains a merge blocker, 2026-10-08.
 
 ## Baseline
 
@@ -16,7 +17,9 @@ Status: schema committed; replay validation complete with a remaining output gat
 
 ## Completed implementation
 
-Schema implementation is committed as `31071aaf`.
+Schema implementation is committed as `31071aaf`; the replay fix is `fa574082`.
+Owned Cargo packages, example packages, maintained pgwire forks and path
+requirements are bumped to 0.32.0. External dependencies are unchanged.
 
 - Inventory every registered direction/format and require factory capabilities.
   Reuse existing metadata APIs; distinguish explicit, built-in, metadata, query
@@ -43,7 +46,7 @@ protocol is introduced.
 
 ## Executed validation
 
-- Schema workspace gate: 6,302 passed, zero failed, five existing ignored;
+- Final 0.32.0 workspace gate: 6,307 passed, zero failed, five existing ignored;
   strict all-feature/all-target and no-default-feature Clippy passed.
 - Replay regressions: five real-operator tests pass, including 273 batches,
   result equivalence, fanout atomicity, byte limits and terminal retry/drain fencing.
@@ -72,9 +75,8 @@ Local MinIO and mocks do not qualify external cloud services or production SLOs.
 
 ## Next action and environment
 
-Commit the replay fix, bump owned Cargo packages to 0.32.0 and run final gates.
-The user has an optional scope question pending about the remaining temporal
-output investigation versus a draft PR with the failed gate documented.
+Open the requested PR as a draft with the failed temporal visibility gate
+documented. Resolve that gate before treating the change as ready to merge.
 Dependencies are cached offline; native Windows/Docker access uses approved
 sandbox escalation. Test services are isolated task fixtures. Logs are in
 `target/schema-resolution/` and `target/schema-kafka/`.

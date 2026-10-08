@@ -1,16 +1,19 @@
 # Durable schema resolution validation
 
-Status: in progress, 2026-10-08. This report records executed results; pending
-checks are not passes. Implementation and migration rules are in
+Status: implementation checks complete; Delta temporal visibility gate remains
+a merge blocker, 2026-10-08. This report records executed results; failed checks
+are not passes. Implementation and migration rules are in
 [SCHEMA_RESOLUTION.md](../SCHEMA_RESOLUTION.md), including the complete registered
 connector/direction/format matrix and SQL examples.
 
 ## Baseline and scope
 
 Starting commit: `009d8d5848cc380b1b125ac716afc5cada24dbfe`, initially clean `main`.
-Work is on `codex/durable-schema-resolution`. Dependency versions remain those
-recorded in the [worklog](durable-schema-resolution-worklog.md); there is no lockfile
-upgrade. Arrow schema serialization uses its existing supported serde feature.
+Work is on `codex/durable-schema-resolution`. The release bump updates owned
+Cargo packages and path requirements to `0.32.0`; the lockfile changes only the
+six workspace packages and two maintained pgwire forks. External dependency
+versions remain those recorded in the [worklog](durable-schema-resolution-worklog.md).
+Arrow schema serialization uses its existing supported serde feature.
 
 The change applies to embedded, single-node and cluster creation/replay. It
 retains each mode's existing delivery and SQL admission boundaries. Metadata is
@@ -53,16 +56,19 @@ approved sandbox escalation. Docker access likewise requires escalation.
 
 | Exact Cargo command (plus stated environment) | Executed outcome |
 | --- | --- |
-| `cargo +1.99.0 test --workspace --lib --offline -- --color never` | PASS: 6,302 tests (2,009 connectors, 1,140 core, 2,283 DB, 870 SQL), five existing ignored; log `linux-workspace-tests-14.txt`. |
-| `cargo +1.99.0 clippy --workspace --all-features --all-targets --offline -- -D warnings` | PASS after schema and replay edits: logs `linux-clippy-all-7.txt` and `linux-clippy-all-8.txt`. Earlier benchmark mutability/unit-value and test-module ordering errors were corrected. |
-| `cargo +1.99.0 clippy --workspace --no-default-features --offline -- -D warnings` | PASS: log `linux-clippy-minimal-3.txt`. |
-| `cargo +nightly fmt --all -- --check` | PASS after the final schema edits. |
+| `cargo +1.99.0 test --workspace --lib --offline -- --color never` | PASS at 0.32.0: 6,307 tests (2,009 connectors, 1,140 core, 2,288 DB, 870 SQL), five existing ignored; log `linux-workspace-tests-15.txt`. Includes all five replay regressions and durable terminal recovery coverage. |
+| `cargo +1.99.0 clippy --workspace --all-features --all-targets --offline -- -D warnings` | PASS at 0.32.0: log `linux-clippy-all-9.txt`. Earlier benchmark mutability/unit-value and test-module ordering errors were corrected. |
+| `cargo +1.99.0 clippy --workspace --no-default-features --offline -- -D warnings` | PASS at 0.32.0: log `linux-clippy-minimal-4.txt`. |
+| `cargo +nightly fmt --all -- --check` | PASS after the final implementation and 0.32.0 bump. |
 | `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .` | PASS: 18 module and 208 function exceptions; no exception grows. |
 | `cargo +1.99.0 test --workspace --lib --offline interval_output_admission -- --color never --nocapture` | PASS: all five real-operator replay admission regressions; log `linux-graph-focused-2.txt`. The first run exposed an incomplete event-time fixture, corrected without changing production validation. |
 | Current DB library test binary with filter `terminal --test-threads=1 --nocapture --color never` | PASS 76/76 in 1.58 s, including durable terminal authority and reopen prevention; log `linux-terminal-regressions-1.txt`. |
 | `cargo clippy -p laminar-connectors --no-default-features --features FEATURE --lib --offline --target-dir target/schema-kafka -- -D warnings` | All 13 executed isolated feature sets passed: `iceberg-core`, `iceberg-catalog-rest`, `iceberg-storage-fs`, `iceberg-gcs`, `iceberg-azure`, `delta-lake`, `delta-lake-s3`, `delta-lake-azure`, `delta-lake-gcs`, `kafka`, `postgres-cdc`, `postgres-sink`, `mongodb-cdc`. |
 
 Logs are in `target/schema-resolution/` and `target/schema-kafka/`.
+The final workspace, Clippy, formatting and readability gates ran after the
+version bump. Native integrations, examples, soaks and performance measurements
+preceded that package-version-only change; they were not rerun at 0.32.0.
 The published SQL examples passed all six cases in 7.95 s using:
 
 ```text
@@ -253,6 +259,14 @@ does not establish eventual completion or classify the remaining probes as lost.
 Log: `temporal-output-independent.txt`. The full Delta output visibility gate
 remains failed and is a release/merge limitation; it is not downgraded to an
 observational pass.
+
+Read-only inspection of the repeat's committed checkpoint 132 found both temporal
+source watermarks at `1791416558921`. The retained right-topic closing sentinel's
+temporal timestamp was `1791416560921`, exactly the configured two-second
+out-of-order allowance ahead. The durable frontier therefore includes that
+sentinel's progress. This does not identify the cause of the visibility delay
+or justify publishing a speculative temporal frontier. No ASOF runtime change
+was made. Logs: `checkpoint-frontier-inspection.txt` and `closing-sentinel.txt`.
 
 The exact replay-fix soak command is:
 

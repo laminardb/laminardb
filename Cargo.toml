@@ -20,7 +20,7 @@ resolver = "2"
 quick-xml = { path = "vendor/quick-xml" }
 
 [workspace.package]
-version = "0.31.0"
+version = "0.32.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"

@@ -5175,7 +5175,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "apache-avro",
  "arrow-array",
@@ -5252,7 +5252,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -5303,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5365,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-derive"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "laminar-connectors",
@@ -5377,7 +5377,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5441,7 +5441,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5466,7 +5466,7 @@ dependencies = [
 
 [[package]]
 name = "laminardb-pgwire"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -5496,7 +5496,7 @@ dependencies = [
 
 [[package]]
 name = "laminardb-pgwire-replication"
-version = "0.31.0"
+version = "0.32.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
