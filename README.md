@@ -162,6 +162,61 @@ PostgreSQL and MongoDB change-data-capture ingestion is not yet available as a s
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
 
+### Connector schemas
+
+You can omit source columns when the connector can read them from metadata, such as an Avro
+schema in Schema Registry or a Parquet file. Generators and OpenTelemetry have fixed schemas.
+JSON and CSV sources need declared columns unless file sampling is explicitly enabled.
+Sinks get their input fields from the source or stream they read. The query must fit the
+destination's fields and types; use aliases and casts in a stream to adjust the output.
+
+For example, if the `events` and `archive` topics already have Avro value schemas containing
+`id` and `label`, you can use them without repeating those fields in SQL:
+
+```sql
+CREATE SOURCE events FROM KAFKA (
+  'bootstrap.servers' = 'localhost:19092', 'topic' = 'events',
+  'group.id' = 'schema-example', 'schema.registry.url' = 'http://localhost:8081'
+) FORMAT AVRO;
+CREATE STREAM output AS SELECT label, id FROM events;
+CREATE SINK archive FROM output INTO KAFKA (
+  'bootstrap.servers' = 'localhost:19092', 'topic' = 'archive',
+  'schema.registry.url' = 'http://localhost:8081'
+) FORMAT AVRO;
+```
+
+By default, this reads the latest schema under each topic's `<topic>-value` subject once when
+you create the object. These settings control selection, sampling and external creation:
+
+| Setting | When to use it |
+|---|---|
+| `schema.registry.url` | Avro registry service URL, such as `http://localhost:8081`. Supply the service URL, not a subject or schema-resource URL. |
+| `schema.registry.value.subject` | Choose a value subject explicitly. Use it when multiple topics, a regex subscription or a naming strategy would make selection ambiguous. |
+| `schema.registry.value.version` or `schema.registry.value.id` | Pin a positive version or schema ID. Set one of these, not both. Without either, creation resolves latest once. |
+| `schema.registry.record.name` | Supply the record name when using the existing record-based subject naming strategies. An explicit value subject overrides subject derivation. |
+| `schema.registry.auto.register` | Defaults to `false`. Set it to `true` on a Kafka sink to permit registration during creation. Changing `schema.compatibility` also requires this permission. |
+| `schema.inference` | Defaults to `false`. Set it to `true` for CSV or JSON file sources to sample up to four files, 1 MiB and 1,000 rows within ten seconds. Empty or all-null samples fail; a sample cannot prove what future files will contain. |
+| `auto.create` | Defaults to `false` for Delta Lake, Iceberg and MongoDB sinks. Set it to `true` to permit creation of a missing destination. |
+| `auto.create.table` | Defaults to `false` for PostgreSQL sinks. Set it to `true` to permit creation of a missing table. |
+| `schema.evolution` | Keep it `false` for Delta sinks using durable schema contracts. Change an incompatible target through a controlled migration. |
+
+For instance, a local Delta sink may create its table when you ask it to:
+
+```sql
+CREATE SINK delta_out FROM output INTO "delta-lake"
+  ('table.path' = './delta-output', 'auto.create' = 'true');
+```
+
+Durable deployments save the resolved contract before starting the connector. Restarts reuse
+that contract, including the selected registry identity. Keep historical Avro writer schemas
+in the registry for replay. Connectivity, authorization and destination identity checks still
+apply after restart. Creating an external table or registering a schema can succeed before
+catalog publication fails, leaving an unused resource for you to review.
+
+Use `DESCRIBE events` to inspect resolved fields and their origin. The
+[schema guide](docs/SCHEMA_RESOLUTION.md) covers supported formats, mappings, recovery and
+migration. Schema discovery uses the existing deployment and delivery restrictions.
+
 ## AI functions
 
 SQL can call models to classify text, score sentiment, create embeddings, or generate text. For

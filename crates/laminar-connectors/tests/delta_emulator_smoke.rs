@@ -58,6 +58,7 @@ fn sink_config(
     let mut config = DeltaLakeSinkConfig::new(&context.test_url);
     config.write_mode = DeltaWriteMode::Append;
     config.delivery_guarantee = delivery_guarantee;
+    config.auto_create = true;
     config.storage_options.clone_from(&context.options);
     config
 }

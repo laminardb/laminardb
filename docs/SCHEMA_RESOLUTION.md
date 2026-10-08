@@ -1,6 +1,6 @@
 # Connector schema resolution
 
-Implementation contract for LaminarDB 0.31.0, updated 2026-10-07.
+Implementation contract for LaminarDB 0.32.0, updated 2026-10-08.
 
 Sources can omit columns when their connector has an authoritative metadata or
 protocol schema. Sinks derive their input fields from a named source or stream.
@@ -286,10 +286,8 @@ CREATE SOURCE json_events FROM FILES
   ('path' = './json-input', 'schema.inference' = 'true') FORMAT JSON;
 ```
 
-Factory and service conformance tests live in `schema_conformance.rs`,
-`schema_postgres_integration.rs`, `schema_mongodb_integration.rs` and the Kafka/
-Iceberg suites. See the [validation report](development/durable-schema-resolution-validation.md)
-for commands, executed outcomes, benchmark workload and remaining validation limits.
+The examples are exercised by `schema_sql_examples.rs`. Connector configuration
+and feature flags are listed in the [connector guide](../crates/laminar-connectors/README.md).
 
 Native semantics are checked against the installed libraries. Background references:
 [Confluent subject strategies and formats](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html),

@@ -2,8 +2,10 @@
 
 #![cfg(feature = "delta-lake-s3")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_schema::{DataType, Field, Schema};
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{DeliveryGuarantee, SinkConnector};
 use laminar_connectors::error::ConnectorError;
@@ -21,7 +23,8 @@ async fn custom_s3_endpoint_passes_admission_before_table_io() {
         .storage_options
         .insert("aws_conditional_put".into(), "etag".into());
 
-    let mut sink = DeltaLakeSink::new(config, None);
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let mut sink = DeltaLakeSink::with_schema(config, schema);
     let error = sink
         .open(&ConnectorConfig::new("delta-lake"))
         .await

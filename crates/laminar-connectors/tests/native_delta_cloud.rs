@@ -33,15 +33,17 @@ fn batch(ids: Vec<i64>) -> RecordBatch {
 fn config(url: &str) -> DeltaLakeSinkConfig {
     let mut config = DeltaLakeSinkConfig::new(url);
     config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
+    config.auto_create = true;
     config
 }
 
 async fn append(url: &str, ids: Vec<i64>) -> Result<(), ()> {
-    let mut sink = DeltaLakeSink::new(config(url), None);
+    let input = batch(ids);
+    let mut sink = DeltaLakeSink::with_schema(config(url), input.schema());
     sink.open(&ConnectorConfig::new("delta-lake"))
         .await
         .map_err(|_| ())?;
-    sink.write_batch(&batch(ids)).await.map_err(|_| ())?;
+    sink.write_batch(&input).await.map_err(|_| ())?;
     sink.flush().await.map_err(|_| ())?;
     sink.close().await.map_err(|_| ())
 }
