@@ -166,6 +166,8 @@ mode. See the [connector guide](crates/laminar-connectors/README.md) for those d
 
 You can omit source columns when the connector can read them from metadata, such as an Avro
 schema in Schema Registry or a Parquet file. Generators and OpenTelemetry have fixed schemas.
+For OpenTelemetry, leave `format` out of the TOML source and omit `FORMAT` in SQL; it uses
+the native OTLP protocol. Codec-based sources use their connector's default when `format` is omitted.
 JSON and CSV sources need declared columns unless file sampling is explicitly enabled.
 Sinks get their input fields from the source or stream they read. The query must fit the
 destination's fields and types; use aliases and casts in a stream to adjust the output.

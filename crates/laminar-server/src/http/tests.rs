@@ -1597,7 +1597,7 @@ async fn explicit_reload_commits_live_sections_but_retains_mixed_restart_only_ch
     current.sources.push(crate::config::SourceConfig {
         name: "removed_source".to_string(),
         connector: "kafka".to_string(),
-        format: "json".to_string(),
+        format: Some("json".to_string()),
         properties: toml::Table::new(),
         schema: vec![],
         primary_key: vec![],

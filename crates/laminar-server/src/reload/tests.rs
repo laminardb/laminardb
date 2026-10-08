@@ -23,7 +23,7 @@ fn make_source(name: &str) -> SourceConfig {
     SourceConfig {
         name: name.to_string(),
         connector: "kafka".to_string(),
-        format: "json".to_string(),
+        format: Some("json".to_string()),
         properties: toml::Table::new(),
         schema: vec![],
         primary_key: vec![],
@@ -199,13 +199,13 @@ fn test_diff_source_changed() {
     old.sources.push(make_source("s1"));
     let mut new = empty_config();
     let mut changed = make_source("s1");
-    changed.format = "avro".to_string();
+    changed.format = Some("avro".to_string());
     new.sources.push(changed);
     let diff = diff_configs(&old, &new);
     assert!(diff.sources_added.is_empty());
     assert!(diff.sources_removed.is_empty());
     assert_eq!(diff.sources_changed.len(), 1);
-    assert_eq!(diff.sources_changed[0].format, "avro");
+    assert_eq!(diff.sources_changed[0].format.as_deref(), Some("avro"));
 }
 
 #[test]
@@ -323,7 +323,7 @@ async fn test_apply_add_source() {
     diff.sources_added.push(SourceConfig {
         name: "test_src".to_string(),
         connector: "kafka".to_string(),
-        format: "json".to_string(),
+        format: Some("json".to_string()),
         properties: toml::Table::new(),
         schema: vec![ColumnDef {
             name: "id".to_string(),

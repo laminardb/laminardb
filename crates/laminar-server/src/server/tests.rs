@@ -990,7 +990,7 @@ fn make_source(name: &str, connector: &str) -> SourceConfig {
     SourceConfig {
         name: name.to_string(),
         connector: connector.to_string(),
-        format: "json".to_string(),
+        format: Some("json".to_string()),
         properties: toml::Table::new(),
         schema: vec![
             ColumnDef {
@@ -1097,35 +1097,35 @@ fn test_source_to_ddl_basic() {
     assert!(!ddl.contains("format ="));
 }
 
-/// Columnless OTel source + WATERMARK FOR must compose: the OTel
-/// connector implements `discover_schema` so the DDL layer can
-/// resolve columns before validating the watermark.
+#[test]
+fn test_source_to_ddl_omitted_format_uses_connector_default() {
+    let mut source = make_source("events", "kafka");
+    source.format = None;
+    let ddl = source_to_ddl(&source);
+    assert!(ddl.ends_with("FROM KAFKA"), "{ddl}");
+}
+
+/// Native OTel metadata resolves columns before watermark validation without a codec.
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn execute_config_ddl_columnless_otel_with_watermark_succeeds() {
-    let mut source = SourceConfig {
-        name: "otel_events".to_string(),
-        connector: "otel".to_string(),
-        format: "json".to_string(),
-        properties: toml::Table::new(),
-        schema: vec![],
-        primary_key: vec![],
-        watermark: Some(WatermarkConfig {
-            column: "_laminar_received_at".to_string(),
-            max_out_of_orderness: std::time::Duration::from_secs(10),
-        }),
-    };
-    // Bind to an ephemeral port so the test doesn't clash with 4317.
-    source
-        .properties
-        .insert("port".to_string(), toml::Value::String("0".to_string()));
-    source.properties.insert(
-        "signals".to_string(),
-        toml::Value::String("logs".to_string()),
-    );
+    let source: SourceConfig = toml::from_str(
+        r#"
+name = "otel_events"
+connector = "otel"
+[properties]
+port = 0
+signals = "logs"
+[watermark]
+column = "_laminar_received_at"
+max_out_of_orderness = "10s"
+"#,
+    )
+    .unwrap();
+    assert!(source.format.is_none());
 
     let db = laminar_db::LaminarDB::open().unwrap();
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         server: ServerSection::default(),
         checkpoint: CheckpointSection::default(),
         supervision: Default::default(),
@@ -1143,17 +1143,18 @@ async fn execute_config_ddl_columnless_otel_with_watermark_succeeds() {
     execute_config_ddl(&db, &config, false)
         .await
         .expect("columnless OTel + WATERMARK FOR should compose");
+    config.sources[0].name = "otel_json".to_string();
+    config.sources[0].format = Some("json".to_string());
+    let error = execute_config_ddl(&db, &config, false)
+        .await
+        .expect_err("OTLP cannot use an explicit JSON codec");
+    assert!(error.to_string().contains("fixed native protocol"));
 }
 
-/// Columnless Kafka source + WATERMARK FOR: the Kafka connector can't
-/// discover a schema without `bootstrap.servers` configured, so the DDL
-/// layer surfaces a "schema auto-discovery failed: …" error (or, when
-/// the connector returns no schema, "could not auto-discover a schema").
-/// The server no longer pre-empts this — we just check the error bubbles
-/// up clearly. Requires the kafka connector to be registered.
+/// Columnless source validation reaches DDL and preserves connector configuration errors.
 #[cfg(feature = "kafka")]
 #[tokio::test]
-async fn execute_config_ddl_columnless_kafka_surfaces_discovery_error() {
+async fn execute_config_ddl_columnless_kafka_preserves_connector_config_error() {
     let mut source = make_source("events", "kafka");
     source.schema.clear();
     source.watermark = Some(WatermarkConfig {
@@ -1180,10 +1181,9 @@ async fn execute_config_ddl_columnless_kafka_surfaces_discovery_error() {
     let err = execute_config_ddl(&db, &config, false).await.unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("schema auto-discovery failed")
-            || msg.contains("could not auto-discover a schema")
-            || msg.contains("no columns declared"),
-        "expected schema-discovery error from the DDL layer, got: {msg}"
+        msg.contains("source 'events' (kafka) schema resolution")
+            && msg.contains("missing required config: bootstrap.servers"),
+        "expected the connector configuration error from the DDL layer, got: {msg}"
     );
 }
 

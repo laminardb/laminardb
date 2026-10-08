@@ -690,8 +690,9 @@ pub struct SourceConfig {
     pub name: String,
     /// Connector type: "kafka", "postgres-cdc", "mongodb-cdc", "generator".
     pub connector: String,
-    #[serde(default = "default_format")]
-    pub format: String,
+    /// Serialization codec; omit it for connectors with a fixed native protocol.
+    #[serde(default)]
+    pub format: Option<String>,
     #[serde(default)]
     pub properties: toml::Table,
     #[serde(default)]
@@ -874,9 +875,6 @@ fn default_checkpoint_interval() -> Duration {
 }
 fn default_checkpoint_timeout() -> Duration {
     Duration::from_secs(120)
-}
-fn default_format() -> String {
-    "json".to_string()
 }
 fn default_max_ooo() -> Duration {
     Duration::from_secs(5)

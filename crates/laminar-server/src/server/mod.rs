@@ -606,6 +606,7 @@ fn connector_option_key_sql(key: &str) -> String {
     format!("\"{}\"", key.replace('"', "\"\""))
 }
 
+/// Builds source DDL without imposing a codec when none was configured.
 pub fn source_to_ddl(source: &SourceConfig) -> String {
     let mut parts = Vec::new();
     parts.push(format!("CREATE SOURCE {}", source.name));
@@ -654,10 +655,9 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
     } else {
         parts.push(format!("FROM {} ({})", connector_keyword, opts.join(", ")));
     }
-    parts.push(format!(
-        "FORMAT {}",
-        connector_sql_identifier(&source.format)
-    ));
+    if let Some(format) = &source.format {
+        parts.push(format!("FORMAT {}", connector_sql_identifier(format)));
+    }
 
     parts.join(" ")
 }

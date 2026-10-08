@@ -244,7 +244,7 @@ mod tests {
         original.sources.push(config::SourceConfig {
             name: "removed_source".to_string(),
             connector: "kafka".to_string(),
-            format: "json".to_string(),
+            format: Some("json".to_string()),
             properties: toml::Table::new(),
             schema: vec![],
             primary_key: vec![],
