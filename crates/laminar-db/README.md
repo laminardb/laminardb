@@ -69,7 +69,9 @@ Single-owner and multi-owner clusters admit native and loopback remote Rust at-l
 splittable placement and the same fixed-batch source profile. Register the deployment binding
 on every owner, then include `process_function_bootstrap_sql()` after source DDL and before
 consumers in the sealed startup catalog. Qualified supervised Python uses the same state and
-ownership lifecycle. Package drift, live catalog changes,
+ownership lifecycle. The server installs this binding from `[[process_function]]` and fences
+serving and intake on worker exit. Cluster timers follow committed watermark cuts; checkpoint
+frequency bounds their latency. Package drift, live catalog changes,
 exactly-once process delivery and distributed subscriptions over process output are rejected.
 See the [account activity example](../../examples/process_account).
 

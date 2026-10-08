@@ -375,6 +375,24 @@ pub(crate) async fn execute_config_ddl(
     for source in &config.sources {
         definitions.push(("source", source.name.clone(), source_to_ddl(source)));
     }
+    #[cfg(feature = "cluster")]
+    if cluster_bootstrap {
+        for process in &config.process_functions {
+            definitions.push((
+                "process source",
+                process.source.clone(),
+                process.source_sql.clone(),
+            ));
+            let sql = db
+                .process_function_bootstrap_sql(&process.output)
+                .map_err(|source| ServerError::Ddl {
+                    section: "process binding".into(),
+                    name: process.output.clone(),
+                    source: Box::new(source),
+                })?;
+            definitions.push(("process binding", process.output.clone(), sql));
+        }
+    }
     for lookup in &config.lookups {
         definitions.push(("lookup", lookup.name.clone(), lookup_to_ddl(lookup)?));
     }

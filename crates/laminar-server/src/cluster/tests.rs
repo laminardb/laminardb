@@ -465,7 +465,14 @@ async fn terminal_process_signal_preempts_the_os_shutdown_wait() {
 
     let trigger = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &[]),
+        wait_for_cluster_shutdown_trigger(
+            &terminal,
+            &leader_lease,
+            &api_handle,
+            &[],
+            #[cfg(feature = "process-remote")]
+            &[],
+        ),
     )
     .await
     .expect("terminal process signal must wake shutdown promptly")
@@ -486,7 +493,14 @@ async fn exited_http_api_triggers_cluster_runtime_shutdown() {
 
     let trigger = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &[]),
+        wait_for_cluster_shutdown_trigger(
+            &terminal,
+            &leader_lease,
+            &api_handle,
+            &[],
+            #[cfg(feature = "process-remote")]
+            &[],
+        ),
     )
     .await
     .expect("an exited HTTP API task must wake cluster shutdown")
@@ -507,7 +521,14 @@ async fn exited_leader_lease_manager_triggers_cluster_runtime_shutdown() {
 
     let trigger = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &[]),
+        wait_for_cluster_shutdown_trigger(
+            &terminal,
+            &leader_lease,
+            &api_handle,
+            &[],
+            #[cfg(feature = "process-remote")]
+            &[],
+        ),
     )
     .await
     .expect("an exited leader lease manager must wake cluster shutdown")
@@ -529,7 +550,14 @@ async fn exited_rebalance_task_triggers_cluster_runtime_shutdown() {
 
     let trigger = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &rebalance_tasks),
+        wait_for_cluster_shutdown_trigger(
+            &terminal,
+            &leader_lease,
+            &api_handle,
+            &rebalance_tasks,
+            #[cfg(feature = "process-remote")]
+            &[],
+        ),
     )
     .await
     .expect("an exited rebalance control task must wake cluster shutdown")
@@ -555,7 +583,14 @@ async fn shutdown_trigger_prefers_process_lease_loss_when_every_trigger_is_ready
 
     let trigger = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &rebalance_tasks),
+        wait_for_cluster_shutdown_trigger(
+            &terminal,
+            &leader_lease,
+            &api_handle,
+            &rebalance_tasks,
+            #[cfg(feature = "process-remote")]
+            &[],
+        ),
     )
     .await
     .expect("a ready shutdown trigger must be selected promptly")
@@ -882,6 +917,8 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
         process_lease,
         rebalance_tasks: vec![rebalance_task],
         rebalance_shutdown: tokio_util::sync::CancellationToken::new(),
+        #[cfg(feature = "process-remote")]
+        process_workers: Vec::new(),
     };
     assert!(controller.process_lease_is_live());
 

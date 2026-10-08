@@ -141,11 +141,24 @@ fn collect_process_function_errors(config: &ServerConfig, errors: &mut Vec<Strin
     if config.process_functions.len() > 32 {
         errors.push("at most 32 process functions may be configured per server".to_string());
     }
-    if config.server.mode != ServerMode::Single {
-        errors.push("process functions require single-node server mode".to_string());
-    }
-    if config.server.delivery != DeliveryGuarantee::BestEffort {
-        errors.push("process functions currently require best_effort delivery".to_string());
+    match (config.server.mode, config.server.delivery) {
+        (ServerMode::Single, DeliveryGuarantee::BestEffort) => {}
+        (_, DeliveryGuarantee::AtLeastOnce) => {
+            if !cfg!(target_os = "linux")
+                || config
+                    .process_functions
+                    .iter()
+                    .any(|entry| entry.runtime_root.is_none())
+            {
+                errors.push("at_least_once Python process functions require Linux and a bound runtime_root in a read-only image".into());
+            }
+        }
+        (ServerMode::Cluster, DeliveryGuarantee::BestEffort) => {
+            errors.push("cluster process functions require at_least_once delivery".into());
+        }
+        (_, DeliveryGuarantee::ExactlyOnce) => {
+            errors.push("process functions do not support exactly_once delivery".into());
+        }
     }
     if !cfg!(feature = "process-remote") {
         errors.push("process functions require the server process-remote feature".to_string());

@@ -145,7 +145,8 @@ is observed by the server even without another call. The server revokes serving,
 stops the database and exits with an error after either loss. A process manager
 can restart the entire server with the same checkpoint and artifacts. There is
 no in-place worker replacement, and uncommitted direct-source input is lost.
-Cluster mode remains rejected. The HTTP control API uses the
+For replayable server input, use the [replay-safe Linux deployment](#replay-safe-linux-deployment)
+profile below. The HTTP control API uses the
 existing console bearer token policy; configure `server.console_token` before
 binding it beyond loopback.
 
@@ -256,8 +257,8 @@ complete immutable dependency closure. This environment binding alone supports
 
 ### Replay-safe Linux deployment
 
-The Rust library also admits supervised Python with `AtLeastOnce` delivery in
-embedded and cluster mode when the manifest declares `"determinism":"replay_safe"`.
+The Rust library and server admit supervised Python with `AtLeastOnce` delivery in
+embedded, single-node and cluster mode when the manifest declares `"determinism":"replay_safe"`.
 This is a reviewed trusted-code contract: results must depend only on activations
 and managed state. The handler must not read external data, use wall-clock time
 or randomness, perform external writes, or keep business state in worker globals.
@@ -289,7 +290,15 @@ Cluster startup registers the
 same package on every owner before sealing its invocation DDL; source ownership
 must follow the certified assignment. Replay tests cover matching callback IDs,
 managed state and timers after worker restart and committed vnode rescale.
-Exactly-once process delivery and cluster server configuration remain rejected.
+For server deployments, set `server.delivery = "at_least_once"` and configure the
+same `[[process_function]]` package on every owner. Its `source_sql` supplies the
+replayable source; a configured sink must support durable at-least-once delivery.
+Cluster mode uses a shared checkpoint URL. The server binds workers before sealing
+the startup catalog and fences intake and serving if a worker exits, including
+while idle. A process manager can restart with the same package and committed
+checkpoints. Cluster timers advance from committed watermark cuts, so checkpoint
+frequency also bounds timer latency. Uncommitted output may be replayed.
+Exactly-once process delivery remains rejected.
 Windows and macOS retain the best-effort profile.
 
 To run the environment-bound Rust regressions, set `LAMINAR_PROCESS_PYTHON` to

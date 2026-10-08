@@ -1,11 +1,14 @@
-//! Offline Python process-function bindings for the single-node server.
+//! Offline Python process-function bindings and worker lifecycle for server deployments.
 
 use std::path::{Path, PathBuf};
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt as _;
 use laminar_db::process_function::remote::{LocalPythonWorker, LocalPythonWorkerConfig};
-use laminar_db::{ExecuteResult, LaminarDB};
+use laminar_db::LaminarDB;
+use laminar_sql::parser::StreamingStatement;
 
-use crate::config::{ProcessFunctionConfig, ServerConfig};
+use crate::config::{ProcessFunctionConfig, ServerConfig, ServerMode};
 use crate::server::ServerError;
 
 pub(crate) async fn install(
@@ -24,7 +27,7 @@ pub(crate) async fn install(
         .to_path_buf();
     let mut workers = Vec::with_capacity(config.process_functions.len());
     for entry in &config.process_functions {
-        match install_one(db, entry, &config_dir).await {
+        match install_one(db, entry, &config_dir, config.server.mode).await {
             Ok(worker) => workers.push(worker),
             Err(primary) => {
                 return match shutdown(workers).await {
@@ -43,32 +46,17 @@ async fn install_one(
     db: &LaminarDB,
     entry: &ProcessFunctionConfig,
     config_dir: &Path,
+    mode: ServerMode,
 ) -> Result<LocalPythonWorker, ServerError> {
-    // One statement prevents a config binding from running unrelated DDL before validation.
-    let source_sql = entry.source_sql.trim().trim_end_matches(';').trim();
-    if source_sql.contains(';') {
-        return Err(ServerError::Build(format!(
-            "process output '{}': source_sql must contain one CREATE SOURCE statement",
-            entry.output
-        )));
-    }
-    let source = db
-        .execute(source_sql)
-        .await
-        .map_err(|source| ServerError::Ddl {
-            section: "process source".into(),
-            name: entry.source.clone(),
-            source: Box::new(source),
-        })?;
-    match source {
-        ExecuteResult::Ddl(info)
-            if info.statement_type == "CREATE SOURCE" && info.object_name == entry.source => {}
-        _ => {
-            return Err(ServerError::Build(format!(
-                "process output '{}': source_sql must create source '{}'",
-                entry.output, entry.source
-            )));
-        }
+    let source_sql = validate_source_sql(entry)?;
+    if mode == ServerMode::Single {
+        db.execute(source_sql)
+            .await
+            .map_err(|source| ServerError::Ddl {
+                section: "process source".into(),
+                name: entry.source.clone(),
+                source: Box::new(source),
+            })?;
     }
 
     let python = if entry.runtime_root.is_none() && entry.python.components().count() == 1 {
@@ -115,12 +103,50 @@ async fn install_one(
     Ok(worker)
 }
 
+fn validate_source_sql(entry: &ProcessFunctionConfig) -> Result<&str, ServerError> {
+    let sql = entry.source_sql.trim().trim_end_matches(';').trim();
+    let statements = laminar_sql::parse_streaming_sql(sql).map_err(|error| {
+        ServerError::Build(format!(
+            "process output '{}': source_sql must contain one CREATE SOURCE statement: {error}",
+            entry.output
+        ))
+    })?;
+    let [StreamingStatement::CreateSource(source)] = statements.as_slice() else {
+        return Err(ServerError::Build(format!(
+            "process output '{}': source_sql must contain one CREATE SOURCE statement",
+            entry.output
+        )));
+    };
+    if source.name.to_string() != entry.source {
+        return Err(ServerError::Build(format!(
+            "process output '{}': source_sql must create source '{}'",
+            entry.output, entry.source
+        )));
+    }
+    Ok(sql)
+}
+
 fn resolve(config_dir: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
         config_dir.join(path)
     }
+}
+
+pub(crate) async fn wait_for_exit(workers: &[LocalPythonWorker]) -> Option<usize> {
+    if workers.is_empty() {
+        return std::future::pending().await;
+    }
+    let mut exits = workers
+        .iter()
+        .enumerate()
+        .map(|(index, worker)| async move {
+            worker.wait_for_exit().await;
+            index
+        })
+        .collect::<FuturesUnordered<_>>();
+    exits.next().await
 }
 
 pub(crate) async fn shutdown(workers: Vec<LocalPythonWorker>) -> Result<(), String> {

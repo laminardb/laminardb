@@ -785,7 +785,7 @@ pub struct SinkConfig {
 pub struct ProcessFunctionConfig {
     pub source: String,
     pub output: String,
-    /// One `CREATE SOURCE` statement, executed before worker registration.
+    /// One `CREATE SOURCE` statement, installed before its process invocation DDL.
     pub source_sql: String,
     pub manifest: std::path::PathBuf,
     pub handler_file: std::path::PathBuf,

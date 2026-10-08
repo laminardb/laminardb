@@ -19,6 +19,14 @@ mod bootstrap;
 mod control_kv;
 mod discovery;
 mod leases;
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "process-remote",
+    feature = "kafka",
+    feature = "aws"
+))]
+mod process_worker_tests;
 #[cfg(all(test, feature = "aws"))]
 mod recovery_round_tests;
 mod services;
@@ -93,6 +101,8 @@ pub struct ClusterHandle {
     rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Persistent shutdown signal shared with [`Self::rebalance_tasks`].
     rebalance_shutdown: tokio_util::sync::CancellationToken,
+    #[cfg(feature = "process-remote")]
+    process_workers: Vec<laminar_db::process_function::remote::LocalPythonWorker>,
 }
 
 /// Stable numeric identity shared by cluster runtime and offline checkpoint validation.

@@ -3,10 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "process-remote")]
-use futures::stream::FuturesUnordered;
-#[cfg(feature = "process-remote")]
-use futures::StreamExt as _;
 use tracing::{info, warn};
 
 use super::{wait_for_termination_signal, ServerError, SingleServerRuntime};
@@ -40,21 +36,9 @@ impl SingleServerRuntime {
     pub(super) async fn wait_for_shutdown(&mut self) -> Result<(), ServerError> {
         #[cfg(feature = "process-remote")]
         let termination = {
-            let worker_exit = async {
-                let mut exits = self
-                    .process_workers
-                    .iter()
-                    .enumerate()
-                    .map(|(index, worker)| async move {
-                        worker.wait_for_exit().await;
-                        index
-                    })
-                    .collect::<FuturesUnordered<_>>();
-                exits.next().await
-            };
             tokio::select! {
                 result = wait_for_termination_signal() => result.map(|()| None),
-                index = worker_exit, if !self.process_workers.is_empty() => Ok(index),
+                index = crate::process_functions::wait_for_exit(&self.process_workers) => Ok(index),
             }
         };
         #[cfg(not(feature = "process-remote"))]

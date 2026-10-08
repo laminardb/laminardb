@@ -396,6 +396,8 @@ pub(super) async fn open_cluster_serving(
     runtime: ConstructedClusterRuntime,
     mut gate: LeaderGate,
     mut launch: ServingLaunch,
+    #[cfg(feature = "process-remote")]
+    workers: &[laminar_db::process_function::remote::LocalPythonWorker],
 ) -> Result<ClusterHandle, ClusterStartupError> {
     let ConstructedClusterRuntime {
         db,
@@ -447,8 +449,13 @@ pub(super) async fn open_cluster_serving(
     // watcher grants ownership.
     let api_exited_before_serving = api_handle.is_finished();
     let process_lease_lost_before_serving = !process_lease.is_live();
+    #[cfg(feature = "process-remote")]
+    let process_worker_exited = workers.iter().any(|worker| !worker.is_alive());
+    #[cfg(not(feature = "process-remote"))]
+    let process_worker_exited = false;
     if api_exited_before_serving
         || process_lease_lost_before_serving
+        || process_worker_exited
         || !app_state.open_startup_gate()
     {
         PostActiveFailure::new(
@@ -475,6 +482,8 @@ pub(super) async fn open_cluster_serving(
             "HTTP API server exited before serving authority opened"
         } else if process_lease_lost_before_serving {
             "stable node identity lease was lost before HTTP serving authority opened"
+        } else if process_worker_exited {
+            "process worker exited before HTTP serving authority opened"
         } else {
             "HTTP serving gate could not be opened"
         };
@@ -503,5 +512,7 @@ pub(super) async fn open_cluster_serving(
         process_lease: identity.process_lease,
         rebalance_tasks: rebalance.tasks,
         rebalance_shutdown: rebalance.shutdown,
+        #[cfg(feature = "process-remote")]
+        process_workers: Vec::new(),
     })
 }

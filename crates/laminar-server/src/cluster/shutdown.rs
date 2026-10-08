@@ -31,6 +31,7 @@ pub(super) enum ClusterShutdownTrigger {
     LeaderLeaseExited,
     HttpApiExited,
     RebalanceTaskExited,
+    ProcessWorkerExited,
 }
 
 pub(super) async fn wait_for_cluster_shutdown_trigger(
@@ -38,7 +39,13 @@ pub(super) async fn wait_for_cluster_shutdown_trigger(
     leader_lease: &LeaderLeaseRuntime,
     api_handle: &tokio::task::JoinHandle<()>,
     rebalance_tasks: &[tokio::task::JoinHandle<()>],
+    #[cfg(feature = "process-remote")]
+    workers: &[laminar_db::process_function::remote::LocalPythonWorker],
 ) -> Result<ClusterShutdownTrigger, ClusterStartupError> {
+    #[cfg(feature = "process-remote")]
+    let worker_exit = crate::process_functions::wait_for_exit(workers);
+    #[cfg(not(feature = "process-remote"))]
+    let worker_exit = std::future::pending::<Option<usize>>();
     tokio::select! {
         biased;
         () = terminal.cancelled() => Ok(ClusterShutdownTrigger::ProcessLeaseLost),
@@ -50,6 +57,9 @@ pub(super) async fn wait_for_cluster_shutdown_trigger(
         }
         () = wait_for_rebalance_task_exit(rebalance_tasks), if !rebalance_tasks.is_empty() => {
             Ok(ClusterShutdownTrigger::RebalanceTaskExited)
+        }
+        _ = worker_exit => {
+            Ok(ClusterShutdownTrigger::ProcessWorkerExited)
         }
         signal = crate::server::wait_for_termination_signal() => {
             signal.map_err(|e| {
@@ -233,6 +243,8 @@ impl ClusterHandle {
             &self.leader_lease,
             &self.api_handle,
             &self.rebalance_tasks,
+            #[cfg(feature = "process-remote")]
+            &self.process_workers,
         )
         .await?;
         let runtime_failure = match shutdown_trigger {
@@ -242,6 +254,9 @@ impl ClusterHandle {
             ClusterShutdownTrigger::HttpApiExited => Some("HTTP API server exited unexpectedly"),
             ClusterShutdownTrigger::RebalanceTaskExited => {
                 Some("rebalance control task exited unexpectedly")
+            }
+            ClusterShutdownTrigger::ProcessWorkerExited => {
+                Some("process worker exited unexpectedly")
             }
             ClusterShutdownTrigger::Signal | ClusterShutdownTrigger::ProcessLeaseLost => None,
         };
@@ -288,7 +303,11 @@ impl ClusterHandle {
             if !runtime_tasks_clean {
                 warn!("Cluster runtime cleanup was incomplete after a runtime task failure");
             }
-            Err(ClusterStartupError::EngineShutdown(runtime_failure.into()))
+            let message = match shutdown_result {
+                Ok(()) => runtime_failure.into(),
+                Err(cleanup) => format!("{runtime_failure}; cleanup: {cleanup}"),
+            };
+            Err(ClusterStartupError::EngineShutdown(message))
         } else if authority_lost {
             if let Err(error) = &shutdown_result {
                 warn!(%error, "Database shutdown after authority loss failed");
@@ -495,6 +514,20 @@ async fn teardown_runtime_and_database(
         Some(result) => result,
         None => shutdown.await,
     };
+    handle.db_shutdown_complete = shutdown_result.is_ok();
+    #[cfg(feature = "process-remote")]
+    let shutdown_result =
+        match crate::process_functions::shutdown(std::mem::take(&mut handle.process_workers)).await
+        {
+            Ok(()) => shutdown_result,
+            Err(cleanup) => {
+                let message = match shutdown_result {
+                    Ok(()) => format!("process worker cleanup: {cleanup}"),
+                    Err(primary) => format!("{primary}; process worker cleanup: {cleanup}"),
+                };
+                Err(laminar_db::DbError::Pipeline(message))
+            }
+        };
 
     // A graceful stop lets checkpoint tails settle before withdrawing discovery. Terminal
     // lease loss does the reverse: stop all external admission and advertisement first.
@@ -507,7 +540,6 @@ async fn teardown_runtime_and_database(
         )
         .await;
     }
-    handle.db_shutdown_complete = shutdown_result.is_ok();
     (shutdown_result, runtime_tasks_clean, authority_lost)
 }
 

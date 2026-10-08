@@ -623,22 +623,59 @@ pub async fn start_cluster(
     let runtime =
         construct_cluster_runtime(&config, &cluster_cfg, &prepared, &mut identity, &mut formed)
             .await?;
-    let gate = install_leader_lease_and_bootstrap_catalog(
-        &config,
-        &cluster_cfg,
-        &mut identity,
-        &runtime,
-        &mut formed.discovery,
-    )
-    .await?;
-    activate_cluster_serving(
-        prepared.node_id_str,
-        config,
-        config_path,
-        formed,
-        identity,
-        runtime,
-        gate,
-    )
-    .await
+    #[cfg(feature = "process-remote")]
+    let workers = match crate::process_functions::install(&runtime.db, &config, &config_path).await
+    {
+        Ok(workers) => workers,
+        Err(primary) => {
+            let mut message = primary.to_string();
+            identity.process_lease.fence_authority();
+            runtime.db.fence_cluster_startup();
+            runtime.db.revoke_cluster_authority();
+            if let Err(error) = runtime.db.shutdown().await {
+                message.push_str(&format!("; database cleanup: {error}"));
+            }
+            if !stop_discovery_with_bound(&mut formed.discovery).await {
+                message.push_str("; discovery cleanup did not complete");
+            }
+            return Err(ClusterStartupError::EngineConstruction(message));
+        }
+    };
+    let started = async {
+        let gate = install_leader_lease_and_bootstrap_catalog(
+            &config,
+            &cluster_cfg,
+            &mut identity,
+            &runtime,
+            &mut formed.discovery,
+        )
+        .await?;
+        activate_cluster_serving(
+            config,
+            config_path,
+            formed,
+            identity,
+            runtime,
+            gate,
+            #[cfg(feature = "process-remote")]
+            &workers,
+        )
+        .await
+    }
+    .await;
+    #[cfg(feature = "process-remote")]
+    return match started {
+        Ok(mut handle) => {
+            handle.process_workers = workers;
+            Ok(handle)
+        }
+        Err(primary) => match crate::process_functions::shutdown(workers).await {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(ClusterStartupError::EngineConstruction(format!(
+                "{primary}; process worker cleanup: {cleanup}"
+            ))),
+        },
+    };
+    #[cfg(not(feature = "process-remote"))]
+    started
 }

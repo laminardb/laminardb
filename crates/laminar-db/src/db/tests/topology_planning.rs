@@ -19,6 +19,54 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use super::*;
 use crate::{ClusterTopologyObjectTransition, TopologyInitialization, TopologyValidationScope};
 
+#[cfg(feature = "kafka")]
+#[tokio::test]
+async fn isolated_catalog_resolves_installed_process_output_for_sink_admission() {
+    use crate::process_function::tests::{descriptor, AccountActivity};
+
+    let base = LaminarDB::builder()
+        .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    let candidate = base.isolated_topology_catalog().unwrap();
+    candidate
+        .register_native_process_function(
+            "activity",
+            "events",
+            descriptor(),
+            Arc::new(AccountActivity),
+        )
+        .await
+        .unwrap();
+    let definitions = [
+        "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+         ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+         FROM KAFKA ('bootstrap.servers' = '127.0.0.1:1', 'group.id' = 'cold-plan', \
+         'topic' = 'events', 'startup.mode' = 'earliest', 'replay.order' = 'partition_rounds') FORMAT JSON".into(),
+        candidate.process_function_bootstrap_sql("activity").unwrap(),
+        "CREATE SINK activity_output FROM activity INTO KAFKA \
+         ('bootstrap.servers' = '127.0.0.1:1', 'topic' = 'activity_output') FORMAT JSON".into(),
+    ];
+    for sql in definitions {
+        let statement = laminar_sql::parse_streaming_sql(&sql).unwrap().remove(0);
+        CATALOG_BOOTSTRAP
+            .scope((), candidate.execute_parsed_single(&sql, &statement))
+            .await
+            .unwrap();
+    }
+    let plan = candidate.plan_topology_graph().await.unwrap();
+    assert_eq!(plan.schemas["activity"], descriptor().output_schema);
+    assert!(plan.connector_sha256.contains_key("activity_output"));
+    assert!(plan.operators.contains_key("activity"));
+    candidate.shutdown().await.unwrap();
+    base.shutdown().await.unwrap();
+}
+
 #[derive(Default)]
 struct RestoreValidationControl {
     block: std::sync::atomic::AtomicBool,

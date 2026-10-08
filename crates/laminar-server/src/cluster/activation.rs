@@ -799,14 +799,16 @@ async fn audit_certified_startup_assignment(
 }
 
 pub(super) async fn activate_cluster_serving(
-    node_id_str: String,
     config: ServerConfig,
     config_path: PathBuf,
     mut formed: FormedCluster,
     identity: AcquiredClusterIdentity,
     runtime: ConstructedClusterRuntime,
     mut gate: LeaderGate,
+    #[cfg(feature = "process-remote")]
+    workers: &[laminar_db::process_function::remote::LocalPythonWorker],
 ) -> Result<ClusterHandle, ClusterStartupError> {
+    let node_id_str = formed.local_node.name.clone();
     let leader_authority_timeout =
         verify_catalog_and_authority_budget(&runtime, &mut gate, &identity, &mut formed).await?;
 
@@ -847,6 +849,8 @@ pub(super) async fn activate_cluster_serving(
             app_state,
             leader_authority_timeout,
         },
+        #[cfg(feature = "process-remote")]
+        workers,
     )
     .await
 }

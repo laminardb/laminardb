@@ -92,13 +92,26 @@ impl LaminarDB {
             .await?;
         self.revalidate_persisted_cluster_query_shapes(&streams)
             .await?;
-        let resolved = super::resolve_stream_output_schemas(
+        let mut resolved = super::resolve_stream_output_schemas(
             &self.ctx,
             &streams,
             &rustc_hash::FxHashSet::default(),
             &interval.joins,
         )
         .await?;
+        for registration in self.connector_manager.lock().process_functions().values() {
+            if self
+                .catalog
+                .get_stream_entry(&registration.output_name)
+                .is_none()
+            {
+                continue;
+            }
+            resolved.schemas.insert(
+                registration.output_name.clone(),
+                Arc::clone(&registration.descriptor.output_schema),
+            );
+        }
         let mut connector_sha256 = BTreeMap::new();
         let mut source_input_modes = BTreeMap::new();
         let mut schemas: BTreeMap<_, _> = resolved
@@ -166,6 +179,48 @@ impl LaminarDB {
             source_input_modes.insert(name.clone(), contract.input_mode);
             schemas.insert(name, Arc::clone(&source.schema));
         }
+        connector_sha256.extend(
+            self.plan_topology_sinks(&sinks, &schemas, &resolved)
+                .await?,
+        );
+        if let Some((input, _)) = &restore {
+            self.bind_topology_subscriptions(&mut streams, input, &resolved.schemas)?;
+        }
+        let graph = if let Some((input, scope)) = restore {
+            self.build_topology_restore_operator_graph(
+                &streams,
+                &tables,
+                &resolved.changelog_carrying,
+                &interval.joins,
+                &input.descriptor().target_pipeline,
+                scope,
+            )?
+        } else {
+            self.build_connector_operator_graph(
+                &streams,
+                &tables,
+                &resolved.changelog_carrying,
+                &interval.joins,
+                None,
+            )?
+        };
+        self.initialize_topology_graph(
+            graph,
+            &resolved.schemas,
+            schemas,
+            connector_sha256,
+            source_input_modes,
+        )
+        .await
+    }
+
+    async fn plan_topology_sinks(
+        &self,
+        sinks: &std::collections::HashMap<String, crate::connector_manager::SinkRegistration>,
+        schemas: &BTreeMap<String, arrow_schema::SchemaRef>,
+        resolved: &super::output_schema::ResolvedStreamOutputs,
+    ) -> Result<BTreeMap<String, String>, DbError> {
+        let mut connector_sha256 = BTreeMap::new();
         let mut sink_names: Vec<_> = sinks.keys().collect();
         sink_names.sort_unstable();
         for name in sink_names {
@@ -241,35 +296,7 @@ impl LaminarDB {
                 ))?,
             );
         }
-        if let Some((input, _)) = &restore {
-            self.bind_topology_subscriptions(&mut streams, input, &resolved.schemas)?;
-        }
-        let graph = if let Some((input, scope)) = restore {
-            self.build_topology_restore_operator_graph(
-                &streams,
-                &tables,
-                &resolved.changelog_carrying,
-                &interval.joins,
-                &input.descriptor().target_pipeline,
-                scope,
-            )?
-        } else {
-            self.build_connector_operator_graph(
-                &streams,
-                &tables,
-                &resolved.changelog_carrying,
-                &interval.joins,
-                None,
-            )?
-        };
-        self.initialize_topology_graph(
-            graph,
-            &resolved.schemas,
-            schemas,
-            connector_sha256,
-            source_input_modes,
-        )
-        .await
+        Ok(connector_sha256)
     }
 
     async fn initialize_topology_graph(

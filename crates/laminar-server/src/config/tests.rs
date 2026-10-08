@@ -1827,7 +1827,7 @@ async fn materialized_view_memory_limits_reach_server_database() {
 }
 
 #[test]
-fn process_function_config_is_local_and_bounded() {
+fn process_function_config_bounds_and_delivery_are_explicit() {
     let mut config: ServerConfig = toml::from_str(
         r#"
 [server]
@@ -1881,13 +1881,27 @@ function = "handle"
     assert!(validate_process_functions(&config)
         .unwrap_err()
         .to_string()
-        .contains("single-node"));
+        .contains("at_least_once"));
     config.server.mode = ServerMode::Single;
     config.server.delivery = DeliveryGuarantee::AtLeastOnce;
     assert!(validate_process_functions(&config)
         .unwrap_err()
         .to_string()
-        .contains("best_effort"));
+        .contains("runtime_root"));
+    config.process_functions[0].runtime_root = Some("/image/runtime".into());
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        config.server.mode = mode;
+        assert_eq!(
+            validate_process_functions(&config).is_ok(),
+            cfg!(all(feature = "process-remote", target_os = "linux"))
+        );
+    }
+    config.server.delivery = DeliveryGuarantee::ExactlyOnce;
+    assert!(validate_process_functions(&config)
+        .unwrap_err()
+        .to_string()
+        .contains("exactly_once"));
+    config.server.mode = ServerMode::Single;
     config.server.delivery = DeliveryGuarantee::BestEffort;
     config.process_functions[0].max_in_flight = 33;
     assert!(validate_process_functions(&config)
