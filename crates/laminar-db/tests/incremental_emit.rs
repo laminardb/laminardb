@@ -401,9 +401,8 @@ async fn chained_projection_over_incremental_is_correct_under_updates() {
     db.shutdown().await.unwrap();
 }
 
-/// Guard: chained aggregates AND simple projections/filters over an incremental MV are allowed
-/// (they net the changelog); a complex shape (join) is rejected. Sinks are no longer rejected at
-/// DDL — capability is enforced at pipeline start (see `sink_from_incremental_mv_*`).
+/// Chained aggregates and projections/filters can consume an incremental MV's changelog.
+/// Joins and sinks without full changelog support are rejected during DDL admission.
 #[tokio::test]
 async fn terminality_guard_allows_agg_and_projection_rejects_join() {
     let dir = tempfile::tempdir().unwrap();
