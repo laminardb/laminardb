@@ -402,7 +402,7 @@ async fn chained_projection_over_incremental_is_correct_under_updates() {
 }
 
 /// Chained aggregates and projections/filters can consume an incremental MV's changelog.
-/// Joins and sinks without full changelog support are rejected during DDL admission.
+/// Joins are rejected during DDL; sink capabilities are checked before connector activation.
 #[tokio::test]
 async fn terminality_guard_allows_agg_and_projection_rejects_join() {
     let dir = tempfile::tempdir().unwrap();
@@ -488,10 +488,10 @@ async fn sink_from_nonincremental_mv_allows_noncapable_sink() {
     db.shutdown().await.ok();
 }
 
-/// Schema preparation follows retractions through a stream and rejects append-only sinks.
+/// Startup follows retractions through a stream and requires full changelog sink support.
 #[cfg(feature = "files")]
 #[tokio::test]
-async fn sink_over_changelog_stream_rejects_noncapable_sink_at_ddl() {
+async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
@@ -501,21 +501,21 @@ async fn sink_over_changelog_stream_rejects_noncapable_sink_at_ddl() {
     db.execute("CREATE STREAM s AS SELECT k, total FROM agg")
         .await
         .expect("stream over incremental MV");
+    db.execute(&format!(
+        "CREATE SINK f FROM s INTO FILES (path = '{}') FORMAT JSON",
+        out.display().to_string().replace('\\', "/")
+    ))
+    .await
+    .expect("CREATE SINK over the stream succeeds at DDL");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
     let error = db
-        .execute(&format!(
-            "CREATE SINK f FROM s INTO FILES (path = '{}') FORMAT JSON",
-            out.display().to_string().replace('\\', "/")
-        ))
+        .start()
         .await
         .expect_err("an append-only sink cannot consume stream retractions");
-    assert!(
-        matches!(error, DbError::Config(ref detail) if detail.contains("FullChangelog")),
-        "{error}"
-    );
-    assert!(db.sinks().is_empty());
+    let error = format!("{error:?}");
+    assert!(error.contains("LDB-1300"), "{error}");
     assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
-    db.start().await.unwrap();
-    db.shutdown().await.unwrap();
+    db.shutdown().await.ok();
 }
 
 /// Stateful joins over changelog-producing materialized views are not part of the single bounded
