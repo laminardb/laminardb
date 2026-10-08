@@ -24,7 +24,7 @@ use testcontainers::GenericImage;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
-use laminar_connectors::config::ConnectorConfig;
+use laminar_connectors::config::{encode_arrow_schema_ipc, ConnectorConfig};
 use laminar_connectors::connector::{
     DeliveryGuarantee, SinkConnector, SourceConnector, SourcePosition, SourceStart,
 };
@@ -773,7 +773,8 @@ async fn resume_token_can_cut_between_events_from_one_mongodb_transaction() {
 async fn sink_insert() {
     let (_container, uri) = start_mongo().await;
 
-    let config = MongoDbSinkConfig::new(&uri, "test_sink_insert", "out");
+    let mut config = MongoDbSinkConfig::new(&uri, "test_sink_insert", "out");
+    config.auto_create = true;
     let mut sink = MongoDbSink::new(sink_test_schema(), config, None);
     let connector_config = ConnectorConfig::new("mongodb-sink");
     sink.open(&connector_config).await.unwrap();
@@ -803,6 +804,7 @@ async fn sink_upsert() {
     let (_container, uri) = start_mongo().await;
 
     let mut config = MongoDbSinkConfig::new(&uri, "test_sink_upsert", "out");
+    config.auto_create = true;
     config.write_mode = WriteMode::Upsert {
         key_fields: vec!["_id".to_string()],
     };
@@ -857,6 +859,7 @@ async fn sink_upsert_collapses_zset_changelog() {
 
     let (_container, uri) = start_mongo().await;
     let mut config = MongoDbSinkConfig::new(&uri, "test_sink_zset", "out");
+    config.auto_create = true;
     config.write_mode = WriteMode::Upsert {
         key_fields: vec!["_id".to_string()],
     };
@@ -1036,6 +1039,55 @@ async fn timeseries_insert() {
     );
 
     sink.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeseries_bucket_uuid_fences_recreated_collection() {
+    let (_container, uri) = start_mongo().await;
+    let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
+    let database = client.database("test_ts_identity");
+    let create = doc! { "create": "metrics", "timeseries": { "timeField": "ts" } };
+    database.run_command(create.clone()).await.unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+        false,
+    )]));
+    let mut config = ConnectorConfig::new("mongodb-sink");
+    config.set("connection.uri", &uri);
+    config.set("database", database.name());
+    config.set("collection", "metrics");
+    config.set("timeseries.time_field", "ts");
+    config.set("_arrow_schema", encode_arrow_schema_ipc(&schema));
+    let parsed = MongoDbSinkConfig::from_config(&config).unwrap();
+    let mut sink = MongoDbSink::new(Arc::clone(&schema), parsed.clone(), None);
+    let binding = sink
+        .resolve_schema(&config, Arc::clone(&schema))
+        .await
+        .unwrap();
+    let identity = &binding.value.as_ref().unwrap().identity;
+    assert_eq!(identity["bucket_collection"], "system.buckets.metrics");
+    assert_eq!(
+        identity["collection_uuid"],
+        collection_uuid(&database, "system.buckets.metrics").await
+    );
+    config.set_schema_binding(binding).unwrap();
+    sink.open(&config).await.unwrap();
+    sink.close().await.unwrap();
+
+    database
+        .collection::<mongodb::bson::Document>("metrics")
+        .drop()
+        .await
+        .unwrap();
+    database.run_command(create).await.unwrap();
+    let mut recovered = MongoDbSink::new(schema, parsed, None);
+    let error = recovered.open(&config).await.unwrap_err();
+    assert!(matches!(
+        error,
+        laminar_connectors::error::ConnectorError::SchemaMismatch(_)
+    ));
 }
 
 // ── Update / Replace / Delete Source Tests ──
@@ -1307,6 +1359,7 @@ async fn sink_cdc_replay() {
     let schema = laminar_connectors::mongodb::mongodb_cdc_envelope_schema();
 
     let mut config = MongoDbSinkConfig::new(&uri, "test_cdc_replay", "replay_out");
+    config.auto_create = true;
     config.write_mode = WriteMode::CdcReplay;
     let mut sink = MongoDbSink::new(schema.clone(), config, None);
     let connector_config = ConnectorConfig::new("mongodb-sink");

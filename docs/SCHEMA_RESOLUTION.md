@@ -41,7 +41,7 @@ limitation before activation.
 | `files` | Sink | JSON, CSV, text, Parquet, Arrow IPC | Bound query | New writer needs no fictional remote schema; existing binary dataset must be compatible; one OS writer lease per output prefix |
 | `mongodb-cdc` | Streaming source | Fixed change-stream JSON envelope | Metadata | Deployment and collection UUID; existing resume/post-image and delivery restrictions remain |
 | `mongodb` | Lookup source | BSON collection validator | Closed flat validator, otherwise explicit projection | Collection UUID and validator retained; supported scalar types only; unique single-column key/index separately validated |
-| `mongodb-sink` | Sink | BSON query writer plus collection validator | Bound query | Collection UUID; flat validator checks; explicit `auto.create` for a missing standard collection; explicit time-series settings retain their existing preparation policy |
+| `mongodb-sink` | Sink | BSON query writer plus collection validator | Bound query | Standard collection UUID or explicit time-series bucket UUID; flat validator checks; explicit `auto.create` for a missing standard collection; explicit time-series settings retain their existing preparation policy |
 | `nats` | Streaming source | JSON / CSV / Debezium JSON; raw | Explicit fields; raw built-in | No authoritative JSON descriptor; existing ephemeral source contract remains |
 | `nats` | Sink | JSON / CSV / raw | Bound query | Core and JetStream delivery admission remains; raw requires one Utf8 field |
 | `websocket` | Streaming source | JSON / CSV / binary | Explicit fields required | Validate the installed decoder before connecting; no remote discovery API |

@@ -174,10 +174,24 @@ async fn three_node_cluster_converges() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn leader_is_consistent_across_nodes() {
     let cluster = MiniCluster::spawn(3).await;
+    let deadline = tokio::time::Instant::now() + CONVERGENCE_DEADLINE;
     cluster
         .wait_for_convergence(CONVERGENCE_DEADLINE)
         .await
         .expect("convergence");
+
+    // WHY: raw gossip peers can converge before the controller membership watch.
+    tokio::time::timeout_at(deadline, async {
+        while !cluster
+            .nodes
+            .iter()
+            .all(|node| node.controller.current_leader() == Some(cluster.nodes[0].instance_id))
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("controller leadership must converge within the same deadline");
 
     // Every node's view must agree on the leader (lowest ID).
     // Node IDs are 1, 2, 3 → leader is 1.

@@ -124,8 +124,12 @@ pub(super) async fn inspect(
         input
     };
     bind_external(&mut binding, &business)?;
-    let metadata =
-        crate::mongodb::schema_metadata::collection(database, &parsed.collection).await?;
+    let metadata = crate::mongodb::schema_metadata::collection(
+        database,
+        &parsed.collection,
+        &parsed.collection_kind,
+    )
+    .await?;
     let Some(metadata) = metadata else {
         if !parsed.auto_create
             && matches!(

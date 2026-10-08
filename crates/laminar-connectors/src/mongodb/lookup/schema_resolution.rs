@@ -17,14 +17,17 @@ pub(in crate::mongodb) async fn resolve(
 ) -> Result<SchemaBinding, ConnectorError> {
     let client = super::super::schema_metadata::client(config.require("connection.uri")?).await?;
     let database = client.database(config.require("database")?);
-    let metadata =
-        super::super::schema_metadata::collection(&database, config.require("collection")?)
-            .await?
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError(
-                    "MongoDB lookup collection is missing; create it separately".into(),
-                )
-            })?;
+    let metadata = super::super::schema_metadata::collection(
+        &database,
+        config.require("collection")?,
+        &super::super::CollectionKind::Standard,
+    )
+    .await?
+    .ok_or_else(|| {
+        ConnectorError::ConfigurationError(
+            "MongoDB lookup collection is missing; create it separately".into(),
+        )
+    })?;
     let origin = if explicit.is_some() {
         SchemaOrigin::Explicit
     } else {

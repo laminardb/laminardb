@@ -196,7 +196,7 @@ you create the object. These settings control selection, sampling and external c
 | `schema.registry.record.name` | Supply the record name when using the existing record-based subject naming strategies. An explicit value subject overrides subject derivation. |
 | `schema.registry.auto.register` | Defaults to `false`. Set it to `true` on a Kafka sink to permit registration during creation. Changing `schema.compatibility` also requires this permission. |
 | `schema.inference` | Defaults to `false`. Set it to `true` for CSV or JSON file sources to sample up to four files, 1 MiB and 1,000 rows within ten seconds. Empty or all-null samples fail; a sample cannot prove what future files will contain. |
-| `auto.create` | Defaults to `false` for Delta Lake, Iceberg and MongoDB sinks. Set it to `true` to permit creation of a missing destination. |
+| `auto.create` | Defaults to `false` for Delta Lake and Iceberg sinks and MongoDB standard collections. Set it to `true` to permit creation of a missing destination. |
 | `auto.create.table` | Defaults to `false` for PostgreSQL sinks. Set it to `true` to permit creation of a missing table. |
 | `schema.evolution` | Keep it `false` for Delta sinks using durable schema contracts. Change an incompatible target through a controlled migration. |
 
@@ -216,6 +216,10 @@ catalog publication fails, leaving an unused resource for you to review.
 Use `DESCRIBE events` to inspect resolved fields and their origin. The
 [schema guide](docs/SCHEMA_RESOLUTION.md) covers supported formats, mappings, recovery and
 migration. Schema discovery uses the existing deployment and delivery restrictions.
+
+MongoDB time-series sinks permit creation through the existing `timeseries.time_field`
+setting. Saved bindings track the backing bucket UUID, so dropping and recreating a
+time-series collection requires a new binding.
 
 ## AI functions
 
