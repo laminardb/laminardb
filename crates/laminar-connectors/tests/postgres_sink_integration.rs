@@ -22,8 +22,8 @@ use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
 
-use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::{ConnectorState, SinkConnector};
+use laminar_connectors::config::{ConnectorConfig, ConnectorState};
+use laminar_connectors::connector::SinkConnector;
 use laminar_connectors::error::ConnectorError;
 use laminar_connectors::postgres::{
     register_postgres_sink, PostgresSink, PostgresSinkConfig, WriteMode,
