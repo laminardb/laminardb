@@ -487,6 +487,58 @@ mod tests {
         assert_eq!(probe.starts.lock().as_slice(), &[0]);
     }
 
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn native_kafka_replay_is_rejected_before_broker_io() {
+        use crate::process_function::tests::AccountActivity;
+
+        let directory = tempfile::tempdir().unwrap();
+        let db = LaminarDB::builder()
+            .storage_dir(directory.path())
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: None,
+                ..Default::default()
+            })
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .build()
+            .await
+            .unwrap();
+        db.execute(
+            "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+             FROM KAFKA ('bootstrap.servers' = '127.0.0.1:1', 'group.id' = 'cold-order', \
+             'topic' = 'events', 'startup.mode' = 'earliest') FORMAT JSON",
+        )
+        .await
+        .unwrap();
+        let contract = db
+            .resolve_registered_source_contract("events", db.connector_manager.lock().sources())
+            .unwrap()
+            .unwrap()
+            .0;
+        assert!(contract.supports_replay());
+        for cluster in [false, true] {
+            let error =
+                admit_process_replay_source("activity", "events", contract, cluster).unwrap_err();
+            assert!(error.to_string().contains("single-channel replay-order"));
+        }
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            db.register_native_process_function(
+                "activity",
+                "events",
+                descriptor(),
+                Arc::new(AccountActivity),
+            ),
+        )
+        .await
+        .expect("source-order rejection must precede broker I/O")
+        .unwrap_err();
+        assert!(error.to_string().contains("single-channel replay-order"));
+        assert!(db.process_functions().is_empty());
+        db.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn startup_rechecks_source_order_before_io() {
         let directory = tempfile::tempdir().unwrap();

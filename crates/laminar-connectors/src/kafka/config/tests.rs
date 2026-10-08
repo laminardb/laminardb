@@ -32,6 +32,14 @@ fn test_parse_missing_required() {
 }
 
 #[test]
+fn source_rejects_connector_owned_replay_order() {
+    let error =
+        KafkaSourceConfig::from_config(&make_config(&[("replay.order", "partition_rounds")]))
+            .unwrap_err();
+    assert!(error.to_string().contains("ordering belongs to the engine"));
+}
+
+#[test]
 #[allow(deprecated)]
 fn test_parse_multi_topic() {
     let cfg = KafkaSourceConfig::from_config(&make_config(&[("topic", "a, b, c")])).unwrap();

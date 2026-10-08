@@ -27,7 +27,7 @@ use crate::{DbError, LaminarDB};
 #[cfg(all(feature = "process-remote", target_os = "linux"))]
 mod python;
 mod runtime;
-mod source;
+pub(crate) mod source;
 
 const DEADLINE: Duration = Duration::from_secs(40);
 const LEASE_TTL: Duration = Duration::from_secs(120);

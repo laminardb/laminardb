@@ -19,9 +19,10 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use super::*;
 use crate::{ClusterTopologyObjectTransition, TopologyInitialization, TopologyValidationScope};
 
-#[cfg(feature = "kafka")]
+#[cfg(all(feature = "kafka", feature = "cluster"))]
 #[tokio::test]
 async fn isolated_catalog_resolves_installed_process_output_for_sink_admission() {
+    use crate::process_function::cluster_recovery_tests::source::{register, SourceProbe, SOURCE};
     use crate::process_function::tests::{descriptor, AccountActivity};
 
     let base = LaminarDB::builder()
@@ -30,6 +31,10 @@ async fn isolated_catalog_resolves_installed_process_output_for_sink_admission()
             interval_ms: None,
             ..Default::default()
         })
+        .register_connector(register(
+            Arc::new(SourceProbe::default()),
+            Vec::new().into(),
+        ))
         .build()
         .await
         .unwrap();
@@ -44,13 +49,17 @@ async fn isolated_catalog_resolves_installed_process_output_for_sink_admission()
         .await
         .unwrap();
     let definitions = [
-        "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+        format!(
+            "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
          ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
-         FROM KAFKA ('bootstrap.servers' = '127.0.0.1:1', 'group.id' = 'cold-plan', \
-         'topic' = 'events', 'startup.mode' = 'earliest', 'replay.order' = 'partition_rounds') FORMAT JSON".into(),
-        candidate.process_function_bootstrap_sql("activity").unwrap(),
+         FROM \"{SOURCE}\""
+        ),
+        candidate
+            .process_function_bootstrap_sql("activity")
+            .unwrap(),
         "CREATE SINK activity_output FROM activity INTO KAFKA \
-         ('bootstrap.servers' = '127.0.0.1:1', 'topic' = 'activity_output') FORMAT JSON".into(),
+         ('bootstrap.servers' = '127.0.0.1:1', 'topic' = 'activity_output') FORMAT JSON"
+            .into(),
     ];
     for sql in definitions {
         let statement = laminar_sql::parse_streaming_sql(&sql).unwrap().remove(0);

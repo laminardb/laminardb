@@ -281,11 +281,13 @@ every owner and across recovery; the package hash does not attest system librari
 The code review must include native extension dependencies and lazy imports.
 
 The source must reproduce one physical channel in fixed replay batches with
-deterministic row positions and watermark cuts. Kafka JSON supplies this profile
-with `'replay.order' = 'partition_rounds'`, an explicit topic inventory and
-engine-owned numeric positions. Each complete round waits for one non-null record
-from every partition. Cluster input follows vnode zero; keyed computation remains
-distributed. See the [Kafka round profile](../../crates/laminar-connectors/README.md#kafka-partition-rounds).
+deterministic row positions and watermark cuts. Built-in sources currently lack
+that replay contract, so they are rejected for at-least-once process execution
+in every mode. Kafka's native partition offsets do not establish a global replay
+order or fixed watermark cuts. The engine's independent-channel merge remains
+unsupported. Best-effort process execution is available in embedded and
+single-node mode.
+
 Cluster startup registers the
 same package on every owner before sealing its invocation DDL; source ownership
 must follow the certified assignment. Replay tests cover matching callback IDs,

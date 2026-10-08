@@ -54,8 +54,10 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 `[[process_function]]` configures a supervised Python worker and its source. Single-node
 best-effort execution supports direct input. Replay-safe Linux packages also support
-at-least-once execution in single-node and cluster mode with fixed source rounds and
-durable checkpoints. See the [Python deployment profile](../../python/laminardb_process/README.md#replay-safe-linux-deployment)
+at-least-once execution in single-node and cluster mode with a qualifying fixed-batch source and
+durable checkpoints. Shipped sources currently lack the required replay-order contract, so
+at-least-once process compositions using them fail before intake. See the
+[Python deployment profile](../../python/laminardb_process/README.md#replay-safe-linux-deployment)
 for package, source and worker-loss requirements.
 
 Set `LAMINAR_CONSOLE_TOKEN` before starting with this configuration. Non-loopback HTTP binds

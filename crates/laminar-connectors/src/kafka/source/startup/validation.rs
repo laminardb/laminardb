@@ -17,6 +17,7 @@ struct PreparedStartPosition {
 }
 
 pub(super) struct VnodeStartInventory {
+    pub(super) topics: Vec<(Arc<str>, i32)>,
     pub(super) routes: KafkaPartitionRoutes,
     pub(super) default_offset: rdkafka::Offset,
 }
@@ -163,13 +164,6 @@ impl KafkaSource {
         delivery: DeliveryGuarantee,
         has_saved_position: bool,
     ) -> Result<(), ConnectorError> {
-        if config.replay_order == super::super::KafkaReplayOrder::PartitionRounds
-            && delivery == DeliveryGuarantee::BestEffort
-        {
-            return Err(ConnectorError::ConfigurationError(
-                "Kafka partition_rounds requires engine-owned guaranteed delivery".into(),
-            ));
-        }
         if (self.vnode_assignment.is_some() || delivery != DeliveryGuarantee::BestEffort)
             && matches!(&config.subscription, TopicSubscription::Pattern(_))
         {

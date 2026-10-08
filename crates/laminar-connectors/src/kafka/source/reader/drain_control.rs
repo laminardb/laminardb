@@ -141,7 +141,6 @@ pub(super) async fn hold_reader_drain(context: KafkaDrainHoldContext<'_>) -> Rea
 }
 
 pub(super) struct KafkaDrainCommandContext<'a> {
-    pub(super) replay_order: super::super::KafkaReplayOrder,
     pub(super) consumer: &'a Arc<StreamConsumer<LaminarConsumerContext>>,
     pub(super) blocking_tasks: &'a KafkaBlockingTasks,
     pub(super) vnode_reassign: &'a Option<(
@@ -338,7 +337,6 @@ async fn resolve_reader_drain_command(
         context.is_paused,
         deadline,
         &execution,
-        context.replay_order,
     )
     .await;
     if result.is_ok() {

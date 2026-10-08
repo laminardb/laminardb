@@ -52,14 +52,7 @@ impl KafkaSource {
             })?
             .to_owned();
         let sealed_baselines = sealed
-            .map(|checkpoint| {
-                validate_sealed_position(
-                    checkpoint,
-                    &source_name,
-                    &topics,
-                    kafka_config.replay_order,
-                )
-            })
+            .map(|checkpoint| validate_sealed_position(checkpoint, &source_name, &topics))
             .transpose()?;
         let deadline = tokio::time::Instant::now() + INITIAL_POSITION_BUDGET;
         let permit = tokio::time::timeout_at(deadline, INITIALIZATION_SLOT.acquire())
@@ -81,7 +74,6 @@ impl KafkaSource {
                 .create()
                 .map_err(|error| consumer_creation_error(&error))?;
             let inventory = fetch_initial_inventory(&consumer, topics, deadline)?;
-            super::validate_round_inventory(&kafka_config, &inventory)?;
             let mut baselines = KafkaPartitionBaselines::with_capacity(inventory.len());
             if sealed_baselines.as_ref().is_some_and(|sealed| {
                 sealed.len() != inventory.len() || inventory.iter().any(|partition| !sealed.contains_key(partition))
@@ -111,7 +103,7 @@ impl KafkaSource {
                     .map(|(topic, partition)| (topic.as_str(), *partition)),
             );
             attach_partition_baselines(&mut checkpoint, &baselines, &inventory);
-            checkpoint.set_input_channels(kafka_input_channels(&source_name, &inventory, kafka_config.replay_order)?)?;
+            checkpoint.set_input_channels(kafka_input_channels(&source_name, &inventory)?)?;
             Ok(checkpoint)
         });
         tokio::time::timeout_at(deadline, task)
@@ -183,7 +175,6 @@ fn validate_sealed_position(
     checkpoint: &SourceCheckpoint,
     source_name: &str,
     topics: &[String],
-    replay_order: super::KafkaReplayOrder,
 ) -> Result<KafkaPartitionBaselines, ConnectorError> {
     if checkpoint.offsets().is_empty() || checkpoint.offsets().len() > MAX_INITIAL_PARTITIONS {
         return Err(ConnectorError::ConfigurationError(
@@ -208,8 +199,7 @@ fn validate_sealed_position(
         return Err(ConnectorError::ConfigurationError("invalid sealed Kafka initialization cursor/ABI; processed offsets and assignment ownership are not new-source positions".into()));
     }
     let inventory = baselines.keys().cloned().collect::<KafkaPartitionSet>();
-    if checkpoint.input_channels()
-        != Some(kafka_input_channels(source_name, &inventory, replay_order)?.as_ref())
+    if checkpoint.input_channels() != Some(kafka_input_channels(source_name, &inventory)?.as_ref())
     {
         return Err(ConnectorError::ConfigurationError(
             "sealed Kafka initialization channels differ from the exact source inventory".into(),

@@ -27,8 +27,8 @@ mod schema_resolution;
 // Source re-exports
 pub use avro::AvroDeserializer;
 pub use config::{
-    AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaReplayOrder, KafkaSourceConfig,
-    OffsetReset, SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
+    AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
+    SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
     TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
@@ -294,11 +294,6 @@ fn kafka_source_consumer_config_keys() -> Vec<ConfigKeySpec> {
             "read_committed",
         ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
-        ConfigKeySpec::optional(
-            "replay.order",
-            "Replay merge profile (unspecified/partition_rounds)",
-            "unspecified",
-        ),
         ConfigKeySpec::optional(
             "partition.assignment.strategy",
             "Partition assignment (range/roundrobin/cooperative-sticky)",

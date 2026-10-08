@@ -16,7 +16,6 @@ use super::{
 };
 
 mod drain_control;
-mod input;
 mod payload;
 mod positioning;
 mod rotation;
@@ -25,7 +24,6 @@ use drain_control::{
     hold_reader_drain, process_reader_drain_command, KafkaDrainCommandContext,
     KafkaDrainHoldContext,
 };
-use input::KafkaReaderInput;
 use payload::{
     build_reader_payload, send_full_reader_item, update_reader_backpressure,
     KafkaBackpressureContext, KafkaFullQueueContext,
@@ -48,7 +46,7 @@ struct KafkaReaderTask {
     data_ready: Arc<Notify>,
     reader_fault: Arc<Mutex<Option<Arc<str>>>>,
     channel_len: Arc<AtomicUsize>,
-    input: KafkaReaderInput,
+    capture_headers: bool,
     reader_channel_capacity: usize,
     reader_channel_capacity_f64: f64,
     assign_generation: Arc<AtomicU64>,
@@ -99,7 +97,6 @@ struct KafkaRotationContext<'a> {
     data_ready: &'a Arc<Notify>,
     reader_shutdown: &'a mut tokio::sync::watch::Receiver<bool>,
     active_drain: &'a mut Option<KafkaReaderDrain>,
-    replay_order: super::KafkaReplayOrder,
     drain_paused: &'a mut std::collections::HashSet<(Arc<str>, i32)>,
 }
 
@@ -131,6 +128,7 @@ impl KafkaSource {
         let data_ready = Arc::clone(&self.data_ready);
         let reader_fault = Arc::clone(&self.reader_fault);
         let channel_len = Arc::clone(&self.channel_len);
+        let capture_headers = self.config.include_headers;
         let reader_channel_capacity = self.config.reader_channel_capacity;
         let reader_channel_capacity_f64 =
             u32::try_from(reader_channel_capacity).map_or(f64::from(u32::MAX), f64::from);
@@ -142,12 +140,6 @@ impl KafkaSource {
         // -- Reader task: message consumption, backpressure, revoke pruning --
         // Engine-controlled re-assignment inputs (cluster mode; `None` otherwise).
         let vnode_partition_routes = std::mem::take(&mut self.vnode_partition_routes);
-        let input = KafkaReaderInput::new(
-            &self.config,
-            vnode_reassign.is_some(),
-            vnode_partition_routes.clone(),
-            self.manual_topic_partitions.len(),
-        );
         let reassign_snapshot = Arc::clone(&self.offset_snapshot);
         let reassign_baselines = self.manual_partition_baselines.clone();
         let assignment_publication = Arc::clone(&self.assignment_publication);
@@ -173,7 +165,7 @@ impl KafkaSource {
             data_ready,
             reader_fault,
             channel_len,
-            input,
+            capture_headers,
             reader_channel_capacity,
             reader_channel_capacity_f64,
             assign_generation,
@@ -220,7 +212,7 @@ impl KafkaReaderTask {
             data_ready,
             reader_fault,
             channel_len,
-            mut input,
+            capture_headers,
             reader_channel_capacity,
             reader_channel_capacity_f64,
             assign_generation,
@@ -241,6 +233,8 @@ impl KafkaReaderTask {
             deterministic_default,
             mut reader_shutdown,
         } = self;
+        let mut cached_topic: Arc<str> = Arc::from("");
+        let mut cached_topic_routes: Option<Arc<[u32]>> = None;
         let mut is_paused = false;
         let mut last_assign_gen: u64 = 0;
         // start() records the exact publication used for its initial Kafka assignment.
@@ -267,7 +261,6 @@ impl KafkaReaderTask {
                 registry.assignment_version() != last_assignment_version
             });
             if assignment_changed {
-                input.reset();
                 let action = reconcile_vnode_assignment(
                     KafkaRotationContext {
                         consumer: &consumer,
@@ -288,7 +281,6 @@ impl KafkaReaderTask {
                         data_ready: &data_ready,
                         reader_shutdown: &mut reader_shutdown,
                         active_drain: &mut active_drain,
-                        replay_order: input.replay_order(),
                         drain_paused: &mut drain_paused,
                     },
                     &mut last_assignment_version,
@@ -306,7 +298,6 @@ impl KafkaReaderTask {
                     .and_then(|receiver| receiver.try_recv().ok())
             });
             if let Some(command) = command {
-                input.reset();
                 let action = process_reader_drain_command(
                     KafkaDrainCommandContext {
                         consumer: &consumer,
@@ -318,7 +309,6 @@ impl KafkaReaderTask {
                         last_assignment_version,
                         is_paused,
                         active_drain: &mut active_drain,
-                        replay_order: input.replay_order(),
                         deferred_command: &mut deferred_drain_command,
                         drain_paused: &mut drain_paused,
                     },
@@ -352,7 +342,6 @@ impl KafkaReaderTask {
             }
             let current_assign_generation = assign_generation.load(Ordering::Acquire);
             if current_assign_generation != last_assign_gen {
-                input.reset();
                 let action = position_reader_assignment(
                     KafkaPositioningContext {
                         consumer: &consumer,
@@ -441,13 +430,25 @@ impl KafkaReaderTask {
                     continue;
                 },
                 () = tokio::time::sleep(std::time::Duration::from_millis(10)), if drain_held => continue,
-                msg = tokio::time::timeout(recv_timeout, input.recv(&consumer)), if !drain_held => match msg {
+                msg = tokio::time::timeout(recv_timeout, consumer.recv()), if !drain_held => match msg {
                     Ok(result) => result,
                     Err(_timeout) => continue,
                 },
             };
             match msg_result {
-                Ok(payload) => {
+                Ok(msg) => {
+                    let Ok(payload) = build_reader_payload(
+                        &msg,
+                        vnode_reassign.is_some(),
+                        &vnode_partition_routes,
+                        capture_headers,
+                        &mut cached_topic,
+                        &mut cached_topic_routes,
+                        &reader_fault,
+                        &data_ready,
+                    ) else {
+                        return;
+                    };
                     let Some(payload) = payload else {
                         continue;
                     };
@@ -487,7 +488,7 @@ impl KafkaReaderTask {
                     }
                     data_ready.notify_one();
                 }
-                Err(e) if e.is_transient() => {
+                Err(e) if kafka_reader_error_is_transient(&e) => {
                     debug!(error = %e, "Kafka consumer poll event");
                 }
                 Err(e) => {

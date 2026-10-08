@@ -29,40 +29,36 @@ See `postgres_cdc_admission_rejects_unexecuted_options_and_reference_use` and
 `mongodb_cdc_admission_uses_runtime_options_and_rejects_removed_ones` in [CDC admission tests](tests/cdc_admission.rs).
 Their lookup connectors and supported sinks are separate capabilities.
 
+### Recovery and native client APIs
+
+The engine admits source and sink compositions through their typed contracts. Connectors
+use their client libraries for fetching, acknowledgements, retries, transactions and storage
+I/O. A library capability becomes a delivery guarantee only when the connector implements
+the corresponding checkpoint and recovery protocol.
+
+Kafka input uses librdkafka partition offsets, assignment, seek, pause/resume and broker
+commits. Broker commits use the engine's durable checkpoint positions; automatic commits
+cannot advance recovery authority. Kafka preserves partition order. It provides neither a
+cross-partition replay order nor fixed poll batches. Stateful process replay currently rejects
+that missing order contract in embedded, single-node and cluster modes. Best-effort process
+execution remains available locally. There is no Kafka `replay.order` setting.
+
+Delta uses delta-rs writers, log-store APIs and application transactions; Iceberg uses native
+writers and catalog transactions. Their storage libraries handle the configured object store.
+The engine coordinates staged output with source positions and managed state. Provider wiring
+alone does not certify that complete recovery protocol. See the
+[object-store support matrix](../../docs/cloud-object-store-support.md) for current admission
+and qualification evidence.
+
+Latency depends on native fetch/write batching, queue bounds, acknowledgements, checkpoint
+frequency and provider calls. Connector I/O runs outside the compute runtime. Delivery
+admission does not establish a latency measurement.
+
 Delta's `cdf_contract_is_full_changelog` in [reader tests](src/lakehouse/delta_source/tests.rs)
 checks its reader contract. That contract is not an admitted append-only streaming source:
 `mutation_sources_fail_before_connector_io` in [engine admission tests](../laminar-db/src/pipeline_lifecycle/connector_admission_tests.rs)
 covers the ordinary route's rejection, and the positioned mutable join routes require ordering
 and recovery capabilities that this reader lacks. Finite reference/lookup reads are separate.
-
-### Kafka partition rounds
-
-Kafka JSON sources can declare `'replay.order' = 'partition_rounds'` for process
-functions that need reproducible input order and event-time cuts. The default is
-`unspecified`. Use an explicit topic list with guaranteed delivery and `earliest`
-startup, or a previously sealed numeric `latest` initialization position.
-Group offsets, topic patterns, specific-offset and timestamp startup, and other
-formats are not admitted by this profile.
-
-A complete round contains one non-null message from each partition, sorted by
-topic and partition. Tombstones do not occupy a round slot. An idle partition
-holds the entire round and its watermark cut. Poll timing and poll limits cannot
-split or combine rounds. The canonical channel ID binds the fixed partition
-inventory; native offset vectors remain the checkpoint and recovery cursor.
-An unfinished round publishes no offsets and is reread after recovery or drain.
-
-The full inventory must fit `max.poll.records`, `reader.channel.capacity`, and
-the engine's requested poll capacity. Round payloads, including encoded headers,
-must fit `fetch.max.bytes` (50 MiB by default). Messages already buffered before
-native partition queues are split have a separate buffer bounded by
-`reader.channel.capacity` and `fetch.max.bytes`; exceeding a bound stops the
-source generation for recovery. Inventory changes fail closed on recovery.
-
-Embedded and single-node runtimes own the complete inventory. In a cluster,
-intake follows vnode zero as one global input channel; keyed processing and
-shuffle use the assigned owners. This concentrates input decoding on one owner.
-At-least-once process delivery may replay output. Exactly-once process delivery
-remains unsupported.
 
 ### On-demand lookup sources (partial cache mode)
 

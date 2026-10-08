@@ -11,7 +11,7 @@ use laminar_connectors::connector::{
 use laminar_connectors::error::ConnectorError;
 
 pub(super) const CHANNEL: &[u8] = b"global-ordered";
-pub(super) const SOURCE: &str = "process-cluster-replay";
+pub(crate) const SOURCE: &str = "process-cluster-replay";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Resume {
@@ -21,11 +21,11 @@ pub(super) struct Resume {
 }
 
 #[derive(Default)]
-pub(super) struct SourceProbe {
-    pub available: AtomicU64,
-    pub hold: AtomicBool,
-    pub polls: AtomicU64,
-    pub starts: parking_lot::Mutex<Vec<Resume>>,
+pub(crate) struct SourceProbe {
+    pub(super) available: AtomicU64,
+    pub(super) hold: AtomicBool,
+    pub(super) polls: AtomicU64,
+    pub(super) starts: parking_lot::Mutex<Vec<Resume>>,
 }
 
 pub(super) struct ReplaySource {
@@ -161,7 +161,7 @@ impl SourceConnector for ReplaySource {
     }
 }
 
-pub(super) fn register(
+pub(crate) fn register(
     probe: Arc<SourceProbe>,
     batches: Arc<[RecordBatch]>,
 ) -> impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError> {

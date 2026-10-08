@@ -314,14 +314,7 @@ async fn topology_start_kafka_rejects_changed_inventory_and_future_offsets_witho
         &inventory,
     );
     changed
-        .set_input_channels(
-            kafka_input_channels(
-                "added_source",
-                &inventory,
-                super::super::KafkaReplayOrder::Unspecified,
-            )
-            .unwrap(),
-        )
+        .set_input_channels(kafka_input_channels("added_source", &inventory).unwrap())
         .unwrap();
     for checkpoint in [future, changed] {
         let mut source = source();

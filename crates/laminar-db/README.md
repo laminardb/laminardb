@@ -50,15 +50,11 @@ replay batch executes as one input/watermark cut, using its event timestamps and
 out-of-orderness. Poll limits cannot change batch membership. The profile disables coalescing,
 wall-clock idleness, the wall-clock future-skew guard and external watermark advancement;
 inactivity timers therefore need subsequent source input to advance event time.
-Kafka JSON sources opt in with `'replay.order' = 'partition_rounds'` and an explicit topic
-inventory. Each complete batch contains one non-null message from every partition in topic and
-partition order. An idle partition holds the entire round. The fixed inventory supplies one
-global input channel; cluster intake follows vnode zero while keyed processing uses all owners.
-Native offset vectors recover partial rounds without publishing their unfinished positions.
-The [Kafka round profile](../laminar-connectors/README.md#kafka-partition-rounds) documents its
-bounds and startup requirements. Per-partition positions alone do not qualify. FILES discovery
-order is not retained. The existing startup checks
-require durable checkpoint storage and a durable sink when a sink is configured. Replaying input
+Per-partition row positions or raw `SingleChannel` order alone do not qualify; built-in
+connectors currently leave replay order unspecified. Kafka preserves native partition order;
+FILES discovery order is not retained. Neither currently qualifies for guaranteed process
+replay. Independent-channel merging belongs to the engine and remains unsupported. The existing
+startup checks require durable checkpoint storage and a durable sink when a sink is configured. Replaying input
 after a crash may publish an output again. Supervised Python also admits `AtLeastOnce` in the
 Rust library when reviewed code declares `replay_safe` and its complete package belongs to an
 unprivileged Linux deployment's read-only root image. A separately connected matching client

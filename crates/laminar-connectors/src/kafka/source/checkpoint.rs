@@ -2,11 +2,10 @@
 
 use super::{
     lock_or_recover, try_capture_at_assignment_fence, Arc, BinaryBuilder, ConnectorError, DataType,
-    Field, KafkaAssignmentPublication, KafkaError, KafkaPartitionBaselines, KafkaPartitionRoutes,
-    KafkaPartitionSet, KafkaReplayOrder, KafkaRotationBaselines, KafkaSource, NonZeroU64,
-    OffsetReset, OffsetTracker, RecordBatch, Schema, SchemaRef, SourceCheckpoint,
-    SourceCheckpointDelta, SourceMutation, SourceRowPositions, StartupMode, TimeUnit,
-    TopicPartitionList, UInt32Array, KAFKA_PARTITION_BASELINE_PREFIX,
+    Field, KafkaAssignmentPublication, KafkaError, KafkaPartitionBaselines, KafkaPartitionSet,
+    KafkaRotationBaselines, KafkaSource, NonZeroU64, OffsetReset, OffsetTracker, RecordBatch,
+    Schema, SchemaRef, SourceCheckpoint, SourceCheckpointDelta, SourceMutation, SourceRowPositions,
+    StartupMode, TimeUnit, TopicPartitionList, UInt32Array, KAFKA_PARTITION_BASELINE_PREFIX,
 };
 
 impl KafkaSource {
@@ -123,7 +122,6 @@ impl KafkaSource {
         checkpoint.set_input_channels(kafka_input_channels(
             self.source_name.as_ref(),
             assigned.as_ref(),
-            self.config.replay_order,
         )?)?;
         Ok(checkpoint)
     }
@@ -160,28 +158,23 @@ pub(super) fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> To
 /// Owned partitions start at their checkpointed offset + 1, otherwise at
 /// `default_offset`. Rotations rebind incrementally in the reader loop.
 pub(super) fn build_vnode_assignment_tpl(
-    routes: &KafkaPartitionRoutes,
+    source_identity: &str,
     assignment: &[laminar_core::state::NodeId],
     self_id: laminar_core::state::NodeId,
+    topic_meta: &[(Arc<str>, i32)],
     offsets: &OffsetTracker,
     baselines: &KafkaPartitionBaselines,
     default_offset: rdkafka::Offset,
 ) -> Result<TopicPartitionList, ConnectorError> {
-    super::super::vnode_routing::validate_owner_map(assignment, self_id)?;
     let mut tpl = TopicPartitionList::new();
-    for (topic, vnodes) in routes {
-        for (partition, vnode) in vnodes.iter().enumerate() {
-            let owner = assignment.get(*vnode as usize).ok_or_else(|| {
-                ConnectorError::ConfigurationError(
-                    "Kafka partition route is outside the assignment".into(),
-                )
-            })?;
-            if *owner != self_id {
-                continue;
-            }
-            let partition = i32::try_from(partition).map_err(|_| {
-                ConnectorError::ConfigurationError("Kafka partition exceeds i32".into())
-            })?;
+    for (topic, count) in topic_meta {
+        for partition in super::super::vnode_routing::owned_partitions_in_assignment(
+            source_identity,
+            topic.as_ref(),
+            *count,
+            assignment,
+            self_id,
+        )? {
             let offset = match offsets.get(topic.as_ref(), partition) {
                 Some(offset) => {
                     rdkafka::Offset::Offset(offset.checked_add(1).ok_or_else(|| {
@@ -308,14 +301,13 @@ pub(super) fn validate_resume_input_channels(
     source_name: &str,
     checkpoint: Option<&[Vec<u8>]>,
     current: &KafkaPartitionSet,
-    replay_order: KafkaReplayOrder,
 ) -> Result<(), ConnectorError> {
     let checkpoint = checkpoint.ok_or_else(|| {
         ConnectorError::ConfigurationError(
             "Kafka engine-owned resume checkpoint has no input-channel inventory".into(),
         )
     })?;
-    let current = kafka_input_channels(source_name, current, replay_order)?;
+    let current = kafka_input_channels(source_name, current)?;
     if checkpoint != current.as_ref() {
         let first_difference = checkpoint
             .iter()
@@ -649,7 +641,6 @@ pub(super) fn encode_kafka_input_channel(
 pub(super) fn kafka_input_channels(
     source_name: &str,
     inventory: &KafkaPartitionSet,
-    replay_order: KafkaReplayOrder,
 ) -> Result<Arc<[Vec<u8>]>, ConnectorError> {
     let mut channels = Vec::with_capacity(inventory.len());
     let mut encoded = Vec::new();
@@ -658,10 +649,7 @@ pub(super) fn kafka_input_channels(
         channels.push(encoded.clone());
     }
     channels.sort_unstable();
-    Ok(match replay_order {
-        KafkaReplayOrder::Unspecified => channels.into(),
-        KafkaReplayOrder::PartitionRounds => super::round_input_channels(&channels),
-    })
+    Ok(channels.into())
 }
 
 pub(super) fn kafka_row_positions(
