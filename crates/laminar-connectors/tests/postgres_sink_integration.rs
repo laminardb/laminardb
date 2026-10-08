@@ -18,11 +18,13 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use testcontainers::runners::AsyncRunner;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
 
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::SinkConnector;
+use laminar_connectors::connector::{ConnectorState, SinkConnector};
+use laminar_connectors::error::ConnectorError;
 use laminar_connectors::postgres::{
     register_postgres_sink, PostgresSink, PostgresSinkConfig, WriteMode,
 };
@@ -358,6 +360,35 @@ async fn test_upsert_insert_and_update() {
     sink.close().await.expect("close");
 }
 
+#[tokio::test]
+async fn test_generated_column_rejects_input_on_postgres_18() {
+    let container = Postgres::default()
+        .with_tag("18")
+        .start()
+        .await
+        .expect("start postgres 18 container");
+    let host = container.get_host().await.expect("get host").to_string();
+    let port = container.get_host_port_ipv4(5432).await.expect("get port");
+    let pg = connect(&host, port).await;
+    pg.batch_execute(
+        "CREATE TABLE public.test_events (id bigint NOT NULL, \
+         computed bigint GENERATED ALWAYS AS (id * 2) STORED)",
+    )
+    .await
+    .expect("create generated column");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("computed", DataType::Int64, true),
+    ]));
+    let mut sink = PostgresSink::new(schema, sink_config(&host, port, WriteMode::Append), None);
+    let error = sink
+        .open(&ConnectorConfig::new("postgres-sink"))
+        .await
+        .expect_err("generated column cannot accept input");
+    assert!(matches!(error, ConnectorError::SchemaMismatch(_)));
+    assert!(error.to_string().contains("generated-column policy"));
+}
+
 // ── Auto-create table test ──────────────────────────────────────────
 
 #[tokio::test]
@@ -428,7 +459,22 @@ async fn test_statement_timeout_is_applied_to_pool_connections() {
         started.elapsed() < Duration::from_secs(6),
         "statement timeout was not applied: {error}"
     );
-    sink.close().await.expect("close after timeout");
+    assert_eq!(sink.state(), ConnectorState::Failed);
+    let retry_error = sink.flush().await.expect_err("failed writer cannot retry");
+    assert!(matches!(retry_error, ConnectorError::InvalidState { .. }));
+    let close_error = sink
+        .close()
+        .await
+        .expect_err("close reports writer failure");
+    assert!(matches!(close_error, ConnectorError::InvalidState { .. }));
+    assert_eq!(sink.state(), ConnectorState::Closed);
+    assert_eq!(sink.buffered_rows(), 0);
+    let count: i64 = pg
+        .query_one("SELECT COUNT(*) FROM public.test_events", &[])
+        .await
+        .expect("timed-out transaction rolled back")
+        .get(0);
+    assert_eq!(count, 0);
 }
 
 // ── Changelog (upsert + delete) test ────────────────────────────────

@@ -21,8 +21,9 @@ pub(super) async fn read_table<C: tokio_postgres::GenericClient + Sync>(
     schema_name: &str,
     table_name: &str,
 ) -> Result<Option<(i64, i64, Vec<Column>)>, ConnectorError> {
+    // COMPAT: PostgreSQL 11 has no attgenerated catalog field.
     let rows = client.query(
-        "SELECT c.oid::bigint, d.oid::bigint, a.attname, a.attnum::int4, t.typname, a.atttypid, a.atttypmod, a.attnotnull, a.attgenerated::text, a.attidentity::text, pg_get_expr(ad.adbin, ad.adrelid) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_database d ON d.datname=current_database() LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid=c.oid AND ad.adnum=a.attnum WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p') AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum LIMIT 4097",
+        "SELECT c.oid::bigint, d.oid::bigint, a.attname, a.attnum::int4, t.typname, a.atttypid, a.atttypmod, a.attnotnull, COALESCE(to_jsonb(a)->>'attgenerated', ''), a.attidentity::text, pg_get_expr(ad.adbin, ad.adrelid) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid JOIN pg_catalog.pg_type t ON t.oid=a.atttypid JOIN pg_catalog.pg_database d ON d.datname=current_database() LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid=c.oid AND ad.adnum=a.attnum WHERE n.nspname=$1 AND c.relname=$2 AND c.relkind IN ('r','p') AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum LIMIT 4097",
         &[&schema_name, &table_name]).await
         .map_err(|_| ConnectorError::ConnectionFailed("PostgreSQL table metadata query failed; verify table visibility and authorization".into()))?;
     if rows.is_empty() {
