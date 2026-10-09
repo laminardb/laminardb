@@ -15,8 +15,9 @@ const REMOVED_CONFIG_KEYS: &[&str] = &[
     "max.buffered.events",
     "max.poll.records",
     "poll.timeout.ms",
-    "snapshot.mode",
     "start.lsn",
+    "table.exclude",
+    "table.include",
     "wal.sender.timeout.ms",
 ];
 
@@ -24,6 +25,9 @@ const DEFAULT_BUFFERED_BYTES: usize = 256 * 1024 * 1024;
 const MIN_BUFFERED_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const WORKING_SET_STAGES: usize = 3;
+/// Relation metadata may use at most this fraction of the decoded stage, leaving the rest for
+/// drainable transaction data.
+const RELATION_METADATA_DIVISOR: usize = 8;
 
 const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "_arrow_schema",
@@ -32,16 +36,85 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "host",
     "laminar.source.name",
     "max.buffered.bytes",
+    "output.mode",
     "password",
     "port",
     "publication",
     "slot.name",
+    "snapshot.mode",
     "ssl.ca.cert.path",
     "ssl.mode",
-    "table.exclude",
-    "table.include",
+    "table",
     "username",
 ];
+
+/// How a source without a checkpoint establishes its starting position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotMode {
+    /// Copy the table at the new slot's consistent point, then stream every later change.
+    #[default]
+    Initial,
+    /// Stream only changes committed after the new slot's consistent point.
+    Never,
+}
+
+str_enum!(SnapshotMode, lowercase, ConnectorError, "unknown snapshot.mode",
+    Initial => "initial";
+    Never => "never"
+);
+
+/// Update model of the emitted rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    /// Keyed current-row images and key-only deletes by the declared primary key.
+    #[default]
+    Upsert,
+    /// Full before/after images as a Z-set with a trailing `__weight` column.
+    Changelog,
+}
+
+str_enum!(OutputMode, lowercase, ConnectorError, "unknown output.mode",
+    Upsert => "upsert";
+    Changelog => "changelog"
+);
+
+/// A schema-qualified `PostgreSQL` table name, compared exactly as stored in the catalog.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TableName {
+    /// Schema (namespace) name.
+    pub schema: String,
+    /// Table name.
+    pub name: String,
+}
+
+impl TableName {
+    /// Parse `schema.table`.
+    ///
+    /// # Errors
+    /// Returns a configuration error unless the value has exactly one dot separating two
+    /// nonempty names.
+    pub fn parse(value: &str) -> Result<Self, ConnectorError> {
+        let invalid = || {
+            ConnectorError::ConfigurationError(format!(
+                "table '{value}' must be schema-qualified as schema.table"
+            ))
+        };
+        let (schema, name) = value.split_once('.').ok_or_else(invalid)?;
+        if schema.is_empty() || name.is_empty() || name.contains('.') || value.contains('\0') {
+            return Err(invalid());
+        }
+        Ok(Self {
+            schema: schema.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for TableName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.schema, self.name)
+    }
+}
 
 /// Configuration for the `PostgreSQL` CDC source connector.
 #[derive(Debug, Clone)]
@@ -75,12 +148,14 @@ pub struct PostgresCdcConfig {
     /// Name of the publication to subscribe to.
     pub publication: String,
 
-    // ── Schema ──
-    /// Tables to include (empty = all tables in publication).
-    pub table_include: Vec<String>,
+    /// The one captured table; the publication must contain exactly this table.
+    pub table: TableName,
 
-    /// Tables to exclude from replication.
-    pub table_exclude: Vec<String>,
+    /// Fresh-start behavior when no checkpoint exists.
+    pub snapshot_mode: SnapshotMode,
+
+    /// Emitted update model.
+    pub output_mode: OutputMode,
 
     /// Total connector-owned payload budget across raw WAL, decoded state, and Arrow construction.
     pub max_buffered_bytes: usize,
@@ -98,21 +173,15 @@ impl Default for PostgresCdcConfig {
             ssl_ca_cert_path: None,
             slot_name: "laminar_slot".to_string(),
             publication: "laminar_pub".to_string(),
-            table_include: Vec::new(),
-            table_exclude: Vec::new(),
+            table: TableName::default(),
+            snapshot_mode: SnapshotMode::default(),
+            output_mode: OutputMode::default(),
             max_buffered_bytes: DEFAULT_BUFFERED_BYTES,
         }
     }
 }
 
 impl PostgresCdcConfig {
-    /// Decoded-stage high watermark used to stop admitting raw WAL before the hard limit.
-    #[must_use]
-    pub(super) fn decoded_high_watermark_bytes(&self) -> usize {
-        self.decoded_event_bytes()
-            .saturating_sub(self.decoded_event_bytes() / 5)
-    }
-
     /// Raw pgwire/frame ownership share of the private working-set limit.
     #[must_use]
     pub(crate) fn raw_wal_bytes(&self) -> usize {
@@ -125,17 +194,18 @@ impl PostgresCdcConfig {
         self.max_buffered_bytes / WORKING_SET_STAGES
     }
 
+    /// Persistent relation metadata limit, carved out of the decoded stage.
+    #[must_use]
+    pub(crate) fn relation_metadata_bytes(&self) -> usize {
+        self.decoded_event_bytes() / RELATION_METADATA_DIVISOR
+    }
+
     /// Arrow construction share, including division remainder.
     #[must_use]
     pub(crate) fn arrow_build_bytes(&self) -> usize {
         self.max_buffered_bytes
             .saturating_sub(self.raw_wal_bytes())
             .saturating_sub(self.decoded_event_bytes())
-    }
-
-    pub(crate) fn normalize_table_filters(&mut self) {
-        normalize_table_list(&mut self.table_include);
-        normalize_table_list(&mut self.table_exclude);
     }
 
     /// Creates a new config with required fields.
@@ -158,7 +228,7 @@ impl PostgresCdcConfig {
     pub(super) fn control_connection_config(
         &self,
     ) -> Result<tokio_postgres::Config, ConnectorError> {
-        self.validate()?;
+        self.validate_connection()?;
 
         let mut config = tokio_postgres::Config::new();
         config
@@ -166,6 +236,7 @@ impl PostgresCdcConfig {
             .port(self.port)
             .dbname(&self.database)
             .user(&self.username)
+            .options(super::typed_rows::SESSION_OPTIONS)
             .ssl_mode(match self.ssl_mode {
                 SslMode::Disable => tokio_postgres::config::SslMode::Disable,
                 SslMode::VerifyFull => tokio_postgres::config::SslMode::Require,
@@ -192,8 +263,15 @@ impl PostgresCdcConfig {
             database: config.require("database")?.to_string(),
             slot_name: config.require("slot.name")?.to_string(),
             publication: config.require("publication")?.to_string(),
+            table: TableName::parse(config.require("table")?)?,
             ssl_mode: config
                 .get_parsed::<SslMode>("ssl.mode")?
+                .unwrap_or_default(),
+            snapshot_mode: config
+                .get_parsed::<SnapshotMode>("snapshot.mode")?
+                .unwrap_or_default(),
+            output_mode: config
+                .get_parsed::<OutputMode>("output.mode")?
                 .unwrap_or_default(),
             ..Self::default()
         };
@@ -206,17 +284,9 @@ impl PostgresCdcConfig {
         }
         cfg.password = config.get("password").map(String::from);
         cfg.ssl_ca_cert_path = config.get("ssl.ca.cert.path").map(PathBuf::from);
-
-        if let Some(tables) = config.get("table.include") {
-            cfg.table_include = tables.split(',').map(str::to_string).collect();
-        }
-        if let Some(tables) = config.get("table.exclude") {
-            cfg.table_exclude = tables.split(',').map(str::to_string).collect();
-        }
         if let Some(max) = config.get_parsed::<usize>("max.buffered.bytes")? {
             cfg.max_buffered_bytes = max;
         }
-        cfg.normalize_table_filters();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -233,6 +303,9 @@ impl PostgresCdcConfig {
                 "max.buffered.events" => {
                     "resource ownership is bounded by max.buffered.bytes instead"
                 }
+                "table.include" | "table.exclude" => {
+                    "the source captures exactly one table; set 'table' to schema.table"
+                }
                 _ => "the connector did not execute it",
             };
             return Err(ConnectorError::ConfigurationError(format!(
@@ -248,6 +321,23 @@ impl PostgresCdcConfig {
     ///
     /// Returns `ConnectorError::ConfigurationError` for invalid settings.
     pub fn validate(&self) -> Result<(), ConnectorError> {
+        self.validate_connection()?;
+        if self.table.schema.is_empty() || self.table.name.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "table must name the one captured table as schema.table".into(),
+            ));
+        }
+        if self.output_mode == OutputMode::Changelog && self.snapshot_mode == SnapshotMode::Never {
+            return Err(ConnectorError::ConfigurationError(
+                "output.mode=changelog requires snapshot.mode=initial: a retraction of a row \
+                 that was never emitted would corrupt downstream state"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_connection(&self) -> Result<(), ConnectorError> {
         crate::config::require_non_empty(&self.host, "host")?;
         crate::config::require_non_empty(&self.database, "database")?;
         crate::config::require_non_empty(&self.username, "username")?;
@@ -322,54 +412,8 @@ impl PostgresCdcConfig {
                 "ssl.ca.cert.path requires ssl.mode=verify-full".to_string(),
             ));
         }
-        for (label, tables) in [
-            ("table.include", &self.table_include),
-            ("table.exclude", &self.table_exclude),
-        ] {
-            for table in tables {
-                let Some((schema, relation)) = table.split_once('.') else {
-                    return Err(ConnectorError::ConfigurationError(format!(
-                        "{label} entry '{table}' must be schema-qualified as schema.table"
-                    )));
-                };
-                if table.trim() != table || schema.is_empty() || relation.is_empty() {
-                    return Err(ConnectorError::ConfigurationError(format!(
-                        "{label} entry '{table}' must contain nonempty schema and table names"
-                    )));
-                }
-            }
-        }
         Ok(())
     }
-
-    /// Returns whether a table should be included based on include/exclude lists.
-    #[must_use]
-    pub(crate) fn should_include_table(&self, table: &str) -> bool {
-        debug_assert!(self.table_include.is_sorted());
-        debug_assert!(self.table_exclude.is_sorted());
-        if self
-            .table_exclude
-            .binary_search_by(|candidate| candidate.as_str().cmp(table))
-            .is_ok()
-        {
-            return false;
-        }
-        if self.table_include.is_empty() {
-            return true;
-        }
-        self.table_include
-            .binary_search_by(|candidate| candidate.as_str().cmp(table))
-            .is_ok()
-    }
-}
-
-fn normalize_table_list(tables: &mut Vec<String>) {
-    for table in tables.iter_mut() {
-        *table = table.trim().to_string();
-    }
-    tables.retain(|table| !table.is_empty());
-    tables.sort_unstable();
-    tables.dedup();
 }
 
 #[cfg(test)]

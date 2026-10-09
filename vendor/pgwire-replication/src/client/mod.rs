@@ -70,8 +70,10 @@
 //! }
 //! ```
 
+mod slot;
 mod tokio_client;
 mod worker;
 
-pub use tokio_client::ReplicationClient;
+pub use slot::{create_logical_slot, CreatedSlot, SlotSnapshot};
+pub use tokio_client::{AppliedLsnHandle, ReplicationClient};
 pub use worker::{ReplicationEvent, ReplicationEventReceiver, WireBytesGuard};

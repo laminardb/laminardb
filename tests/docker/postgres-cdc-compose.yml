@@ -1,0 +1,45 @@
+# PostgreSQL CDC fixtures: logical-replication sources (and sink targets) for PostgreSQL 17 and 18.
+#
+# Bring up:   docker compose -f tests/docker/postgres-cdc-compose.yml up -d --wait
+# Tear down:  docker compose -f tests/docker/postgres-cdc-compose.yml down -v
+#
+# Host ports must match LAMINAR_TEST_POSTGRES_PORT in
+# crates/laminar-connectors/tests/postgres_cdc_integration.rs and
+# crates/laminar-db/tests/postgres_cdc_e2e.rs (15532 = PostgreSQL 17, 15533 = PostgreSQL 18).
+# max_slot_wal_keep_size bounds retained WAL so a slot test can observe invalidation.
+
+x-postgres-cdc: &postgres-cdc
+  environment:
+    POSTGRES_USER: laminar
+    POSTGRES_PASSWORD: laminar-test-secret
+    POSTGRES_DB: cdc
+  command:
+    - postgres
+    - -c
+    - wal_level=logical
+    - -c
+    - max_replication_slots=32
+    - -c
+    - max_wal_senders=32
+    - -c
+    - max_slot_wal_keep_size=1GB
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "laminar", "-d", "cdc"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+services:
+  postgres-17:
+    <<: *postgres-cdc
+    image: postgres:17
+    container_name: laminardb-pg-cdc-17
+    ports:
+      - "127.0.0.1:15532:5432"
+
+  postgres-18:
+    <<: *postgres-cdc
+    image: postgres:18
+    container_name: laminardb-pg-cdc-18
+    ports:
+      - "127.0.0.1:15533:5432"

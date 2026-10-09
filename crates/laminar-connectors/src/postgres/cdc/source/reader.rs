@@ -9,12 +9,11 @@ pub(super) type WalPayloadTx = crossfire::MAsyncTx<crossfire::mpsc::Array<OwnedW
 
 pub(super) type WalTerminalError = Arc<std::sync::Mutex<Option<String>>>;
 
-/// WAL event payload sent from the background reader task to [`PostgresCdcSource::poll_batch`].
+/// WAL event payload sent from the background reader task to `PostgresCdcSource::poll_batch`.
 pub(super) enum WalPayload {
     Begin {
         final_lsn: u64,
         commit_ts_us: i64,
-        xid: u32,
     },
     Commit {
         end_lsn: u64,
@@ -33,7 +32,8 @@ pub(super) enum WalPayload {
 pub(super) struct OwnedWalPayload {
     pub(super) payload: WalPayload,
     pub(super) _byte_permit: OwnedSemaphorePermit,
-    pub(super) wire_bytes: Option<pgwire_replication::WireBytesGuard>,
+    /// Held only to keep the replication worker's in-flight reservation until decoding ends.
+    pub(super) _wire_bytes: Option<pgwire_replication::WireBytesGuard>,
 }
 
 pub(super) fn retained_wal_payload_bytes(payload: &WalPayload) -> usize {
@@ -105,7 +105,7 @@ pub(super) async fn send_wal_with_wire_guard(
     let owned = OwnedWalPayload {
         payload,
         _byte_permit: permit,
-        wire_bytes,
+        _wire_bytes: wire_bytes,
     };
     tokio::select! {
         biased;
@@ -129,21 +129,12 @@ pub(super) fn publish_terminal_wal_error(
     data_ready.notify_one();
 }
 
-pub(super) fn take_confirmed_lsn(
-    receiver: &mut tokio::sync::watch::Receiver<u64>,
-) -> Option<pgwire_replication::Lsn> {
-    let confirmed = *receiver.borrow_and_update();
-    (confirmed > 0).then(|| pgwire_replication::Lsn::from_u64(confirmed))
-}
-
-#[cfg(not(test))]
 pub(super) async fn run_wal_reader(
     mut client: pgwire_replication::ReplicationClient,
     wal_tx: WalPayloadTx,
     byte_budget: Arc<Semaphore>,
     byte_limit: usize,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    mut confirmed_lsn_rx: tokio::sync::watch::Receiver<u64>,
     terminal_error: WalTerminalError,
     data_ready: Arc<Notify>,
     _reader_guard: crate::connector::ConnectorTaskGuard,
@@ -156,27 +147,18 @@ pub(super) async fn run_wal_reader(
                     break 'read;
                 }
             }
-            changed = confirmed_lsn_rx.changed() => {
-                if changed.is_err() {
-                    break 'read;
-                }
-                if let Some(confirmed) = take_confirmed_lsn(&mut confirmed_lsn_rx) {
-                    client.update_applied_lsn(confirmed);
-                }
-            }
             event = client.recv() => {
                 match event {
                     Ok(Some(event)) => {
                         let payload = match event {
                             pgwire_replication::ReplicationEvent::Begin {
                                 final_lsn,
-                                xid,
                                 commit_time_micros,
+                                ..
                             } => Some((
                                 WalPayload::Begin {
                                     final_lsn: final_lsn.as_u64(),
                                     commit_ts_us: commit_time_micros,
-                                    xid,
                                 },
                                 None,
                             )),

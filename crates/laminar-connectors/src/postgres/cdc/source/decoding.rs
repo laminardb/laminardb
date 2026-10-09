@@ -1,16 +1,443 @@
-//! WAL decoding, relation admission, and decoded-stage resource accounting.
+//! WAL decoding into typed rows with transaction-aware memory admission.
+//!
+//! Decoded rows of the open transaction and of committed-but-undrained transactions share the
+//! decoded-stage budget. A new transaction is not started while that work sits above the high
+//! watermark, and a row that would overflow the budget is deferred until committed work drains.
+//! Only a single open transaction that cannot fit on its own is an error.
 
-#[cfg(test)]
-use super::Bytes;
-use super::{
-    conservative_deque_growth_bytes, decode_message, logical_wal_payload_bytes,
-    old_tuple_json_encoded_len, old_tuple_to_json, planned_event_bytes, retained_event_bytes,
-    tuple_json_encoded_len, tuple_to_json, CdcOperation, ChangeEvent, CommittedTransaction,
-    ConnectorError, ConnectorState, Lsn, OldTuple, OwnedWalPayload, PostgresCdcSource,
-    RelationInfo, TransactionState, VecDeque, WalMessage, WalPayload,
+use crate::connector::SourceMutation;
+use crate::error::ConnectorError;
+
+use super::super::decoder::{
+    decode_message, pg_timestamp_to_unix_ms, ColumnValue, OldTuple, TupleData, WalMessage,
 };
+use super::super::schema::RelationInfo;
+use super::super::schema_resolution::validate_relation;
+use super::super::typed_rows::RowLayout;
+use super::reader::logical_wal_payload_bytes;
+use super::{
+    CommittedTransaction, ConnectorState, Lsn, OpenTransaction, OwnedWalPayload, PostgresCdcSource,
+    WalPayload,
+};
+use crate::postgres::cdc::config::OutputMode;
+
+/// What happened to one raw payload offered to the decoder.
+pub(super) enum Decoded {
+    Applied,
+    /// The payload must wait until committed transactions drain; it is returned unchanged.
+    Deferred(OwnedWalPayload),
+}
+
+/// One emitted row: which image it reads and how it is applied.
+#[derive(Clone, Copy)]
+enum RowImage {
+    Put,
+    Tombstone,
+    Weighted(i64),
+}
 
 impl PostgresCdcSource {
+    /// Decoded bytes a drain can release.
+    pub(super) fn drainable_bytes(&self) -> usize {
+        self.committed_bytes.saturating_add(
+            self.open_rows
+                .as_ref()
+                .map_or(0, |rows| rows.retained_bytes()),
+        )
+    }
+
+    /// Decoded-stage capacity left for transaction data after the bound relation metadata.
+    fn event_byte_limit(&self) -> usize {
+        let metadata = self
+            .relation
+            .as_ref()
+            .and_then(|relation| relation.retained_bytes().ok())
+            .unwrap_or(0);
+        self.config.decoded_event_bytes().saturating_sub(metadata)
+    }
+
+    pub(super) fn event_high_watermark(&self) -> usize {
+        let limit = self.event_byte_limit();
+        limit.saturating_sub(limit / 5)
+    }
+
+    /// Decode one payload, or hand it back when committed work must drain first.
+    ///
+    /// # Errors
+    /// Returns an error for malformed protocol data, contract violations, or a single open
+    /// transaction that exceeds the decoded-stage budget on its own.
+    pub(super) fn process_owned_wal_payload(
+        &mut self,
+        payload: OwnedWalPayload,
+    ) -> Result<Decoded, ConnectorError> {
+        let message = match &payload.payload {
+            WalPayload::Begin { .. } => {
+                if !self.committed.is_empty()
+                    && self.drainable_bytes() >= self.event_high_watermark()
+                {
+                    return Ok(Decoded::Deferred(payload));
+                }
+                None
+            }
+            WalPayload::XLogData { data, .. } => {
+                let message = decode_message(data.clone())
+                    .map_err(|e| ConnectorError::ReadError(format!("pgoutput decode: {e}")))?;
+                let planned = self.planned_change_bytes(&message)?;
+                if self.drainable_bytes().saturating_add(planned) > self.event_byte_limit() {
+                    if !self.committed.is_empty() {
+                        return Ok(Decoded::Deferred(payload));
+                    }
+                    return Err(self.oversized_transaction(planned));
+                }
+                Some(message)
+            }
+            WalPayload::Commit { .. } | WalPayload::KeepAlive { .. } => None,
+        };
+        let received = u64::try_from(logical_wal_payload_bytes(&payload.payload))
+            .map_err(|_| ConnectorError::Internal("PostgreSQL CDC byte metric overflow".into()))?;
+        self.metrics.record_bytes(received);
+        match (payload.payload, message) {
+            (WalPayload::XLogData { wal_end, .. }, Some(message)) => {
+                self.apply_message(message)?;
+                self.write_lsn = self.write_lsn.max(Lsn::new(wal_end));
+            }
+            (
+                WalPayload::Begin {
+                    final_lsn,
+                    commit_ts_us,
+                    ..
+                },
+                None,
+            ) => {
+                Self::validate_timestamp(commit_ts_us, "BEGIN")?;
+                self.begin_transaction(Lsn::new(final_lsn))?;
+            }
+            (
+                WalPayload::Commit {
+                    end_lsn,
+                    commit_ts_us,
+                    lsn,
+                },
+                None,
+            ) => {
+                Self::validate_timestamp(commit_ts_us, "COMMIT")?;
+                self.commit_transaction(Lsn::new(lsn), Lsn::new(end_lsn))?;
+            }
+            (WalPayload::KeepAlive { wal_end }, None) => {
+                self.write_lsn = self.write_lsn.max(Lsn::new(wal_end));
+            }
+            _ => {
+                return Err(ConnectorError::Internal(
+                    "PostgreSQL CDC payload decoding lost its message".into(),
+                ));
+            }
+        }
+        Ok(Decoded::Applied)
+    }
+
+    fn validate_timestamp(commit_ts_us: i64, boundary: &str) -> Result<(), ConnectorError> {
+        pg_timestamp_to_unix_ms(commit_ts_us)
+            .map(|_| ())
+            .map_err(|error| {
+                ConnectorError::ReadError(format!("pgoutput {boundary} timestamp decode: {error}"))
+            })
+    }
+
+    fn oversized_transaction(&mut self, planned: usize) -> ConnectorError {
+        let final_lsn = self
+            .open_transaction
+            .as_ref()
+            .map_or(Lsn::ZERO, |transaction| transaction.final_lsn);
+        let rows = self.open_rows.as_ref().map_or(0, |rows| rows.len());
+        self.fail(ConnectorError::ReadError(format!(
+            "PostgreSQL CDC transaction committing at {final_lsn} exceeds the decoded-stage \
+             budget on its own: {} bytes retained after {rows} rows plus {planned} for the next \
+             row exceed {} bytes; raise max.buffered.bytes (one third is the decoded stage) \
+             above the largest captured transaction",
+            self.drainable_bytes(),
+            self.event_byte_limit()
+        )))
+    }
+
+    /// Planned retained bytes of the rows a decoded change will emit; zero for other messages.
+    fn planned_change_bytes(&self, message: &WalMessage) -> Result<usize, ConnectorError> {
+        let Some(layout) = self.layout.as_ref() else {
+            return Ok(0);
+        };
+        let (rows, text_bytes) = match message {
+            WalMessage::Insert(insert) => (1, declared_text_bytes(layout, &insert.new_tuple, None)),
+            WalMessage::Update(update) => {
+                let old = update.old_tuple.as_ref().and_then(full_old_tuple);
+                (
+                    2,
+                    declared_text_bytes(layout, &update.new_tuple, old).saturating_add(
+                        old.map_or(0, |old| declared_text_bytes(layout, old, None)),
+                    ),
+                )
+            }
+            WalMessage::Delete(delete) => (
+                1,
+                full_old_tuple(&delete.old_tuple)
+                    .map_or(0, |old| declared_text_bytes(layout, old, None)),
+            ),
+            _ => return Ok(0),
+        };
+        layout
+            .planned_row_bytes(text_bytes)?
+            .checked_mul(rows)
+            .ok_or_else(|| ConnectorError::ReadError("PostgreSQL CDC row size overflow".into()))
+    }
+
+    /// Apply one decoded message without admission checks.
+    pub(super) fn apply_message(&mut self, message: WalMessage) -> Result<(), ConnectorError> {
+        match message {
+            WalMessage::Begin(begin) => self.begin_transaction(begin.final_lsn),
+            WalMessage::Commit(commit) => {
+                self.commit_transaction(commit.commit_lsn, commit.end_lsn)
+            }
+            WalMessage::Relation(relation) => self.announce_relation(RelationInfo {
+                relation_id: relation.relation_id,
+                namespace: relation.namespace,
+                name: relation.name,
+                replica_identity: char::from(relation.replica_identity),
+                columns: relation.columns,
+            }),
+            WalMessage::Insert(insert) => {
+                self.require_bound_relation(insert.relation_id)?;
+                let image = self.put_or_weighted(1);
+                self.emit_row(&insert.new_tuple, None, image)?;
+                self.metrics.record_insert();
+                Ok(())
+            }
+            WalMessage::Update(update) => {
+                self.require_bound_relation(update.relation_id)?;
+                let old = update
+                    .old_tuple
+                    .as_ref()
+                    .and_then(full_old_tuple)
+                    .ok_or_else(|| self.missing_old_image("UPDATE"))?;
+                self.emit_update(old, &update.new_tuple)?;
+                self.metrics.record_update();
+                Ok(())
+            }
+            WalMessage::Delete(delete) => {
+                self.require_bound_relation(delete.relation_id)?;
+                let old = full_old_tuple(&delete.old_tuple)
+                    .ok_or_else(|| self.missing_old_image("DELETE"))?;
+                let image = match self.config.output_mode {
+                    OutputMode::Upsert => RowImage::Tombstone,
+                    OutputMode::Changelog => RowImage::Weighted(-1),
+                };
+                self.emit_row(old, None, image)?;
+                self.metrics.record_delete();
+                Ok(())
+            }
+            WalMessage::Truncate(_) => Err(self.fail(ConnectorError::ReadError(format!(
+                "TRUNCATE of {} cannot be represented as row changes and would leave the target \
+                 diverged; drop slot '{}', clear downstream targets, and start the source again \
+                 for a fresh snapshot",
+                self.config.table, self.config.slot_name
+            )))),
+            WalMessage::Origin(_) | WalMessage::Type(_) => Ok(()),
+        }
+    }
+
+    fn put_or_weighted(&self, weight: i64) -> RowImage {
+        match self.config.output_mode {
+            OutputMode::Upsert => RowImage::Put,
+            OutputMode::Changelog => RowImage::Weighted(weight),
+        }
+    }
+
+    fn missing_old_image(&mut self, operation: &str) -> ConnectorError {
+        self.fail(ConnectorError::ReadError(format!(
+            "PostgreSQL CDC {operation} on {} carried no complete old row; the table must keep \
+             REPLICA IDENTITY FULL",
+            self.config.table
+        )))
+    }
+
+    fn emit_update(&mut self, old: &TupleData, new: &TupleData) -> Result<(), ConnectorError> {
+        match self.config.output_mode {
+            OutputMode::Changelog => {
+                self.emit_row(old, None, RowImage::Weighted(-1))?;
+                self.emit_row(new, Some(old), RowImage::Weighted(1))
+            }
+            OutputMode::Upsert => {
+                if self.key_changed(old, new)? {
+                    self.emit_row(old, None, RowImage::Tombstone)?;
+                }
+                self.emit_row(new, Some(old), RowImage::Put)
+            }
+        }
+    }
+
+    fn key_changed(&self, old: &TupleData, new: &TupleData) -> Result<bool, ConnectorError> {
+        let layout = self.bound_layout()?;
+        for column in layout.columns.iter().filter(|column| column.is_key) {
+            if resolve_value(new, Some(old), column.tuple_index)?
+                != resolve_value(old, None, column.tuple_index)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn emit_row(
+        &mut self,
+        tuple: &TupleData,
+        old: Option<&TupleData>,
+        image: RowImage,
+    ) -> Result<(), ConnectorError> {
+        if self.open_transaction.is_none() {
+            return Err(self.fail(ConnectorError::ReadError(
+                "PostgreSQL CDC received a row change outside a transaction".into(),
+            )));
+        }
+        let Some(layout) = self.layout.as_ref() else {
+            return Err(ConnectorError::Internal(
+                "PostgreSQL CDC row decoded before its schema binding".into(),
+            ));
+        };
+        if tuple.columns.len() != layout.tuple_width {
+            self.state = ConnectorState::Failed;
+            return Err(ConnectorError::ReadError(format!(
+                "PostgreSQL CDC tuple has {} columns, but the bound relation has {}",
+                tuple.columns.len(),
+                layout.tuple_width
+            )));
+        }
+        let planned = layout.planned_row_bytes(declared_text_bytes(layout, tuple, old))?;
+        let (key_only, weight, mutation) = match image {
+            RowImage::Put => (false, None, Some(SourceMutation::Put)),
+            RowImage::Tombstone => (true, None, Some(SourceMutation::Tombstone)),
+            RowImage::Weighted(weight) => (false, Some(weight), None),
+        };
+        let rows = self.open_rows.as_mut().ok_or_else(|| {
+            ConnectorError::Internal("PostgreSQL CDC row builder is missing".into())
+        })?;
+        if u32::try_from(rows.len()).is_err() {
+            self.state = ConnectorState::Failed;
+            return Err(ConnectorError::ReadError(
+                "PostgreSQL CDC transaction exceeds u32::MAX emitted rows".into(),
+            ));
+        }
+        let appended = rows.append(
+            layout,
+            |_, column| resolve_value(tuple, old, column.tuple_index),
+            key_only,
+            weight,
+            planned,
+        );
+        if let Err(error) = appended {
+            self.state = ConnectorState::Failed;
+            return Err(error);
+        }
+        if let Some(mutation) = mutation {
+            self.open_mutations.push(mutation);
+        }
+        Ok(())
+    }
+
+    fn bound_layout(&self) -> Result<&RowLayout, ConnectorError> {
+        self.layout.as_ref().ok_or_else(|| {
+            ConnectorError::Internal("PostgreSQL CDC row decoded before its schema binding".into())
+        })
+    }
+
+    fn require_bound_relation(&mut self, relation_id: u32) -> Result<(), ConnectorError> {
+        let bound = self.relation.as_ref().map(|relation| relation.relation_id);
+        if bound == Some(relation_id) && self.relation_announced {
+            return Ok(());
+        }
+        Err(self.fail(ConnectorError::ReadError(format!(
+            "pgoutput sent a change for relation {relation_id}, but only an announced {} \
+             (oid {}) is bound",
+            self.config.table,
+            bound.unwrap_or_default()
+        ))))
+    }
+
+    fn announce_relation(&mut self, incoming: RelationInfo) -> Result<(), ConnectorError> {
+        let Some(bound) = self.relation.as_ref() else {
+            return Err(ConnectorError::Internal(
+                "PostgreSQL CDC relation announced before its binding".into(),
+            ));
+        };
+        if let Err(error) = validate_relation(bound, &incoming) {
+            return Err(self.fail(error));
+        }
+        self.relation_announced = true;
+        Ok(())
+    }
+
+    fn begin_transaction(&mut self, final_lsn: Lsn) -> Result<(), ConnectorError> {
+        if self.open_transaction.is_some() {
+            return Err(self.fail(ConnectorError::ReadError(
+                "PostgreSQL CDC received BEGIN before the current transaction committed".into(),
+            )));
+        }
+        self.open_transaction = Some(OpenTransaction { final_lsn });
+        Ok(())
+    }
+
+    fn commit_transaction(&mut self, commit_lsn: Lsn, end_lsn: Lsn) -> Result<(), ConnectorError> {
+        let Some(transaction) = self.open_transaction.as_ref() else {
+            return Err(self.fail(ConnectorError::ReadError(
+                "PostgreSQL CDC received COMMIT without an open transaction".into(),
+            )));
+        };
+        let last_resumable = self.committed.back().map_or(self.polled_lsn, |committed| {
+            committed.end_lsn.max(self.polled_lsn)
+        });
+        let boundary_error = if commit_lsn != transaction.final_lsn {
+            Some(format!(
+                "COMMIT LSN {commit_lsn} does not match BEGIN final LSN {}",
+                transaction.final_lsn
+            ))
+        } else if end_lsn < commit_lsn {
+            Some(format!(
+                "COMMIT end LSN {end_lsn} is before commit LSN {commit_lsn}"
+            ))
+        } else if end_lsn < last_resumable {
+            Some(format!(
+                "COMMIT end LSN {end_lsn} is behind the last emitted or queued LSN {last_resumable}"
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = boundary_error {
+            return Err(self.fail(ConnectorError::ReadError(format!(
+                "PostgreSQL CDC {reason}"
+            ))));
+        }
+        self.open_transaction = None;
+        let layout = self.layout.as_ref();
+        let records = match (self.open_rows.as_mut(), layout) {
+            (Some(rows), Some(layout)) if rows.len() > 0 => Some(rows.finish(layout)?),
+            _ => None,
+        };
+        let mutations: Box<[SourceMutation]> = std::mem::take(&mut self.open_mutations).into();
+        let retained_bytes = records
+            .as_ref()
+            .map_or(0, arrow_array::RecordBatch::get_array_memory_size)
+            .saturating_add(mutations.len());
+        self.committed_bytes = self.committed_bytes.saturating_add(retained_bytes);
+        self.committed.push_back(CommittedTransaction {
+            end_lsn,
+            records,
+            mutations,
+            retained_bytes,
+        });
+        self.write_lsn = self.write_lsn.max(end_lsn);
+        self.metrics.record_transaction();
+        self.metrics
+            .set_replication_lag_bytes(self.replication_lag_bytes());
+        Ok(())
+    }
+
+    /// Raw messages queued by deterministic tests, applied without admission checks.
     #[cfg(test)]
     pub(super) fn enqueue_wal_data(&mut self, data: Vec<u8>) {
         self.pending_messages.push_back(data);
@@ -19,9 +446,9 @@ impl PostgresCdcSource {
     #[cfg(test)]
     pub(super) fn process_pending_messages(&mut self) -> Result<(), ConnectorError> {
         while let Some(data) = self.pending_messages.pop_front() {
-            let result = decode_message(Bytes::from(data))
+            let result = decode_message(bytes::Bytes::from(data))
                 .map_err(|error| ConnectorError::ReadError(format!("pgoutput decode: {error}")))
-                .and_then(|message| self.process_wal_message(message));
+                .and_then(|message| self.apply_message(message));
             if let Err(error) = result {
                 self.state = ConnectorState::Failed;
                 return Err(error);
@@ -29,666 +456,48 @@ impl PostgresCdcSource {
         }
         Ok(())
     }
+}
 
-    /// Processes a single decoded WAL message.
-    pub(super) fn process_wal_message(&mut self, msg: WalMessage) -> Result<(), ConnectorError> {
-        match msg {
-            WalMessage::Begin(begin) => {
-                if self.current_txn.is_some() {
-                    return Err(ConnectorError::ReadError(
-                        "PostgreSQL CDC received BEGIN before the current transaction committed"
-                            .into(),
-                    ));
-                }
-                self.current_txn = Some(TransactionState {
-                    final_lsn: begin.final_lsn,
-                    commit_ts_ms: begin.commit_ts_ms,
-                    events: VecDeque::new(),
-                });
-                self.reserve_committed_transaction_slot()?;
-            }
-            WalMessage::Commit(commit) => {
-                if let Err(error) = self.validate_commit_boundary(&commit) {
-                    self.state = ConnectorState::Failed;
-                    return Err(error);
-                }
-                self.reserve_committed_transaction_slot()?;
-                let txn = self.current_txn.take().ok_or_else(|| {
-                    ConnectorError::ReadError(
-                        "PostgreSQL CDC received COMMIT without an open transaction".into(),
-                    )
-                })?;
-                self.committed_transactions.push_back(CommittedTransaction {
-                    end_lsn: commit.end_lsn,
-                    events: txn.events,
-                });
-                self.write_lsn = self.write_lsn.max(commit.end_lsn);
-                self.metrics.record_transaction();
-                self.metrics
-                    .set_replication_lag_bytes(self.replication_lag_bytes());
-            }
-            WalMessage::Relation(rel) => {
-                let info = RelationInfo {
-                    relation_id: rel.relation_id,
-                    namespace: rel.namespace,
-                    name: rel.name,
-                    replica_identity: rel.replica_identity as char,
-                    columns: rel.columns,
-                };
-                self.admit_relation(info)?;
-            }
-            WalMessage::Insert(ins) => {
-                self.process_insert(ins.relation_id, &ins.new_tuple)?;
-            }
-            WalMessage::Update(upd) => {
-                self.process_update(upd.relation_id, upd.old_tuple.as_ref(), &upd.new_tuple)?;
-            }
-            WalMessage::Delete(del) => {
-                self.process_delete(del.relation_id, &del.old_tuple)?;
-            }
-            WalMessage::Truncate(trunc) => {
-                let table_names: Vec<String> = trunc
-                    .relation_ids
-                    .iter()
-                    .map(|id| {
-                        self.relation_cache
-                            .get(*id)
-                            .map_or_else(|| Ok(format!("oid:{id}")), RelationInfo::full_name)
-                    })
-                    .collect::<Result<_, ConnectorError>>()?;
-                return Err(ConnectorError::ReadError(format!(
-                    "TRUNCATE received on table(s): {}. \
-                     Cannot produce retraction events — restart the pipeline with a fresh snapshot.",
-                    table_names.join(", ")
-                )));
-            }
-            WalMessage::Origin(_) | WalMessage::Type(_) => {
-                // Origin and Type messages are noted but don't
-                // produce change events in the current implementation.
-            }
-        }
-        Ok(())
+fn full_old_tuple(old: &OldTuple) -> Option<&TupleData> {
+    match old {
+        OldTuple::Full(tuple) => Some(tuple),
+        OldTuple::Key(_) => None,
     }
+}
 
-    pub(super) fn process_insert(
-        &mut self,
-        relation_id: u32,
-        new_tuple: &super::super::decoder::TupleData,
-    ) -> Result<(), ConnectorError> {
-        let (lsn, ts_ms) = self.require_current_txn_context()?;
-        let (table, after_len) = {
-            let relation = self.require_relation(relation_id)?;
-            let table = relation.full_name()?;
-
-            if !self.config.should_include_table(&table) {
-                return Ok(());
-            }
-
-            let after_len = tuple_json_encoded_len(new_tuple, relation)?;
-            (table, after_len)
-        };
-        let event_bytes = planned_event_bytes(table.capacity(), None, Some(after_len))?;
-        self.reserve_current_event_slot()?;
-        self.ensure_event_capacity(event_bytes)?;
-        let after_json = tuple_to_json(new_tuple, self.require_relation(relation_id)?, after_len)?;
-
-        let event = ChangeEvent {
-            table,
-            op: CdcOperation::Insert,
-            lsn,
-            ts_ms,
-            before: None,
-            after: Some(after_json),
-        };
-
-        self.push_event(event, event_bytes)?;
-        self.metrics.record_insert();
-        Ok(())
+/// The text value of one column. An unchanged TOAST value reads the complete old row; it is
+/// never mistaken for SQL `NULL`.
+fn resolve_value<'a>(
+    tuple: &'a TupleData,
+    old: Option<&'a TupleData>,
+    index: usize,
+) -> Result<Option<&'a [u8]>, ConnectorError> {
+    match tuple.columns.get(index) {
+        Some(ColumnValue::Text(bytes)) => Ok(Some(bytes)),
+        Some(ColumnValue::Null) => Ok(None),
+        Some(ColumnValue::Unchanged) => match old.and_then(|old| old.columns.get(index)) {
+            Some(ColumnValue::Text(bytes)) => Ok(Some(bytes)),
+            Some(ColumnValue::Null) => Ok(None),
+            Some(ColumnValue::Unchanged) | None => Err(ConnectorError::ReadError(format!(
+                "PostgreSQL CDC column {index} is an unchanged TOAST value with no complete old \
+                 row to restore it from"
+            ))),
+        },
+        None => Err(ConnectorError::ReadError(format!(
+            "PostgreSQL CDC tuple is missing column {index}"
+        ))),
     }
+}
 
-    pub(super) fn process_update(
-        &mut self,
-        relation_id: u32,
-        old_tuple: Option<&OldTuple>,
-        new_tuple: &super::super::decoder::TupleData,
-    ) -> Result<(), ConnectorError> {
-        let (lsn, ts_ms) = self.require_current_txn_context()?;
-        let (table, before_len, after_len) = {
-            let relation = self.require_relation(relation_id)?;
-            let table = relation.full_name()?;
-
-            if !self.config.should_include_table(&table) {
-                return Ok(());
-            }
-
-            let before_len = old_tuple
-                .map(|tuple| old_tuple_json_encoded_len(tuple, relation))
-                .transpose()?;
-            let after_len = tuple_json_encoded_len(new_tuple, relation)?;
-            (table, before_len, after_len)
-        };
-        let event_bytes = planned_event_bytes(table.capacity(), before_len, Some(after_len))?;
-        self.reserve_current_event_slot()?;
-        self.ensure_event_capacity(event_bytes)?;
-        let relation = self.require_relation(relation_id)?;
-        let before_json = old_tuple
-            .zip(before_len)
-            .map(|(tuple, length)| old_tuple_to_json(tuple, relation, length))
-            .transpose()?;
-        let after_json = tuple_to_json(new_tuple, relation, after_len)?;
-
-        let event = ChangeEvent {
-            table,
-            op: CdcOperation::Update,
-            lsn,
-            ts_ms,
-            before: before_json,
-            after: Some(after_json),
-        };
-
-        self.push_event(event, event_bytes)?;
-        self.metrics.record_update();
-        Ok(())
-    }
-
-    pub(super) fn process_delete(
-        &mut self,
-        relation_id: u32,
-        old_tuple: &OldTuple,
-    ) -> Result<(), ConnectorError> {
-        let (lsn, ts_ms) = self.require_current_txn_context()?;
-        let (table, before_len) = {
-            let relation = self.require_relation(relation_id)?;
-            let table = relation.full_name()?;
-
-            if !self.config.should_include_table(&table) {
-                return Ok(());
-            }
-
-            let before_len = old_tuple_json_encoded_len(old_tuple, relation)?;
-            (table, before_len)
-        };
-        let event_bytes = planned_event_bytes(table.capacity(), Some(before_len), None)?;
-        self.reserve_current_event_slot()?;
-        self.ensure_event_capacity(event_bytes)?;
-        let before_json =
-            old_tuple_to_json(old_tuple, self.require_relation(relation_id)?, before_len)?;
-
-        let event = ChangeEvent {
-            table,
-            op: CdcOperation::Delete,
-            lsn,
-            ts_ms,
-            before: Some(before_json),
-            after: None,
-        };
-
-        self.push_event(event, event_bytes)?;
-        self.metrics.record_delete();
-        Ok(())
-    }
-
-    /// Looks up a relation by ID, returning a reference (no clone).
-    ///
-    /// The caller must extract all needed data (table name, JSON) from
-    /// the reference before calling `push_event` or other `&mut self`
-    /// methods (Rust's borrow rules require disjoint access).
-    pub(super) fn require_relation(
-        &self,
-        relation_id: u32,
-    ) -> Result<&RelationInfo, ConnectorError> {
-        self.relation_cache.get(relation_id).ok_or_else(|| {
-            ConnectorError::ReadError(format!(
-                "unknown relation ID {relation_id} (no Relation message received yet)"
-            ))
+fn declared_text_bytes(layout: &RowLayout, tuple: &TupleData, old: Option<&TupleData>) -> usize {
+    layout
+        .columns
+        .iter()
+        .map(|column| {
+            resolve_value(tuple, old, column.tuple_index)
+                .ok()
+                .flatten()
+                .map_or(0, <[u8]>::len)
         })
-    }
-
-    pub(super) fn require_current_txn_context(&mut self) -> Result<(Lsn, i64), ConnectorError> {
-        if let Some(txn) = &self.current_txn {
-            return Ok((txn.final_lsn, txn.commit_ts_ms));
-        }
-        self.state = ConnectorState::Failed;
-        Err(ConnectorError::ReadError(
-            "PostgreSQL CDC received a row change outside a transaction".into(),
-        ))
-    }
-
-    pub(super) fn validate_commit_boundary(
-        &self,
-        commit: &super::super::decoder::CommitMessage,
-    ) -> Result<(), ConnectorError> {
-        let transaction = self.current_txn.as_ref().ok_or_else(|| {
-            ConnectorError::ReadError(
-                "PostgreSQL CDC received COMMIT without an open transaction".into(),
-            )
-        })?;
-        if commit.commit_lsn != transaction.final_lsn {
-            return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC COMMIT LSN {} does not match BEGIN final LSN {}",
-                commit.commit_lsn, transaction.final_lsn
-            )));
-        }
-        if commit.commit_ts_ms != transaction.commit_ts_ms {
-            return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC COMMIT timestamp {} does not match BEGIN timestamp {}",
-                commit.commit_ts_ms, transaction.commit_ts_ms
-            )));
-        }
-        if commit.end_lsn < commit.commit_lsn {
-            return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC COMMIT end LSN {} is before commit LSN {}",
-                commit.end_lsn, commit.commit_lsn
-            )));
-        }
-        let last_resumable_lsn = self
-            .committed_transactions
-            .back()
-            .map_or(self.polled_lsn, |transaction| {
-                transaction.end_lsn.max(self.polled_lsn)
-            });
-        if commit.end_lsn < last_resumable_lsn {
-            return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC COMMIT end LSN {} is behind the last emitted or queued LSN {last_resumable_lsn}",
-                commit.end_lsn
-            )));
-        }
-        Ok(())
-    }
-
-    pub(super) fn event_container_retained_bytes(&self) -> Result<usize, ConnectorError> {
-        let event_size = std::mem::size_of::<ChangeEvent>();
-        let mut retained = self
-            .committed_transactions
-            .capacity()
-            .checked_mul(std::mem::size_of::<CommittedTransaction>())
-            .ok_or_else(|| {
-                ConnectorError::ReadError(
-                    "PostgreSQL CDC committed-transaction container size overflow".into(),
-                )
-            })?;
-        if let Some(transaction) = &self.current_txn {
-            retained = retained
-                .checked_add(
-                    transaction
-                        .events
-                        .capacity()
-                        .checked_mul(event_size)
-                        .ok_or_else(|| {
-                            ConnectorError::ReadError(
-                                "PostgreSQL CDC open-transaction container size overflow".into(),
-                            )
-                        })?,
-                )
-                .ok_or_else(|| {
-                    ConnectorError::ReadError(
-                        "PostgreSQL CDC event-container retained-byte overflow".into(),
-                    )
-                })?;
-        }
-        for transaction in &self.committed_transactions {
-            retained = retained
-                .checked_add(
-                    transaction
-                        .events
-                        .capacity()
-                        .checked_mul(event_size)
-                        .ok_or_else(|| {
-                            ConnectorError::ReadError(
-                                "PostgreSQL CDC committed-event container size overflow".into(),
-                            )
-                        })?,
-                )
-                .ok_or_else(|| {
-                    ConnectorError::ReadError(
-                        "PostgreSQL CDC event-container retained-byte overflow".into(),
-                    )
-                })?;
-        }
-        Ok(retained)
-    }
-
-    pub(super) fn decoded_retained_bytes(&self) -> Result<usize, ConnectorError> {
-        let container_bytes = self.event_container_retained_bytes()?;
-        let relation_bytes = self.relation_cache.retained_bytes()?;
-        self.buffered_event_bytes
-            .checked_add(container_bytes)
-            .and_then(|bytes| bytes.checked_add(relation_bytes))
-            .ok_or_else(|| {
-                ConnectorError::ReadError(
-                    "PostgreSQL CDC decoded-stage retained-byte accounting overflow".into(),
-                )
-            })
-    }
-
-    pub(super) fn ensure_decoded_byte_limit(
-        &mut self,
-        additional_bytes: usize,
-        context: &str,
-    ) -> Result<usize, ConnectorError> {
-        let retained_bytes = self
-            .decoded_retained_bytes()
-            .and_then(|bytes| {
-                bytes.checked_add(additional_bytes).ok_or_else(|| {
-                    ConnectorError::ReadError(
-                        "PostgreSQL CDC decoded-stage retained-byte accounting overflow".into(),
-                    )
-                })
-            })
-            .inspect_err(|_error| {
-                self.state = ConnectorState::Failed;
-            })?;
-        let max_bytes = self.config.decoded_event_bytes();
-        if retained_bytes > max_bytes {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC {context} exceeds the hard decoded-stage buffer limit (retained bytes: {retained_bytes}/{max_bytes})"
-            )));
-        }
-        Ok(retained_bytes)
-    }
-
-    pub(super) fn reserve_current_event_slot(&mut self) -> Result<(), ConnectorError> {
-        let Some(transaction) = self.current_txn.as_ref() else {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(
-                "PostgreSQL CDC received a row change outside a transaction".into(),
-            ));
-        };
-        let old_capacity = transaction.events.capacity();
-        let growth_bytes = conservative_deque_growth_bytes(
-            transaction.events.len(),
-            old_capacity,
-            std::mem::size_of::<ChangeEvent>(),
-        )?;
-        self.ensure_decoded_byte_limit(growth_bytes, "event-container growth")?;
-        let Some(transaction) = self.current_txn.as_mut() else {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::Internal(
-                "PostgreSQL CDC open transaction disappeared during container preflight".into(),
-            ));
-        };
-        if let Err(error) = transaction.events.try_reserve_exact(1) {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC could not reserve decoded-event storage: {error}"
-            )));
-        }
-        let Some(actual_growth) = transaction
-            .events
-            .capacity()
-            .checked_sub(old_capacity)
-            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<ChangeEvent>()))
-        else {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::Internal(
-                "PostgreSQL CDC event-container growth accounting failed".into(),
-            ));
-        };
-        if actual_growth > growth_bytes {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::Internal(format!(
-                "PostgreSQL CDC event-container growth exceeded its conservative preflight: actual={actual_growth}, planned={growth_bytes}"
-            )));
-        }
-        self.ensure_decoded_byte_limit(0, "event-container growth")?;
-        Ok(())
-    }
-
-    pub(super) fn reserve_committed_transaction_slot(&mut self) -> Result<(), ConnectorError> {
-        if self.current_txn.is_none() {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(
-                "PostgreSQL CDC received COMMIT without an open transaction".into(),
-            ));
-        }
-        self.committed_transactions
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| {
-                self.state = ConnectorState::Failed;
-                ConnectorError::ReadError(
-                    "PostgreSQL CDC committed-transaction count overflow".into(),
-                )
-            })?;
-        let old_capacity = self.committed_transactions.capacity();
-        let growth_bytes = conservative_deque_growth_bytes(
-            self.committed_transactions.len(),
-            old_capacity,
-            std::mem::size_of::<CommittedTransaction>(),
-        )?;
-        self.ensure_decoded_byte_limit(growth_bytes, "committed-transaction container growth")?;
-        if let Err(error) = self.committed_transactions.try_reserve_exact(1) {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC could not reserve committed-transaction storage: {error}"
-            )));
-        }
-        let actual_growth = self
-            .committed_transactions
-            .capacity()
-            .checked_sub(old_capacity)
-            .and_then(|capacity| capacity.checked_mul(std::mem::size_of::<CommittedTransaction>()))
-            .ok_or_else(|| {
-                self.state = ConnectorState::Failed;
-                ConnectorError::Internal(
-                    "PostgreSQL CDC committed-transaction growth accounting failed".into(),
-                )
-            })?;
-        if actual_growth > growth_bytes {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::Internal(format!(
-                "PostgreSQL CDC committed-transaction growth exceeded its conservative preflight: actual={actual_growth}, planned={growth_bytes}"
-            )));
-        }
-        self.ensure_decoded_byte_limit(0, "committed-transaction container growth")?;
-        Ok(())
-    }
-
-    pub(super) fn admit_relation(&mut self, info: RelationInfo) -> Result<(), ConnectorError> {
-        super::super::schema_resolution::validate_relation(
-            self.committed_relations.as_ref(),
-            &info,
-            &self.config,
-        )
-        .inspect_err(|_| {
-            self.state = ConnectorState::Failed;
-        })?;
-        let existing_bytes = self
-            .relation_cache
-            .get(info.relation_id)
-            .map(RelationInfo::variable_retained_bytes)
-            .transpose()
-            .inspect_err(|_error| {
-                self.state = ConnectorState::Failed;
-            })?;
-        let new_relation = usize::from(existing_bytes.is_none());
-        let existing_bytes = existing_bytes.unwrap_or(0);
-        self.relation_cache
-            .len()
-            .checked_add(new_relation)
-            .ok_or_else(|| {
-                self.state = ConnectorState::Failed;
-                ConnectorError::ReadError("PostgreSQL CDC relation-cache count overflow".into())
-            })?;
-        let incoming_bytes = info.variable_retained_bytes().inspect_err(|_error| {
-            self.state = ConnectorState::Failed;
-        })?;
-        let retained_growth = incoming_bytes.saturating_sub(existing_bytes);
-        let growth_bytes = self
-            .relation_cache
-            .reservation_growth_bytes(info.relation_id)
-            .inspect_err(|_error| {
-                self.state = ConnectorState::Failed;
-            })?;
-        let admission_bytes = retained_growth.checked_add(growth_bytes).ok_or_else(|| {
-            self.state = ConnectorState::Failed;
-            ConnectorError::ReadError(
-                "PostgreSQL CDC relation-cache admission size overflow".into(),
-            )
-        })?;
-        self.ensure_decoded_byte_limit(admission_bytes, "relation-cache admission")?;
-        let old_cache_bytes = self.relation_cache.retained_bytes()?;
-        self.relation_cache
-            .try_reserve_for(info.relation_id)
-            .inspect_err(|_error| {
-                self.state = ConnectorState::Failed;
-            })?;
-        let actual_growth = self
-            .relation_cache
-            .retained_bytes()?
-            .checked_sub(old_cache_bytes)
-            .ok_or_else(|| {
-                self.state = ConnectorState::Failed;
-                ConnectorError::Internal(
-                    "PostgreSQL CDC relation-cache growth accounting failed".into(),
-                )
-            })?;
-        if actual_growth > growth_bytes {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::Internal(format!(
-                "PostgreSQL CDC relation-cache growth exceeded its conservative preflight: actual={actual_growth}, planned={growth_bytes}"
-            )));
-        }
-        self.ensure_decoded_byte_limit(retained_growth, "relation-cache admission")?;
-        self.relation_cache.insert(info).inspect_err(|_error| {
-            self.state = ConnectorState::Failed;
-        })?;
-        self.ensure_decoded_byte_limit(0, "relation-cache retention")?;
-        Ok(())
-    }
-
-    pub(super) fn ensure_event_capacity(
-        &mut self,
-        event_bytes: usize,
-    ) -> Result<(), ConnectorError> {
-        if self.current_txn.is_none() {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(
-                "PostgreSQL CDC received a row change outside a transaction".into(),
-            ));
-        }
-
-        self.buffered_event_count.checked_add(1).ok_or_else(|| {
-            self.state = ConnectorState::Failed;
-            ConnectorError::ReadError(
-                "PostgreSQL CDC decoded-event count accounting overflow".into(),
-            )
-        })?;
-        self.ensure_decoded_byte_limit(event_bytes, "transaction")?;
-        Ok(())
-    }
-
-    pub(super) fn push_event(
-        &mut self,
-        event: ChangeEvent,
-        preflight_bytes: usize,
-    ) -> Result<(), ConnectorError> {
-        let event_bytes = retained_event_bytes(&event)?;
-        if event_bytes > preflight_bytes {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::Internal(format!(
-                "PostgreSQL CDC decoded event exceeded its retained-byte preflight: actual={event_bytes}, planned={preflight_bytes}"
-            )));
-        }
-        self.ensure_event_capacity(event_bytes)?;
-        let next_event_count = self.buffered_event_count.checked_add(1).ok_or_else(|| {
-            self.state = ConnectorState::Failed;
-            ConnectorError::Internal(
-                "PostgreSQL CDC preflighted event-count accounting overflow".into(),
-            )
-        })?;
-        let next_event_bytes = self
-            .buffered_event_bytes
-            .checked_add(event_bytes)
-            .ok_or_else(|| {
-                self.state = ConnectorState::Failed;
-                ConnectorError::Internal(
-                    "PostgreSQL CDC preflighted retained-byte accounting overflow".into(),
-                )
-            })?;
-
-        let Some(txn) = self.current_txn.as_mut() else {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::Internal(
-                "PostgreSQL CDC open transaction disappeared after event preflight".into(),
-            ));
-        };
-        txn.events.push_back(event);
-        self.buffered_event_count = next_event_count;
-        self.buffered_event_bytes = next_event_bytes;
-        Ok(())
-    }
-
-    /// Processes a [`WalPayload`] received from the background reader task.
-    pub(super) fn process_wal_payload(
-        &mut self,
-        payload: WalPayload,
-    ) -> Result<(), ConnectorError> {
-        use super::super::decoder::pg_timestamp_to_unix_ms;
-
-        match payload {
-            WalPayload::Begin {
-                final_lsn,
-                commit_ts_us,
-                xid,
-            } => {
-                let begin = super::super::decoder::BeginMessage {
-                    final_lsn: Lsn::new(final_lsn),
-                    commit_ts_ms: pg_timestamp_to_unix_ms(commit_ts_us).map_err(|error| {
-                        ConnectorError::ReadError(format!(
-                            "pgoutput BEGIN timestamp decode: {error}"
-                        ))
-                    })?,
-                    xid,
-                };
-                self.process_wal_message(WalMessage::Begin(begin))
-            }
-            WalPayload::Commit {
-                end_lsn,
-                commit_ts_us,
-                lsn,
-            } => {
-                let commit = super::super::decoder::CommitMessage {
-                    flags: 0,
-                    commit_lsn: Lsn::new(lsn),
-                    end_lsn: Lsn::new(end_lsn),
-                    commit_ts_ms: pg_timestamp_to_unix_ms(commit_ts_us).map_err(|error| {
-                        ConnectorError::ReadError(format!(
-                            "pgoutput COMMIT timestamp decode: {error}"
-                        ))
-                    })?,
-                };
-                self.process_wal_message(WalMessage::Commit(commit))
-            }
-            WalPayload::XLogData { wal_end, data } => {
-                let msg = decode_message(data)
-                    .map_err(|e| ConnectorError::ReadError(format!("pgoutput decode: {e}")))?;
-                self.process_wal_message(msg)?;
-                self.write_lsn = self.write_lsn.max(Lsn::new(wal_end));
-                Ok(())
-            }
-            WalPayload::KeepAlive { wal_end } => {
-                self.write_lsn = self.write_lsn.max(Lsn::new(wal_end));
-                Ok(())
-            }
-        }
-    }
-
-    pub(super) fn process_owned_wal_payload(
-        &mut self,
-        payload: OwnedWalPayload,
-    ) -> Result<(), ConnectorError> {
-        let received_bytes = u64::try_from(logical_wal_payload_bytes(&payload.payload))
-            .map_err(|_| ConnectorError::Internal("PostgreSQL CDC byte metric overflow".into()))?;
-        self.metrics.record_bytes(received_bytes);
-        let OwnedWalPayload {
-            payload,
-            _byte_permit,
-            wire_bytes,
-        } = payload;
-        let result = self.process_wal_payload(payload);
-        drop(wire_bytes);
-        result
-    }
+        .fold(0, usize::saturating_add)
 }

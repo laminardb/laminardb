@@ -33,6 +33,9 @@ pub struct PostgresCdcMetrics {
     /// Total transactions (commit messages) received.
     pub transactions: IntCounter,
 
+    /// Total rows emitted by initial snapshots.
+    pub snapshot_rows: IntCounter,
+
     /// Current confirmed flush LSN (as raw u64).
     pub confirmed_flush_lsn: IntGauge,
 
@@ -71,6 +74,10 @@ impl PostgresCdcMetrics {
                 "postgres_cdc_transactions_total",
                 "Total transactions received",
             ),
+            snapshot_rows: reg.counter(
+                "postgres_cdc_snapshot_rows_total",
+                "Total rows emitted by initial snapshots",
+            ),
             confirmed_flush_lsn: reg.gauge(
                 "postgres_cdc_confirmed_flush_lsn",
                 "Current confirmed flush LSN",
@@ -108,6 +115,11 @@ impl PostgresCdcMetrics {
     /// Records bytes received from the WAL stream.
     pub fn record_bytes(&self, bytes: u64) {
         self.bytes_received.inc_by(bytes);
+    }
+
+    /// Records rows emitted by an initial snapshot.
+    pub fn record_snapshot_rows(&self, rows: u64) {
+        self.snapshot_rows.inc_by(rows);
     }
 
     /// Records a batch produced for downstream.

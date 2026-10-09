@@ -73,6 +73,41 @@ pub struct ReplicationClient {
     runtime: tokio::runtime::Handle,
 }
 
+/// Cloneable writer for one client's applied/durable LSN.
+///
+/// The worker reads this value for every standby status update, including while the
+/// event channel is full, so durable progress reaches the server without a consumer poll.
+#[derive(Clone)]
+pub struct AppliedLsnHandle(Arc<SharedProgress>);
+
+impl AppliedLsnHandle {
+    /// A handle not attached to any worker, starting at `start`.
+    pub fn new(start: Lsn) -> Self {
+        Self(Arc::new(SharedProgress::new(start)))
+    }
+
+    /// The applied LSN the worker will report next.
+    #[inline]
+    pub fn get(&self) -> Lsn {
+        self.0.load_applied()
+    }
+
+    /// Monotonically raise the applied LSN; call only once every event up to `lsn` is durable.
+    #[inline]
+    pub fn update(&self, lsn: Lsn) {
+        self.0.update_applied(lsn);
+    }
+}
+
+impl std::fmt::Debug for AppliedLsnHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("AppliedLsnHandle")
+            .field(&self.0.load_applied())
+            .finish()
+    }
+}
+
 /// Aborts a not-yet-published replication worker when `connect()` is
 /// cancelled or returns an error. Once startup succeeds, ownership moves into
 /// `ReplicationClient` and its normal shutdown path applies.
@@ -226,6 +261,12 @@ impl ReplicationClient {
         self.progress.update_applied(lsn);
     }
 
+    /// A cloneable writer for the same applied/durable LSN as
+    /// [`update_applied_lsn`](Self::update_applied_lsn), usable without borrowing the client.
+    pub fn applied_lsn_handle(&self) -> AppliedLsnHandle {
+        AppliedLsnHandle(Arc::clone(&self.progress))
+    }
+
     /// Request the worker to stop gracefully.
     ///
     /// After calling this, [`recv()`](Self::recv) will return remaining buffered
@@ -300,7 +341,7 @@ impl ReplicationClient {
     }
 }
 
-fn validate_config(cfg: &ReplicationConfig) -> Result<()> {
+pub(super) fn validate_config(cfg: &ReplicationConfig) -> Result<()> {
     if cfg.slot.is_empty()
         || cfg.slot.len() > 63
         || !cfg

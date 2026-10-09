@@ -2,6 +2,7 @@ use super::{
     build_replication_config, source_config_digest, validate_replication_slot,
     validate_server_version_num,
 };
+use crate::postgres::cdc::config::{OutputMode, SnapshotMode, TableName};
 use crate::postgres::cdc::{PostgresCdcConfig, SslMode};
 
 #[test]
@@ -61,9 +62,9 @@ fn existing_slot_must_match_the_durable_logical_identity() {
         "pgoutput",
         "app",
         Some("pgoutput"),
-        "logical",
+        Some("logical"),
         Some("app"),
-        false,
+        Some(false),
         None,
     )
     .unwrap();
@@ -74,9 +75,9 @@ fn existing_slot_must_match_the_durable_logical_identity() {
             "pgoutput",
             "app",
             Some("test_decoding"),
-            "logical",
+            Some("logical"),
             Some("app"),
-            false,
+            Some(false),
             None,
         )
         .unwrap_err(),
@@ -85,9 +86,9 @@ fn existing_slot_must_match_the_durable_logical_identity() {
             "pgoutput",
             "app",
             Some("pgoutput"),
-            "logical",
+            Some("logical"),
             Some("other"),
-            false,
+            Some(false),
             None,
         )
         .unwrap_err(),
@@ -96,9 +97,9 @@ fn existing_slot_must_match_the_durable_logical_identity() {
             "pgoutput",
             "app",
             Some("pgoutput"),
-            "logical",
+            Some("logical"),
             Some("app"),
-            true,
+            Some(true),
             None,
         )
         .unwrap_err(),
@@ -107,9 +108,9 @@ fn existing_slot_must_match_the_durable_logical_identity() {
             "pgoutput",
             "app",
             Some("pgoutput"),
-            "logical",
+            Some("logical"),
             Some("app"),
-            false,
+            Some(false),
             Some("wal_removed"),
         )
         .unwrap_err(),
@@ -119,25 +120,35 @@ fn existing_slot_must_match_the_durable_logical_identity() {
 }
 
 #[test]
-fn source_config_digest_is_canonical_but_semantic() {
+fn source_config_digest_covers_only_emission_semantics() {
     let mut first = PostgresCdcConfig::default();
-    first.table_include = vec!["public.b".into(), "public.a".into(), "public.a".into()];
-    first.table_exclude = vec!["public.audit".into()];
+    first.table = TableName::parse("public.orders").unwrap();
 
-    let mut reordered = first.clone();
-    reordered.table_include = vec!["public.a".into(), "public.b".into()];
-    reordered.host = "replacement-primary".into();
-    reordered.max_buffered_bytes = 64 * 1024 * 1024;
+    let mut restartable = first.clone();
+    restartable.host = "replacement-primary".into();
+    restartable.max_buffered_bytes = 64 * 1024 * 1024;
+    restartable.snapshot_mode = SnapshotMode::Never;
     assert_eq!(
         source_config_digest(&first),
-        source_config_digest(&reordered),
-        "endpoint, capacity, order, and duplicates do not change filtering semantics"
+        source_config_digest(&restartable),
+        "endpoint, capacity, and fresh-start mode do not change what a resumed slot emits"
     );
 
-    reordered.table_exclude.push("public.private".into());
-    assert_ne!(
-        source_config_digest(&first),
-        source_config_digest(&reordered)
+    let mut other_table = first.clone();
+    other_table.table = TableName::parse("public.order_lines").unwrap();
+    let mut other_mode = first.clone();
+    other_mode.output_mode = OutputMode::Changelog;
+    for changed in [other_table, other_mode] {
+        assert_ne!(source_config_digest(&first), source_config_digest(&changed));
+    }
+}
+
+#[test]
+fn replication_session_uses_canonical_value_settings() {
+    let replication = build_replication_config(&PostgresCdcConfig::default());
+    assert_eq!(
+        replication.session_options.as_deref(),
+        Some(crate::postgres::cdc::typed_rows::SESSION_OPTIONS)
     );
 }
 

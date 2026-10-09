@@ -6,6 +6,7 @@ fn connector_config() -> ConnectorConfig {
     config.set("database", "db");
     config.set("slot.name", "s");
     config.set("publication", "p");
+    config.set("table", "public.orders");
     config.set("ssl.mode", "disable");
     config
 }
@@ -19,12 +20,15 @@ fn test_default_config() {
     assert_eq!(cfg.slot_name, "laminar_slot");
     assert_eq!(cfg.publication, "laminar_pub");
     assert_eq!(cfg.ssl_mode, SslMode::VerifyFull);
-    assert!(cfg.validate().is_ok());
+    assert_eq!(cfg.snapshot_mode, SnapshotMode::Initial);
+    assert_eq!(cfg.output_mode, OutputMode::Upsert);
+    assert!(cfg.validate().unwrap_err().to_string().contains("table"));
 }
 
 #[test]
 fn replication_identity_rejects_invalid_slot_and_nul() {
     let mut cfg = PostgresCdcConfig::default();
+    cfg.table = TableName::parse("public.orders").unwrap();
     cfg.slot_name = "Mixed-Case".into();
     assert!(cfg
         .validate()
@@ -100,6 +104,7 @@ fn test_from_connector_config() {
     config.set("database", "testdb");
     config.set("slot.name", "test_slot");
     config.set("publication", "test_pub");
+    config.set("table", "sales.Orders");
     config.set("ssl.mode", "disable");
     config.set("port", "5433");
     config.set("max.buffered.bytes", "67108864");
@@ -109,16 +114,59 @@ fn test_from_connector_config() {
     assert_eq!(cfg.port, 5433);
     assert_eq!(cfg.database, "testdb");
     assert_eq!(cfg.max_buffered_bytes, 64 * 1024 * 1024);
+    assert_eq!(cfg.table.schema, "sales");
+    assert_eq!(cfg.table.name, "Orders");
+}
+
+#[test]
+fn modes_parse_and_changelog_requires_a_snapshot() {
+    let mut config = connector_config();
+    config.set("output.mode", "changelog");
+    let cfg = PostgresCdcConfig::from_config(&config).unwrap();
+    assert_eq!(cfg.output_mode, OutputMode::Changelog);
+    assert_eq!(cfg.snapshot_mode, SnapshotMode::Initial);
+
+    config.set("snapshot.mode", "never");
+    let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+    assert!(
+        error.to_string().contains("snapshot.mode=initial"),
+        "{error}"
+    );
+
+    config.set("output.mode", "upsert");
+    let cfg = PostgresCdcConfig::from_config(&config).unwrap();
+    assert_eq!(cfg.snapshot_mode, SnapshotMode::Never);
+
+    config.set("output.mode", "document");
+    assert!(PostgresCdcConfig::from_config(&config).is_err());
+}
+
+#[test]
+fn table_must_be_one_schema_qualified_name() {
+    for table in ["users", ".users", "public.", "a.b.c", ""] {
+        let mut config = connector_config();
+        config.set("table", table);
+        let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("schema"), "{table}: {error}");
+    }
+    let mut properties = connector_config().properties().clone();
+    properties.remove("table");
+    let config = ConnectorConfig::with_properties("postgres-cdc", properties);
+    assert!(PostgresCdcConfig::from_config(&config).is_err());
+}
+
+#[test]
+fn relation_metadata_is_a_bounded_slice_of_the_decoded_stage() {
+    let mut cfg = PostgresCdcConfig::default();
+    cfg.max_buffered_bytes = MIN_BUFFERED_BYTES;
+    assert!(cfg.relation_metadata_bytes() * RELATION_METADATA_DIVISOR <= cfg.decoded_event_bytes());
+    assert!(cfg.relation_metadata_bytes() < cfg.decoded_event_bytes() / 2);
 }
 
 #[test]
 fn total_byte_budget_is_partitioned_without_loss() {
     let mut cfg = PostgresCdcConfig::default();
     cfg.max_buffered_bytes = MIN_BUFFERED_BYTES;
-    assert_eq!(
-        cfg.decoded_high_watermark_bytes(),
-        cfg.decoded_event_bytes() - cfg.decoded_event_bytes() / 5
-    );
     assert_eq!(
         cfg.raw_wal_bytes() + cfg.decoded_event_bytes() + cfg.arrow_build_bytes(),
         MIN_BUFFERED_BYTES
@@ -154,6 +202,7 @@ fn omitted_ssl_mode_uses_verified_tls() {
     config.set("database", "db");
     config.set("slot.name", "s");
     config.set("publication", "p");
+    config.set("table", "public.orders");
     let config = PostgresCdcConfig::from_config(&config).unwrap();
     assert_eq!(config.ssl_mode, SslMode::VerifyFull);
 }
@@ -172,6 +221,7 @@ fn engine_metadata_properties_are_admitted() {
     let mut config = connector_config();
     config.set("laminar.source.name", "orders");
     config.set("_arrow_schema", "engine-owned");
+    config.set("_primary_key_columns", "id");
     PostgresCdcConfig::from_config(&config).unwrap();
 }
 
@@ -185,32 +235,11 @@ fn test_validate_empty_host() {
 #[test]
 fn removed_properties_are_rejected_explicitly() {
     for key in REMOVED_CONFIG_KEYS {
-        let mut config = ConnectorConfig::new("postgres-cdc");
-        config.set("host", "localhost");
-        config.set("database", "db");
-        config.set("slot.name", "s");
-        config.set("publication", "p");
+        let mut config = connector_config();
         config.set(*key, "removed-value");
         let error = PostgresCdcConfig::from_config(&config).unwrap_err();
         assert!(error.to_string().contains(key));
     }
-}
-
-#[test]
-fn test_table_filtering() {
-    let mut cfg = PostgresCdcConfig::default();
-    // No filters → include all
-    assert!(cfg.should_include_table("public.users"));
-
-    // Include list
-    cfg.table_include = vec!["public.users".to_string(), "public.orders".to_string()];
-    cfg.normalize_table_filters();
-    assert!(cfg.should_include_table("public.users"));
-    assert!(!cfg.should_include_table("public.logs"));
-
-    // Exclude overrides include
-    cfg.table_exclude = vec!["public.users".to_string()];
-    assert!(!cfg.should_include_table("public.users"));
 }
 
 #[test]
@@ -222,42 +251,11 @@ fn manual_start_lsn_is_rejected() {
 }
 
 #[test]
-fn test_from_config_table_include() {
+fn table_filters_point_at_the_single_table_key() {
     let mut config = connector_config();
-    config.set("table.include", "public.users, public.orders");
-
-    let cfg = PostgresCdcConfig::from_config(&config).unwrap();
-    assert_eq!(cfg.table_include, vec!["public.orders", "public.users"]);
-}
-
-#[test]
-fn table_filters_are_trimmed_nonempty_sorted_and_deduplicated_once() {
-    let mut config = connector_config();
-    config.set(
-        "table.include",
-        " public.users,public.orders,, public.users,   ",
-    );
-    config.set(
-        "table.exclude",
-        " public.audit, ,public.archive,public.audit ",
-    );
-
-    let cfg = PostgresCdcConfig::from_config(&config).unwrap();
-    assert_eq!(cfg.table_include, vec!["public.orders", "public.users"]);
-    assert_eq!(cfg.table_exclude, vec!["public.archive", "public.audit"]);
-    assert!(cfg.should_include_table("public.users"));
-    assert!(!cfg.should_include_table("public.audit"));
-    assert!(!cfg.should_include_table("users"));
-}
-
-#[test]
-fn table_filters_reject_unqualified_or_empty_components() {
-    for table in ["users", ".users", "public."] {
-        let mut config = connector_config();
-        config.set("table.include", table);
-        let error = PostgresCdcConfig::from_config(&config).unwrap_err();
-        assert!(error.to_string().contains("schema"), "{table}: {error}");
-    }
+    config.set("table.include", "public.users");
+    let error = PostgresCdcConfig::from_config(&config).unwrap_err();
+    assert!(error.to_string().contains("exactly one table"), "{error}");
 }
 
 #[test]

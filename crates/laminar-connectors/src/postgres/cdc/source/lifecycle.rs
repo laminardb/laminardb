@@ -1,70 +1,157 @@
-//! Source startup, polling, durable feedback, and shutdown ownership.
+//! Source contract, startup, polling, durable feedback, and shutdown ownership.
 
-#[cfg(not(test))]
-use super::startup::{prepare_reader_runtime, PreparedReaderRuntime};
-use super::{
-    async_trait, reap_postgres_reader, validate_checkpoint_identity, validate_live_binding,
-    write_checkpoint_binding, Arc, BTreeMap, ConnectorConfig, ConnectorError, ConnectorState,
-    ConnectorTaskTracker, Lsn, Notify, PostgresCdcConfig, PostgresCdcSource,
-    PostgresCheckpointBinding, SchemaRef, SourceBatch, SourceCheckpoint, SourceConnector,
-    SourceContract, SourcePosition, SourceStart, INITIAL_BOOTSTRAP_NOT_ADMITTED,
+use std::collections::BTreeMap;
+
+use arrow_schema::SchemaRef;
+use async_trait::async_trait;
+
+use crate::checkpoint::SourceCheckpoint;
+use crate::config::{ConnectorConfig, ConnectorState};
+use crate::connector::{
+    ConnectorTaskTracker, SourceBatch, SourceCheckpointUnavailablePolicy, SourceConnector,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
+    SourceRowPositionCapability, SourceStart, SourceTopology,
 };
+use crate::error::ConnectorError;
 
-struct PreparedSourceStart {
-    config: PostgresCdcConfig,
-    start_lsn: Lsn,
-    checkpoint_binding: PostgresCheckpointBinding,
-}
+use super::super::config::{OutputMode, PostgresCdcConfig};
+use super::super::schema_resolution::{committed_relation, declared_primary_key, declared_schema};
+use super::super::typed_rows::RowBuilder;
+use super::checkpoint::{parse_resumable, validate_live_binding, write_cursor, CursorPhase};
+use super::decoding::Decoded;
+use super::startup::{prepare, ReaderRuntime, StartInputs, StartPhase, StartPlan};
+use super::{reap_postgres_reader, Arc, Lsn, Notify, Phase, PostgresCdcSource};
 
-fn prepare_source_start(
-    current_config: &PostgresCdcConfig,
+/// Minimum spacing of live publication/table revalidation at checkpoint commits.
+const CONTRACT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn parsed_config(
+    current: &PostgresCdcConfig,
     config: &ConnectorConfig,
-    position: SourcePosition,
-) -> Result<PreparedSourceStart, ConnectorError> {
-    let mut config = if config.properties().is_empty() {
-        current_config.clone()
+) -> Result<PostgresCdcConfig, ConnectorError> {
+    if config.properties().is_empty() {
+        current.validate()?;
+        Ok(current.clone())
     } else {
-        PostgresCdcConfig::from_config(config)?
-    };
-    config.normalize_table_filters();
-    config.validate()?;
-
-    let SourcePosition::Resume {
-        attempt,
-        checkpoint,
-    } = position
-    else {
-        return Err(ConnectorError::ConfigurationError(
-            INITIAL_BOOTSTRAP_NOT_ADMITTED.into(),
-        ));
-    };
-    let context = format!("checkpoint {attempt:?}");
-    let checkpoint_binding = validate_checkpoint_identity(&checkpoint, &config, &context)?;
-    let lsn_str = checkpoint.get_offset("lsn").ok_or_else(|| {
-        ConnectorError::ConfigurationError(format!(
-            "PostgreSQL CDC checkpoint {attempt:?} is missing required 'lsn' offset"
-        ))
-    })?;
-    let start_lsn = lsn_str.parse::<Lsn>().map_err(|error| {
-        ConnectorError::ConfigurationError(format!(
-            "invalid LSN '{lsn_str}' in PostgreSQL CDC checkpoint {attempt:?}: {error}"
-        ))
-    })?;
-    Ok(PreparedSourceStart {
-        config,
-        start_lsn,
-        checkpoint_binding,
-    })
+        PostgresCdcConfig::from_config(config)
+    }
 }
 
-#[cfg(not(test))]
-fn install_reader_runtime(source: &mut PostgresCdcSource, runtime: PreparedReaderRuntime) {
-    source.wal_rx = Some(runtime.wal_rx);
-    source.wal_byte_budget = Some(runtime.wal_byte_budget);
-    source.wal_terminal_error = Some(runtime.terminal_error);
-    source.reader_handle = Some(runtime.reader_handle);
-    source.reader_shutdown = Some(runtime.shutdown_tx);
-    source.confirmed_lsn_tx = Some(runtime.confirmed_lsn_tx);
+impl PostgresCdcSource {
+    /// Decode queued WAL within one bounded work quantum and emit whole committed transactions.
+    fn poll_streaming(
+        &mut self,
+        max_records: usize,
+    ) -> Result<Option<SourceBatch>, ConnectorError> {
+        self.fail_on_terminal_wal_error()?;
+        let payload_budget = max_records.max(1);
+        let mut processed = 0_usize;
+        let mut reader_closed = false;
+        while processed < payload_budget {
+            let payload = if let Some(payload) = self.pending_payloads.pop_front() {
+                payload
+            } else {
+                match self.wal_rx.as_ref().map(|receiver| receiver.try_recv()) {
+                    Some(Ok(payload)) => payload,
+                    Some(Err(crossfire::TryRecvError::Empty)) | None => break,
+                    Some(Err(crossfire::TryRecvError::Disconnected)) => {
+                        reader_closed = true;
+                        break;
+                    }
+                }
+            };
+            match self.process_owned_wal_payload(payload) {
+                Ok(Decoded::Applied) => processed += 1,
+                Ok(Decoded::Deferred(payload)) => {
+                    self.pending_payloads.push_front(payload);
+                    break;
+                }
+                Err(error) => return Err(self.fail(error)),
+            }
+        }
+        // A full quantum may hide queued work behind a coalesced notification; keep one
+        // payload so the next poll is self-notified instead of waiting on the reader.
+        if processed == payload_budget && self.pending_payloads.is_empty() {
+            match self.wal_rx.as_ref().map(|receiver| receiver.try_recv()) {
+                Some(Ok(payload)) => self.pending_payloads.push_back(payload),
+                Some(Err(crossfire::TryRecvError::Disconnected)) => reader_closed = true,
+                Some(Err(crossfire::TryRecvError::Empty)) | None => {}
+            }
+        }
+        #[cfg(test)]
+        self.process_pending_messages()?;
+        self.fail_on_terminal_wal_error()?;
+        if reader_closed && self.committed.is_empty() && self.pending_payloads.is_empty() {
+            return Err(self.fail(ConnectorError::ReadError(
+                "WAL reader task terminated unexpectedly — replication stream lost".to_string(),
+            )));
+        }
+        let batch = self.drain_committed(max_records)?;
+        if max_records > 0 && (!self.pending_payloads.is_empty() || !self.committed.is_empty()) {
+            self.data_ready.notify_one();
+        }
+        self.metrics
+            .set_replication_lag_bytes(self.replication_lag_bytes());
+        Ok(batch)
+    }
+
+    /// Launch the replication reader at the finished snapshot's consistent point.
+    pub(super) async fn begin_streaming(&mut self, start_lsn: Lsn) -> Result<(), ConnectorError> {
+        let binding = self.checkpoint_binding.clone().ok_or_else(|| {
+            ConnectorError::Internal("PostgreSQL CDC streams without a binding".into())
+        })?;
+        let launched = super::startup::launch_reader(
+            &self.task_owner,
+            Arc::clone(&self.data_ready),
+            &self.config,
+            &binding,
+            start_lsn,
+        )
+        .await;
+        match launched {
+            Ok(runtime) => {
+                self.enter_streaming(start_lsn, runtime);
+                Ok(())
+            }
+            Err(error) => Err(self.fail(error)),
+        }
+    }
+
+    fn enter_streaming(&mut self, start_lsn: Lsn, runtime: ReaderRuntime) {
+        self.wal_rx = Some(runtime.wal_rx);
+        self.wal_byte_budget = Some(runtime.wal_byte_budget);
+        self.wal_terminal_error = Some(runtime.terminal_error);
+        self.reader_handle = Some(runtime.reader_handle);
+        self.reader_shutdown = Some(runtime.shutdown_tx);
+        self.applied_lsn = Some(runtime.applied_lsn);
+        self.phase = Phase::Streaming;
+        self.polled_lsn = start_lsn;
+        self.write_lsn = self.write_lsn.max(start_lsn);
+        self.confirmed_flush_lsn = start_lsn;
+        self.metrics.set_confirmed_flush_lsn(start_lsn.as_u64());
+        self.data_ready.notify_one();
+    }
+
+    fn current_cursor(&self) -> CursorPhase {
+        match self.phase {
+            Phase::Snapshot(_) => CursorPhase::Snapshot,
+            Phase::Idle | Phase::Streaming => CursorPhase::Streaming(self.polled_lsn),
+        }
+    }
+
+    /// Re-read the live contract at most every [`CONTRACT_CHECK_INTERVAL`].
+    async fn revalidate_contract(&mut self) -> Result<(), ConnectorError> {
+        let now = tokio::time::Instant::now();
+        if self.next_contract_check.is_some_and(|due| now < due) {
+            return Ok(());
+        }
+        let (Some(binding), Some(relation)) = (&self.checkpoint_binding, &self.relation) else {
+            return Ok(());
+        };
+        super::startup::revalidate(&self.task_owner, &self.config, binding, relation).await?;
+        self.next_contract_check = Some(now + CONTRACT_CHECK_INTERVAL);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -77,21 +164,14 @@ impl SourceConnector for PostgresCdcSource {
         &self,
         config: &ConnectorConfig,
     ) -> Result<Option<BTreeMap<String, String>>, ConnectorError> {
-        let mut parsed = if config.properties().is_empty() {
-            self.config.clone()
-        } else {
-            PostgresCdcConfig::from_config(config)?
-        };
-        parsed.normalize_table_filters();
-        parsed.validate()?;
-
+        let parsed = parsed_config(&self.config, config)?;
         Ok(Some(BTreeMap::from([
             ("database".into(), parsed.database),
             ("publication".into(), parsed.publication),
             ("slot.name".into(), parsed.slot_name),
-            ("table.exclude".into(), parsed.table_exclude.join(",")),
-            ("table.include".into(), parsed.table_include.join(",")),
-            ("wire.protocol".into(), "pgoutput-v1".into()),
+            ("table".into(), parsed.table.to_string()),
+            ("output.mode".into(), parsed.output_mode.to_string()),
+            ("wire.protocol".into(), "pgoutput-v1-typed".into()),
         ])))
     }
 
@@ -114,35 +194,64 @@ impl SourceConnector for PostgresCdcSource {
             });
         }
         let (config, position, _) = request.into_parts();
-        let prepared = prepare_source_start(&self.config, &config, position)?;
-        let relations = super::super::schema_resolution::restore_relations(
-            config.schema_binding(),
-            &prepared.checkpoint_binding,
-        )?;
+        let parsed = parsed_config(&self.config, &config)?;
+        let declared = declared_schema(&config, None)?;
+        let primary_key = declared_primary_key(&config);
+        let committed = committed_relation(config.schema_binding(), &parsed)?;
+        let plan = match position {
+            SourcePosition::Initial => None,
+            SourcePosition::Initialized { .. } => {
+                return Err(ConnectorError::ConfigurationError(
+                    "PostgreSQL CDC has no sealed topology startup contract".into(),
+                ));
+            }
+            SourcePosition::Resume {
+                attempt,
+                checkpoint,
+            } => Some(parse_resumable(
+                &checkpoint,
+                &parsed,
+                &format!("checkpoint {attempt:?}"),
+            )?),
+        };
 
-        #[cfg(not(test))]
-        {
-            let runtime = prepare_reader_runtime(
-                self,
-                &prepared.config,
-                &prepared.checkpoint_binding,
-                prepared.start_lsn,
-            )
-            .await?;
-            install_reader_runtime(self, runtime);
-        }
-
-        // Publish the new runtime only after all fallible startup work has
-        // succeeded. A failed start remains a clean Created connector.
-        self.committed_relations = relations;
-        self.config = prepared.config;
-        self.confirmed_flush_lsn = prepared.start_lsn;
-        self.write_lsn = prepared.start_lsn;
-        self.polled_lsn = prepared.start_lsn;
-        self.checkpoint_binding = Some(prepared.checkpoint_binding);
-        self.metrics
-            .set_confirmed_flush_lsn(prepared.start_lsn.as_u64());
+        let prepared = prepare(
+            &self.task_owner,
+            StartInputs {
+                data_ready: &self.data_ready,
+                config: &parsed,
+                declared: &declared,
+                primary_key: &primary_key,
+                committed_relation: committed.as_ref(),
+            },
+            match plan {
+                None => StartPlan::Fresh,
+                Some((lsn, binding)) => StartPlan::Resume { lsn, binding },
+            },
+        )
+        .await?;
+        // Publish the runtime only after all fallible network preparation succeeded.
+        self.open_rows = Some(RowBuilder::new(&prepared.layout));
+        self.layout = Some(prepared.layout);
+        self.relation = Some(prepared.relation);
+        self.checkpoint_binding = Some(prepared.binding);
+        self.config = parsed;
+        self.schema = declared;
         self.state = ConnectorState::Running;
+        match prepared.phase {
+            StartPhase::Snapshot(reader) => {
+                self.phase = Phase::Snapshot(Box::new(reader));
+                self.data_ready.notify_one();
+            }
+            StartPhase::Stream(lsn, runtime) => self.enter_streaming(lsn, runtime),
+        }
+        tracing::info!(
+            table = %self.config.table,
+            slot = %self.config.slot_name,
+            output_mode = %self.config.output_mode,
+            snapshot_mode = ?self.config.snapshot_mode,
+            "PostgreSQL CDC source opened"
+        );
         Ok(())
     }
 
@@ -156,111 +265,13 @@ impl SourceConnector for PostgresCdcSource {
                 actual: self.state.to_string(),
             });
         }
-
-        // Backpressure: stop draining raw WAL before the decoded-stage hard limit. The raw byte
-        // budget then propagates pressure to the replication reader and PostgreSQL.
-        {
-            self.fail_on_terminal_wal_error()?;
-            let high_watermark = self.config.decoded_high_watermark_bytes();
-            let decoded_retained_bytes = self.decoded_retained_bytes().inspect_err(|_error| {
-                self.state = ConnectorState::Failed;
-            })?;
-            let mut reader_closed = false;
-            let must_finish_transaction = self.current_txn.is_some();
-            let payload_budget = max_records.max(1);
-            let drain_reader = must_finish_transaction || decoded_retained_bytes < high_watermark;
-            if !drain_reader && self.pending_payloads.is_empty() {
-                tracing::debug!(
-                    retained_bytes = decoded_retained_bytes,
-                    high_watermark,
-                    "CDC backpressure active — pausing WAL reader drain"
-                );
-            }
-
-            let mut processed_payloads = 0_usize;
-            while processed_payloads < payload_budget {
-                let payload = if let Some(payload) = self.pending_payloads.pop_front() {
-                    Some(payload)
-                } else if drain_reader {
-                    match self.wal_rx.as_mut().map(|receiver| receiver.try_recv()) {
-                        Some(Ok(payload)) => Some(payload),
-                        Some(Err(crossfire::TryRecvError::Empty)) | None => None,
-                        Some(Err(crossfire::TryRecvError::Disconnected)) => {
-                            reader_closed = true;
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let Some(payload) = payload else {
-                    break;
-                };
-                if let Err(e) = self.process_owned_wal_payload(payload) {
-                    self.state = ConnectorState::Failed;
-                    return Err(e);
-                }
-                processed_payloads = processed_payloads.checked_add(1).ok_or_else(|| {
-                    self.state = ConnectorState::Failed;
-                    ConnectorError::Internal(
-                        "PostgreSQL CDC poll payload-count accounting overflow".into(),
-                    )
-                })?;
-            }
-
-            // Notify ourselves only when a bounded drain demonstrably left work queued.
-            // Retaining one item avoids both a lost coalesced notification and an
-            // open-transaction busy loop while the server is genuinely idle.
-            let reached_payload_budget = processed_payloads == payload_budget;
-            let may_drain_more = if reached_payload_budget && self.current_txn.is_none() {
-                self.decoded_retained_bytes().inspect_err(|_error| {
-                    self.state = ConnectorState::Failed;
-                })? < high_watermark
-            } else {
-                reached_payload_budget
-            };
-            if may_drain_more && !reader_closed {
-                if let Some(ref mut rx) = self.wal_rx {
-                    match rx.try_recv() {
-                        Ok(payload) => self.pending_payloads.push_back(payload),
-                        Err(crossfire::TryRecvError::Empty) => {}
-                        Err(crossfire::TryRecvError::Disconnected) => reader_closed = true,
-                    }
-                }
-            }
-            if !self.pending_payloads.is_empty() {
-                self.data_ready.notify_one();
-            }
-            self.fail_on_terminal_wal_error()?;
-            if reader_closed && self.committed_transactions.is_empty() {
-                self.state = ConnectorState::Failed;
-                return Err(ConnectorError::ReadError(
-                    "WAL reader task terminated unexpectedly — replication stream lost".to_string(),
-                ));
-            }
+        match self.phase {
+            Phase::Snapshot(_) => self.poll_snapshot(max_records).await,
+            Phase::Streaming => self.poll_streaming(max_records),
+            Phase::Idle => Err(ConnectorError::Internal(
+                "PostgreSQL CDC is running without a read phase".into(),
+            )),
         }
-
-        #[cfg(test)]
-        self.process_pending_messages()?;
-
-        // Drain buffered events into a RecordBatch.
-        // Configured Arrow-column extractors derive event-time watermarks from `_ts_ms`.
-        let result = match self.drain_events(max_records)? {
-            Some(batch) => {
-                self.metrics
-                    .set_confirmed_flush_lsn(self.confirmed_flush_lsn.as_u64());
-                self.metrics
-                    .set_replication_lag_bytes(self.replication_lag_bytes());
-
-                Ok(Some(SourceBatch::new(batch)))
-            }
-            None => Ok(None),
-        };
-        let emitted_batch = matches!(&result, Ok(Some(_)));
-        if max_records > 0 && (emitted_batch || !self.committed_transactions.is_empty()) {
-            self.data_ready.notify_one();
-        }
-        result
     }
 
     fn schema(&self) -> SchemaRef {
@@ -268,19 +279,23 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new();
-        // polled_lsn = latest position drained into a batch — the resumable point recorded in the
-        // manifest. The PG slot is NOT advanced here: doing so per poll lets PG reclaim WAL for
-        // data that is only in-pipeline, so a crash loses an LSN range recovery still needs.
-        // Slot feedback is deferred to notify_epoch_committed (durable-commit only).
-        cp.set_offset("lsn", self.polled_lsn.to_string());
-        cp.set_metadata("slot_name", &self.config.slot_name);
-        cp.set_metadata("publication", &self.config.publication);
-        cp.set_metadata("database", &self.config.database);
-        if let Some(binding) = &self.checkpoint_binding {
-            write_checkpoint_binding(&mut cp, binding);
-        }
-        cp
+        write_cursor(
+            &self.config,
+            self.checkpoint_binding.as_ref(),
+            self.current_cursor(),
+        )
+    }
+
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        Ok(match self.current_cursor() {
+            CursorPhase::Snapshot => None,
+            CursorPhase::Streaming(_) => Some(self.checkpoint()),
+        })
+    }
+
+    fn checkpoint_unavailable_policy(&self) -> SourceCheckpointUnavailablePolicy {
+        // The initial snapshot is one replay unit: no checkpoint barrier may cut it.
+        SourceCheckpointUnavailablePolicy::PollToReplayBoundary
     }
 
     async fn notify_epoch_committed(
@@ -288,72 +303,60 @@ impl SourceConnector for PostgresCdcSource {
         epoch: u64,
         checkpoint: &SourceCheckpoint,
     ) -> Result<(), ConnectorError> {
-        // Advance the PG replication slot only after the epoch is durably committed (manifest
-        // persisted + sinks committed), so PG never reclaims WAL for data still in-pipeline.
-        // The checkpoint carries the exact LSN persisted for this epoch; a timer-driven empty
-        // checkpoint has no "lsn" offset and is a no-op.
-        let Some(lsn_str) = checkpoint.get_offset("lsn") else {
+        // Advance the slot only after the epoch is durably committed (manifest persisted and
+        // sinks committed), so PostgreSQL never reclaims WAL for rows still in the pipeline.
+        // Snapshot-phase and empty cursors carry no LSN and are not feedback.
+        if checkpoint.get_offset("lsn").is_none() {
             return Ok(());
-        };
-        let lsn = lsn_str.parse::<Lsn>().map_err(|error| {
-            ConnectorError::ConfigurationError(format!(
-                "committed PostgreSQL CDC epoch {epoch} contains invalid LSN '{lsn_str}': {error}"
-            ))
-        })?;
+        }
         let context = format!("committed epoch {epoch} checkpoint");
-        let committed_binding = validate_checkpoint_identity(checkpoint, &self.config, &context)?;
-        let active_binding =
+        let (lsn, committed_binding) = parse_resumable(checkpoint, &self.config, &context)?;
+        let active =
             self.checkpoint_binding
                 .as_ref()
                 .ok_or_else(|| ConnectorError::InvalidState {
                     expected: "running PostgreSQL CDC checkpoint binding".into(),
                     actual: "checkpoint binding is missing".into(),
                 })?;
-        validate_live_binding(&committed_binding, active_binding, &context)?;
-        if lsn.as_u64() > self.polled_lsn.as_u64() {
+        validate_live_binding(&committed_binding, active, &context)?;
+        if lsn > self.polled_lsn {
             return Err(ConnectorError::ConfigurationError(format!(
                 "committed PostgreSQL CDC epoch {epoch} LSN {lsn} is ahead of the source's polled LSN {}; refusing irreversible slot feedback",
                 self.polled_lsn
             )));
         }
-        // A strictly stale notification is already satisfied and must never regress either cursor.
-        // An equal notification is handed off again: that is idempotent and repairs feedback after
-        // a reader restart whose local cursor was restored before its channel was created.
-        if lsn.as_u64() < self.confirmed_flush_lsn.as_u64() {
+        if lsn < self.confirmed_flush_lsn {
             return Ok(());
         }
-
-        let tx = self
-            .confirmed_lsn_tx
+        self.revalidate_contract().await?;
+        let applied = self
+            .applied_lsn
             .as_ref()
             .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "running PostgreSQL CDC confirmed-LSN feedback channel".into(),
-                actual: "feedback channel is missing".into(),
+                expected: "running PostgreSQL CDC replication feedback".into(),
+                actual: "replication feedback handle is missing".into(),
             })?;
-        tx.send(lsn.as_u64()).map_err(|_| {
-            ConnectorError::ConnectionFailed(
-                "PostgreSQL CDC confirmed-LSN feedback channel is closed".into(),
-            )
-        })?;
-        // The local cursor is authoritative only after the reader accepted the handoff.
+        applied.update(pgwire_replication::Lsn::from_u64(lsn.as_u64()));
         self.confirmed_flush_lsn = lsn;
         self.metrics.set_confirmed_flush_lsn(lsn.as_u64());
         Ok(())
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        // The replication slot's WAL is reclaimed only as the confirmed-flush LSN advances, which
-        // happens on durable commit. Without checkpointing the slot never advances and the source
-        // database's WAL fills without bound, so this source is commit-coupled.
-        if config.properties().is_empty() {
-            self.config.validate()?;
-        } else {
-            PostgresCdcConfig::from_config(config)?.validate()?;
-        }
-        Err(ConnectorError::ConfigurationError(
-            "PostgreSQL CDC emits a raw JSON change envelope; canonical primary-keyed row/delete records are required"
-                .into(),
-        ))
+        let parsed = parsed_config(&self.config, config)?;
+        // Slot WAL is reclaimed only as durable commits advance the confirmed-flush LSN, so the
+        // source is commit-coupled. Exact delivery is not certified: feedback and sink commits
+        // are not one atomic protocol.
+        let input_mode = match parsed.output_mode {
+            OutputMode::Upsert => SourceInputMode::KeyedUpsert,
+            OutputMode::Changelog => SourceInputMode::FullChangelog,
+        };
+        Ok(SourceContract::new(
+            SourceConsistency::CommitCoupled,
+            SourceTopology::Singleton,
+            input_mode,
+        )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic))
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
@@ -377,26 +380,28 @@ impl SourceConnector for PostgresCdcSource {
             tracing::warn!(
                 "PostgreSQL CDC reader did not stop before the close deadline; its tracked reaper retains shutdown ownership"
             );
-            let handle = self
-                .reader_handle
-                .take()
-                .expect("reader handle was present while awaiting it");
-            reap_postgres_reader(handle, &self.task_owner);
+            if let Some(handle) = self.reader_handle.take() {
+                reap_postgres_reader(handle, &self.task_owner);
+            }
+        }
+        if let Phase::Snapshot(reader) = std::mem::replace(&mut self.phase, Phase::Idle) {
+            drop(reader);
         }
         self.reader_handle = None;
         self.reader_shutdown = None;
         self.wal_rx = None;
-        self.confirmed_lsn_tx = None;
+        self.applied_lsn = None;
         self.pending_payloads.clear();
         self.wal_byte_budget = None;
         self.wal_terminal_error = None;
-
         self.state = ConnectorState::Closed;
-        self.committed_transactions.clear();
-        self.current_txn = None;
-        self.relation_cache.clear();
-        self.buffered_event_count = 0;
-        self.buffered_event_bytes = 0;
+        self.committed.clear();
+        self.committed_bytes = 0;
+        self.open_transaction = None;
+        self.open_mutations.clear();
+        if let (Some(rows), Some(layout)) = (self.open_rows.as_mut(), self.layout.as_ref()) {
+            drop(rows.finish(layout));
+        }
         #[cfg(test)]
         self.pending_messages.clear();
         Ok(())

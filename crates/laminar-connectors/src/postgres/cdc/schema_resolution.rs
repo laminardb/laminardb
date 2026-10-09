@@ -1,185 +1,406 @@
-//! Publication-specific pgoutput metadata. Discovery never creates or advances a slot.
+//! Declared-schema binding to the captured table. Resolution never creates or advances a slot.
 
 use std::collections::BTreeMap;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 
-use super::{config::PostgresCdcConfig, postgres_io, schema::RelationInfo, types::PgColumn};
+use super::config::{OutputMode, PostgresCdcConfig};
+use super::postgres_io::{self, CaptureTable};
+use super::schema::RelationInfo;
+use super::typed_rows::{BoundColumn, RowLayout};
+use super::types::bind_value_kind;
 use crate::config::ConnectorConfig;
 use crate::connector::ConnectorTaskGuard;
 use crate::error::ConnectorError;
-use crate::schema::resolution::{fixed_binding, NativeSchema, SchemaBinding};
+use crate::schema::resolution::{
+    bind_external, logical_binding, NativeSchema, SchemaBinding, SchemaDirection, SchemaOrigin,
+};
+
+const NATIVE_FORMAT: &str = "pgoutput";
+const WEIGHT_COLUMN: &str = "__weight";
+
+pub(super) fn declared_primary_key(config: &ConnectorConfig) -> Vec<String> {
+    config
+        .get("_primary_key_columns")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub(super) fn declared_schema(
+    config: &ConnectorConfig,
+    explicit: Option<SchemaRef>,
+) -> Result<SchemaRef, ConnectorError> {
+    explicit.or_else(|| config.arrow_schema()).ok_or_else(|| {
+        ConnectorError::ConfigurationError(
+            "PostgreSQL CDC requires declared columns and a PRIMARY KEY matching the table".into(),
+        )
+    })
+}
 
 pub(super) async fn resolve(
     config: &ConnectorConfig,
     explicit: Option<SchemaRef>,
     guard: ConnectorTaskGuard,
 ) -> Result<SchemaBinding, ConnectorError> {
-    let mut parsed = PostgresCdcConfig::from_config(config)?;
-    parsed.normalize_table_filters();
-    let mut binding = fixed_binding(config, explicit, &super::schema::cdc_envelope_schema())?;
+    let parsed = PostgresCdcConfig::from_config(config)?;
+    let declared = declared_schema(config, explicit)?;
     let connection = postgres_io::connect(&parsed, guard).await?;
-    let result = read_publication(connection.client(), &parsed, &mut binding).await;
+    let inspected = async {
+        let source = postgres_io::inspect_source(connection.client(), &parsed).await?;
+        let table = postgres_io::inspect_capture_table(connection.client(), &parsed).await?;
+        Ok::<_, ConnectorError>((source, table))
+    }
+    .await;
     connection.close().await;
-    result?;
-    Ok(binding)
-}
+    let (source, table) = inspected?;
+    bind_layout(&parsed, &declared, &declared_primary_key(config), &table)?;
 
-async fn read_publication(
-    client: &tokio_postgres::Client,
-    config: &PostgresCdcConfig,
-    binding: &mut SchemaBinding,
-) -> Result<(), ConnectorError> {
-    let inspected = postgres_io::inspect_replication_slot(client, &config.slot_name, "pgoutput",
-        &config.database, &config.publication, postgres_io::source_config_digest(config)).await?
-        .ok_or_else(|| ConnectorError::ConfigurationError("PostgreSQL CDC schema resolution requires the existing recovery slot; discovery does not create slots and initial snapshot-to-WAL startup remains unsupported".into()))?;
-    // The observed LSN is not schema authority and is never advanced or persisted here.
-    let rows = client.query("SELECT c.oid, pt.schemaname, pt.tablename, c.relreplident::text, a.attname, a.atttypid, a.atttypmod, (c.relreplident='f' OR EXISTS(SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid=c.oid AND (i.indisreplident OR (c.relreplident='d' AND i.indisprimary)) AND a.attnum=ANY(i.indkey))) FROM pg_catalog.pg_publication_tables pt JOIN pg_catalog.pg_namespace n ON n.nspname=pt.schemaname JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=pt.tablename JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid WHERE pt.pubname=$1 AND a.attnum>0 AND NOT a.attisdropped AND a.attname=ANY(pt.attnames) ORDER BY c.oid,a.attnum LIMIT 4097", &[&config.publication]).await
-        .map_err(|_| ConnectorError::ReadError("PostgreSQL publication column metadata is unavailable; verify authorization".into()))?;
-    if rows.is_empty() || rows.len() > 4096 {
-        return Err(ConnectorError::SchemaMismatch(
-            "PostgreSQL publication must contain 1..=4096 published columns".into(),
-        ));
-    }
-    let mut relations = BTreeMap::new();
-    for row in rows {
-        let oid: u32 = row.try_get(0).map_err(metadata_error)?;
-        let namespace: String = row.try_get(1).map_err(metadata_error)?;
-        let name: String = row.try_get(2).map_err(metadata_error)?;
-        let identity: String = row.try_get(3).map_err(metadata_error)?;
-        let replica_identity = identity
-            .chars()
-            .next()
-            .ok_or_else(|| ConnectorError::SchemaMismatch("missing replica identity".into()))?;
-        let relation = relations.entry(oid).or_insert_with(|| RelationInfo {
-            relation_id: oid,
-            namespace,
-            name,
-            replica_identity,
-            columns: Vec::new(),
-        });
-        relation.columns.push(PgColumn {
-            name: row.try_get(4).map_err(metadata_error)?,
-            type_oid: row.try_get(5).map_err(metadata_error)?,
-            type_modifier: row.try_get(6).map_err(metadata_error)?,
-            is_key: row.try_get(7).map_err(metadata_error)?,
-        });
-    }
-    let relations: Vec<_> = relations.into_values().collect();
+    let mut binding = logical_binding(
+        config,
+        SchemaDirection::Source,
+        SchemaOrigin::Explicit,
+        &declared,
+    )?;
+    bind_external(&mut binding, &declared)?;
     binding.value = Some(NativeSchema {
-        format: "pgoutput".into(),
+        format: NATIVE_FORMAT.into(),
         identity: BTreeMap::from([
             (
                 "system_identifier".into(),
-                inspected.binding.system_identifier.to_string(),
+                source.system_identifier.to_string(),
             ),
-            (
-                "database_oid".into(),
-                inspected.binding.database_oid.to_string(),
-            ),
-            (
-                "publication_oid".into(),
-                inspected.binding.publication_oid.to_string(),
-            ),
-            ("slot".into(), config.slot_name.clone()),
+            ("database_oid".into(), source.database_oid.to_string()),
+            ("publication_oid".into(), source.publication_oid.to_string()),
+            ("table_oid".into(), table.relation.relation_id.to_string()),
         ]),
-        definition: serde_json::json!({"slot_binding": inspected.binding, "relations": relations, "envelope": "pgoutput-json-envelope-v1"}),
+        definition: serde_json::json!({
+            "relation": table.relation,
+            "output": parsed.output_mode.to_string(),
+        }),
         references: Vec::new(),
     });
-    Ok(())
+    Ok(binding)
 }
 
-pub(super) fn restore_relations(
+/// The relation layout persisted when the source was created, if a binding was committed.
+pub(super) fn committed_relation(
     binding: Option<&SchemaBinding>,
-    checkpoint: &postgres_io::PostgresCheckpointBinding,
-) -> Result<Option<BTreeMap<u32, RelationInfo>>, ConnectorError> {
+    config: &PostgresCdcConfig,
+) -> Result<Option<RelationInfo>, ConnectorError> {
     let Some(binding) = binding else {
         return Ok(None);
     };
     let native = binding.value.as_ref().ok_or_else(|| {
         ConnectorError::SchemaMismatch(
-            "committed PostgreSQL CDC binding lacks publication identity; migrate the legacy catalog before activation".into(),
+            "committed PostgreSQL CDC binding lacks its table identity; recreate the source".into(),
         )
     })?;
-    if native.format != "pgoutput" {
-        return Err(ConnectorError::SchemaMismatch(
-            "CDC contract is not pgoutput".into(),
-        ));
-    }
-    let expected: postgres_io::PostgresCheckpointBinding =
-        serde_json::from_value(native.definition["slot_binding"].clone()).map_err(|_| {
-            ConnectorError::SchemaMismatch("invalid committed PostgreSQL slot binding".into())
-        })?;
-    if expected != *checkpoint {
-        return Err(ConnectorError::SchemaMismatch(
-            "PostgreSQL schema binding and resume authority disagree".into(),
-        ));
-    }
-    let relations: Vec<RelationInfo> =
-        serde_json::from_value(native.definition["relations"].clone()).map_err(|_| {
-            ConnectorError::SchemaMismatch("invalid committed publication layouts".into())
-        })?;
-    Ok(Some(
-        relations
-            .into_iter()
-            .map(|relation| (relation.relation_id, relation))
-            .collect(),
-    ))
-}
-
-pub(super) fn validate_relation(
-    expected: Option<&BTreeMap<u32, RelationInfo>>,
-    incoming: &RelationInfo,
-    config: &PostgresCdcConfig,
-) -> Result<(), ConnectorError> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
-    if !config.should_include_table(&incoming.full_name()?) {
-        return Ok(());
-    }
-    let layout = expected.get(&incoming.relation_id).ok_or_else(|| {
-        ConnectorError::SchemaMismatch(
-            "pgoutput announced an unbound/replaced relation; migrate the catalog".into(),
-        )
-    })?;
-    if layout.namespace != incoming.namespace
-        || layout.name != incoming.name
-        || layout.replica_identity != incoming.replica_identity
-        || layout.columns != incoming.columns
+    if native.format != NATIVE_FORMAT
+        || native.definition["output"] != config.output_mode.to_string()
     {
         return Err(ConnectorError::SchemaMismatch(
-            "pgoutput relation layout changed; intake stops before decoding under the new layout"
-                .into(),
+            "committed PostgreSQL CDC binding has a different protocol or output.mode".into(),
         ));
+    }
+    serde_json::from_value(native.definition["relation"].clone())
+        .map(Some)
+        .map_err(|_| {
+            ConnectorError::SchemaMismatch("invalid committed PostgreSQL table layout".into())
+        })
+}
+
+/// Bind the declared schema and primary key to the captured table.
+///
+/// # Errors
+/// Returns an actionable error when a declared column is not published, a type has no lossless
+/// mapping, nullability could be violated, or the declared key differs from the table's.
+pub(super) fn bind_layout(
+    config: &PostgresCdcConfig,
+    declared: &SchemaRef,
+    primary_key: &[String],
+    table: &CaptureTable,
+) -> Result<RowLayout, ConnectorError> {
+    let weighted = config.output_mode == OutputMode::Changelog;
+    let fields = declared.fields();
+    let visible = if weighted {
+        let weight = fields.last().filter(|field| {
+            field.name() == WEIGHT_COLUMN
+                && field.data_type() == &DataType::Int64
+                && !field.is_nullable()
+        });
+        if weight.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "output.mode=changelog requires a trailing '__weight BIGINT NOT NULL' column"
+                    .into(),
+            ));
+        }
+        &fields[..fields.len() - 1]
+    } else {
+        &fields[..]
+    };
+    if let Some(field) = visible
+        .iter()
+        .find(|field| field.name().eq_ignore_ascii_case(WEIGHT_COLUMN))
+    {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "column '{}' is reserved for output.mode=changelog",
+            field.name()
+        )));
+    }
+    validate_primary_key(primary_key, table)?;
+
+    let relation = &table.relation;
+    let mut columns = Vec::with_capacity(visible.len());
+    for field in visible {
+        let tuple_index = relation
+            .columns
+            .iter()
+            .position(|column| column.name == *field.name())
+            .ok_or_else(|| {
+                ConnectorError::SchemaMismatch(format!(
+                    "declared column '{}' is not a published column of PostgreSQL table {}.{}",
+                    field.name(),
+                    relation.namespace,
+                    relation.name
+                ))
+            })?;
+        let kind = bind_value_kind(&relation.columns[tuple_index], field.data_type()).map_err(
+            |reason| ConnectorError::SchemaMismatch(format!("column '{}': {reason}", field.name())),
+        )?;
+        if !field.is_nullable() && !table.not_null[tuple_index] {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "column '{}' is declared NOT NULL but the PostgreSQL column is nullable",
+                field.name()
+            )));
+        }
+        columns.push(BoundColumn {
+            name: field.name().clone(),
+            tuple_index,
+            kind,
+            nullable: field.is_nullable(),
+            is_key: primary_key.contains(field.name()),
+        });
+    }
+    if let Some(missing) = primary_key
+        .iter()
+        .find(|key| !columns.iter().any(|column| &column.name == *key))
+    {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "PRIMARY KEY column '{missing}' must be declared"
+        )));
+    }
+    Ok(RowLayout {
+        columns,
+        tuple_width: relation.columns.len(),
+        schema: SchemaRef::clone(declared),
+        weighted,
+    })
+}
+
+fn validate_primary_key(
+    primary_key: &[String],
+    table: &CaptureTable,
+) -> Result<(), ConnectorError> {
+    let mut declared = primary_key.to_vec();
+    let mut actual = table.primary_key.clone();
+    declared.sort_unstable();
+    actual.sort_unstable();
+    if declared.is_empty() || declared != actual {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "declared PRIMARY KEY ({}) must equal the primary key ({}) of PostgreSQL table {}.{}",
+            primary_key.join(", "),
+            table.primary_key.join(", "),
+            table.relation.namespace,
+            table.relation.name
+        )));
     }
     Ok(())
 }
 
-fn metadata_error(_: tokio_postgres::Error) -> ConnectorError {
-    ConnectorError::SchemaMismatch("PostgreSQL publication returned malformed metadata".into())
+/// Require an announced relation to be exactly the bound layout.
+pub(super) fn validate_relation(
+    expected: &RelationInfo,
+    incoming: &RelationInfo,
+) -> Result<(), ConnectorError> {
+    if expected.relation_id != incoming.relation_id
+        || expected.namespace != incoming.namespace
+        || expected.name != incoming.name
+        || expected.replica_identity != incoming.replica_identity
+        || expected.columns != incoming.columns
+    {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "PostgreSQL relation {}.{} (oid {}) no longer matches the bound layout of {}.{} \
+             (oid {}); a table or replica-identity change requires recreating the source and a \
+             fresh snapshot",
+            incoming.namespace,
+            incoming.name,
+            incoming.relation_id,
+            expected.namespace,
+            expected.name,
+            expected.relation_id
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{INT8_OID, TEXT_OID};
+    use std::sync::Arc;
+
+    use arrow_schema::{Field, Schema, TimeUnit};
+
+    use super::super::config::TableName;
+    use super::super::types::PgColumn;
+    use super::super::types::{ValueKind, INT4_OID, INT8_OID, TEXT_OID, TIMESTAMPTZ_OID};
     use super::*;
 
+    fn table() -> CaptureTable {
+        CaptureTable {
+            relation: RelationInfo {
+                relation_id: 42,
+                namespace: "public".into(),
+                name: "orders".into(),
+                replica_identity: 'f',
+                columns: vec![
+                    PgColumn::new("id".into(), INT8_OID, -1, true),
+                    PgColumn::new("status".into(), TEXT_OID, -1, true),
+                    PgColumn::new("qty".into(), INT4_OID, -1, true),
+                    PgColumn::new("updated_at".into(), TIMESTAMPTZ_OID, -1, true),
+                ],
+            },
+            not_null: vec![true, true, false, false],
+            primary_key: vec!["id".into()],
+        }
+    }
+
+    fn config(output_mode: OutputMode) -> PostgresCdcConfig {
+        PostgresCdcConfig {
+            table: TableName::parse("public.orders").unwrap(),
+            output_mode,
+            ..PostgresCdcConfig::default()
+        }
+    }
+
+    fn schema(fields: Vec<Field>) -> SchemaRef {
+        Arc::new(Schema::new(fields))
+    }
+
     #[test]
-    fn relation_drift_is_rejected_without_replacing_the_committed_layout() {
-        let layout = RelationInfo {
-            relation_id: 42,
-            namespace: "public".into(),
-            name: "events".into(),
-            replica_identity: 'd',
-            columns: vec![
-                PgColumn::new("id".into(), INT8_OID, -1, true),
-                PgColumn::new("label".into(), TEXT_OID, -1, false),
-            ],
-        };
-        let expected = BTreeMap::from([(42, layout.clone())]);
-        let config = PostgresCdcConfig::default();
-        validate_relation(Some(&expected), &layout, &config).unwrap();
+    fn declared_subset_binds_by_name_in_declared_order() {
+        let declared = schema(vec![
+            Field::new("qty", DataType::Int32, true),
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "updated_at",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]);
+        let layout = bind_layout(
+            &config(OutputMode::Upsert),
+            &declared,
+            &["id".into()],
+            &table(),
+        )
+        .unwrap();
+        assert_eq!(layout.tuple_width, 4);
+        assert!(!layout.weighted);
+        let bound: Vec<_> = layout
+            .columns
+            .iter()
+            .map(|column| (column.tuple_index, column.kind, column.is_key))
+            .collect();
+        assert_eq!(
+            bound,
+            [
+                (2, ValueKind::Int32, false),
+                (0, ValueKind::Int64, true),
+                (3, ValueKind::TimestampTzMicros, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn changelog_requires_the_trailing_weight() {
+        let base = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("qty", DataType::Int32, true),
+        ];
+        let error = bind_layout(
+            &config(OutputMode::Changelog),
+            &schema(base.clone()),
+            &["id".into()],
+            &table(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("__weight"), "{error}");
+        let mut weighted = base.clone();
+        weighted.push(Field::new("__weight", DataType::Int64, false));
+        let layout = bind_layout(
+            &config(OutputMode::Changelog),
+            &schema(weighted.clone()),
+            &["id".into()],
+            &table(),
+        )
+        .unwrap();
+        assert!(layout.weighted);
+        assert_eq!(layout.columns.len(), 2);
+        let error = bind_layout(
+            &config(OutputMode::Upsert),
+            &schema(weighted),
+            &["id".into()],
+            &table(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn binding_rejects_key_type_nullability_and_missing_columns() {
+        let id = Field::new("id", DataType::Int64, false);
+        let cases = [
+            (vec![id.clone()], vec![], "PRIMARY KEY"),
+            (
+                vec![id.clone(), Field::new("status", DataType::Utf8, true)],
+                vec!["status".to_string()],
+                "PRIMARY KEY",
+            ),
+            (
+                vec![Field::new("status", DataType::Utf8, true)],
+                vec!["id".to_string()],
+                "must be declared",
+            ),
+            (
+                vec![id.clone(), Field::new("qty", DataType::Int64, true)],
+                vec!["id".to_string()],
+                "qty",
+            ),
+            (
+                vec![id.clone(), Field::new("qty", DataType::Int32, false)],
+                vec!["id".to_string()],
+                "nullable",
+            ),
+            (
+                vec![id, Field::new("missing", DataType::Utf8, true)],
+                vec!["id".to_string()],
+                "not a published column",
+            ),
+        ];
+        for (fields, key, expected) in cases {
+            let error = bind_layout(&config(OutputMode::Upsert), &schema(fields), &key, &table())
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn relation_drift_is_rejected_without_replacing_the_bound_layout() {
+        let layout = table().relation;
+        validate_relation(&layout, &layout).unwrap();
         let mut reordered = layout.clone();
         reordered.columns.swap(0, 1);
         let mut replaced = layout.clone();
@@ -187,10 +408,10 @@ mod tests {
         let mut changed_type = layout.clone();
         changed_type.columns[0] = PgColumn::new("id".into(), TEXT_OID, -1, true);
         let mut changed_identity = layout.clone();
-        changed_identity.replica_identity = 'f';
+        changed_identity.replica_identity = 'd';
         for incoming in [reordered, replaced, changed_type, changed_identity] {
-            assert!(validate_relation(Some(&expected), &incoming, &config).is_err());
-            assert_eq!(expected[&42].columns, layout.columns);
+            let error = validate_relation(&layout, &incoming).unwrap_err();
+            assert!(error.to_string().contains("fresh snapshot"), "{error}");
         }
     }
 }
