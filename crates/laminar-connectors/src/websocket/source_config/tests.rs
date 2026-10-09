@@ -115,6 +115,7 @@ fn rejects_removed_event_time_and_server_options() {
 fn accepts_engine_and_json_decoder_options() {
     let mut config = valid_config();
     config.set("_arrow_schema", "engine-injected");
+    config.set("_primary_key_columns", "id");
     config.set("laminar.source.name", "orders");
     config.set("json.path", "payload");
     config.set("json.column.ts", "metadata.timestamp");

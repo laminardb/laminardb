@@ -568,7 +568,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, mongodb-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -578,6 +578,7 @@ jobs:
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.build-and-test.result }}" != "success" ]] || \
              [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.mongodb-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
              [[ "${{ needs.iceberg-integration.result }}" != "success" ]] || \
              [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \

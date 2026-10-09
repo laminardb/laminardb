@@ -85,10 +85,15 @@ pub(super) async fn scan(
     let mut after_key = cut.after_key.clone();
     let mut consecutive_failures = 0;
     loop {
+        let attempt_start = after_key.clone();
         match scan_from(db, config, cut.at, &mut after_key, output, shutdown_rx).await {
             Ok(completed) => return Ok(completed),
             Err(ReadFailure::Permanent(error)) => return Err(error),
             Err(ReadFailure::Transient(message)) => {
+                // Only copy progress resets the budget, as stream progress does for changes.
+                if after_key != attempt_start {
+                    consecutive_failures = 0;
+                }
                 if !back_off(
                     &message,
                     "MongoDB snapshot scan",

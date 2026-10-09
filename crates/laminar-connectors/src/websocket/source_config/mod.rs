@@ -10,6 +10,7 @@ pub(super) const INGRESS_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 const SOURCE_OPTIONS: &[&str] = &[
     "_arrow_schema",
+    "_primary_key_columns",
     "format",
     "json.explode",
     "json.path",
