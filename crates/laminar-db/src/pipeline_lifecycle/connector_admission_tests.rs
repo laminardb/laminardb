@@ -2132,7 +2132,7 @@ async fn mutation_source_creation_revalidates_preexisting_consumers_and_plain_co
     assert!(
         error
             .to_string()
-            .contains("exactly one admitted temporal-right, bounded interval, or direct"),
+            .contains("exactly one admitted temporal-right, bounded interval, direct"),
         "{error}"
     );
     assert!(db.catalog.get_stream_entry("keyed_copy").is_none());
@@ -2483,8 +2483,14 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
                 subscription_certificate: None,
             },
         );
-        resolve_stream_output_schemas(&context, &streams, &Default::default(), &Default::default())
-            .await?;
+        resolve_stream_output_schemas(
+            &context,
+            &streams,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
         Ok(())
     }
     .await;

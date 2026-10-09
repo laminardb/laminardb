@@ -271,6 +271,13 @@ impl TrackedSourceRegistration {
         self
     }
 
+    /// Admit the trailing `__weight` of a full-changelog source read by changelog consumers.
+    pub(crate) fn with_full_changelog(mut self) -> Self {
+        debug_assert_eq!(self.contract.input_mode, SourceInputMode::FullChangelog);
+        self.admitted_non_append_mode = Some(SourceInputMode::FullChangelog);
+        self
+    }
+
     pub(crate) fn with_ordered_interval_input_mode(
         mut self,
         mode: SourceInputMode,

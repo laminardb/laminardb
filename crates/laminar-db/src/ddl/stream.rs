@@ -218,8 +218,9 @@ impl LaminarDB {
         }))
     }
 
-    /// Every pre-mutation stream admission check, returning the planned query
-    /// and the temporal-output schema when the query is a managed temporal join.
+    /// Every pre-mutation stream admission check, returning the planned query and the output
+    /// schema when it differs from the plain plan: a managed temporal join's output, or a
+    /// changelog with its trailing weight.
     #[allow(clippy::type_complexity)]
     async fn validate_stream_admission(
         &self,
@@ -252,7 +253,7 @@ impl LaminarDB {
             .await?;
         self.validate_interval_join_schema(&name_str, query_sql, &planned)
             .await?;
-        let _ = self
+        let topology = self
             .validate_interval_topology_candidate(kind, &name_str, query_sql, &planned)
             .await?;
         self.validate_cluster_query_shape(kind, &name_str, query_sql, &planned)
@@ -266,7 +267,20 @@ impl LaminarDB {
             planned.window_config.is_some(),
         )
         .await?;
-        Ok((planned, temporal_output_schema))
+        // A changelog-carrying stream exposes its trailing weight at DDL time, exactly as the
+        // runtime installs it, so changelog sinks can bind to it.
+        let output_schema = match temporal_output_schema {
+            None if topology.candidate_carries_changelog => {
+                crate::pipeline_lifecycle::plan_output_schema(&self.ctx, query_sql)
+                    .await
+                    .map(|schema| {
+                        crate::pipeline_lifecycle::advertise_changelog_schema(&name_str, &schema)
+                    })
+                    .transpose()?
+            }
+            schema => schema,
+        };
+        Ok((planned, output_schema))
     }
 
     /// Catalog registration, placeholder provider, and the coordinator control
@@ -424,11 +438,14 @@ impl LaminarDB {
                 )
                 .await?;
             let static_tables = self.static_table_names();
+            let changelog_sources =
+                self.validate_changelog_source_routes(&source_regs, &ordered, self.runtime_mode())?;
             let current = crate::pipeline_lifecycle::resolve_stream_output_schemas(
                 &self.ctx,
                 &stream_regs,
                 &static_tables,
                 &ordered.joins,
+                &changelog_sources,
             )
             .await?;
             if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(

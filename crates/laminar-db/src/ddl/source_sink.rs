@@ -556,13 +556,23 @@ impl LaminarDB {
             &stream_regs,
             self.runtime_mode(),
         )?;
+        // Interval ownership is rechecked at startup; here a full-changelog source is a candidate
+        // for the changelog route, whose sinks are held to full-changelog admission.
+        let changelog_sources = self.validate_changelog_source_routes(
+            &source_regs,
+            &crate::pipeline_lifecycle::OrderedIntervalAdmissions::default(),
+            self.runtime_mode(),
+        )?;
         for input in std::iter::once(candidate.input.as_str()).chain(
             candidate
                 .query_inputs
                 .iter()
                 .map(std::string::String::as_str),
         ) {
-            if self.catalog.get_source(input).is_none() || direct_mutation_sources.contains(input) {
+            if self.catalog.get_source(input).is_none()
+                || direct_mutation_sources.contains(input)
+                || changelog_sources.contains(input)
+            {
                 continue;
             }
             if self

@@ -284,11 +284,12 @@ mod source_admission;
 use source_admission::{
     admit_routed_source, admit_source_contract, admit_source_recovery_contract,
     admit_temporal_source_contract, has_only_ordered_interval_consumers,
-    has_only_temporal_right_consumers, OrderedIntervalAdmissions, PipelineRecoveryState,
-    PipelineSinkSetup, PipelineWatermarks, PreparedSink, SinkAdmissionContext, SourceRoute,
-    TemporalSourceRole,
+    has_only_temporal_right_consumers, PipelineRecoveryState, PipelineSinkSetup,
+    PipelineWatermarks, PreparedSink, SinkAdmissionContext, SourceRoute, TemporalSourceRole,
 };
-pub(crate) use source_admission::{admit_sink_contract, validate_source_recovery_assignment};
+pub(crate) use source_admission::{
+    admit_sink_contract, validate_source_recovery_assignment, OrderedIntervalAdmissions,
+};
 mod watermarks;
 use watermarks::{
     physical_recovered_input_channel_progress, recovered_source_watermark,
@@ -304,7 +305,8 @@ use sink_admission::close_opened_sinks;
 use sink_admission::{admit_sink, open_prepared_sinks};
 mod output_schema;
 pub(crate) use output_schema::{
-    plan_output_schema, plan_temporal_output_schema, resolve_stream_output_schemas,
+    advertise_changelog_schema, plan_output_schema, plan_temporal_output_schema,
+    resolve_stream_output_schemas,
 };
 mod supervision;
 #[cfg(test)]
@@ -322,6 +324,7 @@ use supervision::{
 mod authority;
 mod cluster_startup;
 mod direct_mutation_routes;
+pub(crate) use direct_mutation_routes::MutationRoutes;
 mod operator_graph;
 mod reference_tables;
 mod runtime_configuration;

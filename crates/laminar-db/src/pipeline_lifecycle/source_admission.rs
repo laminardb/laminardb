@@ -87,6 +87,7 @@ pub(super) enum SourceRoute {
     Temporal(TemporalSourceRole),
     OrderedInterval(SourceInputMode),
     DirectMutationSinks,
+    Changelog,
 }
 
 impl SourceRoute {
@@ -97,9 +98,10 @@ impl SourceRoute {
             Self::Temporal(TemporalSourceRole::Right) => {
                 contract.input_mode == SourceInputMode::KeyedUpsert
             }
-            Self::Temporal(TemporalSourceRole::Left) | Self::OrderedInterval(_) | Self::Plain => {
-                false
-            }
+            Self::Temporal(TemporalSourceRole::Left)
+            | Self::OrderedInterval(_)
+            | Self::Changelog
+            | Self::Plain => false,
         }
     }
 }
@@ -123,6 +125,12 @@ pub(super) fn admit_routed_source(
             }
             if !has_primary_key {
                 return Err(KEYED_SOURCE_PRIMARY_KEY);
+            }
+            admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
+        }
+        SourceRoute::Changelog => {
+            if contract.input_mode != SourceInputMode::FullChangelog {
+                return Err("changelog source contract changed after startup admission");
             }
             admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
         }

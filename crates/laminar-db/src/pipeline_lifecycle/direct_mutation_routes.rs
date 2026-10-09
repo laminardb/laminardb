@@ -1,4 +1,5 @@
-//! Admission of keyed-upsert sources read only by direct keyed-mutation sinks.
+//! Admission of mutation sources outside stateful joins: keyed-upsert sources read only by
+//! direct keyed-mutation sinks, and full-changelog sources read by changelog consumers.
 
 use rustc_hash::FxHashSet;
 
@@ -7,7 +8,16 @@ use super::{
     OrderedIntervalAdmissions, RuntimeMode, TemporalSourceRole,
 };
 use crate::direct_mutation::{direct_sink_consumers, validate_route_shape};
-use laminar_connectors::connector::SourceInputMode;
+use laminar_connectors::connector::{SourceInputMode, SourceRowPositionCapability};
+
+/// Mutation sources admitted to a route other than a temporal or bounded-interval join.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MutationRoutes {
+    /// Keyed-upsert sources read only by direct keyed-mutation sinks.
+    pub(crate) direct: FxHashSet<String>,
+    /// Full-changelog sources whose streams and sinks are validated as changelog consumers.
+    pub(crate) changelog: FxHashSet<String>,
+}
 
 type Registrations<'a> = (
     &'a HashMap<String, crate::connector_manager::SourceRegistration>,
@@ -36,21 +46,32 @@ impl LaminarDB {
     }
 
     /// Require every mutation source to be owned by exactly one admitted route; returns the
-    /// sources admitted to the direct keyed-mutation sink route.
+    /// sources admitted to the direct keyed-mutation sink and changelog routes.
     pub(crate) fn validate_mutation_source_routes(
         &self,
         (source_regs, sink_regs, stream_regs): Registrations<'_>,
         temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
         ordered_interval_admissions: &OrderedIntervalAdmissions,
         runtime: RuntimeMode,
-    ) -> Result<FxHashSet<String>, DbError> {
+    ) -> Result<MutationRoutes, DbError> {
         if runtime == RuntimeMode::Cluster {
             for sink in sink_regs.values() {
                 self.reject_cluster_source_sink(sink)?;
             }
         }
-        let direct =
-            self.validate_direct_mutation_routes(source_regs, sink_regs, stream_regs, runtime)?;
+        let routes = MutationRoutes {
+            direct: self.validate_direct_mutation_routes(
+                source_regs,
+                sink_regs,
+                stream_regs,
+                runtime,
+            )?,
+            changelog: self.validate_changelog_source_routes(
+                source_regs,
+                ordered_interval_admissions,
+                runtime,
+            )?,
+        };
         let mut names = source_regs.keys().collect::<Vec<_>>();
         names.sort_unstable();
         for name in names {
@@ -59,10 +80,61 @@ impl LaminarDB {
                 source_regs,
                 temporal_source_roles,
                 ordered_interval_admissions,
-                &direct,
+                &routes,
             )?;
         }
-        Ok(direct)
+        Ok(routes)
+    }
+
+    /// Full-changelog sources admitted to the changelog route: replayable, deterministically
+    /// positioned, local, and not owned by a bounded interval join. Their streams and sinks are
+    /// then held to the same rules as consumers of an engine changelog: projection/filter,
+    /// retractable aggregates, certified static enrichment, and full-changelog sinks only.
+    pub(crate) fn validate_changelog_source_routes(
+        &self,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        ordered_interval_admissions: &OrderedIntervalAdmissions,
+        runtime: RuntimeMode,
+    ) -> Result<FxHashSet<String>, DbError> {
+        let mut admitted = FxHashSet::default();
+        if runtime == RuntimeMode::Cluster {
+            return Ok(admitted);
+        }
+        let mut names = source_regs.keys().collect::<Vec<_>>();
+        names.sort_unstable();
+        for name in names {
+            if ordered_interval_admissions
+                .source_modes
+                .contains_key(name.as_str())
+            {
+                continue;
+            }
+            let Some((contract, _)) = self.resolve_registered_source_contract(name, source_regs)?
+            else {
+                continue;
+            };
+            if contract.input_mode != SourceInputMode::FullChangelog
+                || !contract.supports_replay()
+                || contract.row_positions != SourceRowPositionCapability::OrderedDeterministic
+            {
+                continue;
+            }
+            admit_source_recovery_contract(
+                contract,
+                self.config.delivery_guarantee,
+                self.config.checkpoint.is_some(),
+                runtime,
+            )
+            .map_err(|reason| {
+                DbError::Config(format!(
+                    "changelog source '{name}' is not admissible in {runtime:?} mode with {} \
+                     delivery: {reason} (contract: {contract:?})",
+                    self.config.delivery_guarantee
+                ))
+            })?;
+            admitted.insert(name.clone());
+        }
+        Ok(admitted)
     }
 
     /// The catalog entry of `input` when it is a configured keyed-upsert source, whose direct

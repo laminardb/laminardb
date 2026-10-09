@@ -62,6 +62,7 @@ pub(crate) async fn resolve_stream_output_schemas(
         String,
         [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
     >,
+    changelog_sources: &rustc_hash::FxHashSet<String>,
 ) -> Result<ResolvedStreamOutputs, DbError> {
     use datafusion::datasource::empty::EmptyTable;
 
@@ -212,8 +213,12 @@ pub(crate) async fn resolve_stream_output_schemas(
             }
         }
 
-        let mut changelog_carrying: rustc_hash::FxHashSet<String> =
-            ordered_interval_joins.keys().cloned().collect();
+        // Admitted full-changelog sources are changelog roots exactly like mutable join output.
+        let mut changelog_carrying: rustc_hash::FxHashSet<String> = ordered_interval_joins
+            .keys()
+            .chain(changelog_sources)
+            .cloned()
+            .collect();
 
         for reg in stream_regs.values() {
             let shape = shapes.get(&reg.name).ok_or_else(|| {
@@ -386,7 +391,10 @@ pub(crate) async fn resolve_stream_output_schemas(
                 )));
             }
         }
-        for name in &changelog_carrying {
+        for name in changelog_carrying
+            .iter()
+            .filter(|name| !changelog_sources.contains(*name))
+        {
             let schema = schemas.get_mut(name).expect("resolved above");
             *schema = advertise_changelog_schema(name, schema)?;
         }
@@ -417,7 +425,7 @@ pub(super) struct StreamOutputShape {
     planned_functions_immutable: bool,
 }
 
-pub(super) fn advertise_changelog_schema(
+pub(crate) fn advertise_changelog_schema(
     stream: &str,
     schema: &arrow_schema::SchemaRef,
 ) -> Result<arrow_schema::SchemaRef, DbError> {
