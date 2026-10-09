@@ -36,6 +36,9 @@ straight to sinks: MongoDB → LaminarDB → destinations, with no broker in bet
 embedded and single-node server mode; cluster mode rejects it (singleton sources and mutable
 sinks have no fenced placement).
 
+New to it? The [main README](../../README.md#mongodb-change-data-capture) walks through
+mirroring a collection into PostgreSQL on your machine.
+
 | `output.mode` | Rows | Contract | Destinations |
 |---|---|---|---|
 | `history` (default) | One immutable, versioned record per change event (and per snapshot copy) | Append-only | Append-only sinks; tested with files, Delta and Iceberg append, PostgreSQL append, and MongoDB `cdc_replay` |
@@ -56,8 +59,9 @@ collection:
 db.runCommand({ collMod: "users", changeStreamPreAndPostImages: { enabled: true } })
 ```
 
-Secrets must be `${VAR}` references, resolved from `LaminarDB::builder().config_var(..)` or the
-environment. In a server TOML `sql` block write `$${VAR}`, because the server expands `${VAR}` in
+Connections use TLS unless `connection.uri` sets `tls=false`; `tlsInsecure` and
+`tlsAllowInvalidCertificates` are rejected. Secrets must be `${VAR}` references, resolved from
+`LaminarDB::builder().config_var(..)` or the environment. In a server TOML `sql` block write `$${VAR}`, because the server expands `${VAR}` in
 the file before running the DDL. A document mirror into PostgreSQL and Delta, plus an exact
 MongoDB copy:
 
