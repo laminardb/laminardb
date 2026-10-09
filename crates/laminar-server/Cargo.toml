@@ -150,7 +150,7 @@ sha2 = { workspace = true }
 tokio-postgres = "0.7"
 mongodb = "3"
 tokio-postgres-rustls = "0.13"
-rcgen = "0.13"
+rcgen = "0.14"
 serde_json = { workspace = true }
 
 [features]
