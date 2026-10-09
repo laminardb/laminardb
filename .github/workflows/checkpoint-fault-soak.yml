@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Free disk space
@@ -203,7 +203,7 @@ jobs:
             slo_mode: observe
             visibility_slo_mode: observe
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Free disk space
@@ -325,7 +325,7 @@ jobs:
         role: [leader, follower]
         discovery: [gossip, static]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Free disk space

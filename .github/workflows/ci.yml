@@ -36,7 +36,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -51,7 +51,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -92,7 +92,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         uses: jlumbroso/free-disk-space@main
@@ -177,7 +177,7 @@ jobs:
       matrix:
         postgres: ["17", "18"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -200,7 +200,7 @@ jobs:
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -236,7 +236,7 @@ jobs:
     # Only run on main/develop to save CI time on PRs
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -269,7 +269,7 @@ jobs:
     name: Feature Matrix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -362,7 +362,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -393,7 +393,7 @@ jobs:
     name: Analytical Dependency Generations
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Reject divergent analytical dependency generations
@@ -416,7 +416,7 @@ jobs:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Extract MSRV
         id: msrv
         run: |
@@ -441,7 +441,7 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -470,7 +470,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Verify dependency exception policy and security backport
         run: |
           python3 tools/check_dependency_exceptions.py
@@ -487,7 +487,7 @@ jobs:
     name: Cargo Deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Verify dependency exception policy and security backport
         run: python3 tools/check_dependency_exceptions.py
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -503,7 +503,7 @@ jobs:
     # Only run on main/develop to save CI time
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -524,7 +524,7 @@ jobs:
     name: Ineligible contract/model scaffolds (NOT evidence)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95"
