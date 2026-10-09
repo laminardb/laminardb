@@ -79,6 +79,7 @@ async fn open(storage: &Path) -> std::sync::Arc<LaminarDB> {
         .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
         .config_var("E2E_PG_PASSWORD", "laminar-test-secret")
         .config_var("E2E_BAD_MONGO_PASSWORD", "wrong")
+        .config_var("E2E_MINIO_SECRET", "minioadmin")
         .build()
         .await
         .expect("open database")
@@ -1331,22 +1332,15 @@ async fn typed_columns_and_history_reach_postgres_and_delta() {
     let pg_table = unique("typed");
     let history_table = unique("typed_history");
     let lake = storage.path().join(unique("typed_lake"));
-    let amounts = storage.path().join(unique("typed_amounts"));
     let location = |path: &Path| path.to_string_lossy().replace('\\', "/");
     let mode = "'output.mode' = 'document', 'full.document.mode' = 'required', \
                 'objectid.columns' = '_id'";
-    // PostgreSQL has no DECIMAL mapping, so the decimal column has its own source and lake.
     let statements = vec![
         format!(
             "CREATE SOURCE typed (_id VARCHAR NOT NULL, i INT, l BIGINT, d DOUBLE, b BOOLEAN, \
-             at TIMESTAMP, bin BYTEA, doc VARCHAR, PRIMARY KEY (_id)) FROM \"mongodb-cdc\" (\
-             'connection.uri' = '{MONGO_URI}', 'database' = '{database}', \
+             amount DECIMAL(18, 2), at TIMESTAMP, bin BYTEA, doc VARCHAR, PRIMARY KEY (_id)) \
+             FROM \"mongodb-cdc\" ('connection.uri' = '{MONGO_URI}', 'database' = '{database}', \
              'collection' = 'items', {mode}, 'document.json.column' = 'doc')"
-        ),
-        format!(
-            "CREATE SOURCE amounts (_id VARCHAR NOT NULL, amount DECIMAL(18, 2), \
-             PRIMARY KEY (_id)) FROM \"mongodb-cdc\" ('connection.uri' = '{MONGO_URI}', \
-             'database' = '{database}', 'collection' = 'items', {mode})"
         ),
         history_source("changes", MONGO_URI, &database, "items", ""),
         pg_sink_on("typed", &pg_table, ", 'changelog.mode' = 'true'"),
@@ -1354,11 +1348,6 @@ async fn typed_columns_and_history_reach_postgres_and_delta() {
             "CREATE SINK typed_delta FROM typed INTO \"delta-lake\" ('table.path' = '{}', \
              'write.mode' = 'upsert', 'merge.key.columns' = '_id', 'auto.create' = 'true')",
             location(&lake)
-        ),
-        format!(
-            "CREATE SINK amounts_delta FROM amounts INTO \"delta-lake\" ('table.path' = '{}', \
-             'write.mode' = 'upsert', 'merge.key.columns' = '_id', 'auto.create' = 'true')",
-            location(&amounts)
         ),
         format!(
             "CREATE SINK changes_pg FROM changes INTO \"postgres-sink\" ({PG_PROPS}, \
@@ -1420,22 +1409,23 @@ async fn typed_columns_and_history_reach_postgres_and_delta() {
                 Some("-5"),
                 Some("1.5"),
                 Some("true"),
+                Some("0.10"),
                 Some("2023-11-14 22:13:20.123"),
                 Some("010203"),
             ]),
         ),
         (
             widened,
-            text(&[None, Some("5"), Some("2"), None, None, None]),
+            text(&[None, Some("5"), Some("2"), None, Some("3.00"), None, None]),
         ),
-        (sparse, text(&[None, None, None, None, None, None])),
+        (sparse, text(&[None, None, None, None, None, None, None])),
     ]
     .into_iter()
     .map(|(id, values)| (id.to_hex(), values))
     .collect();
     let pg_query = format!(
-        "SELECT \"_id\", i::text, l::text, d::text, b::text, at::text, encode(bin, 'hex') \
-         FROM {pg_table}"
+        "SELECT \"_id\", i::text, l::text, d::text, b::text, amount::text, at::text, \
+         encode(bin, 'hex') FROM {pg_table}"
     );
     let observed = eventually(
         CONVERGE,
@@ -1453,42 +1443,27 @@ async fn typed_columns_and_history_reach_postgres_and_delta() {
                 Some("-5"),
                 Some("1.5"),
                 Some("true"),
+                Some("0.10"),
                 Some("2023-11-14T22:13:20.123"),
                 Some("010203"),
             ]),
         ),
         (
             widened,
-            text(&[None, Some("5"), Some("2.0"), None, None, None]),
+            text(&[None, Some("5"), Some("2.0"), None, Some("3.00"), None, None]),
         ),
-        (sparse, text(&[None, None, None, None, None, None])),
+        (sparse, text(&[None, None, None, None, None, None, None])),
     ]
     .into_iter()
     .map(|(id, values)| (id.to_hex(), values))
     .collect();
     let observed = eventually(
         CONVERGE,
-        || delta_text_rows(&lake, "\"_id\", i, l, d, b, at, encode(bin, 'hex')"),
+        || delta_text_rows(&lake, "\"_id\", i, l, d, b, amount, at, encode(bin, 'hex')"),
         |rows| rows == &lake_expected,
     )
     .await;
     assert_eq!(observed, lake_expected, "Delta typed mirror");
-
-    let amounts_expected: TextRows = [
-        (kept, text(&[Some("0.10")])),
-        (widened, text(&[Some("3.00")])),
-        (sparse, text(&[None])),
-    ]
-    .into_iter()
-    .map(|(id, values)| (id.to_hex(), values))
-    .collect();
-    let observed = eventually(
-        CONVERGE,
-        || delta_text_rows(&amounts, "\"_id\", amount"),
-        |rows| rows == &amounts_expected,
-    )
-    .await;
-    assert_eq!(observed, amounts_expected, "Delta DECIMAL mirror");
 
     // The JSON column keeps exact BSON types, nesting, and explicit null versus missing.
     let documents = pg_text_rows(&pg, &format!("SELECT \"_id\", doc FROM {pg_table}")).await;
@@ -2269,4 +2244,249 @@ mod perf {
         );
         println!("PERF peak memory: {:?} MiB", peak_memory_mib());
     }
+}
+
+/// Arm a one-shot `failCommand` failpoint that answers `command` from the client named `app`
+/// with `ChangeStreamHistoryLost`, the error a server returns once the resume point has left
+/// the oplog.
+async fn fail_with_history_lost(client: &mongodb::Client, command: &str, app: &str) {
+    client
+        .database("admin")
+        .run_command(doc! {
+            "configureFailPoint": "failCommand",
+            "mode": {"times": 1},
+            "data": {"failCommands": [command], "errorCode": 286, "appName": app},
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_oplog_history_stops_the_source_instead_of_restarting_from_now() {
+    let Some(client) = mongo(MONGO_URI).await else {
+        return;
+    };
+    let database = unique("oplog");
+    let source_db = client.database(&database);
+    collection_with_images(&source_db, "users").await;
+    let users = source_db.collection::<Document>("users");
+    // The failpoint targets only this pipeline's MongoDB client.
+    let app = unique("oplog");
+    let uri = format!("{MONGO_URI}&appName={app}");
+    let storage = tempfile::tempdir().unwrap();
+    let pg_table = unique("oplog");
+    let pg = postgres().await;
+    let statements = vec![
+        document_source("docs", &uri, &database, "users", ""),
+        pg_sink_on("docs", &pg_table, ", 'changelog.mode' = 'true'"),
+    ];
+
+    let db = open(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let (before, after) = (ObjectId::new(), ObjectId::new());
+    users
+        .insert_one(doc! {"_id": before, "name": "before", "age": 1_i64})
+        .await
+        .unwrap();
+    eventually(
+        CONVERGE,
+        || pg_rows(&pg, &pg_table),
+        |rows| rows.contains_key(&before.to_hex()),
+    )
+    .await;
+    assert!(db.checkpoint().await.unwrap().success);
+
+    // History lost mid-stream: the source stops with the recovery action instead of reopening.
+    // The next awaited getMore fails; a later write must never reach the target.
+    fail_with_history_lost(&client, "getMore", &app).await;
+    expect_pipeline_fault(&db, "no longer in the oplog").await;
+    users
+        .insert_one(doc! {"_id": after, "name": "after", "age": 2_i64})
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !pg_rows(&pg, &pg_table).await.contains_key(&after.to_hex()),
+        "a stopped source must not keep delivering changes"
+    );
+    let _ = db.shutdown().await;
+
+    // History lost at resume: the restart fails rather than opening a fresh stream at "now".
+    let db = reopen(storage.path(), &statements).await;
+    fail_with_history_lost(&client, "aggregate", &app).await;
+    let error = db
+        .start()
+        .await
+        .expect_err("a lost resume point must not restart from now")
+        .to_string();
+    assert!(error.contains("no longer in the oplog"), "{error}");
+    let _ = db.shutdown().await;
+}
+
+#[cfg(feature = "iceberg")]
+fn iceberg_options(table: &str, secret: &str) -> Vec<(&'static str, String)> {
+    [
+        ("catalog.uri", "http://localhost:8181"),
+        ("warehouse", "s3://warehouse/wh"),
+        ("storage.type", "s3"),
+        ("namespace", "laminar_mongodb_cdc"),
+        ("auto.create", "true"),
+        ("storage.endpoint", "http://localhost:9000"),
+        ("storage.region", "us-east-1"),
+        ("storage.path_style", "true"),
+        ("storage.property.s3.access-key-id", "minioadmin"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key, value.to_string()))
+    .chain([
+        ("table.name", table.to_string()),
+        ("storage.property.s3.secret-access-key", secret.to_string()),
+    ])
+    .collect()
+}
+
+/// `(cluster time, operation, event_id)` of every row in an Iceberg history table.
+#[cfg(feature = "iceberg")]
+async fn iceberg_history(table: &str) -> Vec<((i64, i64), String, String)> {
+    use futures_util::StreamExt;
+    use laminar_connectors::lakehouse::{iceberg_config::IcebergSinkConfig, iceberg_io};
+
+    let mut config = laminar_connectors::config::ConnectorConfig::new("iceberg");
+    for (key, value) in iceberg_options(table, "minioadmin") {
+        config.set(key, value);
+    }
+    let config = IcebergSinkConfig::from_config(&config).unwrap();
+    let Ok(catalog) = iceberg_io::build_catalog(&config.catalog, &config.storage).await else {
+        return Vec::new();
+    };
+    let Ok(table) = iceberg_io::load_table(
+        catalog.as_ref(),
+        &config.catalog.namespace,
+        &config.catalog.table_name,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    let Ok(mut stream) = table.scan().build().unwrap().to_arrow().await else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.unwrap();
+        let text = |name: &str| {
+            arrow::compute::cast(
+                batch.column_by_name(name).unwrap(),
+                &arrow::datatypes::DataType::Utf8,
+            )
+            .unwrap()
+        };
+        let (seconds, increments, operations, ids) = (
+            text("cluster_time_seconds"),
+            text("cluster_time_increment"),
+            text("operation"),
+            text("event_id"),
+        );
+        let string = |column: &arrow::array::ArrayRef, row: usize| {
+            arrow::array::cast::as_string_array(column)
+                .value(row)
+                .to_string()
+        };
+        for row in 0..batch.num_rows() {
+            rows.push((
+                (
+                    string(&seconds, row).parse().unwrap(),
+                    string(&increments, row).parse().unwrap(),
+                ),
+                string(&operations, row),
+                string(&ids, row),
+            ));
+        }
+        assert!(
+            matches!(
+                batch.column_by_name("wall_time").unwrap().data_type(),
+                arrow::datatypes::DataType::Timestamp(_, _)
+            ),
+            "wall_time keeps a timestamp type in Iceberg"
+        );
+    }
+    rows.sort();
+    rows
+}
+
+#[cfg(feature = "iceberg")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn history_appends_every_event_to_iceberg() {
+    let Some(client) = mongo(MONGO_URI).await else {
+        return;
+    };
+    let catalog = std::net::SocketAddr::from(([127, 0, 0, 1], 8181));
+    if std::net::TcpStream::connect_timeout(&catalog, Duration::from_secs(2)).is_err() {
+        assert!(
+            std::env::var(REQUIRE_ENV).is_err(),
+            "the Iceberg fixture (tests/docker/iceberg-compose.yml) is required"
+        );
+        eprintln!("skipping: Iceberg REST catalog is not reachable on {catalog}");
+        return;
+    }
+    let database = unique("icehist");
+    let source_db = client.database(&database);
+    collection_with_images(&source_db, "events").await;
+    let events = source_db.collection::<Document>("events");
+    let storage = tempfile::tempdir().unwrap();
+    let table = unique("history");
+    let options = iceberg_options(&table, "${E2E_MINIO_SECRET}")
+        .into_iter()
+        .map(|(key, value)| format!("'{key}' = '{value}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let statements = vec![
+        history_source("changes", MONGO_URI, &database, "events", ""),
+        format!("CREATE SINK changes_lake FROM changes INTO \"iceberg\" ({options})"),
+    ];
+
+    let db = open(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let id = ObjectId::new();
+    events
+        .insert_one(doc! {"_id": id, "v": 1_i32})
+        .await
+        .unwrap();
+    events
+        .update_one(doc! {"_id": id}, doc! {"$set": {"v": 2_i32}})
+        .await
+        .unwrap();
+    events
+        .update_one(doc! {"_id": id}, doc! {"$set": {"v": 3_i32}})
+        .await
+        .unwrap();
+    events
+        .replace_one(doc! {"_id": id}, doc! {"v": 4_i32})
+        .await
+        .unwrap();
+    events.delete_one(doc! {"_id": id}).await.unwrap();
+
+    let rows = eventually(
+        CONVERGE,
+        || async {
+            let _ = db.checkpoint().await;
+            iceberg_history(&table).await
+        },
+        |rows| rows.len() >= 5,
+    )
+    .await;
+    db.shutdown().await.expect("shutdown");
+    let operations: Vec<&str> = rows
+        .iter()
+        .map(|(_, operation, _)| operation.as_str())
+        .collect();
+    assert_eq!(
+        operations,
+        ["insert", "update", "update", "replace", "delete"]
+    );
+    let identities: std::collections::BTreeSet<&str> =
+        rows.iter().map(|(_, _, id)| id.as_str()).collect();
+    assert_eq!(identities.len(), 5);
 }

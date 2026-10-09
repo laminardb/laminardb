@@ -613,7 +613,6 @@ Connector-produced schemas may use other `Timestamp(_)` precisions:
 | `_laminar_received_at` | `Timestamp(Nanosecond)` | OTel |
 | `_ts_ms` | `Timestamp(Millisecond)` | Postgres CDC |
 | `_timestamp` | `Timestamp(Millisecond)` | Kafka metadata |
-| `wall_time` | `Timestamp(Millisecond)` | MongoDB CDC history records |
 | `file_modification_time` | `Timestamp(Millisecond)` | Files connector |
 
 Despite the `_ms` / `_ns` suffixes in some historical names, these are

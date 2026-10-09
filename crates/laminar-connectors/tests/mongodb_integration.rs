@@ -1377,13 +1377,13 @@ async fn sink_cdc_replay() {
 
     let history = |rows: &[(&str, &str, Option<&str>)]| {
         use arrow_array::builder::{
-            Int32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+            Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
         };
         let mut text: Vec<StringBuilder> = (0..12).map(|_| StringBuilder::new()).collect();
         let mut version = Int32Builder::new();
         let mut seconds = Int64Builder::new();
         let mut increment = Int64Builder::new();
-        let mut wall = TimestampMillisecondBuilder::new();
+        let mut wall = TimestampMicrosecondBuilder::new();
         let mut txn = Int64Builder::new();
         for (index, (operation, key, document)) in rows.iter().enumerate() {
             text[0].append_value(format!("event-{index}"));

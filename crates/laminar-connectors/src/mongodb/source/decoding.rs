@@ -16,7 +16,7 @@ pub(super) struct DecodedChange<'a> {
     pub(super) full_document: Option<&'a RawDocument>,
     pub(super) update_description: Option<&'a RawDocument>,
     pub(super) cluster_time: Option<Timestamp>,
-    pub(super) wall_time_ms: Option<i64>,
+    pub(super) wall_time_us: Option<i64>,
     pub(super) txn_number: Option<i64>,
     pub(super) lsid: Option<&'a RawDocument>,
     /// Every other field (for example `to`, `nsType`, `operationDescription`).
@@ -73,7 +73,7 @@ pub(super) fn decode_change(raw: &RawDocument) -> Result<DecodedChange<'_>, Conn
         full_document: None,
         update_description: None,
         cluster_time: None,
-        wall_time_ms: None,
+        wall_time_us: None,
         txn_number: None,
         lsid: None,
         details: None,
@@ -124,11 +124,13 @@ pub(super) fn decode_change(raw: &RawDocument) -> Result<DecodedChange<'_>, Conn
                 );
             }
             "wallTime" => {
-                decoded.wall_time_ms = Some(
+                decoded.wall_time_us = Some(
                     value
                         .as_datetime()
                         .ok_or_else(|| malformed(key, "not a date"))?
-                        .timestamp_millis(),
+                        .timestamp_millis()
+                        .checked_mul(1000)
+                        .ok_or_else(|| malformed(key, "outside the microsecond range"))?,
                 );
             }
             "txnNumber" => {

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    Int32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+    Int32Builder, Int64Builder, StringBuilder, TimestampMicrosecondBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -42,7 +42,7 @@ pub const SNAPSHOT_OPERATION: &str = "snapshot";
 /// | `resume_token` | Utf8 | yes | Opaque resume token JSON (absent for snapshot rows) |
 /// | `cluster_time_seconds` | Int64 | no | Event cluster time, or the snapshot read time |
 /// | `cluster_time_increment` | Int64 | no | Cluster time increment |
-/// | `wall_time` | Timestamp(ms) | yes | Server wall time |
+/// | `wall_time` | Timestamp(us) | yes | Server wall time (millisecond precision) |
 /// | `txn_number` | Int64 | yes | Transaction number when the change belongs to a transaction |
 /// | `lsid` | Utf8 | yes | Canonical Extended JSON transaction session id |
 /// | `snapshot_id` | Utf8 | yes | Snapshot read time `<seconds>.<increment>` for snapshot rows |
@@ -65,7 +65,8 @@ pub fn mongodb_history_schema() -> SchemaRef {
         Field::new("cluster_time_increment", DataType::Int64, false),
         Field::new(
             "wall_time",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
+            // Microseconds: lakehouse formats such as Iceberg have no millisecond timestamp.
+            DataType::Timestamp(TimeUnit::Microsecond, None),
             true,
         ),
         Field::new("txn_number", DataType::Int64, true),
@@ -111,7 +112,7 @@ struct HistoryBuilders {
     resume_token: StringBuilder,
     seconds: Int64Builder,
     increment: Int64Builder,
-    wall_time: TimestampMillisecondBuilder,
+    wall_time: TimestampMicrosecondBuilder,
     txn_number: Int64Builder,
     lsid: StringBuilder,
     snapshot_id: StringBuilder,
@@ -134,7 +135,7 @@ impl HistoryBuilders {
             resume_token: text(),
             seconds: Int64Builder::with_capacity(rows),
             increment: Int64Builder::with_capacity(rows),
-            wall_time: TimestampMillisecondBuilder::with_capacity(rows),
+            wall_time: TimestampMicrosecondBuilder::with_capacity(rows),
             txn_number: Int64Builder::with_capacity(rows),
             lsid: text(),
             snapshot_id: text(),
@@ -184,7 +185,7 @@ impl HistoryBuilders {
             .append_option(optional_extjson(change.details.as_deref())?);
         self.resume_token.append_value(&record.token);
         self.append_time(cluster_time);
-        self.wall_time.append_option(change.wall_time_ms);
+        self.wall_time.append_option(change.wall_time_us);
         self.txn_number.append_option(change.txn_number);
         self.lsid.append_option(optional_extjson(change.lsid)?);
         self.snapshot_id.append_null();

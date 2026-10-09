@@ -7,9 +7,7 @@ use arrow_schema::{Field, SchemaRef};
 use crate::error::ConnectorError;
 
 use super::super::sink_config::{quote_sql_identifier, PostgresSinkConfig};
-use super::super::types::{
-    arrow_to_pg_ddl_type, arrow_type_to_pg_array_cast, arrow_type_to_pg_sql,
-};
+use super::super::types::{arrow_to_pg_ddl_type, arrow_type_to_pg_array_cast};
 use super::input::{quoted_user_columns, user_fields, validate_sink_schema};
 use super::PostgresSink;
 
@@ -137,13 +135,13 @@ impl PostgresSink {
         config: &PostgresSinkConfig,
     ) -> Result<String, ConnectorError> {
         validate_sink_schema(schema, config)?;
-        let pg_type = |column: &str| -> Result<&'static str, ConnectorError> {
+        let key_parameter = |column: &str, parameter: usize| -> Result<String, ConnectorError> {
             let field = schema.field_with_name(column).map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
                     "primary key column '{column}' is not present in PostgreSQL sink schema"
                 ))
             })?;
-            arrow_type_to_pg_sql(field.data_type())
+            arrow_type_to_pg_array_cast(field.data_type(), parameter)
         };
         let pk = &config.primary_key_columns;
 
@@ -158,15 +156,15 @@ impl PostgresSink {
             })?;
             let quoted_column = quote_sql_identifier(column);
             Ok(format!(
-                "DELETE FROM {} WHERE {quoted_column} = ANY($1::{}[])",
+                "DELETE FROM {} WHERE {quoted_column} = ANY({})",
                 config.qualified_table_name(),
-                pg_type(column)?,
+                key_parameter(column, 1)?,
             ))
         } else {
             let unnest_args: Vec<String> = pk
                 .iter()
                 .enumerate()
-                .map(|(i, column)| Ok(format!("${}::{}[]", i + 1, pg_type(column)?)))
+                .map(|(i, column)| key_parameter(column, i + 1))
                 .collect::<Result<_, ConnectorError>>()?;
             let quoted_keys: Vec<String> = pk
                 .iter()

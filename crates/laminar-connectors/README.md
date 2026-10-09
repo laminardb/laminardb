@@ -38,7 +38,7 @@ sinks have no fenced placement).
 
 | `output.mode` | Rows | Contract | Destinations |
 |---|---|---|---|
-| `history` (default) | One immutable, versioned record per change event (and per snapshot copy) | Append-only | Append-only sinks; tested with files, Delta append, PostgreSQL append, and MongoDB `cdc_replay` |
+| `history` (default) | One immutable, versioned record per change event (and per snapshot copy) | Append-only | Append-only sinks; tested with files, Delta and Iceberg append, PostgreSQL append, and MongoDB `cdc_replay` |
 | `document` | Full post-image → keyed put; delete → key-only tombstone | Keyed upsert | PostgreSQL upsert + `changelog.mode`, Delta `write.mode=upsert` |
 
 `snapshot.mode=never` (default) captures changes made after the source first opens; documents
@@ -137,9 +137,9 @@ rows behind.
   columns holding ObjectIds as lowercase hex; ObjectIds are rejected elsewhere, so an ObjectId
   and an equal-looking string can never share a key. Nested and mixed values go through
   `document.json.column`, the whole document as canonical Extended JSON. Typed columns read
-  both a missing field and `null` as `NULL`; the JSON column keeps the difference. The
-  PostgreSQL sink has no `DECIMAL` mapping; mirror decimals to Delta or read them from the
-  JSON column.
+  both a missing field and `null` as `NULL`; the JSON column keeps the difference.
+  `DECIMAL(p,s)` lands as PostgreSQL `NUMERIC(p,s)` and Delta `decimal(p,s)` without rounding;
+  an existing PostgreSQL column must hold at least that scale and integer width.
 - Sinks apply `_op = 'U'` and `_op = 'D'` rows by that key: PostgreSQL upserts and deletes by
   primary key, and Delta merges. A sink must declare exactly the source key. Filters, streams,
   joins, and aggregates over a document source are rejected: they would need retractions of

@@ -9,17 +9,23 @@ use crate::error::ConnectorError;
 pub(super) struct PostgresType {
     sql: &'static str,
     ddl: &'static str,
+    /// UNNEST parameter type when it differs from `sql`: the Rust parameter encoder has no
+    /// lossless NUMERIC, so decimals travel as exact text and the statement casts them.
+    parameter: Option<&'static str>,
 }
 
 impl PostgresType {
-    #[must_use]
-    pub(super) const fn sql(self) -> &'static str {
-        self.sql
+    const fn new(sql: &'static str, ddl: &'static str) -> Self {
+        Self {
+            sql,
+            ddl,
+            parameter: None,
+        }
     }
 
     #[must_use]
-    pub(super) const fn ddl(self) -> &'static str {
-        self.ddl
+    pub(super) const fn sql(self) -> &'static str {
+        self.sql
     }
 }
 
@@ -29,87 +35,128 @@ impl PostgresType {
 /// parameter encoder. Types are added only when both write paths have the same lossless contract.
 pub(super) fn postgres_type(data_type: &DataType) -> Result<PostgresType, ConnectorError> {
     let mapping = match data_type {
-        DataType::Boolean => PostgresType {
-            sql: "bool",
-            ddl: "BOOLEAN",
-        },
-        DataType::Int8 | DataType::UInt8 | DataType::Int16 => PostgresType {
-            sql: "int2",
-            ddl: "SMALLINT",
-        },
-        DataType::UInt16 | DataType::Int32 => PostgresType {
-            sql: "int4",
-            ddl: "INTEGER",
-        },
-        DataType::UInt32 | DataType::Int64 | DataType::UInt64 => PostgresType {
-            sql: "int8",
-            ddl: "BIGINT",
-        },
-        DataType::Float32 => PostgresType {
-            sql: "float4",
-            ddl: "REAL",
-        },
-        DataType::Float64 => PostgresType {
-            sql: "float8",
-            ddl: "DOUBLE PRECISION",
-        },
-        DataType::Utf8 | DataType::LargeUtf8 => PostgresType {
-            sql: "text",
-            ddl: "TEXT",
-        },
-        DataType::Binary | DataType::LargeBinary => PostgresType {
-            sql: "bytea",
-            ddl: "BYTEA",
-        },
-        DataType::Date32 => PostgresType {
-            sql: "date",
-            ddl: "DATE",
+        DataType::Boolean => PostgresType::new("bool", "BOOLEAN"),
+        DataType::Int8 | DataType::UInt8 | DataType::Int16 => PostgresType::new("int2", "SMALLINT"),
+        DataType::UInt16 | DataType::Int32 => PostgresType::new("int4", "INTEGER"),
+        DataType::UInt32 | DataType::Int64 | DataType::UInt64 => {
+            PostgresType::new("int8", "BIGINT")
+        }
+        DataType::Float32 => PostgresType::new("float4", "REAL"),
+        DataType::Float64 => PostgresType::new("float8", "DOUBLE PRECISION"),
+        DataType::Utf8 | DataType::LargeUtf8 => PostgresType::new("text", "TEXT"),
+        DataType::Binary | DataType::LargeBinary => PostgresType::new("bytea", "BYTEA"),
+        DataType::Date32 => PostgresType::new("date", "DATE"),
+        DataType::Decimal128(_, scale) if *scale >= 0 => PostgresType {
+            parameter: Some("text"),
+            ..PostgresType::new("numeric", "NUMERIC")
         },
         DataType::Timestamp(
             TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond,
             None,
-        ) => PostgresType {
-            sql: "timestamp",
-            ddl: "TIMESTAMP",
-        },
+        ) => PostgresType::new("timestamp", "TIMESTAMP"),
         DataType::Timestamp(
             TimeUnit::Second | TimeUnit::Millisecond | TimeUnit::Microsecond,
             Some(_),
-        ) => PostgresType {
-            sql: "timestamptz",
-            ddl: "TIMESTAMPTZ",
-        },
+        ) => PostgresType::new("timestamptz", "TIMESTAMPTZ"),
         unsupported => {
             return Err(ConnectorError::ConfigurationError(format!(
                 "PostgreSQL sink does not support Arrow type {unsupported:?}; supported types are \
                  Boolean, signed integers, UInt8/16/32, range-checked UInt64, Float32/64, \
-                 Utf8/LargeUtf8, Binary/LargeBinary, Date32, and second/millisecond/microsecond \
-                 Timestamp"
+                 Utf8/LargeUtf8, Binary/LargeBinary, Date32, Decimal128 with a non-negative \
+                 scale, and second/millisecond/microsecond Timestamp"
             )));
         }
     };
     Ok(mapping)
 }
 
-/// `PostgreSQL` type used in an UNNEST cast.
-pub(super) fn arrow_type_to_pg_sql(data_type: &DataType) -> Result<&'static str, ConnectorError> {
-    postgres_type(data_type).map(PostgresType::sql)
-}
-
 /// `PostgreSQL` type used in generated CREATE TABLE DDL.
-pub(super) fn arrow_to_pg_ddl_type(data_type: &DataType) -> Result<&'static str, ConnectorError> {
-    postgres_type(data_type).map(PostgresType::ddl)
+pub(super) fn arrow_to_pg_ddl_type(data_type: &DataType) -> Result<String, ConnectorError> {
+    let mapping = postgres_type(data_type)?;
+    Ok(match data_type {
+        DataType::Decimal128(precision, scale) => format!("NUMERIC({precision}, {scale})"),
+        _ => mapping.ddl.to_string(),
+    })
 }
 
-/// Typed `PostgreSQL` array parameter used by an UNNEST statement.
+/// Typed `PostgreSQL` array parameter used by UNNEST and key-delete statements.
 pub(super) fn arrow_type_to_pg_array_cast(
     data_type: &DataType,
     parameter: usize,
 ) -> Result<String, ConnectorError> {
-    Ok(format!(
-        "${parameter}::{}[]",
-        arrow_type_to_pg_sql(data_type)?
-    ))
+    let mapping = postgres_type(data_type)?;
+    Ok(match mapping.parameter {
+        Some(wire) => format!("${parameter}::{wire}[]::{}[]", mapping.sql),
+        None => format!("${parameter}::{}[]", mapping.sql),
+    })
+}
+
+/// Whether an existing NUMERIC column holds every value of `data_type` without rounding.
+pub(super) fn numeric_column_holds(data_type: &DataType, type_modifier: i32) -> bool {
+    let DataType::Decimal128(precision, scale) = data_type else {
+        return true;
+    };
+    if type_modifier == -1 {
+        return true;
+    }
+    // NUMERIC(p, s) stores ((p << 16) | (s & 0x7ff)) + 4, with s sign-extended from 11 bits.
+    let packed = type_modifier - 4;
+    let column_precision = (packed >> 16) & 0xffff;
+    let column_scale = ((packed & 0x7ff) ^ 1024) - 1024;
+    let (precision, scale) = (i32::from(*precision), i32::from(*scale));
+    column_scale >= scale && column_precision - column_scale >= precision - scale
+}
+
+/// `PostgreSQL` NUMERIC binary wire value (without its length prefix) for a non-negative scale.
+///
+/// Digits are base-10000 groups aligned on the decimal point, with leading and trailing zero
+/// groups removed and `weight` naming the power of 10000 of the first group.
+#[cfg(feature = "postgres-sink")]
+fn numeric_wire(value: i128, scale: u8, buffer: &mut Vec<u8>) {
+    let scale = usize::from(scale);
+    let mut digits = value.unsigned_abs().to_string();
+    if digits.len() <= scale {
+        digits.insert_str(0, &"0".repeat(scale + 1 - digits.len()));
+    }
+    let (integer, fraction) = digits.split_at(digits.len() - scale);
+    let integer = format!("{}{integer}", "0".repeat((4 - integer.len() % 4) % 4));
+    let fraction = format!("{fraction}{}", "0".repeat((4 - fraction.len() % 4) % 4));
+    let group = |chunk: &[u8]| {
+        chunk
+            .iter()
+            .fold(0_i16, |total, digit| total * 10 + i16::from(digit - b'0'))
+    };
+    let mut groups: Vec<i16> = integer
+        .as_bytes()
+        .chunks(4)
+        .chain(fraction.as_bytes().chunks(4))
+        .map(group)
+        .collect();
+    let mut weight = i16::try_from(integer.len() / 4).unwrap_or(i16::MAX) - 1;
+    let leading = groups.iter().take_while(|group| **group == 0).count();
+    groups.drain(..leading);
+    weight -= i16::try_from(leading).unwrap_or(i16::MAX);
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    if groups.is_empty() {
+        weight = 0;
+    }
+    let sign: i16 = if value < 0 && !groups.is_empty() {
+        0x4000
+    } else {
+        0
+    };
+    // At most 38 significant digits: ten groups and a weight of a few groups either way.
+    let header = [
+        i16::try_from(groups.len()).unwrap_or(i16::MAX),
+        weight,
+        sign,
+        i16::try_from(scale).unwrap_or(i16::MAX),
+    ];
+    for word in header.into_iter().chain(groups) {
+        buffer.extend_from_slice(&word.to_be_bytes());
+    }
 }
 
 #[cfg(feature = "postgres-sink")]
@@ -175,6 +222,10 @@ pub(super) fn validate_postgres_array_values(
 /// `pgpq` encodes Arrow `UInt64` as `PostgreSQL` NUMERIC. The sink deliberately exposes `UInt64` as a
 /// range-checked BIGINT so COPY and UNNEST have identical table types; values are therefore widened
 /// to an Int64 Arrow column after validation and before the COPY encoder is constructed.
+///
+/// `pgpq` 0.11 drops leading zero fractional groups from decimals (`1.00005` becomes `1.5`), so
+/// decimals are pre-encoded as NUMERIC wire values in a Binary column. COPY BINARY fields carry
+/// no type, so the target NUMERIC column decodes the bytes.
 #[cfg(feature = "postgres-sink")]
 pub(super) fn postgres_copy_batch(
     batch: &arrow_array::RecordBatch,
@@ -189,7 +240,34 @@ pub(super) fn postgres_copy_batch(
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
         postgres_type(column.data_type())?;
-        if field.data_type() == &DataType::UInt64 {
+        if let DataType::Decimal128(_, scale) = field.data_type() {
+            let values = column
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .ok_or_else(|| {
+                    ConnectorError::Internal("downcast to Decimal128Array failed".into())
+                })?;
+            let scale = u8::try_from(*scale).map_err(|_| {
+                ConnectorError::Internal("negative decimal scale passed type admission".into())
+            })?;
+            let mut builder =
+                arrow_array::builder::BinaryBuilder::with_capacity(values.len(), values.len() * 16);
+            let mut wire = Vec::with_capacity(32);
+            for row in 0..values.len() {
+                if values.is_null(row) {
+                    builder.append_null();
+                } else {
+                    wire.clear();
+                    numeric_wire(values.value(row), scale, &mut wire);
+                    builder.append_value(&wire);
+                }
+            }
+            fields.push(Arc::new(
+                field.as_ref().clone().with_data_type(DataType::Binary),
+            ));
+            columns.push(Arc::new(builder.finish()));
+            changed = true;
+        } else if field.data_type() == &DataType::UInt64 {
             let values = column
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -268,13 +346,33 @@ pub(super) fn arrow_column_to_pg_array(
     array: &dyn arrow_array::Array,
 ) -> Result<Box<dyn postgres_types::ToSql + Sync + Send>, ConnectorError> {
     use arrow_array::{
-        Array as _, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, StringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt16Array,
-        UInt32Array, UInt64Array, UInt8Array,
+        Array as _, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+        LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
 
     postgres_type(array.data_type())?;
+
+    // Nulls stay `None`; every non-null value is converted by `$value(values, row)`.
+    macro_rules! nullable {
+        ($array_type:ty, $value:expr) => {{
+            let values = array
+                .as_any()
+                .downcast_ref::<$array_type>()
+                .ok_or_else(|| {
+                    ConnectorError::Internal(format!(
+                        "downcast to {} failed",
+                        stringify!($array_type)
+                    ))
+                })?;
+            Ok(Box::new(
+                (0..values.len())
+                    .map(|row| (!values.is_null(row)).then(|| $value(values, row)))
+                    .collect::<Vec<Option<_>>>(),
+            ))
+        }};
+    }
 
     macro_rules! widen {
         ($array_type:ty, $target:ty) => {{
@@ -295,19 +393,7 @@ pub(super) fn arrow_column_to_pg_array(
     }
 
     match array.data_type() {
-        DataType::Boolean => {
-            let values = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    ConnectorError::Internal("downcast to BooleanArray failed".into())
-                })?;
-            Ok(Box::new(
-                (0..values.len())
-                    .map(|row| (!values.is_null(row)).then(|| values.value(row)))
-                    .collect::<Vec<Option<bool>>>(),
-            ))
-        }
+        DataType::Boolean => nullable!(BooleanArray, |v: &BooleanArray, row| v.value(row)),
         DataType::Int8 => widen!(Int8Array, i16),
         DataType::UInt8 => widen!(UInt8Array, i16),
         DataType::Int16 => widen!(Int16Array, i16),
@@ -333,54 +419,17 @@ pub(super) fn arrow_column_to_pg_array(
         }
         DataType::Float32 => widen!(Float32Array, f32),
         DataType::Float64 => widen!(Float64Array, f64),
-        DataType::Utf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ConnectorError::Internal("downcast to StringArray failed".into()))?;
-            Ok(Box::new(
-                (0..values.len())
-                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_owned()))
-                    .collect::<Vec<Option<String>>>(),
-            ))
-        }
-        DataType::LargeUtf8 => {
-            let values = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| {
-                    ConnectorError::Internal("downcast to LargeStringArray failed".into())
-                })?;
-            Ok(Box::new(
-                (0..values.len())
-                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_owned()))
-                    .collect::<Vec<Option<String>>>(),
-            ))
-        }
-        DataType::Binary => {
-            let values = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ConnectorError::Internal("downcast to BinaryArray failed".into()))?;
-            Ok(Box::new(
-                (0..values.len())
-                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_vec()))
-                    .collect::<Vec<Option<Vec<u8>>>>(),
-            ))
-        }
-        DataType::LargeBinary => {
-            let values = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    ConnectorError::Internal("downcast to LargeBinaryArray failed".into())
-                })?;
-            Ok(Box::new(
-                (0..values.len())
-                    .map(|row| (!values.is_null(row)).then(|| values.value(row).to_vec()))
-                    .collect::<Vec<Option<Vec<u8>>>>(),
-            ))
-        }
+        // Exact decimal text; the statement casts it to NUMERIC.
+        DataType::Decimal128(_, _) => nullable!(Decimal128Array, |v: &Decimal128Array, row| v
+            .value_as_string(row)),
+        DataType::Utf8 => nullable!(StringArray, |v: &StringArray, row| v.value(row).to_owned()),
+        DataType::LargeUtf8 => nullable!(LargeStringArray, |v: &LargeStringArray, row| v
+            .value(row)
+            .to_owned()),
+        DataType::Binary => nullable!(BinaryArray, |v: &BinaryArray, row| v.value(row).to_vec()),
+        DataType::LargeBinary => nullable!(LargeBinaryArray, |v: &LargeBinaryArray, row| v
+            .value(row)
+            .to_vec()),
         DataType::Date32 => {
             let values = array
                 .as_any()

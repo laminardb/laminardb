@@ -207,8 +207,10 @@ jobs:
           key: mongodb-cdc
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
-      - name: Start MongoDB and PostgreSQL fixtures
-        run: docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
+      - name: Start MongoDB, PostgreSQL, and Iceberg fixtures
+        run: |
+          docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
+          docker compose -f tests/docker/iceberg-compose.yml up -d --wait
       - name: Connector change-stream, replay, and admission tests
         run: cargo test -p laminar-connectors --no-default-features --features mongodb-cdc --test mongodb_integration --test cdc_admission -- --test-threads=2
       - name: MongoDB schema contracts
@@ -216,12 +218,14 @@ jobs:
         env:
           LAMINAR_SCHEMA_TEST_MONGO: mongodb://127.0.0.1:27117/?directConnection=true&tls=false
       - name: Direct MongoDB pipeline end-to-end tests
-        run: cargo test -p laminar-db --no-default-features --features mongodb-cdc,postgres-sink,delta-lake,files --test mongodb_cdc_e2e -- --test-threads=1
+        run: cargo test -p laminar-db --no-default-features --features mongodb-cdc,postgres-sink,delta-lake,files,iceberg --test mongodb_cdc_e2e -- --test-threads=1
         env:
           LAMINAR_REQUIRE_MONGODB_CDC: "1"
       - name: Fixture logs
         if: failure()
-        run: docker compose -f tests/docker/mongodb-cdc-compose.yml logs --tail=200
+        run: |
+          docker compose -f tests/docker/mongodb-cdc-compose.yml logs --tail=200
+          docker compose -f tests/docker/iceberg-compose.yml logs --tail=200
 
   # ============================================
   # Release Build (main/develop only)

@@ -50,14 +50,18 @@ three-member set for election tests (`127.0.0.1:27201-27203`), and PostgreSQL
 advertises the host-published address, so the driver discovers the same topology from the
 host.
 
+The history → Iceberg case also needs `iceberg-compose.yml` (MinIO on 9000, REST catalog on 8181).
+
 ```
 docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
-cargo test -p laminar-db --features mongodb-cdc,postgres-sink,delta-lake,files \
+docker compose -f tests/docker/iceberg-compose.yml up -d --wait
+cargo test -p laminar-db --features mongodb-cdc,postgres-sink,delta-lake,files,iceberg \
   --test mongodb_cdc_e2e -- --test-threads=1
 LAMINAR_SCHEMA_TEST_MONGO="mongodb://127.0.0.1:27117/?directConnection=true&tls=false" \
   cargo test -p laminar-connectors --features mongodb-cdc --test schema_mongodb_integration \
   -- --ignored --test-threads=1
 docker compose -f tests/docker/mongodb-cdc-compose.yml down -v
+docker compose -f tests/docker/iceberg-compose.yml down -v
 ```
 
 The end-to-end tests skip when MongoDB is unreachable unless `LAMINAR_REQUIRE_MONGODB_CDC=1`.

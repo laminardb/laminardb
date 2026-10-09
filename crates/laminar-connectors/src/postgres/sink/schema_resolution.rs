@@ -98,6 +98,10 @@ fn validate_columns(input: &SchemaRef, columns: &[Column]) -> Result<SchemaRef, 
             || (target.required && field.is_nullable())
             || (matches!(target.type_name.as_str(), "timestamp" | "timestamptz")
                 && !matches!(target.type_modifier, -1 | 6))
+            || !crate::postgres::types::numeric_column_holds(
+                field.data_type(),
+                target.type_modifier,
+            )
         {
             return Err(ConnectorError::SchemaMismatch(format!("PostgreSQL column '{}' differs in encoding, nullability, precision, or generated-column policy", field.name())));
         }
