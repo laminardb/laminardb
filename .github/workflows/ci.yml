@@ -415,12 +415,13 @@ jobs:
           large-packages: true
           docker-images: true
           swap-storage: false
-      - uses: dtolnay/rust-toolchain@stable
+      # Match the toolchain used by the Pages documentation build.
+      - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build docs
-        run: cargo doc --workspace --no-deps --all-features
+        run: cargo +nightly doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings --cfg docsrs"
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
