@@ -384,12 +384,25 @@ async fn topology_public_atomic_then_sql_migration_preserves_actual_aggregate_an
     ));
     drop(compiler);
     probe.output.lock().clear();
-    let sql = Box::pin(
-        fixture
-            .db
-            .execute("CREATE STREAM downstream AS SELECT * FROM totals"),
-    )
+    // The recovery monitor can still own the compiler after publishing Active.
+    let sql = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match Box::pin(
+                fixture
+                    .db
+                    .execute("CREATE STREAM downstream AS SELECT * FROM totals"),
+            )
+            .await
+            {
+                Err(DbError::Topology(TopologyError::PlanningBusy)) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                result => break result,
+            }
+        }
+    })
     .await
+    .expect("topology compiler did not become available for the SQL migration")
     .unwrap();
     let ExecuteResult::Ddl(info) = sql else {
         panic!("SQL must return its durable receipt");
