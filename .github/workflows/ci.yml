@@ -115,7 +115,7 @@ jobs:
           key: ${{ matrix.os }}
       - uses: taiki-e/install-action@nextest
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: runner.os == 'Linux'
         with:
           python-version: '3.13'
