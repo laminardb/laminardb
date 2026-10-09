@@ -42,7 +42,16 @@ impl StreamingCoordinator {
             source_name,
             barrier_checkpoint.input_channels_arc().cloned(),
         )?;
-        self.capture_replayable_barrier_cursor(source_idx, barrier_checkpoint);
+        // A managed push source binds its native admission cut into the barrier checkpoint
+        // when it establishes the barrier (see `CatalogSourceConnector::checkpoint`), so
+        // batches admitted after the barrier stay outside the committed cut. Persist that cut
+        // even for a non-replayable bridge so it reaches the committed manifest; recovery
+        // still selects replay cursors by `supports_replay()`, so the metadata is not a
+        // replay cursor.
+        let managed = barrier_checkpoint
+            .metadata()
+            .contains_key(crate::source_admission::SOURCE_INSTANCE_METADATA_KEY);
+        self.capture_barrier_cursor(source_idx, barrier_checkpoint, managed);
 
         self.pending_barrier.sources_aligned.insert(source_idx);
 

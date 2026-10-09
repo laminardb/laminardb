@@ -21,13 +21,16 @@ use laminar_connectors::connector::{
 use laminar_connectors::error::ConnectorError;
 use laminar_core::streaming;
 
-use crate::catalog::ArrowRecord;
+use crate::catalog::{ArrowRecord, SourceEntry};
 
 /// Bridges a catalog SPSC subscription into the pipeline alongside external connectors.
 pub(crate) struct CatalogSourceConnector {
     subscription: streaming::Subscription<ArrowRecord>,
     schema: SchemaRef,
     data_notify: Arc<Notify>,
+    /// Catalog entry backing this bridge. Used to snapshot the managed admission cut
+    /// atomically when a checkpoint barrier is established at this source.
+    source: Arc<SourceEntry>,
 }
 
 impl CatalogSourceConnector {
@@ -35,11 +38,13 @@ impl CatalogSourceConnector {
         subscription: streaming::Subscription<ArrowRecord>,
         schema: SchemaRef,
         data_notify: Arc<Notify>,
+        source: Arc<SourceEntry>,
     ) -> Self {
         Self {
             subscription,
             schema,
             data_notify,
+            source,
         }
     }
 }
@@ -105,7 +110,22 @@ impl SourceConnector for CatalogSourceConnector {
         // count cannot reproduce accepted events after restart, so exposing it as a recovery
         // cursor would contradict the connector's Ephemeral contract. Empty checkpoints still
         // let this source participate in barrier alignment without entering durable handoff.
-        SourceCheckpoint::new()
+        let mut checkpoint = SourceCheckpoint::new();
+        // For a declared managed push source, bind the native instance and the admission cut
+        // captured atomically here, at the moment the source establishes its barrier. Batches
+        // admitted after this keep a strictly greater ordinal and stay outside the committed
+        // checkpoint cut. This metadata is not a recovery cursor.
+        if let Some((source_instance, ordered_input_offset)) = self.source.managed_admission_cut() {
+            checkpoint.set_metadata(
+                crate::source_admission::SOURCE_INSTANCE_METADATA_KEY,
+                source_instance.as_str(),
+            );
+            checkpoint.set_metadata(
+                crate::source_admission::ORDERED_INPUT_OFFSET_METADATA_KEY,
+                ordered_input_offset.value().to_string(),
+            );
+        }
+        checkpoint
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

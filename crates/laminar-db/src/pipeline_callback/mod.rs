@@ -6551,6 +6551,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 });
         // Capture-time authority is bound only after the final assignment proof is consumed.
         handoff.bind_request(&mut request, reassignment_portable, assignment_fence);
+        // Managed-source admission metadata is bound into the exact cut that becomes the
+        // committed checkpoint when the source establishes its barrier (see
+        // `CatalogSourceConnector::checkpoint`), never read back from live admission state
+        // here. A managed source's cut therefore travels with its checkpoint and already
+        // reports only the batches admitted before the barrier. Non-managed sources keep
+        // their connector checkpoint byte-identical.
         let mut tail = LeaderTail {
             in_flight,
             coordinator: Arc::clone(&self.coordinator),

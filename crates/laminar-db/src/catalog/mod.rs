@@ -15,6 +15,8 @@ use laminar_core::streaming::{
     self, BackpressureStrategy, SourceConfig, StreamingError, WaitStrategy,
 };
 
+use crate::source_admission::{AdmittedInputCounter, OrderedInputOffset, SourceInstance};
+
 pub(crate) fn schema_has_reserved_mutation_columns(schema: &Schema) -> bool {
     schema.fields().iter().any(|field| {
         ["_op", "__op", laminar_core::changelog::WEIGHT_COLUMN]
@@ -141,6 +143,14 @@ pub struct SourceEntry {
     buffer: parking_lot::Mutex<SnapshotRing>,
     /// Wakeup handle for `db.insert()` event-driven notification.
     data_notify: Arc<Notify>,
+    /// Native-issued identity of this source instance (fresh after restart).
+    source_instance: SourceInstance,
+    /// Monotonic native admission ordinal for pushed batches.
+    admitted_input_offset: AdmittedInputCounter,
+    /// Whether this source is a managed push source owned by a downstream
+    /// context layer. Only declared sources have their native instance/coordinate
+    /// bound into checkpoint metadata, so connector sources are byte-identical.
+    managed_push: std::sync::atomic::AtomicBool,
 }
 
 impl SourceEntry {
@@ -149,6 +159,24 @@ impl SourceEntry {
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
+        self.admit_arrow(batch).map(|_| ())
+    }
+
+    /// Admit a batch and return its native ordered input offset.
+    ///
+    /// The ordinal is reserved only after the native channel accepted the batch,
+    /// so a rejected or backpressured enqueue produces no offset and no receipt.
+    ///
+    /// The managed-push flag is *not* set here. This shared admission path also backs
+    /// ordinary `push_and_buffer` (`INSERT INTO`) and the compatibility
+    /// [`crate::UntypedSourceHandle::push_arrow`], which must stay unmanaged so
+    /// connector sources keep byte-identical checkpoint metadata. Only
+    /// [`crate::UntypedSourceHandle::push_arrow_receipted`] and
+    /// [`Self::declare_managed_push`] opt a source in.
+    pub(crate) fn admit_arrow(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<OrderedInputOffset, laminar_core::streaming::StreamingError> {
         validate_source_batch(
             &self.name,
             &self.schema,
@@ -158,12 +186,31 @@ impl SourceEntry {
         )?;
         // Serialize admission and history publication so concurrent producers cannot leave
         // accepted batches waiting outside either owner or publish snapshots out of order.
+        // Reserve the ordinal while the buffer lock is still held, immediately after the
+        // native channel accepted the batch, so ordinal assignment matches enqueue order
+        // even when two producers interleave.
         let mut buffer = self.buffer.lock();
         self.source.push_arrow(batch.clone())?;
+        let offset = self.admitted_input_offset.next_offset();
         buffer.push(batch);
         drop(buffer);
         self.data_notify.notify_one();
-        Ok(())
+        Ok(offset)
+    }
+
+    /// Declare this source as a managed push source owned by a context layer.
+    ///
+    /// Until declared, checkpoint metadata is left byte-identical for connector
+    /// sources. Declaring does not fabricate progress; it only opts the source
+    /// into native instance/coordinate capture.
+    pub(crate) fn declare_managed_push(&self) {
+        self.managed_push
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether this source is a declared managed push source.
+    pub(crate) fn is_managed_push(&self) -> bool {
+        self.managed_push.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn snapshot(&self) -> Vec<RecordBatch> {
@@ -180,6 +227,30 @@ impl SourceEntry {
                 self.source.queued_arrow_bytes(),
                 self.source.max_queued_bytes(),
             )
+    }
+
+    /// Native-issued identity of this source instance.
+    pub(crate) fn source_instance(&self) -> &SourceInstance {
+        &self.source_instance
+    }
+
+    /// Snapshot the managed admission cut atomically with admission.
+    ///
+    /// Returns `None` unless this is a declared managed push source. Otherwise it holds the
+    /// admission lock, so the read is synchronized with [`Self::admit_arrow`]: no batch can be
+    /// half-admitted when the cut is taken, and every batch admitted afterwards reserves a
+    /// strictly greater ordinal. The catalog bridge calls this when it establishes its
+    /// checkpoint barrier, so batches admitted after the barrier stay outside the committed
+    /// checkpoint cut.
+    pub(crate) fn managed_admission_cut(&self) -> Option<(SourceInstance, OrderedInputOffset)> {
+        if !self.is_managed_push() {
+            return None;
+        }
+        let _admission = self.buffer.lock();
+        Some((
+            self.source_instance.clone(),
+            self.admitted_input_offset.current(),
+        ))
     }
 }
 
@@ -215,6 +286,13 @@ pub struct SourceCatalog {
     streams: RwLock<HashMap<String, Arc<StreamEntry>>>,
     queries: RwLock<HashMap<u64, QueryEntry>>,
     next_query_id: AtomicU64,
+    /// Distinguishes process generations for native source instance identity.
+    ///
+    /// A restart is a new process with a new pid, so the same catalog name issues
+    /// a fresh instance and cannot reuse a dead offset. If pid reuse ever becomes
+    /// observable, extend this nonce from a supervised boot id instead.
+    source_instance_nonce: uuid::Uuid,
+    next_source_instance: AtomicU64,
     default_buffer_size: usize,
     default_backpressure: BackpressureStrategy,
     push_source_max_bytes: usize,
@@ -234,6 +312,8 @@ impl SourceCatalog {
             streams: RwLock::new(HashMap::new()),
             queries: RwLock::new(HashMap::new()),
             next_query_id: AtomicU64::new(1),
+            source_instance_nonce: uuid::Uuid::new_v4(),
+            next_source_instance: AtomicU64::new(1),
             default_buffer_size: buffer_size,
             default_backpressure: backpressure,
             push_source_max_bytes: streaming::DEFAULT_SOURCE_MAX_QUEUED_BYTES,
@@ -320,6 +400,9 @@ impl SourceCatalog {
         #[cfg(not(feature = "cluster"))]
         let (source, sink) = streaming::create_with_config::<ArrowRecord>(config);
 
+        let ordinal = self.next_source_instance.fetch_add(1, Ordering::Relaxed);
+        let source_instance = SourceInstance::issue(name, self.source_instance_nonce, ordinal);
+
         let entry = Arc::new(SourceEntry {
             name: name.to_string(),
             schema,
@@ -335,6 +418,9 @@ impl SourceCatalog {
                 self.push_source_max_bytes,
             )),
             data_notify: Arc::new(Notify::new()),
+            source_instance,
+            admitted_input_offset: AdmittedInputCounter::default(),
+            managed_push: std::sync::atomic::AtomicBool::new(false),
         });
 
         sources.insert(name.to_string(), Arc::clone(&entry));

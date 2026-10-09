@@ -427,15 +427,25 @@ impl StreamingCoordinator {
         }
     }
 
-    pub(super) fn capture_replayable_barrier_cursor(
+    /// Capture this source's barrier checkpoint into the pending source cut.
+    ///
+    /// Non-replayable (ephemeral) sources are normally dropped so they never enter the
+    /// committed source roster. A declared managed push source is the exception: its
+    /// checkpoint carries only native admission metadata and must be persisted so
+    /// `checkpoint_through`/`checkpoint_current` can correlate against it. It stays out of
+    /// every replay path because recovery selects cursors by `supports_replay()`, which is
+    /// unchanged, so persisting the metadata does not make the source a replay cursor.
+    pub(super) fn capture_barrier_cursor(
         &mut self,
         source_idx: usize,
         checkpoint: &SourceCheckpoint,
+        managed: bool,
     ) {
-        if self
-            .source_handles
-            .get(source_idx)
-            .is_some_and(|handle| !handle.recovery_cursor)
+        if !managed
+            && self
+                .source_handles
+                .get(source_idx)
+                .is_some_and(|handle| !handle.recovery_cursor)
         {
             return;
         }
