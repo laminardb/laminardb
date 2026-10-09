@@ -81,7 +81,7 @@ arrow = { version = "=58.4.0", default-features = true }
 arrow-array = "=58.4.0"
 arrow-avro = "=58.4.0"
 arrow-schema = { version = "=58.4.0", features = ["serde"] }
-arrow-cast = "=58.4.0"
+arrow-cast = "=60.0.0"
 arrow-csv = "=58.4.0"
 arrow-ipc = { version = "=58.4.0", features = ["lz4"] }
 arrow-json = "=58.4.0"
