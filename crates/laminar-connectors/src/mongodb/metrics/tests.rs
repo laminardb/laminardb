@@ -1,13 +1,14 @@
 use super::*;
+use crate::mongodb::change_event::ChangeOperation;
 
 #[test]
 fn test_source_metrics_record_events() {
     let m = MongoDbCdcMetrics::new(None);
-    m.record_event("I");
-    m.record_event("I");
-    m.record_event("U");
-    m.record_event("D");
-    m.record_event("DROP");
+    m.record_event(ChangeOperation::Insert);
+    m.record_event(ChangeOperation::Insert);
+    m.record_event(ChangeOperation::Update);
+    m.record_event(ChangeOperation::Delete);
+    m.record_event(ChangeOperation::Drop);
     m.record_bytes(1024);
     m.record_error();
     m.record_batch();

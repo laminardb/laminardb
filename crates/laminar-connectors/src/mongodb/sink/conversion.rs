@@ -6,21 +6,25 @@ use super::{
     WRITE_MODEL_OVERHEAD_BYTES,
 };
 
+/// History-record columns read by `cdc_replay`.
+pub(super) const CDC_REPLAY_FIELDS: [&str; 6] = [
+    "operation",
+    "database",
+    "collection",
+    "document_key",
+    "full_document",
+    "update_description",
+];
+
 pub(super) fn cdc_row_value(
     batch: &RecordBatch,
     row: usize,
 ) -> Result<(serde_json::Value, usize), ConnectorError> {
     use arrow_array::{Array, StringArray};
 
-    let mut value = serde_json::Map::with_capacity(5);
+    let mut value = serde_json::Map::with_capacity(CDC_REPLAY_FIELDS.len());
     let mut staging_bytes = CDC_ROW_OVERHEAD_BYTES;
-    for field_name in [
-        "_namespace",
-        "_op",
-        "_document_key",
-        "_full_document",
-        "_update_desc",
-    ] {
+    for field_name in CDC_REPLAY_FIELDS {
         let column_index = batch.schema().index_of(field_name).map_err(|_| {
             ConnectorError::SchemaMismatch(format!(
                 "MongoDB CDC replay batch is missing '{field_name}'"

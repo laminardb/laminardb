@@ -39,7 +39,7 @@ limitation before activation.
 | `files` | Streaming source | Text | Built-in | Fixed text decoder schema; optional `_metadata` remains separately configured |
 | `files` | Streaming source | CSV / newline-delimited JSON | Explicit or opt-in sample | Sampling does not establish keys, uniqueness or event time |
 | `files` | Sink | JSON, CSV, text, Parquet, Arrow IPC | Bound query | New writer needs no fictional remote schema; existing binary dataset must be compatible; one OS writer lease per output prefix |
-| `mongodb-cdc` | Streaming source | Fixed change-stream JSON envelope | Metadata | Deployment and collection UUID; existing resume/post-image and delivery restrictions remain |
+| `mongodb-cdc` | Streaming source | `output.mode=history`: fixed versioned history records; `document`: declared typed projection | Metadata | Deployment and collection UUID bound before the first record; document mode needs a `PRIMARY KEY` equal to the document key and nullable non-key columns |
 | `mongodb` | Lookup source | BSON collection validator | Closed flat validator, otherwise explicit projection | Collection UUID and validator retained; supported scalar types only; unique single-column key/index separately validated |
 | `mongodb-sink` | Sink | BSON query writer plus collection validator | Bound query | Standard collection UUID or explicit time-series bucket UUID; flat validator checks; explicit `auto.create` for a missing standard collection; explicit time-series settings retain their existing preparation policy |
 | `nats` | Streaming source | JSON / CSV / Debezium JSON; raw | Explicit fields; raw built-in | No authoritative JSON descriptor; existing ephemeral source contract remains |

@@ -2,8 +2,9 @@
 //!
 //! Prometheus-backed counters for tracking CDC source and sink performance.
 
-use prometheus::{IntCounter, Registry};
+use prometheus::{IntCounter, IntGauge, Registry};
 
+use super::change_event::ChangeOperation;
 use crate::prom::reg_or_local;
 
 /// Metrics for the `MongoDB` CDC source connector.
@@ -25,8 +26,14 @@ pub struct MongoDbCdcMetrics {
     pub replaces: IntCounter,
     /// Total DELETE operations received.
     pub deletes: IntCounter,
-    /// Total lifecycle events (drop/rename/invalidate).
+    /// Total lifecycle, metadata, and unrecognized events.
     pub lifecycle_events: IntCounter,
+    /// Collection-metadata events document mode skipped because they leave documents unchanged.
+    pub metadata_events_skipped: IntCounter,
+    /// Documents copied by the initial snapshot.
+    pub snapshot_documents: IntCounter,
+    /// 1 while emitted progress is inside the initial snapshot copy, 0 once streaming.
+    pub snapshot_in_progress: IntGauge,
     /// Total reconnection attempts.
     pub reconnects: IntCounter,
 }
@@ -61,6 +68,18 @@ impl MongoDbCdcMetrics {
                 "mongodb_cdc_lifecycle_events_total",
                 "Total lifecycle events",
             ),
+            metadata_events_skipped: reg.counter(
+                "mongodb_cdc_metadata_events_skipped_total",
+                "Collection metadata events skipped by document replication",
+            ),
+            snapshot_documents: reg.counter(
+                "mongodb_cdc_snapshot_documents_total",
+                "Documents emitted by the initial snapshot",
+            ),
+            snapshot_in_progress: reg.gauge(
+                "mongodb_cdc_snapshot_in_progress",
+                "1 while the initial snapshot copy is being emitted",
+            ),
             reconnects: reg.counter(
                 "mongodb_cdc_reconnects_total",
                 "Total reconnection attempts",
@@ -69,14 +88,19 @@ impl MongoDbCdcMetrics {
     }
 
     /// Records a received change event by operation type.
-    pub fn record_event(&self, op: &str) {
+    pub fn record_event(&self, operation: ChangeOperation) {
         self.events_received.inc();
-        match op {
-            "I" => self.inserts.inc(),
-            "U" => self.updates.inc(),
-            "R" => self.replaces.inc(),
-            "D" => self.deletes.inc(),
-            _ => self.lifecycle_events.inc(),
+        match operation {
+            ChangeOperation::Insert => self.inserts.inc(),
+            ChangeOperation::Update => self.updates.inc(),
+            ChangeOperation::Replace => self.replaces.inc(),
+            ChangeOperation::Delete => self.deletes.inc(),
+            ChangeOperation::Invalidate
+            | ChangeOperation::Drop
+            | ChangeOperation::Rename
+            | ChangeOperation::DropDatabase
+            | ChangeOperation::Metadata
+            | ChangeOperation::Unknown => self.lifecycle_events.inc(),
         }
     }
 

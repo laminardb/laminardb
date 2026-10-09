@@ -168,6 +168,9 @@ proptest = { workspace = true }
 # websocket-gated test; no TLS so non-websocket dev builds stay openssl-free).
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 futures-util = { version = "0.3" }
+# MongoDB CDC end-to-end tests read the source and every target directly.
+mongodb = "3"
+tokio-postgres = "0.7"
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # S3-compatible object store client used by the MinIO-backed integration
 # test. Workspace feature set + aws for the AmazonS3 builder.

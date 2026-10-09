@@ -333,6 +333,14 @@ carries `__weight` requires a sink whose connector contract supports full change
 passes positive and negative weights through unchanged and fails closed if the weight is missing or
 malformed.
 
+A connector sink may read a source directly in embedded and single-node mode; cluster mode
+requires a stream between them. A keyed-upsert source (for example MongoDB CDC
+`output.mode=document`) can feed direct sinks keyed on exactly the source `PRIMARY KEY`, when
+nothing else reads it: they receive the source columns plus `_op` (`U` = put, `D` = key-only delete).
+PostgreSQL `write.mode=upsert` with `changelog.mode=true` and Delta `write.mode=upsert` qualify.
+Otherwise the source must be owned by a route that keeps keyed state (a temporal-join right side
+or a bounded interval join); sink filters and plain streams over it are rejected before any I/O.
+
 ```rust
 // FromRow struct fields must match SELECT column order exactly
 #[derive(FromRow)]
@@ -605,7 +613,7 @@ Connector-produced schemas may use other `Timestamp(_)` precisions:
 | `_laminar_received_at` | `Timestamp(Nanosecond)` | OTel |
 | `_ts_ms` | `Timestamp(Millisecond)` | Postgres CDC |
 | `_timestamp` | `Timestamp(Millisecond)` | Kafka metadata |
-| `_wall_time_ms` | `Timestamp(Millisecond)` | MongoDB CDC |
+| `wall_time` | `Timestamp(Millisecond)` | MongoDB CDC history records |
 | `file_modification_time` | `Timestamp(Millisecond)` | Files connector |
 
 Despite the `_ms` / `_ns` suffixes in some historical names, these are

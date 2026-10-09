@@ -2132,7 +2132,7 @@ async fn mutation_source_creation_revalidates_preexisting_consumers_and_plain_co
     assert!(
         error
             .to_string()
-            .contains("exactly one admitted temporal-right or bounded interval route"),
+            .contains("exactly one admitted temporal-right, bounded interval, or direct"),
         "{error}"
     );
     assert!(db.catalog.get_stream_entry("keyed_copy").is_none());
@@ -2522,6 +2522,7 @@ fn sink_admission_failure_retains_captured_generation_fence() {
                 delivery: DeliveryGuarantee::ExactlyOnce,
                 runtime: RuntimeMode::Local,
                 carries_changelog: false,
+                mutation_key: None,
                 checkpointing_enabled: true,
                 checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
             },
@@ -2912,6 +2913,7 @@ fn coordinated_commit_is_rejected_under_at_least_once_before_open() {
             delivery: DeliveryGuarantee::AtLeastOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::Volatile,
         },
@@ -2999,6 +3001,7 @@ fn complete_exact_protocol_is_admitted_without_opening() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
         },
@@ -3040,6 +3043,7 @@ fn rest_s3_iceberg_is_cluster_exact_admitted_before_io() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Cluster,
             carries_changelog: false,
+            mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,
         },
@@ -3097,6 +3101,7 @@ fn uncertified_or_unsupported_iceberg_targets_fail_before_io() {
                 delivery: DeliveryGuarantee::ExactlyOnce,
                 runtime: RuntimeMode::Cluster,
                 carries_changelog: false,
+                mutation_key: None,
                 checkpointing_enabled: true,
                 checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,
             },
@@ -3130,6 +3135,7 @@ fn checkpoint_committable_contract_without_committer_is_rejected_before_open() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
         },
@@ -3184,6 +3190,7 @@ fn exact_state_scope_is_runtime_aware_and_checked_before_open() {
                 delivery: DeliveryGuarantee::ExactlyOnce,
                 runtime,
                 carries_changelog: false,
+                mutation_key: None,
                 checkpointing_enabled: true,
                 checkpoint_storage_scope: scope,
             },
@@ -3221,6 +3228,7 @@ fn exact_rejection_precedes_open_for_non_committable_contract() {
             delivery: DeliveryGuarantee::ExactlyOnce,
             runtime: RuntimeMode::Local,
             carries_changelog: false,
+            mutation_key: None,
             checkpointing_enabled: true,
             checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
         },
@@ -3229,4 +3237,190 @@ fn exact_rejection_precedes_open_for_non_committable_contract() {
 
     assert!(error.to_string().contains(EXACT_SINK_PROTOCOL));
     assert!(!opened.load(Ordering::SeqCst));
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn generic_keyed_upsert_source_takes_the_direct_sink_route_in_local_mode_only() {
+    let (db, _) = temporal_test_db().await;
+    let connector = crate::temporal_test_source::CONNECTOR_NAME;
+    let lake = tempfile::tempdir().unwrap();
+    let location = lake.path().to_string_lossy().replace('\\', "/");
+    db.execute(&format!(
+        "CREATE SOURCE keyed (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, value BIGINT, \
+         PRIMARY KEY (id, ts)) FROM \"{connector}\" ('mode' = 'upsert')"
+    ))
+    .await
+    .unwrap();
+    db.execute(&format!(
+        "CREATE SINK keyed_lake FROM keyed INTO \"delta-lake\" ('table.path' = '{location}', \
+         'write.mode' = 'upsert', 'merge.key.columns' = 'id,ts', 'auto.create' = 'true')"
+    ))
+    .await
+    .unwrap();
+    let (sources, sinks, streams) = {
+        let manager = db.connector_manager.lock();
+        (
+            manager.sources().clone(),
+            manager.sinks().clone(),
+            manager.streams().clone(),
+        )
+    };
+
+    let direct = db
+        .validate_direct_mutation_routes(&sources, &sinks, &streams, RuntimeMode::Local)
+        .unwrap();
+    assert!(direct.contains("keyed"), "{direct:?}");
+
+    let error = db
+        .validate_mutation_source_routes(
+            (&sources, &sinks, &streams),
+            &rustc_hash::FxHashMap::default(),
+            &super::OrderedIntervalAdmissions {
+                joins: rustc_hash::FxHashMap::default(),
+                source_modes: rustc_hash::FxHashMap::default(),
+            },
+            RuntimeMode::Cluster,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("reads source 'keyed' directly"),
+        "{error}"
+    );
+}
+
+#[cfg(all(
+    feature = "postgres-sink",
+    feature = "delta-lake",
+    feature = "iceberg",
+    feature = "mongodb-cdc"
+))]
+#[tokio::test]
+async fn direct_mutation_sinks_must_apply_keyed_deletes_by_the_source_key() {
+    let db = LaminarDB::builder().build().await.unwrap();
+    let input = crate::direct_mutation::sink_input_schema(&Arc::new(Schema::new(vec![
+        arrow_schema::Field::new("_id", arrow_schema::DataType::Utf8, false),
+        arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+    ])));
+    let config = |connector: &str, properties: &[(&str, &str)]| {
+        let mut config = ConnectorConfig::new(connector);
+        config.set(
+            "_arrow_schema",
+            crate::pipeline_callback::encode_arrow_schema(&input),
+        );
+        for (key, value) in properties {
+            config.set(*key, *value);
+        }
+        config
+    };
+    let postgres = [
+        ("hostname", "pg.invalid"),
+        ("database", "mirror"),
+        ("username", "laminar"),
+        ("table.name", "users"),
+        ("write.mode", "upsert"),
+        ("primary.key", "_id"),
+    ];
+    let with = |base: &[(&'static str, &'static str)], extra: &[(&'static str, &'static str)]| {
+        base.iter().chain(extra).copied().collect::<Vec<_>>()
+    };
+    let cases = [
+        (
+            config(
+                "postgres-sink",
+                &with(&postgres, &[("changelog.mode", "true")]),
+            ),
+            None,
+        ),
+        (
+            config(
+                "delta-lake",
+                &[
+                    ("table.path", "/tmp/lake"),
+                    ("write.mode", "upsert"),
+                    ("merge.key.columns", "_id"),
+                ],
+            ),
+            None,
+        ),
+        (
+            config("postgres-sink", &postgres),
+            Some("require changelog.mode=true"),
+        ),
+        (
+            config(
+                "delta-lake",
+                &[
+                    ("table.path", "/tmp/lake"),
+                    ("write.mode", "upsert"),
+                    ("merge.key.columns", "name"),
+                ],
+            ),
+            Some("must equal the PRIMARY KEY"),
+        ),
+        (
+            config(
+                "delta-lake",
+                &[("table.path", "/tmp/lake"), ("write.mode", "append")],
+            ),
+            Some("cannot apply keyed puts"),
+        ),
+        (
+            config(
+                "iceberg",
+                &[
+                    ("catalog.uri", "http://catalog.invalid"),
+                    ("catalog.warehouse", "s3://lake/wh"),
+                    ("namespace", "app"),
+                    ("table.name", "users"),
+                ],
+            ),
+            Some("requires FullChangelog"),
+        ),
+        (
+            config(
+                "mongodb-sink",
+                &[
+                    ("connection.uri", "mongodb://mongo.invalid/?replicaSet=rs0"),
+                    ("database", "mirror"),
+                    ("collection", "users"),
+                    ("write.mode", "upsert"),
+                    ("write.mode.key_fields", "_id"),
+                ],
+            ),
+            Some("cannot apply keyed puts"),
+        ),
+    ];
+    let key = ["_id".to_string()];
+    for (config, rejected) in cases {
+        let result = db
+            .connector_registry
+            .create_sink(&config, None)
+            .map_err(|error| error.to_string())
+            .and_then(|sink| {
+                admit_sink(
+                    sink.as_ref(),
+                    SinkAdmissionContext {
+                        config: &config,
+                        name: "mirror",
+                        input: "users",
+                        delivery: DeliveryGuarantee::AtLeastOnce,
+                        runtime: RuntimeMode::Local,
+                        carries_changelog: true,
+                        mutation_key: Some(&key),
+                        checkpointing_enabled: true,
+                        checkpoint_storage_scope: CheckpointStorageScope::NodeDurable,
+                    },
+                )
+                .map_err(|error| error.to_string())
+            });
+        match (result, rejected) {
+            (Ok(_), None) => {}
+            (Err(error), Some(needle)) => {
+                assert!(error.contains(needle), "{config:?}: {error}");
+            }
+            (Ok(_), Some(_)) => panic!("{config:?} must be rejected before I/O"),
+            (Err(error), None) => panic!("{config:?} must be admitted: {error}"),
+        }
+    }
 }

@@ -24,11 +24,12 @@ impl SinkConnector for MongoDbSink {
         };
         cfg.validate()?;
         Self::validate_schema(&schema, &cfg)?;
+        // `cdc_replay` interprets immutable history records itself; it consumes no engine
+        // changelog, so it advertises append-only input and admission rejects retractions.
         let (topology, input_mode) = match cfg.write_mode {
             WriteMode::Insert => (SinkTopology::MultiWriter, SinkInputMode::AppendOnly),
-            WriteMode::Upsert { .. } | WriteMode::CdcReplay => {
-                (SinkTopology::Singleton, SinkInputMode::FullChangelog)
-            }
+            WriteMode::CdcReplay => (SinkTopology::Singleton, SinkInputMode::AppendOnly),
+            WriteMode::Upsert { .. } => (SinkTopology::Singleton, SinkInputMode::FullChangelog),
         };
         Ok(SinkContract::new(
             SinkConsistency::DurableAtLeastOnce,

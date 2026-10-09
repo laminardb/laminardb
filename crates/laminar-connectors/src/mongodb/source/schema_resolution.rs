@@ -1,19 +1,41 @@
-//! Fixed CDC envelope with pre-consumption collection and deployment identity.
+//! History or document schema bound with pre-consumption collection and deployment identity.
 
 use arrow_schema::SchemaRef;
 use std::collections::BTreeMap;
 
+use super::super::config::SourceOutputMode;
 use super::{checkpoint, MongoDbSourceConfig, MongoDeploymentIdentity};
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
-use crate::schema::resolution::{fixed_binding, NativeSchema, SchemaBinding};
+use crate::schema::resolution::{
+    bind_external, fixed_binding, logical_binding, NativeSchema, SchemaBinding, SchemaDirection,
+    SchemaOrigin,
+};
 
 pub(super) async fn resolve(
     config: &ConnectorConfig,
     explicit: Option<SchemaRef>,
 ) -> Result<SchemaBinding, ConnectorError> {
     let parsed = MongoDbSourceConfig::from_config(config)?;
-    let mut binding = fixed_binding(config, explicit, &super::mongodb_cdc_envelope_schema())?;
+    let mut binding = match parsed.output_mode {
+        SourceOutputMode::History => {
+            fixed_binding(config, explicit, &super::mongodb_history_schema())?
+        }
+        SourceOutputMode::Document => {
+            let projection = super::lifecycle::document_projection(&parsed, config, explicit)?
+                .ok_or_else(|| {
+                    ConnectorError::Internal("document projection is required".into())
+                })?;
+            let mut binding = logical_binding(
+                config,
+                SchemaDirection::Source,
+                SchemaOrigin::Explicit,
+                projection.schema(),
+            )?;
+            bind_external(&mut binding, projection.schema())?;
+            binding
+        }
+    };
     #[cfg(feature = "mongodb-cdc")]
     {
         let database =
@@ -42,7 +64,11 @@ pub(super) async fn resolve(
                 ("database".into(), parsed.database),
                 ("collection".into(), parsed.collection),
             ]),
-            definition: serde_json::json!({"envelope": "expanded-change-stream-json-v1", "post_images_enabled": observation.collection.post_images_enabled}),
+            definition: serde_json::json!({
+                "output": parsed.output_mode.to_string(),
+                "history_version": super::MONGODB_HISTORY_VERSION,
+                "post_images_enabled": observation.collection.post_images_enabled,
+            }),
             references: Vec::new(),
         });
         Ok(binding)

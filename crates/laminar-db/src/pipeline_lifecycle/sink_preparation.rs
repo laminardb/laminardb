@@ -11,6 +11,7 @@ impl LaminarDB {
         sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
         stream_output_schemas: &HashMap<String, arrow_schema::SchemaRef>,
         changelog_carrying: &rustc_hash::FxHashSet<String>,
+        direct_mutation_sources: &rustc_hash::FxHashSet<String>,
         runtime_mode: RuntimeMode,
         checkpointing_enabled: bool,
         pipeline_checkpoint_timeout: std::time::Duration,
@@ -26,7 +27,12 @@ impl LaminarDB {
             if reg.connector_type.is_none() {
                 continue;
             }
-            let config = pipeline_sink_config(self, reg, stream_output_schemas)?;
+            let direct_source = direct_mutation_sources
+                .contains(&reg.input)
+                .then(|| self.catalog.get_source(&reg.input))
+                .flatten();
+            let config =
+                pipeline_sink_config(self, reg, stream_output_schemas, direct_source.as_ref())?;
             let mut sink = self
                 .connector_registry
                 .create_sink(&config, prom_registry)
@@ -43,7 +49,10 @@ impl LaminarDB {
                 &self.owned_connector_task_fences,
             );
 
-            let carries_changelog = changelog_carrying.contains(&reg.input);
+            // Key-only deletes need a sink that represents deletes faithfully, though the batches
+            // carry `_op` rather than a weighted changelog.
+            let carries_changelog =
+                direct_source.is_some() || changelog_carrying.contains(&reg.input);
             let checkpoint_storage_scope = sink_checkpoint_storage_scope(self);
             let (contract, configured_timeout) = admit_and_bind_sink(
                 self,
@@ -55,28 +64,16 @@ impl LaminarDB {
                     delivery: self.config.delivery_guarantee,
                     runtime: runtime_mode,
                     carries_changelog,
+                    mutation_key: direct_source
+                        .as_ref()
+                        .map(|entry| entry.primary_key.as_slice()),
                     checkpointing_enabled,
                     checkpoint_storage_scope,
                 },
             )
             .await?;
-            let write_timeout = configured_timeout.map_or(
-                sink.suggested_write_timeout(),
-                std::time::Duration::from_millis,
-            );
-            if write_timeout.is_zero() {
-                return Err(DbError::Connector(format!(
-                    "sink '{name}': write_timeout must be > 0 \
-                     (check 'sink.write.timeout.ms' or the sink's \
-                     suggested_write_timeout)"
-                )));
-            }
-            let flush_interval = sink.flush_interval();
-            if flush_interval.is_zero() {
-                return Err(DbError::Connector(format!(
-                    "sink '{name}': flush_interval must be > 0"
-                )));
-            }
+            let (write_timeout, flush_interval) =
+                sink_write_timing(sink.as_ref(), name, configured_timeout)?;
             prepared_sinks.push(PreparedSink {
                 name: name.clone(),
                 connector: sink,
@@ -84,7 +81,7 @@ impl LaminarDB {
                 filter_expr: reg.filter_expr.clone(),
                 input: reg.input.clone(),
                 contract,
-                expects_changelog: carries_changelog,
+                expects_changelog: changelog_carrying.contains(&reg.input),
                 write_timeout,
                 flush_interval,
                 requires_recovery_on_error: contract.is_checkpoint_committable()
@@ -213,6 +210,7 @@ impl LaminarDB {
 
         Ok(PipelineSinkSetup {
             sinks,
+            direct_sinks: self.direct_sink_inputs(sink_regs, direct_mutation_sources),
             sink_event_rx,
             #[cfg(feature = "cluster")]
             callback_controller,
@@ -220,16 +218,46 @@ impl LaminarDB {
     }
 }
 
+/// Validated write deadline and periodic flush interval of one sink.
+fn sink_write_timing(
+    sink: &dyn laminar_connectors::connector::SinkConnector,
+    name: &str,
+    configured_timeout: Option<u64>,
+) -> Result<(std::time::Duration, std::time::Duration), DbError> {
+    let write_timeout = configured_timeout.map_or(
+        sink.suggested_write_timeout(),
+        std::time::Duration::from_millis,
+    );
+    if write_timeout.is_zero() {
+        return Err(DbError::Connector(format!(
+            "sink '{name}': write_timeout must be > 0 \
+             (check 'sink.write.timeout.ms' or the sink's \
+             suggested_write_timeout)"
+        )));
+    }
+    let flush_interval = sink.flush_interval();
+    if flush_interval.is_zero() {
+        return Err(DbError::Connector(format!(
+            "sink '{name}': flush_interval must be > 0"
+        )));
+    }
+    Ok((write_timeout, flush_interval))
+}
+
 fn pipeline_sink_config(
     database: &LaminarDB,
     reg: &crate::connector_manager::SinkRegistration,
     stream_output_schemas: &HashMap<String, arrow_schema::SchemaRef>,
+    direct_source: Option<&Arc<crate::catalog::SourceEntry>>,
 ) -> Result<laminar_connectors::config::ConnectorConfig, DbError> {
     use crate::connector_manager::build_sink_config;
     let mut config = build_sink_config(reg, database.config.delivery_guarantee)?;
     let upstream_schema = stream_output_schemas
         .get(&reg.input)
         .cloned()
+        .or_else(|| {
+            direct_source.map(|entry| crate::direct_mutation::sink_input_schema(&entry.schema))
+        })
         .or_else(|| {
             database
                 .catalog

@@ -104,6 +104,23 @@ pub trait SinkConnector: Send {
         Ok(SinkContract::default())
     }
 
+    /// Key columns by which this configuration applies keyed mutations: rows whose trailing
+    /// Utf8 `_op` is `U` replace the row with that key and rows whose `_op` is `D` delete it,
+    /// reading only the key columns. Last writer wins per key within one flush.
+    ///
+    /// `None` (the default) means the configuration cannot faithfully apply key-only deletes,
+    /// so keyed-mutation sources cannot feed it directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration itself is invalid.
+    fn keyed_mutation_key(
+        &self,
+        _config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Resolve a writer contract from already-bound query output before activation.
     /// Destinations with authoritative schemas override this read-only hook.
     async fn resolve_schema(

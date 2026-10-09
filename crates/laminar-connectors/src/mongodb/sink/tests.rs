@@ -289,10 +289,14 @@ fn test_sink_contract_upsert() {
 fn test_sink_contract_cdc_replay() {
     let mut config = test_config();
     config.write_mode = WriteMode::CdcReplay;
-    let sink = MongoDbSink::new(super::super::mongodb_cdc_envelope_schema(), config, None);
+    let sink = MongoDbSink::new(super::super::mongodb_history_schema(), config, None);
     let contract = sink.contract(&ConnectorConfig::new("mongodb")).unwrap();
     assert_eq!(contract.topology, SinkTopology::Singleton);
-    assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert_eq!(
+        contract.input_mode,
+        SinkInputMode::AppendOnly,
+        "history records are immutable data; replay applies them itself"
+    );
 }
 
 #[test]
@@ -595,11 +599,12 @@ async fn close_releases_resources_but_returns_pending_flush_error() {
 #[test]
 fn cdc_insert_is_prepared_as_document_keyed_idempotent_upsert() {
     let rows = vec![serde_json::json!({
-        "_namespace": "db.coll",
-        "_op": "I",
-        "_document_key": r#"{"_id":"a"}"#,
-        "_full_document": r#"{"_id":"a","value":1}"#,
-        "_update_desc": null
+        "database": "db",
+        "collection": "coll",
+        "operation": "insert",
+        "document_key": r#"{"_id":"a"}"#,
+        "full_document": r#"{"_id":"a","value":1}"#,
+        "update_description": null
     })];
     let (writes, bytes) =
         MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "db.coll").unwrap();
@@ -622,11 +627,12 @@ fn cdc_insert_is_prepared_as_document_keyed_idempotent_upsert() {
 #[test]
 fn cdc_replay_requires_id_but_accepts_complete_sharded_and_document_keys() {
     let missing_id = vec![serde_json::json!({
-        "_namespace": "db.coll",
-        "_op": "D",
-        "_document_key": r#"{"tenant":"a"}"#,
-        "_full_document": null,
-        "_update_desc": null
+        "database": "db",
+        "collection": "coll",
+        "operation": "delete",
+        "document_key": r#"{"tenant":"a"}"#,
+        "full_document": null,
+        "update_description": null
     })];
     let error = MongoDbSink::prepare_cdc_writes(&missing_id, MAX_SINK_WORKING_SET_BYTES, "db.coll")
         .unwrap_err();
@@ -637,11 +643,12 @@ fn cdc_replay_requires_id_but_accepts_complete_sharded_and_document_keys() {
         r#"{"_id":{"tenant":"t","sequence":1}}"#,
     ] {
         let rows = vec![serde_json::json!({
-            "_namespace": "db.coll",
-            "_op": "D",
-            "_document_key": key,
-            "_full_document": null,
-            "_update_desc": null
+            "database": "db",
+        "collection": "coll",
+            "operation": "delete",
+            "document_key": key,
+            "full_document": null,
+            "update_description": null
         })];
         MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "db.coll").unwrap();
     }
@@ -650,25 +657,30 @@ fn cdc_replay_requires_id_but_accepts_complete_sharded_and_document_keys() {
 #[test]
 fn cdc_replay_rejects_cross_namespace_rows() {
     let rows = vec![serde_json::json!({
-        "_namespace": "source.events",
-        "_op": "D",
-        "_document_key": r#"{"_id":"a"}"#,
-        "_full_document": null,
-        "_update_desc": null
+        "database": "source",
+        "collection": "events",
+        "operation": "delete",
+        "document_key": r#"{"_id":"a"}"#,
+        "full_document": null,
+        "update_description": null
     })];
     let error = MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "target.events")
         .unwrap_err();
-    assert!(error.to_string().contains("fixed target"));
+    assert!(
+        error.to_string().contains("replay.source.namespace"),
+        "{error}"
+    );
 }
 
 #[test]
 fn cdc_replay_rejects_replacement_key_drift() {
     let rows = vec![serde_json::json!({
-        "_namespace": "db.coll",
-        "_op": "I",
-        "_document_key": r#"{"_id":"a","tenant":"source"}"#,
-        "_full_document": r#"{"_id":"a","tenant":"other","value":1}"#,
-        "_update_desc": null
+        "database": "db",
+        "collection": "coll",
+        "operation": "insert",
+        "document_key": r#"{"_id":"a","tenant":"source"}"#,
+        "full_document": r#"{"_id":"a","tenant":"other","value":1}"#,
+        "update_description": null
     })];
     let error =
         MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "db.coll").unwrap_err();
@@ -712,16 +724,17 @@ fn cdc_bulk_models_preserve_mixed_operation_order() {
 #[test]
 fn cdc_update_accepts_source_shape_and_preserves_array_truncation() {
     let update_description = serde_json::json!({
-        "updated_fields": {"name": "new"},
-        "removed_fields": ["obsolete"],
-        "truncated_arrays": [{"field": "items", "new_size": 2}]
+        "updatedFields": {"name": "new"},
+        "removedFields": ["obsolete"],
+        "truncatedArrays": [{"field": "items", "newSize": 2}]
     });
     let rows = vec![serde_json::json!({
-        "_namespace": "db.coll",
-        "_op": "U",
-        "_document_key": r#"{"_id":"a"}"#,
-        "_full_document": null,
-        "_update_desc": update_description.to_string()
+        "database": "db",
+        "collection": "coll",
+        "operation": "update",
+        "document_key": r#"{"_id":"a"}"#,
+        "full_document": null,
+        "update_description": update_description.to_string()
     })];
     let (writes, _) =
         MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "db.coll").unwrap();
@@ -737,10 +750,11 @@ fn cdc_update_accepts_source_shape_and_preserves_array_truncation() {
 
 #[test]
 fn cdc_unknown_operation_fails_closed() {
-    for operation in ["FUTURE_OP", "DROP", "RENAME", "INVALIDATE", "DROP_DATABASE"] {
+    for operation in ["futureOp", "drop", "rename", "invalidate", "dropDatabase"] {
         let rows = vec![serde_json::json!({
-            "_namespace": "db.coll",
-            "_op": operation
+            "database": "db",
+        "collection": "coll",
+            "operation": operation
         })];
         let error = MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "db.coll")
             .unwrap_err();
@@ -752,17 +766,18 @@ fn cdc_unknown_operation_fails_closed() {
 #[test]
 fn cdc_ambiguous_update_paths_fail_closed() {
     let update_description = serde_json::json!({
-        "updated_fields": {"a.b": 1},
-        "removed_fields": [],
-        "truncated_arrays": [],
-        "disambiguated_paths": {"a.b": ["a.b"]}
+        "updatedFields": {"a.b": 1},
+        "removedFields": [],
+        "truncatedArrays": [],
+        "disambiguatedPaths": {"a.b": ["a.b"]}
     });
     let rows = vec![serde_json::json!({
-        "_namespace": "db.coll",
-        "_op": "U",
-        "_document_key": r#"{"_id":"a"}"#,
-        "_full_document": null,
-        "_update_desc": update_description.to_string()
+        "database": "db",
+        "collection": "coll",
+        "operation": "update",
+        "document_key": r#"{"_id":"a"}"#,
+        "full_document": null,
+        "update_description": update_description.to_string()
     })];
 
     let error =
@@ -774,20 +789,119 @@ fn cdc_ambiguous_update_paths_fail_closed() {
 #[test]
 fn cdc_full_document_update_uses_idempotent_replacement() {
     let update_description = serde_json::json!({
-        "updated_fields": {"a.b": 1},
-        "removed_fields": [],
-        "truncated_arrays": [],
-        "disambiguated_paths": {"a.b": ["a.b"]}
+        "updatedFields": {"a.b": 1},
+        "removedFields": [],
+        "truncatedArrays": [],
+        "disambiguatedPaths": {"a.b": ["a.b"]}
     });
     let rows = vec![serde_json::json!({
-        "_namespace": "db.coll",
-        "_op": "U",
-        "_document_key": r#"{"_id":"a"}"#,
-        "_full_document": r#"{"_id":"a","a.b":1}"#,
-        "_update_desc": update_description.to_string()
+        "database": "db",
+        "collection": "coll",
+        "operation": "update",
+        "document_key": r#"{"_id":"a"}"#,
+        "full_document": r#"{"_id":"a","a.b":1}"#,
+        "update_description": update_description.to_string()
     })];
 
     let (writes, _) =
         MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "db.coll").unwrap();
     assert!(matches!(&writes[0], CdcWrite::Replace { .. }));
+}
+
+#[test]
+fn cdc_replay_rejects_weighted_or_mutation_changelog_input() {
+    let mut config = test_config();
+    config.write_mode = WriteMode::CdcReplay;
+    for extra in [WEIGHT_COLUMN, "_op"] {
+        let mut fields = super::super::mongodb_history_schema().fields().to_vec();
+        let data_type = if extra == WEIGHT_COLUMN {
+            DataType::Int64
+        } else {
+            DataType::Utf8
+        };
+        fields.push(Arc::new(arrow_schema::Field::new(extra, data_type, false)));
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let error = MongoDbSink::validate_schema(&schema, &config).unwrap_err();
+        assert!(error.to_string().contains("append-only history"), "{error}");
+    }
+    let envelope_without_history = test_schema();
+    let error = MongoDbSink::validate_schema(&envelope_without_history, &config).unwrap_err();
+    assert!(error.to_string().contains("output.mode=history"), "{error}");
+}
+
+#[test]
+fn cdc_replay_applies_snapshot_copies_and_skips_metadata_events() {
+    let rows = vec![
+        serde_json::json!({
+            "database": "db",
+            "collection": "coll",
+            "operation": crate::mongodb::SNAPSHOT_OPERATION,
+            "document_key": r#"{"_id":"a"}"#,
+            "full_document": r#"{"_id":"a","v":1}"#,
+            "update_description": null
+        }),
+        serde_json::json!({
+            "database": "db",
+            "collection": "coll",
+            "operation": "createIndexes",
+            "document_key": null,
+            "full_document": null,
+            "update_description": null
+        }),
+    ];
+    let (writes, _) =
+        MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "db.coll").unwrap();
+    assert!(matches!(&writes[0], CdcWrite::Replace { .. }));
+    assert!(matches!(&writes[1], CdcWrite::Noop));
+}
+
+#[test]
+fn cdc_replay_round_trips_canonical_bson_types() {
+    use mongodb::bson::Bson;
+
+    let rows = vec![serde_json::json!({
+        "database": "app",
+        "collection": "users",
+        "operation": "insert",
+        "document_key": r#"{"_id":{"$oid":"65a1b2c3d4e5f60718293a4b"}}"#,
+        "full_document": r#"{"_id":{"$oid":"65a1b2c3d4e5f60718293a4b"},"n":{"$numberLong":"5"},"i":{"$numberInt":"5"},"d":{"$numberDecimal":"1.10"},"at":{"$date":{"$numberLong":"1700000000123"}},"z":null}"#,
+        "update_description": null
+    })];
+    let (writes, _) =
+        MongoDbSink::prepare_cdc_writes(&rows, MAX_SINK_WORKING_SET_BYTES, "app.users").unwrap();
+    let CdcWrite::Insert {
+        filter,
+        replacement,
+    } = &writes[0]
+    else {
+        panic!("insert must be a keyed upsert plan");
+    };
+    assert!(matches!(
+        filter.get_document("_id").unwrap().get("$eq"),
+        Some(Bson::ObjectId(_))
+    ));
+    assert_eq!(replacement.get("n"), Some(&Bson::Int64(5)));
+    assert_eq!(replacement.get("i"), Some(&Bson::Int32(5)));
+    assert!(matches!(replacement.get("d"), Some(Bson::Decimal128(_))));
+    assert!(matches!(replacement.get("at"), Some(Bson::DateTime(_))));
+    assert_eq!(replacement.get("z"), Some(&Bson::Null));
+    assert!(!replacement.contains_key("missing"));
+}
+
+#[test]
+fn cdc_replay_maps_an_explicit_source_namespace_to_the_target() {
+    let mut config = ConnectorConfig::new("mongodb-sink");
+    config.set("connection.uri", "mongodb://localhost:27017");
+    config.set("database", "mirror");
+    config.set("collection", "users_copy");
+    config.set("write.mode", "cdc_replay");
+    config.set("replay.source.namespace", "app.users");
+    let parsed = MongoDbSinkConfig::from_config(&config).unwrap();
+    assert_eq!(parsed.replay_source_namespace.as_deref(), Some("app.users"));
+
+    config.set("replay.source.namespace", "no-dot");
+    assert!(MongoDbSinkConfig::from_config(&config).is_err());
+    config.set("replay.source.namespace", "app.users");
+    config.set("write.mode", "insert");
+    assert!(MongoDbSinkConfig::from_config(&config).is_err());
 }

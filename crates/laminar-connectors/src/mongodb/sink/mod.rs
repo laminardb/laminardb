@@ -52,7 +52,7 @@ const NAMESPACE_EXISTS_CODE: i32 = 48;
 
 mod bulk;
 mod cdc;
-mod conversion;
+pub(super) mod conversion;
 mod failure;
 mod lifecycle;
 mod schema_resolution;
@@ -64,8 +64,8 @@ use bulk::{cdc_bulk_models, CdcWrite};
 use conversion::{
     account_bson_document, accumulate_write_result, arrow_value_to_bson, cdc_row_value,
     checked_converted_total, clamp_client_timeout, encoded_document_size, ensure_working_set,
-    json_to_bson_document, mongo_partial_batch_error, requires_preflush, retained_batch_bytes,
-    validate_cdc_document_key, validate_cdc_replacement_key,
+    json_to_bson, json_to_bson_document, mongo_partial_batch_error, requires_preflush,
+    retained_batch_bytes, validate_cdc_document_key, validate_cdc_replacement_key,
 };
 #[cfg(test)]
 use conversion::{timestamp_millis, working_set_charge};
@@ -239,13 +239,7 @@ impl MongoDbSink {
                 }
             }
             WriteMode::CdcReplay => {
-                for field in [
-                    "_namespace",
-                    "_op",
-                    "_document_key",
-                    "_full_document",
-                    "_update_desc",
-                ] {
+                for field in conversion::CDC_REPLAY_FIELDS {
                     match schema.field_with_name(field) {
                         Ok(schema_field) if schema_field.data_type() == &DataType::Utf8 => {}
                         Ok(schema_field) => {
@@ -256,12 +250,13 @@ impl MongoDbSink {
                         }
                         Err(_) => {
                             return Err(ConnectorError::ConfigurationError(format!(
-                                "MongoDB CDC replay schema must contain '{field}'"
+                                "MongoDB CDC replay input must be MongoDB history records \
+                                 (output.mode=history); missing '{field}'"
                             )));
                         }
                     }
                 }
-                for field in ["_namespace", "_op", "_document_key"] {
+                for field in ["operation", "database"] {
                     if schema
                         .field_with_name(field)
                         .is_ok_and(arrow_schema::Field::is_nullable)
@@ -270,6 +265,18 @@ impl MongoDbSink {
                             "MongoDB CDC replay field '{field}' must be non-nullable"
                         )));
                     }
+                }
+                // History records are immutable facts. A weighted changelog would carry
+                // retractions that replay cannot apply faithfully.
+                if let Some(field) = schema.fields().iter().find(|field| {
+                    field.name().eq_ignore_ascii_case(WEIGHT_COLUMN)
+                        || field.name().eq_ignore_ascii_case("_op")
+                }) {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "MongoDB CDC replay consumes append-only history records; input column \
+                         '{}' marks a changelog it cannot apply",
+                        field.name()
+                    )));
                 }
             }
             WriteMode::Insert => {}
@@ -475,11 +482,17 @@ impl MongoDbSink {
         let (mut pending, retained_bytes) = self.take_buffer();
         let write_result: Result<(usize, u64), ConnectorError> =
             if matches!(self.config.write_mode, WriteMode::CdcReplay) {
+                let target = format!("{}.{}", self.config.database, self.config.collection);
+                let source = self
+                    .config
+                    .replay_source_namespace
+                    .as_deref()
+                    .unwrap_or(&target);
                 match Self::batches_to_cdc_writes(
                     &pending,
                     retained_bytes,
                     MAX_SINK_WORKING_SET_BYTES,
-                    &format!("{}.{}", self.config.database, self.config.collection),
+                    source,
                 ) {
                     Ok((writes, bytes)) => {
                         let count = writes.len();

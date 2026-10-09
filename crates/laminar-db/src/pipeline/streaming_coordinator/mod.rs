@@ -264,7 +264,8 @@ impl TrackedSourceRegistration {
         self.contract
     }
 
-    pub(crate) fn with_temporal_right_mutations(mut self) -> Self {
+    /// Admit keyed mutation metadata for a temporal-right or direct keyed-mutation sink route.
+    pub(crate) fn with_keyed_upsert_mutations(mut self) -> Self {
         debug_assert_eq!(self.contract.input_mode, SourceInputMode::KeyedUpsert);
         self.admitted_non_append_mode = Some(SourceInputMode::KeyedUpsert);
         self

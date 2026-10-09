@@ -1,10 +1,10 @@
 use laminar_connectors::connector::SourceConnector as _;
 
 use super::{
-    admit_source_contract, admit_source_recovery_contract, admit_temporal_source_contract,
-    exact_table_reference, schema_has_reserved_mutation_columns, Arc,
-    ConnectorTaskFenceRegistration, DbError, FxHashMap, HashMap, LaminarDB, RuntimeMode,
-    SourceInputMode, SourceTopology, TemporalSourceRole, TrackedSourceRegistration,
+    admit_routed_source, admit_source_contract, exact_table_reference,
+    schema_has_reserved_mutation_columns, Arc, ConnectorTaskFenceRegistration, DbError, FxHashMap,
+    HashMap, LaminarDB, RuntimeMode, SourceInputMode, SourceRoute, SourceTopology,
+    TemporalSourceRole, TrackedSourceRegistration,
 };
 
 impl LaminarDB {
@@ -260,6 +260,7 @@ impl LaminarDB {
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
         ordered_interval_source_modes: &FxHashMap<String, SourceInputMode>,
+        direct_mutation_sources: &rustc_hash::FxHashSet<String>,
         checkpointing_enabled: bool,
         runtime_mode: RuntimeMode,
         prom_registry: Option<&Arc<prometheus::Registry>>,
@@ -310,52 +311,35 @@ impl LaminarDB {
             let has_reserved_mutation_columns = source_entry
                 .as_ref()
                 .is_some_and(|entry| schema_has_reserved_mutation_columns(entry.schema.as_ref()));
-            let temporal_role = temporal_source_roles.get(name).copied();
-            let ordered_interval_mode = ordered_interval_source_modes.get(name).copied();
-            let admission = if let Some(mode) = ordered_interval_mode {
-                if mode == contract.input_mode {
-                    admit_source_recovery_contract(
-                        contract,
-                        self.config.delivery_guarantee,
-                        checkpointing_enabled,
-                        runtime_mode,
-                    )
-                } else {
-                    Err("bounded interval source contract changed after startup admission")
-                }
-            } else if let Some(role) = temporal_role {
-                admit_temporal_source_contract(
-                    contract,
-                    role,
-                    has_primary_key,
-                    has_reserved_mutation_columns,
-                    self.config.delivery_guarantee,
-                    checkpointing_enabled,
-                    runtime_mode,
-                )
+            let route = if direct_mutation_sources.contains(name) {
+                SourceRoute::DirectMutationSinks
+            } else if let Some(mode) = ordered_interval_source_modes.get(name) {
+                SourceRoute::OrderedInterval(*mode)
+            } else if let Some(role) = temporal_source_roles.get(name) {
+                SourceRoute::Temporal(*role)
             } else {
-                admit_source_contract(
-                    contract,
-                    has_primary_key,
-                    has_reserved_mutation_columns,
-                    self.config.delivery_guarantee,
-                    checkpointing_enabled,
-                    runtime_mode,
-                )
+                SourceRoute::Plain
             };
-            admission.map_err(|reason| {
+            admit_routed_source(
+                contract,
+                route,
+                has_primary_key,
+                has_reserved_mutation_columns,
+                self.config.delivery_guarantee,
+                checkpointing_enabled,
+                runtime_mode,
+            )
+            .map_err(|reason| {
                 DbError::Config(format!(
                     "source '{name}' is not admissible in {runtime_mode:?} mode with {} delivery: \
                      {reason} (contract: {contract:?})",
                     self.config.delivery_guarantee
                 ))
             })?;
-            if matches!(temporal_role, Some(TemporalSourceRole::Right))
-                && contract.input_mode == SourceInputMode::KeyedUpsert
-            {
-                source = source.with_temporal_right_mutations();
+            if route.keeps_keyed_mutations(contract) {
+                source = source.with_keyed_upsert_mutations();
             }
-            if let Some(mode) = ordered_interval_mode {
+            if let SourceRoute::OrderedInterval(mode) = route {
                 source = source.with_ordered_interval_input_mode(mode)?;
             }
             let assignment_scoped = cfg!(feature = "cluster")

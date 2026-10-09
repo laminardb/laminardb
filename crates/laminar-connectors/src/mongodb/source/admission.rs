@@ -6,16 +6,29 @@ use futures_util::TryStreamExt;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use super::document::DocumentProjection;
+use super::reader::ReaderOutput;
 use super::{
-    run_change_stream_reader, BufferedMongoEvent, ConnectorError, ConnectorState,
-    MongoAdmissionObservation, MongoCollectionObservation, MongoDbCdcSource, MongoDbSourceConfig,
-    MongoDeploymentIdentity, MongoReaderAdmissionGuard, MongoReaderFailure, MongoReaderReady,
-    MongoResumePosition, READER_SHUTDOWN_TIMEOUT, READER_STARTUP_TIMEOUT,
+    run_change_stream_reader, BufferedMongoEvent, ConnectorError, ConnectorState, EmittedPosition,
+    MongoAdmissionObservation, MongoCheckpointPosition, MongoCollectionObservation,
+    MongoDbCdcSource, MongoDbSourceConfig, MongoDeploymentIdentity, MongoReaderAdmissionGuard,
+    MongoReaderFailure, MongoReaderReady, ReaderStart, READER_SHUTDOWN_TIMEOUT,
+    READER_STARTUP_TIMEOUT,
 };
+
+/// Everything a reader generation needs before it starts.
+pub(super) struct ReaderLaunch {
+    pub(super) config: MongoDbSourceConfig,
+    pub(super) start: ReaderStart,
+    /// Restored emitted progress; `None` for a fresh start.
+    pub(super) restored: Option<EmittedPosition>,
+    pub(super) expected_collection_uuid: Option<Uuid>,
+    pub(super) expected_deployment_identity: Option<MongoDeploymentIdentity>,
+    pub(super) projection: Option<DocumentProjection>,
+}
 
 // ── Feature-gated I/O (real MongoDB driver) ──
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn clamp_source_startup_timeout(
     configured: Option<std::time::Duration>,
 ) -> std::time::Duration {
@@ -26,7 +39,6 @@ pub(super) fn clamp_source_startup_timeout(
         })
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn source_client_options(
     connection_uri: &str,
 ) -> Result<mongodb::options::ClientOptions, ConnectorError> {
@@ -50,7 +62,6 @@ pub(super) async fn source_client_options(
     Ok(options)
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn source_database(
     connection_uri: &str,
     database: &str,
@@ -61,7 +72,6 @@ pub(super) async fn source_database(
     Ok(client.database(database))
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn await_mongo_reader_ready(
     ready_rx: tokio::sync::oneshot::Receiver<Result<MongoReaderReady, MongoReaderFailure>>,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
@@ -103,17 +113,11 @@ pub(super) async fn await_mongo_reader_ready(
     Err(error)
 }
 
-#[cfg(feature = "mongodb-cdc")]
 impl MongoDbCdcSource {
     /// Starts the background change stream reader task.
     pub(super) async fn start_change_stream_reader(
         &mut self,
-        config: MongoDbSourceConfig,
-        checkpoint_resume_token: Option<String>,
-        checkpoint_requires_start_after: bool,
-        initial_resume_position: Option<MongoResumePosition>,
-        expected_collection_uuid: Option<Uuid>,
-        expected_deployment_identity: Option<MongoDeploymentIdentity>,
+        launch: ReaderLaunch,
     ) -> Result<(), ConnectorError> {
         if self.reader_handle.is_some() {
             return Err(ConnectorError::InvalidState {
@@ -126,6 +130,14 @@ impl MongoDbCdcSource {
                 "MongoDB CDC cannot start with pre-buffered test events".into(),
             ));
         }
+        let ReaderLaunch {
+            config,
+            start,
+            restored,
+            expected_collection_uuid,
+            expected_deployment_identity,
+            projection,
+        } = launch;
         let max_buffered_bytes = config.max_buffered_bytes;
         let byte_budget = Arc::new(Semaphore::new(max_buffered_bytes));
 
@@ -135,11 +147,16 @@ impl MongoDbCdcSource {
         let (error_tx, error_rx) = tokio::sync::watch::channel(None);
         let (ready_tx, ready_rx) =
             tokio::sync::oneshot::channel::<Result<MongoReaderReady, MongoReaderFailure>>();
+        let (snapshot_committed_tx, snapshot_committed_rx) = tokio::sync::watch::channel(false);
         let reader_config = config.clone();
-        let data_ready = Arc::clone(&self.data_ready);
         let terminal_ready = Arc::clone(&self.data_ready);
-        let metrics = Arc::clone(&self.metrics);
-        let task_byte_budget = Arc::clone(&byte_budget);
+        let output = ReaderOutput {
+            tx,
+            data_ready: Arc::clone(&self.data_ready),
+            metrics: Arc::clone(&self.metrics),
+            byte_budget: Arc::clone(&byte_budget),
+            max_buffered_bytes,
+        };
 
         let reader_guard = self.task_owner.track().ok_or_else(|| {
             ConnectorError::Internal("MongoDB CDC connector generation is already retired".into())
@@ -162,16 +179,13 @@ impl MongoDbCdcSource {
                 run_change_stream_reader(
                     db,
                     reader_config,
-                    tx,
+                    output,
                     shutdown_rx,
-                    data_ready,
-                    metrics,
-                    task_byte_budget,
-                    max_buffered_bytes,
-                    initial_resume_position,
+                    start,
                     expected_collection_uuid,
                     expected_deployment_identity,
                     ready_tx,
+                    snapshot_committed_rx,
                 )
                 .await
             }
@@ -185,11 +199,35 @@ impl MongoDbCdcSource {
         let mut admission_guard = MongoReaderAdmissionGuard::new(shutdown_tx.clone());
 
         let ready = await_mongo_reader_ready(ready_rx, &shutdown_tx, &mut handle).await?;
+        let emitted = match (restored, ready.initial_position) {
+            (Some(restored), None) => restored,
+            (None, Some(position)) => EmittedPosition {
+                position,
+                next_sequence: 0,
+            },
+            _ => {
+                return Err(ConnectorError::Internal(
+                    "MongoDB CDC reader reported an inconsistent starting position".into(),
+                ));
+            }
+        };
 
         admission_guard.disarm();
+        self.snapshot_committed = match (&emitted.position, emitted.next_sequence) {
+            (MongoCheckpointPosition::Snapshot(cut), 0) if cut.after_key.is_none() => {
+                Some((cut.at, snapshot_committed_tx))
+            }
+            _ => None,
+        };
+        if let Some(projection) = projection.as_ref() {
+            self.schema = std::sync::Arc::clone(projection.schema());
+        }
+        self.projection = projection;
         self.config = config;
-        self.checkpoint_resume_token = ready.initial_resume_token.or(checkpoint_resume_token);
-        self.checkpoint_requires_start_after = checkpoint_requires_start_after;
+        self.metrics
+            .snapshot_in_progress
+            .set(i64::from(emitted.in_snapshot()));
+        self.emitted = Some(emitted);
         self.collection_uuid = Some(ready.collection_uuid);
         self.deployment_identity = Some(ready.deployment_identity);
         self.byte_budget = byte_budget;
@@ -213,9 +251,6 @@ impl MongoDbCdcSource {
                 };
                 item
             };
-            if let Some(event) = item.event() {
-                self.metrics.record_event(event.operation_type.as_str());
-            }
             self.event_buffer.push_back(item);
         }
     }
@@ -233,7 +268,6 @@ impl MongoDbCdcSource {
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn mongodb_identity_command_is_permanent(code: i32, code_name: &str) -> bool {
     matches!(
         code,
@@ -254,7 +288,6 @@ pub(super) fn mongodb_identity_command_is_permanent(code: i32, code_name: &str) 
     )
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn mongodb_identity_probe_is_permanent(error: &mongodb::error::Error) -> bool {
     match error.kind.as_ref() {
         mongodb::error::ErrorKind::Authentication { .. } => true,
@@ -265,7 +298,6 @@ pub(super) fn mongodb_identity_probe_is_permanent(error: &mongodb::error::Error)
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn observe_mongodb_deployment(
     db: &mongodb::Database,
 ) -> Result<MongoDeploymentIdentity, ConnectorError> {
@@ -356,7 +388,6 @@ pub(super) async fn observe_mongodb_deployment(
     ))
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn observe_mongodb_admission(
     db: &mongodb::Database,
     database: &str,
@@ -373,7 +404,6 @@ pub(super) async fn observe_mongodb_admission(
 }
 
 /// Read the immutable identity and post-image capability for one fixed collection.
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn observe_mongodb_collection(
     db: &mongodb::Database,
     database: &str,

@@ -42,6 +42,38 @@ before `cargo test`. Without these the `ssl` feature from
 `laminar-connectors` (or `laminar-db` dev-dependencies) tries to build OpenSSL from source via Perl, which
 fails on the stock Windows toolchain.
 
+## MongoDB CDC
+
+`mongodb-cdc-compose.yml` starts a single-member replica set (`127.0.0.1:27117`), a
+three-member set for election tests (`127.0.0.1:27201-27203`), and PostgreSQL
+(`127.0.0.1:15433`, `laminar` / `laminar-test-secret`, database `mirror`). Every member
+advertises the host-published address, so the driver discovers the same topology from the
+host.
+
+```
+docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
+cargo test -p laminar-db --features mongodb-cdc,postgres-sink,delta-lake,files \
+  --test mongodb_cdc_e2e -- --test-threads=1
+LAMINAR_SCHEMA_TEST_MONGO="mongodb://127.0.0.1:27117/?directConnection=true&tls=false" \
+  cargo test -p laminar-connectors --features mongodb-cdc --test schema_mongodb_integration \
+  -- --ignored --test-threads=1
+docker compose -f tests/docker/mongodb-cdc-compose.yml down -v
+```
+
+The end-to-end tests skip when MongoDB is unreachable unless `LAMINAR_REQUIRE_MONGODB_CDC=1`.
+
+Two ignored suites measure rather than gate. Run each `perf_` scenario in its own process, in
+release, so its peak memory is its own; the soak drives the standalone server with mixed writes
+and transactions, hard-kills it every `LAMINAR_MONGODB_SOAK_KILL_EVERY_SECONDS` (default 20),
+and requires exact PostgreSQL and MongoDB mirrors at the end:
+
+```
+cargo test --release -p laminar-db --test mongodb_cdc_e2e -- --ignored --nocapture --exact \
+  perf::perf_history_fetch_decode_and_batch
+LAMINAR_MONGODB_SOAK_SECONDS=300 cargo test --release -p laminar-server \
+  --test mongodb_cdc_soak -- --ignored --nocapture
+```
+
 ## Tear down
 
 ```

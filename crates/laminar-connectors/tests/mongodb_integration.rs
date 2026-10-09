@@ -182,23 +182,28 @@ async fn collect_insert_sequences_until(source: &mut MongoDbCdcSource, target: i
         if let Some(batch) = source.poll_batch(100).await.unwrap() {
             let operations = batch
                 .records
-                .column_by_name("_op")
+                .column_by_name("operation")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
             let documents = batch
                 .records
-                .column_by_name("_full_document")
+                .column_by_name("full_document")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
             for row in 0..batch.num_rows() {
-                if operations.value(row) == "I" && !documents.is_null(row) {
+                if operations.value(row) == "insert" && !documents.is_null(row) {
                     let document: serde_json::Value =
                         serde_json::from_str(documents.value(row)).unwrap();
-                    if let Some(sequence) = document.get("seq").and_then(|value| value.as_i64()) {
+                    let document = mongodb::bson::Bson::try_from(document).unwrap();
+                    if let Some(sequence) = document
+                        .as_document()
+                        .and_then(|document| document.get("seq"))
+                        .and_then(|value| value.as_i32().map(i64::from).or(value.as_i64()))
+                    {
                         sequences.push(sequence);
                     }
                 }
@@ -457,8 +462,9 @@ async fn checkpoint_resume_covers_empty_anchor_and_exact_emitted_token() {
         .unwrap();
     let empty_checkpoint = source.checkpoint();
     assert!(empty_checkpoint.get_offset("resume_token").is_some());
-    assert_eq!(empty_checkpoint.offsets().len(), 1);
-    assert_eq!(empty_checkpoint.get_metadata("version"), Some("4"));
+    assert_eq!(empty_checkpoint.get_offset("sequence"), Some("0"));
+    assert_eq!(empty_checkpoint.offsets().len(), 2);
+    assert_eq!(empty_checkpoint.get_metadata("version"), Some("5"));
     assert!(empty_checkpoint
         .get_metadata("deployment_identity")
         .is_some_and(|identity| identity.starts_with("replica-set:")));
@@ -504,7 +510,7 @@ async fn checkpoint_resume_covers_empty_anchor_and_exact_emitted_token() {
 
     let checkpoint = source.checkpoint();
     assert!(checkpoint.get_offset("resume_token").is_some());
-    assert_eq!(checkpoint.offsets().len(), 1);
+    assert_eq!(checkpoint.offsets().len(), 2);
     source.close().await.unwrap();
 
     // The emitted token resumes strictly after the fifth event.
@@ -615,12 +621,12 @@ async fn invalidate_checkpoint_rejects_recreated_collection() {
             if let Some(batch) = source.poll_batch(100).await.unwrap() {
                 let operations = batch
                     .records
-                    .column_by_name("_op")
+                    .column_by_name("operation")
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .unwrap();
-                if operations.iter().flatten().any(|op| op == "INVALIDATE") {
+                if operations.iter().flatten().any(|op| op == "invalidate") {
                     break source.checkpoint();
                 }
             }
@@ -711,13 +717,16 @@ async fn resume_token_can_cut_between_events_from_one_mongodb_transaction() {
             if let Some(batch) = source.poll_batch(1).await.unwrap() {
                 let document = batch
                     .records
-                    .column_by_name("_full_document")
+                    .column_by_name("full_document")
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .unwrap()
                     .value(0);
-                assert!(document.contains(r#""seq":1"#), "{document}");
+                assert!(
+                    document.contains(r#""seq":{"$numberInt":"1"}"#),
+                    "{document}"
+                );
                 break source.checkpoint();
             }
             sleep(Duration::from_millis(20)).await;
@@ -750,13 +759,16 @@ async fn resume_token_can_cut_between_events_from_one_mongodb_transaction() {
             if let Some(batch) = resumed.poll_batch(1).await.unwrap() {
                 let document = batch
                     .records
-                    .column_by_name("_full_document")
+                    .column_by_name("full_document")
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .unwrap()
                     .value(0);
-                assert!(document.contains(r#""seq":2"#), "{document}");
+                assert!(
+                    document.contains(r#""seq":{"$numberInt":"2"}"#),
+                    "{document}"
+                );
                 return;
             }
             sleep(Duration::from_millis(20)).await;
@@ -1122,27 +1134,27 @@ async fn update_delta_mode() {
     for _ in 0..20 {
         sleep(Duration::from_millis(200)).await;
         if let Some(batch) = source.poll_batch(100).await.unwrap() {
-            // Check for an update event with _update_desc populated.
+            // Check for an update event with update_description populated.
             let op_col = batch
                 .records
-                .column_by_name("_op")
+                .column_by_name("operation")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .unwrap();
             for i in 0..batch.num_rows() {
-                if op_col.value(i) == "U" {
-                    // In delta mode, _full_document should be null.
+                if op_col.value(i) == "update" {
+                    // In delta mode, full_document should be null.
                     let fd_col = batch
                         .records
-                        .column_by_name("_full_document")
+                        .column_by_name("full_document")
                         .unwrap()
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
                         .unwrap();
                     let ud_col = batch
                         .records
-                        .column_by_name("_update_desc")
+                        .column_by_name("update_description")
                         .unwrap()
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
@@ -1218,16 +1230,16 @@ async fn required_post_image_mode_checks_admission_and_emits_post_image() {
         if let Some(batch) = source.poll_batch(100).await.unwrap() {
             let op_col = batch
                 .records
-                .column_by_name("_op")
+                .column_by_name("operation")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .unwrap();
             for i in 0..batch.num_rows() {
-                if op_col.value(i) == "U" {
+                if op_col.value(i) == "update" {
                     let fd_col = batch
                         .records
-                        .column_by_name("_full_document")
+                        .column_by_name("full_document")
                         .unwrap()
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
@@ -1282,13 +1294,13 @@ async fn replace_cdc() {
         if let Some(batch) = source.poll_batch(100).await.unwrap() {
             let op_col = batch
                 .records
-                .column_by_name("_op")
+                .column_by_name("operation")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .unwrap();
             for i in 0..batch.num_rows() {
-                if op_col.value(i) == "R" {
+                if op_col.value(i) == "replace" {
                     found_replace = true;
                 }
             }
@@ -1329,13 +1341,13 @@ async fn delete_cdc() {
         if let Some(batch) = source.poll_batch(100).await.unwrap() {
             let op_col = batch
                 .records
-                .column_by_name("_op")
+                .column_by_name("operation")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .unwrap();
             for i in 0..batch.num_rows() {
-                if op_col.value(i) == "D" {
+                if op_col.value(i) == "delete" {
                     found_delete = true;
                 }
             }
@@ -1354,9 +1366,7 @@ async fn delete_cdc() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sink_cdc_replay() {
     let (_container, uri) = start_mongo().await;
-
-    // Use the CDC envelope schema for the sink.
-    let schema = laminar_connectors::mongodb::mongodb_cdc_envelope_schema();
+    let schema = laminar_connectors::mongodb::mongodb_history_schema();
 
     let mut config = MongoDbSinkConfig::new(&uri, "test_cdc_replay", "replay_out");
     config.auto_create = true;
@@ -1365,98 +1375,100 @@ async fn sink_cdc_replay() {
     let connector_config = ConnectorConfig::new("mongodb-sink");
     sink.open(&connector_config).await.unwrap();
 
-    // Build CDC insert events.
-    use arrow_array::builder::{StringBuilder, TimestampMillisecondBuilder, UInt32Builder};
+    let history = |rows: &[(&str, &str, Option<&str>)]| {
+        use arrow_array::builder::{
+            Int32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
+        };
+        let mut text: Vec<StringBuilder> = (0..12).map(|_| StringBuilder::new()).collect();
+        let mut version = Int32Builder::new();
+        let mut seconds = Int64Builder::new();
+        let mut increment = Int64Builder::new();
+        let mut wall = TimestampMillisecondBuilder::new();
+        let mut txn = Int64Builder::new();
+        for (index, (operation, key, document)) in rows.iter().enumerate() {
+            text[0].append_value(format!("event-{index}"));
+            text[1].append_value(*operation);
+            text[2].append_value("test_cdc_replay");
+            text[3].append_value("replay_out");
+            text[4].append_value("123e4567-e89b-12d3-a456-426614174000");
+            text[5].append_value(*key);
+            text[6].append_option(*document);
+            text[7].append_null();
+            text[8].append_null();
+            text[9].append_value(format!(r#"{{"_data":"{index}"}}"#));
+            text[10].append_null();
+            text[11].append_null();
+            version.append_value(1);
+            seconds.append_value(1);
+            increment.append_value(index as i64);
+            wall.append_null();
+            txn.append_null();
+        }
+        let mut text = text.into_iter().map(|mut builder| builder.finish());
+        let mut next = || Arc::new(text.next().unwrap()) as arrow_array::ArrayRef;
+        let columns: Vec<arrow_array::ArrayRef> = vec![
+            next(),
+            Arc::new(version.finish()),
+            next(),
+            next(),
+            next(),
+            next(),
+            next(),
+            next(),
+            next(),
+            next(),
+            next(),
+            Arc::new(seconds.finish()),
+            Arc::new(increment.finish()),
+            Arc::new(wall.finish()),
+            Arc::new(txn.finish()),
+            next(),
+            next(),
+        ];
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
+    };
 
-    let mut ns_b = StringBuilder::new();
-    let mut op_b = StringBuilder::new();
-    let mut dk_b = StringBuilder::new();
-    let mut cts_b = UInt32Builder::new();
-    let mut cti_b = UInt32Builder::new();
-    let mut wt_b = TimestampMillisecondBuilder::new();
-    let mut fd_b = StringBuilder::new();
-    let mut ud_b = StringBuilder::new();
-    let mut rt_b = StringBuilder::new();
-
-    // Insert two documents.
-    for id in ["c1", "c2"] {
-        ns_b.append_value("test_cdc_replay.replay_out");
-        op_b.append_value("I");
-        dk_b.append_value(format!(r#"{{"_id":"{id}"}}"#));
-        cts_b.append_value(0);
-        cti_b.append_value(0);
-        wt_b.append_value(0);
-        fd_b.append_value(format!(r#"{{"_id":"{id}","val":1}}"#));
-        ud_b.append_null();
-        rt_b.append_value("tok");
-    }
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(ns_b.finish()),
-            Arc::new(op_b.finish()),
-            Arc::new(dk_b.finish()),
-            Arc::new(cts_b.finish()),
-            Arc::new(cti_b.finish()),
-            Arc::new(wt_b.finish()),
-            Arc::new(fd_b.finish()),
-            Arc::new(ud_b.finish()),
-            Arc::new(rt_b.finish()),
-        ],
-    )
+    sink.write_batch(&history(&[
+        (
+            "insert",
+            r#"{"_id":"c1"}"#,
+            Some(r#"{"_id":"c1","val":{"$numberLong":"1"}}"#),
+        ),
+        (
+            "insert",
+            r#"{"_id":"c2"}"#,
+            Some(r#"{"_id":"c2","val":{"$numberLong":"1"}}"#),
+        ),
+    ]))
+    .await
     .unwrap();
-
-    sink.write_batch(&batch).await.unwrap();
+    sink.flush().await.unwrap();
+    sink.write_batch(&history(&[("delete", r#"{"_id":"c1"}"#, None)]))
+        .await
+        .unwrap();
     sink.flush().await.unwrap();
 
-    // Delete one document via CDC.
-    let mut ns_b = StringBuilder::new();
-    let mut op_b = StringBuilder::new();
-    let mut dk_b = StringBuilder::new();
-    let mut cts_b = UInt32Builder::new();
-    let mut cti_b = UInt32Builder::new();
-    let mut wt_b = TimestampMillisecondBuilder::new();
-    let mut fd_b = StringBuilder::new();
-    let mut ud_b = StringBuilder::new();
-    let mut rt_b = StringBuilder::new();
-
-    ns_b.append_value("test_cdc_replay.replay_out");
-    op_b.append_value("D");
-    dk_b.append_value(r#"{"_id":"c1"}"#);
-    cts_b.append_value(0);
-    cti_b.append_value(0);
-    wt_b.append_value(0);
-    fd_b.append_null();
-    ud_b.append_null();
-    rt_b.append_value("tok2");
-
-    let del_batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(ns_b.finish()),
-            Arc::new(op_b.finish()),
-            Arc::new(dk_b.finish()),
-            Arc::new(cts_b.finish()),
-            Arc::new(cti_b.finish()),
-            Arc::new(wt_b.finish()),
-            Arc::new(fd_b.finish()),
-            Arc::new(ud_b.finish()),
-            Arc::new(rt_b.finish()),
-        ],
-    )
-    .unwrap();
-
-    sink.write_batch(&del_batch).await.unwrap();
-    sink.flush().await.unwrap();
-
-    // Verify final state: only c2 should remain.
     let client = mongodb::Client::with_uri_str(&uri).await.unwrap();
     let coll = client
         .database("test_cdc_replay")
         .collection::<mongodb::bson::Document>("replay_out");
-    let count = coll.count_documents(doc! {}).await.unwrap();
-    assert_eq!(count, 1, "expected 1 document after insert+delete");
+    let remaining: Vec<_> = coll
+        .find(doc! {})
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "expected 1 document after insert+delete"
+    );
+    assert_eq!(
+        remaining[0].get_i64("val").unwrap(),
+        1,
+        "Int64 survives replay as Int64"
+    );
 
     sink.close().await.unwrap();
 }

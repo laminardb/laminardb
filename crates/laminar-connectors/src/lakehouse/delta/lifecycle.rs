@@ -74,6 +74,20 @@ impl SinkConnector for DeltaLakeSink {
         )
     }
 
+    fn keyed_mutation_key(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            DeltaLakeSinkConfig::from_config(config)?
+        };
+        // Upsert mode collapses each epoch to one terminal `_op` per merge key and MERGEs it:
+        // `U` updates or inserts, `D` deletes the matched row.
+        Ok((cfg.write_mode == DeltaWriteMode::Upsert).then_some(cfg.merge_key_columns))
+    }
+
     async fn resolve_schema(
         &mut self,
         config: &ConnectorConfig,

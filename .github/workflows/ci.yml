@@ -191,6 +191,39 @@ jobs:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # ============================================
+  # MongoDB CDC direct pipelines
+  # ============================================
+  mongodb-cdc-integration:
+    name: MongoDB CDC (direct pipelines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mongodb-cdc
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+      - name: Start MongoDB and PostgreSQL fixtures
+        run: docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
+      - name: Connector change-stream, replay, and admission tests
+        run: cargo test -p laminar-connectors --no-default-features --features mongodb-cdc --test mongodb_integration --test cdc_admission -- --test-threads=2
+      - name: MongoDB schema contracts
+        run: cargo test -p laminar-connectors --no-default-features --features mongodb-cdc --test schema_mongodb_integration -- --ignored --test-threads=1
+        env:
+          LAMINAR_SCHEMA_TEST_MONGO: mongodb://127.0.0.1:27117/?directConnection=true&tls=false
+      - name: Direct MongoDB pipeline end-to-end tests
+        run: cargo test -p laminar-db --no-default-features --features mongodb-cdc,postgres-sink,delta-lake,files --test mongodb_cdc_e2e -- --test-threads=1
+        env:
+          LAMINAR_REQUIRE_MONGODB_CDC: "1"
+      - name: Fixture logs
+        if: failure()
+        run: docker compose -f tests/docker/mongodb-cdc-compose.yml logs --tail=200
+
+  # ============================================
   # Release Build (main/develop only)
   # ============================================
   release-build:

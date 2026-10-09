@@ -1,9 +1,11 @@
 //! Fail-closed CDC replay validation and ordered write preparation.
 
 use super::{
-    account_bson_document, cdc_bulk_models, json_to_bson_document, validate_cdc_document_key,
-    validate_cdc_replacement_key, CdcWrite, ConnectorError, MongoDbSink,
+    account_bson_document, cdc_bulk_models, json_to_bson, json_to_bson_document,
+    validate_cdc_document_key, validate_cdc_replacement_key, CdcWrite, ConnectorError, MongoDbSink,
 };
+use crate::mongodb::change_event::ChangeOperation;
+use crate::mongodb::SNAPSHOT_OPERATION;
 use mongodb::bson::{doc, Bson, Document};
 
 impl MongoDbSink {
@@ -48,28 +50,29 @@ fn cdc_operation<'a>(
     value: &'a serde_json::Value,
     expected_namespace: &str,
 ) -> Result<&'a str, ConnectorError> {
-    let namespace = value
-        .get("_namespace")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError(
-                "MongoDB CDC replay event requires a non-null string '_namespace'".into(),
-            )
-        })?;
-    if namespace != expected_namespace {
+    let text = |field: &str| value.get(field).and_then(serde_json::Value::as_str);
+    let database = text("database").ok_or_else(|| {
+        ConnectorError::ConfigurationError(
+            "MongoDB CDC replay record requires a non-null string 'database'".into(),
+        )
+    })?;
+    let operation = text("operation").ok_or_else(|| {
+        ConnectorError::ConfigurationError(
+            "MongoDB CDC replay record requires a non-null string 'operation'".into(),
+        )
+    })?;
+    let same_namespace = expected_namespace
+        .split_once('.')
+        .is_some_and(|(db, coll)| db == database && text("collection") == Some(coll));
+    if !same_namespace {
         return Err(ConnectorError::ConfigurationError(format!(
-            "MongoDB CDC replay namespace '{namespace}' does not match fixed target \
-             '{expected_namespace}'"
+            "MongoDB CDC replay record from '{database}.{}' does not match the mapped source \
+             namespace '{expected_namespace}'; set replay.source.namespace to mirror into a \
+             different collection",
+            text("collection").unwrap_or("<none>")
         )));
     }
-    value
-        .get("_op")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError(
-                "MongoDB CDC replay event requires a non-null string '_op'".into(),
-            )
-        })
+    Ok(operation)
 }
 
 fn prepare_cdc_write(
@@ -79,30 +82,36 @@ fn prepare_cdc_write(
     converted_limit: usize,
     bytes: &mut u64,
 ) -> Result<CdcWrite, ConnectorError> {
-    match operation {
-        "I" | "R" => prepare_replacement(value, operation, converted_limit, bytes),
-        "U" => prepare_update(value, converted_limit, bytes),
-        "D" => prepare_delete(value, converted_limit, bytes),
-        "DROP" | "RENAME" | "INVALIDATE" | "DROP_DATABASE" => {
-            Err(ConnectorError::ConfigurationError(format!(
-                "MongoDB CDC replay cannot apply lifecycle operation '{operation}' to fixed \
-                 destination '{expected_namespace}'"
-            )))
-        }
-        other => Err(ConnectorError::ConfigurationError(format!(
-            "MongoDB CDC replay does not support operation '{other}'"
+    if operation == SNAPSHOT_OPERATION {
+        return prepare_replacement(value, false, converted_limit, bytes);
+    }
+    match ChangeOperation::classify(operation) {
+        ChangeOperation::Insert => prepare_replacement(value, true, converted_limit, bytes),
+        ChangeOperation::Replace => prepare_replacement(value, false, converted_limit, bytes),
+        ChangeOperation::Update => prepare_update(value, converted_limit, bytes),
+        ChangeOperation::Delete => prepare_delete(value, converted_limit, bytes),
+        ChangeOperation::Metadata => Ok(CdcWrite::Noop),
+        ChangeOperation::Drop
+        | ChangeOperation::Rename
+        | ChangeOperation::DropDatabase
+        | ChangeOperation::Invalidate => Err(ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC replay cannot apply lifecycle operation '{operation}' to fixed \
+             destination '{expected_namespace}'; the target is left unchanged"
+        ))),
+        ChangeOperation::Unknown => Err(ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC replay does not support operation '{operation}'"
         ))),
     }
 }
 
 fn prepare_replacement(
     value: &serde_json::Value,
-    operation: &str,
+    insert: bool,
     converted_limit: usize,
     bytes: &mut u64,
 ) -> Result<CdcWrite, ConnectorError> {
-    let key = parse_cdc_field(value, "_document_key")?;
-    let full_document = parse_cdc_field(value, "_full_document")?;
+    let key = parse_cdc_field(value, "document_key")?;
+    let full_document = parse_cdc_field(value, "full_document")?;
     let key = json_to_bson_document(key.as_ref())?;
     let filter = validate_cdc_document_key(&key)?;
     let replacement = json_to_bson_document(full_document.as_ref())?;
@@ -114,7 +123,7 @@ fn prepare_replacement(
         converted_limit,
         "MongoDB CDC replacement document",
     )?;
-    if operation == "I" {
+    if insert {
         Ok(CdcWrite::Insert {
             filter,
             replacement,
@@ -132,15 +141,15 @@ fn prepare_update(
     converted_limit: usize,
     bytes: &mut u64,
 ) -> Result<CdcWrite, ConnectorError> {
-    let key = parse_cdc_field(value, "_document_key")?;
+    let key = parse_cdc_field(value, "document_key")?;
     let key = json_to_bson_document(key.as_ref())?;
     let filter = validate_cdc_document_key(&key)?;
 
     if value
-        .get("_full_document")
+        .get("full_document")
         .is_some_and(|document| !document.is_null())
     {
-        let full_document = parse_cdc_field(value, "_full_document")?;
+        let full_document = parse_cdc_field(value, "full_document")?;
         let replacement = json_to_bson_document(full_document.as_ref())?;
         validate_cdc_replacement_key(&key, &replacement)?;
         account_cdc_key_and_document(
@@ -156,7 +165,7 @@ fn prepare_update(
         });
     }
 
-    let description = parse_cdc_field(value, "_update_desc")?;
+    let description = parse_cdc_field(value, "update_description")?;
     let update = build_update_document(description.as_ref())?;
     account_bson_document(bytes, &filter, converted_limit, "MongoDB CDC document key")?;
     if update.is_empty() {
@@ -176,7 +185,7 @@ fn prepare_delete(
     converted_limit: usize,
     bytes: &mut u64,
 ) -> Result<CdcWrite, ConnectorError> {
-    let key = parse_cdc_field(value, "_document_key")?;
+    let key = parse_cdc_field(value, "document_key")?;
     let key = json_to_bson_document(key.as_ref())?;
     let filter = validate_cdc_document_key(&key)?;
     account_bson_document(bytes, &filter, converted_limit, "MongoDB CDC document key")?;
@@ -204,10 +213,7 @@ fn build_update_document(description: &serde_json::Value) -> Result<Document, Co
 }
 
 fn reject_disambiguated_paths(description: &serde_json::Value) -> Result<(), ConnectorError> {
-    let Some(disambiguated) = description
-        .get("disambiguated_paths")
-        .or_else(|| description.get("disambiguatedPaths"))
-    else {
+    let Some(disambiguated) = description.get("disambiguatedPaths") else {
         return Ok(());
     };
     let paths = disambiguated.as_object().ok_or_else(|| {
@@ -229,10 +235,7 @@ fn append_updated_fields(
     description: &serde_json::Value,
     update: &mut Document,
 ) -> Result<(), ConnectorError> {
-    if let Some(updated) = description
-        .get("updated_fields")
-        .or_else(|| description.get("updatedFields"))
-    {
+    if let Some(updated) = description.get("updatedFields") {
         update.insert("$set", Bson::Document(json_to_bson_document(updated)?));
     }
     Ok(())
@@ -242,10 +245,7 @@ fn append_removed_fields(
     description: &serde_json::Value,
     update: &mut Document,
 ) -> Result<(), ConnectorError> {
-    let Some(removed) = description
-        .get("removed_fields")
-        .or_else(|| description.get("removedFields"))
-    else {
+    let Some(removed) = description.get("removedFields") else {
         return Ok(());
     };
     let fields = removed.as_array().ok_or_else(|| {
@@ -271,10 +271,7 @@ fn append_truncated_arrays(
     description: &serde_json::Value,
     update: &mut Document,
 ) -> Result<(), ConnectorError> {
-    let Some(truncated) = description
-        .get("truncated_arrays")
-        .or_else(|| description.get("truncatedArrays"))
-    else {
+    let Some(truncated) = description.get("truncatedArrays") else {
         return Ok(());
     };
     let arrays = truncated.as_array().ok_or_else(|| {
@@ -294,13 +291,18 @@ fn append_truncated_arrays(
                 )
             })?;
         let new_size = array
-            .get("new_size")
-            .or_else(|| array.get("newSize"))
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|size| i64::try_from(size).ok())
+            .get("newSize")
+            .map(json_to_bson)
+            .transpose()?
+            .and_then(|size| match size {
+                Bson::Int32(size) => Some(i64::from(size)),
+                Bson::Int64(size) => Some(size),
+                _ => None,
+            })
+            .filter(|size| *size >= 0)
             .ok_or_else(|| {
                 ConnectorError::ConfigurationError(
-                    "MongoDB CDC truncated array requires an i64 'new_size'".into(),
+                    "MongoDB CDC truncated array requires a non-negative integer 'newSize'".into(),
                 )
             })?;
         push.insert(

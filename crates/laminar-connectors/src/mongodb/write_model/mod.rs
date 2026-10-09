@@ -23,16 +23,16 @@ pub enum WriteMode {
         key_fields: Vec<String>,
     },
 
-    /// Routes operations based on the incoming event's `operationType`.
+    /// Applies `MongoDB` CDC history records (`output.mode=history`) in order, mirroring the
+    /// source collection with its exact BSON types:
     ///
-    /// Only valid for `LaminarEvent<MongoDbChangeEvent>` (CDC fan-out
-    /// replication). Maps operations as follows:
-    ///
-    /// - `insert` → idempotent `replaceOne(..., upsert: true)` by document key
-    /// - `update` → `updateOne` using `$set`/`$unset` from `updateDescription`
-    /// - `replace` → `replaceOne` with `upsert: true`
-    /// - `delete` → `deleteOne` using `documentKey._id`
-    /// - lifecycle and expanded events → rejected because a fixed destination cannot replay them
+    /// - `insert`, `replace`, `snapshot` → `replaceOne(..., upsert: true)` by document key
+    /// - `update` → `replaceOne` with the post-image when present, otherwise `updateOne`
+    ///   from `updateDescription`
+    /// - `delete` → `deleteOne` by document key
+    /// - collection metadata events → no write
+    /// - `drop`, `rename`, `dropDatabase`, `invalidate`, unknown → rejected; a fixed destination
+    ///   never receives destructive DDL
     CdcReplay,
 }
 

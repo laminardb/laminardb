@@ -11,9 +11,13 @@ pub mod timeseries;
 pub mod write_model;
 
 // Re-export primary types at module level.
-pub use config::{FullDocumentMode, MongoDbSinkConfig, MongoDbSourceConfig};
+pub use config::{
+    FullDocumentMode, MongoDbSinkConfig, MongoDbSourceConfig, SnapshotMode, SourceOutputMode,
+};
 pub use sink::MongoDbSink;
-pub use source::{mongodb_cdc_envelope_schema, MongoDbCdcSource};
+pub use source::{
+    mongodb_history_schema, MongoDbCdcSource, MONGODB_HISTORY_VERSION, SNAPSHOT_OPERATION,
+};
 pub use timeseries::{CollectionKind, TimeSeriesConfig, TimeSeriesGranularity};
 pub use write_model::WriteMode;
 
@@ -176,9 +180,29 @@ fn mongodb_cdc_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::required("database", "Database name"),
         ConfigKeySpec::required("collection", "Fixed collection name"),
         ConfigKeySpec::optional(
+            "output.mode",
+            "history (immutable event records) or document (keyed puts and deletes)",
+            "history",
+        ),
+        ConfigKeySpec::optional(
+            "snapshot.mode",
+            "never (changes only) or initial (copy the collection, then stream changes)",
+            "never",
+        ),
+        ConfigKeySpec::optional(
             "full.document.mode",
             "Deterministic full document mode (delta or required post-image)",
             "delta",
+        ),
+        ConfigKeySpec::optional(
+            "objectid.columns",
+            "Document-mode VARCHAR columns holding ObjectId values as lowercase hex",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "document.json.column",
+            "Document-mode VARCHAR column receiving the whole canonical Extended JSON document",
+            "",
         ),
         ConfigKeySpec::optional(
             "pipeline",

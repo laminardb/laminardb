@@ -28,7 +28,11 @@ const SOURCE_CONFIG_KEYS: &[&str] = &[
     "connection.uri",
     "database",
     "collection",
+    "output.mode",
+    "snapshot.mode",
     "full.document.mode",
+    "objectid.columns",
+    "document.json.column",
     "pipeline",
     "max.buffered.bytes",
     "laminar.source.name",
@@ -53,6 +57,7 @@ const SINK_CONFIG_KEYS: &[&str] = &[
     "flush.interval.ms",
     "write.mode",
     "write.mode.key_fields",
+    "replay.source.namespace",
     "timeseries.time_field",
     "timeseries.meta_field",
     "timeseries.granularity",
@@ -90,6 +95,38 @@ str_enum!(FullDocumentMode, lowercase, ConnectorError, "unknown full document mo
     RequirePostImage => "required"
 );
 
+/// What a `MongoDB` CDC source emits for each change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceOutputMode {
+    /// Every captured event becomes an immutable, versioned history record.
+    #[default]
+    History,
+    /// Full documents become keyed puts and deletes become key-only tombstones.
+    Document,
+}
+
+str_enum!(SourceOutputMode, lowercase, ConnectorError, "unknown output mode",
+    History => "history";
+    Document => "document"
+);
+
+/// Whether a fresh source copies the existing collection before streaming changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotMode {
+    /// Capture only changes made after the source first opens.
+    #[default]
+    Never,
+    /// Copy the collection at one snapshot time, then stream every change from that time.
+    Initial,
+}
+
+str_enum!(SnapshotMode, lowercase, ConnectorError, "unknown snapshot mode",
+    Never => "never";
+    Initial => "initial"
+);
+
 /// Configuration for the `MongoDB` CDC source connector.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -103,8 +140,24 @@ pub struct MongoDbSourceConfig {
     /// Fixed collection name.
     pub collection: String,
 
+    /// History records or keyed document mutations.
+    #[serde(default)]
+    pub output_mode: SourceOutputMode,
+
+    /// Changes only, or an initial collection snapshot followed by changes.
+    #[serde(default)]
+    pub snapshot_mode: SnapshotMode,
+
     /// Full document retrieval mode for update events.
     pub full_document_mode: FullDocumentMode,
+
+    /// Document-mode `Utf8` columns whose BSON values must be `ObjectId`s.
+    #[serde(default)]
+    pub objectid_columns: Vec<String>,
+
+    /// Document-mode `Utf8` column that receives the complete canonical Extended JSON document.
+    #[serde(default)]
+    pub document_json_column: Option<String>,
 
     /// Additional `$match` stages applied when the change stream opens.
     #[serde(default)]
@@ -125,7 +178,11 @@ impl Default for MongoDbSourceConfig {
             connection_uri: "mongodb://localhost:27017".to_string(),
             database: String::new(),
             collection: String::new(),
+            output_mode: SourceOutputMode::default(),
+            snapshot_mode: SnapshotMode::default(),
             full_document_mode: FullDocumentMode::default(),
+            objectid_columns: Vec::new(),
+            document_json_column: None,
             pipeline: Vec::new(),
             max_buffered_bytes: default_max_buffered_bytes(),
         }
@@ -181,7 +238,56 @@ impl MongoDbSourceConfig {
         }
 
         validate_pipeline(&self.pipeline)?;
+        self.validate_output_shape()
+    }
 
+    fn validate_output_shape(&self) -> Result<(), ConnectorError> {
+        if self.snapshot_mode == SnapshotMode::Initial && !self.pipeline.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "MongoDB CDC snapshot.mode=initial cannot use a change-stream pipeline; its \
+                 $match stages filter change events, not the copied documents"
+                    .into(),
+            ));
+        }
+        match self.output_mode {
+            SourceOutputMode::History => {
+                if !self.objectid_columns.is_empty() || self.document_json_column.is_some() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "MongoDB CDC objectid.columns and document.json.column require \
+                         output.mode=document"
+                            .into(),
+                    ));
+                }
+            }
+            SourceOutputMode::Document => {
+                if self.full_document_mode != FullDocumentMode::RequirePostImage {
+                    return Err(ConnectorError::ConfigurationError(
+                        "MongoDB CDC output.mode=document requires full.document.mode=required: \
+                         a keyed put needs the exact post-image of every update"
+                            .into(),
+                    ));
+                }
+                if !self.pipeline.is_empty() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "MongoDB CDC output.mode=document cannot use a change-stream pipeline; \
+                         filtering changes would leave stale documents in the target"
+                            .into(),
+                    ));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for column in self
+                    .objectid_columns
+                    .iter()
+                    .chain(self.document_json_column.iter())
+                {
+                    if column.trim().is_empty() || !seen.insert(column.as_str()) {
+                        return Err(ConnectorError::ConfigurationError(format!(
+                            "MongoDB CDC projection column '{column}' is empty or listed twice"
+                        )));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -214,9 +320,21 @@ impl MongoDbSourceConfig {
             ..Self::default()
         };
 
+        if let Some(mode) = config.get_parsed::<SourceOutputMode>("output.mode")? {
+            cfg.output_mode = mode;
+        }
+        if let Some(mode) = config.get_parsed::<SnapshotMode>("snapshot.mode")? {
+            cfg.snapshot_mode = mode;
+        }
         if let Some(mode) = config.get_parsed::<FullDocumentMode>("full.document.mode")? {
             cfg.full_document_mode = mode;
         }
+        if let Some(columns) = config.get("objectid.columns") {
+            cfg.objectid_columns = columns.split(',').map(|c| c.trim().to_string()).collect();
+        }
+        cfg.document_json_column = config
+            .get("document.json.column")
+            .map(|column| column.trim().to_string());
         if let Some(pipeline) = config.get("pipeline") {
             cfg.pipeline = parse_pipeline_property(pipeline)?;
         }
@@ -362,6 +480,30 @@ fn validate_sink_properties(config: &ConnectorConfig) -> Result<(), ConnectorErr
     Ok(())
 }
 
+fn replay_source_namespace(
+    config: &ConnectorConfig,
+    write_mode: &WriteMode,
+) -> Result<Option<String>, ConnectorError> {
+    let Some(namespace) = config.get("replay.source.namespace") else {
+        return Ok(None);
+    };
+    if !matches!(write_mode, WriteMode::CdcReplay) {
+        return Err(ConnectorError::ConfigurationError(
+            "MongoDB sink property 'replay.source.namespace' is only valid for \
+             write.mode=cdc_replay"
+                .into(),
+        ));
+    }
+    match namespace.split_once('.') {
+        Some((database, collection)) if !database.is_empty() && !collection.is_empty() => {
+            Ok(Some(namespace.to_string()))
+        }
+        _ => Err(ConnectorError::ConfigurationError(format!(
+            "replay.source.namespace '{namespace}' must be '<database>.<collection>'"
+        ))),
+    }
+}
+
 /// Configuration for the `MongoDB` sink connector.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -390,6 +532,11 @@ pub struct MongoDbSinkConfig {
     /// Maximum time between flushes in milliseconds.
     #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
+
+    /// `database.collection` whose history records `cdc_replay` applies to this target.
+    /// Defaults to the target namespace itself.
+    #[serde(default)]
+    pub replay_source_namespace: Option<String>,
 }
 
 fn default_flush_interval_ms() -> u64 {
@@ -406,6 +553,7 @@ impl Default for MongoDbSinkConfig {
             auto_create: false,
             write_mode: WriteMode::default(),
             flush_interval_ms: default_flush_interval_ms(),
+            replay_source_namespace: None,
         }
     }
 }
@@ -527,6 +675,7 @@ impl MongoDbSinkConfig {
             };
         }
 
+        cfg.replay_source_namespace = replay_source_namespace(config, &cfg.write_mode)?;
         if config.get("write.mode.key_fields").is_some()
             && !matches!(&cfg.write_mode, WriteMode::Upsert { .. })
         {

@@ -3,10 +3,29 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use rustc_hash::FxHashMap;
 
-use super::{set_checkpoint_fault, ConnectorPipelineCallback};
+use super::{set_checkpoint_fault, ConnectorPipelineCallback, HandoffCapture};
 use crate::pipeline::{CycleError, PipelineCallback};
 
 impl ConnectorPipelineCallback {
+    pub(super) fn capture_terminal_cut(&self, flags: u64) -> Option<HandoffCapture> {
+        #[cfg(feature = "cluster")]
+        let handoff_replay_pending = flags
+            & (laminar_core::checkpoint::flags::HANDOFF
+                | laminar_core::checkpoint::flags::TOPOLOGY_CUT)
+            != 0
+            && !self.graph.handoff_is_quiescent();
+        #[cfg(not(feature = "cluster"))]
+        let handoff_replay_pending = false;
+        if flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT != 0 && handoff_replay_pending {
+            set_checkpoint_fault(
+                &self.checkpoint_fault,
+                "topology cut cannot retain replay; coordinated recovery is required",
+            );
+            return None;
+        }
+        Some(HandoffCapture::new(flags, handoff_replay_pending))
+    }
+
     pub(super) fn checkpoint_drain_timeout(&mut self) -> CycleError {
         #[cfg(feature = "cluster")]
         self.abort_prepared_subscription_output_cycle();
@@ -28,6 +47,9 @@ impl ConnectorPipelineCallback {
                 return Err(error);
             }
         }
+        // A drain publishes graph-retained rows only. A leftover direct-sink stage belongs to a
+        // cycle whose publication failed and whose source offsets were discarded.
+        self.direct_sinks.discard_staged();
         let (any_failed, _) = self.graph.take_cycle_failures();
         if any_failed {
             #[cfg(feature = "cluster")]

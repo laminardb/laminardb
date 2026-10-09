@@ -18,6 +18,7 @@ pub(super) fn admit_sink(
         delivery,
         runtime,
         carries_changelog,
+        mutation_key,
         checkpointing_enabled,
         checkpoint_storage_scope,
     } = context;
@@ -42,6 +43,16 @@ pub(super) fn admit_sink(
             DbError::Config(format!("[LDB-5035] {detail}"))
         }
     })?;
+
+    if let Some(source_key) = mutation_key {
+        let sink_key = sink.keyed_mutation_key(config).map_err(|error| {
+            DbError::Config(format!(
+                "sink '{name}' has an invalid configuration: {error}"
+            ))
+        })?;
+        crate::direct_mutation::validate_sink_key(name, input, source_key, sink_key)
+            .map_err(|reason| DbError::Config(format!("[LDB-5035] {reason}")))?;
+    }
 
     if delivery == DeliveryGuarantee::ExactlyOnce {
         if !checkpointing_enabled {

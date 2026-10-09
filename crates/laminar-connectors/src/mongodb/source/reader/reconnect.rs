@@ -1,92 +1,90 @@
 //! Bounded identity verification, cursor opening, and reconnect admission.
 
+use super::failure::{classify_stream_error, ReadFailure};
 use super::{
-    bootstrap_change_stream_options, change_stream_options, observe_mongodb_admission,
+    bootstrap_change_stream_options, change_stream_options, namespace, observe_mongodb_admission,
     parse_change_stream_pipeline, report_mongo_reader_admission_error, retry_interrupted,
-    verify_mongodb_admission, ConnectorError, MongoAdmissionObservation, MongoDbCdcMetrics,
-    MongoDbSourceConfig, MongoDeploymentIdentity, MongoReaderFailure, MongoReaderReady,
-    MongoResumePosition, Uuid, MAX_FAILURES,
+    verify_mongodb_admission, ConnectorError, MongoAdmissionObservation, MongoChangeStream,
+    MongoDbCdcMetrics, MongoDbSourceConfig, MongoDeploymentIdentity, MongoResumePosition, ReadyTx,
+    Uuid, MAX_FAILURES,
 };
 
-#[cfg(feature = "mongodb-cdc")]
 enum AdmissionPhase {
     BeforeCursorOpen,
     AfterCursorOpen,
 }
 
-#[cfg(feature = "mongodb-cdc")]
 enum AdmissionAttempt {
     Verified,
     Retry,
     Stop,
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) enum ReconnectControl {
     Retry,
     Stop,
 }
 
-#[cfg(feature = "mongodb-cdc")]
-type MongoChangeStream = mongodb::change_stream::ChangeStream<
-    mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
->;
-
-#[cfg(feature = "mongodb-cdc")]
 type CursorAttempt = Result<MongoChangeStream, ReconnectControl>;
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) struct ReaderAdmission {
     pub(super) pipeline: Vec<mongodb::bson::Document>,
     pub(super) collection_uuid: Uuid,
     pub(super) deployment_identity: MongoDeploymentIdentity,
 }
 
-#[cfg(feature = "mongodb-cdc")]
-pub(super) type VerifiedCursorAttempt = Result<(MongoChangeStream, bool), ReconnectControl>;
+/// Count one transient failure and back off. `Ok(false)` means shutdown interrupted the wait.
+pub(super) async fn back_off(
+    error: &str,
+    context: &str,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    metrics: &MongoDbCdcMetrics,
+    consecutive_failures: &mut u32,
+) -> Result<bool, ConnectorError> {
+    *consecutive_failures += 1;
+    if *consecutive_failures >= MAX_FAILURES {
+        return Err(ConnectorError::ConnectionFailed(format!(
+            "{context} failed after {MAX_FAILURES} consecutive attempts: {error}"
+        )));
+    }
+    let backoff = crate::retry::Backoff::broker_reconnect().delay(*consecutive_failures);
+    tracing::warn!(attempt = *consecutive_failures, ?backoff, %error, "{context} failed, retrying");
+    metrics.record_reconnect();
+    Ok(!retry_interrupted(shutdown_rx, backoff).await)
+}
 
-#[cfg(feature = "mongodb-cdc")]
 async fn observe_initial_admission(
     db: &mongodb::Database,
     config: &MongoDbSourceConfig,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     metrics: &MongoDbCdcMetrics,
-    consecutive_failures: &mut u32,
-    ready_tx: &mut Option<
-        tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
-    >,
+    ready_tx: &mut ReadyTx,
 ) -> Result<Option<MongoAdmissionObservation>, ConnectorError> {
+    let mut consecutive_failures = 0;
     loop {
-        match observe_mongodb_admission(db, &config.database, &config.collection).await {
+        let error = match observe_mongodb_admission(db, &config.database, &config.collection).await
+        {
             Ok(observation) => return Ok(Some(observation)),
-            Err(error) if !error.is_transient() => {
-                report_mongo_reader_admission_error(ready_tx, &error);
-                return Err(error);
-            }
-            Err(error) => {
-                *consecutive_failures += 1;
-                if *consecutive_failures >= MAX_FAILURES {
-                    report_mongo_reader_admission_error(ready_tx, &error);
-                    return Err(error);
-                }
-                let backoff =
-                    crate::retry::Backoff::broker_reconnect().delay(*consecutive_failures);
-                tracing::warn!(
-                    attempt = *consecutive_failures,
-                    ?backoff,
-                    error = %error,
-                    "failed to inspect MongoDB deployment or collection identity, retrying"
-                );
-                metrics.record_reconnect();
-                if retry_interrupted(shutdown_rx, backoff).await {
-                    return Ok(None);
-                }
-            }
-        }
+            Err(error) if !error.is_transient() => error,
+            Err(error) => match back_off(
+                &error.to_string(),
+                "MongoDB deployment and collection identity inspection",
+                shutdown_rx,
+                metrics,
+                &mut consecutive_failures,
+            )
+            .await
+            {
+                Ok(true) => continue,
+                Ok(false) => return Ok(None),
+                Err(error) => error,
+            },
+        };
+        report_mongo_reader_admission_error(ready_tx, &error);
+        return Err(error);
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn prepare_reader_admission(
     db: &mongodb::Database,
     config: &MongoDbSourceConfig,
@@ -94,9 +92,7 @@ pub(super) async fn prepare_reader_admission(
     expected_deployment_identity: Option<MongoDeploymentIdentity>,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     metrics: &MongoDbCdcMetrics,
-    ready_tx: &mut Option<
-        tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
-    >,
+    ready_tx: &mut ReadyTx,
 ) -> Result<Option<ReaderAdmission>, ConnectorError> {
     let pipeline = match parse_change_stream_pipeline(&config.pipeline) {
         Ok(pipeline) => pipeline,
@@ -105,16 +101,8 @@ pub(super) async fn prepare_reader_admission(
             return Err(error);
         }
     };
-    let mut consecutive_failures = 0;
-    let Some(observation) = observe_initial_admission(
-        db,
-        config,
-        shutdown_rx,
-        metrics,
-        &mut consecutive_failures,
-        ready_tx,
-    )
-    .await?
+    let Some(observation) =
+        observe_initial_admission(db, config, shutdown_rx, metrics, ready_tx).await?
     else {
         return Ok(None);
     };
@@ -135,25 +123,24 @@ pub(super) async fn prepare_reader_admission(
     }))
 }
 
-#[cfg(feature = "mongodb-cdc")]
 async fn verify_reconnect_admission(
     db: &mongodb::Database,
     config: &MongoDbSourceConfig,
-    deployment_identity: &MongoDeploymentIdentity,
-    collection_uuid: Uuid,
+    admission: &ReaderAdmission,
     phase: AdmissionPhase,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     metrics: &MongoDbCdcMetrics,
     consecutive_failures: &mut u32,
-    ready_tx: &mut Option<
-        tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
-    >,
+    ready_tx: &mut ReadyTx,
 ) -> Result<AdmissionAttempt, ConnectorError> {
     let error = match observe_mongodb_admission(db, &config.database, &config.collection).await {
         Ok(observation) => {
-            if let Err(error) =
-                verify_mongodb_admission(config, deployment_identity, collection_uuid, &observation)
-            {
+            if let Err(error) = verify_mongodb_admission(
+                config,
+                &admission.deployment_identity,
+                admission.collection_uuid,
+                &observation,
+            ) {
                 report_mongo_reader_admission_error(ready_tx, &error);
                 return Err(error);
             }
@@ -165,36 +152,28 @@ async fn verify_reconnect_admission(
         report_mongo_reader_admission_error(ready_tx, &error);
         return Err(error);
     }
-
-    *consecutive_failures += 1;
-    if *consecutive_failures >= MAX_FAILURES {
-        report_mongo_reader_admission_error(ready_tx, &error);
-        return Err(error);
-    }
-    let backoff = crate::retry::Backoff::broker_reconnect().delay(*consecutive_failures);
-    match phase {
-        AdmissionPhase::BeforeCursorOpen => tracing::warn!(
-            attempt = *consecutive_failures,
-            ?backoff,
-            error = %error,
-            "failed to verify MongoDB deployment or collection identity before reconnect"
-        ),
-        AdmissionPhase::AfterCursorOpen => tracing::warn!(
-            attempt = *consecutive_failures,
-            ?backoff,
-            error = %error,
-            "failed to verify MongoDB deployment or collection identity after opening change stream"
-        ),
-    }
-    metrics.record_reconnect();
-    if retry_interrupted(shutdown_rx, backoff).await {
-        Ok(AdmissionAttempt::Stop)
-    } else {
-        Ok(AdmissionAttempt::Retry)
+    let context = match phase {
+        AdmissionPhase::BeforeCursorOpen => "MongoDB identity verification before reconnect",
+        AdmissionPhase::AfterCursorOpen => "MongoDB identity verification after cursor open",
+    };
+    match back_off(
+        &error.to_string(),
+        context,
+        shutdown_rx,
+        metrics,
+        consecutive_failures,
+    )
+    .await
+    {
+        Ok(true) => Ok(AdmissionAttempt::Retry),
+        Ok(false) => Ok(AdmissionAttempt::Stop),
+        Err(error) => {
+            report_mongo_reader_admission_error(ready_tx, &error);
+            Err(error)
+        }
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
 async fn open_change_stream_cursor(
     db: &mongodb::Database,
     config: &MongoDbSourceConfig,
@@ -203,9 +182,7 @@ async fn open_change_stream_cursor(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     metrics: &MongoDbCdcMetrics,
     consecutive_failures: &mut u32,
-    ready_tx: &mut Option<
-        tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
-    >,
+    ready_tx: &mut ReadyTx,
 ) -> Result<CursorAttempt, ConnectorError> {
     let result = db
         .collection::<mongodb::bson::Document>(&config.collection)
@@ -213,56 +190,54 @@ async fn open_change_stream_cursor(
         .pipeline(pipeline.to_vec())
         .with_options(options)
         .await;
-    match result {
-        Ok(cursor) => Ok(Ok(cursor)),
+    let error = match result {
+        Ok(cursor) => return Ok(Ok(cursor.with_type::<mongodb::bson::RawDocumentBuf>())),
+        Err(error) => error,
+    };
+    let message = match classify_stream_error(&error, &namespace(config)) {
+        ReadFailure::Permanent(error) => {
+            report_mongo_reader_admission_error(ready_tx, &error);
+            return Err(error);
+        }
+        ReadFailure::Transient(message) => message,
+    };
+    match back_off(
+        &message,
+        "MongoDB change stream open",
+        shutdown_rx,
+        metrics,
+        consecutive_failures,
+    )
+    .await
+    {
+        Ok(true) => Ok(Err(ReconnectControl::Retry)),
+        Ok(false) => Ok(Err(ReconnectControl::Stop)),
         Err(error) => {
-            *consecutive_failures += 1;
-            if *consecutive_failures >= MAX_FAILURES {
-                let msg =
-                    format!("change stream open failed after {MAX_FAILURES} attempts: {error}");
-                tracing::error!(%msg);
-                let error = ConnectorError::ReadError(msg);
-                report_mongo_reader_admission_error(ready_tx, &error);
-                return Err(error);
-            }
-            let backoff = crate::retry::Backoff::broker_reconnect().delay(*consecutive_failures);
-            tracing::warn!(
-                attempt = *consecutive_failures,
-                ?backoff,
-                error = %error,
-                "failed to open change stream, retrying"
-            );
-            metrics.record_reconnect();
-            if retry_interrupted(shutdown_rx, backoff).await {
-                Ok(Err(ReconnectControl::Stop))
-            } else {
-                Ok(Err(ReconnectControl::Retry))
-            }
+            report_mongo_reader_admission_error(ready_tx, &error);
+            Err(error)
         }
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
+/// Open a cursor at `resume_position` between two identity checks. Opening successfully does
+/// not reset the failure budget; only stream progress does.
 pub(super) async fn open_verified_cursor(
     db: &mongodb::Database,
     config: &MongoDbSourceConfig,
     admission: &ReaderAdmission,
-    fresh_start: bool,
     resume_position: Option<&MongoResumePosition>,
+    empty_first_batch: bool,
     verify_before_open: &mut bool,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     metrics: &MongoDbCdcMetrics,
     consecutive_failures: &mut u32,
-    ready_tx: &mut Option<
-        tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
-    >,
-) -> Result<VerifiedCursorAttempt, ConnectorError> {
+    ready_tx: &mut ReadyTx,
+) -> Result<CursorAttempt, ConnectorError> {
     if *verify_before_open {
         match verify_reconnect_admission(
             db,
             config,
-            &admission.deployment_identity,
-            admission.collection_uuid,
+            admission,
             AdmissionPhase::BeforeCursorOpen,
             shutdown_rx,
             metrics,
@@ -277,9 +252,8 @@ pub(super) async fn open_verified_cursor(
         }
     }
 
-    let bootstrap = fresh_start && ready_tx.is_some() && resume_position.is_none();
-    let options = if bootstrap {
-        bootstrap_change_stream_options(config)
+    let options = if empty_first_batch {
+        bootstrap_change_stream_options(config, resume_position)
     } else {
         change_stream_options(config, resume_position)
     };
@@ -306,8 +280,7 @@ pub(super) async fn open_verified_cursor(
     match verify_reconnect_admission(
         db,
         config,
-        &admission.deployment_identity,
-        admission.collection_uuid,
+        admission,
         AdmissionPhase::AfterCursorOpen,
         shutdown_rx,
         metrics,
@@ -316,10 +289,7 @@ pub(super) async fn open_verified_cursor(
     )
     .await?
     {
-        AdmissionAttempt::Verified => {
-            *consecutive_failures = 0;
-            Ok(Ok((cursor, bootstrap)))
-        }
+        AdmissionAttempt::Verified => Ok(Ok(cursor)),
         AdmissionAttempt::Retry => {
             *verify_before_open = true;
             Ok(Err(ReconnectControl::Retry))

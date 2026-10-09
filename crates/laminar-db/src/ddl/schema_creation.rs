@@ -10,7 +10,7 @@ struct SchemaDependencies {
 use laminar_core::schema_binding::{SchemaBinding, SchemaDirection};
 use laminar_sql::parser::{SinkFrom, StreamingStatement};
 
-use crate::db::{canonical_object_name, exact_table_reference, LaminarDB};
+use crate::db::{canonical_object_name, LaminarDB};
 use crate::error::DbError;
 use crate::handle::ExecuteResult;
 
@@ -361,13 +361,7 @@ impl LaminarDB {
                 ))
             }
         };
-        let schema = {
-            let _catalog = self.topology_ddl_lock.read().await;
-            self.ctx
-                .table_provider(exact_table_reference(&input))
-                .await?
-                .schema()
-        };
+        let (schema, direct_mutation) = self.bound_sink_input_schema(&input).await?;
         let candidate = crate::connector_manager::SinkRegistration {
             name: name.clone(),
             input: input.clone(),
@@ -392,12 +386,13 @@ impl LaminarDB {
         );
         let mut sink = self.connector_registry.create_sink(&config, None)?;
         let contract = sink.contract(&config)?;
-        let carries_changelog = self
-            .connector_manager
-            .lock()
-            .streams()
-            .get(&input)
-            .is_some_and(|stream| stream.incremental);
+        let carries_changelog = direct_mutation
+            || self
+                .connector_manager
+                .lock()
+                .streams()
+                .get(&input)
+                .is_some_and(|stream| stream.incremental);
         crate::pipeline_lifecycle::admit_sink_contract(
             contract,
             self.config.delivery_guarantee,

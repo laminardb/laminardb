@@ -80,6 +80,78 @@ pub(super) fn admit_source_recovery_contract(
     Ok(())
 }
 
+/// The admitted consumer route of one configured source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SourceRoute {
+    Plain,
+    Temporal(TemporalSourceRole),
+    OrderedInterval(SourceInputMode),
+    DirectMutationSinks,
+}
+
+impl SourceRoute {
+    /// Whether rows on this route keep their keyed mutation metadata.
+    pub(super) fn keeps_keyed_mutations(self, contract: SourceContract) -> bool {
+        match self {
+            Self::DirectMutationSinks => true,
+            Self::Temporal(TemporalSourceRole::Right) => {
+                contract.input_mode == SourceInputMode::KeyedUpsert
+            }
+            Self::Temporal(TemporalSourceRole::Left) | Self::OrderedInterval(_) | Self::Plain => {
+                false
+            }
+        }
+    }
+}
+
+/// Validate a source contract for its admitted route before the connector performs I/O.
+pub(super) fn admit_routed_source(
+    contract: SourceContract,
+    route: SourceRoute,
+    has_primary_key: bool,
+    has_reserved_mutation_columns: bool,
+    delivery: DeliveryGuarantee,
+    checkpointing_enabled: bool,
+    runtime: RuntimeMode,
+) -> Result<(), &'static str> {
+    match route {
+        SourceRoute::DirectMutationSinks => {
+            if contract.input_mode != SourceInputMode::KeyedUpsert {
+                return Err(
+                    "direct keyed-mutation source contract changed after startup admission",
+                );
+            }
+            if !has_primary_key {
+                return Err(KEYED_SOURCE_PRIMARY_KEY);
+            }
+            admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
+        }
+        SourceRoute::OrderedInterval(mode) if mode == contract.input_mode => {
+            admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
+        }
+        SourceRoute::OrderedInterval(_) => {
+            Err("bounded interval source contract changed after startup admission")
+        }
+        SourceRoute::Temporal(role) => admit_temporal_source_contract(
+            contract,
+            role,
+            has_primary_key,
+            has_reserved_mutation_columns,
+            delivery,
+            checkpointing_enabled,
+            runtime,
+        ),
+        SourceRoute::Plain => admit_source_contract(
+            contract,
+            has_primary_key,
+            has_reserved_mutation_columns,
+            delivery,
+            checkpointing_enabled,
+            runtime,
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TemporalSourceRole {
     Left,
@@ -310,6 +382,8 @@ pub(super) struct SinkAdmissionContext<'a> {
     pub(super) delivery: DeliveryGuarantee,
     pub(super) runtime: RuntimeMode,
     pub(super) carries_changelog: bool,
+    /// Primary key of a direct keyed-mutation source input.
+    pub(super) mutation_key: Option<&'a [String]>,
     pub(super) checkpointing_enabled: bool,
     pub(super) checkpoint_storage_scope: CheckpointStorageScope,
 }
@@ -339,6 +413,7 @@ pub(super) type PipelineSink = (
 
 pub(super) struct PipelineSinkSetup {
     pub(super) sinks: Vec<PipelineSink>,
+    pub(super) direct_sinks: crate::direct_mutation::DirectSinkInputs,
     pub(super) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
     #[cfg(feature = "cluster")]
     pub(super) callback_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,

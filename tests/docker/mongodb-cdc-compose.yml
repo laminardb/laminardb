@@ -1,0 +1,64 @@
+# MongoDB CDC end-to-end fixtures: direct MongoDB -> LaminarDB -> PostgreSQL/MongoDB/Delta/files.
+#
+# Bring up:   docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
+# Tear down:  docker compose -f tests/docker/mongodb-cdc-compose.yml down -v
+#
+# Ports are host-side and must match crates/laminar-db/tests/mongodb_cdc_e2e.rs.
+# Every member advertises 127.0.0.1:<port>, which resolves both inside its container and from
+# the host through the identical published port.
+
+services:
+  mongo-rs:
+    # Single-member replica set: change streams and snapshot reads.
+    image: mongo:8.0
+    container_name: laminardb-mongo-rs
+    command: ["mongod", "--replSet", "rs0", "--port", "27117", "--bind_ip_all",
+              "--setParameter", "enableTestCommands=1"]
+    ports:
+      - "127.0.0.1:27117:27117"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--port", "27117", "--eval",
+             "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: '127.0.0.1:27117'}]}).ok }"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  mongo-rs3:
+    # Three-member replica set in one container, for election and failover tests.
+    image: mongo:8.0
+    container_name: laminardb-mongo-rs3
+    # Three mongod processes; the container lives while any member runs, so a test may kill one.
+    entrypoint:
+      - bash
+      - -c
+      - |
+        for port in 27201 27202 27203; do
+          mkdir -p /data/rs3-$$port
+          mongod --replSet rs3 --port $$port --bind_ip_all --dbpath /data/rs3-$$port --setParameter enableTestCommands=1 --logpath /data/rs3-$$port.log --fork
+        done
+        while pgrep -x mongod >/dev/null; do sleep 2; done
+    ports:
+      - "127.0.0.1:27201:27201"
+      - "127.0.0.1:27202:27202"
+      - "127.0.0.1:27203:27203"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--port", "27201", "--eval",
+             "try { rs.status().members.filter(m => m.health === 1).length === 3 ? 1 : quit(1) } catch (e) { rs.initiate({_id: 'rs3', members: [{_id: 0, host: '127.0.0.1:27201'}, {_id: 1, host: '127.0.0.1:27202'}, {_id: 2, host: '127.0.0.1:27203'}]}); quit(1) }"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+
+  postgres:
+    image: postgres:17
+    container_name: laminardb-cdc-postgres
+    environment:
+      POSTGRES_USER: laminar
+      POSTGRES_PASSWORD: laminar-test-secret
+      POSTGRES_DB: mirror
+    ports:
+      - "127.0.0.1:15433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "laminar", "-d", "mirror"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

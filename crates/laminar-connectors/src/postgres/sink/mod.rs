@@ -707,6 +707,21 @@ impl SinkConnector for PostgresSink {
         ))
     }
 
+    fn keyed_mutation_key(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Vec<String>>, ConnectorError> {
+        let cfg = if config.properties().is_empty() {
+            self.config.clone()
+        } else {
+            Self::decode_connector_config(config)?.0
+        };
+        // Changelog mode collapses each flush to one terminal `_op` per key, upserts `U` rows
+        // and deletes `D` rows by primary key only.
+        Ok((cfg.changelog_mode && cfg.write_mode == WriteMode::Upsert)
+            .then_some(cfg.primary_key_columns))
+    }
+
     async fn resolve_schema(
         &mut self,
         config: &ConnectorConfig,

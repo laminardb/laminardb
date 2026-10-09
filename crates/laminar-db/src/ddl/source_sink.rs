@@ -549,13 +549,20 @@ impl LaminarDB {
                 manager.streams().clone(),
             )
         };
+        sink_regs.insert(candidate.name.clone(), candidate.clone());
+        let direct_mutation_sources = self.validate_direct_mutation_routes(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            self.runtime_mode(),
+        )?;
         for input in std::iter::once(candidate.input.as_str()).chain(
             candidate
                 .query_inputs
                 .iter()
                 .map(std::string::String::as_str),
         ) {
-            if self.catalog.get_source(input).is_none() {
+            if self.catalog.get_source(input).is_none() || direct_mutation_sources.contains(input) {
                 continue;
             }
             if self
@@ -563,11 +570,10 @@ impl LaminarDB {
                 .is_some_and(|(contract, _)| contract.input_mode != SourceInputMode::AppendOnly)
             {
                 return Err(DbError::Config(format!(
-                    "sink '{}' cannot directly consume mutation source '{input}'; mutable sources are exclusive to admitted stateful routes", candidate.name
+                    "sink '{}' cannot directly consume mutation source '{input}'; mutable sources are exclusive to admitted stateful routes or plain direct keyed-mutation sinks", candidate.name
                 )));
             }
         }
-        sink_regs.insert(candidate.name.clone(), candidate.clone());
         self.validate_persisted_temporal_source_contracts(
             &source_regs,
             &sink_regs,

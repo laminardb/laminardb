@@ -1498,40 +1498,54 @@ max_out_of_orderness = "5s"</code></pre>
 
       <!-- MONGODB CDC SOURCE -->
       <h3 id="mongodb-cdc">MongoDB CDC Source</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/source.rs" target="_blank" rel="noopener">mongodb/source.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/source/mod.rs" target="_blank" rel="noopener">mongodb/source/mod.rs</a></div>
 
-      <p>Consumes fixed-collection MongoDB <a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">change streams</a> with byte-bounded backpressure, reconnect, and deployment- and collection-bound resume-token checkpoints. Fresh sources establish an exact empty bootstrap cut. Delivery is replayable at-least-once.</p>
+      <p>Reads one collection's <a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">change stream</a> and delivers it straight to sinks, with no broker in between. Byte-bounded backpressure, classified bounded reconnects, and deployment- and collection-bound resume-token checkpoints. Embedded and single-node server mode, at-least-once; cluster mode and exactly-once reject it.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">connection.uri</td><td><span class="field-required">required</span></td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">connection.uri</td><td><span class="field-required">required</span></td><td>MongoDB connection string (replica set or sharded cluster)</td></tr>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
           <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Fixed collection name; the collection must exist before source startup</td></tr>
-          <tr><td class="field-name">full.document.mode</td><td class="field-default">delta</td><td>delta or required</td></tr>
-          <tr><td class="field-name">pipeline</td><td class="field-default">[]</td><td>JSON array of at most 64 <code>$match</code> stages, bounded to 256 KiB</td></tr>
-          <tr><td class="field-name">max.buffered.bytes</td><td class="field-default">67108864</td><td>Retained decoded-byte limit across the reader queue and poll buffer (1 MiB to 4 GiB)</td></tr>
+          <tr><td class="field-name">output.mode</td><td class="field-default">history</td><td><code>history</code>: one immutable record per change event (append-only). <code>document</code>: post-image puts and key-only deletes for keyed mirrors</td></tr>
+          <tr><td class="field-name">full.document.mode</td><td class="field-default">delta</td><td>delta or required; <code>document</code> mode needs required</td></tr>
+          <tr><td class="field-name">snapshot.mode</td><td class="field-default">never</td><td><code>initial</code> copies the collection at a committed point in time, then streams every later change (replica sets only)</td></tr>
+          <tr><td class="field-name">objectid.columns</td><td></td><td><code>document</code> mode: VARCHAR columns that hold ObjectIds as lowercase hex</td></tr>
+          <tr><td class="field-name">document.json.column</td><td></td><td><code>document</code> mode: VARCHAR column receiving the whole document as canonical Extended JSON</td></tr>
+          <tr><td class="field-name">pipeline</td><td class="field-default">[]</td><td>JSON array of at most 64 <code>$match</code> stages, bounded to 256 KiB; history mode without a snapshot only</td></tr>
+          <tr><td class="field-name">max.buffered.bytes</td><td class="field-default">67108864</td><td>Retained BSON-byte limit across the reader queue and poll buffer (1 MiB to 4 GiB)</td></tr>
         </tbody>
       </table>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Full document modes:</strong>
         <code>delta</code> sends the update description only (default).
-        <code>required</code> needs <code>changeStreamPreAndPostImages</code> enabled on the collection.
+        <code>required</code> needs <code>changeStreamPreAndPostImages</code> enabled on the collection; a missing image stops the source and is never treated as a delete.
       </p>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
-        <strong>CDC envelope schema:</strong>
-        <code>_namespace</code> (Utf8), <code>_op</code> (Utf8: I/U/R/D/DROP),
-        <code>_document_key</code> (Utf8), <code>_cluster_time_s</code> (UInt32),
-        <code>_cluster_time_i</code> (UInt32), <code>_wall_time_ms</code> (Timestamp(ms)),
-        <code>_full_document</code> (Utf8, nullable), <code>_update_desc</code> (Utf8, nullable),
-        <code>_resume_token</code> (Utf8).
+        <strong>History schema (version 1):</strong>
+        <code>event_id</code>, <code>event_version</code>, <code>operation</code>, <code>database</code>,
+        <code>collection</code>, <code>collection_uuid</code>, <code>document_key</code>,
+        <code>full_document</code>, <code>update_description</code>, <code>event_details</code>,
+        <code>resume_token</code>, <code>cluster_time_seconds</code>, <code>cluster_time_increment</code>,
+        <code>wall_time</code>, <code>txn_number</code>, <code>lsid</code>, <code>snapshot_id</code>.
+        Document values are canonical Extended JSON v2. Operation names are data: no history column
+        makes a sink delete rows.
+      </p>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">
+        <strong>Document mode:</strong> the <code>PRIMARY KEY</code> must be the document key
+        (<code>_id</code>, plus shard-key fields); non-key columns are nullable and map exactly or
+        fail. Sinks must be keyed on the same columns: PostgreSQL <code>upsert</code> with
+        <code>changelog.mode</code>, or Delta <code>write.mode=upsert</code>. Filters, streams,
+        joins and aggregates over a document source are rejected.
       </p>
 
       <!-- MONGODB SINK -->
       <h3 id="mongodb-sink">MongoDB Sink</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/sink.rs" target="_blank" rel="noopener">mongodb/sink.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/sink/mod.rs" target="_blank" rel="noopener">mongodb/sink/mod.rs</a></div>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
@@ -1541,6 +1555,7 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Target collection name</td></tr>
           <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, cdc_replay</td></tr>
           <tr><td class="field-name">write.mode.key_fields</td><td></td><td>Comma-separated top-level keys; required for upsert</td></tr>
+          <tr><td class="field-name">replay.source.namespace</td><td></td><td><code>cdc_replay</code>: the source <code>database.collection</code> whose events apply to this target</td></tr>
           <tr><td class="field-name">flush.interval.ms</td><td class="field-default">250</td><td>Max time between flushes (ms)</td></tr>
           <tr><td class="field-name">sink.write.timeout.ms</td><td class="field-default">30000</td><td>End-to-end write deadline</td></tr>
         </tbody>
@@ -1550,7 +1565,7 @@ max_out_of_orderness = "5s"</code></pre>
         <strong>Write modes:</strong>
         <code>insert</code> is append-only.
         <code>upsert</code> replaces documents by the fields listed in <code>write.mode.key_fields</code>.
-        <code>cdc_replay</code> routes by the <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
+        <code>cdc_replay</code> applies MongoDB CDC history records: insert, replace and snapshot replace by document key, update applies the post-image (or the update description), delete deletes by key, metadata events write nothing, and destructive lifecycle events stop the sink.
         Writes are ordered and majority-journaled; these correctness settings are not user-tunable. Time series collections only support <code>insert</code>.
       </p>
 

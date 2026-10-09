@@ -506,6 +506,7 @@ impl LaminarDB {
         pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
         temporal_source_roles: FxHashMap<String, TemporalSourceRole>,
         ordered_interval_admissions: OrderedIntervalAdmissions,
+        direct_mutation_sources: rustc_hash::FxHashSet<String>,
         runtime_shutdown: tokio_util::sync::CancellationToken,
         #[cfg(feature = "cluster")] topology: Option<crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
@@ -622,6 +623,7 @@ impl LaminarDB {
             &source_regs,
             &temporal_source_roles,
             &ordered_interval_admissions.source_modes,
+            &direct_mutation_sources,
             checkpointing_enabled,
             runtime_mode,
             prom_registry.as_ref(),
@@ -637,6 +639,7 @@ impl LaminarDB {
                 &sink_regs,
                 stream_output_schemas,
                 &resolved_stream_outputs.changelog_carrying,
+                &direct_mutation_sources,
                 runtime_mode,
                 checkpointing_enabled,
                 pipeline_checkpoint_timeout,

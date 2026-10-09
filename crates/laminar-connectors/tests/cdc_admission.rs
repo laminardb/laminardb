@@ -33,7 +33,11 @@ fn postgres_cdc_admission_rejects_unexecuted_options_and_reference_use() {
 
 #[cfg(feature = "mongodb-cdc")]
 #[test]
-fn mongodb_cdc_admission_uses_runtime_options_and_rejects_removed_ones() {
+fn mongodb_cdc_admission_declares_history_and_document_contracts() {
+    use laminar_connectors::connector::{
+        SourceConsistency, SourceInputMode, SourceRowPositionCapability, SourceTopology,
+    };
+
     let registry = ConnectorRegistry::new();
     laminar_connectors::mongodb::register_mongodb_cdc_source(&registry).unwrap();
     let mut config = ConnectorConfig::new("mongodb-cdc");
@@ -43,8 +47,33 @@ fn mongodb_cdc_admission_uses_runtime_options_and_rejects_removed_ones() {
     config.set("max.buffered.bytes", "33554432");
 
     let source = registry.create_source(&config, None).unwrap();
-    let error = source.contract(&config).unwrap_err();
-    assert!(error.to_string().contains("raw JSON change envelope"));
+    let history = source.contract(&config).unwrap();
+    assert_eq!(history.input_mode, SourceInputMode::AppendOnly);
+    assert_eq!(history.consistency, SourceConsistency::Replayable);
+    assert_eq!(history.topology, SourceTopology::Singleton);
+    assert!(!history.is_exact_delivery_certified());
+
+    let mut document = config.clone();
+    document.set("output.mode", "document");
+    document.set("full.document.mode", "required");
+    let keyed = source.contract(&document).unwrap();
+    assert_eq!(keyed.input_mode, SourceInputMode::KeyedUpsert);
+    assert_eq!(
+        keyed.row_positions,
+        SourceRowPositionCapability::OrderedDeterministic
+    );
+
+    let mut snapshot = document.clone();
+    snapshot.set("snapshot.mode", "initial");
+    assert_eq!(
+        source.contract(&snapshot).unwrap().consistency,
+        SourceConsistency::CommitCoupled
+    );
+
+    let mut delta_document = document;
+    delta_document.set("full.document.mode", "delta");
+    let error = source.contract(&delta_document).unwrap_err();
+    assert!(error.to_string().contains("full.document.mode=required"));
 
     let mut removed = config;
     removed.set("max.buffered.events", "4096");

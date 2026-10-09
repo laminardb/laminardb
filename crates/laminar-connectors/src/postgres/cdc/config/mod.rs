@@ -27,6 +27,7 @@ const WORKING_SET_STAGES: usize = 3;
 
 const ALLOWED_CONFIG_KEYS: &[&str] = &[
     "_arrow_schema",
+    "_primary_key_columns",
     "database",
     "host",
     "laminar.source.name",

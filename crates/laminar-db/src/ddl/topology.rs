@@ -148,6 +148,12 @@ impl LaminarDB {
                 self.runtime_mode(),
             )
             .await?;
+        let direct_mutation_sources = self.validate_direct_mutation_routes(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            self.runtime_mode(),
+        )?;
         let query_references = crate::sql_analysis::extract_table_references(query_sql);
         for input in &query_references {
             self.validate_registered_mutation_source_admission(
@@ -155,6 +161,7 @@ impl LaminarDB {
                 &source_regs,
                 &temporal_source_roles,
                 &admissions,
+                &direct_mutation_sources,
             )?;
         }
         let mutable_interval = admissions.joins.contains_key(name);

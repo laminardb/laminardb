@@ -290,15 +290,16 @@ impl LaminarDB {
         Ok(Some((contract, connector_schema)))
     }
 
-    /// Require every configured mutation source to be owned by exactly one certified stateful
-    /// route. The role-specific validators also prove consumer exclusivity; this closes sources
-    /// that are otherwise absent from both role maps (for example a direct copy or sink).
+    /// Require every configured mutation source to be owned by exactly one certified route. The
+    /// role-specific validators also prove consumer exclusivity; this closes sources that are
+    /// otherwise absent from every route (for example a stream copy or a filtered sink).
     pub(crate) fn validate_registered_mutation_source_admission(
         &self,
         source_name: &str,
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
         ordered_interval_admissions: &OrderedIntervalAdmissions,
+        direct_mutation_sources: &rustc_hash::FxHashSet<String>,
     ) -> Result<(), DbError> {
         let Some((contract, _)) =
             self.resolve_registered_source_contract(source_name, source_regs)?
@@ -313,11 +314,17 @@ impl LaminarDB {
             && contract.input_mode == SourceInputMode::KeyedUpsert;
         let ordered_interval =
             ordered_interval_admissions.source_modes.get(source_name) == Some(&contract.input_mode);
-        if temporal_right ^ ordered_interval {
+        let direct_sinks = direct_mutation_sources.contains(source_name);
+        if [temporal_right, ordered_interval, direct_sinks]
+            .into_iter()
+            .filter(|admitted| *admitted)
+            .count()
+            == 1
+        {
             return Ok(());
         }
         Err(DbError::Config(format!(
-            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right or bounded interval route"
+            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right, bounded interval, or direct keyed-mutation sink route"
         )))
     }
 

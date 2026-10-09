@@ -281,13 +281,14 @@ pub(crate) use cluster_faults::report_cluster_terminal_halt;
 #[cfg(feature = "cluster")]
 use cluster_faults::{queue_owned_cluster_compute_fault, report_cluster_compute_fault};
 mod source_admission;
-pub(crate) use source_admission::{admit_sink_contract, validate_source_recovery_assignment};
 use source_admission::{
-    admit_source_contract, admit_source_recovery_contract, admit_temporal_source_contract,
-    has_only_ordered_interval_consumers, has_only_temporal_right_consumers,
-    OrderedIntervalAdmissions, PipelineRecoveryState, PipelineSinkSetup, PipelineWatermarks,
-    PreparedSink, SinkAdmissionContext, TemporalSourceRole,
+    admit_routed_source, admit_source_contract, admit_source_recovery_contract,
+    admit_temporal_source_contract, has_only_ordered_interval_consumers,
+    has_only_temporal_right_consumers, OrderedIntervalAdmissions, PipelineRecoveryState,
+    PipelineSinkSetup, PipelineWatermarks, PreparedSink, SinkAdmissionContext, SourceRoute,
+    TemporalSourceRole,
 };
+pub(crate) use source_admission::{admit_sink_contract, validate_source_recovery_assignment};
 mod watermarks;
 use watermarks::{
     physical_recovered_input_channel_progress, recovered_source_watermark,
@@ -320,6 +321,7 @@ use supervision::{
 };
 mod authority;
 mod cluster_startup;
+mod direct_mutation_routes;
 mod operator_graph;
 mod reference_tables;
 mod runtime_configuration;

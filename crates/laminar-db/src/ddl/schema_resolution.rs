@@ -63,7 +63,10 @@ impl LaminarDB {
                 None,
             ));
         };
-        let config = resolution_config(resolved)?;
+        let mut config = resolution_config(resolved)?;
+        if let Some(definition) = explicit.as_ref() {
+            set_primary_key_columns(&mut config, &definition.primary_key);
+        }
         let binding = match supplied_binding() {
             Some(binding) => {
                 validate_supplied(&binding, &config, SchemaDirection::Source)?;
@@ -133,7 +136,10 @@ impl LaminarDB {
             .map_err(|error| {
                 DbError::Config(format!("sink input '{input}' cannot be bound: {error}"))
             })?;
-        let input_schema = provider.schema();
+        let input_schema = match self.keyed_mutation_source(&input)? {
+            Some(source) => crate::direct_mutation::sink_input_schema(&source.schema),
+            None => provider.schema(),
+        };
         config.set(
             "_arrow_schema",
             crate::pipeline_callback::encode_arrow_schema(&input_schema),
@@ -166,6 +172,13 @@ impl LaminarDB {
                     config.connector_type()
                 ))
             })
+    }
+}
+
+/// Expose a declared `PRIMARY KEY` to source connectors that key their output by it.
+pub(crate) fn set_primary_key_columns(config: &mut ConnectorConfig, primary_key: &[String]) {
+    if !primary_key.is_empty() {
+        config.set("_primary_key_columns", primary_key.join(","));
     }
 }
 

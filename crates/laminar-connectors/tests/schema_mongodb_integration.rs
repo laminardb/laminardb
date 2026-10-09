@@ -241,7 +241,8 @@ async fn cdc_factory_resolves_empty_collection_identity_without_opening_a_change
         binding.value.as_ref().unwrap().format,
         "mongodb_change_stream"
     );
-    assert!(binding.logical.index_of("_document_key").is_ok());
+    assert!(binding.logical.index_of("document_key").is_ok());
+    assert!(binding.logical.index_of("_op").is_err());
     assert_eq!(
         database
             .collection::<mongodb::bson::Document>(name)
@@ -250,4 +251,52 @@ async fn cdc_factory_resolves_empty_collection_identity_without_opening_a_change
             .unwrap(),
         0
     );
+}
+
+#[tokio::test]
+#[ignore = "requires LAMINAR_SCHEMA_TEST_MONGO"]
+async fn document_projection_binds_declared_keyed_columns_and_rejects_unsafe_ones() {
+    let database = database().await;
+    let name = "schema_cdc_document";
+    let _ = database
+        .collection::<mongodb::bson::Document>(name)
+        .drop()
+        .await;
+    database.create_collection(name).await.unwrap();
+    let registry = registry();
+    let mut config = config("mongodb-cdc", name);
+    config.set("output.mode", "document");
+    config.set("full.document.mode", "required");
+    config.set("objectid.columns", "_id");
+    config.set("_primary_key_columns", "_id");
+    let declared = Arc::new(Schema::new(vec![
+        Field::new("_id", DataType::Utf8, false),
+        Field::new("amount", DataType::Decimal128(18, 2), true),
+    ]));
+    let binding = registry
+        .resolve_source_schema(&config, Some(declared.clone()))
+        .await
+        .unwrap();
+    assert_eq!(binding.logical, *declared);
+    assert_eq!(
+        binding.value.as_ref().unwrap().format,
+        "mongodb_change_stream"
+    );
+
+    let strict = Arc::new(Schema::new(vec![
+        Field::new("_id", DataType::Utf8, false),
+        Field::new("amount", DataType::Decimal128(18, 2), false),
+    ]));
+    let error = registry
+        .resolve_source_schema(&config, Some(strict))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must be nullable"), "{error}");
+
+    config.set("_primary_key_columns", "amount");
+    let error = registry
+        .resolve_source_schema(&config, Some(declared))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("_id"), "{error}");
 }

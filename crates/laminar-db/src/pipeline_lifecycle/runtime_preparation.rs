@@ -61,6 +61,18 @@ fn prepare_subscription_output(
     crate::subscription::cluster::ClusterSubscriptionOutputState::new(certificates, Some(process))
 }
 
+/// Filtered sinks awaiting compilation, and whether any sink is checkpoint-committable.
+fn sink_callback_flags(sinks: &[super::source_admission::PipelineSink]) -> (usize, bool) {
+    let pending_filters = sinks
+        .iter()
+        .filter(|(_, _, filter_sql, _, _, _)| filter_sql.is_some())
+        .count();
+    let committable = sinks
+        .iter()
+        .any(|(_, handle, _, _, _, _)| handle.checkpoint_committable());
+    (pending_filters, committable)
+}
+
 impl LaminarDB {
     pub(super) async fn prepare_pipeline_runtime(
         &self,
@@ -73,6 +85,7 @@ impl LaminarDB {
     ) -> Result<PreparedPipelineRuntime, DbError> {
         let PipelineSinkSetup {
             sinks,
+            direct_sinks,
             sink_event_rx,
             #[cfg(feature = "cluster")]
             callback_controller,
@@ -95,10 +108,8 @@ impl LaminarDB {
             config.max_replay_buffer_bytes,
         );
 
-        let pending_sink_filter_compiles = sinks
-            .iter()
-            .filter(|(_, _, filter_sql, _, _, _)| filter_sql.is_some())
-            .count();
+        let (pending_sink_filter_compiles, checkpoint_committable_sinks) =
+            sink_callback_flags(&sinks);
         let CallbackCollections {
             source_name_arcs,
             source_frontiers_buf,
@@ -118,9 +129,6 @@ impl LaminarDB {
         let (checkpoint_complete_tx, checkpoint_complete_rx) =
             crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(16);
 
-        let checkpoint_committable_sinks = sinks
-            .iter()
-            .any(|(_, handle, _, _, _, _)| handle.checkpoint_committable());
         let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (
             epoch_allocator,
@@ -191,6 +199,7 @@ impl LaminarDB {
             graph,
             stream_entries,
             sinks,
+            direct_sinks,
             owned_sink_handles: Arc::clone(&self.owned_sink_handles),
             watermark_states,
             source_entries_for_wm: source_entries,

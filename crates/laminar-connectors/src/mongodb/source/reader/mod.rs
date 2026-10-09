@@ -1,73 +1,137 @@
-//! Bounded change-stream reading, retry, and cancellation ownership.
+//! Bounded change-stream reading, snapshot bootstrap, retry, and cancellation ownership.
 
 use std::sync::Arc;
 
+use mongodb::bson::{RawDocumentBuf, Timestamp};
+use mongodb::change_stream::event::ResumeToken;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+use super::super::change_event::ChangeOperation;
+use super::buffering::{buffered_retained_bytes, BufferedMongoPayload, ChangeRecord};
+use super::checkpoint::{canonical_resume_token, MongoCheckpointPosition, SnapshotCut};
+use super::decoding::{event_operation, event_token};
 use super::{
-    canonical_resume_token, mongo_event_retained_bytes, mongo_high_watermark_retained_bytes,
-    observe_mongodb_admission, parse_change_stream_event, BufferedMongoEvent, ChangeStreamTx,
-    ConnectorError, MongoAdmissionObservation, MongoCollectionObservation, MongoDbCdcMetrics,
-    MongoDbChangeEvent, MongoDbSourceConfig, MongoDeploymentIdentity, MongoReaderFailure,
-    MongoReaderReady, MongoResumePosition, OperationType, CURSOR_MAX_AWAIT_TIME,
+    observe_mongodb_admission, BufferedMongoEvent, ChangeStreamTx, ConnectorError,
+    MongoAdmissionObservation, MongoCollectionObservation, MongoDbCdcMetrics, MongoDbSourceConfig,
+    MongoDeploymentIdentity, MongoReaderFailure, MongoReaderReady, CURSOR_MAX_AWAIT_TIME,
     MAX_MONGODB_WIRE_EVENT_BYTES,
 };
 
-#[cfg(feature = "mongodb-cdc")]
+mod failure;
 mod reconnect;
-#[cfg(feature = "mongodb-cdc")]
+mod snapshot;
+
+use failure::{classify_stream_error, ReadFailure};
 use reconnect::{
     open_verified_cursor, prepare_reader_admission, ReaderAdmission, ReconnectControl,
 };
 
 /// Maximum consecutive failures before the reader gives up.
-#[cfg(feature = "mongodb-cdc")]
 const MAX_FAILURES: u32 = 10;
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) const READER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[cfg(feature = "mongodb-cdc")]
+pub(super) type MongoChangeStream = mongodb::change_stream::ChangeStream<RawDocumentBuf>;
+pub(super) type ReadyTx =
+    Option<tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>>;
+
+/// Driver resume option for the next cursor open.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum MongoResumePosition {
+    ResumeAfter(ResumeToken),
+    StartAfter(ResumeToken),
+    /// Inclusive: every event at or after this cluster time.
+    StartAt(Timestamp),
+}
+
+/// Where a reader generation begins.
+#[derive(Clone, Debug)]
+pub(super) enum ReaderStart {
+    /// Changes only, from the exclusive post-batch token of an empty initial open.
+    FreshChanges,
+    /// Copy the collection at a new snapshot time, then stream from that time.
+    FreshSnapshot,
+    /// Continue a durable snapshot scan, then stream from its snapshot time.
+    Snapshot(SnapshotCut),
+    /// Continue streaming from a stored position.
+    Stream(MongoResumePosition),
+}
+
+/// The reader's half of the bounded reader-to-poll queue.
+pub(super) struct ReaderOutput {
+    pub(super) tx: ChangeStreamTx,
+    pub(super) data_ready: Arc<Notify>,
+    pub(super) metrics: Arc<MongoDbCdcMetrics>,
+    pub(super) byte_budget: Arc<Semaphore>,
+    pub(super) max_buffered_bytes: usize,
+}
+
+impl ReaderOutput {
+    /// Charge one item to the shared byte budget and enqueue it. `Ok(false)` means shutdown.
+    pub(super) async fn send(
+        &self,
+        payload: BufferedMongoPayload,
+        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<bool, ConnectorError> {
+        let retained_bytes = buffered_retained_bytes(&payload)?;
+        let Some(permit) = acquire_mongo_byte_permit(
+            retained_bytes,
+            &self.byte_budget,
+            self.max_buffered_bytes,
+            shutdown_rx,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        if !send_event_or_shutdown(
+            &self.tx,
+            BufferedMongoEvent::new(payload, permit),
+            shutdown_rx,
+        )
+        .await
+        {
+            return Ok(false);
+        }
+        self.data_ready.notify_one();
+        Ok(true)
+    }
+}
+
+pub(super) enum ChangeStreamRead {
+    Stop,
+    Reconnect,
+}
+
+pub(super) fn reader_stopping(shutdown_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
+    *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err()
+}
+
+pub(super) fn namespace(config: &MongoDbSourceConfig) -> String {
+    format!("{}.{}", config.database, config.collection)
+}
+
 fn publish_reader_ready(
-    ready_tx: &mut Option<
-        tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
-    >,
-    initial_resume_token: &mut Option<String>,
+    ready_tx: &mut ReadyTx,
+    initial_position: &mut Option<MongoCheckpointPosition>,
     admission: &ReaderAdmission,
 ) {
     if let Some(ready_tx) = ready_tx.take() {
         let _ = ready_tx.send(Ok(MongoReaderReady {
-            initial_resume_token: initial_resume_token.take(),
+            initial_position: initial_position.take(),
             collection_uuid: admission.collection_uuid,
             deployment_identity: admission.deployment_identity.clone(),
         }));
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
-fn report_reader_stopped_before_ready(
-    ready_tx: Option<tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>>,
-) {
-    if let Some(ready_tx) = ready_tx {
-        let _ = ready_tx.send(Err(MongoReaderFailure::Read(
-            "change stream reader was shut down before the cursor opened".into(),
-        )));
+pub(super) fn report_mongo_reader_admission_error(ready_tx: &mut ReadyTx, error: &ConnectorError) {
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = ready_tx.send(Err(MongoReaderFailure::from_connector(error)));
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
-pub(super) enum ChangeStreamRead {
-    Stop,
-    Reconnect,
-}
-
-#[cfg(feature = "mongodb-cdc")]
-pub(super) fn reader_stopping(shutdown_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
-    *shutdown_rx.borrow() || shutdown_rx.has_changed().is_err()
-}
-
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn change_stream_options(
     config: &MongoDbSourceConfig,
     position: Option<&MongoResumePosition>,
@@ -85,35 +149,32 @@ pub(super) fn change_stream_options(
     match position {
         Some(MongoResumePosition::ResumeAfter(token)) => options.resume_after = Some(token.clone()),
         Some(MongoResumePosition::StartAfter(token)) => options.start_after = Some(token.clone()),
+        Some(MongoResumePosition::StartAt(at)) => options.start_at_operation_time = Some(*at),
         None => {}
     }
     options
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn bootstrap_change_stream_options(
     config: &MongoDbSourceConfig,
+    position: Option<&MongoResumePosition>,
 ) -> mongodb::options::ChangeStreamOptions {
-    let mut options = change_stream_options(config, None);
+    let mut options = change_stream_options(config, position);
     // MongoDB guarantees an empty firstBatch for batchSize=0, so its PBRT is an exact opening
     // cut and cannot skip concurrently buffered events.
     options.batch_size = Some(0);
     options
 }
 
-#[cfg(feature = "mongodb-cdc")]
+/// Forward one opened cursor until shutdown, invalidation, or a reconnectable failure.
+#[allow(clippy::too_many_lines)] // PERF: one getMore/forward kernel; splitting fragments its state.
 pub(super) async fn forward_change_stream(
-    cursor: &mut mongodb::change_stream::ChangeStream<
-        mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
-    >,
+    cursor: &mut MongoChangeStream,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     resume_position: &mut Option<MongoResumePosition>,
-    tx: &ChangeStreamTx,
-    data_ready: &Notify,
+    output: &ReaderOutput,
     consecutive_failures: &mut u32,
-    byte_budget: &Arc<Semaphore>,
-    max_buffered_bytes: usize,
-    metrics: &MongoDbCdcMetrics,
+    namespace: &str,
 ) -> Result<ChangeStreamRead, ConnectorError> {
     loop {
         if reader_stopping(shutdown_rx) {
@@ -130,32 +191,41 @@ pub(super) async fn forward_change_stream(
         }
 
         match next {
-            Ok(Some(event)) => {
+            Ok(Some(raw)) => {
                 *consecutive_failures = 0;
-                let event_token = event.id.clone();
-                let wire_bytes = change_stream_wire_bytes(&event)?;
-                metrics.record_bytes(u64::try_from(wire_bytes).unwrap_or(u64::MAX));
-                let change_event = parse_change_stream_event(&event)?;
-                let invalidated = change_event.operation_type == OperationType::Invalidate;
-                let Some(change_event) = acquire_mongo_event_ownership(
-                    change_event,
-                    byte_budget,
-                    max_buffered_bytes,
-                    shutdown_rx,
-                )
-                .await?
-                else {
-                    return Ok(ChangeStreamRead::Stop);
+                let wire_bytes = raw.as_bytes().len();
+                if wire_bytes > MAX_MONGODB_WIRE_EVENT_BYTES {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "MongoDB CDC event exceeds the supported unsplit BSON bound: \
+                         event={wire_bytes}, limit={MAX_MONGODB_WIRE_EVENT_BYTES}"
+                    )));
+                }
+                output
+                    .metrics
+                    .record_bytes(u64::try_from(wire_bytes).unwrap_or(u64::MAX));
+                let operation = event_operation(&raw)?;
+                let token = canonical_resume_token(&event_token(&raw)?)?;
+                let invalidated = operation == ChangeOperation::Invalidate;
+                let event_resume_token: ResumeToken = serde_json::from_str(&token)
+                    .map_err(|error| ConnectorError::ReadError(format!("resume token: {error}")))?;
+                let record = ChangeRecord {
+                    raw,
+                    token,
+                    operation,
                 };
-                if !send_event_or_shutdown(tx, change_event, shutdown_rx).await {
+                if !output
+                    .send(BufferedMongoPayload::Change(record), shutdown_rx)
+                    .await?
+                {
                     return Ok(ChangeStreamRead::Stop);
                 }
                 *resume_position = Some(if invalidated {
-                    MongoResumePosition::StartAfter(event_token)
+                    MongoResumePosition::StartAfter(event_resume_token)
                 } else {
-                    MongoResumePosition::ResumeAfter(cursor.resume_token().unwrap_or(event_token))
+                    MongoResumePosition::ResumeAfter(
+                        cursor.resume_token().unwrap_or(event_resume_token),
+                    )
                 });
-                data_ready.notify_one();
                 if invalidated {
                     return Ok(ChangeStreamRead::Reconnect);
                 }
@@ -172,25 +242,20 @@ pub(super) async fn forward_change_stream(
                             Some(MongoResumePosition::ResumeAfter(current)) => {
                                 requires_start_after || current != &token
                             }
-                            Some(MongoResumePosition::StartAfter(_)) | None => true,
+                            Some(
+                                MongoResumePosition::StartAfter(_)
+                                | MongoResumePosition::StartAt(_),
+                            )
+                            | None => true,
                         };
                         if changed {
-                            let encoded = canonical_post_batch_token(&token)?;
-                            let Some(marker) = acquire_mongo_high_watermark_ownership(
-                                encoded,
+                            let marker = BufferedMongoPayload::HighWatermark {
+                                token: canonical_post_batch_token(&token)?,
                                 requires_start_after,
-                                byte_budget,
-                                max_buffered_bytes,
-                                shutdown_rx,
-                            )
-                            .await?
-                            else {
-                                return Ok(ChangeStreamRead::Stop);
                             };
-                            if !send_event_or_shutdown(tx, marker, shutdown_rx).await {
+                            if !output.send(marker, shutdown_rx).await? {
                                 return Ok(ChangeStreamRead::Stop);
                             }
-                            data_ready.notify_one();
                         }
                         *resume_position = Some(if requires_start_after {
                             MongoResumePosition::StartAfter(token)
@@ -205,38 +270,18 @@ pub(super) async fn forward_change_stream(
                 }
                 *consecutive_failures = 0;
             }
-            Err(error) => {
-                tracing::error!(%error, "change stream error");
-                return Ok(ChangeStreamRead::Reconnect);
-            }
+            Err(error) => match classify_stream_error(&error, namespace) {
+                ReadFailure::Transient(message) => {
+                    tracing::warn!(error = %message, "change stream read failed; reconnecting");
+                    return Ok(ChangeStreamRead::Reconnect);
+                }
+                ReadFailure::Permanent(error) => return Err(error),
+            },
         }
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
-fn change_stream_wire_bytes(
-    event: &mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
-) -> Result<usize, ConnectorError> {
-    let wire_bytes = mongodb::bson::to_vec(event)
-        .map_err(|error| {
-            ConnectorError::ReadError(format!(
-                "serialize change stream event for byte accounting: {error}"
-            ))
-        })?
-        .len();
-    if wire_bytes > MAX_MONGODB_WIRE_EVENT_BYTES {
-        return Err(ConnectorError::ReadError(format!(
-            "MongoDB CDC wire event exceeds the supported unsplit BSON bound: event={wire_bytes}, \
-             limit={MAX_MONGODB_WIRE_EVENT_BYTES}"
-        )));
-    }
-    Ok(wire_bytes)
-}
-
-#[cfg(feature = "mongodb-cdc")]
-fn canonical_post_batch_token(
-    token: &mongodb::change_stream::event::ResumeToken,
-) -> Result<String, ConnectorError> {
+fn canonical_post_batch_token(token: &ResumeToken) -> Result<String, ConnectorError> {
     let encoded = serde_json::to_string(token).map_err(|error| {
         ConnectorError::ReadError(format!(
             "serialize MongoDB post-batch resume token: {error}"
@@ -247,7 +292,6 @@ fn canonical_post_batch_token(
     })
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn send_event_or_shutdown(
     tx: &ChangeStreamTx,
     event: BufferedMongoEvent,
@@ -269,47 +313,6 @@ pub(super) async fn send_event_or_shutdown(
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
-pub(super) async fn acquire_mongo_event_ownership(
-    event: MongoDbChangeEvent,
-    byte_budget: &Arc<Semaphore>,
-    max_buffered_bytes: usize,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-) -> Result<Option<BufferedMongoEvent>, ConnectorError> {
-    let retained_bytes = mongo_event_retained_bytes(&event)?;
-    let Some(byte_permit) =
-        acquire_mongo_byte_permit(retained_bytes, byte_budget, max_buffered_bytes, shutdown_rx)
-            .await?
-    else {
-        return Ok(None);
-    };
-
-    Ok(Some(BufferedMongoEvent::new(event, byte_permit)))
-}
-
-#[cfg(feature = "mongodb-cdc")]
-pub(super) async fn acquire_mongo_high_watermark_ownership(
-    token: String,
-    requires_start_after: bool,
-    byte_budget: &Arc<Semaphore>,
-    max_buffered_bytes: usize,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-) -> Result<Option<BufferedMongoEvent>, ConnectorError> {
-    let retained_bytes = mongo_high_watermark_retained_bytes(token.capacity())?;
-    let Some(byte_permit) =
-        acquire_mongo_byte_permit(retained_bytes, byte_budget, max_buffered_bytes, shutdown_rx)
-            .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(BufferedMongoEvent::high_watermark(
-        token,
-        requires_start_after,
-        byte_permit,
-    )))
-}
-
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn acquire_mongo_byte_permit(
     retained_bytes: usize,
     byte_budget: &Arc<Semaphore>,
@@ -319,18 +322,16 @@ pub(super) async fn acquire_mongo_byte_permit(
     if reader_stopping(shutdown_rx) {
         return Ok(None);
     }
-    if retained_bytes > max_buffered_bytes {
-        return Err(ConnectorError::ReadError(format!(
-            "MongoDB CDC decoded item exceeds the hard byte bound: item={retained_bytes}, \
-             limit={max_buffered_bytes}"
-        )));
-    }
-    let permits = u32::try_from(retained_bytes).map_err(|_| {
-        ConnectorError::ReadError(format!(
-            "MongoDB CDC decoded item exceeds the hard byte bound: item={retained_bytes}, \
-             limit={max_buffered_bytes}"
+    let too_large = || {
+        ConnectorError::ConfigurationError(format!(
+            "MongoDB CDC item exceeds the hard byte bound: item={retained_bytes}, \
+             limit={max_buffered_bytes}; raise max.buffered.bytes"
         ))
-    })?;
+    };
+    if retained_bytes > max_buffered_bytes {
+        return Err(too_large());
+    }
+    let permits = u32::try_from(retained_bytes).map_err(|_| too_large())?;
     let byte_permit = tokio::select! {
         biased;
         _ = shutdown_rx.changed() => return Ok(None),
@@ -341,7 +342,6 @@ pub(super) async fn acquire_mongo_byte_permit(
     Ok(Some(byte_permit))
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn retry_interrupted(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
     delay: std::time::Duration,
@@ -352,7 +352,6 @@ pub(super) async fn retry_interrupted(
     }
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn parse_change_stream_pipeline(
     pipeline: &[serde_json::Value],
 ) -> Result<Vec<mongodb::bson::Document>, ConnectorError> {
@@ -369,7 +368,6 @@ pub(super) fn parse_change_stream_pipeline(
         .collect()
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn verify_mongodb_collection_uuid(
     expected: Uuid,
     observed: Uuid,
@@ -385,7 +383,6 @@ pub(super) fn verify_mongodb_collection_uuid(
     )))
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn verify_mongodb_collection(
     config: &MongoDbSourceConfig,
     expected_uuid: Uuid,
@@ -409,7 +406,6 @@ pub(super) fn verify_mongodb_collection(
     Ok(())
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn verify_mongodb_deployment_identity(
     expected: &MongoDeploymentIdentity,
     observed: &MongoDeploymentIdentity,
@@ -425,7 +421,6 @@ pub(super) fn verify_mongodb_deployment_identity(
     )))
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn verify_mongodb_admission(
     config: &MongoDbSourceConfig,
     expected_deployment: &MongoDeploymentIdentity,
@@ -436,12 +431,9 @@ pub(super) fn verify_mongodb_admission(
     verify_mongodb_collection(config, expected_uuid, &observation.collection)
 }
 
-#[cfg(feature = "mongodb-cdc")]
 pub(super) fn fresh_stream_anchor(
-    cursor: &mongodb::change_stream::ChangeStream<
-        mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
-    >,
-) -> Result<(mongodb::change_stream::event::ResumeToken, String), ConnectorError> {
+    cursor: &MongoChangeStream,
+) -> Result<(ResumeToken, String), ConnectorError> {
     // The bootstrap aggregate uses batchSize=0, so MongoDB returns an empty firstBatch and its
     // exact postBatchResumeToken. Refuse an inclusive timestamp fallback: it can replay the final
     // write that preceded admission.
@@ -450,65 +442,34 @@ pub(super) fn fresh_stream_anchor(
             "fresh MongoDB change stream omitted its initial postBatchResumeToken".into(),
         )
     })?;
-    let encoded = serde_json::to_string(&token).map_err(|error| {
-        ConnectorError::ReadError(format!(
-            "serialize initial MongoDB post-batch resume token: {error}"
-        ))
-    })?;
-    let encoded = canonical_resume_token(&encoded).map_err(|error| {
-        ConnectorError::ReadError(format!(
-            "invalid initial MongoDB post-batch resume token: {error}"
-        ))
-    })?;
+    let encoded = canonical_post_batch_token(&token)?;
     Ok((token, encoded))
-}
-
-#[cfg(feature = "mongodb-cdc")]
-pub(super) fn report_mongo_reader_admission_error(
-    ready_tx: &mut Option<
-        tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
-    >,
-    error: &ConnectorError,
-) {
-    if let Some(ready_tx) = ready_tx.take() {
-        let _ = ready_tx.send(Err(MongoReaderFailure::from_connector(error)));
-    }
 }
 
 /// Background task that reads from the `MongoDB` change stream and sends
 /// events to the source via a channel.
-///
-/// Uses a `'reconnect` / `'recv` double-loop pattern (mirroring the
-/// Postgres CDC source) with exponential backoff capped at 30 seconds.
-#[cfg(feature = "mongodb-cdc")]
 pub(super) async fn run_change_stream_reader(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
-    tx: ChangeStreamTx,
+    output: ReaderOutput,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    data_ready: Arc<Notify>,
-    metrics: Arc<MongoDbCdcMetrics>,
-    byte_budget: Arc<Semaphore>,
-    max_buffered_bytes: usize,
-    initial_resume_position: Option<MongoResumePosition>,
+    start: ReaderStart,
     expected_collection_uuid: Option<Uuid>,
     expected_deployment_identity: Option<MongoDeploymentIdentity>,
     ready_tx: tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
+    snapshot_committed: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ConnectorError> {
     let client = db.client().clone();
     let result = run_change_stream_reader_loop(
         db,
         config,
-        tx,
+        output,
         shutdown_rx,
-        data_ready,
-        metrics,
-        byte_budget,
-        max_buffered_bytes,
-        initial_resume_position,
+        start,
         expected_collection_uuid,
         expected_deployment_identity,
-        ready_tx,
+        Some(ready_tx),
+        snapshot_committed,
     )
     .await;
 
@@ -518,82 +479,226 @@ pub(super) async fn run_change_stream_reader(
     result
 }
 
-#[cfg(feature = "mongodb-cdc")]
-pub(super) async fn run_change_stream_reader_loop(
+/// Everything a reader generation borrows while it owns the driver.
+struct ReaderSession<'a> {
+    db: &'a mongodb::Database,
+    config: &'a MongoDbSourceConfig,
+    admission: &'a ReaderAdmission,
+    output: &'a ReaderOutput,
+    namespace: String,
+}
+
+/// Retry state shared by every cursor open in one reader generation.
+struct ReaderControl {
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ready_tx: ReadyTx,
+    consecutive_failures: u32,
+    verify_before_open: bool,
+}
+
+impl ReaderControl {
+    async fn open(
+        &mut self,
+        session: &ReaderSession<'_>,
+        position: Option<&MongoResumePosition>,
+        empty_first_batch: bool,
+    ) -> Result<Result<MongoChangeStream, ReconnectControl>, ConnectorError> {
+        open_verified_cursor(
+            session.db,
+            session.config,
+            session.admission,
+            position,
+            empty_first_batch,
+            &mut self.verify_before_open,
+            &mut self.shutdown_rx,
+            &session.output.metrics,
+            &mut self.consecutive_failures,
+            &mut self.ready_tx,
+        )
+        .await
+    }
+
+    fn fail_admission(&mut self, error: ConnectorError) -> ConnectorError {
+        report_mongo_reader_admission_error(&mut self.ready_tx, &error);
+        error
+    }
+}
+
+async fn run_change_stream_reader_loop(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
-    tx: ChangeStreamTx,
+    output: ReaderOutput,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    data_ready: Arc<Notify>,
-    metrics: Arc<MongoDbCdcMetrics>,
-    byte_budget: Arc<Semaphore>,
-    max_buffered_bytes: usize,
-    initial_resume_position: Option<MongoResumePosition>,
+    start: ReaderStart,
     expected_collection_uuid: Option<Uuid>,
     expected_deployment_identity: Option<MongoDeploymentIdentity>,
-    ready_tx: tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
+    mut ready_tx: ReadyTx,
+    snapshot_committed: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ConnectorError> {
-    let mut resume_position = initial_resume_position;
-    let fresh_start = resume_position.is_none();
-    let mut initial_resume_token = None;
-    let mut ready_tx = Some(ready_tx);
-    let current_db = db;
     let Some(admission) = prepare_reader_admission(
-        &current_db,
+        &db,
         &config,
         expected_collection_uuid,
         expected_deployment_identity,
         &mut shutdown_rx,
-        &metrics,
+        &output.metrics,
         &mut ready_tx,
     )
     .await?
     else {
         return Ok(());
     };
-    let mut consecutive_failures = 0;
-    let mut verify_before_open = false;
+    let session = ReaderSession {
+        db: &db,
+        config: &config,
+        admission: &admission,
+        output: &output,
+        namespace: namespace(&config),
+    };
+    let mut control = ReaderControl {
+        shutdown_rx,
+        ready_tx,
+        consecutive_failures: 0,
+        verify_before_open: false,
+    };
+    let resume_position = match start {
+        ReaderStart::FreshChanges => None,
+        ReaderStart::Stream(position) => Some(position),
+        ReaderStart::FreshSnapshot => {
+            let at = snapshot::choose_snapshot_time(&db, &config)
+                .await
+                .map_err(|error| control.fail_admission(error))?;
+            let cut = SnapshotCut {
+                at,
+                after_key: None,
+            };
+            let Some(position) =
+                bootstrap_snapshot(&session, &mut control, cut, Some(snapshot_committed)).await?
+            else {
+                return Ok(());
+            };
+            Some(position)
+        }
+        ReaderStart::Snapshot(cut) => {
+            let Some(position) = bootstrap_snapshot(&session, &mut control, cut, None).await?
+            else {
+                return Ok(());
+            };
+            Some(position)
+        }
+    };
+    stream_changes(&session, &mut control, resume_position).await?;
+    if let Some(ready_tx) = control.ready_tx.take() {
+        let _ = ready_tx.send(Err(MongoReaderFailure::Read(
+            "change stream reader was shut down before the cursor opened".into(),
+        )));
+    }
+    Ok(())
+}
 
-    'reconnect: loop {
-        let (mut cursor, bootstrap) = match open_verified_cursor(
-            &current_db,
-            &config,
-            &admission,
-            fresh_start,
-            resume_position.as_ref(),
-            &mut verify_before_open,
-            &mut shutdown_rx,
-            &metrics,
-            &mut consecutive_failures,
-            &mut ready_tx,
-        )
-        .await?
+/// Copy the collection at `cut`, then return the inclusive stream start. A fresh cut first waits
+/// for `committed`. `Ok(None)` means shutdown.
+async fn bootstrap_snapshot(
+    session: &ReaderSession<'_>,
+    control: &mut ReaderControl,
+    cut: SnapshotCut,
+    committed: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<Option<MongoResumePosition>, ConnectorError> {
+    if matches!(
+        session.admission.deployment_identity,
+        MongoDeploymentIdentity::ShardedCluster(_)
+    ) {
+        return Err(
+            control.fail_admission(ConnectorError::ConfigurationError(format!(
+                "MongoDB CDC snapshot.mode=initial supports replica sets only; {} is on a sharded \
+             cluster, where _id need not be unique across shards",
+                session.namespace
+            ))),
+        );
+    }
+    // The stream must already be able to start at the snapshot time before any copy.
+    let probe = MongoResumePosition::StartAt(cut.at);
+    loop {
+        match control.open(session, Some(&probe), true).await? {
+            Ok(cursor) => {
+                drop(cursor);
+                break;
+            }
+            Err(ReconnectControl::Retry) => {}
+            Err(ReconnectControl::Stop) => return Ok(None),
+        }
+    }
+    let mut initial_position = committed
+        .is_some()
+        .then(|| MongoCheckpointPosition::Snapshot(cut.clone()));
+    publish_reader_ready(
+        &mut control.ready_tx,
+        &mut initial_position,
+        session.admission,
+    );
+    if let Some(committed) = committed {
+        if !snapshot::await_committed_cut(committed, &mut control.shutdown_rx).await? {
+            return Ok(None);
+        }
+    }
+    let output = session.output;
+    if !snapshot::scan(
+        session.db,
+        session.config,
+        &cut,
+        output,
+        &mut control.shutdown_rx,
+    )
+    .await?
+        || !output
+            .send(
+                BufferedMongoPayload::SnapshotComplete,
+                &mut control.shutdown_rx,
+            )
+            .await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(MongoResumePosition::StartAt(cut.at)))
+}
+
+/// Forward changes from `resume_position` (or a fresh exclusive anchor) until shutdown.
+async fn stream_changes(
+    session: &ReaderSession<'_>,
+    control: &mut ReaderControl,
+    mut resume_position: Option<MongoResumePosition>,
+) -> Result<(), ConnectorError> {
+    let mut initial_position = None;
+    loop {
+        let bootstrap = resume_position.is_none() && control.ready_tx.is_some();
+        let mut cursor = match control
+            .open(session, resume_position.as_ref(), bootstrap)
+            .await?
         {
             Ok(opened) => opened,
-            Err(ReconnectControl::Retry) => continue 'reconnect,
-            Err(ReconnectControl::Stop) => break 'reconnect,
+            Err(ReconnectControl::Retry) => continue,
+            Err(ReconnectControl::Stop) => return Ok(()),
         };
 
         if bootstrap {
-            match fresh_stream_anchor(&cursor) {
-                Ok((token, encoded)) => {
-                    resume_position = Some(MongoResumePosition::ResumeAfter(token));
-                    initial_resume_token = Some(encoded);
-                }
-                Err(error) => {
-                    report_mongo_reader_admission_error(&mut ready_tx, &error);
-                    return Err(error);
-                }
-            }
+            let (token, encoded) =
+                fresh_stream_anchor(&cursor).map_err(|error| control.fail_admission(error))?;
+            resume_position = Some(MongoResumePosition::ResumeAfter(token));
+            initial_position = Some(MongoCheckpointPosition::Stream(
+                super::checkpoint::StreamPosition::ResumeAfter(encoded),
+            ));
             drop(cursor);
-            continue 'reconnect;
+            continue;
         }
 
-        publish_reader_ready(&mut ready_tx, &mut initial_resume_token, &admission);
-
+        publish_reader_ready(
+            &mut control.ready_tx,
+            &mut initial_position,
+            session.admission,
+        );
         tracing::info!(
-            database = %config.database,
-            collection = %config.collection,
+            database = %session.config.database,
+            collection = %session.config.collection,
             resumed = resume_position.is_some(),
             "change stream reader started"
         );
@@ -601,47 +706,44 @@ pub(super) async fn run_change_stream_reader_loop(
         if matches!(
             forward_change_stream(
                 &mut cursor,
-                &mut shutdown_rx,
+                &mut control.shutdown_rx,
                 &mut resume_position,
-                &tx,
-                &data_ready,
-                &mut consecutive_failures,
-                &byte_budget,
-                max_buffered_bytes,
-                &metrics,
+                session.output,
+                &mut control.consecutive_failures,
+                &session.namespace,
             )
             .await?,
             ChangeStreamRead::Stop
         ) {
-            break 'reconnect;
+            return Ok(());
         }
 
         // Exited recv loop due to error or cursor exhaustion — attempt reconnect.
-        consecutive_failures += 1;
-        if consecutive_failures >= MAX_FAILURES {
-            let msg = format!("change stream failed after {MAX_FAILURES} consecutive failures");
+        control.consecutive_failures += 1;
+        if control.consecutive_failures >= MAX_FAILURES {
+            let msg = format!(
+                "change stream of {} failed after {MAX_FAILURES} consecutive transient failures",
+                session.namespace
+            );
             tracing::error!(%msg);
             return Err(ConnectorError::ReadError(msg));
         }
 
-        let backoff = crate::retry::Backoff::broker_reconnect().delay(consecutive_failures);
+        let backoff = crate::retry::Backoff::broker_reconnect().delay(control.consecutive_failures);
         tracing::warn!(
             resume_position = ?resume_position,
-            attempt = consecutive_failures,
+            attempt = control.consecutive_failures,
             ?backoff,
             "reconnecting change stream"
         );
-        metrics.record_reconnect();
+        session.output.metrics.record_reconnect();
 
-        if retry_interrupted(&mut shutdown_rx, backoff).await {
-            break 'reconnect;
+        if retry_interrupted(&mut control.shutdown_rx, backoff).await {
+            return Ok(());
         }
 
         // The MongoDB client owns topology monitoring and reconnects its pool.
         // Reusing it avoids spawning untracked driver generations on each retry.
-        verify_before_open = true;
+        control.verify_before_open = true;
     }
-
-    report_reader_stopped_before_ready(ready_tx.take());
-    Ok(())
 }

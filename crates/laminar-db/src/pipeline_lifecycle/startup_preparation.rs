@@ -14,6 +14,7 @@ impl LaminarDB {
                 "_arrow_schema".to_string(),
                 crate::pipeline_callback::encode_arrow_schema(&entry.schema),
             );
+            crate::ddl::schema_resolution::set_primary_key_columns(&mut config, &entry.primary_key);
         }
         Ok(config)
     }
@@ -88,16 +89,12 @@ impl LaminarDB {
                 startup_runtime,
             )
             .await?;
-        let mut registered_source_names = source_regs.keys().collect::<Vec<_>>();
-        registered_source_names.sort_unstable();
-        for source_name in registered_source_names {
-            self.validate_registered_mutation_source_admission(
-                source_name,
-                &source_regs,
-                &temporal_source_roles,
-                &ordered_interval_admissions,
-            )?;
-        }
+        let direct_mutation_sources = self.validate_mutation_source_routes(
+            (&source_regs, &sink_regs, &stream_regs),
+            &temporal_source_roles,
+            &ordered_interval_admissions,
+            startup_runtime,
+        )?;
 
         let injected_cluster_checkpoint_store =
             self.validate_startup_durability(startup_runtime)?;
@@ -170,6 +167,7 @@ impl LaminarDB {
                 pipeline_identity,
                 temporal_source_roles,
                 ordered_interval_admissions,
+                direct_mutation_sources,
                 runtime_shutdown,
                 #[cfg(feature = "cluster")]
                 topology,

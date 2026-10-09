@@ -154,11 +154,12 @@ subscriptions.
 
 | Use | Available connectors |
 |---|---|
-| Sources | Kafka, NATS, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
+| Sources | Kafka, NATS, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
 | Sinks | Kafka, NATS, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
 | Lookups | PostgreSQL, MongoDB, Delta Lake, and Iceberg. |
 
-PostgreSQL and MongoDB change-data-capture ingestion is not yet available as a streaming source.
+MongoDB change streams can feed sinks directly as event history or as keyed document mirrors.
+PostgreSQL change-data-capture ingestion is not yet available as a streaming source.
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
 

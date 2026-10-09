@@ -93,6 +93,7 @@ pub mod engine_metrics;
 #[cfg(feature = "api")]
 pub mod api;
 mod ddl;
+mod direct_mutation;
 mod error;
 mod filter_compile;
 mod handle;
