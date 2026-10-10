@@ -374,7 +374,7 @@ pub(crate) async fn resolve_stream_output_schemas(
                 )));
             }
         }
-        certify_changelog_outputs(&mut schemas, &changelog_carrying, changelog_sources)?;
+        advertise_changelog_outputs(&mut schemas, &changelog_carrying, changelog_sources)?;
         Ok(ResolvedStreamOutputs {
             schemas,
             changelog_carrying,
@@ -403,7 +403,7 @@ pub(super) struct StreamOutputShape {
 
 /// Reject a reserved weight on streams that carry no changelog, and advertise the trailing weight
 /// on every changelog-carrying stream output. Changelog sources keep their declared schemas.
-fn certify_changelog_outputs(
+fn advertise_changelog_outputs(
     schemas: &mut HashMap<String, arrow_schema::SchemaRef>,
     changelog_carrying: &rustc_hash::FxHashSet<String>,
     changelog_sources: &rustc_hash::FxHashSet<String>,
