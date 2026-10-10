@@ -577,6 +577,16 @@ impl PostgresSink {
                 self.target_binding.as_ref(),
             )
             .await?;
+            if schema_resolution::defers_constraints(self.target_binding.as_ref()) {
+                transaction
+                    .batch_execute("SET CONSTRAINTS ALL DEFERRED")
+                    .await
+                    .map_err(|error| {
+                        ConnectorError::WriteError(format!(
+                            "defer PostgreSQL constraints to commit: {error}"
+                        ))
+                    })?;
+            }
             match self.config.write_mode {
                 WriteMode::Append => self.flush_append(&transaction, buffer).await,
                 WriteMode::Upsert => self.flush_upsert(&transaction, buffer).await,

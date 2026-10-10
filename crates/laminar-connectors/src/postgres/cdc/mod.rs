@@ -1,6 +1,5 @@
 //! `PostgreSQL` CDC source connector.
 
-pub mod changelog;
 pub mod config;
 pub mod decoder;
 pub mod lsn;
@@ -9,6 +8,7 @@ pub mod postgres_io;
 pub mod schema;
 mod schema_resolution;
 pub mod source;
+mod typed_rows;
 pub mod types;
 
 // Re-export primary types at module level.
@@ -192,15 +192,19 @@ fn postgres_cdc_config_keys() -> Vec<ConfigKeySpec> {
             "PEM file with trusted CA certificates; defaults to webpki roots",
             "",
         ),
-        ConfigKeySpec::optional(
-            "table.include",
-            "Comma-separated schema-qualified tables to include",
-            "",
+        ConfigKeySpec::required(
+            "table",
+            "The one captured table as schema.table; the publication must contain only it",
         ),
         ConfigKeySpec::optional(
-            "table.exclude",
-            "Comma-separated schema-qualified tables to exclude",
-            "",
+            "snapshot.mode",
+            "Fresh start: 'initial' copies the table at the slot's consistent point; 'never' streams later changes only",
+            "initial",
+        ),
+        ConfigKeySpec::optional(
+            "output.mode",
+            "'upsert' emits keyed puts and key-only deletes; 'changelog' emits weighted before/after images",
+            "upsert",
         ),
         ConfigKeySpec::optional(
             "max.buffered.bytes",

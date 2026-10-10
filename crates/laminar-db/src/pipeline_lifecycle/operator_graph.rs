@@ -260,7 +260,7 @@ impl LaminarDB {
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
         ordered_interval_source_modes: &FxHashMap<String, SourceInputMode>,
-        direct_mutation_sources: &rustc_hash::FxHashSet<String>,
+        mutation_routes: &super::direct_mutation_routes::MutationRoutes,
         checkpointing_enabled: bool,
         runtime_mode: RuntimeMode,
         prom_registry: Option<&Arc<prometheus::Registry>>,
@@ -311,8 +311,10 @@ impl LaminarDB {
             let has_reserved_mutation_columns = source_entry
                 .as_ref()
                 .is_some_and(|entry| schema_has_reserved_mutation_columns(entry.schema.as_ref()));
-            let route = if direct_mutation_sources.contains(name) {
+            let route = if mutation_routes.direct.contains(name) {
                 SourceRoute::DirectMutationSinks
+            } else if mutation_routes.changelog.contains(name) {
+                SourceRoute::Changelog
             } else if let Some(mode) = ordered_interval_source_modes.get(name) {
                 SourceRoute::OrderedInterval(*mode)
             } else if let Some(role) = temporal_source_roles.get(name) {
@@ -341,6 +343,9 @@ impl LaminarDB {
             }
             if let SourceRoute::OrderedInterval(mode) = route {
                 source = source.with_ordered_interval_input_mode(mode)?;
+            }
+            if route == SourceRoute::Changelog {
+                source = source.with_full_changelog();
             }
             let assignment_scoped = cfg!(feature = "cluster")
                 && runtime_mode == RuntimeMode::Cluster

@@ -299,7 +299,7 @@ impl LaminarDB {
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
         ordered_interval_admissions: &OrderedIntervalAdmissions,
-        direct_mutation_sources: &rustc_hash::FxHashSet<String>,
+        routes: &super::direct_mutation_routes::MutationRoutes,
     ) -> Result<(), DbError> {
         let Some((contract, _)) =
             self.resolve_registered_source_contract(source_name, source_regs)?
@@ -314,8 +314,9 @@ impl LaminarDB {
             && contract.input_mode == SourceInputMode::KeyedUpsert;
         let ordered_interval =
             ordered_interval_admissions.source_modes.get(source_name) == Some(&contract.input_mode);
-        let direct_sinks = direct_mutation_sources.contains(source_name);
-        if [temporal_right, ordered_interval, direct_sinks]
+        let direct_sinks = routes.direct.contains(source_name);
+        let changelog = routes.changelog.contains(source_name);
+        if [temporal_right, ordered_interval, direct_sinks, changelog]
             .into_iter()
             .filter(|admitted| *admitted)
             .count()
@@ -324,7 +325,7 @@ impl LaminarDB {
             return Ok(());
         }
         Err(DbError::Config(format!(
-            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right, bounded interval, or direct keyed-mutation sink route"
+            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right, bounded interval, direct keyed-mutation sink, or local changelog route"
         )))
     }
 

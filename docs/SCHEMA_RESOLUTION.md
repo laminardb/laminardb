@@ -28,7 +28,7 @@ limitation before activation.
 | `kafka` | Streaming source | Plain JSON, CSV, Debezium JSON | Explicit fields required | A registry URL requires Avro; it does not select a different codec |
 | `kafka` | Streaming source | Raw / bytes | Built-in `value` | Existing Kafka metadata/header settings remain separate |
 | `kafka` | Sink | Avro, JSON, CSV, raw | Bound query | Avro uses a concrete registry writer ID; raw needs one Utf8 query field; no Debezium writer |
-| `postgres-cdc` | Streaming source | Fixed pgoutput JSON envelope plus publication metadata | Metadata | PostgreSQL 17+, system/database/publication/slot identities and published relation layouts; requires the existing recovery slot; no initial snapshot-to-WAL admission |
+| `postgres-cdc` | Streaming source | Declared typed columns of one published table; `output.mode=changelog` adds a trailing `__weight` | Explicit fields required | PostgreSQL 17+; the declared `PRIMARY KEY` must equal the table's and every column must map exactly; system, timeline, database, publication, table and slot identities and the relation layout are persisted and revalidated on resume; layout drift stops the source |
 | `postgres` | Reference / lookup source | PostgreSQL table catalog | Metadata | Database/relation OIDs, column OIDs/modifiers/defaults/constraints; keys separately declared and validated |
 | `postgres-sink` | Sink | Named PostgreSQL COPY / keyed writes | Bound query plus target metadata | Database/relation OIDs and target layout; explicit table-creation policy; no implicit evolution |
 | `delta-lake` | Streaming / reference / lookup source | Delta log/catalog metadata | Metadata | Table ID, native schema, protocol and column mapping; the SQL schema is pinned while the data cursor advances |

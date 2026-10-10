@@ -1,21 +1,75 @@
-use super::*;
-use crate::postgres::cdc::types::{INT4_OID, INT8_OID, TEXT_OID};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use arrow_array::cast::AsArray;
+use arrow_array::types::{Int32Type, Int64Type};
+use arrow_array::Array;
+use arrow_schema::{DataType, Field};
 
-struct ReaderDropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+use super::checkpoint::parse_resumable;
+use super::reader::{
+    publish_terminal_wal_error, retained_wal_payload_bytes, send_wal_or_shutdown, WalPayloadTx,
+};
+use super::*;
+use crate::checkpoint::SourceCheckpoint;
+use crate::config::ConnectorConfig;
+use crate::connector::{
+    source_mutations, source_row_positions, SourceBatch, SourceConnector, SourceConsistency,
+    SourceInputMode, SourceRowPositionCapability, SourceTopology,
+};
+use crate::postgres::cdc::config::{OutputMode, TableName};
+use crate::postgres::cdc::postgres_io::{source_config_digest, CaptureTable};
+use crate::postgres::cdc::schema_resolution::bind_layout;
+use crate::postgres::cdc::types::{PgColumn, INT4_OID, INT8_OID, TEXT_OID};
 
-impl Drop for ReaderDropSignal {
-    fn drop(&mut self) {
-        if let Some(tx) = self.0.take() {
-            let _ = tx.send(());
-        }
+const OID: u32 = 7;
+
+/// One pgoutput tuple value.
+#[derive(Clone, Copy)]
+enum V<'a> {
+    T(&'a str),
+    Null,
+    Unchanged,
+}
+
+fn capture_table() -> CaptureTable {
+    CaptureTable {
+        relation: RelationInfo {
+            relation_id: OID,
+            namespace: "public".into(),
+            name: "orders".into(),
+            replica_identity: 'f',
+            columns: vec![
+                PgColumn::new("id".into(), INT8_OID, -1, true),
+                PgColumn::new("status".into(), TEXT_OID, -1, true),
+                PgColumn::new("qty".into(), INT4_OID, -1, true),
+                PgColumn::new("note".into(), TEXT_OID, -1, true),
+            ],
+        },
+        not_null: vec![true, false, false, false],
+        primary_key: vec!["id".into()],
     }
 }
 
-fn default_source() -> PostgresCdcSource {
-    let mut config = PostgresCdcConfig::default();
-    config.ssl_mode = crate::postgres::SslMode::Disable;
-    PostgresCdcSource::new(config, None)
+fn source_config(output_mode: OutputMode) -> PostgresCdcConfig {
+    PostgresCdcConfig {
+        ssl_mode: crate::postgres::SslMode::Disable,
+        table: TableName::parse("public.orders").unwrap(),
+        output_mode,
+        ..PostgresCdcConfig::default()
+    }
+}
+
+fn declared(output_mode: OutputMode) -> SchemaRef {
+    let mut fields = vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("qty", DataType::Int32, true),
+        Field::new("note", DataType::Utf8, true),
+    ];
+    if output_mode == OutputMode::Changelog {
+        fields.push(Field::new("__weight", DataType::Int64, false));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 fn test_binding(config: &PostgresCdcConfig) -> PostgresCheckpointBinding {
@@ -28,365 +82,714 @@ fn test_binding(config: &PostgresCdcConfig) -> PostgresCheckpointBinding {
         source_config_sha256: source_config_digest(config),
         slot_plugin: "pgoutput".into(),
         slot_two_phase: false,
-        slot_failover: true,
+        slot_failover: false,
     }
 }
 
-fn running_source() -> PostgresCdcSource {
-    let mut src = default_source();
-    src.state = ConnectorState::Running;
-    src.checkpoint_binding = Some(test_binding(&src.config));
-    src
+fn streaming_source(output_mode: OutputMode) -> PostgresCdcSource {
+    let config = source_config(output_mode);
+    let schema = declared(output_mode);
+    let layout = bind_layout(&config, &schema, &["id".into()], &capture_table()).unwrap();
+    let mut source = PostgresCdcSource::new(config, None);
+    source.checkpoint_binding = Some(test_binding(&source.config));
+    source.open_rows = Some(RowBuilder::new(&layout));
+    source.layout = Some(layout);
+    source.relation = Some(capture_table().relation);
+    source.schema = schema;
+    source.state = ConnectorState::Running;
+    source.phase = Phase::Streaming;
+    source.applied_lsn = Some(pgwire_replication::AppliedLsnHandle::new(
+        pgwire_replication::Lsn::ZERO,
+    ));
+    // Live contract revalidation needs a server; integration tests cover it.
+    source.next_contract_check =
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3_600));
+    source
 }
 
-fn recovery_identity_config() -> ConnectorConfig {
-    let mut config = ConnectorConfig::new("postgres-cdc");
-    config.set("host", "db-a.internal");
-    config.set("database", "orders");
-    config.set("username", "replicator");
-    config.set("password", "secret-a");
-    config.set("slot.name", "orders_slot");
-    config.set("publication", "orders_pub");
-    config.set("table.include", "public.z, public.a");
-    config
+fn relation_message() -> Vec<u8> {
+    let mut buf = vec![b'R'];
+    buf.extend_from_slice(&OID.to_be_bytes());
+    buf.extend_from_slice(b"public\0orders\0f");
+    let columns = capture_table().relation.columns;
+    buf.extend_from_slice(&i16::try_from(columns.len()).unwrap().to_be_bytes());
+    for column in columns {
+        buf.push(1);
+        buf.extend_from_slice(column.name.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&column.type_oid.to_be_bytes());
+        buf.extend_from_slice(&column.type_modifier.to_be_bytes());
+    }
+    buf
 }
 
-// ── Construction ──
-
-#[test]
-fn test_new_source() {
-    let src = default_source();
-    assert_eq!(src.state, ConnectorState::Created);
-    assert!(src.confirmed_flush_lsn.is_zero());
-    assert_eq!(src.buffered_events(), 0);
-    assert_eq!(src.schema().fields().len(), 6);
+fn tuple(buf: &mut Vec<u8>, tag: u8, values: &[V<'_>]) {
+    buf.push(tag);
+    buf.extend_from_slice(&i16::try_from(values.len()).unwrap().to_be_bytes());
+    for value in values {
+        match value {
+            V::T(text) => {
+                buf.push(b't');
+                buf.extend_from_slice(&i32::try_from(text.len()).unwrap().to_be_bytes());
+                buf.extend_from_slice(text.as_bytes());
+            }
+            V::Null => buf.push(b'n'),
+            V::Unchanged => buf.push(b'u'),
+        }
+    }
 }
 
-#[test]
-fn source_contract_fails_closed_for_raw_json_envelope() {
-    let error = default_source()
-        .contract(&ConnectorConfig::new("postgres-cdc"))
-        .unwrap_err();
-    assert!(error.to_string().contains("raw JSON change envelope"));
+fn begin(final_lsn: u64) -> Vec<u8> {
+    let mut buf = vec![b'B'];
+    buf.extend_from_slice(&final_lsn.to_be_bytes());
+    buf.extend_from_slice(&0_i64.to_be_bytes());
+    buf.extend_from_slice(&1_u32.to_be_bytes());
+    buf
 }
 
-#[test]
-fn source_lifecycle_cancellation_retires_the_generation() {
-    assert_eq!(
-        default_source().cancellation_policy(),
-        crate::connector::ConnectorCancellationPolicy::RetireConnector
-    );
+fn commit(commit_lsn: u64, end_lsn: u64) -> Vec<u8> {
+    let mut buf = vec![b'C', 0];
+    buf.extend_from_slice(&commit_lsn.to_be_bytes());
+    buf.extend_from_slice(&end_lsn.to_be_bytes());
+    buf.extend_from_slice(&0_i64.to_be_bytes());
+    buf
 }
 
-#[test]
-fn recovery_identity_ignores_operational_connection_tuning() {
-    let left = recovery_identity_config();
-    let source = PostgresCdcSource::from_config(&left).unwrap();
-    let mut right = recovery_identity_config();
-    right.set("host", "db-b.internal");
-    right.set("port", "6432");
-    right.set("username", "rotated-user");
-    right.set("password", "rotated-secret");
-    right.set("ssl.mode", "disable");
-    right.set("max.buffered.bytes", "134217728");
-
-    let stored = source.recovery_identity_options(&left).unwrap();
-    assert_eq!(
-        stored,
-        source.recovery_identity_options(&right).unwrap(),
-        "connection and memory tuning must not fence durable recovery"
-    );
-    assert_eq!(
-        stored,
-        source
-            .recovery_identity_options(&ConnectorConfig::new("postgres-cdc"))
-            .unwrap(),
-        "an empty runtime config must use the validated provider config"
-    );
+fn insert(values: &[V<'_>]) -> Vec<u8> {
+    let mut buf = vec![b'I'];
+    buf.extend_from_slice(&OID.to_be_bytes());
+    tuple(&mut buf, b'N', values);
+    buf
 }
 
-#[test]
-fn recovery_identity_normalizes_filters_and_fences_slot_semantics() {
-    let left = recovery_identity_config();
-    let source = PostgresCdcSource::from_config(&left).unwrap();
-    let mut reordered = recovery_identity_config();
-    reordered.set("table.include", "public.a,public.z,public.a");
-    assert_eq!(
-        source.recovery_identity_options(&left).unwrap(),
-        source.recovery_identity_options(&reordered).unwrap(),
-        "equivalent filters must have one canonical identity"
-    );
-
-    let mut different_slot = recovery_identity_config();
-    different_slot.set("slot.name", "other_slot");
-    assert_ne!(
-        source.recovery_identity_options(&left).unwrap(),
-        source.recovery_identity_options(&different_slot).unwrap(),
-        "a different replication history must fence recovery"
-    );
+fn update(old_tag: Option<u8>, old: &[V<'_>], new: &[V<'_>]) -> Vec<u8> {
+    let mut buf = vec![b'U'];
+    buf.extend_from_slice(&OID.to_be_bytes());
+    if let Some(tag) = old_tag {
+        tuple(&mut buf, tag, old);
+    }
+    tuple(&mut buf, b'N', new);
+    buf
 }
 
-#[test]
-fn test_from_config() {
-    let mut config = ConnectorConfig::new("postgres-cdc");
-    config.set("host", "pg.local");
-    config.set("database", "testdb");
-    config.set("slot.name", "my_slot");
-    config.set("publication", "my_pub");
-    config.set("ssl.mode", "disable");
-
-    let src = PostgresCdcSource::from_config(&config).unwrap();
-    assert_eq!(src.config().host, "pg.local");
-    assert_eq!(src.config().database, "testdb");
+fn delete(old_tag: u8, old: &[V<'_>]) -> Vec<u8> {
+    let mut buf = vec![b'D'];
+    buf.extend_from_slice(&OID.to_be_bytes());
+    tuple(&mut buf, old_tag, old);
+    buf
 }
 
-#[test]
-fn test_from_config_invalid() {
-    let config = ConnectorConfig::new("postgres-cdc");
-    assert!(PostgresCdcSource::from_config(&config).is_err());
+fn row<'a>(id: &'a str, status: &'a str, qty: &'a str) -> [V<'a>; 4] {
+    [V::T(id), V::T(status), V::T(qty), V::Null]
 }
 
-// ── Lifecycle ──
+fn transaction(source: &mut PostgresCdcSource, final_lsn: u64, changes: Vec<Vec<u8>>) {
+    source.enqueue_wal_data(begin(final_lsn));
+    for change in changes {
+        source.enqueue_wal_data(change);
+    }
+    source.enqueue_wal_data(commit(final_lsn, final_lsn + 0x10));
+}
 
-#[tokio::test]
-async fn initial_start_fails_closed_before_external_io() {
-    let mut src = default_source();
-    let error = src
-        .start(
-            SourceStart::new(
-                ConnectorConfig::new("postgres-cdc"),
-                SourcePosition::Initial,
-                crate::connector::DeliveryGuarantee::AtLeastOnce,
-            )
-            .unwrap(),
+async fn next(source: &mut PostgresCdcSource, max: usize) -> SourceBatch {
+    source.poll_batch(max).await.unwrap().expect("a batch")
+}
+
+fn ids(batch: &SourceBatch) -> Vec<i64> {
+    batch
+        .records
+        .column(0)
+        .as_primitive::<Int64Type>()
+        .values()
+        .to_vec()
+}
+
+fn statuses(batch: &SourceBatch) -> Vec<Option<String>> {
+    let column = batch.records.column(1).as_string::<i32>();
+    (0..column.len())
+        .map(|row| column.is_valid(row).then(|| column.value(row).to_string()))
+        .collect()
+}
+
+fn encoded(source: &PostgresCdcSource, batch: SourceBatch) -> arrow_array::RecordBatch {
+    use crate::connector::{
+        schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
+    };
+    batch
+        .into_records_with_metadata(
+            SourceRowPositionCapability::OrderedDeterministic,
+            &schema_with_source_row_positions(&source.schema).unwrap(),
+            &schema_with_source_mutations_and_row_positions(&source.schema).unwrap(),
         )
-        .await
-        .expect_err("initial startup must wait for certified snapshot/WAL bootstrap");
-    assert!(error.to_string().contains("[LDB-5060]"), "{error}");
-    assert_eq!(src.state, ConnectorState::Created);
-    assert!(src.reader_handle.is_none());
-    assert!(src.wal_rx.is_none());
+        .unwrap()
+}
+
+// ── Contract ──
+
+#[test]
+fn contract_is_commit_coupled_singleton_with_ordered_positions() {
+    let source = streaming_source(OutputMode::Upsert);
+    let empty = ConnectorConfig::new("postgres-cdc");
+    let contract = source.contract(&empty).unwrap();
+    assert_eq!(contract.consistency, SourceConsistency::CommitCoupled);
+    assert_eq!(contract.topology, SourceTopology::Singleton);
+    assert_eq!(contract.input_mode, SourceInputMode::KeyedUpsert);
+    assert_eq!(
+        contract.row_positions,
+        SourceRowPositionCapability::OrderedDeterministic
+    );
+    assert!(!contract.is_exact_delivery_certified());
+    let changelog = streaming_source(OutputMode::Changelog);
+    assert_eq!(
+        changelog.contract(&empty).unwrap().input_mode,
+        SourceInputMode::FullChangelog
+    );
+}
+
+// ── Upsert row semantics ──
+
+#[tokio::test]
+async fn upsert_emits_full_puts_and_key_only_tombstones() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(relation_message());
+    transaction(
+        &mut source,
+        0x100,
+        vec![
+            insert(&row("1", "OPEN", "100")),
+            update(
+                Some(b'O'),
+                &row("1", "OPEN", "100"),
+                &row("1", "OPEN", "120"),
+            ),
+            delete(b'O', &row("1", "OPEN", "120")),
+        ],
+    );
+    let batch = next(&mut source, 100).await;
+    assert_eq!(ids(&batch), [1, 1, 1]);
+    assert_eq!(
+        batch.mutations().unwrap(),
+        [
+            SourceMutation::Put,
+            SourceMutation::Put,
+            SourceMutation::Tombstone
+        ]
+    );
+    let qty = batch.records.column(2).as_primitive::<Int32Type>();
+    assert_eq!((qty.value(0), qty.value(1)), (100, 120));
+    assert!(qty.is_null(2), "a delete carries only the key");
+    assert_eq!(statuses(&batch)[2], None);
 }
 
 #[tokio::test]
-async fn start_normalizes_a_programmatic_filter_before_checkpoint_identity() {
-    let mut src = default_source();
-    src.config.table_include = vec![
-        " public.users ".into(),
-        String::new(),
-        "public.orders".into(),
-        "public.users".into(),
-    ];
-    let mut expected_config = src.config.clone();
-    expected_config.normalize_table_filters();
-    let mut checkpoint = src.checkpoint();
-    checkpoint.set_offset("lsn", "1/10");
-    write_checkpoint_binding(&mut checkpoint, &test_binding(&expected_config));
-
-    src.start(
-        SourceStart::new(
-            ConnectorConfig::new("postgres-cdc"),
-            SourcePosition::Resume {
-                attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
-                checkpoint,
-            },
-            crate::connector::DeliveryGuarantee::AtLeastOnce,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
+async fn primary_key_change_retracts_the_old_key_before_the_new_row() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(relation_message());
+    transaction(
+        &mut source,
+        0x100,
+        vec![update(
+            Some(b'O'),
+            &row("1", "OPEN", "5"),
+            &row("2", "OPEN", "5"),
+        )],
+    );
+    let batch = next(&mut source, 100).await;
+    assert_eq!(ids(&batch), [1, 2]);
     assert_eq!(
-        src.config.table_include,
-        vec!["public.orders", "public.users"]
+        batch.mutations().unwrap(),
+        [SourceMutation::Tombstone, SourceMutation::Put]
     );
 }
 
 #[tokio::test]
-async fn test_close() {
-    let mut src = running_source();
-    src.inject_event(ChangeEvent {
-        table: "t".to_string(),
-        op: CdcOperation::Insert,
-        lsn: Lsn::ZERO,
-        ts_ms: 0,
-        before: None,
-        after: Some("{}".to_string()),
+async fn unchanged_toast_reads_the_old_image_and_null_stays_null() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(relation_message());
+    let big = "x".repeat(4096);
+    transaction(
+        &mut source,
+        0x100,
+        vec![update(
+            Some(b'O'),
+            &[V::T("1"), V::Null, V::T("1"), V::T(&big)],
+            &[V::T("1"), V::Null, V::T("2"), V::Unchanged],
+        )],
+    );
+    let batch = next(&mut source, 100).await;
+    let notes = batch.records.column(3).as_string::<i32>();
+    assert_eq!(
+        notes.value(0),
+        big,
+        "unchanged TOAST is restored, never NULL"
+    );
+    assert!(batch.records.column(1).is_null(0), "SQL NULL stays NULL");
+}
+
+#[tokio::test]
+async fn missing_full_old_image_fails_closed() {
+    for change in [
+        update(None, &[], &row("1", "OPEN", "1")),
+        update(Some(b'K'), &row("1", "OPEN", "1"), &row("1", "OPEN", "2")),
+        delete(b'K', &row("1", "OPEN", "1")),
+    ] {
+        let mut source = streaming_source(OutputMode::Upsert);
+        source.enqueue_wal_data(relation_message());
+        transaction(&mut source, 0x100, vec![change]);
+        let error = source.poll_batch(100).await.unwrap_err();
+        assert!(
+            error.to_string().contains("REPLICA IDENTITY FULL"),
+            "{error}"
+        );
+        assert_eq!(source.state, ConnectorState::Failed);
+    }
+}
+
+#[tokio::test]
+async fn unchanged_toast_without_a_full_old_value_is_an_error_not_null() {
+    let mut source = streaming_source(OutputMode::Changelog);
+    source.enqueue_wal_data(relation_message());
+    transaction(
+        &mut source,
+        0x100,
+        vec![update(
+            Some(b'O'),
+            &[V::T("1"), V::Null, V::T("1"), V::Unchanged],
+            &[V::T("1"), V::Null, V::T("2"), V::Unchanged],
+        )],
+    );
+    let error = source.poll_batch(100).await.unwrap_err();
+    assert!(error.to_string().contains("unchanged TOAST"), "{error}");
+}
+
+#[tokio::test]
+async fn repeated_changes_to_one_key_keep_transaction_order() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(relation_message());
+    transaction(
+        &mut source,
+        0x100,
+        vec![
+            insert(&row("1", "A", "1")),
+            delete(b'O', &row("1", "A", "1")),
+            insert(&row("1", "B", "2")),
+            update(Some(b'O'), &row("1", "B", "2"), &row("1", "C", "3")),
+        ],
+    );
+    let batch = next(&mut source, 100).await;
+    assert_eq!(
+        statuses(&batch),
+        [Some("A".into()), None, Some("B".into()), Some("C".into())]
+    );
+    assert_eq!(
+        batch.mutations().unwrap(),
+        [
+            SourceMutation::Put,
+            SourceMutation::Tombstone,
+            SourceMutation::Put,
+            SourceMutation::Put
+        ]
+    );
+}
+
+// ── Changelog row semantics ──
+
+#[tokio::test]
+async fn changelog_weights_before_and_after_images() {
+    let mut source = streaming_source(OutputMode::Changelog);
+    source.enqueue_wal_data(relation_message());
+    transaction(
+        &mut source,
+        0x100,
+        vec![
+            insert(&row("1", "OPEN", "100")),
+            update(
+                Some(b'O'),
+                &row("1", "OPEN", "100"),
+                &row("1", "CLOSED", "120"),
+            ),
+            update(
+                Some(b'O'),
+                &row("1", "CLOSED", "120"),
+                &row("2", "CLOSED", "120"),
+            ),
+            delete(b'O', &row("2", "CLOSED", "120")),
+        ],
+    );
+    let batch = next(&mut source, 100).await;
+    assert!(batch.mutations().is_none(), "changelog rows carry weights");
+    let weights = batch.records.column(4).as_primitive::<Int64Type>();
+    assert_eq!(weights.values().as_ref(), [1, -1, 1, -1, 1, -1]);
+    assert_eq!(ids(&batch), [1, 1, 1, 1, 2, 2]);
+    let qty = batch.records.column(2).as_primitive::<Int32Type>();
+    assert_eq!(qty.values().as_ref(), [100, 100, 120, 120, 120, 120]);
+    assert_eq!(
+        statuses(&batch),
+        ["OPEN", "OPEN", "CLOSED", "CLOSED", "CLOSED", "CLOSED"].map(|s| Some(s.to_string()))
+    );
+}
+
+// ── Relation and protocol contract ──
+
+#[tokio::test]
+async fn relation_layout_drift_and_unbound_relations_fail_closed() {
+    let mut drifted = relation_message();
+    // The last column's type OID sits immediately before its four-byte type modifier.
+    let oid_end = drifted.len() - 4;
+    drifted[oid_end - 4..oid_end].copy_from_slice(&INT8_OID.to_be_bytes());
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(drifted);
+    let error = source.poll_batch(100).await.unwrap_err();
+    assert!(error.to_string().contains("fresh snapshot"), "{error}");
+
+    let mut source = streaming_source(OutputMode::Upsert);
+    transaction(&mut source, 0x100, vec![insert(&row("1", "A", "1"))]);
+    let error = source.poll_batch(100).await.unwrap_err();
+    assert!(error.to_string().contains("announced"), "{error}");
+}
+
+#[tokio::test]
+async fn truncate_stops_intake_with_reset_guidance() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(relation_message());
+    let mut truncate = vec![b'T'];
+    truncate.extend_from_slice(&1_i32.to_be_bytes());
+    truncate.push(0);
+    truncate.extend_from_slice(&OID.to_be_bytes());
+    transaction(&mut source, 0x100, vec![truncate]);
+    let error = source.poll_batch(100).await.unwrap_err();
+    assert!(error.to_string().contains("TRUNCATE"), "{error}");
+    assert!(error.to_string().contains("drop slot"), "{error}");
+}
+
+#[tokio::test]
+async fn open_transaction_rows_stay_invisible_and_behind_the_cursor() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(relation_message());
+    source.enqueue_wal_data(begin(0x100));
+    source.enqueue_wal_data(insert(&row("1", "A", "1")));
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+    assert_eq!(source.buffered_rows(), 1);
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/0"));
+    source.enqueue_wal_data(commit(0x100, 0x110));
+    let batch = next(&mut source, 100).await;
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/110"));
+}
+
+// ── Positions, batching, and cursors ──
+
+#[tokio::test]
+async fn positions_are_deterministic_wal_order_with_bound_cursors() {
+    let changes = || {
+        vec![
+            insert(&row("1", "A", "1")),
+            update(Some(b'O'), &row("1", "A", "1"), &row("2", "A", "1")),
+        ]
+    };
+    let mut encoded_runs = Vec::new();
+    for _ in 0..2 {
+        let mut source = streaming_source(OutputMode::Upsert);
+        source.enqueue_wal_data(relation_message());
+        transaction(&mut source, 0x100, changes());
+        transaction(&mut source, 0x200, vec![insert(&row("3", "B", "2"))]);
+        let mut batch = next(&mut source, 100).await;
+        let cursor = batch.take_cursor().expect("every batch binds its cursor");
+        let crate::connector::SourceBatchCursor::Complete(cursor) = cursor else {
+            panic!("complete cursor expected");
+        };
+        assert_eq!(cursor.get_offset("lsn"), Some("0/210"));
+        encoded_runs.push(encoded(&source, batch));
+    }
+    assert_eq!(
+        encoded_runs[0], encoded_runs[1],
+        "replay reproduces rows and positions"
+    );
+    let positions = source_row_positions(&encoded_runs[0]).unwrap().unwrap();
+    let mut previous = None;
+    for row in 0..positions.len() {
+        let position = positions.get(row).unwrap();
+        assert_eq!(position.partition, b"laminar_slot");
+        let key = (position.order_key.to_vec(), position.sub_offset);
+        assert!(previous.as_ref().is_none_or(|previous| previous < &key));
+        previous = Some(key);
+    }
+    let first = positions.get(0).unwrap();
+    assert_eq!(first.order_key[0], 1);
+    assert_eq!(&first.order_key[1..], &0x110_u64.to_be_bytes());
+    assert_eq!(
+        (0..3)
+            .map(|row| positions.get(row).unwrap().sub_offset)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    assert!(source_mutations(&encoded_runs[0]).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn batch_target_never_splits_a_transaction() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.enqueue_wal_data(relation_message());
+    transaction(
+        &mut source,
+        0x100,
+        vec![
+            insert(&row("1", "A", "1")),
+            insert(&row("2", "A", "1")),
+            insert(&row("3", "A", "1")),
+        ],
+    );
+    transaction(&mut source, 0x200, vec![insert(&row("4", "A", "1"))]);
+    assert_eq!(next(&mut source, 2).await.num_rows(), 3);
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/110"));
+    assert_eq!(next(&mut source, 2).await.num_rows(), 1);
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/210"));
+}
+
+#[test]
+fn snapshot_cursor_is_unavailable_and_never_resumable() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    let streaming = source.try_checkpoint().unwrap().unwrap();
+    let (lsn, binding) = parse_resumable(&streaming, &source.config, "test").unwrap();
+    assert_eq!(lsn, Lsn::ZERO);
+    assert_eq!(&binding, source.checkpoint_binding.as_ref().unwrap());
+
+    let snapshot = super::checkpoint::write_cursor(
+        &source.config,
+        source.checkpoint_binding.as_ref(),
+        super::checkpoint::CursorPhase::Snapshot,
+    );
+    assert!(snapshot.get_offset("lsn").is_none());
+    let error = parse_resumable(&snapshot, &source.config, "test").unwrap_err();
+    assert!(error.to_string().contains("cannot be resumed"), "{error}");
+
+    let mut other_table = source.config.clone();
+    other_table.table = TableName::parse("public.other").unwrap();
+    assert!(parse_resumable(&streaming, &other_table, "test").is_err());
+    source.config.output_mode = OutputMode::Changelog;
+    let error = parse_resumable(&streaming, &source.config, "test").unwrap_err();
+    assert!(error.to_string().contains("drifted"), "{error}");
+}
+
+// ── Bounded buffering ──
+
+async fn queue(source: &mut PostgresCdcSource, payloads: Vec<WalPayload>) -> WalPayloadTx {
+    let budget = Arc::new(Semaphore::new(64 * 1024 * 1024));
+    let (tx, rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(payloads.len().max(1));
+    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    for payload in payloads {
+        assert!(
+            send_wal_or_shutdown(&tx, payload, &budget, 64 * 1024 * 1024, &mut shutdown_rx)
+                .await
+                .unwrap()
+        );
+    }
+    source.wal_rx = Some(rx);
+    source.wal_byte_budget = Some(budget);
+    tx
+}
+
+fn xlog(data: Vec<u8>) -> WalPayload {
+    WalPayload::XLogData {
+        wal_end: 0,
+        data: Bytes::from(data),
+    }
+}
+
+fn wire_transaction(final_lsn: u64, rows: usize, note: &str) -> Vec<WalPayload> {
+    let mut payloads = vec![WalPayload::Begin {
+        final_lsn,
+        commit_ts_us: 0,
+    }];
+    for id in 0..rows {
+        let id = id.to_string();
+        payloads.push(xlog(insert(&[V::T(&id), V::Null, V::Null, V::T(note)])));
+    }
+    payloads.push(WalPayload::Commit {
+        end_lsn: final_lsn + 0x10,
+        commit_ts_us: 0,
+        lsn: final_lsn,
     });
-
-    src.close().await.unwrap();
-    assert_eq!(src.state, ConnectorState::Closed);
-    assert_eq!(src.buffered_events(), 0);
+    payloads
 }
 
 #[tokio::test]
-async fn normal_close_joins_the_owned_reader() {
-    let mut src = running_source();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-    src.reader_shutdown = Some(shutdown_tx);
-    src.reader_handle = Some(tokio::spawn(async move {
-        let _drop_signal = ReaderDropSignal(Some(dropped_tx));
-        let _ = started_tx.send(());
-        let _ = shutdown_rx.changed().await;
-    }));
-    started_rx.await.expect("reader task started");
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), src.close())
-        .await
-        .expect("normal close must join the reader")
-        .unwrap();
-
-    tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
-        .await
-        .expect("reader was not joined")
-        .expect("reader drop signal closed");
-    assert!(src.reader_handle.is_none());
-    assert!(src.reader_shutdown.is_none());
+async fn independently_fitting_transactions_progress_under_a_small_budget() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.config.max_buffered_bytes = 1024 * 1024;
+    let note = "v".repeat(20 * 1024);
+    let mut payloads = vec![xlog(relation_message())];
+    for transaction in 0..4 {
+        payloads.extend(wire_transaction(0x100 * (transaction + 1), 3, &note));
+    }
+    let _tx = queue(&mut source, payloads).await;
+    let mut rows = 0;
+    for _ in 0..20 {
+        if let Some(batch) = source.poll_batch(1_000).await.unwrap() {
+            rows += batch.num_rows();
+            assert!(
+                source.drainable_bytes() <= source.config.decoded_event_bytes(),
+                "retained decoded rows stay within the stage budget"
+            );
+        }
+    }
+    assert_eq!(
+        rows, 12,
+        "every transaction is emitted, none fails the source"
+    );
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/410"));
 }
 
 #[tokio::test]
-async fn cancelling_close_preserves_reader_ownership_for_retry() {
-    let mut src = running_source();
-    let terminal = src.terminal_task_tracker().unwrap();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let release = Arc::new(Notify::new());
-    let task_release = Arc::clone(&release);
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-    let reader_guard = src
-        .task_owner
-        .track()
-        .expect("live test source must admit its reader");
-    src.reader_shutdown = Some(shutdown_tx);
-    src.reader_handle = Some(tokio::spawn(async move {
-        let _reader_guard = reader_guard;
-        let _drop_signal = ReaderDropSignal(Some(dropped_tx));
-        let _ = started_tx.send(());
-        task_release.notified().await;
-    }));
-    started_rx.await.expect("reader task started");
-
-    let mut close = Box::pin(src.close());
+async fn a_single_transaction_larger_than_the_budget_fails_with_diagnostics() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.config.max_buffered_bytes = 1024 * 1024;
+    let note = "v".repeat(64 * 1024);
+    let mut payloads = vec![xlog(relation_message())];
+    payloads.extend(wire_transaction(0x100, 8, &note));
+    let _tx = queue(&mut source, payloads).await;
+    let error = source.poll_batch(1_000).await.unwrap_err();
+    let message = error.to_string();
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(10), &mut close)
-            .await
-            .is_err(),
-        "reader should keep the first close pending"
+        message.contains("exceeds the decoded-stage budget on its own"),
+        "{message}"
     );
-    drop(close);
-
-    assert!(src.reader_handle.is_some());
-    assert!(src.reader_shutdown.is_some());
-    assert!(*shutdown_rx.borrow());
-
-    release.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(1), src.close())
-        .await
-        .expect("retry close must join the retained reader")
-        .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
-        .await
-        .expect("retained reader was not joined")
-        .expect("reader drop signal closed");
-    drop(src);
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        terminal.wait_terminated(),
-    )
-    .await
-    .expect("source tracker must resolve after retry close joins the reader");
+    assert!(message.contains("max.buffered.bytes"), "{message}");
+    assert_eq!(source.state, ConnectorState::Failed);
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/0"));
 }
 
 #[tokio::test]
-async fn dropping_source_signals_and_tracks_the_reader_to_completion() {
-    let mut src = running_source();
-    let terminal = src.terminal_task_tracker().unwrap();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut task_shutdown = shutdown_rx.clone();
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-    let reader_guard = src
-        .task_owner
-        .track()
-        .expect("live test source must admit its reader");
-    src.reader_shutdown = Some(shutdown_tx);
-    src.reader_handle = Some(tokio::spawn(async move {
-        let _reader_guard = reader_guard;
-        let _drop_signal = ReaderDropSignal(Some(dropped_tx));
-        let _ = started_tx.send(());
-        let _ = task_shutdown.changed().await;
-    }));
-    started_rx.await.expect("reader task started");
-
-    drop(src);
-
-    assert!(*shutdown_rx.borrow());
-    tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+async fn relation_metadata_cannot_pin_intake_above_the_watermark() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.config.max_buffered_bytes = 1024 * 1024;
+    let mut relation = capture_table().relation;
+    relation
+        .name
+        .reserve(source.config.relation_metadata_bytes());
+    source.relation = Some(relation);
+    assert!(source.event_high_watermark() > source.config.decoded_event_bytes() / 2);
+    let mut payloads = vec![xlog(relation_message())];
+    payloads.extend(wire_transaction(0x100, 1, "small"));
+    let _tx = queue(&mut source, payloads).await;
+    let batch = source
+        .poll_batch(100)
         .await
-        .expect("reader must stop when the source is dropped")
-        .expect("reader drop signal closed");
-    tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        terminal.wait_terminated(),
+        .unwrap()
+        .expect("a small transaction drains");
+    assert_eq!(batch.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn deferred_payloads_are_kept_and_decoded_after_the_drain() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.config.max_buffered_bytes = 1024 * 1024;
+    let note = "v".repeat(20 * 1024);
+    let mut payloads = vec![xlog(relation_message())];
+    payloads.extend(wire_transaction(0x100, 6, &note));
+    payloads.extend(wire_transaction(0x200, 6, &note));
+    payloads.extend(wire_transaction(0x300, 1, "tail"));
+    let _tx = queue(&mut source, payloads).await;
+    let first = next(&mut source, 1_000).await;
+    assert_eq!(first.num_rows(), 6);
+    assert!(
+        !source.pending_payloads.is_empty(),
+        "the payload that did not fit waits; it is not lost"
+    );
+    let mut rows = first.num_rows();
+    for _ in 0..5 {
+        if let Some(batch) = source.poll_batch(1_000).await.unwrap() {
+            rows += batch.num_rows();
+        }
+    }
+    assert_eq!(rows, 13);
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/310"));
+}
+
+// ── Durable feedback ──
+
+fn committed_cursor(source: &PostgresCdcSource, lsn: u64) -> SourceCheckpoint {
+    super::checkpoint::write_cursor(
+        &source.config,
+        source.checkpoint_binding.as_ref(),
+        super::checkpoint::CursorPhase::Streaming(Lsn::new(lsn)),
+    )
+}
+
+#[tokio::test]
+async fn durable_feedback_reaches_the_worker_while_the_wal_queue_is_full() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.polled_lsn = Lsn::new(0x500);
+    let (tx, rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(1);
+    let budget = Arc::new(Semaphore::new(1024));
+    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    assert!(send_wal_or_shutdown(
+        &tx,
+        WalPayload::KeepAlive { wal_end: 9 },
+        &budget,
+        1024,
+        &mut shutdown_rx
     )
     .await
-    .expect("source tracker outlived the completed WAL reader");
-}
+    .unwrap());
+    source.wal_rx = Some(rx);
+    let handle = source.applied_lsn.clone().unwrap();
 
-#[test]
-fn tracker_covers_a_reader_destroyed_before_first_poll_on_another_runtime() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let mut source = running_source();
-    let terminal = source.terminal_task_tracker().unwrap();
-    let reader_guard = source
-        .task_owner
-        .track()
-        .expect("live test source must admit its reader");
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-    let drop_signal = ReaderDropSignal(Some(dropped_tx));
-    source.reader_shutdown = Some(shutdown_tx);
-    source.reader_handle = Some(runtime.spawn(async move {
-        let _reader_guard = reader_guard;
-        let _drop_signal = drop_signal;
-        std::future::pending::<()>().await;
-    }));
-
-    // The source is retired outside the reader's executor, before that
-    // executor has polled the task even once.
-    drop(source);
-    assert!(!terminal.is_terminated());
-    drop(runtime);
-
-    let observer = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    observer.block_on(async {
-        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
-            .await
-            .expect("runtime destruction must drop the unpolled reader promptly")
-            .expect("unpolled reader drop signal was lost");
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            terminal.wait_terminated(),
-        )
+    source
+        .notify_epoch_committed(3, &committed_cursor(&source, 0x400))
         .await
-        .expect("tracker must resolve across runtimes after actual task destruction");
-    });
+        .unwrap();
+    assert_eq!(handle.get().as_u64(), 0x400);
+    assert_eq!(source.confirmed_flush_lsn(), Lsn::new(0x400));
+
+    source
+        .notify_epoch_committed(2, &committed_cursor(&source, 0x300))
+        .await
+        .unwrap();
+    assert_eq!(
+        handle.get().as_u64(),
+        0x400,
+        "stale commits never regress feedback"
+    );
 }
+
+#[tokio::test]
+async fn feedback_never_passes_the_polled_cursor_or_a_drifted_binding() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.polled_lsn = Lsn::new(0x100);
+    let handle = source.applied_lsn.clone().unwrap();
+    let error = source
+        .notify_epoch_committed(1, &committed_cursor(&source, 0x200))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ahead"), "{error}");
+
+    let mut drifted = committed_cursor(&source, 0x100);
+    drifted.set_metadata("publication_oid", "1");
+    let error = source
+        .notify_epoch_committed(1, &drifted)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("drifted"), "{error}");
+
+    let snapshot = super::checkpoint::write_cursor(
+        &source.config,
+        source.checkpoint_binding.as_ref(),
+        super::checkpoint::CursorPhase::Snapshot,
+    );
+    source.notify_epoch_committed(1, &snapshot).await.unwrap();
+    assert_eq!(
+        handle.get().as_u64(),
+        0,
+        "no feedback is ever sent for snapshot rows"
+    );
+}
+
+// ── Reader ownership ──
 
 #[tokio::test]
 async fn close_interrupts_reader_blocked_on_full_wal_queue() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let mut src = running_source();
+    let mut source = streaming_source(OutputMode::Upsert);
     let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(1);
     let payload_bytes = retained_wal_payload_bytes(&WalPayload::KeepAlive { wal_end: 1 });
     let byte_budget = Arc::new(Semaphore::new(payload_bytes * 2));
@@ -402,1536 +805,47 @@ async fn close_interrupts_reader_blocked_on_full_wal_queue() {
     .unwrap());
     let stopped = Arc::new(AtomicBool::new(false));
     let stopped_in_task = Arc::clone(&stopped);
-    let task_byte_budget = Arc::clone(&byte_budget);
+    let task_budget = Arc::clone(&byte_budget);
     let reader_handle = tokio::spawn(async move {
         let sent = send_wal_or_shutdown(
             &wal_tx,
             WalPayload::KeepAlive { wal_end: 2 },
-            &task_byte_budget,
+            &task_budget,
             payload_bytes * 2,
             &mut shutdown_rx,
         )
         .await;
         stopped_in_task.store(matches!(sent, Ok(false)), Ordering::Release);
     });
-
-    src.wal_rx = Some(wal_rx);
-    src.wal_byte_budget = Some(byte_budget);
-    src.reader_shutdown = Some(shutdown_tx);
-    src.reader_handle = Some(reader_handle);
-
-    tokio::time::timeout(std::time::Duration::from_millis(250), src.close())
-        .await
-        .expect("close must not wait for WAL queue capacity")
-        .unwrap();
-    assert!(stopped.load(Ordering::Acquire));
-    assert_eq!(src.state, ConnectorState::Closed);
-}
-
-#[tokio::test]
-async fn oversized_raw_wal_payload_reports_terminal_error_without_waiting_for_capacity() {
-    let max_payload_bytes = 128;
-    let byte_budget = Arc::new(Semaphore::new(max_payload_bytes));
-    let _all_capacity = Arc::clone(&byte_budget)
-        .acquire_many_owned(u32::try_from(max_payload_bytes).unwrap())
-        .await
-        .unwrap();
-    let (wal_tx, _wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(1);
-    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let oversized = WalPayload::XLogData {
-        wal_end: 1,
-        data: Bytes::from(vec![0; max_payload_bytes]),
-    };
-
-    let message = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        send_wal_or_shutdown(
-            &wal_tx,
-            oversized,
-            &byte_budget,
-            max_payload_bytes,
-            &mut shutdown_rx,
-        ),
-    )
-    .await
-    .expect("oversized payload must fail before waiting for byte permits")
-    .expect_err("payload and envelope exceed the byte budget");
-    assert!(message.contains("hard raw buffer limit"), "{message}");
-
-    let terminal_error: WalTerminalError = Arc::new(std::sync::Mutex::new(None));
-    let data_ready = Notify::new();
-    publish_terminal_wal_error(&terminal_error, message.clone(), &data_ready);
-    let mut source = running_source();
-    source.wal_terminal_error = Some(terminal_error);
-    let error = source
-        .fail_on_terminal_wal_error()
-        .expect_err("reader terminal error must fail the source");
-    assert!(error.to_string().contains(message.as_str()));
-    assert_eq!(source.state, ConnectorState::Failed);
-}
-
-#[tokio::test]
-async fn raw_wal_budget_backpressures_aggregate_payload_bytes() {
-    let first = WalPayload::XLogData {
-        wal_end: 1,
-        data: Bytes::from_static(&[1; 32]),
-    };
-    let payload_bytes = retained_wal_payload_bytes(&first);
-    let byte_limit = payload_bytes * 2 - 1;
-    let byte_budget = Arc::new(Semaphore::new(byte_limit));
-    let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(2);
-    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    assert!(
-        send_wal_or_shutdown(&wal_tx, first, &byte_budget, byte_limit, &mut shutdown_rx,)
-            .await
-            .unwrap()
-    );
-
-    let task_budget = Arc::clone(&byte_budget);
-    let mut handle = tokio::spawn(async move {
-        send_wal_or_shutdown(
-            &wal_tx,
-            WalPayload::XLogData {
-                wal_end: 2,
-                data: Bytes::from_static(&[2; 32]),
-            },
-            &task_budget,
-            byte_limit,
-            &mut shutdown_rx,
-        )
-        .await
-    });
-
-    let first_owned = wal_rx.recv().await.unwrap();
-    assert_eq!(byte_budget.available_permits(), payload_bytes - 1);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), &mut handle)
-            .await
-            .is_err(),
-        "receiving must not release byte ownership before processing"
-    );
-    drop(first_owned);
-    assert!(handle.await.unwrap().unwrap());
-    let second_owned = wal_rx.recv().await.unwrap();
-    drop(second_owned);
-    assert_eq!(byte_budget.available_permits(), byte_limit);
-}
-
-#[tokio::test]
-async fn pending_wal_payload_keeps_its_byte_reservation() {
-    let payload = WalPayload::KeepAlive { wal_end: 7 };
-    let payload_bytes = retained_wal_payload_bytes(&payload);
-    let byte_budget = Arc::new(Semaphore::new(payload_bytes));
-    let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(1);
-    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    assert!(send_wal_or_shutdown(
-        &wal_tx,
-        payload,
-        &byte_budget,
-        payload_bytes,
-        &mut shutdown_rx,
-    )
-    .await
-    .unwrap());
-
-    let mut source = running_source();
-    source
-        .pending_payloads
-        .push_back(wal_rx.recv().await.unwrap());
-    assert_eq!(byte_budget.available_permits(), 0);
-    let pending = source.pending_payloads.pop_front().unwrap();
-    source.process_owned_wal_payload(pending).unwrap();
-    assert_eq!(source.write_lsn, Lsn::new(7));
-    assert_eq!(byte_budget.available_permits(), payload_bytes);
-}
-
-#[tokio::test]
-async fn owned_wal_path_records_boundary_bytes_once() {
-    let begin = WalPayload::Begin {
-        final_lsn: 0x100,
-        commit_ts_us: 0,
-        xid: 1,
-    };
-    let commit = WalPayload::Commit {
-        end_lsn: 0x200,
-        commit_ts_us: 0,
-        lsn: 0x100,
-    };
-    let expected_bytes = logical_wal_payload_bytes(&begin)
-        .checked_add(logical_wal_payload_bytes(&commit))
-        .unwrap();
-    let byte_limit = retained_wal_payload_bytes(&begin)
-        .checked_add(retained_wal_payload_bytes(&commit))
-        .unwrap();
-    let byte_budget = Arc::new(Semaphore::new(byte_limit));
-    let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(2);
-    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    assert!(
-        send_wal_or_shutdown(&wal_tx, begin, &byte_budget, byte_limit, &mut shutdown_rx,)
-            .await
-            .unwrap()
-    );
-    assert!(
-        send_wal_or_shutdown(&wal_tx, commit, &byte_budget, byte_limit, &mut shutdown_rx,)
-            .await
-            .unwrap()
-    );
-
-    let mut source = running_source();
-    source
-        .process_owned_wal_payload(wal_rx.recv().await.unwrap())
-        .unwrap();
-    source
-        .process_owned_wal_payload(wal_rx.recv().await.unwrap())
-        .unwrap();
-
-    assert_eq!(
-        source.metrics.bytes_received.get(),
-        u64::try_from(expected_bytes).unwrap()
-    );
-    assert_eq!(byte_budget.available_permits(), byte_limit);
-}
-
-#[tokio::test]
-async fn decoded_byte_high_watermark_stops_raw_lookahead() {
-    let mut source = running_source();
-    source.config.max_buffered_bytes = 1024 * 1024;
-    let relation_name = "x".repeat(source.config.decoded_high_watermark_bytes());
-    let relation = WalPayload::XLogData {
-        wal_end: 1,
-        data: Bytes::from(PostgresCdcSource::build_relation_message(
-            1,
-            "public",
-            &relation_name,
-            &[],
-        )),
-    };
-    let keepalive = WalPayload::KeepAlive { wal_end: 2 };
-    let byte_limit = source.config.raw_wal_bytes();
-    let byte_budget = Arc::new(Semaphore::new(byte_limit));
-    let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(2);
-    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    assert!(send_wal_or_shutdown(
-        &wal_tx,
-        relation,
-        &byte_budget,
-        byte_limit,
-        &mut shutdown_rx,
-    )
-    .await
-    .unwrap());
-    assert!(send_wal_or_shutdown(
-        &wal_tx,
-        keepalive,
-        &byte_budget,
-        byte_limit,
-        &mut shutdown_rx,
-    )
-    .await
-    .unwrap());
-    source.wal_rx = Some(wal_rx);
-    source.wal_byte_budget = Some(byte_budget);
-
-    assert!(source.poll_batch(1).await.unwrap().is_none());
-    assert_eq!(source.relation_cache.len(), 1);
-    assert!(
-        source.decoded_retained_bytes().unwrap() >= source.config.decoded_high_watermark_bytes()
-    );
-    assert!(source.pending_payloads.is_empty());
-    assert_eq!(source.write_lsn, Lsn::new(1));
-}
-
-#[tokio::test]
-async fn bounded_poll_self_notifies_when_an_open_transaction_has_queued_work() {
-    let begin = WalPayload::Begin {
-        final_lsn: 0x100,
-        commit_ts_us: 0,
-        xid: 1,
-    };
-    let commit = WalPayload::Commit {
-        end_lsn: 0x200,
-        commit_ts_us: 0,
-        lsn: 0x100,
-    };
-    let byte_limit =
-        retained_wal_payload_bytes(&begin).saturating_add(retained_wal_payload_bytes(&commit));
-    let byte_budget = Arc::new(Semaphore::new(byte_limit));
-    let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(2);
-    let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    assert!(
-        send_wal_or_shutdown(&wal_tx, begin, &byte_budget, byte_limit, &mut shutdown_rx,)
-            .await
-            .unwrap()
-    );
-    assert!(
-        send_wal_or_shutdown(&wal_tx, commit, &byte_budget, byte_limit, &mut shutdown_rx,)
-            .await
-            .unwrap()
-    );
-
-    let mut source = running_source();
-    source.wal_rx = Some(wal_rx);
-    source.wal_byte_budget = Some(byte_budget);
-    assert!(source.poll_batch(1).await.unwrap().is_none());
-    assert!(source.current_txn.is_some());
-    assert_eq!(source.pending_payloads.len(), 1);
-    tokio::time::timeout(
-        std::time::Duration::from_millis(25),
-        source.data_ready.notified(),
-    )
-    .await
-    .expect("queued protocol work must leave a readiness permit");
-    assert!(source.poll_batch(1).await.unwrap().is_none());
-    assert!(source.current_txn.is_none());
-    assert!(source.pending_payloads.is_empty());
-}
-
-#[tokio::test]
-async fn close_interrupts_reader_waiting_for_raw_wal_byte_budget() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let mut source = running_source();
-    let payload = WalPayload::KeepAlive { wal_end: 9 };
-    let payload_bytes = retained_wal_payload_bytes(&payload);
-    let byte_budget = Arc::new(Semaphore::new(payload_bytes));
-    let held_capacity = Arc::clone(&byte_budget)
-        .acquire_many_owned(u32::try_from(payload_bytes).unwrap())
-        .await
-        .unwrap();
-    let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(1);
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let task_budget = Arc::clone(&byte_budget);
-    let stopped = Arc::new(AtomicBool::new(false));
-    let task_stopped = Arc::clone(&stopped);
-    let reader_handle = tokio::spawn(async move {
-        let sent = send_wal_or_shutdown(
-            &wal_tx,
-            payload,
-            &task_budget,
-            payload_bytes,
-            &mut shutdown_rx,
-        )
-        .await;
-        task_stopped.store(matches!(sent, Ok(false)), Ordering::Release);
-    });
-
     source.wal_rx = Some(wal_rx);
     source.wal_byte_budget = Some(byte_budget);
     source.reader_shutdown = Some(shutdown_tx);
     source.reader_handle = Some(reader_handle);
+
     tokio::time::timeout(std::time::Duration::from_millis(250), source.close())
         .await
-        .expect("close must interrupt a WAL byte-permit wait")
+        .expect("close must not wait for WAL queue capacity")
         .unwrap();
-    drop(held_capacity);
     assert!(stopped.load(Ordering::Acquire));
     assert_eq!(source.state, ConnectorState::Closed);
-}
-
-// ── Checkpoint / Restore ──
-
-#[test]
-fn test_checkpoint() {
-    let mut src = running_source();
-    src.confirmed_flush_lsn = "1/ABCD".parse().unwrap();
-    src.polled_lsn = "1/ABCD".parse().unwrap();
-    src.write_lsn = "1/ABCE".parse().unwrap();
-
-    let cp = src.checkpoint();
-    assert_eq!(cp.get_offset("lsn"), Some("1/ABCD"));
-    assert_eq!(cp.get_offset("write_lsn"), None);
-    assert_eq!(cp.get_metadata("slot_name"), Some("laminar_slot"));
-    assert_eq!(cp.get_metadata("checkpoint_version"), Some("3"));
-    assert_eq!(cp.get_metadata(SYSTEM_IDENTIFIER_METADATA), Some("7"));
-    assert_eq!(cp.get_metadata(TIMELINE_ID_METADATA), Some("1"));
-    assert_eq!(cp.get_metadata(SLOT_PLUGIN_METADATA), Some("pgoutput"));
-}
-
-fn committed_lsn_checkpoint(lsn: &str) -> SourceCheckpoint {
-    let source = default_source();
-    let mut checkpoint = source.checkpoint();
-    checkpoint.set_offset("lsn", lsn);
-    write_checkpoint_binding(&mut checkpoint, &test_binding(&source.config));
-    checkpoint
+    assert!(source.applied_lsn.is_none());
 }
 
 #[tokio::test]
-async fn committed_epoch_rejects_malformed_durable_lsn() {
-    let mut source = default_source();
-    let error = source
-        .notify_epoch_committed(7, &committed_lsn_checkpoint("not-an-lsn"))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("invalid LSN"), "{error}");
-    assert!(source.confirmed_flush_lsn.is_zero());
-}
+async fn reader_terminal_error_fails_the_source() {
+    let terminal: WalTerminalError = Arc::new(std::sync::Mutex::new(None));
+    let data_ready = Notify::new();
+    publish_terminal_wal_error(&terminal, "stream failed".into(), &data_ready);
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.wal_terminal_error = Some(terminal);
+    let error = source.poll_batch(10).await.unwrap_err();
+    assert!(error.to_string().contains("stream failed"));
+    assert_eq!(source.state, ConnectorState::Failed);
 
-#[tokio::test]
-async fn committed_epoch_rejects_missing_feedback_channel() {
-    let mut source = running_source();
-    source.polled_lsn = "1/10".parse().unwrap();
-    let error = source
-        .notify_epoch_committed(7, &committed_lsn_checkpoint("1/10"))
-        .await
-        .unwrap_err();
+    let repeated = source.poll_batch(10).await.unwrap_err();
     assert!(
-        error.to_string().contains("feedback channel is missing"),
-        "{error}"
+        matches!(repeated, ConnectorError::InvalidState { .. }) && !repeated.is_transient(),
+        "{repeated:?}"
     );
-    assert!(source.confirmed_flush_lsn.is_zero());
-}
-
-#[tokio::test]
-async fn committed_epoch_rejects_closed_feedback_without_advancing_local_lsn() {
-    let mut source = running_source();
-    source.polled_lsn = "1/10".parse().unwrap();
-    let (feedback_tx, feedback_rx) = tokio::sync::watch::channel(0);
-    drop(feedback_rx);
-    source.confirmed_lsn_tx = Some(feedback_tx);
-
-    let error = source
-        .notify_epoch_committed(7, &committed_lsn_checkpoint("1/10"))
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("feedback channel is closed"),
-        "{error}"
-    );
-    assert!(source.confirmed_flush_lsn.is_zero());
-}
-
-#[tokio::test]
-async fn committed_epoch_advances_local_lsn_only_after_feedback_handoff() {
-    let mut source = running_source();
-    source.polled_lsn = "1/10".parse().unwrap();
-    let (feedback_tx, mut feedback_rx) = tokio::sync::watch::channel(0);
-    source.confirmed_lsn_tx = Some(feedback_tx);
-
-    source
-        .notify_epoch_committed(7, &committed_lsn_checkpoint("1/10"))
-        .await
-        .unwrap();
-    let expected = "1/10".parse::<Lsn>().unwrap();
-    assert_eq!(source.confirmed_flush_lsn, expected);
-    assert_eq!(*feedback_rx.borrow_and_update(), expected.as_u64());
-}
-
-#[tokio::test]
-async fn committed_epoch_ahead_of_polled_lsn_leaves_feedback_and_cursor_unchanged() {
-    let mut source = running_source();
-    source.confirmed_flush_lsn = "1/8".parse().unwrap();
-    source.polled_lsn = "1/10".parse().unwrap();
-    let (feedback_tx, mut feedback_rx) = tokio::sync::watch::channel(0x1008);
-    source.confirmed_lsn_tx = Some(feedback_tx);
-
-    let error = source
-        .notify_epoch_committed(7, &committed_lsn_checkpoint("1/11"))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("ahead of"), "{error}");
-    assert_eq!(source.confirmed_flush_lsn, "1/8".parse().unwrap());
-    assert_eq!(*feedback_rx.borrow_and_update(), 0x1008);
-}
-
-#[tokio::test]
-async fn committed_epoch_rejects_binding_drift_before_feedback() {
-    let mut source = running_source();
-    source.polled_lsn = "1/10".parse().unwrap();
-    let (feedback_tx, mut feedback_rx) = tokio::sync::watch::channel(0);
-    source.confirmed_lsn_tx = Some(feedback_tx);
-    let mut checkpoint = committed_lsn_checkpoint("1/10");
-    checkpoint.set_metadata(PUBLICATION_OID_METADATA, "16385");
-
-    let error = source
-        .notify_epoch_committed(7, &checkpoint)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("identity drifted"), "{error}");
-    assert!(source.confirmed_flush_lsn.is_zero());
-    assert_eq!(*feedback_rx.borrow_and_update(), 0);
-}
-
-#[tokio::test]
-async fn confirmed_lsn_watch_wakes_without_a_replication_event() {
-    let (feedback_tx, mut feedback_rx) = tokio::sync::watch::channel(0);
-    feedback_tx.send(0x1234).unwrap();
-
-    tokio::time::timeout(std::time::Duration::from_millis(25), feedback_rx.changed())
-        .await
-        .expect("confirmed LSN notification must wake the reader select")
-        .unwrap();
-    assert_eq!(
-        take_confirmed_lsn(&mut feedback_rx).unwrap().as_u64(),
-        0x1234
-    );
-}
-
-#[tokio::test]
-async fn committed_epoch_never_regresses_confirmed_lsn() {
-    let mut source = running_source();
-    source.confirmed_flush_lsn = "2/20".parse().unwrap();
-    source.polled_lsn = "2/20".parse().unwrap();
-
-    source
-        .notify_epoch_committed(6, &committed_lsn_checkpoint("1/10"))
-        .await
-        .unwrap();
-    assert_eq!(source.confirmed_flush_lsn, "2/20".parse().unwrap());
-}
-
-#[tokio::test]
-async fn test_resume_installs_exact_engine_lsn() {
-    let mut src = default_source();
-    let cp = committed_lsn_checkpoint("2/FF00");
-
-    let result = src
-        .start(
-            SourceStart::new(
-                ConnectorConfig::new("postgres-cdc"),
-                SourcePosition::Resume {
-                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
-                    checkpoint: cp,
-                },
-                crate::connector::DeliveryGuarantee::AtLeastOnce,
-            )
-            .unwrap(),
-        )
-        .await;
-    result.unwrap();
-    assert_eq!(src.confirmed_flush_lsn.as_u64(), 0x2_0000_FF00);
-    assert_eq!(src.polled_lsn.as_u64(), 0x2_0000_FF00);
-    assert_eq!(
-        src.write_lsn.as_u64(),
-        0x2_0000_FF00,
-        "diagnostic write_lsn starts at the durable recovery cursor"
-    );
-}
-
-#[tokio::test]
-async fn test_resume_invalid_lsn_fails_before_replication() {
-    let mut src = default_source();
-    let cp = committed_lsn_checkpoint("not_an_lsn");
-
-    let error = src
-        .start(
-            SourceStart::new(
-                ConnectorConfig::new("postgres-cdc"),
-                SourcePosition::Resume {
-                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
-                    checkpoint: cp,
-                },
-                crate::connector::DeliveryGuarantee::AtLeastOnce,
-            )
-            .unwrap(),
-        )
-        .await
-        .expect_err("invalid durable LSN must fail closed");
-    assert!(error.to_string().contains("invalid LSN"));
-    assert_eq!(src.state, ConnectorState::Created);
-}
-
-#[tokio::test]
-async fn old_checkpoint_version_fails_without_installing_runtime_state() {
-    let mut src = default_source();
-    let mut checkpoint = committed_lsn_checkpoint("1/10");
-    checkpoint.set_metadata("checkpoint_version", "2");
-
-    let error = src
-        .start(
-            SourceStart::new(
-                ConnectorConfig::new("postgres-cdc"),
-                SourcePosition::Resume {
-                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
-                    checkpoint,
-                },
-                crate::connector::DeliveryGuarantee::AtLeastOnce,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("expected '3'"), "{error}");
-    assert_eq!(src.state, ConnectorState::Created);
-    assert!(src.checkpoint_binding.is_none());
-    assert!(src.reader_handle.is_none());
-    assert!(src.wal_rx.is_none());
-    assert!(src.confirmed_lsn_tx.is_none());
-}
-
-// ── Poll (empty) ──
-
-#[tokio::test]
-async fn test_poll_empty() {
-    let mut src = running_source();
-    let result = src.poll_batch(100).await.unwrap();
-    assert!(result.is_none());
-}
-
-#[tokio::test]
-async fn test_poll_not_running() {
-    let mut src = default_source();
-    assert!(src.poll_batch(100).await.is_err());
-}
-
-// ── WAL message processing: full transaction ──
-
-#[tokio::test]
-async fn test_process_insert_transaction() {
-    let mut src = running_source();
-
-    let rel_msg = PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1), (0, "name", TEXT_OID, -1)],
-    );
-    let begin_msg = PostgresCdcSource::build_begin_message(0x100, 0, 1);
-    let insert_msg = PostgresCdcSource::build_insert_message(16384, &[Some("42"), Some("Alice")]);
-    let commit_msg = PostgresCdcSource::build_commit_message(0x100, 0x200, 0);
-
-    src.enqueue_wal_data(rel_msg);
-    src.enqueue_wal_data(begin_msg);
-    src.enqueue_wal_data(insert_msg);
-    src.enqueue_wal_data(commit_msg);
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 1);
-
-    let records = &batch.records;
-    let table_col = records.column(0).as_string::<i32>();
-    assert_eq!(table_col.value(0), "public.users");
-
-    let op_col = records.column(1).as_string::<i32>();
-    assert_eq!(op_col.value(0), "I");
-
-    let after_col = records.column(5).as_string::<i32>();
-    let after_json: serde_json::Value = serde_json::from_str(after_col.value(0)).unwrap();
-    assert_eq!(after_json["id"], "42");
-    assert_eq!(after_json["name"], "Alice");
-
-    // before should be null for INSERT
-    assert!(records.column(4).is_null(0));
-}
-
-// ── Multiple events in one transaction ──
-
-#[tokio::test]
-async fn test_multi_event_transaction() {
-    let mut src = running_source();
-
-    // Register relation
-    let rel_msg = PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1), (0, "name", TEXT_OID, -1)],
-    );
-    src.enqueue_wal_data(rel_msg);
-
-    // Transaction with 3 events
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x300, 0, 2));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-        16384,
-        &[Some("1"), Some("Alice")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-        16384,
-        &[Some("2"), Some("Bob")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-        16384,
-        &[Some("3"), Some("Charlie")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x300, 0x400, 0));
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 3);
-}
-
-// ── Events buffered until commit ──
-
-#[tokio::test]
-async fn test_events_buffered_until_commit() {
-    let mut src = running_source();
-
-    let rel_msg = PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1)],
-    );
-    src.enqueue_wal_data(rel_msg);
-
-    // Begin + Insert but NO commit
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("1")]));
-
-    // Poll should return nothing (events in txn buffer)
-    let result = src.poll_batch(100).await.unwrap();
-    assert!(result.is_none());
-
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 1);
-}
-
-#[tokio::test]
-async fn decoded_container_growth_is_charged_before_the_rejected_event() {
-    let mut src = running_source();
-    src.config.max_buffered_bytes = 1024 * 1024;
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "orders",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x400, 0, 1));
-    for _ in 0..10_000 {
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
-    }
-
-    let error = src.poll_batch(100).await.unwrap_err();
-    assert!(error.to_string().contains("decoded-stage buffer limit"));
-    assert_eq!(src.state, ConnectorState::Failed);
-    assert!(src.buffered_event_count > 0);
-    assert_eq!(
-        src.current_txn.as_ref().unwrap().events.len(),
-        src.buffered_event_count
-    );
-    assert!(src.decoded_retained_bytes().unwrap() <= src.config.decoded_event_bytes());
-    assert!(src.committed_transactions.is_empty());
-    assert!(src.write_lsn.is_zero());
-    assert!(src.polled_lsn.is_zero());
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/0"));
-}
-
-#[tokio::test]
-async fn relation_cache_growth_is_bounded_by_the_decoded_stage() {
-    let mut src = running_source();
-    src.config.max_buffered_bytes = 1024 * 1024;
-    for relation_id in 1..=5_000 {
-        let name = format!("t{relation_id}");
-        src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-            relation_id,
-            "public",
-            &name,
-            &[(1, "id", INT4_OID, -1)],
-        ));
-    }
-
-    let error = src.poll_batch(100).await.unwrap_err();
-    assert!(error.to_string().contains("relation-cache"), "{error}");
-    assert_eq!(src.state, ConnectorState::Failed);
-    assert!(!src.relation_cache.is_empty());
-    assert!(src.decoded_retained_bytes().unwrap() <= src.config.decoded_event_bytes());
-}
-
-#[test]
-fn relation_replacement_charges_only_retained_growth() {
-    let mut src = running_source();
-    let relation = RelationInfo {
-        relation_id: 1,
-        namespace: "public".to_string(),
-        name: "orders".to_string(),
-        replica_identity: 'd',
-        columns: Vec::new(),
-    };
-    src.admit_relation(relation.clone()).unwrap();
-    let retained = src.decoded_retained_bytes().unwrap();
-    src.config.max_buffered_bytes = retained.checked_mul(3).unwrap();
-
-    src.admit_relation(relation).unwrap();
-
-    assert_eq!(src.relation_cache.len(), 1);
-    assert_eq!(src.decoded_retained_bytes().unwrap(), retained);
-}
-
-#[tokio::test]
-async fn json_escape_expansion_is_rejected_by_the_total_byte_limit() {
-    let mut src = running_source();
-    src.config.max_buffered_bytes = 1024 * 1024;
-    let oversized_value = "\n".repeat(src.config.decoded_event_bytes() / 2 + 128);
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "orders",
-        &[(1, "payload", TEXT_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x400, 0, 1));
-    let insert = PostgresCdcSource::build_insert_message(100, &[Some(&oversized_value)]);
-    assert!(insert.len() <= src.config.raw_wal_bytes());
-    src.enqueue_wal_data(insert);
-
-    let error = src.poll_batch(100).await.unwrap_err();
-    assert!(error.to_string().contains("retained bytes"));
-    assert_eq!(src.state, ConnectorState::Failed);
-    assert_eq!(src.buffered_event_count, 0);
-    assert_eq!(src.buffered_event_bytes, 0);
-    assert!(src.current_txn.as_ref().unwrap().events.is_empty());
-    assert!(src.write_lsn.is_zero());
-    assert!(src.polled_lsn.is_zero());
-}
-
-#[tokio::test]
-async fn row_change_outside_transaction_fails_closed() {
-    let mut src = running_source();
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "orders",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
-
-    let error = src.poll_batch(100).await.unwrap_err();
-    assert!(error.to_string().contains("outside a transaction"));
-    assert_eq!(src.buffered_events(), 0);
-}
-
-#[test]
-fn corrupt_commit_boundaries_fail_closed() {
-    let cases = [
-        super::super::decoder::CommitMessage {
-            flags: 0,
-            commit_lsn: Lsn::new(0x101),
-            end_lsn: Lsn::new(0x200),
-            commit_ts_ms: 7,
-        },
-        super::super::decoder::CommitMessage {
-            flags: 0,
-            commit_lsn: Lsn::new(0x100),
-            end_lsn: Lsn::new(0x0ff),
-            commit_ts_ms: 7,
-        },
-        super::super::decoder::CommitMessage {
-            flags: 0,
-            commit_lsn: Lsn::new(0x100),
-            end_lsn: Lsn::new(0x200),
-            commit_ts_ms: 8,
-        },
-    ];
-
-    for commit in cases {
-        let mut src = running_source();
-        src.process_wal_message(WalMessage::Begin(super::super::decoder::BeginMessage {
-            final_lsn: Lsn::new(0x100),
-            commit_ts_ms: 7,
-            xid: 1,
-        }))
-        .unwrap();
-        let error = src
-            .process_wal_message(WalMessage::Commit(commit))
-            .unwrap_err();
-        assert_eq!(src.state, ConnectorState::Failed, "{error}");
-        assert!(src.committed_transactions.is_empty());
-        assert!(src.current_txn.is_some());
-    }
-}
-
-#[test]
-fn commit_end_lsn_cannot_move_behind_a_queued_transaction() {
-    let mut src = running_source();
-    for (final_lsn, end_lsn) in [(0x100, 0x300), (0x200, 0x250)] {
-        src.process_wal_message(WalMessage::Begin(super::super::decoder::BeginMessage {
-            final_lsn: Lsn::new(final_lsn),
-            commit_ts_ms: 0,
-            xid: 1,
-        }))
-        .unwrap();
-        let result =
-            src.process_wal_message(WalMessage::Commit(super::super::decoder::CommitMessage {
-                flags: 0,
-                commit_lsn: Lsn::new(final_lsn),
-                end_lsn: Lsn::new(end_lsn),
-                commit_ts_ms: 0,
-            }));
-        if end_lsn == 0x250 {
-            let error = result.unwrap_err();
-            assert!(error.to_string().contains("behind"), "{error}");
-        } else {
-            result.unwrap();
-        }
-    }
-    assert_eq!(src.state, ConnectorState::Failed);
-    assert_eq!(src.committed_transactions.len(), 1);
-    assert!(src.current_txn.is_some());
-}
-
-#[test]
-fn vendor_timestamp_overflow_is_rejected() {
-    let mut src = running_source();
-    let error = src
-        .process_wal_payload(WalPayload::Begin {
-            final_lsn: 0x100,
-            commit_ts_us: i64::MAX,
-            xid: 1,
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("timestamp"), "{error}");
-    assert!(src.current_txn.is_none());
-}
-
-#[test]
-fn malformed_raw_boundary_is_not_silently_skipped() {
-    let mut src = running_source();
-    let mut data = PostgresCdcSource::build_begin_message(0x100, 0, 1);
-    data.push(0xff);
-    let error = src
-        .process_wal_payload(WalPayload::XLogData {
-            wal_end: 0x100,
-            data: Bytes::from(data),
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("trailing bytes"), "{error}");
-    assert!(src.current_txn.is_none());
-    assert!(src.write_lsn.is_zero());
-}
-
-#[tokio::test]
-async fn checkpoint_stays_before_open_transaction_when_write_lsn_advances() {
-    let mut src = running_source();
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "orders",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x300, 0, 2));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("2")]));
-
-    src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
-    assert!(src.current_txn.is_some());
-
-    src.process_wal_payload(WalPayload::KeepAlive { wal_end: 0x500 })
-        .unwrap();
-    assert_eq!(src.write_lsn.as_u64(), 0x500);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
-}
-
-#[tokio::test]
-async fn batch_target_never_splits_a_committed_transaction() {
-    let mut src = running_source();
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "orders",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x400, 0, 1));
-    for id in ["1", "2", "3"] {
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some(id)]));
-    }
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x400, 0x500, 0));
-
-    let first = src.poll_batch(2).await.unwrap().unwrap();
-    assert_eq!(first.num_rows(), 3);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/500"));
-    assert!(src.poll_batch(2).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn batch_target_stops_before_the_next_whole_transaction() {
-    let mut src = running_source();
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "orders",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-    for (xid, ids, final_lsn, end_lsn) in
-        [(1, ["1", "2"], 0x100, 0x200), (2, ["3", "4"], 0x300, 0x400)]
-    {
-        src.enqueue_wal_data(PostgresCdcSource::build_begin_message(final_lsn, 0, xid));
-        for id in ids {
-            src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some(id)]));
-        }
-        src.enqueue_wal_data(PostgresCdcSource::build_commit_message(
-            final_lsn, end_lsn, 0,
-        ));
-    }
-
-    let first = src.poll_batch(3).await.unwrap().unwrap();
-    assert_eq!(first.num_rows(), 2);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
-    let second = src.poll_batch(3).await.unwrap().unwrap();
-    assert_eq!(second.num_rows(), 2);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/400"));
-}
-
-#[tokio::test]
-async fn buffered_whole_transaction_wakes_an_event_driven_next_poll() {
-    let mut src = running_source();
-    src.inject_event(ChangeEvent {
-        table: "public.orders".into(),
-        op: CdcOperation::Insert,
-        lsn: Lsn::new(0x100),
-        ts_ms: 0,
-        before: None,
-        after: Some("{\"id\":\"1\"}".into()),
-    });
-    src.inject_event(ChangeEvent {
-        table: "public.orders".into(),
-        op: CdcOperation::Insert,
-        lsn: Lsn::new(0x200),
-        ts_ms: 0,
-        before: None,
-        after: Some("{\"id\":\"2\"}".into()),
-    });
-    let ready = src.data_ready_notify().unwrap();
-
-    let first = src.poll_batch(1).await.unwrap().unwrap();
-    assert_eq!(first.num_rows(), 1);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/100"));
-    tokio::time::timeout(std::time::Duration::from_millis(25), ready.notified())
-        .await
-        .expect("a buffered committed transaction must retain a readiness permit");
-    let second = src.poll_batch(1).await.unwrap().unwrap();
-    assert_eq!(second.num_rows(), 1);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
-}
-
-#[tokio::test]
-async fn zero_capacity_poll_does_not_self_wake() {
-    let mut src = running_source();
-    src.inject_event(ChangeEvent {
-        table: "public.orders".into(),
-        op: CdcOperation::Insert,
-        lsn: Lsn::new(0x100),
-        ts_ms: 0,
-        before: None,
-        after: Some("{\"id\":\"1\"}".into()),
-    });
-    let ready = src.data_ready_notify().unwrap();
-
-    assert!(src.poll_batch(0).await.unwrap().is_none());
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), ready.notified())
-            .await
-            .is_err(),
-        "a zero-capacity poll must not create a readiness busy loop"
-    );
-}
-
-#[tokio::test]
-async fn final_batch_rearms_raw_polling_once() {
-    let mut src = running_source();
-    src.inject_event(ChangeEvent {
-        table: "public.orders".into(),
-        op: CdcOperation::Insert,
-        lsn: Lsn::new(0x100),
-        ts_ms: 0,
-        before: None,
-        after: Some("{\"id\":\"1\"}".into()),
-    });
-    let ready = src.data_ready_notify().unwrap();
-
-    src.poll_batch(1).await.unwrap().unwrap();
-    tokio::time::timeout(std::time::Duration::from_millis(25), ready.notified())
-        .await
-        .expect("the final batch must re-arm raw WAL polling");
-    assert!(src.poll_batch(1).await.unwrap().is_none());
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), ready.notified())
-            .await
-            .is_err(),
-        "an empty follow-up poll must quiesce"
-    );
-}
-
-#[tokio::test]
-async fn empty_filtered_transaction_advances_only_in_wal_order() {
-    let mut config = PostgresCdcConfig::default();
-    config.ssl_mode = crate::postgres::SslMode::Disable;
-    config.table_exclude = vec!["public.users".to_string()];
-    let mut src = PostgresCdcSource::new(config, None);
-    src.state = ConnectorState::Running;
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "orders",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        101,
-        "public",
-        "users",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-
-    for (xid, relation, id, commit_lsn) in [
-        (1, 100, "1", 0x100),
-        (2, 101, "2", 0x200),
-        (3, 100, "3", 0x300),
-    ] {
-        src.enqueue_wal_data(PostgresCdcSource::build_begin_message(
-            commit_lsn - 1,
-            0,
-            xid,
-        ));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-            relation,
-            &[Some(id)],
-        ));
-        if xid == 1 {
-            src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-                relation,
-                &[Some("11")],
-            ));
-        }
-        src.enqueue_wal_data(PostgresCdcSource::build_commit_message(
-            commit_lsn - 1,
-            commit_lsn,
-            0,
-        ));
-    }
-
-    let first = src.poll_batch(1).await.unwrap().unwrap();
-    assert_eq!(first.num_rows(), 2);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
-    let second = src.poll_batch(1).await.unwrap().unwrap();
-    assert_eq!(second.num_rows(), 1);
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/300"));
-}
-
-// ── Update with old tuple ──
-
-#[tokio::test]
-async fn test_process_update() {
-    let mut src = running_source();
-
-    let rel_msg = PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1), (0, "name", TEXT_OID, -1)],
-    );
-    src.enqueue_wal_data(rel_msg);
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_update_message(
-        16384,
-        b'O',
-        &[Some("42"), Some("Alice")],
-        &[Some("42"), Some("Bob")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 1);
-
-    let op_col = batch.records.column(1).as_string::<i32>();
-    assert_eq!(op_col.value(0), "U");
-
-    let before = batch.records.column(4).as_string::<i32>();
-    let before: serde_json::Value = serde_json::from_str(before.value(0)).unwrap();
-    assert_eq!(before["id"], "42");
-    assert_eq!(before["name"], "Alice");
-
-    let after = batch.records.column(5).as_string::<i32>();
-    let after: serde_json::Value = serde_json::from_str(after.value(0)).unwrap();
-    assert_eq!(after["id"], "42");
-    assert_eq!(after["name"], "Bob");
-}
-
-#[tokio::test]
-async fn key_update_before_image_omits_non_identity_fields() {
-    let mut src = running_source();
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1), (0, "name", TEXT_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_update_message(
-        16384,
-        b'K',
-        &[Some("41"), None],
-        &[Some("42"), Some("Alice")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    let before = batch.records.column(4).as_string::<i32>();
-    let before: serde_json::Value = serde_json::from_str(before.value(0)).unwrap();
-    assert_eq!(before["id"], "41");
-    assert!(before.get("name").is_none());
-}
-
-// ── Delete ──
-
-#[tokio::test]
-async fn test_process_delete() {
-    let mut src = running_source();
-
-    let rel_msg = PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1), (0, "name", TEXT_OID, -1)],
-    );
-    src.enqueue_wal_data(rel_msg);
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_delete_message(
-        16384,
-        &[Some("42"), None],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    let op_col = batch.records.column(1).as_string::<i32>();
-    assert_eq!(op_col.value(0), "D");
-
-    let before = batch.records.column(4).as_string::<i32>();
-    let before: serde_json::Value = serde_json::from_str(before.value(0)).unwrap();
-    assert_eq!(before["id"], "42");
-    assert!(before.get("name").is_none());
-    assert!(batch.records.column(5).is_null(0));
-}
-
-// ── Table filtering ──
-
-#[tokio::test]
-async fn test_table_exclude_filter() {
-    let mut config = PostgresCdcConfig::default();
-    config.table_exclude = vec!["public.users".to_string()];
-    let mut src = PostgresCdcSource::new(config, None);
-    src.state = ConnectorState::Running;
-
-    let rel_msg = PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1)],
-    );
-    src.enqueue_wal_data(rel_msg);
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("1")]));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-    let result = src.poll_batch(100).await.unwrap();
-    assert!(result.is_none()); // filtered out
-    assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
-}
-
-#[tokio::test]
-async fn public_qualified_include_matches_runtime_table_name() {
-    let mut config = PostgresCdcConfig::default();
-    config.table_include = vec!["public.users".to_string()];
-    let mut src = PostgresCdcSource::new(config, None);
-    src.state = ConnectorState::Running;
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        16_384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-        16_384,
-        &[Some("1")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    let table = batch.records.column(0).as_string::<i32>();
-    assert_eq!(table.value(0), "public.users");
-}
-
-// ── Max poll records batching ──
-
-#[tokio::test]
-async fn test_poll_batch_honors_engine_limit() {
-    let mut src = running_source();
-
-    // Inject 5 events directly
-    for i in 0..5 {
-        src.inject_event(ChangeEvent {
-            table: "t".to_string(),
-            op: CdcOperation::Insert,
-            lsn: Lsn::new(i as u64),
-            ts_ms: 0,
-            before: None,
-            after: Some(format!("{{\"id\":\"{i}\"}}")),
-        });
-    }
-
-    // Poll only 2
-    let batch = src.poll_batch(2).await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 2);
-    assert_eq!(src.buffered_events(), 3);
-
-    // Poll remaining
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 3);
-    assert_eq!(src.buffered_events(), 0);
-}
-
-// ── Replication lag ──
-
-#[test]
-fn test_replication_lag() {
-    let mut src = default_source();
-    src.write_lsn = Lsn::new(1000);
-    src.confirmed_flush_lsn = Lsn::new(500);
-    assert_eq!(src.replication_lag_bytes(), 500);
-}
-
-// ── Unknown relation ID ──
-
-#[tokio::test]
-async fn test_unknown_relation_error() {
-    let mut src = running_source();
-
-    // Insert without prior Relation message
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(99999, &[Some("1")]));
-
-    let result = src.poll_batch(100).await;
-    assert!(result.is_err());
-}
-
-// ── Multi-table in one transaction ──
-
-#[tokio::test]
-async fn test_multi_table_transaction() {
-    let mut src = running_source();
-
-    // Two relations
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "users",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        200,
-        "public",
-        "orders",
-        &[(1, "order_id", INT4_OID, -1)],
-    ));
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x500, 0, 5));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-        200,
-        &[Some("1001")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x500, 0x600, 0));
-
-    let batch = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 2);
-
-    let table_col = batch.records.column(0).as_string::<i32>();
-    assert_eq!(table_col.value(0), "public.users");
-    assert_eq!(table_col.value(1), "public.orders");
-}
-
-// ── Relation cache update (schema change) ──
-
-#[tokio::test]
-async fn test_schema_change_mid_stream() {
-    let mut src = running_source();
-
-    // Initial schema: 1 column
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "users",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-    let batch1 = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch1.num_rows(), 1);
-
-    // Schema changes: add a column
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "users",
-        &[(1, "id", INT4_OID, -1), (0, "email", TEXT_OID, -1)],
-    ));
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x200, 0, 2));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-        100,
-        &[Some("2"), Some("alice@example.com")],
-    ));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x200, 0x300, 0));
-
-    let batch2 = src.poll_batch(100).await.unwrap().unwrap();
-    assert_eq!(batch2.num_rows(), 1);
-
-    // Verify the new column appears in JSON
-    let after_col = batch2.records.column(5).as_string::<i32>();
-    let json: serde_json::Value = serde_json::from_str(after_col.value(0)).unwrap();
-    assert_eq!(json["email"], "alice@example.com");
-}
-
-// ── Write LSN advances on commit ──
-
-#[tokio::test]
-async fn test_write_lsn_advances() {
-    let mut src = running_source();
-
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "t",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x500, 0));
-
-    let _ = src.poll_batch(100).await;
-    assert_eq!(src.write_lsn().as_u64(), 0x500);
-}
-
-// ── TRUNCATE returns error ──
-
-#[tokio::test]
-async fn test_truncate_returns_error() {
-    let mut src = running_source();
-
-    // Register relation so the error message includes the table name.
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        16384,
-        "public",
-        "users",
-        &[(1, "id", INT8_OID, -1)],
-    ));
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_truncate_message(&[16384], 0));
-
-    let result = src.poll_batch(100).await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("TRUNCATE"),
-        "error should mention TRUNCATE: {err}"
-    );
-    assert!(
-        err.contains("users"),
-        "error should mention table name: {err}"
-    );
-}
-
-#[tokio::test]
-async fn test_truncate_unknown_relation_uses_oid() {
-    let mut src = running_source();
-
-    // No relation registered for ID 99999
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_truncate_message(&[99999], 0));
-
-    let result = src.poll_batch(100).await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(err.contains("oid:99999"), "error should mention oid: {err}");
-}
-
-// ── confirmed_flush_lsn not advanced until checkpoint ──
-
-#[tokio::test]
-async fn test_confirmed_lsn_not_advanced_until_checkpoint() {
-    let mut src = running_source();
-
-    src.enqueue_wal_data(PostgresCdcSource::build_relation_message(
-        100,
-        "public",
-        "t",
-        &[(1, "id", INT4_OID, -1)],
-    ));
-
-    src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-    src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
-    src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x500, 0));
-
-    // Before poll: confirmed_flush_lsn is ZERO.
-    assert!(src.confirmed_flush_lsn().is_zero());
-
-    // After poll: confirmed_flush_lsn must NOT have advanced.
-    let _ = src.poll_batch(100).await.unwrap().unwrap();
-    assert!(
-        src.confirmed_flush_lsn().is_zero(),
-        "confirmed_flush_lsn should not advance on poll, got {}",
-        src.confirmed_flush_lsn()
-    );
-
-    // polled_lsn should have advanced.
-    assert_eq!(src.polled_lsn.as_u64(), 0x500);
-
-    // After checkpoint: the checkpoint offset should use polled_lsn.
-    let cp = src.checkpoint();
-    assert_eq!(cp.get_offset("lsn"), Some("0/500"));
-}
-
-// ── Resume identity validation ──
-
-#[tokio::test]
-async fn test_resume_rejects_slot_identity_mismatch() {
-    let mut src = default_source();
-    let mut cp = committed_lsn_checkpoint("2/FF00");
-    cp.set_metadata("slot_name", "different_slot");
-
-    let error = src
-        .start(
-            SourceStart::new(
-                ConnectorConfig::new("postgres-cdc"),
-                SourcePosition::Resume {
-                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
-                    checkpoint: cp,
-                },
-                crate::connector::DeliveryGuarantee::AtLeastOnce,
-            )
-            .unwrap(),
-        )
-        .await
-        .expect_err("checkpoint for another slot must fail closed");
-    assert!(error.to_string().contains("different_slot"));
-    assert_eq!(src.state, ConnectorState::Created);
-}
-
-// ── Backpressure (no event dropping) ──
-
-#[tokio::test]
-async fn test_backpressure_does_not_drop_buffered_events() {
-    let mut src = running_source();
-
-    // Inject 200 events directly into the event buffer.
-    // With backpressure, existing buffered events are never dropped —
-    // only channel draining is paused when the buffer exceeds the
-    // high watermark. Direct-injected events are already in the buffer.
-    for i in 0..200u64 {
-        src.inject_event(ChangeEvent {
-            table: "public.t".to_string(),
-            op: CdcOperation::Insert,
-            before: None,
-            after: Some(format!("{{\"id\": {i}}}")),
-            ts_ms: i as i64,
-            lsn: Lsn::new(i),
-        });
-    }
-    assert_eq!(src.buffered_events(), 200);
-
-    // poll_batch drains events from the buffer — no dropping.
-    let batch = src.poll_batch(50).await.unwrap().unwrap();
-    assert_eq!(batch.records.num_rows(), 50);
-    // 200 - 50 drained = 150 remaining. No events dropped.
-    assert_eq!(src.buffered_events(), 150);
+    assert!(repeated.to_string().contains("stream failed"), "{repeated}");
 }

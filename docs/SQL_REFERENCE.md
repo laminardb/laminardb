@@ -611,7 +611,6 @@ Connector-produced schemas may use other `Timestamp(_)` precisions:
 | Column | Precision | Source |
 |--------|-----------|--------|
 | `_laminar_received_at` | `Timestamp(Nanosecond)` | OTel |
-| `_ts_ms` | `Timestamp(Millisecond)` | Postgres CDC |
 | `_timestamp` | `Timestamp(Millisecond)` | Kafka metadata |
 | `file_modification_time` | `Timestamp(Millisecond)` | Files connector |
 

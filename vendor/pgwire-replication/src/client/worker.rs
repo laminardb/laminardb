@@ -226,8 +226,8 @@ impl WorkerState {
         // so writes (standby status replies, etc.) are unaffected.
         let mut stream = BufReader::with_capacity(SOCKET_READ_AHEAD_BYTES, stream);
         let startup = async {
-            self.startup(&mut stream).await?;
-            self.authenticate(&mut stream).await?;
+            startup(&self.cfg, &mut stream).await?;
+            authenticate(&self.cfg, &mut stream).await?;
             self.validate_recovery_identity(&mut stream).await?;
             self.start_replication(&mut stream).await
         }
@@ -241,18 +241,6 @@ impl WorkerState {
         // this exact protocol boundary.
         self.publish_startup(Ok(()));
         self.stream_loop(&mut stream).await
-    }
-
-    /// Send startup message with replication parameters.
-    async fn startup<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<()> {
-        let params = [
-            ("user", self.cfg.user.as_str()),
-            ("database", self.cfg.database.as_str()),
-            ("replication", "database"),
-            ("client_encoding", "UTF8"),
-            ("application_name", "pgwire-replication"),
-        ];
-        write_startup_message(stream, 196608, &params).await
     }
 
     /// Start the logical replication stream.
@@ -283,9 +271,8 @@ impl WorkerState {
             return Ok(());
         }
 
-        let identity = self
-            .query_single_text_row(stream, "IDENTIFY_SYSTEM", "IDENTIFY_SYSTEM")
-            .await?;
+        let identity =
+            query_single_text_row(&self.cfg, stream, "IDENTIFY_SYSTEM", "IDENTIFY_SYSTEM").await?;
         validate_identify_system(&self.cfg, &identity)?;
 
         let slot = escape_string_literal(&self.cfg.slot);
@@ -293,46 +280,10 @@ impl WorkerState {
             "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots \
              WHERE slot_name = {slot}"
         );
-        let slot_row = self
-            .query_single_text_row(stream, &sql, "replication-slot recovery cursor")
-            .await?;
+        let slot_row =
+            query_single_text_row(&self.cfg, stream, &sql, "replication-slot recovery cursor")
+                .await?;
         validate_slot_cursor(&self.cfg, &slot_row)
-    }
-
-    async fn query_single_text_row<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        stream: &mut S,
-        sql: &str,
-        context: &str,
-    ) -> Result<Vec<Option<String>>> {
-        write_query(stream, sql).await?;
-        let mut row = None;
-        loop {
-            let message =
-                read_backend_message_with_limit(stream, self.cfg.max_message_bytes).await?;
-            match message.tag {
-                b'D' => {
-                    if row.is_some() {
-                        return Err(PgWireError::Protocol(format!(
-                            "{context} returned more than one row"
-                        )));
-                    }
-                    row = Some(parse_text_data_row(&message.payload, context)?);
-                }
-                b'E' => return Err(PgWireError::Server(parse_error_response(&message.payload))),
-                b'Z' => {
-                    return row.ok_or_else(|| {
-                        PgWireError::Configuration(format!("{context} returned no rows"))
-                    });
-                }
-                b'T' | b'C' | b'N' | b'S' | b'A' => {}
-                tag => {
-                    return Err(PgWireError::Protocol(format!(
-                        "unexpected backend message 0x{tag:02X} while reading {context}"
-                    )));
-                }
-            }
-        }
     }
 
     /// Main replication streaming loop.
@@ -695,118 +646,6 @@ impl WorkerState {
         }
     }
 
-    /// Handle PostgreSQL authentication exchange.
-    async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
-        &mut self,
-        stream: &mut S,
-    ) -> Result<()> {
-        loop {
-            let msg = read_backend_message_with_limit(stream, self.cfg.max_message_bytes).await?;
-            match msg.tag {
-                b'R' => {
-                    let (code, rest) = parse_auth_request(&msg.payload)?;
-                    self.handle_auth_request(stream, code, rest).await?;
-                }
-                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                b'S' | b'K' => {}      // ParameterStatus, BackendKeyData - ignore
-                b'Z' => return Ok(()), // ReadyForQuery - auth complete
-                _ => {}
-            }
-        }
-    }
-
-    /// Handle a specific authentication request.
-    async fn handle_auth_request<S: AsyncRead + AsyncWrite + Unpin>(
-        &mut self,
-        stream: &mut S,
-        code: i32,
-        data: &[u8],
-    ) -> Result<()> {
-        match code {
-            0 => Ok(()), // AuthenticationOk
-            3 => {
-                // Cleartext password
-                let mut payload = Vec::from(self.cfg.password.as_bytes());
-                payload.push(0);
-                write_password_message(stream, &payload).await
-            }
-            10 => {
-                // SASL (SCRAM-SHA-256)
-                self.auth_scram(stream, data).await
-            }
-            #[cfg(feature = "md5")]
-            5 => {
-                // MD5 password
-                if data.len() != 4 {
-                    return Err(PgWireError::Protocol(
-                        "MD5 auth: expected 4-byte salt".into(),
-                    ));
-                }
-                let mut salt = [0u8; 4];
-                salt.copy_from_slice(&data[..4]);
-
-                let hash = postgres_md5(&self.cfg.password, &self.cfg.user, &salt);
-                let mut payload = hash.into_bytes();
-                payload.push(0);
-                write_password_message(stream, &payload).await
-            }
-            _ => Err(PgWireError::Auth(format!(
-                "unsupported auth method code: {code}"
-            ))),
-        }
-    }
-
-    /// Perform SCRAM-SHA-256 authentication.
-    async fn auth_scram<S: AsyncRead + AsyncWrite + Unpin>(
-        &mut self,
-        stream: &mut S,
-        mechanisms_data: &[u8],
-    ) -> Result<()> {
-        // Parse offered mechanisms
-        let mechanisms = parse_sasl_mechanisms(mechanisms_data);
-
-        if !mechanisms.iter().any(|m| m == "SCRAM-SHA-256") {
-            return Err(PgWireError::Auth(format!(
-                "server doesn't offer SCRAM-SHA-256, available: {mechanisms:?}"
-            )));
-        }
-
-        #[cfg(not(feature = "scram"))]
-        return Err(PgWireError::Auth(
-            "SCRAM authentication required but 'scram' feature not enabled".into(),
-        ));
-
-        #[cfg(feature = "scram")]
-        {
-            use crate::auth::scram::ScramClient;
-
-            let scram = ScramClient::new(&self.cfg.user);
-
-            // Send SASLInitialResponse
-            let mut init = Vec::new();
-            init.extend_from_slice(b"SCRAM-SHA-256\0");
-            init.extend_from_slice(&(scram.client_first.len() as i32).to_be_bytes());
-            init.extend_from_slice(scram.client_first.as_bytes());
-            write_password_message(stream, &init).await?;
-
-            // Receive AuthenticationSASLContinue (code 11)
-            let server_first = read_auth_data(stream, 11, self.cfg.max_message_bytes).await?;
-            let server_first_str = String::from_utf8_lossy(&server_first);
-
-            // Compute and send client-final
-            let (client_final, auth_message, salted_password) =
-                scram.client_final(&self.cfg.password, &server_first_str)?;
-            write_password_message(stream, client_final.as_bytes()).await?;
-
-            // Receive and verify AuthenticationSASLFinal (code 12)
-            let server_final = read_auth_data(stream, 12, self.cfg.max_message_bytes).await?;
-            let server_final_str = String::from_utf8_lossy(&server_final);
-            ScramClient::verify_server_final(&server_final_str, &salted_password, &auth_message)?;
-
-            Ok(())
-        }
-    }
-
     /// Send standby status update to server.
     async fn send_feedback<S: AsyncWrite + Unpin>(
         &self,
@@ -817,6 +656,171 @@ impl WorkerState {
         let client_time = current_pg_timestamp();
         let payload = encode_standby_status_update(applied, client_time, reply_requested);
         write_copy_data(stream, &payload).await
+    }
+}
+
+/// Send startup message with replication parameters.
+pub(super) async fn startup<S: AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+) -> Result<()> {
+    let mut params = vec![
+        ("user", cfg.user.as_str()),
+        ("database", cfg.database.as_str()),
+        ("replication", "database"),
+        ("client_encoding", "UTF8"),
+        ("application_name", "pgwire-replication"),
+    ];
+    if let Some(options) = cfg.session_options.as_deref() {
+        params.push(("options", options));
+    }
+    write_startup_message(stream, 196608, &params).await
+}
+
+/// Handle PostgreSQL authentication exchange.
+pub(super) async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+) -> Result<()> {
+    loop {
+        let msg = read_backend_message_with_limit(stream, cfg.max_message_bytes).await?;
+        match msg.tag {
+            b'R' => {
+                let (code, rest) = parse_auth_request(&msg.payload)?;
+                handle_auth_request(cfg, stream, code, rest).await?;
+            }
+            b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+            b'S' | b'K' => {}      // ParameterStatus, BackendKeyData - ignore
+            b'Z' => return Ok(()), // ReadyForQuery - auth complete
+            _ => {}
+        }
+    }
+}
+
+/// Handle a specific authentication request.
+async fn handle_auth_request<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    code: i32,
+    data: &[u8],
+) -> Result<()> {
+    match code {
+        0 => Ok(()), // AuthenticationOk
+        3 => {
+            // Cleartext password
+            let mut payload = Vec::from(cfg.password.as_bytes());
+            payload.push(0);
+            write_password_message(stream, &payload).await
+        }
+        10 => {
+            // SASL (SCRAM-SHA-256)
+            auth_scram(cfg, stream, data).await
+        }
+        #[cfg(feature = "md5")]
+        5 => {
+            // MD5 password
+            if data.len() != 4 {
+                return Err(PgWireError::Protocol(
+                    "MD5 auth: expected 4-byte salt".into(),
+                ));
+            }
+            let mut salt = [0u8; 4];
+            salt.copy_from_slice(&data[..4]);
+
+            let hash = postgres_md5(&cfg.password, &cfg.user, &salt);
+            let mut payload = hash.into_bytes();
+            payload.push(0);
+            write_password_message(stream, &payload).await
+        }
+        _ => Err(PgWireError::Auth(format!(
+            "unsupported auth method code: {code}"
+        ))),
+    }
+}
+
+/// Perform SCRAM-SHA-256 authentication.
+async fn auth_scram<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    mechanisms_data: &[u8],
+) -> Result<()> {
+    // Parse offered mechanisms
+    let mechanisms = parse_sasl_mechanisms(mechanisms_data);
+
+    if !mechanisms.iter().any(|m| m == "SCRAM-SHA-256") {
+        return Err(PgWireError::Auth(format!(
+            "server doesn't offer SCRAM-SHA-256, available: {mechanisms:?}"
+        )));
+    }
+
+    #[cfg(not(feature = "scram"))]
+    return Err(PgWireError::Auth(
+        "SCRAM authentication required but 'scram' feature not enabled".into(),
+    ));
+
+    #[cfg(feature = "scram")]
+    {
+        use crate::auth::scram::ScramClient;
+
+        let scram = ScramClient::new(&cfg.user);
+
+        // Send SASLInitialResponse
+        let mut init = Vec::new();
+        init.extend_from_slice(b"SCRAM-SHA-256\0");
+        init.extend_from_slice(&(scram.client_first.len() as i32).to_be_bytes());
+        init.extend_from_slice(scram.client_first.as_bytes());
+        write_password_message(stream, &init).await?;
+
+        // Receive AuthenticationSASLContinue (code 11)
+        let server_first = read_auth_data(stream, 11, cfg.max_message_bytes).await?;
+        let server_first_str = String::from_utf8_lossy(&server_first);
+
+        // Compute and send client-final
+        let (client_final, auth_message, salted_password) =
+            scram.client_final(&cfg.password, &server_first_str)?;
+        write_password_message(stream, client_final.as_bytes()).await?;
+
+        // Receive and verify AuthenticationSASLFinal (code 12)
+        let server_final = read_auth_data(stream, 12, cfg.max_message_bytes).await?;
+        let server_final_str = String::from_utf8_lossy(&server_final);
+        ScramClient::verify_server_final(&server_final_str, &salted_password, &auth_message)?;
+
+        Ok(())
+    }
+}
+
+pub(super) async fn query_single_text_row<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    sql: &str,
+    context: &str,
+) -> Result<Vec<Option<String>>> {
+    write_query(stream, sql).await?;
+    let mut row = None;
+    loop {
+        let message = read_backend_message_with_limit(stream, cfg.max_message_bytes).await?;
+        match message.tag {
+            b'D' => {
+                if row.is_some() {
+                    return Err(PgWireError::Protocol(format!(
+                        "{context} returned more than one row"
+                    )));
+                }
+                row = Some(parse_text_data_row(&message.payload, context)?);
+            }
+            b'E' => return Err(PgWireError::Server(parse_error_response(&message.payload))),
+            b'Z' => {
+                return row.ok_or_else(|| {
+                    PgWireError::Configuration(format!("{context} returned no rows"))
+                });
+            }
+            b'T' | b'C' | b'N' | b'S' | b'A' => {}
+            tag => {
+                return Err(PgWireError::Protocol(format!(
+                    "unexpected backend message 0x{tag:02X} while reading {context}"
+                )));
+            }
+        }
     }
 }
 
@@ -874,7 +878,7 @@ fn parse_text_data_row(payload: &[u8], context: &str) -> Result<Vec<Option<Strin
     Ok(columns)
 }
 
-fn required_text_column<'a>(
+pub(super) fn required_text_column<'a>(
     row: &'a [Option<String>],
     index: usize,
     label: &str,

@@ -154,15 +154,152 @@ subscriptions.
 
 | Use | Available connectors |
 |---|---|
-| Sources | Kafka, NATS, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
+| Sources | Kafka, NATS, PostgreSQL logical replication, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
 | Sinks | Kafka, NATS, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
 | Lookups | PostgreSQL, MongoDB, Delta Lake, and Iceberg. |
 
-MongoDB change streams can feed sinks directly, either as change history or as a mirror of
-each document. See [MongoDB change data capture](#mongodb-change-data-capture) to get started.
-PostgreSQL change-data-capture ingestion is not yet available as a streaming source.
+PostgreSQL tables and MongoDB collections can feed sinks and SQL directly. See
+[PostgreSQL change data capture](#postgresql-change-data-capture) and
+[MongoDB change data capture](#mongodb-change-data-capture) to get started.
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
+
+### PostgreSQL change data capture
+
+LaminarDB can follow a PostgreSQL table through logical replication and keep a copy of it, or
+running results over it, up to date. There is no Kafka or Debezium in between.
+
+You can use it in two ways:
+
+- **Mirror** (`output.mode = 'upsert'`, the default): a sink keeps one row per primary key.
+  Inserts and updates become upserts; deletes and primary-key changes remove the old row.
+- **Changelog** (`output.mode = 'changelog'`): each change retracts the old row and adds the
+  new one, so filters and `SUM`/`COUNT`/`AVG` totals stay exact as rows change or disappear.
+
+#### Try it locally
+
+You need Docker, a Rust toolchain, and a checkout of this repository. These steps mirror a
+table and maintain totals over it, writing both into the same PostgreSQL server.
+
+1. Start PostgreSQL with logical replication turned on:
+
+   ```bash
+   docker compose -f tests/docker/postgres-cdc-compose.yml up -d --wait
+   ```
+
+   PostgreSQL 17 listens on `127.0.0.1:15532` (user `laminar`, password
+   `laminar-test-secret`, database `cdc`).
+
+2. Create the table and a publication for it. `REPLICA IDENTITY FULL` makes PostgreSQL send
+   the whole old row with every update and delete:
+
+   ```bash
+   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc -c "
+     CREATE TABLE orders (id bigint PRIMARY KEY, status text NOT NULL, qty integer);
+     ALTER TABLE orders REPLICA IDENTITY FULL;
+     CREATE PUBLICATION orders_pub FOR TABLE orders;
+     INSERT INTO orders VALUES (1, 'OPEN', 100), (2, 'OPEN', 40), (3, 'CLOSED', 7);"
+   ```
+
+3. Save this as `laminardb.toml`:
+
+   ```toml
+   sql = '''
+   CREATE SOURCE orders (
+       id BIGINT NOT NULL, status VARCHAR, qty INT, PRIMARY KEY (id)
+   ) FROM "postgres-cdc" (
+       'host' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'publication' = 'orders_pub', 'slot.name' = 'laminar_orders', 'table' = 'public.orders'
+   );
+
+   CREATE SOURCE order_changes (
+       id BIGINT NOT NULL, status VARCHAR NOT NULL, qty INT, __weight BIGINT NOT NULL,
+       PRIMARY KEY (id)
+   ) FROM "postgres-cdc" (
+       'host' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'publication' = 'orders_pub', 'slot.name' = 'laminar_order_changes',
+       'table' = 'public.orders', 'output.mode' = 'changelog'
+   );
+
+   CREATE STREAM status_totals AS
+       SELECT status, SUM(qty) AS total, COUNT(*) AS orders
+       FROM order_changes GROUP BY status EMIT CHANGES;
+
+   CREATE SINK orders_copy FROM orders INTO "postgres-sink" (
+       'hostname' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'table.name' = 'orders_copy', 'auto.create.table' = 'true',
+       'write.mode' = 'upsert', 'primary.key' = 'id', 'changelog.mode' = 'true'
+   );
+
+   CREATE SINK status_totals_pg FROM status_totals INTO "postgres-sink" (
+       'hostname' = '127.0.0.1', 'port' = '15532', 'database' = 'cdc',
+       'username' = 'laminar', 'password' = '$${PG_PASSWORD}', 'ssl.mode' = 'disable',
+       'table.name' = 'status_totals', 'auto.create.table' = 'true',
+       'write.mode' = 'upsert', 'primary.key' = 'status', 'changelog.mode' = 'true'
+   );
+   '''
+
+   [server]
+   bind = "127.0.0.1:8080"
+   delivery = "at_least_once"
+
+   [checkpoint]
+   url = "file:///tmp/laminardb-pg-cdc"
+   interval = "1s"
+   ```
+
+   Each source creates and owns its replication slot. Changelog columns end with
+   `__weight BIGINT NOT NULL`, which carries `+1` for an added row and `-1` for a removed one.
+
+4. Start the server. The first build takes a few minutes.
+
+   ```bash
+   PG_PASSWORD=laminar-test-secret cargo run --release -p laminar-server --bin laminardb -- \
+     --config laminardb.toml
+   ```
+
+5. In another terminal, change some rows, then look at the results:
+
+   ```bash
+   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc -c "
+     UPDATE orders SET qty = 120 WHERE id = 1;
+     UPDATE orders SET status = 'CLOSED' WHERE id = 2;
+     UPDATE orders SET id = 4 WHERE id = 3;
+     DELETE FROM orders WHERE id = 1;"
+
+   docker exec laminardb-pg-cdc-17 psql -U laminar -d cdc \
+     -c 'SELECT * FROM orders_copy ORDER BY id' -c 'SELECT * FROM status_totals ORDER BY status'
+   ```
+
+   `orders_copy` now holds orders 2 and 4, and `status_totals` has one row: `CLOSED`, total 47,
+   2 orders. Order 1 moved from 100 to 120 and was then deleted, so it counts nowhere.
+
+If you stop the server and start it again, it carries on from its last checkpoint. To start
+over, stop it, drop the slots
+(`SELECT pg_drop_replication_slot('laminar_orders'), pg_drop_replication_slot('laminar_order_changes')`),
+delete `/tmp/laminardb-pg-cdc`, and empty the target tables.
+
+#### Things to know
+
+- Run it with checkpointing on and at-least-once delivery. After a crash, some changes may be
+  applied again; sinks apply rows by key and totals restore with the checkpoint, so the results
+  stay exact. Exactly-once delivery isn't available.
+- Each source reads one table, which needs a primary key and `REPLICA IDENTITY FULL`, through a
+  publication of exactly that table. The declared `PRIMARY KEY` must match the table's.
+- The initial copy (`snapshot.mode = 'initial'`, the default) keeps a transaction open until it
+  finishes, and a restart in the middle of it needs the reset above. `snapshot.mode = 'never'`
+  skips the copy and follows changes from the first start.
+- PostgreSQL keeps WAL for the slot until LaminarDB has committed the changes. Set
+  `max_slot_wal_keep_size` so a stopped pipeline can't fill the disk.
+- `TRUNCATE`, a change to the table's columns, or a change to the publication stops the source
+  with an error that names the reset, instead of guessing.
+- It runs embedded or on a single-node server. Cluster mode isn't supported.
+
+The [connector guide](crates/laminar-connectors/README.md#postgresql-cdc) covers every option,
+the type mapping, and failure handling in detail.
 
 ### MongoDB change data capture
 

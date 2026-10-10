@@ -97,6 +97,7 @@ impl LaminarDB {
             &streams,
             &rustc_hash::FxHashSet::default(),
             &interval.joins,
+            &rustc_hash::FxHashSet::default(),
         )
         .await?;
         for registration in self.connector_manager.lock().process_functions().values() {
@@ -130,7 +131,7 @@ impl LaminarDB {
                 &sources,
                 &temporal,
                 &interval,
-                &rustc_hash::FxHashSet::default(),
+                &super::direct_mutation_routes::MutationRoutes::default(),
             )?;
             let source = self.catalog.get_source(&name).ok_or_else(|| {
                 TopologyError::Invalid(format!(

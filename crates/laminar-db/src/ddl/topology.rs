@@ -148,10 +148,9 @@ impl LaminarDB {
                 self.runtime_mode(),
             )
             .await?;
-        let direct_mutation_sources = self.validate_direct_mutation_routes(
-            &source_regs,
-            &sink_regs,
-            &stream_regs,
+        let routes = self.mutation_routes(
+            (&source_regs, &sink_regs, &stream_regs),
+            &admissions,
             self.runtime_mode(),
         )?;
         let query_references = crate::sql_analysis::extract_table_references(query_sql);
@@ -161,7 +160,7 @@ impl LaminarDB {
                 &source_regs,
                 &temporal_source_roles,
                 &admissions,
-                &direct_mutation_sources,
+                &routes,
             )?;
         }
         let mutable_interval = admissions.joins.contains_key(name);
@@ -172,6 +171,7 @@ impl LaminarDB {
             )));
         }
         let has_existing_changelog_root = !admissions.joins.is_empty()
+            || !routes.changelog.is_empty()
             || stream_regs.values().any(|registration| {
                 registration.incremental
                     || registration.emit_clause.as_ref().is_some_and(|emit| {
@@ -190,6 +190,7 @@ impl LaminarDB {
             &stream_regs,
             &reference_tables,
             &admissions.joins,
+            &routes.changelog,
         )
         .await?;
         let consumes_ordered_changelog = query_references

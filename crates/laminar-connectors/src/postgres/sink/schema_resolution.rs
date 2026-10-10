@@ -46,9 +46,13 @@ pub(super) async fn resolve(
         return Err(ConnectorError::ConfigurationError("PostgreSQL target is absent; create it separately or explicitly enable auto.create.table=true".into()));
     };
     let selected = validate_columns(&business, &columns)?;
+    let mut defer_constraints = false;
     if parsed.write_mode == WriteMode::Upsert {
         let mut keys = parsed.primary_key_columns.clone();
         keys.sort();
+        if parsed.changelog_mode {
+            defer_constraints = changelog_constraint_policy(&**client, relation_oid, &keys).await?;
+        }
         let valid: bool = client.query_one(
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid=$1::bigint::oid AND i.indisunique AND i.indisvalid AND i.indpred IS NULL AND i.indexprs IS NULL AND (SELECT array_agg(a.attname::text ORDER BY a.attname) FROM unnest(i.indkey) WITH ORDINALITY k(attnum, ord) JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum WHERE k.ord<=i.indnkeyatts)=$2::text[])",
             &[&relation_oid, &keys]).await.map_err(|_| ConnectorError::SchemaMismatch("PostgreSQL key constraints cannot be validated".into()))?
@@ -68,10 +72,85 @@ pub(super) async fn resolve(
             ("schema".into(), parsed.schema_name.clone()),
             ("table".into(), parsed.table_name.clone()),
         ]),
-        definition: serde_json::json!({"columns": columns, "write_columns": business.fields().iter().map(|field| field.name()).collect::<Vec<_>>(), "key_columns": parsed.primary_key_columns}),
+        definition: serde_json::json!({"columns": columns, "write_columns": business.fields().iter().map(|field| field.name()).collect::<Vec<_>>(), "key_columns": parsed.primary_key_columns, "defer_constraints": defer_constraints}),
         references: Vec::new(),
     });
     Ok(binding)
+}
+
+/// Decide how a changelog upsert may meet the target's other unique and exclusion constraints.
+///
+/// A flush applies only the final row of each key, so a value that moves between rows within one
+/// source transaction (a delete releasing it, or two rows swapping it) can transiently collide.
+/// Deferrable constraints are checked at commit, after the whole flush; non-deferrable ones are
+/// checked row by row and are rejected. Returns whether any constraint must be deferred.
+async fn changelog_constraint_policy<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    relation_oid: i64,
+    sorted_keys: &[String],
+) -> Result<bool, ConnectorError> {
+    let rows = client
+        .query(
+            "SELECT c.conname::text, c.condeferrable, \
+                    (SELECT array_agg(a.attname::text ORDER BY a.attname) \
+                     FROM unnest(c.conkey) AS k(attnum) \
+                     JOIN pg_catalog.pg_attribute a \
+                       ON a.attrelid = c.conrelid AND a.attnum = k.attnum) \
+             FROM pg_catalog.pg_constraint c \
+             WHERE c.conrelid = $1::bigint::oid AND c.contype IN ('p', 'u', 'x') \
+             UNION ALL \
+             SELECT i.indexrelid::regclass::text, false, \
+                    (SELECT array_agg(a.attname::text ORDER BY a.attname) \
+                     FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) \
+                     JOIN pg_catalog.pg_attribute a \
+                       ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+                     WHERE k.ord <= i.indnkeyatts) \
+             FROM pg_catalog.pg_index i \
+             WHERE i.indrelid = $1::bigint::oid AND i.indisunique \
+               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint c \
+                               WHERE c.conindid = i.indexrelid)",
+            &[&relation_oid],
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::SchemaMismatch(
+                "PostgreSQL unique and exclusion constraints cannot be validated".into(),
+            )
+        })?;
+    let mut defer = false;
+    let mut immediate = Vec::new();
+    for row in rows {
+        let columns: Option<Vec<String>> = row.try_get(2).map_err(metadata_error)?;
+        if columns.as_deref() == Some(sorted_keys) {
+            continue;
+        }
+        if row.try_get::<_, bool>(1).map_err(metadata_error)? {
+            defer = true;
+        } else {
+            immediate.push(row.try_get::<_, String>(0).map_err(metadata_error)?);
+        }
+    }
+    if !immediate.is_empty() {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "PostgreSQL changelog target has non-deferrable unique or exclusion constraints \
+             beyond the upsert key: {}. A changelog flush applies the final row of each key, so a \
+             value that moves between rows in one source transaction can collide; make each \
+             constraint DEFERRABLE (ALTER TABLE ... ALTER CONSTRAINT name DEFERRABLE), and \
+             replace a plain unique index, which cannot be deferred, with a DEFERRABLE UNIQUE \
+             constraint",
+            immediate.join(", ")
+        )));
+    }
+    Ok(defer)
+}
+
+/// Whether the activated target needs its deferrable constraints checked at commit.
+pub(super) fn defers_constraints(binding: Option<&SchemaBinding>) -> bool {
+    binding
+        .and_then(|binding| binding.value.as_ref())
+        .and_then(|native| native.definition.get("defer_constraints"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn validate_columns(input: &SchemaRef, columns: &[Column]) -> Result<SchemaRef, ConnectorError> {

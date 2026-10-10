@@ -57,19 +57,10 @@ fn input_schema() -> Arc<Schema> {
 
 #[tokio::test]
 #[ignore = "requires LAMINAR_SCHEMA_TEST_PG with wal_level=logical"]
-async fn registered_publication_resolution_preserves_selected_columns_and_slot_cursor() {
+async fn registered_source_resolution_binds_declared_columns_without_a_slot() {
     use laminar_connectors::registry::ConnectorRegistry;
     let client = connection().await;
-    client.batch_execute("DROP PUBLICATION IF EXISTS schema_contract_publication; DROP TABLE IF EXISTS schema_contract_cdc; CREATE TABLE schema_contract_cdc (id bigint PRIMARY KEY, label text, unpublished integer); CREATE PUBLICATION schema_contract_publication FOR TABLE schema_contract_cdc (id, label) WITH (publish='insert,update,delete')").await.unwrap();
-    client.query("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'schema_contract_slot'", &[]).await.unwrap();
-    client
-        .query(
-            "SELECT pg_create_logical_replication_slot('schema_contract_slot','pgoutput')",
-            &[],
-        )
-        .await
-        .unwrap();
-    let before: String = client.query_one("SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name='schema_contract_slot'", &[]).await.unwrap().get(0);
+    client.batch_execute("DROP PUBLICATION IF EXISTS schema_contract_publication; DROP TABLE IF EXISTS schema_contract_cdc; CREATE TABLE schema_contract_cdc (id bigint PRIMARY KEY, label text, undeclared integer); ALTER TABLE schema_contract_cdc REPLICA IDENTITY FULL; CREATE PUBLICATION schema_contract_publication FOR TABLE schema_contract_cdc").await.unwrap();
     let pg: tokio_postgres::Config = std::env::var("LAMINAR_SCHEMA_TEST_PG")
         .unwrap()
         .parse()
@@ -86,19 +77,36 @@ async fn registered_publication_resolution_preserves_selected_columns_and_slot_c
     config.set("ssl.mode", "disable");
     config.set("publication", "schema_contract_publication");
     config.set("slot.name", "schema_contract_slot");
+    config.set("table", "public.schema_contract_cdc");
+    config.set("_primary_key_columns", "id");
+    let declared = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, true),
+    ]));
     let registry = ConnectorRegistry::new();
     laminar_connectors::postgres::register_postgres_cdc_source(&registry).unwrap();
-    let binding = registry.resolve_source_schema(&config, None).await.unwrap();
-    assert_eq!(binding.origin, SchemaOrigin::Metadata);
-    let relations = &binding.value.as_ref().unwrap().definition["relations"];
-    assert_eq!(relations.as_array().unwrap().len(), 1);
-    let columns = relations[0]["columns"].as_array().unwrap();
-    assert_eq!(columns.len(), 2);
-    assert_eq!(columns[0]["name"], "id");
-    assert_eq!(columns[1]["name"], "label");
-    let after = client.query_one("SELECT confirmed_flush_lsn::text, active FROM pg_replication_slots WHERE slot_name='schema_contract_slot'", &[]).await.unwrap();
-    assert_eq!(after.get::<_, String>(0), before);
-    assert!(!after.get::<_, bool>(1));
+    let binding = registry
+        .resolve_source_schema(&config, Some(Arc::clone(&declared)))
+        .await
+        .unwrap();
+    assert_eq!(binding.origin, SchemaOrigin::Explicit);
+    let native = binding.value.as_ref().unwrap();
+    assert!(native.identity.contains_key("table_oid"));
+    let columns = native.definition["relation"]["columns"].as_array().unwrap();
+    assert_eq!(
+        columns.len(),
+        3,
+        "the persisted layout is the whole published relation"
+    );
+    let slots: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'schema_contract_slot'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(slots, 0, "resolution never creates a slot");
     let mut reference = reference_config("schema_contract_cdc");
     let table = registry
         .resolve_table_schema(&reference, None)
@@ -111,13 +119,6 @@ async fn registered_publication_resolution_preserves_selected_columns_and_slot_c
         .await
         .unwrap();
     assert_eq!(lookup, table);
-    client
-        .query(
-            "SELECT pg_drop_replication_slot('schema_contract_slot')",
-            &[],
-        )
-        .await
-        .unwrap();
     client
         .batch_execute(
             "DROP PUBLICATION schema_contract_publication; DROP TABLE schema_contract_cdc",
