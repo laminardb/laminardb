@@ -251,8 +251,9 @@ table and maintain totals over it, writing both into the same PostgreSQL server.
    interval = "1s"
    ```
 
-   Each source creates and owns its replication slot. Changelog columns end with
-   `__weight BIGINT NOT NULL`, which carries `+1` for an added row and `-1` for a removed one.
+   Each source creates and owns a replication slot once its first checkpoint commits, named
+   after its `slot.name` prefix, such as `laminar_orders_3f9a0c27d1e4b856`. Changelog columns end
+   with `__weight BIGINT NOT NULL`, which carries `+1` for an added row and `-1` for a removed one.
 
 4. Start the server. The first build takes a few minutes.
 
@@ -279,7 +280,7 @@ table and maintain totals over it, writing both into the same PostgreSQL server.
 
 If you stop the server and start it again, it carries on from its last checkpoint. To start
 over, stop it, drop the slots
-(`SELECT pg_drop_replication_slot('laminar_orders'), pg_drop_replication_slot('laminar_order_changes')`),
+(`SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name ~ '^laminar_(orders|order_changes)_[0-9a-f]{16}$' AND NOT active`),
 delete `/tmp/laminardb-pg-cdc`, and empty the target tables.
 
 #### Things to know
@@ -290,8 +291,10 @@ delete `/tmp/laminardb-pg-cdc`, and empty the target tables.
 - Each source reads one table, which needs a primary key and `REPLICA IDENTITY FULL`, through a
   publication of exactly that table. The declared `PRIMARY KEY` must match the table's.
 - The initial copy (`snapshot.mode = 'initial'`, the default) keeps a transaction open until it
-  finishes, and a restart in the middle of it needs the reset above. `snapshot.mode = 'never'`
-  skips the copy and follows changes from the first start.
+  finishes, and a restart once the copy has started needs the reset above. `snapshot.mode =
+  'never'` skips the copy and follows changes from the first start.
+- LaminarDB never drops a slot. A slot left behind by a restart is logged as an orphan with the
+  statement that drops it.
 - PostgreSQL keeps WAL for the slot until LaminarDB has committed the changes. Set
   `max_slot_wal_keep_size` so a stopped pipeline can't fill the disk.
 - `TRUNCATE`, a change to the table's columns, or a change to the publication stops the source

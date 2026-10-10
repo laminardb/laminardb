@@ -216,8 +216,8 @@ mirroring a table on your machine.
 #### Setup
 
 PostgreSQL 17 or newer with `wal_level = logical` (tested with 17 and 18). Prepare the table,
-publication and role once; LaminarDB creates the replication slot itself and refuses a slot that
-already exists:
+publication and role once; LaminarDB creates and owns the replication slots (see
+[Slots](#slots)):
 
 ```sql
 ALTER TABLE public.orders REPLICA IDENTITY FULL;
@@ -235,7 +235,11 @@ Startup fails before it creates a slot unless:
   TOAST values can be restored;
 - the declared `PRIMARY KEY` equals the table's primary key, every declared column exists with a
   supported type, and a column declared `NOT NULL` is `NOT NULL` in PostgreSQL. Declared columns
-  may be a subset of the table's columns.
+  may be a subset of the table's columns;
+- with `snapshot.mode=initial`, the role can `SELECT` every declared column and row-level
+  security does not apply to its reads of the table. Logical replication ignores row-level security, so a filtered copy would miss rows the
+  stream later updates. Use a role with `BYPASSRLS`, or the table owner without
+  `FORCE ROW LEVEL SECURITY`.
 
 ```sql
 CREATE SOURCE orders (
@@ -263,13 +267,44 @@ in a server TOML `sql` block write `$${VAR}`.
 | `host`, `port`, `database` | required, `5432`, required | Server and database |
 | `username`, `password` | `postgres`, none | Role with `REPLICATION` and `SELECT` on the table |
 | `ssl.mode`, `ssl.ca.cert.path` | `verify-full`, bundled public CA roots | `verify-full` or `disable` |
-| `publication`, `slot.name`, `table` | required | `table` is `schema.table` |
+| `publication`, `slot.name`, `table` | required | `slot.name` is a prefix of at most 46 bytes of lower-case letters, digits and `_` (see [Slots](#slots)); `table` is `schema.table` |
 | `snapshot.mode` | `initial` | `initial` or `never` |
 | `output.mode` | `upsert` | `upsert` or `changelog` |
 | `max.buffered.bytes` | `268435456` (256 MiB) | All source memory for raw WAL, decoded transactions and Arrow building; 1 MiB to 4 GiB |
 
 Removed keys (`table.include`, `table.exclude`, `start.lsn`, `max.buffered.events`,
 `max.poll.records`, `poll.timeout.ms`, …) are rejected with the reason.
+
+#### Slots
+
+A new source picks a random 16-hex-digit claim id and records it in a checkpoint before it
+touches PostgreSQL. After that checkpoint commits, it creates the slot `<slot.name>_<claim id>`,
+for example `laminar_orders_3f9a0c27d1e4b856`. A slot name is never reused. Logs, errors and
+reset instructions name the exact slot.
+
+- The source reads nothing until its claim commits, and emits no row until the next checkpoint,
+  which names the new slot, commits too. Rows therefore start flowing about two checkpoint
+  intervals after the source starts, in both snapshot modes. With a manual checkpoint schedule
+  the slot is created after the first `checkpoint()` and rows flow after the second.
+- Creating a logical slot waits for every running transaction that has written something. The
+  wait has no deadline. Every 30 seconds the source logs a warning that names those sessions and
+  any prepared transactions.
+- A restart uses only the slot its committed checkpoint names. The slot must be a logical
+  `pgoutput` slot of this database, not temporary, two-phase, failover or synced, not
+  invalidated, and must not have lost WAL. A session of the same claim left over from an earlier
+  run (`application_name` `laminar:<claim id>:…`) is ended first. A slot held by any other
+  session fails the start with a retryable error that names its pid, `application_name` and
+  client address.
+- Other slots under the prefix are reported and never dropped. Each inactive one is logged with
+  the WAL it retains and the statement that drops it, and counted in
+  `postgres_cdc_orphaned_slots`. Give every source its own prefix: an inactive slot of another
+  source under the same prefix looks like an orphan. Drop orphans once no pipeline restores from
+  a checkpoint that names them:
+
+  ```sql
+  SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+  WHERE slot_name ~ '^<prefix>_[0-9a-f]{16}$' AND NOT active;
+  ```
 
 #### Types
 
@@ -296,8 +331,9 @@ timestamp fails the source. Snapshot and replication sessions pin `DateStyle`, `
 - An unchanged TOAST value in an update is restored from the full old row.
 - `TRUNCATE` stops the source: it has no row images to apply. Reset as described below.
 - A change to the table's columns, types or replica identity stops the source at the first row
-  change after it. The publication and slot are rechecked as checkpoints commit, at most every
-  30 seconds; that check is best-effort, so restrict who can alter them.
+  change after it. The publication and slot are rechecked, and orphaned slots reported, as
+  checkpoints commit, at most every 30 seconds; that check is best-effort, so restrict who can
+  alter them.
 
 #### Initial snapshot
 
@@ -306,12 +342,17 @@ transaction, copies the declared columns through a cursor, and then streams from
 consistent point. The copy holds exactly the transactions committed before that point and the
 stream every one after it: no gap and no overlap.
 
-- The copy keeps a transaction open, so vacuum cannot remove dead rows until it finishes, and
-  `idle_in_transaction_session_timeout` must not end it. The slot retains WAL from the start of
-  the copy; the source checks the slot's `wal_status` every 10 seconds and fails if
-  `max_slot_wal_keep_size` removed WAL it needs.
+- No row is copied until a checkpoint naming the new slot commits, about one checkpoint interval
+  after the slot is created. A restart before that copies the table again from a new slot and
+  reports the first one as an orphan.
+- The copy keeps a transaction open from the slot's creation, so vacuum cannot remove dead rows
+  until it finishes. The source turns `idle_in_transaction_session_timeout` off for that
+  transaction, but a `transaction_timeout` must be longer than the whole copy. The slot retains
+  WAL from the start of the copy; the source checks the slot's `wal_status` every 10 seconds and
+  fails if `max_slot_wal_keep_size` removed WAL it needs.
 - Checkpoints keep committing during the copy, but an exported snapshot cannot be imported again,
-  so a restart before the copy finishes fails and names the reset. Use new or empty targets.
+  so a restart after the copy has started and before it finishes fails and names the reset. Use
+  new or empty targets.
 
 #### Delivery, recovery and resources
 
@@ -321,13 +362,16 @@ stream every one after it: no gap and no overlap.
   aggregates restore their state from the same checkpoint, so replayed changes are not counted
   twice. Exactly-once is not available.
 - A checkpoint records the server's system identifier and timeline, the database, publication,
-  table and slot. Resuming against another server, a promoted replica, or a changed publication
-  fails closed.
+  table and exact slot. Resuming against another server, a promoted replica, or a changed
+  publication fails closed.
 - A lost replication connection, or another recoverable fault, restarts the pipeline in process
   when supervision is on (the server default; `LaminarDB::enable_supervision()` when embedded):
-  the source reattaches to its slot at the last committed position. A fault before the first
-  checkpoint commits has no position to resume from, so the restart refuses the existing slot and
-  names the reset; the same holds inside the initial snapshot.
+  the source reattaches to its slot at the last committed position. A restart before the first
+  checkpoint commits makes a new claim. A restart after the claim commits but before a checkpoint
+  naming the slot commits has emitted nothing, so it creates the claimed slot, or uses it
+  (`snapshot.mode=never`, from its consistent point) or, with `snapshot.mode=initial`, leaves it
+  as an orphan and copies the table from a new slot; none of these needs a reset. A restart inside
+  the initial snapshot still does.
 - The PostgreSQL sink paces itself by how fast the target applied its recent statements. It
   flushes before the next batch would make a flush take more than half of `statement.timeout.ms`
   (30 s by default), and splits a flush into statements of about a quarter of it inside one
@@ -345,9 +389,9 @@ stream every one after it: no gap and no overlap.
 - `max.buffered.bytes` bounds the source. One transaction may use about a sixth of it while it is
   decoded; a larger one fails the source with a message naming the limit. While downstream is
   slow the source stops reading WAL but still reports committed progress to the server.
-- Reset, when an error asks for it: stop the pipeline, run
-  `SELECT pg_drop_replication_slot('<slot.name>')`, delete the pipeline's checkpoints, empty the
-  targets, and start again.
+- Reset, when an error asks for it: stop the pipeline, run the
+  `SELECT pg_drop_replication_slot('<slot>')` the error names (or the prefix query under
+  [Slots](#slots)), delete the pipeline's checkpoints, empty the targets, and start again.
 - Latency: rows reach the PostgreSQL sink mostly on its own flush schedule
   (`flush.interval.ms`, default 250 ms) rather than at checkpoints. On one Windows 11 workstation
   (release build, PostgreSQL 17 in Docker, sink in the same server) single-row commits reached

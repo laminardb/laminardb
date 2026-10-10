@@ -669,7 +669,7 @@ pub(super) async fn startup<S: AsyncWrite + Unpin>(
         ("database", cfg.database.as_str()),
         ("replication", "database"),
         ("client_encoding", "UTF8"),
-        ("application_name", "pgwire-replication"),
+        ("application_name", cfg.application_name.as_str()),
     ];
     if let Some(options) = cfg.session_options.as_deref() {
         params.push(("options", options));

@@ -240,9 +240,9 @@ impl PostgresCdcSource {
             }
             WalMessage::Truncate(_) => Err(self.fail(ConnectorError::ReadError(format!(
                 "TRUNCATE of {} cannot be represented as row changes and would leave the target \
-                 diverged; drop slot '{}', clear downstream targets, and start the source again \
-                 for a fresh snapshot",
-                self.config.table, self.config.slot_name
+                 diverged; for a fresh snapshot, {}",
+                self.config.table,
+                super::claim::reset_instructions(self.slot_name()?)
             )))),
             WalMessage::Origin(_) | WalMessage::Type(_) => Ok(()),
         }

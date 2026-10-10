@@ -331,6 +331,10 @@ pub struct ReplicationConfig {
     /// `-c DateStyle=ISO`). Session settings govern how output plugins render values.
     pub session_options: Option<String>,
 
+    /// `application_name` startup parameter, shown in `pg_stat_activity` and
+    /// `pg_stat_replication`. A value in `options` cannot override it.
+    pub application_name: String,
+
     /// Aggregate raw backend-message payload bytes allowed in flight.
     ///
     /// Reservations are retained while a frame is being read, buffered in the
@@ -359,6 +363,7 @@ impl Default for ReplicationConfig {
             buffer_events: 8192,
             max_message_bytes: 64 * 1024 * 1024,
             session_options: None,
+            application_name: "pgwire-replication".into(),
             max_in_flight_bytes: 256 * 1024 * 1024,
         }
     }

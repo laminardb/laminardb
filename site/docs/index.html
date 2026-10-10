@@ -1463,7 +1463,7 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
           <tr><td class="field-name">username</td><td class="field-default">postgres</td><td>Auth username</td></tr>
           <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
-          <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Logical replication slot, created by the source; an existing slot is refused on a fresh start</td></tr>
+          <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Prefix (at most 46 bytes) of the replication slot the source creates after its first checkpoint commits, named <code>&lt;slot.name&gt;_&lt;claim id&gt;</code>; other slots under the prefix are reported, never used or dropped</td></tr>
           <tr><td class="field-name">publication</td><td><span class="field-required">required</span></td><td>Publication name</td></tr>
           <tr><td class="field-name">ssl.mode</td><td class="field-default">verify-full</td><td><code>verify-full</code> or explicit plaintext <code>disable</code></td></tr>
           <tr><td class="field-name">ssl.ca.cert.path</td><td></td><td>Optional PEM CA bundle for <code>verify-full</code>; web PKI roots are used by default</td></tr>

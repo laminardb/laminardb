@@ -1,39 +1,42 @@
-//! Network startup: contract validation, owned slot creation or resume validation, and the
+//! Network startup: contract validation, the restart matrix for a committed cursor, and the
 //! replication reader launch.
 
 use arrow_schema::SchemaRef;
 
 use super::super::config::{PostgresCdcConfig, SnapshotMode};
 use super::super::postgres_io::{
-    self, inspect_capture_table, inspect_source, ControlConnection, InspectedSource,
-    PostgresCheckpointBinding,
+    self, inspect_capture_table, inspect_source, unreadable_columns, CaptureTable,
+    ControlConnection, PostgresCheckpointBinding,
 };
 use super::super::schema::RelationInfo;
 use super::super::schema_resolution::{bind_layout, validate_relation};
 use super::super::typed_rows::RowLayout;
-use super::checkpoint::validate_live_binding;
+use super::checkpoint::{validate_live_binding, Cursor, CursorPhase};
+use super::claim::{busy, report_orphans, settle, warn_orphaning, ResumeAction, SlotClaim};
 use super::reader::{run_wal_reader, OwnedWalPayload, WalPayloadRx, WalTerminalError};
-use super::snapshot::SnapshotReader;
 use super::{
     Arc, ConnectorError, ConnectorTaskOwner, Lsn, Notify, Semaphore, PGWIRE_IN_FLIGHT_EVENTS,
     RAW_WAL_QUEUE_CAPACITY,
 };
 
-/// How a start request positions the source.
-pub(super) enum StartPlan {
-    /// No checkpoint: create the slot this start owns.
-    Fresh,
-    /// Resume from a committed streaming cursor.
-    Resume {
-        lsn: Lsn,
-        binding: PostgresCheckpointBinding,
-    },
-}
-
-/// Where a prepared source begins reading.
+/// Where a prepared source begins.
 pub(super) enum StartPhase {
-    Snapshot(SnapshotReader),
-    Stream(Lsn, ReaderRuntime),
+    /// Hold intake under `claim`; create its slot once a checkpoint carrying the claim commits,
+    /// or at once when `committed`.
+    Claim { claim: SlotClaim, committed: bool },
+    /// The claim's existing slot was adopted at `consistent_point`; streaming waits for a
+    /// committed cursor naming it.
+    AwaitStream {
+        claim: SlotClaim,
+        consistent_point: Lsn,
+    },
+    /// Stream the claim's existing slot from `lsn`.
+    Stream {
+        claim: SlotClaim,
+        consistent_point: Lsn,
+        lsn: Lsn,
+        runtime: ReaderRuntime,
+    },
 }
 
 /// Everything a successful startup installs at once.
@@ -42,6 +45,8 @@ pub(super) struct PreparedStart {
     pub(super) relation: RelationInfo,
     pub(super) binding: PostgresCheckpointBinding,
     pub(super) phase: StartPhase,
+    /// Orphaned slots under the prefix, when they could be listed.
+    pub(super) orphans: Option<usize>,
 }
 
 /// Declared inputs of one start request.
@@ -51,6 +56,7 @@ pub(super) struct StartInputs<'a> {
     pub(super) declared: &'a SchemaRef,
     pub(super) primary_key: &'a [String],
     pub(super) committed_relation: Option<&'a RelationInfo>,
+    pub(super) incarnation: &'a str,
 }
 
 pub(super) struct ReaderRuntime {
@@ -70,18 +76,29 @@ fn guard(
     })
 }
 
-/// Validate the live contract and position the source.
+/// Validate the live contract and position the source: a fresh start claims a new slot name,
+/// and a committed cursor goes through the restart matrix.
 ///
 /// # Errors
-/// Returns an actionable error for contract drift, an unowned existing slot, or I/O failure.
-/// A slot created by this call is dropped again if a later step fails.
+/// Returns an actionable error for contract drift, a cursor that cannot be resumed, a slot held
+/// by another consumer, or I/O failure.
 pub(super) async fn prepare(
     owner: &ConnectorTaskOwner,
     inputs: StartInputs<'_>,
-    plan: StartPlan,
+    cursor: Option<Cursor>,
 ) -> Result<PreparedStart, ConnectorError> {
-    let control = postgres_io::connect(inputs.config, guard(owner)?).await?;
-    let prepared = prepare_on(&control, owner, &inputs, plan).await;
+    let config = inputs.config;
+    let claim = cursor.as_ref().map_or_else(
+        || SlotClaim::generate(&config.slot_name),
+        |cursor| cursor.claim.clone(),
+    );
+    let control = postgres_io::connect(
+        config,
+        &claim.application_name(inputs.incarnation),
+        guard(owner)?,
+    )
+    .await?;
+    let prepared = prepare_on(&control, owner, &inputs, claim, cursor).await;
     control.close().await;
     prepared
 }
@@ -90,10 +107,11 @@ async fn prepare_on(
     control: &ControlConnection,
     owner: &ConnectorTaskOwner,
     inputs: &StartInputs<'_>,
-    plan: StartPlan,
+    claim: SlotClaim,
+    cursor: Option<Cursor>,
 ) -> Result<PreparedStart, ConnectorError> {
     let config = inputs.config;
-    let inspected = inspect_source(control.client(), config).await?;
+    let live = inspect_source(control.client(), config, Some(claim.slot())).await?;
     let table = inspect_capture_table(control.client(), config).await?;
     let layout = bind_layout(config, inputs.declared, inputs.primary_key, &table)?;
     if let Some(committed) = inputs.committed_relation {
@@ -108,166 +126,143 @@ async fn prepare_on(
             config.relation_metadata_bytes()
         )));
     }
-    match plan {
-        StartPlan::Resume { lsn, binding } => {
-            validate_resume(config, &inspected, &binding, lsn)?;
-            let reader =
-                launch_reader(owner, Arc::clone(inputs.data_ready), config, &binding, lsn).await?;
-            Ok(PreparedStart {
-                layout,
-                relation: table.relation,
-                binding,
-                phase: StartPhase::Stream(lsn, reader),
-            })
-        }
-        StartPlan::Fresh => {
-            if inspected.slot.is_some() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "PostgreSQL replication slot '{}' already exists, but no LaminarDB checkpoint \
-                     references it (an interrupted initial snapshot, a crash before the first \
-                     checkpoint, or another consumer's slot). LaminarDB never adopts or drops an \
-                     existing slot: drop it with SELECT pg_drop_replication_slot('{}'), clear \
-                     downstream targets of this source, and start again",
-                    config.slot_name, config.slot_name
-                )));
-            }
-            let created = create_slot(config).await?;
-            match finish_fresh(control, owner, inputs, &layout, &inspected, created).await {
-                Ok((binding, phase)) => Ok(PreparedStart {
-                    layout,
-                    relation: table.relation,
-                    binding,
-                    phase,
-                }),
-                Err(error) => {
-                    if let Err(cleanup) =
-                        postgres_io::drop_created_slot(control.client(), &config.slot_name).await
-                    {
-                        tracing::warn!(
-                            slot = %config.slot_name,
-                            %cleanup,
-                            "could not drop the PostgreSQL CDC slot this failed start created"
-                        );
-                    }
-                    Err(error)
-                }
-            }
-        }
+    let copies = config.snapshot_mode == SnapshotMode::Initial
+        && cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.phase == CursorPhase::Claimed);
+    if copies {
+        admit_copy(control, config, &table, &layout).await?;
     }
+    let (binding, phase) = match cursor {
+        None => (
+            live.binding(config),
+            StartPhase::Claim {
+                claim,
+                committed: false,
+            },
+        ),
+        Some(cursor) => {
+            let action = settle(
+                control,
+                config,
+                &claim,
+                inputs.incarnation,
+                cursor.phase,
+                &cursor.binding,
+            )
+            .await?;
+            let phase = resumed_phase(owner, inputs, claim, &cursor, action).await?;
+            (cursor.binding, phase)
+        }
+    };
+    let current = match &phase {
+        StartPhase::Claim { claim, .. }
+        | StartPhase::AwaitStream { claim, .. }
+        | StartPhase::Stream { claim, .. } => claim,
+    };
+    let orphans = report_orphans(control.client(), &config.slot_name, current).await;
+    Ok(PreparedStart {
+        layout,
+        relation: table.relation,
+        binding,
+        phase,
+        orphans,
+    })
 }
 
-fn validate_resume(
+/// Require the initial copy to read every row and declared column that logical replication
+/// streams, before any slot exists: a refused copy would otherwise fail after creating one.
+async fn admit_copy(
+    control: &ControlConnection,
     config: &PostgresCdcConfig,
-    inspected: &InspectedSource,
-    binding: &PostgresCheckpointBinding,
-    lsn: Lsn,
+    table: &CaptureTable,
+    layout: &RowLayout,
 ) -> Result<(), ConnectorError> {
-    let Some(slot) = inspected.slot.as_ref() else {
+    let (user, name) = (&config.username, &config.table);
+    if table.row_security {
         return Err(ConnectorError::ConfigurationError(format!(
-            "cannot resume PostgreSQL CDC slot '{}': the slot is missing; LaminarDB never \
-             recreates a recovery slot because the WAL it retained is gone",
-            config.slot_name
+            "row-level security applies to role '{user}' on PostgreSQL table {name}, so the \
+             initial snapshot would silently miss rows that logical replication still streams; \
+             grant the role BYPASSRLS (ALTER ROLE {user} BYPASSRLS), connect as the table owner \
+             without FORCE ROW LEVEL SECURITY, or disable row-level security on the table"
         )));
-    };
-    validate_live_binding(binding, &inspected.binding(config)?, "resume checkpoint")?;
-    let confirmed = slot.confirmed_flush_lsn.ok_or_else(|| {
-        ConnectorError::ConfigurationError(format!(
-            "cannot resume PostgreSQL CDC slot '{}': the slot has no retained durable position",
-            config.slot_name
-        ))
-    })?;
-    if confirmed > lsn {
+    }
+    let columns: Vec<String> = layout
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let unreadable =
+        unreadable_columns(control.client(), table.relation.relation_id, &columns).await?;
+    if !unreadable.is_empty() {
         return Err(ConnectorError::ConfigurationError(format!(
-            "cannot resume PostgreSQL CDC checkpoint at {lsn}: slot '{}' has already advanced to \
-             {confirmed}; required WAL may have been reclaimed",
-            config.slot_name
+            "role '{user}' cannot SELECT column(s) {} of PostgreSQL table {name}, which the \
+             initial snapshot copies; run GRANT SELECT ON {name} TO {user}",
+            unreadable.join(", ")
         )));
     }
     Ok(())
 }
 
-async fn create_slot(
-    config: &PostgresCdcConfig,
-) -> Result<pgwire_replication::CreatedSlot, ConnectorError> {
-    let snapshot = match config.snapshot_mode {
-        SnapshotMode::Initial => pgwire_replication::SlotSnapshot::Export,
-        SnapshotMode::Never => pgwire_replication::SlotSnapshot::Nothing,
-    };
-    let replication = postgres_io::build_replication_config(config);
-    tokio::time::timeout(
-        postgres_io::CONNECT_TIMEOUT,
-        pgwire_replication::create_logical_slot(&replication, snapshot),
-    )
-    .await
-    .map_err(|_| {
-        ConnectorError::ConnectionFailed(format!(
-            "creating PostgreSQL replication slot '{}' timed out; check whether it exists before \
-             retrying",
-            config.slot_name
-        ))
-    })?
-    .map_err(|error| {
-        ConnectorError::ConnectionFailed(format!(
-            "create PostgreSQL replication slot '{}': {error}",
-            config.slot_name
-        ))
-    })
-}
-
-async fn finish_fresh(
-    control: &ControlConnection,
+/// Carry out the restart matrix's decision for a committed cursor.
+async fn resumed_phase(
     owner: &ConnectorTaskOwner,
     inputs: &StartInputs<'_>,
-    layout: &RowLayout,
-    inspected: &InspectedSource,
-    created: pgwire_replication::CreatedSlot,
-) -> Result<(PostgresCheckpointBinding, StartPhase), ConnectorError> {
-    if (created.system_identifier, created.timeline_id)
-        != (inspected.system_identifier, inspected.timeline_id)
-    {
-        return Err(ConnectorError::ConfigurationError(
-            "the replication and control connections reached different PostgreSQL clusters or \
-             timelines"
-                .into(),
-        ));
-    }
+    claim: SlotClaim,
+    cursor: &Cursor,
+    action: ResumeAction,
+) -> Result<StartPhase, ConnectorError> {
     let config = inputs.config;
-    let consistent_point = Lsn::new(created.consistent_point.as_u64());
-    let snapshot = match config.snapshot_mode {
-        SnapshotMode::Initial => {
-            let snapshot_name = created.snapshot_name.clone().ok_or_else(|| {
-                ConnectorError::ReadError("PostgreSQL exported no snapshot".into())
-            })?;
-            let connection = postgres_io::connect(config, guard(owner)?).await?;
-            let reader =
-                SnapshotReader::open(connection, config, layout, &snapshot_name, consistent_point)
-                    .await?;
-            Some(reader)
+    match action {
+        ResumeAction::Create => Ok(StartPhase::Claim {
+            claim,
+            committed: true,
+        }),
+        ResumeAction::Adopt(lsn) => {
+            let CursorPhase::Streaming {
+                consistent_point, ..
+            } = cursor.phase
+            else {
+                tracing::info!(slot = claim.slot(), %lsn, "adopted the claimed PostgreSQL replication slot");
+                return Ok(StartPhase::AwaitStream {
+                    claim,
+                    consistent_point: lsn,
+                });
+            };
+            let runtime = launch_reader(
+                owner,
+                Arc::clone(inputs.data_ready),
+                config,
+                &claim,
+                inputs.incarnation,
+                &cursor.binding,
+                lsn,
+            )
+            .await?;
+            tracing::info!(slot = claim.slot(), %lsn, "resuming PostgreSQL replication slot");
+            Ok(StartPhase::Stream {
+                claim,
+                consistent_point,
+                lsn,
+                runtime,
+            })
         }
-        SnapshotMode::Never => None,
-    };
-    // The importer holds its own copy of the snapshot, so the exporting session can end now.
-    if let Err(error) = created.release().await {
-        tracing::debug!(%error, "PostgreSQL slot-creating session closed with an error");
+        ResumeAction::NewClaim(reason) => {
+            warn_orphaning(claim.slot(), &reason);
+            Ok(StartPhase::Claim {
+                claim: SlotClaim::generate(&config.slot_name),
+                committed: false,
+            })
+        }
+        ResumeAction::Busy(holder) | ResumeAction::TerminateStale(holder) => {
+            Err(busy(claim.slot(), &holder))
+        }
+        ResumeAction::FailClosed(reason) => Err(ConnectorError::ConfigurationError(reason)),
     }
-    let binding = inspect_source(control.client(), config)
-        .await?
-        .binding(config)?;
-    if let Some(reader) = snapshot {
-        return Ok((binding, StartPhase::Snapshot(reader)));
-    }
-    let reader = launch_reader(
-        owner,
-        Arc::clone(inputs.data_ready),
-        config,
-        &binding,
-        consistent_point,
-    )
-    .await?;
-    Ok((binding, StartPhase::Stream(consistent_point, reader)))
 }
 
-/// Connect the replication stream at `start_lsn` and spawn the bounded reader task.
+/// Connect the replication stream of `claim`'s slot at `start_lsn` and spawn the bounded reader
+/// task.
 ///
 /// # Errors
 /// Returns an error when the replication socket rejects the identity or the cursor.
@@ -275,10 +270,16 @@ pub(super) async fn launch_reader(
     owner: &ConnectorTaskOwner,
     data_ready: Arc<Notify>,
     config: &PostgresCdcConfig,
+    claim: &SlotClaim,
+    incarnation: &str,
     binding: &PostgresCheckpointBinding,
     start_lsn: Lsn,
 ) -> Result<ReaderRuntime, ConnectorError> {
-    let mut replication = postgres_io::build_replication_config(config);
+    let mut replication = postgres_io::build_replication_config(
+        config,
+        claim.slot(),
+        &claim.application_name(incarnation),
+    );
     replication.buffer_events = PGWIRE_IN_FLIGHT_EVENTS;
     replication.start_lsn = pgwire_replication::Lsn::from_u64(start_lsn.as_u64());
     replication.expected_recovery_identity = Some(pgwire_replication::ExpectedRecoveryIdentity {
@@ -297,13 +298,15 @@ pub(super) async fn launch_reader(
         Ok(Ok(client)) => client,
         Ok(Err(error)) => {
             return Err(ConnectorError::ConnectionFailed(format!(
-                "pgwire-replication connect: {error}"
+                "pgwire-replication connect to slot '{}': {error}",
+                claim.slot()
             )));
         }
         Err(_) => {
-            return Err(ConnectorError::ConnectionFailed(
-                "pgwire-replication connect timed out after 10 seconds".into(),
-            ));
+            return Err(ConnectorError::ConnectionFailed(format!(
+                "pgwire-replication connect to slot '{}' timed out after 10 seconds",
+                claim.slot()
+            )));
         }
     };
     let applied_lsn = client.applied_lsn_handle();
@@ -335,24 +338,42 @@ pub(super) async fn launch_reader(
     })
 }
 
-/// Re-read the live publication, slot, and table and require them to match the binding.
+/// Re-read the live publication, slot, and table, require them to match the binding, and
+/// report orphaned slots under the prefix.
 ///
 /// # Errors
-/// Returns an error when the contract drifted or cannot be read.
+/// Returns an error when the contract drifted, the slot can no longer be adopted, or the
+/// catalog cannot be read.
 pub(super) async fn revalidate(
     owner: &ConnectorTaskOwner,
     config: &PostgresCdcConfig,
+    claim: &SlotClaim,
+    incarnation: &str,
     binding: &PostgresCheckpointBinding,
     relation: &RelationInfo,
-) -> Result<(), ConnectorError> {
-    let control = postgres_io::connect(config, guard(owner)?).await?;
+) -> Result<Option<usize>, ConnectorError> {
+    let control =
+        postgres_io::connect(config, &claim.application_name(incarnation), guard(owner)?).await?;
     let checked = async {
-        let live = inspect_source(control.client(), config)
-            .await?
-            .binding(config)?;
-        validate_live_binding(binding, &live, "running source")?;
+        let live = inspect_source(control.client(), config, Some(claim.slot())).await?;
+        validate_live_binding(binding, &live.binding(config), "running source")?;
+        let slot = claim.slot();
+        match live.slot.as_ref().map(|facts| facts.unusable.as_deref()) {
+            None => {
+                return Err(ConnectorError::ReadError(format!(
+                    "PostgreSQL replication slot '{slot}' disappeared"
+                )));
+            }
+            Some(Some(problem)) => {
+                return Err(ConnectorError::ReadError(format!(
+                    "PostgreSQL replication slot '{slot}' {problem}"
+                )));
+            }
+            Some(None) => {}
+        }
         let table = inspect_capture_table(control.client(), config).await?;
-        validate_relation(relation, &table.relation)
+        validate_relation(relation, &table.relation)?;
+        Ok(report_orphans(control.client(), &config.slot_name, claim).await)
     }
     .await;
     control.close().await;

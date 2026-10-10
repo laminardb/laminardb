@@ -36,6 +36,15 @@ fn replication_identity_rejects_invalid_slot_and_nul() {
         .to_string()
         .contains("slot.name"));
 
+    cfg.slot_name = "s".repeat(46);
+    cfg.validate().unwrap();
+    cfg.slot_name = "s".repeat(47);
+    let error = cfg.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("slot.name") && error.contains("46"),
+        "{error}"
+    );
+
     cfg.slot_name = "valid_slot".into();
     cfg.publication = "bad\0publication".into();
     assert!(cfg.validate().unwrap_err().to_string().contains("NUL"));
@@ -65,7 +74,13 @@ fn typed_control_config_preserves_adversarial_values() {
     cfg.username = " user name'\\ ".into();
     cfg.password = Some(" password with 'quotes' and \\slashes\\ ".into());
 
-    let control = cfg.control_connection_config().unwrap();
+    let control = cfg
+        .control_connection_config("laminar:0123456789abcdef:89abcdef")
+        .unwrap();
+    assert_eq!(
+        control.get_application_name(),
+        Some("laminar:0123456789abcdef:89abcdef")
+    );
     assert_eq!(
         control.get_hosts(),
         &[tokio_postgres::config::Host::Tcp(" db\\host' ".into())]
@@ -92,7 +107,9 @@ fn typed_control_config_maps_disabled_tls_exactly() {
     let mut cfg = PostgresCdcConfig::default();
     cfg.ssl_mode = SslMode::Disable;
     assert_eq!(
-        cfg.control_connection_config().unwrap().get_ssl_mode(),
+        cfg.control_connection_config("laminar")
+            .unwrap()
+            .get_ssl_mode(),
         tokio_postgres::config::SslMode::Disable
     );
 }

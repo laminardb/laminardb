@@ -41,6 +41,9 @@ pub struct PostgresCdcMetrics {
 
     /// Current replication lag in bytes (`write_lsn` - `confirmed_flush_lsn`).
     pub replication_lag_bytes: IntGauge,
+
+    /// Inactive slots of other claims under the `slot.name` prefix, last counted.
+    pub orphaned_slots: IntGauge,
 }
 
 impl PostgresCdcMetrics {
@@ -85,6 +88,10 @@ impl PostgresCdcMetrics {
             replication_lag_bytes: reg.gauge(
                 "postgres_cdc_replication_lag_bytes",
                 "Replication lag in bytes",
+            ),
+            orphaned_slots: reg.gauge(
+                "postgres_cdc_orphaned_slots",
+                "Inactive replication slots of other claims under the slot.name prefix",
             ),
         }
     }
@@ -137,6 +144,12 @@ impl PostgresCdcMetrics {
     pub fn set_replication_lag_bytes(&self, lag: u64) {
         self.replication_lag_bytes
             .set(i64::from_ne_bytes(lag.to_ne_bytes()));
+    }
+
+    /// Updates the orphaned slot count.
+    pub fn set_orphaned_slots(&self, count: usize) {
+        self.orphaned_slots
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
     }
 }
 

@@ -403,6 +403,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_announces_the_configured_application_name() {
+        let cfg = ReplicationConfig {
+            application_name: "laminar:0123456789abcdef:89abcdef".into(),
+            ..ReplicationConfig::default()
+        };
+        let (mut client, mut peer) = tokio::io::duplex(4096);
+        startup(&cfg, &mut client).await.unwrap();
+        let (_, payload) = read_frontend(&mut peer, false).await;
+        let expected = b"application_name\0laminar:0123456789abcdef:89abcdef\0";
+        assert!(
+            payload
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "{}",
+            String::from_utf8_lossy(&payload)
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_slot_name_fails_before_connecting() {
         let cfg = ReplicationConfig {
             slot: "Bad Slot".into(),

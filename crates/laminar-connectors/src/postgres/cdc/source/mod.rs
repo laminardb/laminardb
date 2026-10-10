@@ -1,9 +1,10 @@
 //! `PostgreSQL` CDC source connector implementation.
 //!
 //! Streams the changes of one primary-keyed table from `PostgreSQL` logical replication
-//! (`pgoutput`) as typed Arrow rows of the declared source schema. A fresh source either copies
-//! the table at a new slot's consistent point (`snapshot.mode=initial`) or starts at that point
-//! (`snapshot.mode=never`); later starts resume from the engine checkpoint.
+//! (`pgoutput`) as typed Arrow rows of the declared source schema. A fresh source claims a new
+//! slot name and creates the slot once a checkpoint commits the claim; it then either copies the
+//! table at the slot's consistent point (`snapshot.mode=initial`) or starts at that point
+//! (`snapshot.mode=never`). Later starts resume from the engine checkpoint.
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
@@ -25,6 +26,7 @@ use super::schema::RelationInfo;
 use super::typed_rows::{RowBuilder, RowLayout};
 
 mod checkpoint;
+mod claim;
 mod decoding;
 mod drain;
 mod lifecycle;
@@ -32,6 +34,7 @@ mod reader;
 mod snapshot;
 mod startup;
 
+use claim::{ClaimTask, SlotClaim};
 use reader::{OwnedWalPayload, WalPayload, WalPayloadRx, WalTerminalError};
 use snapshot::SnapshotReader;
 
@@ -42,7 +45,13 @@ const RAW_WAL_QUEUE_CAPACITY: usize = 4_096;
 enum Phase {
     /// Not started, or closed.
     Idle,
-    /// Copying the table from the exported snapshot; no resumable cursor exists yet.
+    /// Intake held until a checkpoint commits the claim and its slot exists.
+    Claiming(ClaimTask),
+    /// `snapshot.mode=never`: the slot exists, and the reader starts at its consistent point once
+    /// a committed `streaming` cursor names it (`released`). A restart from the claim may stream
+    /// from a later point on another slot, so nothing may be emitted under it.
+    AwaitingStream { released: bool },
+    /// Copying the table from the exported snapshot, once a cursor naming the slot committed.
     Snapshot(Box<SnapshotReader>),
     /// Streaming committed transactions from the slot.
     Streaming,
@@ -100,8 +109,14 @@ pub struct PostgresCdcSource {
     /// keepalive position received while no transaction was open or undrained.
     polled_lsn: Lsn,
 
-    /// Exact database, publication, and slot identity bound to checkpoints.
+    /// Exact database and publication identity bound to checkpoints.
     checkpoint_binding: Option<PostgresCheckpointBinding>,
+    /// The claim whose slot this source creates or reads.
+    claim: Option<SlotClaim>,
+    /// Random per `start()`, in this incarnation's `application_name`.
+    incarnation: String,
+    /// The owned slot's consistent point, once the slot exists.
+    consistent_point: Option<Lsn>,
 
     #[cfg(test)]
     pending_messages: VecDeque<Vec<u8>>,
@@ -179,6 +194,9 @@ impl PostgresCdcSource {
             write_lsn: Lsn::ZERO,
             polled_lsn: Lsn::ZERO,
             checkpoint_binding: None,
+            claim: None,
+            incarnation: String::new(),
+            consistent_point: None,
             #[cfg(test)]
             pending_messages: VecDeque::new(),
             data_ready: Arc::new(Notify::new()),

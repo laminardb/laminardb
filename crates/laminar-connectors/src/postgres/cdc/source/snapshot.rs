@@ -4,10 +4,15 @@
 //! exactly the transactions committed before the slot's consistent point; streaming then starts
 //! at that point with no gap or overlap. An exported snapshot cannot be re-imported once its
 //! session ends, so an interrupted snapshot is not resumable.
+//!
+//! No row is emitted until a cursor naming the slot's snapshot phase has committed. A restart
+//! before that resumes from the claim, which copies the table again from a new slot; without the
+//! gate, rows a sink already wrote could go stale behind that second copy.
 
 use std::time::Duration;
 
 use arrow_array::{RecordBatch, UInt32Array};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::SimpleQueryMessage;
 
 use crate::connector::SourceBatch;
@@ -16,7 +21,6 @@ use crate::error::ConnectorError;
 use super::super::config::PostgresCdcConfig;
 use super::super::postgres_io::{self, ControlConnection};
 use super::super::typed_rows::{RowBuilder, RowLayout};
-use super::checkpoint::{write_cursor, CursorPhase};
 use super::drain::snapshot_order_key;
 use super::{Lsn, Phase, PostgresCdcSource};
 
@@ -34,6 +38,8 @@ pub(super) struct SnapshotReader {
     widest_row_bytes: usize,
     emitted_rows: u64,
     next_wal_status: tokio::time::Instant,
+    /// A cursor naming this snapshot committed, so rows may be emitted.
+    released: bool,
 }
 
 fn quote_identifier(identifier: &str) -> String {
@@ -69,9 +75,12 @@ impl SnapshotReader {
             .map(|column| quote_identifier(&column.name))
             .collect::<Vec<_>>()
             .join(", ");
+        // The transaction idles until the snapshot gate opens, about one checkpoint interval; a
+        // server idle-in-transaction timeout must not mistake that wait for an abandoned session.
         let statement = format!(
             "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY; \
              SET TRANSACTION SNAPSHOT '{snapshot_name}'; \
+             SET LOCAL idle_in_transaction_session_timeout = 0; \
              DECLARE {CURSOR} NO SCROLL CURSOR FOR SELECT {columns} FROM {}.{}",
             quote_identifier(&config.table.schema),
             quote_identifier(&config.table.name)
@@ -85,7 +94,13 @@ impl SnapshotReader {
             ConnectorError::ConnectionFailed("snapshot import timed out after 10 seconds".into())
         })?
         .map_err(|error| {
-            ConnectorError::ConnectionFailed(format!("import PostgreSQL snapshot: {error}"))
+            let message = format!("import PostgreSQL snapshot: {error}");
+            // Retrying a refusal (privileges, a dropped table) would create a slot per attempt.
+            if postgres_io::is_connection_failure(error.code().map(SqlState::code)) {
+                ConnectorError::ConnectionFailed(message)
+            } else {
+                ConnectorError::ConfigurationError(message)
+            }
         })?;
         Ok(Self {
             connection,
@@ -94,7 +109,12 @@ impl SnapshotReader {
             widest_row_bytes: 0,
             emitted_rows: 0,
             next_wal_status: tokio::time::Instant::now(),
+            released: false,
         })
+    }
+
+    pub(super) fn release(&mut self) {
+        self.released = true;
     }
 
     /// Fail before streaming would find the retained WAL already removed.
@@ -191,6 +211,7 @@ impl PostgresCdcSource {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
         let byte_budget = self.config.arrow_build_bytes();
+        let slot = self.slot_name()?.to_string();
         let (Phase::Snapshot(reader), Some(layout), Some(rows)) = (
             &mut self.phase,
             self.layout.as_ref(),
@@ -200,7 +221,10 @@ impl PostgresCdcSource {
                 "PostgreSQL CDC snapshot state is incomplete".into(),
             ));
         };
-        let fetched = match reader.check_slot_retention(&self.config.slot_name).await {
+        if !reader.released {
+            return Ok(None);
+        }
+        let fetched = match reader.check_slot_retention(&slot).await {
             Ok(()) => reader.fetch(layout, rows, max_records, byte_budget).await,
             Err(error) => Err(error),
         };
@@ -239,13 +263,7 @@ impl PostgresCdcSource {
         self.metrics
             .record_snapshot_rows(u64::try_from(rows).unwrap_or(u64::MAX));
         self.metrics.record_batch();
-        Ok(
-            SourceBatch::positioned(records, positions)?.with_checkpoint(write_cursor(
-                &self.config,
-                self.checkpoint_binding.as_ref(),
-                CursorPhase::Snapshot,
-            )),
-        )
+        Ok(SourceBatch::positioned(records, positions)?.with_checkpoint(self.cursor()))
     }
 
     /// Hand off from the finished snapshot to streaming at the slot's consistent point.
@@ -257,6 +275,7 @@ impl PostgresCdcSource {
         };
         let consistent_point = reader.consistent_point;
         let rows = reader.emitted_rows;
+        self.polled_lsn = consistent_point;
         if let Err(error) = reader.finish().await {
             return Err(self.fail(error));
         }

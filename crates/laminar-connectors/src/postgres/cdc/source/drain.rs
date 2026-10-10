@@ -5,7 +5,6 @@ use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
 use crate::connector::{SourceBatch, SourceMutation, SourceRowPositions};
 use crate::error::ConnectorError;
 
-use super::checkpoint::{write_cursor, CursorPhase};
 use super::{CommittedTransaction, Lsn, PostgresCdcSource};
 use crate::postgres::cdc::config::OutputMode;
 
@@ -126,11 +125,7 @@ impl PostgresCdcSource {
             batch = batch.with_mutations(mutations)?;
         }
         self.metrics.record_batch();
-        Ok(Some(batch.with_checkpoint(write_cursor(
-            &self.config,
-            self.checkpoint_binding.as_ref(),
-            CursorPhase::Streaming(self.polled_lsn),
-        ))))
+        Ok(Some(batch.with_checkpoint(self.cursor())))
     }
 
     /// Positions in one partition named by the slot, whose WAL history is one ordered stream.
@@ -141,10 +136,7 @@ impl PostgresCdcSource {
     ) -> Result<SourceRowPositions, ConnectorError> {
         let rows = order_keys.len();
         SourceRowPositions::try_new(
-            BinaryArray::from_iter_values(std::iter::repeat_n(
-                self.config.slot_name.as_bytes(),
-                rows,
-            )),
+            BinaryArray::from_iter_values(std::iter::repeat_n(self.slot_name()?.as_bytes(), rows)),
             BinaryArray::from_iter_values(order_keys),
             sub_offsets,
         )
