@@ -578,6 +578,52 @@ async fn unchanged_toast_values_and_nulls_survive_real_wal() {
 }
 
 #[tokio::test]
+async fn column_change_stops_intake_at_the_first_change_after_it() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut source = started(start(&config)).await;
+    let mut mirror = Mirror::new();
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (1, 'a', 1)", fixture.table))
+        .await;
+    drain_to(&mut source, &mut mirror, &fixture).await;
+    fixture
+        .exec(&format!(
+            "ALTER TABLE {} ADD COLUMN extra integer",
+            fixture.table
+        ))
+        .await;
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} VALUES (2, 'b', 2, 2)",
+            fixture.table
+        ))
+        .await;
+    let error = timeout(WAIT, async {
+        loop {
+            match source.poll_batch(64).await {
+                Ok(Some(batch)) => apply(&mut mirror, &batch),
+                Ok(None) => sleep(Duration::from_millis(10)).await,
+                Err(error) => return error,
+            }
+        }
+    })
+    .await
+    .expect("a column change must stop the source");
+    assert!(
+        error
+            .to_string()
+            .contains("no longer matches the bound layout"),
+        "{error}"
+    );
+    assert!(mirror.contains_key(&1) && !mirror.contains_key(&2));
+    source.close().await.unwrap();
+    fixture.drop_slot().await;
+}
+
+#[tokio::test]
 async fn truncate_stops_intake_before_feedback() {
     let Some(fixture) = Fixture::new(ORDERS).await else {
         return;

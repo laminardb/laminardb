@@ -182,10 +182,15 @@ impl Capture {
     }
 
     fn upsert_sink(&self, name: &str, input: &str, key: &str) -> String {
+        self.upsert_sink_with(name, input, key, "")
+    }
+
+    fn upsert_sink_with(&self, name: &str, input: &str, key: &str, options: &str) -> String {
         format!(
             "CREATE SINK {name} FROM {input} INTO \"postgres-sink\" ({PG_SINK}, \
              'port' = '{port}', 'table.name' = '{mirror}', 'write.mode' = 'upsert', \
-             'primary.key' = '{key}', 'changelog.mode' = 'true', 'auto.create.table' = 'true')",
+             'primary.key' = '{key}', 'changelog.mode' = 'true', 'auto.create.table' = 'true'\
+             {options})",
             port = port(),
             mirror = self.mirror,
         )
@@ -998,7 +1003,8 @@ mod latency {
     enum Load {
         /// One single-row transaction every `every` for `run`.
         Paced { every: Duration, run: Duration },
-        /// `bursts` groups of `txns` pipelined single-row transactions, `pause` apart.
+        /// `bursts` groups of `txns` single-row transactions pipelined on one connection,
+        /// `pause` apart; commit flushes bound the rate.
         Bursts {
             bursts: usize,
             txns: usize,
@@ -1323,18 +1329,27 @@ mod latency {
         )
     }
 
-    async fn open_db(storage: &Path, checkpoint_ms: u64) -> Arc<LaminarDB> {
-        LaminarDB::builder()
+    async fn open_db(
+        storage: &Path,
+        checkpoint_ms: u64,
+        sink_delay_ms: Option<f64>,
+    ) -> Arc<LaminarDB> {
+        let db = LaminarDB::builder()
             .storage_dir(storage)
             .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
                 interval_ms: Some(checkpoint_ms),
+                // A checkpoint's sink flush must fit the deadline; a slow target needs more.
+                timeout_ms: sink_delay_ms.map(|_| 600_000),
                 ..Default::default()
             })
             .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
             .config_var("E2E_PG_PASSWORD", PASSWORD)
             .build()
             .await
-            .expect("open database")
+            .expect("open database");
+        // As in the server, a recoverable fault restarts the pipeline instead of parking it.
+        db.enable_supervision();
+        db
     }
 
     async fn create_slow_mirror(client: &tokio_postgres::Client, mirror: &str, delay_ms: f64) {
@@ -1418,11 +1433,22 @@ mod latency {
             mirror: unique("unused"),
         };
         let storage = tempfile::tempdir().unwrap();
-        let db = open_db(storage.path(), scenario.checkpoint_ms).await;
+        let db = open_db(
+            storage.path(),
+            scenario.checkpoint_ms,
+            scenario.sink_delay_ms,
+        )
+        .await;
         let budget = format!(", 'max.buffered.bytes' = '{}'", scenario.max_buffered_bytes);
+        // One flush is one statement; a slow target needs room to apply the whole backlog.
+        let sink_options = if scenario.sink_delay_ms.is_some() {
+            ", 'statement.timeout.ms' = '600000'"
+        } else {
+            ""
+        };
         let mut statements = vec![
             capture.source("orders", ORDER_COLUMNS, &budget),
-            capture.upsert_sink("orders_mirror", "orders", "id"),
+            capture.upsert_sink_with("orders_mirror", "orders", "id", sink_options),
         ];
         if scenario.visible {
             statements.push(changes.source(
@@ -1593,7 +1619,7 @@ mod latency {
             capture.upsert_sink("orders_mirror", "orders", "id"),
         ];
         {
-            let db = open_db(storage.path(), 1_000).await;
+            let db = open_db(storage.path(), 1_000, None).await;
             execute_all(&db, &statements).await;
             db.start().await.expect("start");
             client
@@ -1626,7 +1652,7 @@ mod latency {
             .get(0);
         let restarted = Instant::now();
         let db = loop {
-            let db = open_db(storage.path(), 1_000).await;
+            let db = open_db(storage.path(), 1_000, None).await;
             match first_error(&db, &statements).await {
                 None => break db,
                 Some(error) if error.contains("LDB-0014") => {
