@@ -8,7 +8,6 @@
 //! (default 20), and `LAMINAR_TEST_POSTGRES_PORT` (default 15532) size and place the run.
 
 #![cfg(all(feature = "postgres-cdc", feature = "postgres-sink"))]
-#![allow(clippy::disallowed_types)]
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;

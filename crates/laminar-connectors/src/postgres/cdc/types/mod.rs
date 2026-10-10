@@ -182,7 +182,7 @@ fn numeric_precision_scale(type_modifier: i32) -> Result<(u16, i16), String> {
     // PostgreSQL 15+ stores the scale as an 11-bit two's-complement field.
     let scale =
         i16::try_from(((packed & 0x7ff) ^ 0x400) - 0x400).map_err(|error| error.to_string())?;
-    if precision == 0 || precision > MAX_DECIMAL128_PRECISION || scale < 0 || scale > 38 {
+    if precision == 0 || precision > MAX_DECIMAL128_PRECISION || !(0..=38).contains(&scale) {
         return Err(format!(
             "numeric({precision},{scale}) has no exact DECIMAL128 mapping (precision 1..=38, scale 0..=38)"
         ));

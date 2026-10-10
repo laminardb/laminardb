@@ -13,7 +13,7 @@ use super::super::decoder::{
 };
 use super::super::schema::RelationInfo;
 use super::super::schema_resolution::validate_relation;
-use super::super::typed_rows::RowLayout;
+use super::super::typed_rows::{RowBuilder, RowLayout};
 use super::reader::logical_wal_payload_bytes;
 use super::{
     CommittedTransaction, ConnectorState, Lsn, OpenTransaction, OwnedWalPayload, PostgresCdcSource,
@@ -42,7 +42,7 @@ impl PostgresCdcSource {
         self.committed_bytes.saturating_add(
             self.open_rows
                 .as_ref()
-                .map_or(0, |rows| rows.retained_bytes()),
+                .map_or(0, RowBuilder::retained_bytes),
         )
     }
 
@@ -148,7 +148,7 @@ impl PostgresCdcSource {
             .open_transaction
             .as_ref()
             .map_or(Lsn::ZERO, |transaction| transaction.final_lsn);
-        let rows = self.open_rows.as_ref().map_or(0, |rows| rows.len());
+        let rows = self.open_rows.as_ref().map_or(0, RowBuilder::len);
         self.fail(ConnectorError::ReadError(format!(
             "PostgreSQL CDC transaction committing at {final_lsn} exceeds the decoded-stage \
              budget on its own: {} bytes retained after {rows} rows plus {planned} for the next \
@@ -195,7 +195,7 @@ impl PostgresCdcSource {
             WalMessage::Commit(commit) => {
                 self.commit_transaction(commit.commit_lsn, commit.end_lsn)
             }
-            WalMessage::Relation(relation) => self.announce_relation(RelationInfo {
+            WalMessage::Relation(relation) => self.announce_relation(&RelationInfo {
                 relation_id: relation.relation_id,
                 namespace: relation.namespace,
                 name: relation.name,
@@ -359,13 +359,13 @@ impl PostgresCdcSource {
         ))))
     }
 
-    fn announce_relation(&mut self, incoming: RelationInfo) -> Result<(), ConnectorError> {
+    fn announce_relation(&mut self, incoming: &RelationInfo) -> Result<(), ConnectorError> {
         let Some(bound) = self.relation.as_ref() else {
             return Err(ConnectorError::Internal(
                 "PostgreSQL CDC relation announced before its binding".into(),
             ));
         };
-        if let Err(error) = validate_relation(bound, &incoming) {
+        if let Err(error) = validate_relation(bound, incoming) {
             return Err(self.fail(error));
         }
         self.relation_announced = true;

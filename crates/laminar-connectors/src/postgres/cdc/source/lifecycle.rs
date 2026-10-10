@@ -50,7 +50,7 @@ impl PostgresCdcSource {
             let payload = if let Some(payload) = self.pending_payloads.pop_front() {
                 payload
             } else {
-                match self.wal_rx.as_ref().map(|receiver| receiver.try_recv()) {
+                match self.wal_rx.as_ref().map(crossfire::AsyncRx::try_recv) {
                     Some(Ok(payload)) => payload,
                     Some(Err(crossfire::TryRecvError::Empty)) | None => break,
                     Some(Err(crossfire::TryRecvError::Disconnected)) => {
@@ -71,7 +71,7 @@ impl PostgresCdcSource {
         // A full quantum may hide queued work behind a coalesced notification; keep one
         // payload so the next poll is self-notified instead of waiting on the reader.
         if processed == payload_budget && self.pending_payloads.is_empty() {
-            match self.wal_rx.as_ref().map(|receiver| receiver.try_recv()) {
+            match self.wal_rx.as_ref().map(crossfire::AsyncRx::try_recv) {
                 Some(Ok(payload)) => self.pending_payloads.push_back(payload),
                 Some(Err(crossfire::TryRecvError::Disconnected)) => reader_closed = true,
                 Some(Err(crossfire::TryRecvError::Empty)) | None => {}

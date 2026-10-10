@@ -253,21 +253,18 @@ async fn finish_fresh(
     let binding = inspect_source(control.client(), config)
         .await?
         .binding(config)?;
-    let phase = match snapshot {
-        Some(reader) => StartPhase::Snapshot(reader),
-        None => {
-            let reader = launch_reader(
-                owner,
-                Arc::clone(inputs.data_ready),
-                config,
-                &binding,
-                consistent_point,
-            )
-            .await?;
-            StartPhase::Stream(consistent_point, reader)
-        }
-    };
-    Ok((binding, phase))
+    if let Some(reader) = snapshot {
+        return Ok((binding, StartPhase::Snapshot(reader)));
+    }
+    let reader = launch_reader(
+        owner,
+        Arc::clone(inputs.data_ready),
+        config,
+        &binding,
+        consistent_point,
+    )
+    .await?;
+    Ok((binding, StartPhase::Stream(consistent_point, reader)))
 }
 
 /// Connect the replication stream at `start_lsn` and spawn the bounded reader task.

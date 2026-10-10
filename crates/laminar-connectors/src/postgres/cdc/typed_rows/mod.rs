@@ -343,10 +343,12 @@ fn decode_bytea_hex(text: &[u8]) -> Result<Vec<u8>, String> {
     let hex = text
         .strip_prefix(b"\\x")
         .ok_or_else(|| "bytea text is not in hex format".to_string())?;
-    if hex.len() % 2 != 0 {
+    let (pairs, odd) = hex.as_chunks::<2>();
+    if !odd.is_empty() {
         return Err("bytea hex text has an odd length".into());
     }
-    hex.chunks_exact(2)
+    pairs
+        .iter()
         .map(|pair| {
             let digit = |byte: u8| match byte {
                 b'0'..=b'9' => Ok(byte - b'0'),
