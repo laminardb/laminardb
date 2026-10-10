@@ -1451,9 +1451,9 @@ max_out_of_orderness = "5s"</code></pre>
 
       <!-- POSTGRES CDC -->
       <h3 id="postgres-cdc">PostgreSQL CDC Source</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/postgres/cdc/source.rs" target="_blank" rel="noopener">postgres/cdc/source.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/postgres/cdc/source/mod.rs" target="_blank" rel="noopener">postgres/cdc/source/mod.rs</a></div>
 
-      <p><strong>Delivery boundary:</strong> the source resumes from the last fully emitted committed transaction and is admitted for at-least-once processing. It does not create an initial snapshot, so fresh startup is rejected before network I/O. Both the control and replication connections use the same verified TLS policy.</p>
+      <p>Reads one table through logical replication (<code>pgoutput</code>, PostgreSQL 17+) as typed keyed upserts or a retractable <code>__weight</code> changelog, with an optional initial snapshot handed off at the slot's consistent point. The table needs a primary key and <code>REPLICA IDENTITY FULL</code>, and the publication must be <code>FOR TABLE</code> exactly that table. The slot advances only after a checkpoint commits. Embedded and single-node server mode, at-least-once; cluster mode and exactly-once reject it. TRUNCATE and table or publication changes stop the source with reset guidance.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
@@ -1463,12 +1463,13 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
           <tr><td class="field-name">username</td><td class="field-default">postgres</td><td>Auth username</td></tr>
           <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
-          <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Logical replication slot</td></tr>
+          <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Logical replication slot, created by the source; an existing slot is refused on a fresh start</td></tr>
           <tr><td class="field-name">publication</td><td><span class="field-required">required</span></td><td>Publication name</td></tr>
           <tr><td class="field-name">ssl.mode</td><td class="field-default">verify-full</td><td><code>verify-full</code> or explicit plaintext <code>disable</code></td></tr>
           <tr><td class="field-name">ssl.ca.cert.path</td><td></td><td>Optional PEM CA bundle for <code>verify-full</code>; web PKI roots are used by default</td></tr>
-          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated, schema-qualified table filter</td></tr>
-          <tr><td class="field-name">table.exclude</td><td></td><td>Comma-separated, schema-qualified table exclusions</td></tr>
+          <tr><td class="field-name">table</td><td><span class="field-required">required</span></td><td>Captured table as <code>schema.table</code></td></tr>
+          <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td><code>initial</code> copies the table, then streams every later change; <code>never</code> streams changes after the slot is created</td></tr>
+          <tr><td class="field-name">output.mode</td><td class="field-default">upsert</td><td><code>upsert</code>: current rows and key-only deletes for keyed sinks. <code>changelog</code>: Z-set rows with a trailing <code>__weight BIGINT NOT NULL</code> for filters and COUNT/SUM/AVG with EMIT CHANGES; needs <code>snapshot.mode=initial</code></td></tr>
           <tr><td class="field-name">max.buffered.bytes</td><td class="field-default">268435456</td><td>Total connector-owned payload budget across raw WAL, decoded transactions, and Arrow construction (1 MiB to 4 GiB)</td></tr>
         </tbody>
       </table>
