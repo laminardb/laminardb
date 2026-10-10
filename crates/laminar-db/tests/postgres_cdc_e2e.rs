@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use laminar_db::{DeliveryGuarantee, LaminarDB};
@@ -60,10 +61,15 @@ async fn postgres() -> Option<tokio_postgres::Client> {
 }
 
 async fn open(storage: &Path) -> std::sync::Arc<LaminarDB> {
+    open_with(storage, Some(300)).await
+}
+
+/// A database checkpointing every `interval_ms`, or only on `checkpoint()` when `None`.
+async fn open_with(storage: &Path, interval_ms: Option<u64>) -> std::sync::Arc<LaminarDB> {
     LaminarDB::builder()
         .storage_dir(storage)
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-            interval_ms: Some(300),
+            interval_ms,
             ..Default::default()
         })
         .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
@@ -76,9 +82,17 @@ async fn open(storage: &Path) -> std::sync::Arc<LaminarDB> {
 /// Open a database and register `statements`, waiting for the previous process generation to
 /// release the checkpoint namespace lock after shutdown.
 async fn reopen(storage: &Path, statements: &[String]) -> std::sync::Arc<LaminarDB> {
+    reopen_with(storage, statements, Some(300)).await
+}
+
+async fn reopen_with(
+    storage: &Path,
+    statements: &[String],
+    interval_ms: Option<u64>,
+) -> std::sync::Arc<LaminarDB> {
     let deadline = tokio::time::Instant::now() + CONVERGE;
     loop {
-        let db = open(storage).await;
+        let db = open_with(storage, interval_ms).await;
         match first_error(&db, statements).await {
             None => return db,
             Some(error) if error.contains("LDB-0014") && tokio::time::Instant::now() < deadline => {
@@ -138,7 +152,8 @@ async fn rows(client: &tokio_postgres::Client, query: &str) -> Rows {
 const PG_SINK: &str = "'hostname' = '127.0.0.1', 'database' = 'cdc', 'username' = 'laminar', \
      'password' = '${E2E_PG_PASSWORD}', 'ssl.mode' = 'disable'";
 
-/// One captured table with its own slot and publication, plus a mirror table name.
+/// One captured table with its own slot prefix and publication, plus a mirror table name.
+/// Dropping it ends sessions on and drops every slot under the prefix.
 struct Capture {
     table: String,
     slot: String,
@@ -198,31 +213,73 @@ impl Capture {
     fn mirror_rows(&self) -> String {
         format!("SELECT id, label, qty FROM {} ORDER BY id", self.mirror)
     }
+}
 
-    async fn drop_slot(&self, client: &tokio_postgres::Client) {
+impl Drop for Capture {
+    fn drop(&mut self) {
+        let prefix = format!("{}_", self.slot);
+        let _ = std::thread::spawn(move || drop_test_slots(&prefix)).join();
+    }
+}
+
+/// Test cleanup only: end every session on, then drop, every slot whose name starts with
+/// `prefix`.
+fn drop_test_slots(prefix: &str) {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    runtime.block_on(async {
+        let Some(client) = postgres().await else {
+            return;
+        };
         let deadline = tokio::time::Instant::now() + CONVERGE;
         while tokio::time::Instant::now() < deadline {
-            let dropped = client
+            let _ = client
                 .execute(
-                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
-                     WHERE slot_name = $1 AND NOT active",
-                    &[&self.slot],
+                    "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+                     WHERE starts_with(slot_name::text, $1) AND active_pid IS NOT NULL",
+                    &[&prefix],
                 )
                 .await;
-            let remaining = client
+            let _ = client
+                .execute(
+                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                     WHERE starts_with(slot_name::text, $1) AND NOT active",
+                    &[&prefix],
+                )
+                .await;
+            let remaining: i64 = client
                 .query_one(
-                    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
-                    &[&self.slot],
+                    "SELECT count(*) FROM pg_replication_slots \
+                     WHERE starts_with(slot_name::text, $1)",
+                    &[&prefix],
                 )
                 .await
-                .unwrap()
-                .get::<_, i64>(0);
-            if dropped.is_ok() && remaining == 0 {
+                .map_or(1, |row| row.get(0));
+            if remaining == 0 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-    }
+    });
+}
+
+/// Slots the source created under its `slot.name` prefix.
+async fn slots_under(client: &tokio_postgres::Client, prefix: &str) -> Vec<String> {
+    client
+        .query(
+            "SELECT slot_name::text FROM pg_replication_slots \
+             WHERE starts_with(slot_name::text, $1) ORDER BY 1",
+            &[&format!("{prefix}_")],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
 }
 
 const ORDER_COLUMNS: &str = "id BIGINT NOT NULL, label VARCHAR, qty INT, PRIMARY KEY (id)";
@@ -299,7 +356,6 @@ async fn snapshot_and_changes_mirror_into_postgres_across_restart() {
         assert_eq!(observed, expected, "mirror after restart");
         db.shutdown().await.expect("shutdown");
     }
-    capture.drop_slot(&client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -342,14 +398,7 @@ async fn unsupported_upsert_compositions_fail_before_data_moves() {
                 .unwrap_or_default();
         }
         assert!(error.contains(needle), "{needle}: {error}");
-        let slots = client
-            .query_one(
-                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
-                &[&capture.slot],
-            )
-            .await
-            .unwrap()
-            .get::<_, i64>(0);
+        let slots = slots_under(&client, &capture.slot).await.len();
         assert_eq!(slots, 0, "a rejected pipeline never creates the slot");
         let _ = db.shutdown().await;
     }
@@ -492,7 +541,6 @@ async fn changelog_source_maintains_aggregates_and_filters_exactly() {
         views.converge(&client).await;
         db.shutdown().await.expect("shutdown");
     }
-    capture.drop_slot(&client).await;
 }
 
 /// Terminate the backends `query` selects, returning how many were terminated.
@@ -513,10 +561,7 @@ async fn terminate(client: &tokio_postgres::Client, query: &str) -> i64 {
 /// at least once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connection_loss_recovers_from_the_committed_slot_position() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_test_writer()
-        .try_init();
+    let _ = logs();
     let Some(client) = postgres().await else {
         return;
     };
@@ -553,15 +598,10 @@ async fn connection_loss_recovers_from_the_committed_slot_position() {
             == expected
     };
     assert!(converge().await, "mirror before any connection loss");
-    // A restart resumes from a committed slot position; before the first commit there is none,
-    // and a fresh start refuses the source's own slot.
+    // Commit a position on the slot so each restart below resumes the stream.
     assert!(db.checkpoint().await.expect("checkpoint").success);
 
-    let walsender = format!(
-        "SELECT active_pid AS pid FROM pg_replication_slots \
-         WHERE slot_name = '{}' AND active_pid IS NOT NULL",
-        capture.slot
-    );
+    let walsender = walsender_of(&capture.slot);
     // The sink's sessions and the source's control session.
     let sessions = "SELECT pid FROM pg_stat_activity WHERE datname = current_database() \
                     AND backend_type = 'client backend' AND pid <> pg_backend_pid()"
@@ -582,7 +622,333 @@ async fn connection_loss_recovers_from_the_committed_slot_position() {
         );
     }
     db.shutdown().await.expect("shutdown");
-    capture.drop_slot(&client).await;
+}
+
+/// The source's replication connection, once its slot exists and streams.
+fn walsender_of(prefix: &str) -> String {
+    format!(
+        "SELECT active_pid AS pid FROM pg_replication_slots \
+         WHERE starts_with(slot_name, '{prefix}_') AND active_pid IS NOT NULL"
+    )
+}
+
+/// A source that faults before any checkpoint covering its rows commits restarts on the slot it
+/// created and loses nothing. Its stream opens one checkpoint after the slot is created, and the
+/// fault lands before the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fault_before_the_first_slot_position_commits_recovers() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    let storage = tempfile::tempdir().unwrap();
+    let db = open_with(storage.path(), Some(5_000)).await;
+    db.enable_supervision();
+    execute_all(
+        &db,
+        &[
+            capture.source("orders", ORDER_COLUMNS, ", 'snapshot.mode' = 'never'"),
+            capture.upsert_sink("orders_mirror", "orders", "id"),
+        ],
+    )
+    .await;
+    db.start().await.expect("start");
+    let walsender = walsender_of(&capture.slot);
+    let count = format!("SELECT count(*) FROM ({walsender}) holders");
+    let streaming = eventually(
+        CONVERGE,
+        || async {
+            client
+                .query_one(&count, &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        },
+        |active| *active > 0,
+    )
+    .await;
+    assert!(streaming > 0, "the source never started streaming");
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, 'before', g FROM generate_series(1, 100) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    assert!(terminate(&client, &walsender).await > 0);
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, 'after', g FROM generate_series(101, 200) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let expected = rows(&client, &capture.source_rows()).await;
+    let mirror_rows = capture.mirror_rows();
+    let observed = eventually(
+        CONVERGE,
+        || rows(&client, &mirror_rows),
+        |rows| rows == &expected,
+    )
+    .await;
+    assert_eq!(
+        observed.len(),
+        expected.len(),
+        "mirror after the early fault: {:?}",
+        db.last_fault()
+    );
+    assert_eq!(observed, expected);
+    db.shutdown().await.expect("shutdown");
+}
+
+/// With manual checkpoints the slot is created after the first `checkpoint()` commits the claim
+/// and the copy starts after the next; a restart before the claim commits leaves nothing behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_checkpoints_create_the_slot_and_a_restart_before_them_leaves_nothing() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, 'seed', g FROM generate_series(1, 200) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let statements = vec![
+        capture.source("orders", ORDER_COLUMNS, ""),
+        capture.upsert_sink("orders_mirror", "orders", "id"),
+    ];
+    let db = open_with(storage.path(), None).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(slots_under(&client, &capture.slot).await.is_empty());
+    db.shutdown().await.expect("shutdown");
+
+    let db = reopen_with(storage.path(), &statements, None).await;
+    db.start().await.expect("restart before the claim commits");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        slots_under(&client, &capture.slot).await.is_empty(),
+        "no slot before a checkpoint commits the claim"
+    );
+    assert!(db.checkpoint().await.expect("checkpoint").success);
+    let created = eventually(
+        CONVERGE,
+        || slots_under(&client, &capture.slot),
+        |slots| !slots.is_empty(),
+    )
+    .await;
+    assert_eq!(created.len(), 1, "{created:?}");
+    let expected = rows(&client, &capture.source_rows()).await;
+    let mirror_rows = capture.mirror_rows();
+    let observed = eventually(
+        CONVERGE,
+        || async {
+            assert!(db.checkpoint().await.expect("checkpoint").success);
+            rows(&client, &mirror_rows).await
+        },
+        |rows| rows == &expected,
+    )
+    .await;
+    assert_eq!(observed, expected);
+    assert_eq!(slots_under(&client, &capture.slot).await, created);
+    db.shutdown().await.expect("shutdown");
+}
+
+/// Slot creation waits for transactions already running. The wait is reported with the
+/// transaction it waits for, and a restart during the wait ends the stale creation and creates
+/// the claimed slot once the transaction ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slot_creation_waits_for_running_transactions_and_survives_a_restart() {
+    let logs = logs();
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    let unrelated = unique("unrelated");
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, 'seed', g FROM generate_series(1, 100) g; \
+             CREATE TABLE {unrelated} (id integer);",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let blocker = postgres().await.expect("a second session");
+    blocker
+        .batch_execute(&format!("BEGIN; INSERT INTO {unrelated} VALUES (1)"))
+        .await
+        .unwrap();
+    let pid: i32 = blocker
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let storage = tempfile::tempdir().unwrap();
+    let statements = vec![
+        capture.source("orders", ORDER_COLUMNS, ""),
+        capture.upsert_sink("orders_mirror", "orders", "id"),
+    ];
+    let db = open(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let needle = format!("pid {pid} ");
+    let reported = eventually(
+        Duration::from_secs(90),
+        || async { logged(&logs, &needle) },
+        |reported| *reported,
+    )
+    .await;
+    assert!(
+        reported,
+        "the creation wait names the transaction it waits for"
+    );
+    assert!(rows(&client, &capture.mirror_rows()).await.is_empty());
+    db.shutdown()
+        .await
+        .expect("shutdown while the slot is being created");
+
+    let db = reopen(storage.path(), &statements).await;
+    db.start().await.expect("restart from the committed claim");
+    blocker.batch_execute("COMMIT").await.unwrap();
+    let expected = rows(&client, &capture.source_rows()).await;
+    let mirror_rows = capture.mirror_rows();
+    let observed = eventually(
+        CONVERGE,
+        || rows(&client, &mirror_rows),
+        |rows| rows == &expected,
+    )
+    .await;
+    assert_eq!(observed, expected);
+    assert_eq!(
+        slots_under(&client, &capture.slot).await.len(),
+        1,
+        "the restart created the claimed slot and nothing else"
+    );
+    db.shutdown().await.expect("shutdown");
+    client
+        .batch_execute(&format!("DROP TABLE {unrelated}"))
+        .await
+        .unwrap();
+}
+
+/// A crash after the slot exists but before a cursor naming its snapshot commits emitted no row,
+/// so the restart copies the table again from a new slot and reports the first one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_before_the_snapshot_cursor_commits_restarts_on_a_new_slot_exactly() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, 'seed', g FROM generate_series(1, 300) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let statements = vec![
+        capture.source("orders", ORDER_COLUMNS, ""),
+        capture.upsert_sink("orders_mirror", "orders", "id"),
+    ];
+    let db = open_with(storage.path(), Some(5_000)).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let first = eventually(
+        CONVERGE,
+        || slots_under(&client, &capture.slot),
+        |slots| !slots.is_empty(),
+    )
+    .await;
+    assert_eq!(first.len(), 1, "{first:?}");
+    db.shutdown()
+        .await
+        .expect("shutdown before the next checkpoint");
+    assert!(
+        rows(&client, &capture.mirror_rows()).await.is_empty(),
+        "no snapshot row passes the gate before its cursor commits"
+    );
+
+    churn(&client, &capture.table, 0).await;
+    let db = reopen(storage.path(), &statements).await;
+    db.start().await.expect("restart from the committed claim");
+    churn(&client, &capture.table, 1).await;
+    let expected = rows(&client, &capture.source_rows()).await;
+    let mirror_rows = capture.mirror_rows();
+    let observed = eventually(
+        CONVERGE,
+        || rows(&client, &mirror_rows),
+        |rows| rows == &expected,
+    )
+    .await;
+    assert_eq!(observed, expected);
+    let slots = slots_under(&client, &capture.slot).await;
+    assert_eq!(slots.len(), 2, "{slots:?}");
+    assert!(
+        slots.contains(&first[0]),
+        "the first slot is reported, never dropped"
+    );
+    db.shutdown().await.expect("shutdown");
+}
+
+/// One process-wide subscriber: `RUST_LOG`-filtered output for the test log, plus every
+/// `laminar_connectors` warning kept for assertions.
+fn logs() -> Arc<Mutex<Vec<u8>>> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    Arc::clone(LOGS.get_or_init(|| {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let captured = Captured(Arc::clone(&logs));
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_test_writer()
+                    .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(move || captured.clone())
+                    .with_filter(tracing_subscriber::filter::Targets::new().with_target(
+                        "laminar_connectors",
+                        tracing_subscriber::filter::LevelFilter::WARN,
+                    )),
+            )
+            .try_init();
+        logs
+    }))
+}
+
+fn logged(logs: &Mutex<Vec<u8>>, needle: &str) -> bool {
+    String::from_utf8_lossy(
+        &logs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .contains(needle)
 }
 
 /// A changelog source read straight into a keyed changelog sink applies each retraction and
@@ -622,7 +988,6 @@ async fn changelog_source_feeds_a_changelog_sink_directly() {
     .await;
     assert_eq!(observed, expected);
     db.shutdown().await.expect("shutdown");
-    capture.drop_slot(&client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -680,14 +1045,7 @@ async fn changelog_consumers_that_cannot_retract_are_rejected_before_data_moves(
                 .unwrap_or_default(),
         };
         assert!(error.contains(needle), "{needle}: {error}");
-        let slots = client
-            .query_one(
-                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
-                &[&capture.slot],
-            )
-            .await
-            .unwrap()
-            .get::<_, i64>(0);
+        let slots = slots_under(&client, &capture.slot).await.len();
         assert_eq!(
             slots, 0,
             "{needle}: a rejected pipeline never creates the slot"
@@ -776,7 +1134,6 @@ async fn unique_value_transfers_reach_a_deferrable_target() {
     .await;
     assert_eq!(observed, expected, "unique transfers and swaps");
     db.shutdown().await.expect("shutdown");
-    capture.drop_slot(&client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -791,14 +1148,7 @@ async fn non_deferrable_extra_unique_constraints_are_rejected_before_data_moves(
             panic!("a non-deferrable extra unique constraint is rejected");
         };
         assert!(error.contains("DEFERRABLE"), "{error}");
-        let slots = client
-            .query_one(
-                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
-                &[&capture.slot],
-            )
-            .await
-            .unwrap()
-            .get::<_, i64>(0);
+        let slots = slots_under(&client, &capture.slot).await.len();
         assert_eq!(slots, 0);
     }
 
@@ -885,7 +1235,6 @@ async fn transaction_slower_than_the_statement_timeout_reaches_a_slow_target() {
         observed.len()
     );
     db.shutdown().await.expect("shutdown");
-    capture.drop_slot(&client).await;
 }
 
 const WIDE_ROWS: usize = 6_000;
@@ -984,7 +1333,6 @@ async fn snapshot_longer_than_the_checkpoint_timeout_completes() {
         "streaming continues after the long snapshot"
     );
     db.shutdown().await.expect("shutdown");
-    capture.drop_slot(&client).await;
 }
 
 /// An exported snapshot cannot be re-imported, so a restart inside the initial snapshot fails
@@ -1013,6 +1361,8 @@ async fn restart_inside_the_snapshot_fails_closed() {
         partial.len()
     );
     db.shutdown().await.expect("shutdown");
+    let slots = slots_under(&client, &capture.slot).await;
+    assert_eq!(slots.len(), 1, "{slots:?}");
 
     let db = reopen(storage.path(), &statements).await;
     let error = db
@@ -1021,9 +1371,11 @@ async fn restart_inside_the_snapshot_fails_closed() {
         .expect_err("a snapshot-phase checkpoint is not resumable")
         .to_string();
     assert!(error.contains("initial snapshot"), "{error}");
-    assert!(error.contains(&capture.slot), "{error}");
+    assert!(
+        error.contains(&format!("SELECT pg_drop_replication_slot('{}')", slots[0])),
+        "{error}"
+    );
     let _ = db.shutdown().await;
-    capture.drop_slot(&client).await;
 }
 
 /// Latency and resource measurements for the direct PostgreSQL CDC path. The numbers are only
@@ -1204,8 +1556,8 @@ mod latency {
                 .query_one(
                     "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint, \
                      COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint \
-                     FROM pg_replication_slots WHERE slot_name = $1",
-                    &[&slot],
+                     FROM pg_replication_slots WHERE starts_with(slot_name::text, $1)",
+                    &[&format!("{slot}_")],
                 )
                 .await
             {
@@ -1534,10 +1886,6 @@ mod latency {
         );
         drop(subscription);
         db.shutdown().await.expect("shutdown");
-        capture.drop_slot(&client).await;
-        if scenario.visible {
-            changes.drop_slot(&client).await;
-        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1669,8 +2017,8 @@ mod latency {
         let lag: i64 = client
             .query_one(
                 "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint \
-                 FROM pg_replication_slots WHERE slot_name = $1",
-                &[&capture.slot],
+                 FROM pg_replication_slots WHERE starts_with(slot_name::text, $1)",
+                &[&format!("{}_", capture.slot)],
             )
             .await
             .unwrap()
@@ -1703,6 +2051,5 @@ mod latency {
             caught_up.as_secs_f64()
         );
         db.shutdown().await.expect("shutdown");
-        capture.drop_slot(&client).await;
     }
 }

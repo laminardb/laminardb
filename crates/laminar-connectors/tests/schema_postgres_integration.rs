@@ -100,7 +100,8 @@ async fn registered_source_resolution_binds_declared_columns_without_a_slot() {
     );
     let slots: i64 = client
         .query_one(
-            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'schema_contract_slot'",
+            "SELECT count(*) FROM pg_replication_slots \
+             WHERE starts_with(slot_name::text, 'schema_contract_slot')",
             &[],
         )
         .await

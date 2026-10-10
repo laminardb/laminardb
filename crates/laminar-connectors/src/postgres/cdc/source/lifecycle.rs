@@ -16,9 +16,10 @@ use crate::error::ConnectorError;
 use super::super::config::{OutputMode, PostgresCdcConfig};
 use super::super::schema_resolution::{committed_relation, declared_primary_key, declared_schema};
 use super::super::typed_rows::RowBuilder;
-use super::checkpoint::{parse_resumable, validate_live_binding, write_cursor, CursorPhase};
+use super::checkpoint::{parse_cursor, validate_live_binding, write_cursor, CursorPhase};
+use super::claim::incarnation;
 use super::decoding::Decoded;
-use super::startup::{prepare, ReaderRuntime, StartInputs, StartPhase, StartPlan};
+use super::startup::{prepare, ReaderRuntime, StartInputs, StartPhase};
 use super::{reap_postgres_reader, Arc, Lsn, Notify, Phase, PostgresCdcSource};
 
 /// Minimum spacing of live publication/table revalidation at checkpoint commits.
@@ -94,16 +95,20 @@ impl PostgresCdcSource {
         Ok(batch)
     }
 
-    /// Launch the replication reader at the finished snapshot's consistent point.
+    /// Launch the replication reader of the owned slot at `start_lsn`.
     pub(super) async fn begin_streaming(&mut self, start_lsn: Lsn) -> Result<(), ConnectorError> {
-        let binding = self.checkpoint_binding.clone().ok_or_else(|| {
-            ConnectorError::Internal("PostgreSQL CDC streams without a binding".into())
-        })?;
+        let (Some(binding), Some(claim)) = (&self.checkpoint_binding, &self.claim) else {
+            return Err(self.fail(ConnectorError::Internal(
+                "PostgreSQL CDC streams without a binding or a slot claim".into(),
+            )));
+        };
         let launched = super::startup::launch_reader(
             &self.task_owner,
             Arc::clone(&self.data_ready),
             &self.config,
-            &binding,
+            claim,
+            &self.incarnation,
+            binding,
             start_lsn,
         )
         .await;
@@ -131,30 +136,70 @@ impl PostgresCdcSource {
         self.data_ready.notify_one();
     }
 
-    fn current_cursor(&self) -> CursorPhase {
-        match self.phase {
-            Phase::Snapshot(_) => CursorPhase::Snapshot,
-            Phase::Idle | Phase::Streaming => CursorPhase::Streaming(self.polled_lsn),
-        }
+    /// The resumable cursor of the current phase: always present once started, so barriers
+    /// keep flowing while the claim, the slot creation, and the snapshot or stream gate are
+    /// pending.
+    pub(super) fn cursor(&self) -> SourceCheckpoint {
+        // A source that failed while installing its slot still reports where it stands: a
+        // barrier captured between a retried poll error and the fault may commit.
+        let phase = match (&self.phase, self.consistent_point) {
+            (Phase::Claiming(_), _) | (Phase::Idle, None) => CursorPhase::Claimed,
+            (Phase::Snapshot(_), Some(consistent_point)) => {
+                CursorPhase::Snapshot { consistent_point }
+            }
+            (
+                Phase::AwaitingStream { .. } | Phase::Streaming | Phase::Idle,
+                Some(consistent_point),
+            ) => CursorPhase::Streaming {
+                consistent_point,
+                lsn: self.polled_lsn,
+            },
+            (Phase::AwaitingStream { .. } | Phase::Snapshot(_) | Phase::Streaming, None) => {
+                return write_cursor(&self.config, None);
+            }
+        };
+        let position = match (&self.claim, &self.checkpoint_binding) {
+            (Some(claim), Some(binding)) => Some((claim, binding, phase)),
+            _ => None,
+        };
+        write_cursor(&self.config, position)
     }
 
-    /// Re-read the live contract at most every [`CONTRACT_CHECK_INTERVAL`].
+    /// Re-read the live contract and report orphaned slots at most every
+    /// [`CONTRACT_CHECK_INTERVAL`].
     async fn revalidate_contract(&mut self) -> Result<(), ConnectorError> {
         let now = tokio::time::Instant::now();
         if self.next_contract_check.is_some_and(|due| now < due) {
             return Ok(());
         }
-        let (Some(binding), Some(relation)) = (&self.checkpoint_binding, &self.relation) else {
+        let (Some(binding), Some(relation), Some(claim)) =
+            (&self.checkpoint_binding, &self.relation, &self.claim)
+        else {
             return Ok(());
         };
         self.next_contract_check = Some(now + CONTRACT_CHECK_INTERVAL);
-        match super::startup::revalidate(&self.task_owner, &self.config, binding, relation).await {
+        let checked = super::startup::revalidate(
+            &self.task_owner,
+            &self.config,
+            claim,
+            &self.incarnation,
+            binding,
+            relation,
+        )
+        .await;
+        match checked {
+            Ok(orphans) => {
+                if let Some(orphans) = orphans {
+                    self.metrics.set_orphaned_slots(orphans);
+                }
+                Ok(())
+            }
             // An unreachable control plane is not drift; replication itself is still healthy.
             Err(ConnectorError::ConnectionFailed(reason)) => {
                 tracing::warn!(%reason, "PostgreSQL CDC contract revalidation deferred");
                 Ok(())
             }
-            checked => checked,
+            Err(error) => Err(error),
         }
     }
 }
@@ -203,7 +248,7 @@ impl SourceConnector for PostgresCdcSource {
         let declared = declared_schema(&config, None)?;
         let primary_key = declared_primary_key(&config);
         let committed = committed_relation(config.schema_binding(), &parsed)?;
-        let plan = match position {
+        let cursor = match position {
             SourcePosition::Initial => None,
             SourcePosition::Initialized { .. } => {
                 return Err(ConnectorError::ConfigurationError(
@@ -213,13 +258,14 @@ impl SourceConnector for PostgresCdcSource {
             SourcePosition::Resume {
                 attempt,
                 checkpoint,
-            } => Some(parse_resumable(
+            } => Some(parse_cursor(
                 &checkpoint,
                 &parsed,
                 &format!("checkpoint {attempt:?}"),
             )?),
         };
 
+        let incarnation = incarnation();
         let prepared = prepare(
             &self.task_owner,
             StartInputs {
@@ -228,11 +274,9 @@ impl SourceConnector for PostgresCdcSource {
                 declared: &declared,
                 primary_key: &primary_key,
                 committed_relation: committed.as_ref(),
+                incarnation: &incarnation,
             },
-            match plan {
-                None => StartPlan::Fresh,
-                Some((lsn, binding)) => StartPlan::Resume { lsn, binding },
-            },
+            cursor,
         )
         .await?;
         // Publish the runtime only after all fallible network preparation succeeded.
@@ -240,19 +284,38 @@ impl SourceConnector for PostgresCdcSource {
         self.layout = Some(prepared.layout);
         self.relation = Some(prepared.relation);
         self.checkpoint_binding = Some(prepared.binding);
+        self.incarnation = incarnation;
         self.config = parsed;
         self.schema = declared;
-        self.state = ConnectorState::Running;
-        match prepared.phase {
-            StartPhase::Snapshot(reader) => {
-                self.phase = Phase::Snapshot(Box::new(reader));
-                self.data_ready.notify_one();
-            }
-            StartPhase::Stream(lsn, runtime) => self.enter_streaming(lsn, runtime),
+        if let Some(orphans) = prepared.orphans {
+            self.metrics.set_orphaned_slots(orphans);
         }
+        match prepared.phase {
+            StartPhase::Claim { claim, committed } => self.begin_claim(claim, committed)?,
+            StartPhase::AwaitStream {
+                claim,
+                consistent_point,
+            } => {
+                self.claim = Some(claim);
+                self.consistent_point = Some(consistent_point);
+                self.polled_lsn = consistent_point;
+                self.phase = Phase::AwaitingStream { released: false };
+            }
+            StartPhase::Stream {
+                claim,
+                consistent_point,
+                lsn,
+                runtime,
+            } => {
+                self.claim = Some(claim);
+                self.consistent_point = Some(consistent_point);
+                self.enter_streaming(lsn, runtime);
+            }
+        }
+        self.state = ConnectorState::Running;
         tracing::info!(
             table = %self.config.table,
-            slot = %self.config.slot_name,
+            slot = self.slot_name()?,
             output_mode = %self.config.output_mode,
             snapshot_mode = ?self.config.snapshot_mode,
             "PostgreSQL CDC source opened"
@@ -277,6 +340,17 @@ impl SourceConnector for PostgresCdcSource {
             });
         }
         match self.phase {
+            Phase::Claiming(_) => self.poll_claim().await,
+            Phase::AwaitingStream { released: false } => Ok(None),
+            Phase::AwaitingStream { released: true } => {
+                let start = self.consistent_point.ok_or_else(|| {
+                    ConnectorError::Internal(
+                        "PostgreSQL CDC awaits streaming without a consistent point".into(),
+                    )
+                })?;
+                self.begin_streaming(start).await?;
+                Ok(None)
+            }
             Phase::Snapshot(_) => self.poll_snapshot(max_records).await,
             Phase::Streaming => self.poll_streaming(max_records),
             Phase::Idle => Err(ConnectorError::Internal(
@@ -290,14 +364,7 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        // Checkpoints keep running during the snapshot: a barrier held for the whole copy would
-        // starve the sink flush that follows alignment. A snapshot cursor has no LSN, so it gives
-        // the slot no feedback and refuses to resume.
-        write_cursor(
-            &self.config,
-            self.checkpoint_binding.as_ref(),
-            self.current_cursor(),
-        )
+        self.cursor()
     }
 
     async fn notify_epoch_committed(
@@ -305,22 +372,52 @@ impl SourceConnector for PostgresCdcSource {
         epoch: u64,
         checkpoint: &SourceCheckpoint,
     ) -> Result<(), ConnectorError> {
-        // Advance the slot only after the epoch is durably committed (manifest persisted and
-        // sinks committed), so PostgreSQL never reclaims WAL for rows still in the pipeline.
-        // Snapshot-phase and empty cursors carry no LSN and are not feedback.
-        if checkpoint.get_offset("lsn").is_none() {
+        // Empty cursors (another source's commit) and unstarted ones carry no position.
+        if checkpoint.get_metadata("phase").is_none() {
             return Ok(());
         }
         let context = format!("committed epoch {epoch} checkpoint");
-        let (lsn, committed_binding) = parse_resumable(checkpoint, &self.config, &context)?;
-        let active =
-            self.checkpoint_binding
-                .as_ref()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "running PostgreSQL CDC checkpoint binding".into(),
-                    actual: "checkpoint binding is missing".into(),
-                })?;
-        validate_live_binding(&committed_binding, active, &context)?;
+        let committed = parse_cursor(checkpoint, &self.config, &context)?;
+        let (Some(active), Some(claim)) = (&self.checkpoint_binding, &self.claim) else {
+            return Err(ConnectorError::InvalidState {
+                expected: "running PostgreSQL CDC slot claim".into(),
+                actual: "the source has no slot claim".into(),
+            });
+        };
+        validate_live_binding(&committed.binding, active, &context)?;
+        if committed.claim != *claim {
+            // A claim replaced after its slot proved unusable can still commit; it emitted
+            // nothing, so it is not feedback.
+            return match committed.phase {
+                CursorPhase::Claimed => Ok(()),
+                CursorPhase::Snapshot { .. } | CursorPhase::Streaming { .. } => {
+                    Err(ConnectorError::ConfigurationError(format!(
+                        "committed PostgreSQL CDC epoch {epoch} names slot '{}', not this \
+                         source's slot '{}'",
+                        committed.claim.slot(),
+                        claim.slot()
+                    )))
+                }
+            };
+        }
+        let lsn = match (committed.phase, &mut self.phase) {
+            (CursorPhase::Claimed, Phase::Claiming(task)) => {
+                task.commit();
+                return Ok(());
+            }
+            (CursorPhase::Snapshot { .. }, Phase::Snapshot(reader)) => {
+                reader.release();
+                return Ok(());
+            }
+            (CursorPhase::Streaming { .. }, Phase::AwaitingStream { released }) => {
+                *released = true;
+                return Ok(());
+            }
+            (CursorPhase::Streaming { lsn, .. }, _) => lsn,
+            (CursorPhase::Claimed | CursorPhase::Snapshot { .. }, _) => return Ok(()),
+        };
+        // Advance the slot only after the epoch is durably committed (manifest persisted and
+        // sinks committed), so PostgreSQL never reclaims WAL for rows still in the pipeline.
         if lsn > self.polled_lsn {
             return Err(ConnectorError::ConfigurationError(format!(
                 "committed PostgreSQL CDC epoch {epoch} LSN {lsn} is ahead of the source's polled LSN {}; refusing irreversible slot feedback",
@@ -386,8 +483,10 @@ impl SourceConnector for PostgresCdcSource {
                 reap_postgres_reader(handle, &self.task_owner);
             }
         }
-        if let Phase::Snapshot(reader) = std::mem::replace(&mut self.phase, Phase::Idle) {
-            drop(reader);
+        match std::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Claiming(task) => task.cancel().await,
+            Phase::Snapshot(reader) => drop(reader),
+            Phase::Idle | Phase::AwaitingStream { .. } | Phase::Streaming => {}
         }
         self.reader_handle = None;
         self.reader_shutdown = None;

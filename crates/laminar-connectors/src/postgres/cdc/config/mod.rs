@@ -21,6 +21,8 @@ const REMOVED_CONFIG_KEYS: &[&str] = &[
     "wal.sender.timeout.ms",
 ];
 
+/// A slot name is at most 63 bytes; the claim suffix `_<16 hex digits>` takes 17 of them.
+const MAX_SLOT_PREFIX_BYTES: usize = 46;
 const DEFAULT_BUFFERED_BYTES: usize = 256 * 1024 * 1024;
 const MIN_BUFFERED_BYTES: usize = 1024 * 1024;
 const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -142,7 +144,8 @@ pub struct PostgresCdcConfig {
     pub ssl_ca_cert_path: Option<PathBuf>,
 
     // ── Replication ──
-    /// Name of the logical replication slot.
+    /// Prefix of the logical replication slots the source creates: each claim creates
+    /// `<slot_name>_<16 hex digits>` once a checkpoint commits the claim.
     pub slot_name: String,
 
     /// Name of the publication to subscribe to.
@@ -227,6 +230,7 @@ impl PostgresCdcConfig {
     /// than connection-string syntax.
     pub(super) fn control_connection_config(
         &self,
+        application_name: &str,
     ) -> Result<tokio_postgres::Config, ConnectorError> {
         self.validate_connection()?;
 
@@ -236,6 +240,7 @@ impl PostgresCdcConfig {
             .port(self.port)
             .dbname(&self.database)
             .user(&self.username)
+            .application_name(application_name)
             .options(super::typed_rows::SESSION_OPTIONS)
             .ssl_mode(match self.ssl_mode {
                 SslMode::Disable => tokio_postgres::config::SslMode::Disable,
@@ -356,16 +361,17 @@ impl PostgresCdcConfig {
                 )));
             }
         }
-        if self.slot_name.len() > 63
+        if self.slot_name.len() > MAX_SLOT_PREFIX_BYTES
             || !self
                 .slot_name
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         {
-            return Err(ConnectorError::ConfigurationError(
-                "slot.name must be at most 63 bytes and contain only lower-case ASCII letters, digits, or underscore"
-                    .into(),
-            ));
+            return Err(ConnectorError::ConfigurationError(format!(
+                "slot.name is the prefix of the slots the source creates (<slot.name>_<16 hex \
+                 digits>): at most {MAX_SLOT_PREFIX_BYTES} bytes of lower-case ASCII letters, \
+                 digits, or underscore"
+            )));
         }
         if self.publication.len() > 63
             || !self

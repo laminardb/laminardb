@@ -5,7 +5,7 @@ use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::Array;
 use arrow_schema::{DataType, Field};
 
-use super::checkpoint::parse_resumable;
+use super::checkpoint::{parse_cursor, write_cursor, Cursor, CursorPhase};
 use super::reader::{
     publish_terminal_wal_error, retained_wal_payload_bytes, send_wal_or_shutdown, WalPayloadTx,
 };
@@ -47,6 +47,7 @@ fn capture_table() -> CaptureTable {
         },
         not_null: vec![true, false, false, false],
         primary_key: vec!["id".into()],
+        row_security: false,
     }
 }
 
@@ -80,11 +81,11 @@ fn test_binding(config: &PostgresCdcConfig) -> PostgresCheckpointBinding {
         publication_oid: 16_384,
         publication_definition_sha256: "11".repeat(32),
         source_config_sha256: source_config_digest(config),
-        slot_plugin: "pgoutput".into(),
-        slot_two_phase: false,
-        slot_failover: false,
     }
 }
+
+const CLAIM_ID: &str = "0123456789abcdef";
+const CONSISTENT_POINT: Lsn = Lsn::new(0x10);
 
 fn streaming_source(output_mode: OutputMode) -> PostgresCdcSource {
     let config = source_config(output_mode);
@@ -92,6 +93,9 @@ fn streaming_source(output_mode: OutputMode) -> PostgresCdcSource {
     let layout = bind_layout(&config, &schema, &["id".into()], &capture_table()).unwrap();
     let mut source = PostgresCdcSource::new(config, None);
     source.checkpoint_binding = Some(test_binding(&source.config));
+    source.claim = SlotClaim::parse(&source.config.slot_name, CLAIM_ID);
+    source.incarnation = "89abcdef".into();
+    source.consistent_point = Some(CONSISTENT_POINT);
     source.open_rows = Some(RowBuilder::new(&layout));
     source.layout = Some(layout);
     source.relation = Some(capture_table().relation);
@@ -509,7 +513,7 @@ async fn positions_are_deterministic_wal_order_with_bound_cursors() {
     let mut previous = None;
     for row in 0..positions.len() {
         let position = positions.get(row).unwrap();
-        assert_eq!(position.partition, b"laminar_slot");
+        assert_eq!(position.partition, b"laminar_slot_0123456789abcdef");
         let key = (position.order_key.to_vec(), position.sub_offset);
         assert!(previous.as_ref().is_none_or(|previous| previous < &key));
         previous = Some(key);
@@ -546,29 +550,228 @@ async fn batch_target_never_splits_a_transaction() {
     assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/210"));
 }
 
-#[test]
-fn snapshot_cursor_is_unavailable_and_never_resumable() {
-    let mut source = streaming_source(OutputMode::Upsert);
-    let streaming = source.try_checkpoint().unwrap().unwrap();
-    let (lsn, binding) = parse_resumable(&streaming, &source.config, "test").unwrap();
-    assert_eq!(lsn, Lsn::ZERO);
-    assert_eq!(&binding, source.checkpoint_binding.as_ref().unwrap());
-
-    let snapshot = super::checkpoint::write_cursor(
+fn cursor(source: &PostgresCdcSource, phase: CursorPhase) -> SourceCheckpoint {
+    write_cursor(
         &source.config,
-        source.checkpoint_binding.as_ref(),
-        super::checkpoint::CursorPhase::Snapshot,
-    );
-    assert!(snapshot.get_offset("lsn").is_none());
-    let error = parse_resumable(&snapshot, &source.config, "test").unwrap_err();
-    assert!(error.to_string().contains("cannot be resumed"), "{error}");
+        Some((
+            source.claim.as_ref().unwrap(),
+            source.checkpoint_binding.as_ref().unwrap(),
+            phase,
+        )),
+    )
+}
 
+#[test]
+fn cursors_round_trip_every_phase_bound_to_the_exact_slot() {
+    let source = streaming_source(OutputMode::Upsert);
+    let phases = [
+        CursorPhase::Claimed,
+        CursorPhase::Snapshot {
+            consistent_point: CONSISTENT_POINT,
+        },
+        CursorPhase::Streaming {
+            consistent_point: CONSISTENT_POINT,
+            lsn: Lsn::new(0x500),
+        },
+    ];
+    for phase in phases {
+        let checkpoint = cursor(&source, phase);
+        assert_eq!(
+            parse_cursor(&checkpoint, &source.config, "test").unwrap(),
+            Cursor {
+                claim: source.claim.clone().unwrap(),
+                binding: source.checkpoint_binding.clone().unwrap(),
+                phase,
+            }
+        );
+        assert_eq!(checkpoint.get_metadata("checkpoint_version"), Some("5"));
+        assert_eq!(
+            checkpoint.get_metadata("slot"),
+            Some("laminar_slot_0123456789abcdef")
+        );
+        assert_eq!(
+            checkpoint.get_offset("lsn").is_some(),
+            matches!(phase, CursorPhase::Streaming { .. }),
+            "only a streaming cursor is slot feedback"
+        );
+    }
+    let streaming = source.try_checkpoint().unwrap().unwrap();
+    assert_eq!(
+        parse_cursor(&streaming, &source.config, "test")
+            .unwrap()
+            .phase,
+        CursorPhase::Streaming {
+            consistent_point: CONSISTENT_POINT,
+            lsn: Lsn::ZERO
+        }
+    );
+
+    let identity = source
+        .recovery_identity_options(&ConnectorConfig::new("postgres-cdc"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        identity.values().all(|value| !value.contains(CLAIM_ID)),
+        "a new claim never changes the recovery identity: {identity:?}"
+    );
+}
+
+#[test]
+fn older_formats_foreign_slots_and_drift_are_rejected() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    let streaming = cursor(
+        &source,
+        CursorPhase::Streaming {
+            consistent_point: CONSISTENT_POINT,
+            lsn: Lsn::new(0x500),
+        },
+    );
+
+    let mut v4 = SourceCheckpoint::new();
+    for (key, value) in [
+        ("connector", "postgres-cdc"),
+        ("checkpoint_version", "4"),
+        ("slot_name", "laminar_slot"),
+        ("phase", "streaming"),
+    ] {
+        v4.set_metadata(key, value);
+    }
+    let error = parse_cursor(&v4, &source.config, "test")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("version '4'"), "{error}");
+    assert!(
+        error.contains("SELECT pg_drop_replication_slot('laminar_slot')"),
+        "{error}"
+    );
+
+    for (claim, slot) in [
+        (CLAIM_ID, "laminar_slot_ffffffffffffffff"),
+        (CLAIM_ID, "other_0123456789abcdef"),
+        ("NOT-A-CLAIM", "laminar_slot_NOT-A-CLAIM"),
+    ] {
+        let mut foreign = streaming.clone();
+        foreign.set_metadata("claim", claim);
+        foreign.set_metadata("slot", slot);
+        let error = parse_cursor(&foreign, &source.config, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("SELECT pg_drop_replication_slot('{slot}')")),
+            "{error}"
+        );
+    }
+
+    let mut other_prefix = source.config.clone();
+    other_prefix.slot_name = "other_slot".into();
+    assert!(parse_cursor(&streaming, &other_prefix, "test").is_err());
     let mut other_table = source.config.clone();
     other_table.table = TableName::parse("public.other").unwrap();
-    assert!(parse_resumable(&streaming, &other_table, "test").is_err());
+    assert!(parse_cursor(&streaming, &other_table, "test").is_err());
     source.config.output_mode = OutputMode::Changelog;
-    let error = parse_resumable(&streaming, &source.config, "test").unwrap_err();
+    let error = parse_cursor(&streaming, &source.config, "test").unwrap_err();
     assert!(error.to_string().contains("drifted"), "{error}");
+}
+
+#[tokio::test]
+async fn a_claiming_source_holds_intake_and_its_commit_only_signals_creation() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.phase = Phase::Claiming(super::claim::ClaimTask::pending());
+    let feedback = source.applied_lsn.clone().unwrap();
+    let committed = |source: &PostgresCdcSource| match &source.phase {
+        Phase::Claiming(task) => task.is_committed(),
+        _ => panic!("the source left the claim phase"),
+    };
+
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+    let claimed = source
+        .try_checkpoint()
+        .unwrap()
+        .expect("a claim is a cursor");
+    assert_eq!(claimed.get_metadata("phase"), Some("claimed"));
+    assert!(claimed.get_offset("lsn").is_none());
+
+    source
+        .notify_epoch_committed(1, &SourceCheckpoint::new())
+        .await
+        .unwrap();
+    let other = SlotClaim::generate(&source.config.slot_name);
+    let superseded = write_cursor(
+        &source.config,
+        Some((
+            &other,
+            source.checkpoint_binding.as_ref().unwrap(),
+            CursorPhase::Claimed,
+        )),
+    );
+    source.notify_epoch_committed(2, &superseded).await.unwrap();
+    assert!(!committed(&source), "only this source's claim counts");
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        source.notify_epoch_committed(3, &claimed),
+    )
+    .await
+    .expect("a claim commit does no I/O")
+    .unwrap();
+    assert!(committed(&source));
+    assert_eq!(feedback.get().as_u64(), 0, "a claim is never slot feedback");
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn never_mode_streams_only_after_a_cursor_naming_the_slot_commits() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    source.phase = Phase::AwaitingStream { released: false };
+    source.applied_lsn = None;
+    source.polled_lsn = CONSISTENT_POINT;
+    let released = |source: &PostgresCdcSource| match source.phase {
+        Phase::AwaitingStream { released } => released,
+        _ => panic!("the source left the stream gate"),
+    };
+
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+    let held = source.try_checkpoint().unwrap().expect("a cursor");
+    assert_eq!(
+        parse_cursor(&held, &source.config, "test").unwrap().phase,
+        CursorPhase::Streaming {
+            consistent_point: CONSISTENT_POINT,
+            lsn: CONSISTENT_POINT
+        },
+        "the held cursor resumes the slot from its consistent point"
+    );
+    source
+        .notify_epoch_committed(1, &cursor(&source, CursorPhase::Claimed))
+        .await
+        .unwrap();
+    assert!(!released(&source), "a committed claim is not enough");
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        source.notify_epoch_committed(2, &held),
+    )
+    .await
+    .expect("opening the gate does no I/O")
+    .unwrap();
+    assert!(released(&source));
+    assert!(
+        source.applied_lsn.is_none(),
+        "opening the gate is not slot feedback"
+    );
+}
+
+#[tokio::test]
+async fn a_snapshot_cursor_is_never_slot_feedback() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    let feedback = source.applied_lsn.clone().unwrap();
+    let snapshot = cursor(
+        &source,
+        CursorPhase::Snapshot {
+            consistent_point: CONSISTENT_POINT,
+        },
+    );
+    source.notify_epoch_committed(1, &snapshot).await.unwrap();
+    assert_eq!(feedback.get().as_u64(), 0);
 }
 
 // ── Bounded buffering ──
@@ -753,10 +956,12 @@ async fn keepalives_advance_the_cursor_only_when_nothing_is_in_flight() {
 // ── Durable feedback ──
 
 fn committed_cursor(source: &PostgresCdcSource, lsn: u64) -> SourceCheckpoint {
-    super::checkpoint::write_cursor(
-        &source.config,
-        source.checkpoint_binding.as_ref(),
-        super::checkpoint::CursorPhase::Streaming(Lsn::new(lsn)),
+    cursor(
+        source,
+        CursorPhase::Streaming {
+            consistent_point: CONSISTENT_POINT,
+            lsn: Lsn::new(lsn),
+        },
     )
 }
 
@@ -816,10 +1021,11 @@ async fn feedback_never_passes_the_polled_cursor_or_a_drifted_binding() {
         .unwrap_err();
     assert!(error.to_string().contains("drifted"), "{error}");
 
-    let snapshot = super::checkpoint::write_cursor(
-        &source.config,
-        source.checkpoint_binding.as_ref(),
-        super::checkpoint::CursorPhase::Snapshot,
+    let snapshot = cursor(
+        &source,
+        CursorPhase::Snapshot {
+            consistent_point: CONSISTENT_POINT,
+        },
     );
     source.notify_epoch_committed(1, &snapshot).await.unwrap();
     assert_eq!(

@@ -48,9 +48,9 @@ pub(super) async fn resolve(
 ) -> Result<SchemaBinding, ConnectorError> {
     let parsed = PostgresCdcConfig::from_config(config)?;
     let declared = declared_schema(config, explicit)?;
-    let connection = postgres_io::connect(&parsed, guard).await?;
+    let connection = postgres_io::connect(&parsed, "laminar", guard).await?;
     let inspected = async {
-        let source = postgres_io::inspect_source(connection.client(), &parsed).await?;
+        let source = postgres_io::inspect_source(connection.client(), &parsed, None).await?;
         let table = postgres_io::inspect_capture_table(connection.client(), &parsed).await?;
         Ok::<_, ConnectorError>((source, table))
     }
@@ -274,6 +274,7 @@ mod tests {
             },
             not_null: vec![true, true, false, false],
             primary_key: vec!["id".into()],
+            row_security: false,
         }
     }
 

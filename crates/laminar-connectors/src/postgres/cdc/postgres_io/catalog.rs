@@ -16,9 +16,12 @@ pub(crate) struct CaptureTable {
     pub(crate) not_null: Vec<bool>,
     /// Primary-key column names in attribute order.
     pub(crate) primary_key: Vec<String>,
+    /// Row-level security filters what this role reads from the table, which logical
+    /// replication does not.
+    pub(crate) row_security: bool,
 }
 
-async fn query<T>(
+pub(super) async fn query<T>(
     future: impl std::future::Future<Output = Result<T, tokio_postgres::Error>>,
     context: &str,
 ) -> Result<T, ConnectorError> {
@@ -44,8 +47,32 @@ pub(crate) async fn inspect_capture_table(
     config: &PostgresCdcConfig,
 ) -> Result<CaptureTable, ConnectorError> {
     let published = published_columns(client, &config.publication, &config.table).await?;
-    let relation_id = full_identity_table(client, &config.table).await?;
-    read_columns(client, &config.table, relation_id, &published).await
+    let (relation_id, row_security) = full_identity_table(client, &config.table).await?;
+    let mut capture = read_columns(client, &config.table, relation_id, &published).await?;
+    capture.row_security = row_security;
+    Ok(capture)
+}
+
+/// The `columns` of relation `relation_id` this role cannot `SELECT`.
+///
+/// # Errors
+///
+/// Returns an error when the privilege query fails.
+pub(crate) async fn unreadable_columns(
+    client: &tokio_postgres::Client,
+    relation_id: u32,
+    columns: &[String],
+) -> Result<Vec<String>, ConnectorError> {
+    let rows = query(
+        client.query(
+            "SELECT name FROM unnest($2::text[]) AS name \
+             WHERE NOT pg_catalog.has_column_privilege($1::oid, name, 'SELECT')",
+            &[&relation_id, &columns],
+        ),
+        "query PostgreSQL column privileges",
+    )
+    .await?;
+    Ok(rows.iter().map(|row| row.get(0)).collect())
 }
 
 /// The columns `publication` publishes for `table`, its only member.
@@ -109,14 +136,16 @@ async fn published_columns(
     Ok(member.get(3))
 }
 
-/// The OID of `table`, which must be an ordinary table with `REPLICA IDENTITY FULL`.
+/// The OID of `table`, which must be an ordinary table with `REPLICA IDENTITY FULL`, and whether
+/// row-level security applies to this role's reads of it.
 async fn full_identity_table(
     client: &tokio_postgres::Client,
     table: &TableName,
-) -> Result<u32, ConnectorError> {
+) -> Result<(u32, bool), ConnectorError> {
     let row = query(
         client.query_opt(
-            "SELECT c.oid, c.relkind::text, c.relreplident::text \
+            "SELECT c.oid, c.relkind::text, c.relreplident::text, \
+                    pg_catalog.row_security_active(c.oid) \
              FROM pg_catalog.pg_class AS c \
              JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
              WHERE n.nspname = $1 AND c.relname = $2",
@@ -143,7 +172,7 @@ async fn full_identity_table(
              ALTER TABLE {table} REPLICA IDENTITY FULL"
         )));
     }
-    Ok(row.get(0))
+    Ok((row.get(0), row.get(3)))
 }
 
 /// The published columns of the table in attribute order, with nullability and primary key.
@@ -183,6 +212,7 @@ async fn read_columns(
         },
         not_null: Vec::with_capacity(columns.len()),
         primary_key: Vec::new(),
+        row_security: false,
     };
     for column in &columns {
         let name: String = column.get(0);

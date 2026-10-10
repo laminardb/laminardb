@@ -261,15 +261,16 @@ async fn totals(client: &tokio_postgres::Client, query: &str) -> Totals {
         .unwrap_or_default()
 }
 
-/// Bytes of WAL each slot still retains behind the server's current position.
+/// Bytes of WAL the slots under each `slot.name` prefix, orphans included, still retain behind
+/// the server's current position; `-1` before a slot exists.
 async fn retained_wal(client: &tokio_postgres::Client, slots: [&str; 2]) -> Vec<i64> {
     let mut retained = Vec::new();
     for slot in slots {
         let row = client
             .query_one(
-                "SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), -1)::bigint \
-                 FROM pg_replication_slots WHERE slot_name = $1",
-                &[&slot],
+                "SELECT COALESCE(MAX(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)), -1)::bigint \
+                 FROM pg_replication_slots WHERE starts_with(slot_name::text, $1)",
+                &[&format!("{slot}_")],
             )
             .await
             .unwrap();
@@ -415,7 +416,11 @@ async fn postgres_cdc_survives_repeated_hard_kills_under_sustained_writes() {
     );
     for slot in slots {
         let _ = client
-            .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+            .execute(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                 WHERE starts_with(slot_name::text, $1) AND NOT active",
+                &[&format!("{slot}_")],
+            )
             .await;
     }
 }

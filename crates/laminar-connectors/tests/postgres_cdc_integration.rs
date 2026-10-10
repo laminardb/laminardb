@@ -66,7 +66,8 @@ async fn admin() -> Option<Client> {
     }
 }
 
-/// One isolated table, publication, and slot.
+/// One isolated table, publication, and slot prefix. Dropping it ends sessions on and drops every
+/// slot under the prefix, so a failed test leaks none.
 struct Fixture {
     admin: Client,
     table: String,
@@ -86,6 +87,9 @@ fn unique_id() -> String {
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
 }
+
+const PREFIX_SLOTS: &str = "SELECT slot_name::text, confirmed_flush_lsn::text, active \
+     FROM pg_replication_slots WHERE starts_with(slot_name::text, $1)";
 
 impl Fixture {
     async fn new(columns: &str) -> Option<Self> {
@@ -145,19 +149,25 @@ impl Fixture {
         config
     }
 
-    async fn slot(&self) -> Option<(Option<Lsn>, bool)> {
+    /// Slots under this fixture's `slot.name` prefix: confirmed position and whether active.
+    async fn slots(&self) -> BTreeMap<String, (Option<Lsn>, bool)> {
         self.admin
-            .query_opt(
-                "SELECT confirmed_flush_lsn::text, active FROM pg_replication_slots \
-                 WHERE slot_name = $1",
-                &[&self.slot],
-            )
+            .query(PREFIX_SLOTS, &[&format!("{}_", self.slot)])
             .await
             .unwrap()
+            .into_iter()
             .map(|row| {
-                let lsn: Option<String> = row.get(0);
-                (lsn.map(|lsn| lsn.parse().unwrap()), row.get(1))
+                let lsn: Option<String> = row.get(1);
+                (
+                    row.get(0),
+                    (lsn.map(|lsn| lsn.parse().unwrap()), row.get(2)),
+                )
             })
+            .collect()
+    }
+
+    async fn slot(&self, name: &str) -> Option<(Option<Lsn>, bool)> {
+        self.slots().await.remove(name)
     }
 
     async fn current_wal_lsn(&self) -> Lsn {
@@ -169,25 +179,60 @@ impl Fixture {
             .get(0);
         lsn.parse().unwrap()
     }
+}
 
-    async fn drop_slot(&self) {
-        timeout(WAIT, async {
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let prefix = format!("{}_", self.slot);
+        let _ = std::thread::spawn(move || drop_test_slots(&prefix)).join();
+    }
+}
+
+/// Test cleanup only: end every session on, then drop, every slot whose name starts with
+/// `prefix`.
+fn drop_test_slots(prefix: &str) {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    runtime.block_on(async {
+        let Some(admin) = admin().await else {
+            return;
+        };
+        let _ = timeout(WAIT, async {
             loop {
-                match self.slot().await {
-                    None => return,
-                    Some((_, false)) => {
-                        let _ = self
-                            .admin
-                            .execute("SELECT pg_drop_replication_slot($1)", &[&self.slot])
-                            .await;
-                    }
-                    Some((_, true)) => sleep(Duration::from_millis(50)).await,
+                let _ = admin
+                    .execute(
+                        "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
+                         WHERE starts_with(slot_name::text, $1) AND active_pid IS NOT NULL",
+                        &[&prefix],
+                    )
+                    .await;
+                let _ = admin
+                    .execute(
+                        "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
+                         WHERE starts_with(slot_name::text, $1) AND NOT active",
+                        &[&prefix],
+                    )
+                    .await;
+                let remaining: i64 = admin
+                    .query_one(
+                        "SELECT count(*) FROM pg_replication_slots \
+                         WHERE starts_with(slot_name::text, $1)",
+                        &[&prefix],
+                    )
+                    .await
+                    .map_or(1, |row| row.get(0));
+                if remaining == 0 {
+                    return;
                 }
+                sleep(Duration::from_millis(50)).await;
             }
         })
-        .await
-        .expect("slot must become droppable");
-    }
+        .await;
+    });
 }
 
 fn orders_schema() -> SchemaRef {
@@ -221,9 +266,55 @@ fn resume(config: &ConnectorConfig, checkpoint: SourceCheckpoint) -> SourceStart
     .unwrap()
 }
 
+fn phase(cursor: &SourceCheckpoint) -> &str {
+    cursor.get_metadata("phase").unwrap_or_default()
+}
+
+fn slot_of(cursor: &SourceCheckpoint) -> String {
+    cursor.get_metadata("slot").expect("slot").to_string()
+}
+
+/// Commit cursors as the engine does until the source has its slot and a committed cursor
+/// naming it has opened its snapshot or stream gate. No row may arrive before.
+async fn commit_until_ready(source: &mut PostgresCdcSource) {
+    timeout(WAIT, async {
+        loop {
+            let cursor = source.try_checkpoint().unwrap().expect("a cursor");
+            source.notify_epoch_committed(1, &cursor).await.unwrap();
+            if phase(&cursor) != "claimed" {
+                return;
+            }
+            assert!(
+                source.poll_batch(64).await.unwrap().is_none(),
+                "no row before the slot exists"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the claimed slot was not installed");
+}
+
+/// Poll until the cursor reaches `wanted` without committing it, as when the process dies first.
+async fn poll_until_phase(source: &mut PostgresCdcSource, wanted: &str) -> SourceCheckpoint {
+    timeout(WAIT, async {
+        loop {
+            assert!(source.poll_batch(64).await.unwrap().is_none());
+            let cursor = source.try_checkpoint().unwrap().expect("a cursor");
+            if phase(&cursor) == wanted {
+                return cursor;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("phase not reached")
+}
+
 async fn started(request: SourceStart) -> PostgresCdcSource {
     let mut source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
     source.start(request).await.expect("source start");
+    commit_until_ready(&mut source).await;
     source
 }
 
@@ -343,7 +434,6 @@ async fn snapshot_hands_off_to_wal_without_gap_or_overlap() {
     assert!(mirror.contains_key(&11_901) && !mirror.contains_key(&1901));
     assert!(source.try_checkpoint().unwrap().is_some());
     source.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -374,7 +464,6 @@ async fn changes_from_now_skip_existing_rows() {
     );
     assert_eq!(mirror[&2], (Some("new".into()), Some(2)));
     source.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -392,9 +481,10 @@ async fn committed_cursor_resumes_and_feedback_advances_the_slot() {
         .await
         .expect("cursor");
     let committed: Lsn = cursor.get_offset("lsn").unwrap().parse().unwrap();
+    let slot = slot_of(&cursor);
     source.notify_epoch_committed(1, &cursor).await.unwrap();
     timeout(WAIT, async {
-        while fixture.slot().await.and_then(|slot| slot.0) < Some(committed) {
+        while fixture.slot(&slot).await.and_then(|slot| slot.0) < Some(committed) {
             sleep(Duration::from_millis(50)).await;
         }
     })
@@ -419,7 +509,6 @@ async fn committed_cursor_resumes_and_feedback_advances_the_slot() {
         "committed rows are not replayed"
     );
     resumed.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -446,16 +535,16 @@ async fn durable_feedback_reaches_postgres_while_intake_is_blocked() {
         ))
         .await;
     sleep(Duration::from_millis(500)).await;
+    let slot = slot_of(&cursor);
     source.notify_epoch_committed(1, &cursor).await.unwrap();
     timeout(WAIT, async {
-        while fixture.slot().await.and_then(|slot| slot.0) < Some(committed) {
+        while fixture.slot(&slot).await.and_then(|slot| slot.0) < Some(committed) {
             sleep(Duration::from_millis(50)).await;
         }
     })
     .await
     .expect("feedback must not wait for the blocked reader");
     source.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -504,9 +593,10 @@ async fn idle_table_cursor_follows_keepalives_past_other_tables_writes() {
     .await
     .expect("an idle source's cursor must pass the other table's writes");
     let committed: Lsn = cursor.get_offset("lsn").unwrap().parse().unwrap();
+    let slot = slot_of(&cursor);
     source.notify_epoch_committed(1, &cursor).await.unwrap();
     timeout(WAIT, async {
-        while fixture.slot().await.and_then(|slot| slot.0) < Some(committed) {
+        while fixture.slot(&slot).await.and_then(|slot| slot.0) < Some(committed) {
             sleep(Duration::from_millis(50)).await;
         }
     })
@@ -547,11 +637,10 @@ async fn idle_table_cursor_follows_keepalives_past_other_tables_writes() {
         "each change after the cursor arrives once"
     );
     resumed.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
-async fn existing_slot_and_interrupted_snapshot_fail_closed() {
+async fn fresh_starts_leave_existing_slots_alone_and_an_interrupted_snapshot_fails_closed() {
     let Some(fixture) = Fixture::new(ORDERS).await else {
         return;
     };
@@ -567,24 +656,33 @@ async fn existing_slot_and_interrupted_snapshot_fail_closed() {
     let Some(SourceBatchCursor::Complete(snapshot_cursor)) = batch.take_cursor() else {
         panic!("snapshot rows carry a cursor");
     };
+    assert_eq!(phase(&snapshot_cursor), "snapshot");
     source.close().await.unwrap();
-    let slot_before = fixture.slot().await.expect("the created slot is kept");
+    let slot = slot_of(&snapshot_cursor);
+    let slot_before = fixture.slot(&slot).await.expect("the created slot is kept");
 
-    let mut restarted = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
-    let error = restarted.start(start(&config)).await.unwrap_err();
-    assert!(error.to_string().contains("already exists"), "{error}");
-    assert!(
-        error.to_string().contains("pg_drop_replication_slot"),
-        "{error}"
-    );
+    let registry = prometheus::Registry::new();
+    let mut fresh = PostgresCdcSource::new(PostgresCdcConfig::default(), Some(&registry));
+    fresh
+        .start(start(&config))
+        .await
+        .expect("a fresh start claims a new slot name");
+    assert_ne!(slot_of(&fresh.try_checkpoint().unwrap().unwrap()), slot);
+    assert_eq!(orphaned_slots(&registry), "postgres_cdc_orphaned_slots 1");
+    fresh.close().await.unwrap();
+
     let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
     let error = resumed
         .start(resume(&config, snapshot_cursor))
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("cannot be resumed"), "{error}");
-    assert_eq!(fixture.slot().await.map(|slot| slot.0), Some(slot_before.0));
-    fixture.drop_slot().await;
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot be resumed"), "{error}");
+    assert!(
+        error.contains(&format!("SELECT pg_drop_replication_slot('{slot}')")),
+        "{error}"
+    );
+    assert_eq!(fixture.slot(&slot).await, Some(slot_before));
 }
 
 #[tokio::test]
@@ -650,7 +748,7 @@ async fn contract_violations_fail_before_creating_a_slot() {
         let error = source.start(start(&config)).await.unwrap_err();
         assert!(error.to_string().contains(expected), "{expected}: {error}");
         assert!(
-            fixture.slot().await.is_none(),
+            fixture.slots().await.is_empty(),
             "{expected}: no slot may be created"
         );
     }
@@ -676,7 +774,6 @@ async fn unchanged_toast_values_and_nulls_survive_real_wal() {
     poll_until(&mut source, &mut mirror, |mirror| *mirror == expected).await;
     assert_eq!(mirror[&1].0.as_ref().map(String::len), Some(64_000));
     source.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -722,7 +819,6 @@ async fn column_change_stops_intake_at_the_first_change_after_it() {
     );
     assert!(mirror.contains_key(&1) && !mirror.contains_key(&2));
     source.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -750,7 +846,6 @@ async fn truncate_stops_intake_before_feedback() {
     .expect("TRUNCATE must stop the source");
     assert!(error.to_string().contains("TRUNCATE"), "{error}");
     source.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -846,7 +941,6 @@ async fn snapshot_and_wal_decode_every_supported_type_identically() {
         "timestamptz is the UTC instant"
     );
     source.close().await.unwrap();
-    fixture.drop_slot().await;
 }
 
 #[tokio::test]
@@ -868,7 +962,442 @@ async fn resume_rejects_publication_drift() {
     let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
     let error = resumed.start(resume(&config, cursor)).await.unwrap_err();
     assert!(error.to_string().contains("drifted"), "{error}");
-    fixture.drop_slot().await;
+}
+
+/// The orphan gauge's exposition line.
+fn orphaned_slots(registry: &prometheus::Registry) -> String {
+    use prometheus::Encoder;
+    let mut text = Vec::new();
+    prometheus::TextEncoder::new()
+        .encode(&registry.gather(), &mut text)
+        .unwrap();
+    String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .find(|line| line.starts_with("postgres_cdc_orphaned_slots "))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Hold `slot` with a replication session announcing `application_name`.
+async fn hold_slot(
+    fixture: &Fixture,
+    slot: &str,
+    application_name: &str,
+) -> pgwire_replication::ReplicationClient {
+    let holder =
+        pgwire_replication::ReplicationClient::connect(pgwire_replication::ReplicationConfig {
+            host: "127.0.0.1".into(),
+            port: port(),
+            user: "laminar".into(),
+            password: PASSWORD.into(),
+            database: "cdc".into(),
+            slot: slot.into(),
+            publication: fixture.publication.clone(),
+            application_name: application_name.into(),
+            ..pgwire_replication::ReplicationConfig::default()
+        })
+        .await
+        .expect("hold the slot");
+    assert_eq!(fixture.slot(slot).await.map(|slot| slot.1), Some(true));
+    holder
+}
+
+/// Ids delivered by `source` until `last` arrives, in delivery order.
+async fn delivered_until(source: &mut PostgresCdcSource, last: i64) -> Vec<i64> {
+    let mut delivered = Vec::new();
+    timeout(WAIT, async {
+        while !delivered.contains(&last) {
+            match source.poll_batch(64).await.expect("poll") {
+                Some(batch) => delivered.extend(
+                    batch
+                        .records
+                        .column(0)
+                        .as_primitive::<Int64Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                ),
+                None => sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the change must arrive");
+    delivered
+}
+
+#[tokio::test]
+async fn the_slot_follows_its_committed_claim_and_rows_follow_the_committed_snapshot_cursor() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} SELECT g, 'seed', g::int FROM generate_series(1, 50) g",
+            fixture.table
+        ))
+        .await;
+    let config = fixture.config(&orders_schema(), &["id"], &[]);
+    let mut source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    source.start(start(&config)).await.unwrap();
+    let claimed = source.try_checkpoint().unwrap().expect("a claim");
+    assert_eq!(phase(&claimed), "claimed");
+    assert!(claimed.get_offset("lsn").is_none());
+    let slot = slot_of(&claimed);
+    assert!(
+        slot.len() == fixture.slot.len() + 17 && slot.starts_with(&format!("{}_", fixture.slot)),
+        "{slot}"
+    );
+    for _ in 0..20 {
+        assert!(source.poll_batch(64).await.unwrap().is_none());
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        fixture.slots().await.is_empty(),
+        "no slot before the claim commits"
+    );
+
+    source.notify_epoch_committed(1, &claimed).await.unwrap();
+    let snapshot = poll_until_phase(&mut source, "snapshot").await;
+    assert_eq!(slot_of(&snapshot), slot);
+    assert_eq!(
+        fixture.slots().await.into_keys().collect::<Vec<_>>(),
+        std::slice::from_ref(&slot)
+    );
+    for _ in 0..20 {
+        assert!(
+            source.poll_batch(64).await.unwrap().is_none(),
+            "no snapshot row before a cursor naming the slot commits"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    source.notify_epoch_committed(2, &snapshot).await.unwrap();
+    let mut mirror = Mirror::new();
+    drain_to(&mut source, &mut mirror, &fixture).await;
+    assert_eq!(mirror.len(), 50);
+    source.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_claim_that_committed_before_a_crash_creates_its_slot_on_restart() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut first = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    first.start(start(&config)).await.unwrap();
+    let claimed = first.try_checkpoint().unwrap().expect("a claim");
+    first.close().await.unwrap();
+    assert!(fixture.slots().await.is_empty());
+
+    let mut resumed = started(resume(&config, claimed.clone())).await;
+    assert_eq!(
+        fixture.slots().await.into_keys().collect::<Vec<_>>(),
+        [slot_of(&claimed)]
+    );
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (1, 'a', 1)", fixture.table))
+        .await;
+    assert_eq!(delivered_until(&mut resumed, 1).await, [1]);
+    resumed.close().await.unwrap();
+}
+
+/// Rows wait for a committed cursor naming the slot, so a crash before it emitted nothing, and the
+/// restart from the claim adopts the slot and streams from its consistent point exactly once.
+#[tokio::test]
+async fn never_mode_emits_nothing_before_a_cursor_naming_its_slot_commits() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut first = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    first.start(start(&config)).await.unwrap();
+    let claimed = first.try_checkpoint().unwrap().expect("a claim");
+    first.notify_epoch_committed(1, &claimed).await.unwrap();
+    let held = poll_until_phase(&mut first, "streaming").await;
+    let slot = slot_of(&claimed);
+    assert_eq!(slot_of(&held), slot);
+    fixture
+        .exec(&format!(
+            "INSERT INTO {t} VALUES (1, 'a', 1); INSERT INTO {t} VALUES (2, 'b', 2);",
+            t = fixture.table
+        ))
+        .await;
+    for _ in 0..20 {
+        assert!(
+            first.poll_batch(64).await.unwrap().is_none(),
+            "no row before a streaming cursor naming the slot commits"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        fixture.slot(&slot).await.map(|slot| slot.1),
+        Some(false),
+        "the stream is not even opened"
+    );
+    first.close().await.unwrap();
+    let (confirmed, _) = fixture.slot(&slot).await.expect("the slot is kept");
+
+    let registry = prometheus::Registry::new();
+    let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), Some(&registry));
+    resumed.start(resume(&config, claimed)).await.unwrap();
+    let cursor = resumed.try_checkpoint().unwrap().expect("a cursor");
+    assert_eq!(phase(&cursor), "streaming");
+    assert_eq!(slot_of(&cursor), slot);
+    assert_eq!(
+        cursor.get_offset("lsn"),
+        confirmed.map(|lsn| lsn.to_string()).as_deref(),
+        "the adopted slot streams from its consistent point"
+    );
+    assert!(resumed.poll_batch(64).await.unwrap().is_none());
+    resumed.notify_epoch_committed(2, &cursor).await.unwrap();
+    assert_eq!(
+        delivered_until(&mut resumed, 2).await,
+        [1, 2],
+        "each change after the consistent point arrives once"
+    );
+    assert_eq!(fixture.slots().await.len(), 1, "adopted, not replaced");
+    assert_eq!(orphaned_slots(&registry), "postgres_cdc_orphaned_slots 0");
+    resumed.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn initial_mode_restarts_from_its_claim_on_a_new_slot_and_reports_the_old_one() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} SELECT g, 'seed', g::int FROM generate_series(1, 30) g",
+            fixture.table
+        ))
+        .await;
+    let config = fixture.config(&orders_schema(), &["id"], &[]);
+    let mut first = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    first.start(start(&config)).await.unwrap();
+    let claimed = first.try_checkpoint().unwrap().expect("a claim");
+    first.notify_epoch_committed(1, &claimed).await.unwrap();
+    let old = slot_of(&poll_until_phase(&mut first, "snapshot").await);
+    // The process dies before a cursor naming the snapshot commits, so no row was emitted.
+    first.close().await.unwrap();
+
+    let registry = prometheus::Registry::new();
+    let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), Some(&registry));
+    resumed.start(resume(&config, claimed)).await.unwrap();
+    let reclaimed = resumed.try_checkpoint().unwrap().expect("a claim");
+    assert_eq!(phase(&reclaimed), "claimed");
+    let new = slot_of(&reclaimed);
+    assert_ne!(new, old);
+    assert_eq!(orphaned_slots(&registry), "postgres_cdc_orphaned_slots 1");
+
+    commit_until_ready(&mut resumed).await;
+    fixture
+        .exec(&format!(
+            "UPDATE {} SET label = 'later' WHERE id <= 5",
+            fixture.table
+        ))
+        .await;
+    let mut mirror = Mirror::new();
+    drain_to(&mut resumed, &mut mirror, &fixture).await;
+    assert_eq!(mirror.len(), 30);
+    let slots = fixture.slots().await;
+    assert!(
+        slots.contains_key(&old) && slots.contains_key(&new),
+        "the orphan is reported, never dropped: {slots:?}"
+    );
+    resumed.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stale_session_of_the_claim_is_ended_and_its_slot_adopted() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut first = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    first.start(start(&config)).await.unwrap();
+    let claimed = first.try_checkpoint().unwrap().expect("a claim");
+    commit_until_ready(&mut first).await;
+    first.close().await.unwrap();
+    let slot = slot_of(&claimed);
+    let claim = claimed.get_metadata("claim").unwrap();
+    let stale = hold_slot(&fixture, &slot, &format!("laminar:{claim}:deadbeef")).await;
+
+    let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    resumed
+        .start(resume(&config, claimed))
+        .await
+        .expect("the stale session is ended and the slot adopted");
+    assert_eq!(
+        phase(&resumed.try_checkpoint().unwrap().unwrap()),
+        "streaming"
+    );
+    commit_until_ready(&mut resumed).await;
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (1, 'a', 1)", fixture.table))
+        .await;
+    assert_eq!(delivered_until(&mut resumed, 1).await, [1]);
+    drop(stale);
+    resumed.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_slot_held_by_another_consumer_is_a_retryable_error_naming_it() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut first = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    first.start(start(&config)).await.unwrap();
+    let claimed = first.try_checkpoint().unwrap().expect("a claim");
+    commit_until_ready(&mut first).await;
+    first.close().await.unwrap();
+    let slot = slot_of(&claimed);
+    let foreign = hold_slot(&fixture, &slot, "foreign-consumer").await;
+    let pid: i32 = fixture
+        .admin
+        .query_one(
+            "SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let error = resumed.start(resume(&config, claimed)).await.unwrap_err();
+    assert!(error.is_transient(), "{error:?}");
+    let text = error.to_string();
+    for needle in [slot.as_str(), &format!("pid {pid}"), "foreign-consumer"] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
+    assert_eq!(
+        fixture.slot(&slot).await.map(|slot| slot.1),
+        Some(true),
+        "another consumer's session is never ended"
+    );
+    drop(foreign);
+}
+
+#[tokio::test]
+async fn an_unusable_claimed_slot_is_left_as_an_orphan_for_a_new_claim() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut first = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    first.start(start(&config)).await.unwrap();
+    let claimed = first.try_checkpoint().unwrap().expect("a claim");
+    first.close().await.unwrap();
+    let slot = slot_of(&claimed);
+    // LaminarDB never creates two-phase slots, so this one fails the adoption checks.
+    fixture
+        .exec(&format!(
+            "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput', false, true)"
+        ))
+        .await;
+
+    let registry = prometheus::Registry::new();
+    let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), Some(&registry));
+    resumed.start(resume(&config, claimed)).await.unwrap();
+    let reclaimed = resumed.try_checkpoint().unwrap().expect("a claim");
+    assert_eq!(phase(&reclaimed), "claimed");
+    assert_ne!(slot_of(&reclaimed), slot);
+    assert_eq!(orphaned_slots(&registry), "postgres_cdc_orphaned_slots 1");
+    commit_until_ready(&mut resumed).await;
+    assert!(
+        fixture.slots().await.contains_key(&slot),
+        "the unusable slot is never dropped"
+    );
+    resumed.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_streaming_cursor_fails_closed_naming_its_exact_slot() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut source = started(start(&config)).await;
+    let cursor = source.try_checkpoint().unwrap().expect("a cursor");
+    assert_eq!(phase(&cursor), "streaming");
+    source.close().await.unwrap();
+    let slot = slot_of(&cursor);
+    let reset = format!("SELECT pg_drop_replication_slot('{slot}')");
+
+    fixture
+        .exec(&format!(
+            "SELECT pg_drop_replication_slot('{slot}'); \
+             SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput', false, true);"
+        ))
+        .await;
+    let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let error = resumed
+        .start(resume(&config, cursor.clone()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("two_phase") && error.contains(&reset),
+        "{error}"
+    );
+
+    fixture.exec(&reset).await;
+    let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let error = resumed
+        .start(resume(&config, cursor))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("missing") && error.contains(&reset),
+        "{error}"
+    );
+}
+
+/// The initial copy must read every row and declared column that logical replication streams: a
+/// role missing a column grant, or filtered by row-level security, fails before any slot exists.
+#[tokio::test]
+async fn a_copy_that_cannot_read_every_row_and_column_fails_before_any_slot() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let role = format!("rls_{}", unique_id());
+    let table = fixture.table.as_str();
+    fixture
+        .exec(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD '{PASSWORD}'; \
+             GRANT SELECT (id, label) ON {table} TO {role};"
+        ))
+        .await;
+    let mut config = fixture.config(&orders_schema(), &["id"], &[]);
+    config.set("username", &role);
+    let mut source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let missing_column = source.start(start(&config)).await;
+    fixture
+        .exec(&format!(
+            "GRANT SELECT ON {table} TO {role}; ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;"
+        ))
+        .await;
+    let mut source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let filtered = source.start(start(&config)).await;
+    fixture
+        .exec(&format!("DROP OWNED BY {role}; DROP ROLE {role};"))
+        .await;
+
+    let error = missing_column
+        .expect_err("the copy would miss a column")
+        .to_string();
+    for needle in ["qty", table, "GRANT SELECT"] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    let error = filtered.expect_err("the copy would miss rows").to_string();
+    for needle in ["row-level security", table, "BYPASSRLS"] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    assert!(fixture.slots().await.is_empty());
 }
 
 #[tokio::test]

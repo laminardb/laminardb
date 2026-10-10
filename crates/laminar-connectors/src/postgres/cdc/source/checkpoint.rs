@@ -5,13 +5,20 @@ use crate::error::ConnectorError;
 
 use super::super::config::PostgresCdcConfig;
 use super::super::postgres_io::{source_config_digest, PostgresCheckpointBinding};
+use super::claim::{reset_instructions, SlotClaim};
 use super::Lsn;
 
 const CHECKPOINT_CONNECTOR: &str = "postgres-cdc";
-const CHECKPOINT_VERSION: &str = "4";
+const CHECKPOINT_VERSION: &str = "5";
 const PHASE_METADATA: &str = "phase";
+const PHASE_CLAIMED: &str = "claimed";
 const PHASE_SNAPSHOT: &str = "snapshot";
 const PHASE_STREAMING: &str = "streaming";
+const CLAIM_METADATA: &str = "claim";
+const SLOT_METADATA: &str = "slot";
+/// The slot key of version 4 cursors, read only to name the slot in the reset instructions.
+const V4_SLOT_METADATA: &str = "slot_name";
+const CONSISTENT_POINT_METADATA: &str = "consistent_point";
 const LSN_OFFSET: &str = "lsn";
 const SYSTEM_IDENTIFIER_METADATA: &str = "system_identifier";
 const TIMELINE_ID_METADATA: &str = "timeline_id";
@@ -19,42 +26,61 @@ const DATABASE_OID_METADATA: &str = "database_oid";
 const PUBLICATION_OID_METADATA: &str = "publication_oid";
 const PUBLICATION_DEFINITION_METADATA: &str = "publication_definition_sha256";
 const SOURCE_CONFIG_METADATA: &str = "source_config_sha256";
-const SLOT_PLUGIN_METADATA: &str = "slot_plugin";
-const SLOT_TWO_PHASE_METADATA: &str = "slot_two_phase";
-const SLOT_FAILOVER_METADATA: &str = "slot_failover";
 
 /// The source position a cursor describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CursorPhase {
-    /// Inside the initial snapshot; not resumable.
-    Snapshot,
-    /// After every transaction ending at or before this LSN.
-    Streaming(Lsn),
+    /// The slot name is claimed; the slot is created once this cursor commits. Nothing was
+    /// emitted.
+    Claimed,
+    /// Inside the initial snapshot of the slot created at `consistent_point`; not resumable.
+    Snapshot { consistent_point: Lsn },
+    /// After every transaction ending at or before `lsn` on the slot created at
+    /// `consistent_point`.
+    Streaming { consistent_point: Lsn, lsn: Lsn },
 }
 
-/// Encode a cursor bound to the exact slot, publication, and cluster identity.
+/// A committed cursor: the claim, the identity it was taken under, and the position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Cursor {
+    pub(super) claim: SlotClaim,
+    pub(super) binding: PostgresCheckpointBinding,
+    pub(super) phase: CursorPhase,
+}
+
+/// Encode a cursor bound to the exact claim, publication, and cluster identity. Without a
+/// position, only the source identity is written and the cursor cannot be resumed.
 pub(super) fn write_cursor(
     config: &PostgresCdcConfig,
-    binding: Option<&PostgresCheckpointBinding>,
-    phase: CursorPhase,
+    position: Option<(&SlotClaim, &PostgresCheckpointBinding, CursorPhase)>,
 ) -> SourceCheckpoint {
     let mut checkpoint = SourceCheckpoint::new();
-    match phase {
-        CursorPhase::Snapshot => checkpoint.set_metadata(PHASE_METADATA, PHASE_SNAPSHOT),
-        CursorPhase::Streaming(lsn) => {
-            checkpoint.set_offset(LSN_OFFSET, lsn.to_string());
-            checkpoint.set_metadata(PHASE_METADATA, PHASE_STREAMING);
-        }
-    }
     checkpoint.set_metadata("connector", CHECKPOINT_CONNECTOR);
     checkpoint.set_metadata("checkpoint_version", CHECKPOINT_VERSION);
-    checkpoint.set_metadata("slot_name", &config.slot_name);
+    checkpoint.set_metadata("slot_prefix", &config.slot_name);
     checkpoint.set_metadata("publication", &config.publication);
     checkpoint.set_metadata("database", &config.database);
     checkpoint.set_metadata("table", config.table.to_string());
-    let Some(binding) = binding else {
+    let Some((claim, binding, phase)) = position else {
         return checkpoint;
     };
+    checkpoint.set_metadata(CLAIM_METADATA, claim.id());
+    checkpoint.set_metadata(SLOT_METADATA, claim.slot());
+    match phase {
+        CursorPhase::Claimed => checkpoint.set_metadata(PHASE_METADATA, PHASE_CLAIMED),
+        CursorPhase::Snapshot { consistent_point } => {
+            checkpoint.set_metadata(PHASE_METADATA, PHASE_SNAPSHOT);
+            checkpoint.set_metadata(CONSISTENT_POINT_METADATA, consistent_point.to_string());
+        }
+        CursorPhase::Streaming {
+            consistent_point,
+            lsn,
+        } => {
+            checkpoint.set_metadata(PHASE_METADATA, PHASE_STREAMING);
+            checkpoint.set_metadata(CONSISTENT_POINT_METADATA, consistent_point.to_string());
+            checkpoint.set_offset(LSN_OFFSET, lsn.to_string());
+        }
+    }
     checkpoint.set_metadata(
         SYSTEM_IDENTIFIER_METADATA,
         binding.system_identifier.to_string(),
@@ -70,26 +96,34 @@ pub(super) fn write_cursor(
         &binding.publication_definition_sha256,
     );
     checkpoint.set_metadata(SOURCE_CONFIG_METADATA, &binding.source_config_sha256);
-    checkpoint.set_metadata(SLOT_PLUGIN_METADATA, &binding.slot_plugin);
-    checkpoint.set_metadata(SLOT_TWO_PHASE_METADATA, binding.slot_two_phase.to_string());
-    checkpoint.set_metadata(SLOT_FAILOVER_METADATA, binding.slot_failover.to_string());
     checkpoint
 }
 
-/// Parse a committed cursor into its resumable LSN and recovery identity.
+/// Parse a committed cursor.
 ///
 /// # Errors
-/// Rejects a cursor from another source, an older format, drifted configuration, or a cursor
-/// captured inside an initial snapshot, which cannot be resumed.
-pub(super) fn parse_resumable(
+/// Rejects a cursor from another source or an older format, a slot that is not the cursor's
+/// claim, and drifted configuration.
+pub(super) fn parse_cursor(
     checkpoint: &SourceCheckpoint,
     config: &PostgresCdcConfig,
     context: &str,
-) -> Result<(Lsn, PostgresCheckpointBinding), ConnectorError> {
+) -> Result<Cursor, ConnectorError> {
+    let version = required(checkpoint, "checkpoint_version", context)?;
+    if version != CHECKPOINT_VERSION {
+        let slot = checkpoint
+            .get_metadata(SLOT_METADATA)
+            .or_else(|| checkpoint.get_metadata(V4_SLOT_METADATA))
+            .unwrap_or(&config.slot_name);
+        return Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL CDC {context} has checkpoint format version '{version}'; this release \
+             resumes only version {CHECKPOINT_VERSION}: {}",
+            reset_instructions(slot)
+        )));
+    }
     for (key, expected) in [
-        ("checkpoint_version", CHECKPOINT_VERSION),
         ("connector", CHECKPOINT_CONNECTOR),
-        ("slot_name", config.slot_name.as_str()),
+        ("slot_prefix", config.slot_name.as_str()),
         ("publication", config.publication.as_str()),
         ("database", config.database.as_str()),
         ("table", config.table.to_string().as_str()),
@@ -101,31 +135,64 @@ pub(super) fn parse_resumable(
             )));
         }
     }
-    if required(checkpoint, PHASE_METADATA, context)? != PHASE_STREAMING {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "PostgreSQL CDC {context} was captured inside the initial snapshot, which cannot be \
-             resumed: drop slot '{}', clear downstream targets and this pipeline's checkpoints, \
-             and start the source again",
-            config.slot_name
-        )));
-    }
+    let claim = parse_claim(checkpoint, config, context)?;
+    let phase = match required(checkpoint, PHASE_METADATA, context)? {
+        PHASE_CLAIMED => CursorPhase::Claimed,
+        PHASE_SNAPSHOT => CursorPhase::Snapshot {
+            consistent_point: lsn(checkpoint.get_metadata(CONSISTENT_POINT_METADATA), context)?,
+        },
+        PHASE_STREAMING => CursorPhase::Streaming {
+            consistent_point: lsn(checkpoint.get_metadata(CONSISTENT_POINT_METADATA), context)?,
+            lsn: lsn(checkpoint.get_offset(LSN_OFFSET), context)?,
+        },
+        other => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "PostgreSQL CDC {context} has unknown phase '{other}'"
+            )));
+        }
+    };
     let binding = binding(checkpoint, context)?;
     if binding.source_config_sha256 != source_config_digest(config) {
         return Err(ConnectorError::ConfigurationError(format!(
             "PostgreSQL CDC {context} table or output.mode drifted from its checkpoint"
         )));
     }
-    let lsn_text = checkpoint.get_offset(LSN_OFFSET).ok_or_else(|| {
+    Ok(Cursor {
+        claim,
+        binding,
+        phase,
+    })
+}
+
+fn parse_claim(
+    checkpoint: &SourceCheckpoint,
+    config: &PostgresCdcConfig,
+    context: &str,
+) -> Result<SlotClaim, ConnectorError> {
+    let id = required(checkpoint, CLAIM_METADATA, context)?;
+    let slot = required(checkpoint, SLOT_METADATA, context)?;
+    match SlotClaim::parse(&config.slot_name, id) {
+        Some(claim) if claim.slot() == slot => Ok(claim),
+        _ => Err(ConnectorError::ConfigurationError(format!(
+            "PostgreSQL CDC {context} names slot '{slot}' with claim '{id}', which is not a \
+             slot this source creates under slot.name '{}': {}",
+            config.slot_name,
+            reset_instructions(slot)
+        ))),
+    }
+}
+
+fn lsn(value: Option<&str>, context: &str) -> Result<Lsn, ConnectorError> {
+    let text = value.ok_or_else(|| {
         ConnectorError::ConfigurationError(format!(
-            "PostgreSQL CDC {context} is missing required '{LSN_OFFSET}' offset"
+            "PostgreSQL CDC {context} is missing its slot position"
         ))
     })?;
-    let lsn = lsn_text.parse::<Lsn>().map_err(|error| {
+    text.parse::<Lsn>().map_err(|error| {
         ConnectorError::ConfigurationError(format!(
-            "invalid LSN '{lsn_text}' in PostgreSQL CDC {context}: {error}"
+            "invalid LSN '{text}' in PostgreSQL CDC {context}: {error}"
         ))
-    })?;
-    Ok((lsn, binding))
+    })
 }
 
 /// Require a live binding to equal the one a checkpoint was captured under.
@@ -136,7 +203,7 @@ pub(super) fn validate_live_binding(
 ) -> Result<(), ConnectorError> {
     if checkpoint != live {
         return Err(ConnectorError::ConfigurationError(format!(
-            "PostgreSQL CDC {context} identity drifted from the live database, publication, or replication slot (checkpoint: {checkpoint:?}; live: {live:?})"
+            "PostgreSQL CDC {context} identity drifted from the live database or publication (checkpoint: {checkpoint:?}; live: {live:?})"
         )));
     }
     Ok(())
@@ -173,20 +240,6 @@ where
     Ok(parsed)
 }
 
-fn boolean(
-    checkpoint: &SourceCheckpoint,
-    key: &str,
-    context: &str,
-) -> Result<bool, ConnectorError> {
-    match required(checkpoint, key, context)? {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        value => Err(ConnectorError::ConfigurationError(format!(
-            "PostgreSQL CDC {context} has invalid '{key}' metadata '{value}'"
-        ))),
-    }
-}
-
 fn sha256(
     checkpoint: &SourceCheckpoint,
     key: &str,
@@ -220,8 +273,5 @@ fn binding(
             context,
         )?,
         source_config_sha256: sha256(checkpoint, SOURCE_CONFIG_METADATA, context)?,
-        slot_plugin: required(checkpoint, SLOT_PLUGIN_METADATA, context)?.to_string(),
-        slot_two_phase: boolean(checkpoint, SLOT_TWO_PHASE_METADATA, context)?,
-        slot_failover: boolean(checkpoint, SLOT_FAILOVER_METADATA, context)?,
     })
 }

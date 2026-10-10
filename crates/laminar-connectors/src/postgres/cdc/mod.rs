@@ -177,7 +177,10 @@ fn postgres_cdc_config_keys() -> Vec<ConfigKeySpec> {
     vec![
         ConfigKeySpec::required("host", "PostgreSQL host address"),
         ConfigKeySpec::required("database", "Database name"),
-        ConfigKeySpec::required("slot.name", "Logical replication slot name"),
+        ConfigKeySpec::required(
+            "slot.name",
+            "Prefix (at most 46 bytes) of the replication slots the source creates",
+        ),
         ConfigKeySpec::required("publication", "Publication name"),
         ConfigKeySpec::optional("port", "PostgreSQL port", "5432"),
         ConfigKeySpec::optional("username", "Connection username", "postgres"),
