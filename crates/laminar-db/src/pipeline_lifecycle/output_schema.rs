@@ -214,11 +214,8 @@ pub(crate) async fn resolve_stream_output_schemas(
         }
 
         // Admitted full-changelog sources are changelog roots exactly like mutable join output.
-        let mut changelog_carrying: rustc_hash::FxHashSet<String> = ordered_interval_joins
-            .keys()
-            .chain(changelog_sources)
-            .cloned()
-            .collect();
+        let mut changelog_carrying: rustc_hash::FxHashSet<String> =
+            ordered_interval_joins.keys().chain(changelog_sources).cloned().collect();
 
         for reg in stream_regs.values() {
             let shape = shapes.get(&reg.name).ok_or_else(|| {
@@ -377,28 +374,7 @@ pub(crate) async fn resolve_stream_output_schemas(
                 )));
             }
         }
-        for (name, schema) in &schemas {
-            if !changelog_carrying.contains(name)
-                && schema.fields().iter().any(|field| {
-                    field
-                        .name()
-                        .eq_ignore_ascii_case(crate::aggregate_state::WEIGHT_COLUMN)
-                })
-            {
-                return Err(DbError::Pipeline(format!(
-                    "stream '{name}' is not a certified changelog producer but declares the reserved engine-owned '{}' column",
-                    crate::aggregate_state::WEIGHT_COLUMN
-                )));
-            }
-        }
-        for name in changelog_carrying
-            .iter()
-            .filter(|name| !changelog_sources.contains(*name))
-        {
-            let schema = schemas.get_mut(name).expect("resolved above");
-            *schema = advertise_changelog_schema(name, schema)?;
-        }
-
+        certify_changelog_outputs(&mut schemas, &changelog_carrying, changelog_sources)?;
         Ok(ResolvedStreamOutputs {
             schemas,
             changelog_carrying,
@@ -423,6 +399,33 @@ pub(super) struct StreamOutputShape {
     aggregate: bool,
     projection_filter: bool,
     planned_functions_immutable: bool,
+}
+
+/// Reject a reserved weight on streams that carry no changelog, and advertise the trailing weight
+/// on every changelog-carrying stream output. Changelog sources keep their declared schemas.
+fn certify_changelog_outputs(
+    schemas: &mut HashMap<String, arrow_schema::SchemaRef>,
+    changelog_carrying: &rustc_hash::FxHashSet<String>,
+    changelog_sources: &rustc_hash::FxHashSet<String>,
+) -> Result<(), DbError> {
+    let weight = crate::aggregate_state::WEIGHT_COLUMN;
+    for (name, schema) in schemas.iter() {
+        if !changelog_carrying.contains(name)
+            && schema
+                .fields()
+                .iter()
+                .any(|field| field.name().eq_ignore_ascii_case(weight))
+        {
+            return Err(DbError::Pipeline(format!(
+                "stream '{name}' is not a certified changelog producer but declares the reserved engine-owned '{weight}' column"
+            )));
+        }
+    }
+    for name in changelog_carrying.difference(changelog_sources) {
+        let schema = schemas.get_mut(name).expect("resolved above");
+        *schema = advertise_changelog_schema(name, schema)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn advertise_changelog_schema(

@@ -1,6 +1,6 @@
 //! Catalog admission of the one captured table and its publication.
 
-use super::super::config::PostgresCdcConfig;
+use super::super::config::{PostgresCdcConfig, TableName};
 use super::super::schema::RelationInfo;
 use super::super::types::PgColumn;
 use super::CONNECT_TIMEOUT;
@@ -43,13 +43,22 @@ pub(crate) async fn inspect_capture_table(
     client: &tokio_postgres::Client,
     config: &PostgresCdcConfig,
 ) -> Result<CaptureTable, ConnectorError> {
-    let publication = &config.publication;
-    let table = &config.table;
+    let published = published_columns(client, &config.publication, &config.table).await?;
+    let relation_id = full_identity_table(client, &config.table).await?;
+    read_columns(client, &config.table, relation_id, &published).await
+}
+
+/// The columns `publication` publishes for `table`, its only member.
+async fn published_columns(
+    client: &tokio_postgres::Client,
+    publication: &str,
+    table: &TableName,
+) -> Result<Vec<String>, ConnectorError> {
     let flags = query(
         client.query_opt(
             "SELECT puballtables, pubinsert, pubupdate, pubdelete, pubtruncate \
              FROM pg_catalog.pg_publication WHERE pubname = $1",
-            &[publication],
+            &[&publication],
         ),
         "query PostgreSQL publication",
     )
@@ -67,13 +76,12 @@ pub(crate) async fn inspect_capture_table(
              publish='insert, update, delete, truncate'"
         )));
     }
-
     let members = query(
         client.query(
             "SELECT schemaname::text, tablename::text, rowfilter IS NOT NULL, \
                     attnames::text[] \
              FROM pg_catalog.pg_publication_tables WHERE pubname = $1 LIMIT 2",
-            &[publication],
+            &[&publication],
         ),
         "query PostgreSQL publication tables",
     )
@@ -98,9 +106,15 @@ pub(crate) async fn inspect_capture_table(
              turn updates into inserts and deletes and are not supported"
         )));
     }
-    let published: Vec<String> = member.get(3);
+    Ok(member.get(3))
+}
 
-    let relation_row = query(
+/// The OID of `table`, which must be an ordinary table with `REPLICA IDENTITY FULL`.
+async fn full_identity_table(
+    client: &tokio_postgres::Client,
+    table: &TableName,
+) -> Result<u32, ConnectorError> {
+    let row = query(
         client.query_opt(
             "SELECT c.oid, c.relkind::text, c.relreplident::text \
              FROM pg_catalog.pg_class AS c \
@@ -114,9 +128,8 @@ pub(crate) async fn inspect_capture_table(
     .ok_or_else(|| {
         ConnectorError::ConfigurationError(format!("PostgreSQL table {table} does not exist"))
     })?;
-    let relation_id: u32 = relation_row.get(0);
-    let relkind: String = relation_row.get(1);
-    let replica_identity: String = relation_row.get(2);
+    let relkind: String = row.get(1);
+    let replica_identity: String = row.get(2);
     if relkind != "r" {
         return Err(ConnectorError::ConfigurationError(format!(
             "PostgreSQL relation {table} must be an ordinary table; partitioned tables, views, \
@@ -130,7 +143,16 @@ pub(crate) async fn inspect_capture_table(
              ALTER TABLE {table} REPLICA IDENTITY FULL"
         )));
     }
+    Ok(row.get(0))
+}
 
+/// The published columns of the table in attribute order, with nullability and primary key.
+async fn read_columns(
+    client: &tokio_postgres::Client,
+    table: &TableName,
+    relation_id: u32,
+    published: &[String],
+) -> Result<CaptureTable, ConnectorError> {
     let columns = query(
         client.query(
             "SELECT a.attname::text, a.atttypid, a.atttypmod, a.attnotnull, \

@@ -74,18 +74,23 @@ struct Fixture {
     publication: String,
 }
 
+/// A name suffix unique across test runs against the long-lived fixture.
+fn unique_id() -> String {
+    format!(
+        "{:x}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 0xffff_ffff,
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 impl Fixture {
     async fn new(columns: &str) -> Option<Self> {
         let admin = admin().await?;
-        let id = format!(
-            "{:x}_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-                % 0xffff_ffff,
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
+        let id = unique_id();
         let fixture = Self {
             admin,
             table: format!("cdc_{id}"),
@@ -301,9 +306,10 @@ async fn snapshot_hands_off_to_wal_without_gap_or_overlap() {
         .await;
     let config = fixture.config(&orders_schema(), &["id"], &[]);
     let mut source = started(start(&config)).await;
+    let inside = source.try_checkpoint().unwrap().expect("snapshot cursor");
     assert!(
-        source.try_checkpoint().unwrap().is_none(),
-        "no resumable cursor exists inside the snapshot"
+        inside.get_offset("lsn").is_none(),
+        "a cursor inside the snapshot carries no slot position"
     );
 
     // The first fetch is in flight on the imported snapshot; these changes commit after the
@@ -722,7 +728,7 @@ async fn lookup_open_requires_a_usable_single_key_unique_index() {
     let Some(client) = admin().await else {
         return;
     };
-    let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+    let suffix = unique_id();
     client
         .batch_execute(&format!(
             "CREATE TABLE lookup_unindexed_{suffix} (id BIGINT, payload TEXT); \

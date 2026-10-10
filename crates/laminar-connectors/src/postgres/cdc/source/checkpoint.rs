@@ -104,7 +104,8 @@ pub(super) fn parse_resumable(
     if required(checkpoint, PHASE_METADATA, context)? != PHASE_STREAMING {
         return Err(ConnectorError::ConfigurationError(format!(
             "PostgreSQL CDC {context} was captured inside the initial snapshot, which cannot be \
-             resumed: drop slot '{}', clear downstream targets, and start the source again",
+             resumed: drop slot '{}', clear downstream targets and this pipeline's checkpoints, \
+             and start the source again",
             config.slot_name
         )));
     }

@@ -8,9 +8,8 @@ use async_trait::async_trait;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    ConnectorTaskTracker, SourceBatch, SourceCheckpointUnavailablePolicy, SourceConnector,
-    SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
-    SourceRowPositionCapability, SourceStart, SourceTopology,
+    ConnectorTaskTracker, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
+    SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 
@@ -148,9 +147,15 @@ impl PostgresCdcSource {
         let (Some(binding), Some(relation)) = (&self.checkpoint_binding, &self.relation) else {
             return Ok(());
         };
-        super::startup::revalidate(&self.task_owner, &self.config, binding, relation).await?;
         self.next_contract_check = Some(now + CONTRACT_CHECK_INTERVAL);
-        Ok(())
+        match super::startup::revalidate(&self.task_owner, &self.config, binding, relation).await {
+            // An unreachable control plane is not drift; replication itself is still healthy.
+            Err(ConnectorError::ConnectionFailed(reason)) => {
+                tracing::warn!(%reason, "PostgreSQL CDC contract revalidation deferred");
+                Ok(())
+            }
+            checked => checked,
+        }
     }
 }
 
@@ -279,23 +284,14 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        // Checkpoints keep running during the snapshot: a barrier held for the whole copy would
+        // starve the sink flush that follows alignment. A snapshot cursor has no LSN, so it gives
+        // the slot no feedback and refuses to resume.
         write_cursor(
             &self.config,
             self.checkpoint_binding.as_ref(),
             self.current_cursor(),
         )
-    }
-
-    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
-        Ok(match self.current_cursor() {
-            CursorPhase::Snapshot => None,
-            CursorPhase::Streaming(_) => Some(self.checkpoint()),
-        })
-    }
-
-    fn checkpoint_unavailable_policy(&self) -> SourceCheckpointUnavailablePolicy {
-        // The initial snapshot is one replay unit: no checkpoint barrier may cut it.
-        SourceCheckpointUnavailablePolicy::PollToReplayBoundary
     }
 
     async fn notify_epoch_committed(

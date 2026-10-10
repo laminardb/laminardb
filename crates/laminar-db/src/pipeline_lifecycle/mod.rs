@@ -324,7 +324,6 @@ use supervision::{
 mod authority;
 mod cluster_startup;
 mod direct_mutation_routes;
-pub(crate) use direct_mutation_routes::MutationRoutes;
 mod operator_graph;
 mod reference_tables;
 mod runtime_configuration;

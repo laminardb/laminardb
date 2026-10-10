@@ -13,9 +13,8 @@ use super::*;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
-    source_mutations, source_row_positions, SourceBatch, SourceCheckpointUnavailablePolicy,
-    SourceConnector, SourceConsistency, SourceInputMode, SourceRowPositionCapability,
-    SourceTopology,
+    source_mutations, source_row_positions, SourceBatch, SourceConnector, SourceConsistency,
+    SourceInputMode, SourceRowPositionCapability, SourceTopology,
 };
 use crate::postgres::cdc::config::{OutputMode, TableName};
 use crate::postgres::cdc::postgres_io::{source_config_digest, CaptureTable};
@@ -244,10 +243,6 @@ fn contract_is_commit_coupled_singleton_with_ordered_positions() {
     assert_eq!(
         changelog.contract(&empty).unwrap().input_mode,
         SourceInputMode::FullChangelog
-    );
-    assert_eq!(
-        source.checkpoint_unavailable_policy(),
-        SourceCheckpointUnavailablePolicy::PollToReplayBoundary
     );
 }
 

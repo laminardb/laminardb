@@ -148,19 +148,11 @@ impl LaminarDB {
                 self.runtime_mode(),
             )
             .await?;
-        let routes = crate::pipeline_lifecycle::MutationRoutes {
-            direct: self.validate_direct_mutation_routes(
-                &source_regs,
-                &sink_regs,
-                &stream_regs,
-                self.runtime_mode(),
-            )?,
-            changelog: self.validate_changelog_source_routes(
-                &source_regs,
-                &admissions,
-                self.runtime_mode(),
-            )?,
-        };
+        let routes = self.mutation_routes(
+            (&source_regs, &sink_regs, &stream_regs),
+            &admissions,
+            self.runtime_mode(),
+        )?;
         let query_references = crate::sql_analysis::extract_table_references(query_sql);
         for input in &query_references {
             self.validate_registered_mutation_source_admission(

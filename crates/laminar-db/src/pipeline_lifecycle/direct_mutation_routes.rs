@@ -59,19 +59,11 @@ impl LaminarDB {
                 self.reject_cluster_source_sink(sink)?;
             }
         }
-        let routes = MutationRoutes {
-            direct: self.validate_direct_mutation_routes(
-                source_regs,
-                sink_regs,
-                stream_regs,
-                runtime,
-            )?,
-            changelog: self.validate_changelog_source_routes(
-                source_regs,
-                ordered_interval_admissions,
-                runtime,
-            )?,
-        };
+        let routes = self.mutation_routes(
+            (source_regs, sink_regs, stream_regs),
+            ordered_interval_admissions,
+            runtime,
+        )?;
         let mut names = source_regs.keys().collect::<Vec<_>>();
         names.sort_unstable();
         for name in names {
@@ -84,6 +76,28 @@ impl LaminarDB {
             )?;
         }
         Ok(routes)
+    }
+
+    /// The direct keyed-mutation and changelog routes the registrations admit.
+    pub(crate) fn mutation_routes(
+        &self,
+        (source_regs, sink_regs, stream_regs): Registrations<'_>,
+        ordered_interval_admissions: &OrderedIntervalAdmissions,
+        runtime: RuntimeMode,
+    ) -> Result<MutationRoutes, DbError> {
+        Ok(MutationRoutes {
+            direct: self.validate_direct_mutation_routes(
+                source_regs,
+                sink_regs,
+                stream_regs,
+                runtime,
+            )?,
+            changelog: self.validate_changelog_source_routes(
+                source_regs,
+                ordered_interval_admissions,
+                runtime,
+            )?,
+        })
     }
 
     /// Full-changelog sources admitted to the changelog route: replayable, deterministically

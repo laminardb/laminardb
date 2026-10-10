@@ -697,3 +697,141 @@ async fn non_deferrable_extra_unique_constraints_are_rejected_before_data_moves(
     assert!(error.contains("unique index"), "{error}");
     let _ = db.shutdown().await;
 }
+
+const WIDE_ROWS: usize = 6_000;
+
+/// A table whose initial snapshot takes seconds: 6,000 rows of 16 KiB.
+async fn wide_capture(client: &tokio_postgres::Client) -> Capture {
+    let capture = Capture::new(client).await;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, repeat(md5(g::text), 500), g \
+             FROM generate_series(1, {WIDE_ROWS}) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    capture
+}
+
+/// A database whose checkpoints fire every 100 ms and time out well before the wide snapshot
+/// finishes copying.
+async fn open_with_short_checkpoints(storage: &Path) -> std::sync::Arc<LaminarDB> {
+    LaminarDB::builder()
+        .storage_dir(storage)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: Some(100),
+            timeout_ms: Some(2_000),
+            ..Default::default()
+        })
+        .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .config_var("E2E_PG_PASSWORD", PASSWORD)
+        .build()
+        .await
+        .expect("open database")
+}
+
+fn wide_pipeline(capture: &Capture) -> Vec<String> {
+    vec![
+        capture.source(
+            "orders",
+            ORDER_COLUMNS,
+            ", 'max.buffered.bytes' = '1048576'",
+        ),
+        capture.upsert_sink("orders_mirror", "orders", "id"),
+    ]
+}
+
+/// Checkpoints keep committing while the snapshot copies, so a copy that outlives the
+/// checkpoint timeout neither stalls a barrier nor faults the pipeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_longer_than_the_checkpoint_timeout_completes() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = wide_capture(&client).await;
+    let storage = tempfile::tempdir().unwrap();
+    let db = open_with_short_checkpoints(storage.path()).await;
+    execute_all(&db, &wide_pipeline(&capture)).await;
+    db.start().await.expect("start");
+    client
+        .batch_execute(&format!(
+            "UPDATE {} SET qty = -qty WHERE id % 1000 = 0",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let source_rows = capture.source_rows();
+    let mirror_rows = capture.mirror_rows();
+    let expected = rows(&client, &source_rows).await;
+    let observed = eventually(
+        CONVERGE,
+        || rows(&client, &mirror_rows),
+        |rows| rows == &expected,
+    )
+    .await;
+    assert!(
+        observed == expected,
+        "mirror converged after a long snapshot"
+    );
+    assert!(db.checkpoint().await.expect("checkpoint").success);
+    client
+        .batch_execute(&format!(
+            "UPDATE {} SET qty = 0 WHERE id = 1",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let expected = rows(&client, &source_rows).await;
+    let observed = eventually(
+        CONVERGE,
+        || rows(&client, &mirror_rows),
+        |rows| rows == &expected,
+    )
+    .await;
+    assert!(
+        observed == expected,
+        "streaming continues after the long snapshot"
+    );
+    db.shutdown().await.expect("shutdown");
+    capture.drop_slot(&client).await;
+}
+
+/// An exported snapshot cannot be re-imported, so a restart inside the initial snapshot fails
+/// closed with reset guidance instead of resuming from a partial copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_inside_the_snapshot_fails_closed() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = wide_capture(&client).await;
+    let storage = tempfile::tempdir().unwrap();
+    let statements = wide_pipeline(&capture);
+    let db = open_with_short_checkpoints(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let mirror_rows = capture.mirror_rows();
+    let partial = eventually(
+        CONVERGE,
+        || rows(&client, &mirror_rows),
+        |rows| !rows.is_empty(),
+    )
+    .await;
+    assert!(
+        !partial.is_empty() && partial.len() < WIDE_ROWS,
+        "the restart lands inside the snapshot ({} mirrored rows)",
+        partial.len()
+    );
+    db.shutdown().await.expect("shutdown");
+
+    let db = reopen(storage.path(), &statements).await;
+    let error = db
+        .start()
+        .await
+        .expect_err("a snapshot-phase checkpoint is not resumable")
+        .to_string();
+    assert!(error.contains("initial snapshot"), "{error}");
+    assert!(error.contains(&capture.slot), "{error}");
+    let _ = db.shutdown().await;
+    capture.drop_slot(&client).await;
+}

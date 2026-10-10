@@ -21,7 +21,9 @@ use super::drain::snapshot_order_key;
 use super::{ConnectorState, Lsn, Phase, PostgresCdcSource};
 
 const CURSOR: &str = "laminar_cdc_snapshot";
-const INITIAL_FETCH_ROWS: usize = 64;
+/// Row widths are unknown until the first fetch, which therefore reads one row; later fetches
+/// are sized from the widest row seen.
+const INITIAL_FETCH_ROWS: usize = 1;
 const WAL_STATUS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// An open cursor over the declared columns inside the imported snapshot.

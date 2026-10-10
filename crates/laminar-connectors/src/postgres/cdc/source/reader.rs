@@ -129,6 +129,71 @@ pub(super) fn publish_terminal_wal_error(
     data_ready.notify_one();
 }
 
+type ReaderPayload = (WalPayload, Option<pgwire_replication::WireBytesGuard>);
+
+/// Map one replication event to the payload handed to `poll_batch`, or the terminal reason
+/// the stream cannot continue.
+fn reader_payload(event: pgwire_replication::ReplicationEvent) -> Result<ReaderPayload, String> {
+    use pgwire_replication::ReplicationEvent;
+
+    Ok(match event {
+        ReplicationEvent::Begin {
+            final_lsn,
+            commit_time_micros,
+            ..
+        } => (
+            WalPayload::Begin {
+                final_lsn: final_lsn.as_u64(),
+                commit_ts_us: commit_time_micros,
+            },
+            None,
+        ),
+        ReplicationEvent::Commit {
+            end_lsn,
+            commit_time_micros,
+            lsn,
+        } => (
+            WalPayload::Commit {
+                end_lsn: end_lsn.as_u64(),
+                commit_ts_us: commit_time_micros,
+                lsn: lsn.as_u64(),
+            },
+            None,
+        ),
+        ReplicationEvent::XLogData {
+            wal_end,
+            data,
+            wire_bytes,
+            ..
+        } => (
+            WalPayload::XLogData {
+                wal_end: wal_end.as_u64(),
+                data,
+            },
+            Some(wire_bytes),
+        ),
+        ReplicationEvent::KeepAlive { wal_end, .. } => (
+            WalPayload::KeepAlive {
+                wal_end: wal_end.as_u64(),
+            },
+            None,
+        ),
+        ReplicationEvent::Message { .. } => {
+            return Err(
+                "PostgreSQL emitted a logical decoding message even though replication \
+                 was started with messages=false"
+                    .to_string(),
+            );
+        }
+        ReplicationEvent::StoppedAt { reached } => {
+            return Err(format!(
+                "PostgreSQL replication stopped unexpectedly at {reached}; no stop LSN was \
+                 configured"
+            ));
+        }
+    })
+}
+
 pub(super) async fn run_wal_reader(
     mut client: pgwire_replication::ReplicationClient,
     wal_tx: WalPayloadTx,
@@ -139,124 +204,46 @@ pub(super) async fn run_wal_reader(
     data_ready: Arc<Notify>,
     _reader_guard: crate::connector::ConnectorTaskGuard,
 ) {
-    'read: loop {
+    let terminal = loop {
         tokio::select! {
             biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    break 'read;
+                    break None;
                 }
             }
             event = client.recv() => {
-                match event {
-                    Ok(Some(event)) => {
-                        let payload = match event {
-                            pgwire_replication::ReplicationEvent::Begin {
-                                final_lsn,
-                                commit_time_micros,
-                                ..
-                            } => Some((
-                                WalPayload::Begin {
-                                    final_lsn: final_lsn.as_u64(),
-                                    commit_ts_us: commit_time_micros,
-                                },
-                                None,
-                            )),
-                            pgwire_replication::ReplicationEvent::Commit {
-                                end_lsn,
-                                commit_time_micros,
-                                lsn,
-                            } => Some((
-                                WalPayload::Commit {
-                                    end_lsn: end_lsn.as_u64(),
-                                    commit_ts_us: commit_time_micros,
-                                    lsn: lsn.as_u64(),
-                                },
-                                None,
-                            )),
-                            pgwire_replication::ReplicationEvent::XLogData {
-                                wal_end,
-                                data,
-                                wire_bytes,
-                                ..
-                            } => Some((
-                                WalPayload::XLogData {
-                                    wal_end: wal_end.as_u64(),
-                                    data,
-                                },
-                                Some(wire_bytes),
-                            )),
-                            pgwire_replication::ReplicationEvent::KeepAlive {
-                                wal_end, ..
-                            } => Some((
-                                WalPayload::KeepAlive {
-                                    wal_end: wal_end.as_u64(),
-                                },
-                                None,
-                            )),
-                            pgwire_replication::ReplicationEvent::Message { .. } => {
-                                publish_terminal_wal_error(
-                                    &terminal_error,
-                                    "PostgreSQL emitted a logical decoding message even though replication was started with messages=false"
-                                        .to_string(),
-                                    &data_ready,
-                                );
-                                break 'read;
-                            }
-                            pgwire_replication::ReplicationEvent::StoppedAt { reached } => {
-                                publish_terminal_wal_error(
-                                    &terminal_error,
-                                    format!(
-                                        "PostgreSQL replication stopped unexpectedly at {reached}; no stop LSN was configured"
-                                    ),
-                                    &data_ready,
-                                );
-                                break 'read;
-                            }
-                        };
-                        if let Some((payload, wire_bytes)) = payload {
-                            match send_wal_with_wire_guard(
-                                &wal_tx,
-                                payload,
-                                wire_bytes,
-                                &byte_budget,
-                                byte_limit,
-                                &mut shutdown_rx,
-                            )
-                            .await
-                            {
-                                Ok(true) => data_ready.notify_one(),
-                                Ok(false) => break 'read,
-                                Err(message) => {
-                                    publish_terminal_wal_error(
-                                        &terminal_error,
-                                        message,
-                                        &data_ready,
-                                    );
-                                    break 'read;
-                                }
-                            }
-                        }
-                    }
+                let (payload, wire_bytes) = match event {
+                    Ok(Some(event)) => match reader_payload(event) {
+                        Ok(payload) => payload,
+                        Err(reason) => break Some(reason),
+                    },
                     Ok(None) => {
-                        publish_terminal_wal_error(
-                            &terminal_error,
-                            "PostgreSQL replication stream ended unexpectedly".into(),
-                            &data_ready,
-                        );
-                        break 'read;
+                        break Some("PostgreSQL replication stream ended unexpectedly".into());
                     }
                     Err(error) => {
-                        publish_terminal_wal_error(
-                            &terminal_error,
-                            format!("PostgreSQL replication stream failed: {error}"),
-                            &data_ready,
-                        );
-                        break 'read;
+                        break Some(format!("PostgreSQL replication stream failed: {error}"));
                     }
+                };
+                match send_wal_with_wire_guard(
+                    &wal_tx,
+                    payload,
+                    wire_bytes,
+                    &byte_budget,
+                    byte_limit,
+                    &mut shutdown_rx,
+                )
+                .await
+                {
+                    Ok(true) => data_ready.notify_one(),
+                    Ok(false) => break None,
+                    Err(message) => break Some(message),
                 }
             }
         }
+    };
+    if let Some(message) = terminal {
+        publish_terminal_wal_error(&terminal_error, message, &data_ready);
     }
     let _ = client.shutdown().await;
 }
