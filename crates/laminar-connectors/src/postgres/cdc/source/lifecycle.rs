@@ -265,9 +265,15 @@ impl SourceConnector for PostgresCdcSource {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
         if self.state != ConnectorState::Running {
+            // Repeat the cause as a terminal error: the engine retries transient errors, and a
+            // failed source never recovers in place.
+            let actual = match (self.state, self.failure.as_deref()) {
+                (ConnectorState::Failed, Some(cause)) => format!("Failed: {cause}"),
+                (state, _) => state.to_string(),
+            };
             return Err(ConnectorError::InvalidState {
                 expected: "Running".to_string(),
-                actual: self.state.to_string(),
+                actual,
             });
         }
         match self.phase {

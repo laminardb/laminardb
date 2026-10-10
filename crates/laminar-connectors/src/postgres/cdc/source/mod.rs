@@ -72,6 +72,8 @@ struct CommittedTransaction {
 pub struct PostgresCdcSource {
     config: PostgresCdcConfig,
     state: ConnectorState,
+    /// The error that failed the source, repeated by every later poll.
+    failure: Option<String>,
     /// Declared output schema; empty until started.
     schema: SchemaRef,
     metrics: Arc<PostgresCdcMetrics>,
@@ -160,6 +162,7 @@ impl PostgresCdcSource {
         Self {
             config,
             state: ConnectorState::Created,
+            failure: None,
             schema: Arc::new(Schema::empty()),
             metrics: Arc::new(PostgresCdcMetrics::new(registry)),
             phase: Phase::Idle,
@@ -233,6 +236,7 @@ impl PostgresCdcSource {
 
     fn fail(&mut self, error: ConnectorError) -> ConnectorError {
         self.state = ConnectorState::Failed;
+        self.failure.get_or_insert_with(|| error.to_string());
         error
     }
 }

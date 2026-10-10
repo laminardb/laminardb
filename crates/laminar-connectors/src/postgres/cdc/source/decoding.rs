@@ -16,8 +16,7 @@ use super::super::schema_resolution::validate_relation;
 use super::super::typed_rows::{RowBuilder, RowLayout};
 use super::reader::logical_wal_payload_bytes;
 use super::{
-    CommittedTransaction, ConnectorState, Lsn, OpenTransaction, OwnedWalPayload, PostgresCdcSource,
-    WalPayload,
+    CommittedTransaction, Lsn, OpenTransaction, OwnedWalPayload, PostgresCdcSource, WalPayload,
 };
 use crate::postgres::cdc::config::OutputMode;
 
@@ -301,12 +300,11 @@ impl PostgresCdcSource {
             ));
         };
         if tuple.columns.len() != layout.tuple_width {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(format!(
+            return Err(self.fail(ConnectorError::ReadError(format!(
                 "PostgreSQL CDC tuple has {} columns, but the bound relation has {}",
                 tuple.columns.len(),
                 layout.tuple_width
-            )));
+            ))));
         }
         let planned = layout.planned_row_bytes(declared_text_bytes(layout, tuple, old))?;
         let (key_only, weight, mutation) = match image {
@@ -318,10 +316,9 @@ impl PostgresCdcSource {
             ConnectorError::Internal("PostgreSQL CDC row builder is missing".into())
         })?;
         if u32::try_from(rows.len()).is_err() {
-            self.state = ConnectorState::Failed;
-            return Err(ConnectorError::ReadError(
+            return Err(self.fail(ConnectorError::ReadError(
                 "PostgreSQL CDC transaction exceeds u32::MAX emitted rows".into(),
-            ));
+            )));
         }
         let appended = rows.append(
             layout,
@@ -331,8 +328,7 @@ impl PostgresCdcSource {
             planned,
         );
         if let Err(error) = appended {
-            self.state = ConnectorState::Failed;
-            return Err(error);
+            return Err(self.fail(error));
         }
         if let Some(mutation) = mutation {
             self.open_mutations.push(mutation);
@@ -450,8 +446,7 @@ impl PostgresCdcSource {
                 .map_err(|error| ConnectorError::ReadError(format!("pgoutput decode: {error}")))
                 .and_then(|message| self.apply_message(message));
             if let Err(error) = result {
-                self.state = ConnectorState::Failed;
-                return Err(error);
+                return Err(self.fail(error));
             }
         }
         Ok(())

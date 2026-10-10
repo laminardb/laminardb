@@ -18,7 +18,7 @@ use super::super::postgres_io::{self, ControlConnection};
 use super::super::typed_rows::{RowBuilder, RowLayout};
 use super::checkpoint::{write_cursor, CursorPhase};
 use super::drain::snapshot_order_key;
-use super::{ConnectorState, Lsn, Phase, PostgresCdcSource};
+use super::{Lsn, Phase, PostgresCdcSource};
 
 const CURSOR: &str = "laminar_cdc_snapshot";
 /// Row widths are unknown until the first fetch, which therefore reads one row; later fetches
@@ -207,7 +207,7 @@ impl PostgresCdcSource {
         match fetched {
             Ok(Some((records, first_ordinal))) => self
                 .snapshot_batch(records, first_ordinal)
-                .inspect_err(|_| self.state = ConnectorState::Failed)
+                .map_err(|error| self.fail(error))
                 .map(Some),
             Ok(None) => {
                 self.complete_snapshot().await?;

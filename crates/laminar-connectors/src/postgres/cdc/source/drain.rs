@@ -6,7 +6,7 @@ use crate::connector::{SourceBatch, SourceMutation, SourceRowPositions};
 use crate::error::ConnectorError;
 
 use super::checkpoint::{write_cursor, CursorPhase};
-use super::{CommittedTransaction, ConnectorState, Lsn, PostgresCdcSource};
+use super::{CommittedTransaction, Lsn, PostgresCdcSource};
 use crate::postgres::cdc::config::OutputMode;
 
 /// Order-key tag of snapshot rows; all of them sort before every streamed transaction.
@@ -79,7 +79,7 @@ impl PostgresCdcSource {
         };
         self.polled_lsn = last.end_lsn;
         let batch = self.positioned_batch(&selected);
-        batch.inspect_err(|_| self.state = ConnectorState::Failed)
+        batch.map_err(|error| self.fail(error))
     }
 
     fn positioned_batch(

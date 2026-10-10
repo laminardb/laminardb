@@ -841,4 +841,11 @@ async fn reader_terminal_error_fails_the_source() {
     let error = source.poll_batch(10).await.unwrap_err();
     assert!(error.to_string().contains("stream failed"));
     assert_eq!(source.state, ConnectorState::Failed);
+
+    let repeated = source.poll_batch(10).await.unwrap_err();
+    assert!(
+        matches!(repeated, ConnectorError::InvalidState { .. }) && !repeated.is_transient(),
+        "{repeated:?}"
+    );
+    assert!(repeated.to_string().contains("stream failed"), "{repeated}");
 }
