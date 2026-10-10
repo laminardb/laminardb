@@ -7,6 +7,7 @@
 # crates/laminar-connectors/tests/postgres_cdc_integration.rs and
 # crates/laminar-db/tests/postgres_cdc_e2e.rs (15532 = PostgreSQL 17, 15533 = PostgreSQL 18).
 # max_slot_wal_keep_size bounds retained WAL so a slot test can observe invalidation.
+# track_commit_timestamp lets the latency benchmark compare source and sink commit times on one clock.
 
 x-postgres-cdc: &postgres-cdc
   environment:
@@ -23,6 +24,8 @@ x-postgres-cdc: &postgres-cdc
     - max_wal_senders=32
     - -c
     - max_slot_wal_keep_size=1GB
+    - -c
+    - track_commit_timestamp=on
   healthcheck:
     test: ["CMD", "pg_isready", "-U", "laminar", "-d", "cdc"]
     interval: 2s

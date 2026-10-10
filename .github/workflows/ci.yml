@@ -169,26 +169,40 @@ jobs:
   # PostgreSQL CDC Compatibility
   # ============================================
   postgres-cdc-integration:
-    name: PostgreSQL CDC (PostgreSQL ${{ matrix.postgres }})
+    name: PostgreSQL CDC (PostgreSQL ${{ matrix.postgres.version }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        postgres: ["17", "18"]
+        postgres:
+          - { version: "17", port: "15532" }
+          - { version: "18", port: "15533" }
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      LAMINAR_TEST_POSTGRES_PORT: ${{ matrix.postgres.port }}
+      LAMINAR_REQUIRE_POSTGRES_CDC: "1"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: postgres-cdc-${{ matrix.postgres }}
+          key: postgres-cdc-${{ matrix.postgres.version }}
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
-      - name: Run PostgreSQL CDC integration tests
-        run: cargo test -p laminar-connectors --no-default-features --features postgres-cdc --test postgres_cdc_integration -- --test-threads=1 --nocapture
+      - name: Start PostgreSQL ${{ matrix.postgres.version }}
+        run: docker compose -f tests/docker/postgres-cdc-compose.yml up -d --wait postgres-${{ matrix.postgres.version }}
+      - name: Connector replication, snapshot, and admission tests
+        run: cargo test -p laminar-connectors --no-default-features --features postgres-cdc --test postgres_cdc_integration --test cdc_admission -- --test-threads=1
+      - name: PostgreSQL schema contracts
+        run: cargo test -p laminar-connectors --no-default-features --features postgres-cdc,postgres-sink --test schema_postgres_integration -- --ignored --test-threads=1
         env:
-          LAMINAR_TEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          LAMINAR_SCHEMA_TEST_PG: host=127.0.0.1 port=${{ matrix.postgres.port }} user=laminar password=laminar-test-secret dbname=cdc
+      - name: Direct PostgreSQL pipeline end-to-end tests
+        run: cargo test -p laminar-db --no-default-features --features postgres-cdc,postgres-sink --test postgres_cdc_e2e -- --test-threads=1
+      - name: Fixture logs
+        if: failure()
+        run: docker compose -f tests/docker/postgres-cdc-compose.yml logs --tail=200
 
   # ============================================
   # MongoDB CDC direct pipelines
