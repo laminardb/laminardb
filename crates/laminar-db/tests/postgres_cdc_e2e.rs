@@ -182,15 +182,10 @@ impl Capture {
     }
 
     fn upsert_sink(&self, name: &str, input: &str, key: &str) -> String {
-        self.upsert_sink_with(name, input, key, "")
-    }
-
-    fn upsert_sink_with(&self, name: &str, input: &str, key: &str, options: &str) -> String {
         format!(
             "CREATE SINK {name} FROM {input} INTO \"postgres-sink\" ({PG_SINK}, \
              'port' = '{port}', 'table.name' = '{mirror}', 'write.mode' = 'upsert', \
-             'primary.key' = '{key}', 'changelog.mode' = 'true', 'auto.create.table' = 'true'\
-             {options})",
+             'primary.key' = '{key}', 'changelog.mode' = 'true', 'auto.create.table' = 'true')",
             port = port(),
             mirror = self.mirror,
         )
@@ -832,6 +827,67 @@ async fn non_deferrable_extra_unique_constraints_are_rejected_before_data_moves(
     let _ = db.shutdown().await;
 }
 
+/// Create `mirror` with a trigger that sleeps `delay_ms` for every row written to it.
+async fn create_slow_mirror(client: &tokio_postgres::Client, mirror: &str, delay_ms: f64) {
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {mirror} (id bigint PRIMARY KEY, label text, qty integer); \
+             CREATE FUNCTION {mirror}_delay() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN PERFORM pg_sleep({seconds}); RETURN NEW; END $$; \
+             CREATE TRIGGER delay BEFORE INSERT OR UPDATE ON {mirror} \
+             FOR EACH ROW EXECUTE FUNCTION {mirror}_delay();",
+            seconds = delay_ms / 1000.0
+        ))
+        .await
+        .unwrap();
+}
+
+/// One source transaction that the target needs about 40 s to apply, longer than the default
+/// 30 s statement timeout, lands with default timeouts and without faulting the pipeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transaction_slower_than_the_statement_timeout_reaches_a_slow_target() {
+    const ROWS: usize = 10_000;
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    create_slow_mirror(&client, &capture.mirror, 4.0).await;
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path()).await;
+    execute_all(
+        &db,
+        &[
+            capture.source("orders", ORDER_COLUMNS, ""),
+            capture.upsert_sink("orders_mirror", "orders", "id"),
+        ],
+    )
+    .await;
+    db.start().await.expect("start");
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, 'slow', g FROM generate_series(1, {ROWS}) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let expected = rows(&client, &capture.source_rows()).await;
+    let mirror_rows = capture.mirror_rows();
+    let observed = eventually(
+        Duration::from_secs(80),
+        || rows(&client, &mirror_rows),
+        |rows| rows == &expected || db.pipeline_state() == "Faulted",
+    )
+    .await;
+    assert_eq!(db.last_fault(), None);
+    assert!(
+        observed == expected,
+        "mirror holds {} of {ROWS} rows",
+        observed.len()
+    );
+    db.shutdown().await.expect("shutdown");
+    capture.drop_slot(&client).await;
+}
+
 const WIDE_ROWS: usize = 6_000;
 
 /// A table whose initial snapshot takes seconds: 6,000 rows of 16 KiB.
@@ -994,8 +1050,8 @@ mod latency {
     use laminar_db::{DeliveryGuarantee, FromBatch, LaminarDB, TypedSubscriptionFrame};
 
     use super::{
-        execute_all, first_error, postgres, unique, Capture, CHANGELOG_COLUMNS, ORDER_COLUMNS,
-        PASSWORD,
+        create_slow_mirror, execute_all, first_error, postgres, unique, Capture, CHANGELOG_COLUMNS,
+        ORDER_COLUMNS, PASSWORD,
     };
 
     /// How the writer commits rows.
@@ -1329,17 +1385,11 @@ mod latency {
         )
     }
 
-    async fn open_db(
-        storage: &Path,
-        checkpoint_ms: u64,
-        sink_delay_ms: Option<f64>,
-    ) -> Arc<LaminarDB> {
+    async fn open_db(storage: &Path, checkpoint_ms: u64) -> Arc<LaminarDB> {
         let db = LaminarDB::builder()
             .storage_dir(storage)
             .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
                 interval_ms: Some(checkpoint_ms),
-                // A checkpoint's sink flush must fit the deadline; a slow target needs more.
-                timeout_ms: sink_delay_ms.map(|_| 600_000),
                 ..Default::default()
             })
             .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
@@ -1350,20 +1400,6 @@ mod latency {
         // As in the server, a recoverable fault restarts the pipeline instead of parking it.
         db.enable_supervision();
         db
-    }
-
-    async fn create_slow_mirror(client: &tokio_postgres::Client, mirror: &str, delay_ms: f64) {
-        client
-            .batch_execute(&format!(
-                "CREATE TABLE {mirror} (id bigint PRIMARY KEY, label text, qty integer); \
-                 CREATE FUNCTION {mirror}_delay() RETURNS trigger LANGUAGE plpgsql AS \
-                 $$ BEGIN PERFORM pg_sleep({seconds}); RETURN NEW; END $$; \
-                 CREATE TRIGGER delay BEFORE INSERT OR UPDATE ON {mirror} \
-                 FOR EACH ROW EXECUTE FUNCTION {mirror}_delay();",
-                seconds = delay_ms / 1000.0
-            ))
-            .await
-            .unwrap();
     }
 
     /// Rows the writer committed, and commit→visible milliseconds for those the subscription
@@ -1433,22 +1469,11 @@ mod latency {
             mirror: unique("unused"),
         };
         let storage = tempfile::tempdir().unwrap();
-        let db = open_db(
-            storage.path(),
-            scenario.checkpoint_ms,
-            scenario.sink_delay_ms,
-        )
-        .await;
+        let db = open_db(storage.path(), scenario.checkpoint_ms).await;
         let budget = format!(", 'max.buffered.bytes' = '{}'", scenario.max_buffered_bytes);
-        // One flush is one statement; a slow target needs room to apply the whole backlog.
-        let sink_options = if scenario.sink_delay_ms.is_some() {
-            ", 'statement.timeout.ms' = '600000'"
-        } else {
-            ""
-        };
         let mut statements = vec![
             capture.source("orders", ORDER_COLUMNS, &budget),
-            capture.upsert_sink_with("orders_mirror", "orders", "id", sink_options),
+            capture.upsert_sink("orders_mirror", "orders", "id"),
         ];
         if scenario.visible {
             statements.push(changes.source(
@@ -1619,7 +1644,7 @@ mod latency {
             capture.upsert_sink("orders_mirror", "orders", "id"),
         ];
         {
-            let db = open_db(storage.path(), 1_000, None).await;
+            let db = open_db(storage.path(), 1_000).await;
             execute_all(&db, &statements).await;
             db.start().await.expect("start");
             client
@@ -1652,7 +1677,7 @@ mod latency {
             .get(0);
         let restarted = Instant::now();
         let db = loop {
-            let db = open_db(storage.path(), 1_000, None).await;
+            let db = open_db(storage.path(), 1_000).await;
             match first_error(&db, &statements).await {
                 None => break db,
                 Some(error) if error.contains("LDB-0014") => {

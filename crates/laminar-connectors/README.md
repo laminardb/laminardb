@@ -328,11 +328,15 @@ stream every one after it: no gap and no overlap.
   the source reattaches to its slot at the last committed position. A fault before the first
   checkpoint commits has no position to resume from, so the restart refuses the existing slot and
   names the reset; the same holds inside the initial snapshot.
-- Each checkpoint's sink flush must finish within the checkpoint timeout (30 s by default), and
-  the PostgreSQL sink applies each flush as one statement bounded by its `statement.timeout.ms`
-  (30 s by default). A target too slow to apply the backlog it has received within those limits
-  faults the pipeline on every attempt: the restart replays the same backlog and fails again.
-  Raise both limits for slow targets, or speed up the target.
+- The PostgreSQL sink paces itself by how fast the target applied its recent statements. It
+  flushes before the next batch would make a flush take more than half of `statement.timeout.ms`
+  (30 s by default), and splits a flush into statements of about a quarter of it inside one
+  target transaction, so a slow target receives more, smaller transactions instead of a
+  statement that times out. A batch is never split, and read directly from the source a batch
+  holds whole transactions, so one source transaction must apply within the sink's write
+  deadline (`statement.timeout.ms` plus 5 s; twice `statement.timeout.ms` plus 5 s with
+  `changelog.mode`; or `sink.write.timeout.ms` when set) and the checkpoint timeout (120 s by default). A larger transaction
+  faults the pipeline on every attempt: raise those limits, or speed up the target.
 - Retained WAL grows while the pipeline is stopped or slow. Set `max_slot_wal_keep_size` and
   watch `postgres_cdc_replication_lag_bytes`; a slot that has lost WAL cannot resume.
 - `max.buffered.bytes` bounds the source. One transaction may use about a sixth of it while it is

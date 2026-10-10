@@ -694,6 +694,28 @@ async fn crossing_batch_flushes_existing_before_admission() {
 
 #[cfg(feature = "postgres-sink")]
 #[tokio::test]
+async fn batch_that_would_overrun_the_measured_window_flushes_existing_first() {
+    let mut sink = PostgresSink::new(test_schema(), test_config(), None);
+    sink.state = ConnectorState::Running;
+    // 100 rows/s against the default 30 s statement timeout: a 1,500-row window.
+    sink.pacing
+        .record(Statement::Copy, 100, Duration::from_secs(1));
+
+    sink.write_batch(&test_batch(1_400)).await.unwrap();
+    sink.write_batch(&test_batch(100)).await.unwrap();
+    assert_eq!(sink.buffered_rows(), 1_500);
+
+    let error = sink
+        .write_batch(&test_batch(1))
+        .await
+        .expect_err("a full window flushes before admission");
+    assert!(matches!(error, ConnectorError::InvalidState { .. }));
+    assert!(sink.buffer.is_empty());
+    assert_eq!(sink.buffered_rows, 0);
+}
+
+#[cfg(feature = "postgres-sink")]
+#[tokio::test]
 async fn close_reports_flush_failure_but_releases_state() {
     let mut sink = PostgresSink::new(test_schema(), test_config(), None);
     sink.state = ConnectorState::Running;
