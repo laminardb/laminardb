@@ -208,7 +208,7 @@ mirroring a table on your machine.
 | `output.mode` | Rows | Contract | Consumers |
 |---|---|---|---|
 | `upsert` (default) | Current row per primary key; delete → key-only tombstone; a primary-key change → tombstone for the old key, then the new row | Keyed upsert | A keyed sink reading the source directly; tested with the PostgreSQL upsert sink (`changelog.mode = 'true'`). Streams over it are rejected |
-| `changelog` | Z-set with a trailing `__weight BIGINT NOT NULL`: insert `+1`, delete `−1`, update `−1` old row then `+1` new row | Full changelog | Projections, filters, and non-windowed `COUNT`/`SUM`/`AVG` aggregates with `EMIT CHANGES`, into a PostgreSQL upsert sink with `changelog.mode`; needs `snapshot.mode=initial` |
+| `changelog` | Z-set with a trailing `__weight BIGINT NOT NULL`: insert `+1`, delete `−1`, update `−1` old row then `+1` new row | Full changelog | A PostgreSQL upsert sink with `changelog.mode`, directly or through projections, filters, and non-windowed `COUNT`/`SUM`/`AVG` aggregates with `EMIT CHANGES`; windows, `MIN`/`MAX`, joins with other streams, and append sinks are rejected. Needs `snapshot.mode=initial` |
 
 `snapshot.mode=initial` (default) copies the table, then streams every later change.
 `snapshot.mode=never` streams only changes committed after the source creates its slot.
