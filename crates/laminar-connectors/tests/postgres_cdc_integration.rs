@@ -160,6 +160,16 @@ impl Fixture {
             })
     }
 
+    async fn current_wal_lsn(&self) -> Lsn {
+        let lsn: String = self
+            .admin
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await
+            .unwrap()
+            .get(0);
+        lsn.parse().unwrap()
+    }
+
     async fn drop_slot(&self) {
         timeout(WAIT, async {
             loop {
@@ -445,6 +455,98 @@ async fn durable_feedback_reaches_postgres_while_intake_is_blocked() {
     .await
     .expect("feedback must not wait for the blocked reader");
     source.close().await.unwrap();
+    fixture.drop_slot().await;
+}
+
+#[tokio::test]
+async fn idle_table_cursor_follows_keepalives_past_other_tables_writes() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    // Outside the publication: PostgreSQL 15+ skips these transactions and sends keepalives.
+    let busy = format!("{}_busy", fixture.table);
+    fixture
+        .exec(&format!(
+            "CREATE TABLE {busy} (id bigint PRIMARY KEY, note text)"
+        ))
+        .await;
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut source = started(start(&config)).await;
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (1, 'a', 1)", fixture.table))
+        .await;
+    let mut mirror = Mirror::new();
+    poll_until(&mut source, &mut mirror, |mirror| mirror.len() == 1).await;
+    for id in 0..200 {
+        fixture
+            .exec(&format!(
+                "INSERT INTO {busy} VALUES ({id}, repeat('x', 1000))"
+            ))
+            .await;
+    }
+    let busy_end = fixture.current_wal_lsn().await;
+    let mut next_id = 200;
+    let cursor = timeout(WAIT, async {
+        loop {
+            assert!(source.poll_batch(64).await.expect("poll").is_none());
+            let cursor = source.try_checkpoint().unwrap().expect("streaming cursor");
+            let lsn: Lsn = cursor.get_offset("lsn").unwrap().parse().unwrap();
+            if lsn >= busy_end {
+                return cursor;
+            }
+            fixture
+                .exec(&format!("INSERT INTO {busy} VALUES ({next_id}, 'x')"))
+                .await;
+            next_id += 1;
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("an idle source's cursor must pass the other table's writes");
+    let committed: Lsn = cursor.get_offset("lsn").unwrap().parse().unwrap();
+    source.notify_epoch_committed(1, &cursor).await.unwrap();
+    timeout(WAIT, async {
+        while fixture.slot().await.and_then(|slot| slot.0) < Some(committed) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("durable feedback must release the other table's WAL");
+    source.close().await.unwrap();
+
+    // Row 2 commits between the committed cursor and the resume; row 3 after it.
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (2, 'b', 2)", fixture.table))
+        .await;
+    let mut resumed = started(resume(&config, cursor)).await;
+    fixture
+        .exec(&format!("INSERT INTO {} VALUES (3, 'c', 3)", fixture.table))
+        .await;
+    let mut delivered = Vec::new();
+    timeout(WAIT, async {
+        while !delivered.contains(&3) {
+            match resumed.poll_batch(64).await.expect("poll") {
+                Some(batch) => delivered.extend(
+                    batch
+                        .records
+                        .column(0)
+                        .as_primitive::<Int64Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                ),
+                None => sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("changes after the committed cursor must arrive");
+    assert_eq!(
+        delivered,
+        [2, 3],
+        "each change after the cursor arrives once"
+    );
+    resumed.close().await.unwrap();
     fixture.drop_slot().await;
 }
 

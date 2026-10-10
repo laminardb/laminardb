@@ -706,6 +706,50 @@ async fn deferred_payloads_are_kept_and_decoded_after_the_drain() {
     assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/310"));
 }
 
+#[tokio::test]
+async fn keepalives_advance_the_cursor_only_when_nothing_is_in_flight() {
+    let mut source = streaming_source(OutputMode::Upsert);
+    let feedback = source.applied_lsn.clone().unwrap();
+    let mut payloads = vec![xlog(relation_message())];
+    payloads.extend(wire_transaction(0x100, 1, "a"));
+    let _drained = queue(&mut source, payloads).await;
+    assert_eq!(next(&mut source, 100).await.num_rows(), 1);
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/110"));
+
+    let keepalive = |wal_end| WalPayload::KeepAlive { wal_end };
+    let _idle = queue(&mut source, vec![keepalive(0x300), keepalive(0x200)]).await;
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/300"));
+
+    let mut open = wire_transaction(0x400, 1, "b");
+    let commit = open.pop().unwrap();
+    open.push(keepalive(0x500));
+    let _open = queue(&mut source, open).await;
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+    assert_eq!(
+        source.checkpoint().get_offset("lsn"),
+        Some("0/300"),
+        "an open transaction holds the cursor"
+    );
+
+    let _undrained = queue(&mut source, vec![commit, keepalive(0x700)]).await;
+    assert_eq!(next(&mut source, 100).await.num_rows(), 1);
+    assert_eq!(
+        source.checkpoint().get_offset("lsn"),
+        Some("0/410"),
+        "an undrained commit holds the cursor"
+    );
+
+    let _quiet = queue(&mut source, vec![keepalive(0x800)]).await;
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/800"));
+    assert_eq!(
+        feedback.get().as_u64(),
+        0,
+        "only a committed checkpoint acknowledges"
+    );
+}
+
 // ── Durable feedback ──
 
 fn committed_cursor(source: &PostgresCdcSource, lsn: u64) -> SourceCheckpoint {
