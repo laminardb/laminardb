@@ -123,7 +123,14 @@ impl PostgresCdcSource {
                 self.commit_transaction(Lsn::new(lsn), Lsn::new(end_lsn))?;
             }
             (WalPayload::KeepAlive { wal_end }, None) => {
-                self.write_lsn = self.write_lsn.max(Lsn::new(wal_end));
+                let wal_end = Lsn::new(wal_end);
+                self.write_lsn = self.write_lsn.max(wal_end);
+                // A logical keepalive carries the walsender's decoded position: every commit
+                // before it has already arrived. With nothing open or undrained, moving the
+                // cursor there lets an idle captured table release other tables' WAL.
+                if self.open_transaction.is_none() && self.committed.is_empty() {
+                    self.polled_lsn = self.polled_lsn.max(wal_end);
+                }
             }
             _ => {
                 return Err(ConnectorError::Internal(

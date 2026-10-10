@@ -96,7 +96,8 @@ pub struct PostgresCdcSource {
     confirmed_flush_lsn: Lsn,
     /// Latest position received from the server.
     write_lsn: Lsn,
-    /// End LSN of the last transaction drained into a batch: the resumable cursor.
+    /// The resumable cursor: the end LSN of the last transaction drained into a batch, or a later
+    /// keepalive position received while no transaction was open or undrained.
     polled_lsn: Lsn,
 
     /// Exact database, publication, and slot identity bound to checkpoints.

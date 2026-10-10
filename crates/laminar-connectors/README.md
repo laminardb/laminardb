@@ -338,7 +338,10 @@ stream every one after it: no gap and no overlap.
   `changelog.mode`; or `sink.write.timeout.ms` when set) and the checkpoint timeout (120 s by default). A larger transaction
   faults the pipeline on every attempt: raise those limits, or speed up the target.
 - Retained WAL grows while the pipeline is stopped or slow. Set `max_slot_wal_keep_size` and
-  watch `postgres_cdc_replication_lag_bytes`; a slot that has lost WAL cannot resume.
+  watch `postgres_cdc_replication_lag_bytes`; a slot that has lost WAL cannot resume. An idle
+  captured table does not hold back WAL written by other tables: once every received change has
+  been emitted, the source position follows the server's keepalives, and the next committed
+  checkpoint confirms it.
 - `max.buffered.bytes` bounds the source. One transaction may use about a sixth of it while it is
   decoded; a larger one fails the source with a message naming the limit. While downstream is
   slow the source stops reading WAL but still reports committed progress to the server.
