@@ -495,6 +495,96 @@ async fn changelog_source_maintains_aggregates_and_filters_exactly() {
     capture.drop_slot(&client).await;
 }
 
+/// Terminate the backends `query` selects, returning how many were terminated.
+async fn terminate(client: &tokio_postgres::Client, query: &str) -> i64 {
+    client
+        .query_one(
+            &format!("SELECT count(pg_terminate_backend(pid)) FROM ({query}) victims"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Losing the replication connection, or the sink's and the source's control sessions, faults
+/// the pipeline. The supervisor (on by default in the server) restarts it in process: the source
+/// reattaches to its own slot at the last committed position and the mirror converges, replaying
+/// at least once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_loss_recovers_from_the_committed_slot_position() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, 'seed', g FROM generate_series(1, 200) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path()).await;
+    db.enable_supervision();
+    execute_all(
+        &db,
+        &[
+            capture.source("orders", ORDER_COLUMNS, ""),
+            capture.upsert_sink("orders_mirror", "orders", "id"),
+        ],
+    )
+    .await;
+    db.start().await.expect("start");
+    let source_rows = capture.source_rows();
+    let mirror_rows = capture.mirror_rows();
+    let converge = || async {
+        let expected = rows(&client, &source_rows).await;
+        eventually(
+            CONVERGE,
+            || rows(&client, &mirror_rows),
+            |rows| rows == &expected,
+        )
+        .await
+            == expected
+    };
+    assert!(converge().await, "mirror before any connection loss");
+    // A restart resumes from a committed slot position; before the first commit there is none,
+    // and a fresh start refuses the source's own slot.
+    assert!(db.checkpoint().await.expect("checkpoint").success);
+
+    let walsender = format!(
+        "SELECT active_pid AS pid FROM pg_replication_slots \
+         WHERE slot_name = '{}' AND active_pid IS NOT NULL",
+        capture.slot
+    );
+    // The sink's sessions and the source's control session.
+    let sessions = "SELECT pid FROM pg_stat_activity WHERE datname = current_database() \
+                    AND backend_type = 'client backend' AND pid <> pg_backend_pid()"
+        .to_string();
+    for (victims, round) in [walsender, sessions].iter().zip(0_i64..) {
+        churn(&client, &capture.table, 2 * round + 1).await;
+        let terminated = eventually(
+            CONVERGE,
+            || terminate(&client, victims),
+            |terminated| *terminated > 0,
+        )
+        .await;
+        assert!(terminated > 0, "round {round}: no backend to terminate");
+        churn(&client, &capture.table, 2 * round + 2).await;
+        assert!(
+            converge().await,
+            "round {round}: mirror after the connection loss"
+        );
+    }
+    db.shutdown().await.expect("shutdown");
+    capture.drop_slot(&client).await;
+}
+
 /// A changelog source read straight into a keyed changelog sink applies each retraction and
 /// insertion by key, primary-key changes included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1312,6 +1402,10 @@ mod latency {
 
     #[allow(clippy::too_many_lines)]
     async fn run(scenario: Scenario) {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
         let client = connect().await;
         let capture = Capture::new(&client).await;
         if let Some(delay) = scenario.sink_delay_ms {
@@ -1474,7 +1568,7 @@ mod latency {
     #[ignore = "benchmark: run in release with --nocapture"]
     async fn latency_slow_sink() {
         run(Scenario {
-            sink_delay_ms: Some(2.0),
+            sink_delay_ms: Some(10.0),
             ..Scenario::new(
                 "slow_sink",
                 Load::Sustained {

@@ -323,6 +323,14 @@ stream every one after it: no gap and no overlap.
 - A checkpoint records the server's system identifier and timeline, the database, publication,
   table and slot. Resuming against another server, a promoted replica, or a changed publication
   fails closed.
+- A lost replication connection, or another recoverable fault, restarts the pipeline in process
+  when supervision is on (the server default; `LaminarDB::enable_supervision()` when embedded):
+  the source reattaches to its slot at the last committed position. A fault before the first
+  checkpoint commits has no position to resume from, so the restart refuses the existing slot and
+  names the reset; the same holds inside the initial snapshot.
+- Each checkpoint's sink flush must finish within the checkpoint timeout (30 s by default). A
+  sink too slow for the backlog it receives faults the pipeline, which then replays from the
+  last checkpoint; raise the timeout or speed up the target.
 - Retained WAL grows while the pipeline is stopped or slow. Set `max_slot_wal_keep_size` and
   watch `postgres_cdc_replication_lag_bytes`; a slot that has lost WAL cannot resume.
 - `max.buffered.bytes` bounds the source. One transaction may use about a sixth of it while it is
@@ -331,6 +339,14 @@ stream every one after it: no gap and no overlap.
 - Reset, when an error asks for it: stop the pipeline, run
   `SELECT pg_drop_replication_slot('<slot.name>')`, delete the pipeline's checkpoints, empty the
   targets, and start again.
+- Latency: rows reach the PostgreSQL sink on its own flush schedule (`flush.interval.ms`,
+  default 250 ms), independent of the checkpoint interval. On one Windows 11 workstation (release
+  build, PostgreSQL 17 in Docker, sink in the same server, 1 s checkpoints) single-row commits
+  reached the target in 125–131 ms p50 and under 280 ms p99, and stream subscribers saw them in
+  8–10 ms p50 and 30–40 ms p99. A 200,000-row transaction arrived 2.8 s after commit (about
+  72,000 rows/s), and 200,000 rows written while stopped were caught up 2.7 s after a restart.
+  Rerun the ignored `latency` tests in `crates/laminar-db/tests/postgres_cdc_e2e.rs` on your own
+  hardware before relying on a number.
 - Metrics: `postgres_cdc_events_received_total`, `postgres_cdc_inserts_total`,
   `postgres_cdc_updates_total`, `postgres_cdc_deletes_total`, `postgres_cdc_transactions_total`,
   `postgres_cdc_snapshot_rows_total`, `postgres_cdc_confirmed_flush_lsn`,
