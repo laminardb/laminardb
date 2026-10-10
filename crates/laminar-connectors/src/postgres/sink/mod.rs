@@ -36,6 +36,8 @@ use super::sink_metrics::PostgresSinkMetrics;
 
 mod input;
 #[cfg(feature = "postgres-sink")]
+mod pacing;
+#[cfg(feature = "postgres-sink")]
 mod schema_resolution;
 mod statements;
 
@@ -47,13 +49,19 @@ use input::{
     execute_unnest, retained_batch_bytes_u64, strip_metadata_columns, validate_changelog_input,
     validate_input_batch,
 };
+#[cfg(feature = "postgres-sink")]
+use pacing::{ApplyPacing, Statement};
 
 #[cfg(feature = "postgres-sink")]
 fn postgres_dispatched_write_error(
     operation: &str,
     error: &tokio_postgres::Error,
 ) -> ConnectorError {
-    classify_postgres_write_failure(operation, error, error.as_db_error().is_some())
+    // tokio-postgres displays every server error as "db error"; the cause is in the DbError.
+    match error.as_db_error() {
+        Some(server) => classify_postgres_write_failure(operation, server, true),
+        None => classify_postgres_write_failure(operation, error, false),
+    }
 }
 
 #[cfg(any(feature = "postgres-sink", test))]
@@ -165,6 +173,8 @@ pub struct PostgresSink {
     buffered_rows: usize,
     /// Arrow-reported retained bytes held by `buffer`.
     buffered_retained_bytes: usize,
+    #[cfg(feature = "postgres-sink")]
+    pacing: ApplyPacing,
     /// Sink metrics.
     metrics: PostgresSinkMetrics,
     /// Cached upsert SQL statement (for upsert mode).
@@ -199,6 +209,8 @@ impl PostgresSink {
             buffer: Vec::with_capacity(4),
             buffered_rows: 0,
             buffered_retained_bytes: 0,
+            #[cfg(feature = "postgres-sink")]
+            pacing: ApplyPacing::default(),
             metrics: PostgresSinkMetrics::new(registry),
             upsert_sql: None,
             copy_sql: None,
@@ -338,7 +350,26 @@ impl PostgresSink {
         if user_batch.num_rows() == 0 {
             return Ok(WriteResult::new(0, 0));
         }
-        let copy_batch = postgres_copy_batch(&user_batch)?;
+        let (_, encoded_bytes) = self
+            .apply_statements(client, Statement::Copy, &user_batch)
+            .await?;
+
+        let rows = user_batch.num_rows();
+        self.metrics.record_write(rows as u64, encoded_bytes);
+        self.metrics.record_flush();
+        self.metrics.record_copy();
+
+        Ok(WriteResult::new(rows, encoded_bytes))
+    }
+
+    /// Sends `batch` as one COPY BINARY statement, returning the encoded bytes.
+    #[cfg(feature = "postgres-sink")]
+    async fn copy_rows(
+        &self,
+        client: &tokio_postgres::Transaction<'_>,
+        batch: &RecordBatch,
+    ) -> Result<u64, ConnectorError> {
+        let copy_batch = postgres_copy_batch(batch)?;
         let mut encoder = pgpq::ArrowToPostgresBinaryEncoder::try_new(copy_batch.schema().as_ref())
             .map_err(|e| ConnectorError::Internal(format!("pgpq encoder init: {e}")))?;
 
@@ -376,13 +407,49 @@ impl PostgresSink {
                 .await
                 .map_err(|error| postgres_dispatched_write_error("COPY finish", &error))?;
         }
+        Ok(encoded_bytes as u64)
+    }
 
-        let rows = user_batch.num_rows();
-        self.metrics.record_write(rows as u64, encoded_bytes as u64);
-        self.metrics.record_flush();
-        self.metrics.record_copy();
-
-        Ok(WriteResult::new(rows, encoded_bytes as u64))
+    /// Applies `batch` inside the caller's transaction as consecutive statements, each sized from
+    /// the target's measured rate to finish well inside `statement.timeout.ms`. Returns the rows
+    /// the statements reported and the COPY bytes sent.
+    #[cfg(feature = "postgres-sink")]
+    async fn apply_statements(
+        &mut self,
+        client: &tokio_postgres::Transaction<'_>,
+        statement: Statement,
+        batch: &RecordBatch,
+    ) -> Result<(u64, u64), ConnectorError> {
+        let mut reported = 0_u64;
+        let mut copied_bytes = 0_u64;
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let rows = self.pacing.statement_rows(
+                statement,
+                batch.num_rows() - offset,
+                self.config.statement_timeout,
+            );
+            let chunk = batch.slice(offset, rows);
+            let started = std::time::Instant::now();
+            let applied = match statement {
+                Statement::Copy => {
+                    let bytes = self.copy_rows(client, &chunk).await?;
+                    copied_bytes = copied_bytes.saturating_add(bytes);
+                    rows as u64
+                }
+                Statement::Upsert => {
+                    let upsert_sql = self.upsert_sql.as_deref().ok_or_else(|| {
+                        ConnectorError::Internal("upsert SQL not prepared".into())
+                    })?;
+                    execute_unnest(client, upsert_sql, &chunk).await?
+                }
+                Statement::Delete => self.execute_deletes(client, &chunk).await? as u64,
+            };
+            self.pacing.record(statement, rows, started.elapsed());
+            reported = reported.saturating_add(applied);
+            offset += rows;
+        }
+        Ok((reported, copied_bytes))
     }
 
     /// Flushes buffered data to `PostgreSQL` using UNNEST-based upsert.
@@ -402,13 +469,9 @@ impl PostgresSink {
             return Ok(WriteResult::new(0, 0));
         }
         let user_batch = collapse_upsert_batch(&user_batch, &self.config.primary_key_columns)?;
-
-        let upsert_sql = self
-            .upsert_sql
-            .as_deref()
-            .ok_or_else(|| ConnectorError::Internal("upsert SQL not prepared".into()))?;
-
-        let rows = execute_unnest(client, upsert_sql, &user_batch).await?;
+        let (rows, _) = self
+            .apply_statements(client, Statement::Upsert, &user_batch)
+            .await?;
 
         let byte_estimate = retained_batch_bytes_u64(&user_batch);
         self.metrics.record_write(rows, byte_estimate);
@@ -468,38 +531,29 @@ impl PostgresSink {
             }
         }
 
-        let mutation = async {
-            let mut upserted = 0_u64;
-            let mut deleted = 0_usize;
-            let mut bytes = 0_u64;
-
-            if !all_inserts.is_empty() {
-                let insert_batch =
-                    arrow_select::concat::concat_batches(&self.user_schema, &all_inserts)
-                        .map_err(|e| ConnectorError::Internal(format!("concat inserts: {e}")))?;
-                let upsert_sql = self
-                    .upsert_sql
-                    .as_deref()
-                    .ok_or_else(|| ConnectorError::Internal("upsert SQL not prepared".into()))?;
-                upserted = execute_unnest(client, upsert_sql, &insert_batch).await?;
-                bytes = retained_batch_bytes_u64(&insert_batch);
-            }
-
-            if !all_deletes.is_empty() {
-                let delete_batch =
-                    arrow_select::concat::concat_batches(&self.user_schema, &all_deletes)
-                        .map_err(|e| ConnectorError::Internal(format!("concat deletes: {e}")))?;
-                bytes = bytes.saturating_add(retained_batch_bytes_u64(&delete_batch));
-                deleted = self.execute_deletes(client, &delete_batch).await?;
-            }
-
-            Ok::<_, ConnectorError>((upserted, deleted, bytes))
+        let mut upserted = 0_u64;
+        let mut deleted = 0_u64;
+        let mut total_bytes = 0_u64;
+        if !all_inserts.is_empty() {
+            let insert_batch =
+                arrow_select::concat::concat_batches(&self.user_schema, &all_inserts)
+                    .map_err(|e| ConnectorError::Internal(format!("concat inserts: {e}")))?;
+            (upserted, _) = self
+                .apply_statements(client, Statement::Upsert, &insert_batch)
+                .await?;
+            total_bytes = retained_batch_bytes_u64(&insert_batch);
         }
-        .await;
+        if !all_deletes.is_empty() {
+            let delete_batch =
+                arrow_select::concat::concat_batches(&self.user_schema, &all_deletes)
+                    .map_err(|e| ConnectorError::Internal(format!("concat deletes: {e}")))?;
+            total_bytes = total_bytes.saturating_add(retained_batch_bytes_u64(&delete_batch));
+            (deleted, _) = self
+                .apply_statements(client, Statement::Delete, &delete_batch)
+                .await?;
+        }
 
-        let (upserted, deleted, total_bytes) = mutation?;
-
-        let total_rows = upserted.saturating_add(deleted as u64);
+        let total_rows = upserted.saturating_add(deleted);
         if total_rows != 0 {
             self.metrics.record_write(total_rows, total_bytes);
         }
@@ -507,7 +561,7 @@ impl PostgresSink {
             self.metrics.record_upsert();
         }
         if deleted != 0 {
-            self.metrics.record_deletes(deleted as u64);
+            self.metrics.record_deletes(deleted);
         }
         self.metrics.record_flush();
         Ok(WriteResult::new(total_rows as usize, total_bytes))
@@ -667,7 +721,11 @@ impl PostgresSink {
             self.buffered_retained_bytes,
             batch_retained_bytes,
             retained_limit,
-        )?;
+        )? || self.pacing.window_full(
+            self.buffered_rows,
+            batch.num_rows(),
+            self.config.statement_timeout,
+        );
         let result = if preflush {
             self.flush_buffer().await?
         } else {
