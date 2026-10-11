@@ -203,6 +203,14 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
             crate::lakehouse::delta_io::CatalogAccess::Read,
         )
         .await?;
+        if resolved.credentials_expire_at.is_some() {
+            return Err(crate::error::ConnectorError::ConfigurationError(
+                "on-demand Delta lookups keep the storage credentials they open with and cannot \
+                 renew Unity Catalog vended credentials; use a reference table, or \
+                 catalog.storage.credentials=configured"
+                    .into(),
+            ));
+        }
 
         let lookup_config = DeltaLookupSourceConfig {
             table_path: resolved.location,

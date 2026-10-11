@@ -577,7 +577,9 @@ automatically). With the default `catalog.storage.credentials = 'vended'`, Lamin
 temporary credentials for that table — `READ` for sources, reference and lookup tables,
 `READ_WRITE` for sinks — and renews them before they expire, between replay units and before each
 flush or coordinated pre-commit. Vending needs external data access enabled on the metastore and
-`EXTERNAL USE SCHEMA` for the principal; a refusal fails the connector. `'configured'` uses the
+`EXTERNAL USE SCHEMA` for the principal; a refusal fails the connector. On-demand lookups keep the
+credentials they open with, so they refuse vended credentials; use a reference table instead.
+Tables with row filters or column masks are not vended. `'configured'` uses the
 connector's own `storage.*` credentials or cloud identity instead and bypasses Unity Catalog's
 storage governance.
 
