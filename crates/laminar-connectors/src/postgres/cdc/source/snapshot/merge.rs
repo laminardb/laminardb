@@ -126,12 +126,17 @@ impl HeldRows {
         Ok(())
     }
 
-    /// The held rows in order.
-    pub(crate) fn rows(&self) -> impl Iterator<Item = (&RowValues, usize)> {
+    /// The held rows in order from slot `start`, each with the slot after it.
+    pub(crate) fn rows_from(
+        &self,
+        start: usize,
+    ) -> impl Iterator<Item = (usize, &RowValues, usize)> {
         self.rows
+            .get(start..)
+            .unwrap_or_default()
             .iter()
-            .flatten()
-            .map(|(values, bytes)| (values, *bytes))
+            .zip(start + 1..)
+            .filter_map(|(row, next)| row.as_ref().map(|(values, bytes)| (next, values, *bytes)))
     }
 
     fn remove(&mut self, index: usize) {

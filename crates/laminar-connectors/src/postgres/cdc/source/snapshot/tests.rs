@@ -14,7 +14,9 @@ use super::merge::{encode_key, row_action, KeyClass, RowAction};
 use super::*;
 use crate::config::ConnectorState;
 use crate::connector::SourceMutation::{Put, Tombstone};
-use crate::connector::{source_mutations, source_row_positions, SourceConnector};
+use crate::connector::{
+    source_mutations, source_row_positions, SourceConnector, SourceRowPositions,
+};
 use crate::postgres::cdc::config::OutputMode;
 use crate::postgres::cdc::postgres_io::IndexKeyColumn;
 use crate::postgres::cdc::source::{CommittedTransaction, RowImage, RowValues};
@@ -191,8 +193,13 @@ fn held_rows_take_upserts_and_tombstones_and_count_their_bytes() {
         .unwrap();
     held.apply(RowImage::Tombstone, key(&b), b, 20).unwrap();
     assert_eq!(held.bytes(), 15);
-    let rows: Vec<RowValues> = held.rows().map(|(values, _)| values.clone()).collect();
-    assert_eq!(rows, [a2], "replaced in place, deleted rows gone");
+    let rows: Vec<(usize, RowValues)> = held
+        .rows_from(0)
+        .map(|(next, values, _)| (next, values.clone()))
+        .collect();
+    assert_eq!(rows, [(1, a2)], "replaced in place, deleted rows gone");
+    assert_eq!(held.rows_from(1).count(), 0);
+    assert_eq!(held.rows_from(9).count(), 0);
 }
 
 #[test]
@@ -287,14 +294,19 @@ fn ids(batch: &SourceBatch) -> Vec<i64> {
         .to_vec()
 }
 
-/// Emit the held chunk as if a keepalive had passed its `high`.
-fn emit_chunk(source: &mut PostgresCdcSource) -> Option<SourceBatch> {
+/// Mark the held chunk as passed by a keepalive.
+fn pass_held(source: &mut PostgresCdcSource) {
     if let Phase::Snapshot(copy) = &mut source.phase {
         if let Some(held) = copy.held.as_mut() {
             held.passed = true;
         }
     }
-    source.emit_held_chunk().unwrap()
+}
+
+/// Emit the held chunk as if a keepalive had passed its `high`.
+fn emit_chunk(source: &mut PostgresCdcSource) -> Option<SourceBatch> {
+    pass_held(source);
+    source.emit_held_chunk(1_024).unwrap()
 }
 
 fn fetched(ids: &[&str]) -> Vec<RowValues> {
@@ -523,26 +535,64 @@ async fn truncate_before_high_fails_the_copy_before_its_chunk_is_emitted() {
     assert!(copy.held.is_some(), "the chunk was never emitted");
 }
 
-/// A chunk that fails to build leaves the copy's progress where it was, so a barrier captured
-/// after the failed poll cannot record its range as emitted.
-#[test]
-fn a_chunk_that_fails_to_build_does_not_advance_the_copy() {
-    let mut rows = fetched(&["11", "12"]);
-    rows.push(values("13", "A", "not a number", None));
-    let mut source = copying_source(OutputMode::Upsert, "1:1:", &rows);
-    if let Phase::Snapshot(copy) = &mut source.phase {
-        if let Some(held) = copy.held.as_mut() {
-            held.passed = true;
-        }
-    }
-    assert!(source.emit_held_chunk().is_err());
+/// The copy's progress and the held chunk's next piece: `(chunks, bound, emitted)`.
+fn copy_progress(source: &PostgresCdcSource) -> (u64, Option<Vec<String>>, Option<usize>) {
     let Phase::Snapshot(copy) = &source.phase else {
         panic!("not copying");
     };
-    assert_eq!(copy.bound, Some(vec!["10".to_string()]));
-    assert_eq!(copy.chunks, 0);
-    assert!(
-        copy.held.is_some(),
+    let emitted = copy.held.as_ref().map(|held| held.emitted);
+    (copy.chunks, copy.bound.clone(), emitted)
+}
+
+/// A chunk larger than `max_records` is emitted in pieces under one order key with continuing
+/// sub-offsets, and only its last piece records it.
+#[test]
+fn a_chunk_is_emitted_in_pieces_and_recorded_with_its_last() {
+    let rows = fetched(&["11", "12", "13", "14", "15"]);
+    let mut source = copying_source(OutputMode::Upsert, "1:1:", &rows);
+    pass_held(&mut source);
+    assert!(source.emit_held_chunk(0).unwrap().is_none());
+    let bound = Some(vec!["10".to_string()]);
+    let mut pieces = Vec::new();
+    for emitted in [2, 4] {
+        pieces.push(source.emit_held_chunk(2).unwrap().expect("a piece"));
+        assert_eq!(copy_progress(&source), (0, bound.clone(), Some(emitted)));
+    }
+    pieces.push(source.emit_held_chunk(2).unwrap().expect("the last piece"));
+    assert_eq!(copy_progress(&source), (1, Some(vec!["20".into()]), None));
+    let ids: Vec<Vec<i64>> = pieces.iter().map(ids).collect();
+    assert_eq!(ids, [vec![11, 12], vec![13, 14], vec![15]]);
+    let positions: Vec<&SourceRowPositions> = pieces
+        .iter()
+        .map(|piece| piece.row_positions().unwrap())
+        .collect();
+    let sub_offsets: Vec<u32> = positions
+        .iter()
+        .flat_map(|positions| positions.sub_offset().values().iter().copied())
+        .collect();
+    assert_eq!(sub_offsets, [0, 1, 2, 3, 4]);
+    let order_key = chunk_order_key(Lsn::new(HIGH), 0);
+    assert!(positions
+        .iter()
+        .flat_map(|positions| positions.order_key().iter())
+        .all(|key| key == Some(order_key.as_slice())));
+}
+
+/// A piece that fails to build leaves the copy's progress where it was, so a barrier captured
+/// after the failed poll cannot record its rows or the chunk as emitted.
+#[test]
+fn a_piece_that_fails_to_build_does_not_advance_the_copy() {
+    let mut rows = fetched(&["11", "12"]);
+    rows.push(values("13", "A", "not a number", None));
+    let mut source = copying_source(OutputMode::Upsert, "1:1:", &rows);
+    pass_held(&mut source);
+    let bound = Some(vec!["10".to_string()]);
+    assert!(source.emit_held_chunk(2).unwrap().is_some());
+    assert_eq!(copy_progress(&source), (0, bound.clone(), Some(2)));
+    assert!(source.emit_held_chunk(2).is_err());
+    assert_eq!(
+        copy_progress(&source),
+        (0, bound, Some(2)),
         "the chunk is fetched again after a restart"
     );
 }

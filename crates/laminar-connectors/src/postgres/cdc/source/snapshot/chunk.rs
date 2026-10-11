@@ -20,7 +20,8 @@ use super::classify::key_row;
 use super::merge::{encode_key, HeldRows};
 use super::{ChunkedSnapshot, CopyPlan, HeldChunk, Lsn, PgSnapshot, Upper};
 
-/// A chunk is an atomic replay unit, so its size is bounded by memory rather than `max_records`.
+/// A chunk is an atomic replay unit emitted in pieces of `max_records` rows, so its size is
+/// bounded by memory rather than `max_records`.
 const MAX_CHUNK_ROWS: usize = 65_536;
 /// Above the server-side bounds of one attempt: a 5 s lock wait and 20 s statements.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -428,6 +429,8 @@ impl ChunkedSnapshot {
             rows: read.rows,
             passed: false,
             keepalive_requested: Instant::now(),
+            emitted: 0,
+            next_slot: 0,
         })
     }
 

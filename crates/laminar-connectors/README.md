@@ -363,7 +363,8 @@ committed after it was copied: no gap and no overlap.
   60 s against a slow server, so keep the checkpoint timeout above that while a copy runs (the
   default is 120 s): a poll that exceeds it fails the source, and in `changelog` mode that
   failure needs the reset below.
-- A chunk is emitted once the stream has passed the position it was read at. Changes its
+- A chunk is emitted once the stream has passed the position it was read at, in batches of the
+  pipeline's poll size, so a chunk of wide rows still fits a sink's input limit. Changes its
   snapshot missed are merged into it first. A change is matched to a chunk by transaction
   visibility, not by WAL position. A transaction that has committed but is not yet visible to
   new snapshots, such as one waiting for a synchronous standby, pauses copying until it becomes

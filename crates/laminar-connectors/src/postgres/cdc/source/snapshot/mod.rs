@@ -184,6 +184,9 @@ struct HeldChunk {
     /// A keepalive reached `high`, so every transaction ending by `high` has arrived.
     passed: bool,
     keepalive_requested: Instant,
+    /// Rows emitted so far, and the slot of `rows` the next piece starts at.
+    emitted: usize,
+    next_slot: usize,
 }
 
 /// How often a held chunk asks again for a keepalive: an answer sent before the walsender
@@ -327,6 +330,8 @@ impl ChunkedSnapshot {
             rows: HeldRows::default(),
             passed: false,
             keepalive_requested: Instant::now(),
+            emitted: 0,
+            next_slot: 0,
         });
         self
     }
@@ -344,28 +349,41 @@ impl ChunkedSnapshot {
         (passed && first_end.is_none_or(|end| end > held.high)).then_some(held)
     }
 
-    /// Record the held chunk as emitted, advancing the bound to its upper key.
-    fn commit_held(&mut self, rows: usize) {
+    /// Record a piece of `rows` rows of the held chunk, ending before `next_slot`, as emitted.
+    /// The last piece records the chunk, advancing the bound to its upper key.
+    fn record_piece(&mut self, rows: usize, next_slot: usize, last: bool) {
+        self.copied_rows = self
+            .copied_rows
+            .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+        let Some(held) = self.held.as_mut() else {
+            return;
+        };
+        held.emitted = held.emitted.saturating_add(rows);
+        held.next_slot = next_slot;
+        if !last {
+            return;
+        }
         let Some(held) = self.held.take() else {
             return;
         };
         self.chunks = self.chunks.saturating_add(1);
-        self.copied_rows = self
-            .copied_rows
-            .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
         if let Upper::Key(upper) = held.upper {
             self.bound = Some(upper);
         }
     }
 }
 
-/// The held rows as copied state: `+1` images in changelog mode, puts in upsert mode.
+/// Up to `limit` held rows from slot `start` as copied state: `+1` images in changelog mode,
+/// puts in upsert mode. Returns the slot after the last row taken.
 fn chunk_records(
     layout: &RowLayout,
     rows: &HeldRows,
-) -> Result<(RecordBatch, Option<Vec<SourceMutation>>), ConnectorError> {
+    start: usize,
+    limit: usize,
+) -> Result<(RecordBatch, Option<Vec<SourceMutation>>, usize), ConnectorError> {
     let mut builder = RowBuilder::new(layout);
-    for (values, bytes) in rows.rows() {
+    let mut next_slot = start;
+    for (next, values, bytes) in rows.rows_from(start).take(limit) {
         builder.append(
             layout,
             |index, _| Ok(values[index].as_deref()),
@@ -373,9 +391,10 @@ fn chunk_records(
             layout.weighted.then_some(1),
             bytes,
         )?;
+        next_slot = next;
     }
     let mutations = (!layout.weighted).then(|| vec![SourceMutation::Put; builder.len()]);
-    Ok((builder.finish(layout)?, mutations))
+    Ok((builder.finish(layout)?, mutations, next_slot))
 }
 
 impl PostgresCdcSource {
@@ -394,7 +413,9 @@ impl PostgresCdcSource {
         let decoded = self.decode_queued(max_records)?;
         let mut batch = self.drain_snapshot(max_records).await?;
         if batch.is_none() {
-            batch = self.emit_held_chunk().map_err(|error| self.fail(error))?;
+            batch = self
+                .emit_held_chunk(max_records)
+                .map_err(|error| self.fail(error))?;
         }
         if batch.is_none() && matches!(self.phase, Phase::Snapshot(_)) {
             self.advance_copy(decoded).await?;
@@ -440,11 +461,13 @@ impl PostgresCdcSource {
         Ok(())
     }
 
-    /// Emit the held chunk once the stream has passed its `high` and every transaction ending at
-    /// or before it was drained. Its rows are the table's state at `high`. The copy's progress
-    /// advances only after every fallible step: a barrier captured after a failed poll must
-    /// not record the chunk as emitted.
-    fn emit_held_chunk(&mut self) -> Result<Option<SourceBatch>, ConnectorError> {
+    /// Emit the held chunk, in pieces of at most `max_rows` rows, once the stream has passed its
+    /// `high` and every transaction ending at or before it was drained. Its rows are the table's
+    /// state at `high` and no longer change: the stream delivers in commit order, so nothing
+    /// ending at or before `high` arrives after it passed. The copy's progress advances only
+    /// with the last piece and after every fallible step, so a barrier captured between pieces
+    /// or after a failed poll records the chunk as not emitted, and a restart fetches it again.
+    fn emit_held_chunk(&mut self, max_rows: usize) -> Result<Option<SourceBatch>, ConnectorError> {
         let first_end = self
             .committed
             .front()
@@ -453,12 +476,16 @@ impl PostgresCdcSource {
         let Phase::Snapshot(snapshot) = &self.phase else {
             return Ok(None);
         };
-        let Some(held) = snapshot.passed(first_end, last_end) else {
+        let Some(held) = snapshot
+            .passed(first_end, last_end)
+            .filter(|_| max_rows > 0)
+        else {
             return Ok(None);
         };
-        let finished = held.upper == Upper::End;
-        let batch = self.chunk_batch(held, snapshot.chunks)?;
+        let (batch, next_slot) = self.chunk_batch(held, snapshot.chunks, max_rows)?;
         let count = batch.as_ref().map_or(0, SourceBatch::num_rows);
+        let last = held.rows.rows_from(next_slot).next().is_none();
+        let finished = last && held.upper == Upper::End;
         if finished {
             self.build_staged_transactions()?;
         }
@@ -467,7 +494,7 @@ impl PostgresCdcSource {
                 "PostgreSQL CDC left the snapshot phase while emitting a chunk".into(),
             ));
         };
-        snapshot.commit_held(count);
+        snapshot.record_piece(count, next_slot, last);
         if finished {
             tracing::info!(
                 table = %self.config.table,
@@ -486,23 +513,26 @@ impl PostgresCdcSource {
         Ok(Some(batch.with_checkpoint(self.cursor())))
     }
 
-    /// The rows of `held`, the `ordinal`-th chunk, positioned after every transaction ending at
-    /// or before its `high`; `None` when merged deletions emptied it.
+    /// The next piece of at most `max_rows` rows of `held`, the `ordinal`-th chunk, positioned
+    /// after every transaction ending at or before its `high`, and the slot after it; `None`
+    /// when merged deletions emptied the chunk.
     fn chunk_batch(
         &self,
         held: &HeldChunk,
         ordinal: u64,
-    ) -> Result<Option<SourceBatch>, ConnectorError> {
+        max_rows: usize,
+    ) -> Result<(Option<SourceBatch>, usize), ConnectorError> {
         let layout = self.layout.as_ref().ok_or_else(|| {
             ConnectorError::Internal("PostgreSQL CDC copies before its schema binding".into())
         })?;
-        let (records, mutations) = chunk_records(layout, &held.rows)?;
+        let (records, mutations, next_slot) =
+            chunk_records(layout, &held.rows, held.next_slot, max_rows)?;
         let count = records.num_rows();
         if count == 0 {
-            return Ok(None);
+            return Ok((None, next_slot));
         }
         let key = chunk_order_key(held.high, ordinal);
-        let sub_offsets = (0..count)
+        let sub_offsets = (held.emitted..held.emitted + count)
             .map(|row| {
                 u32::try_from(row).map_err(|_| {
                     ConnectorError::Internal("PostgreSQL CDC chunk row ordinal overflow".into())
@@ -517,7 +547,7 @@ impl PostgresCdcSource {
         if let Some(mutations) = mutations {
             batch = batch.with_mutations(mutations)?;
         }
-        Ok(Some(batch))
+        Ok((Some(batch), next_slot))
     }
 }
 

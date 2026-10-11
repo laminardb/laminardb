@@ -1575,6 +1575,39 @@ async fn supervised_restarts_during_and_after_the_copy_converge_exactly() {
     db.shutdown().await.expect("shutdown");
 }
 
+/// A table of 8 KiB rows copied into the PostgreSQL sink at the default `max.buffered.bytes`:
+/// a chunk of them is larger than the sink's 16 MiB input limit, so it is emitted in pieces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wide_rows_copy_into_a_postgres_sink_at_the_default_budget() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = Capture::new(&client).await;
+    client
+        .batch_execute(&format!(
+            "INSERT INTO {} SELECT g, repeat(md5(g::text), 256), g \
+             FROM generate_series(1, 4000) g",
+            capture.table
+        ))
+        .await
+        .unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path()).await;
+    db.enable_supervision();
+    execute_all(
+        &db,
+        &[
+            capture.source("orders", ORDER_COLUMNS, ""),
+            capture.upsert_sink("orders_mirror", "orders", "id"),
+        ],
+    )
+    .await;
+    db.start().await.expect("start");
+    converge_mirror(&client, &capture, "wide rows at the default budget").await;
+    assert_eq!(db.last_fault(), None);
+    db.shutdown().await.expect("shutdown");
+}
+
 const LARGE_ROWS: i64 = 30_000;
 
 /// Copies of large tables under continuous writes stay exact: an upsert mirror, maintained
