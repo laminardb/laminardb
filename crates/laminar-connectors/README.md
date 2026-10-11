@@ -233,13 +233,19 @@ Startup fails before it creates a slot unless:
 - the table is an ordinary table (not partitioned, a view or a foreign table) with a primary key
   and `REPLICA IDENTITY FULL`, so updates and deletes carry the complete old row and unchanged
   TOAST values can be restored;
+- the primary key is not `DEFERRABLE`. A deferred key lets one transaction such as
+  `UPDATE t SET id = id + 1` move a key value between rows, so a row can arrive before the delete
+  of the row that held its key, and a consumer applying changes by key would then delete it;
 - the declared `PRIMARY KEY` equals the table's primary key, every declared column exists with a
   supported type, and a column declared `NOT NULL` is `NOT NULL` in PostgreSQL. Declared columns
   may be a subset of the table's columns;
 - with `snapshot.mode=initial`, the role can `SELECT` every declared column and row-level
   security does not apply to its reads of the table. Logical replication ignores row-level security, so a filtered copy would miss rows the
   stream later updates. Use a role with `BYPASSRLS`, or the table owner without
-  `FORCE ROW LEVEL SECURITY`.
+  `FORCE ROW LEVEL SECURITY`;
+- with `snapshot.mode=initial`, the server is a primary, not a standby, and the primary-key
+  columns use deterministic collations, their own collation in the index, and default operator
+  classes (see [Initial snapshot](#initial-snapshot)).
 
 ```sql
 CREATE SOURCE orders (
@@ -295,6 +301,11 @@ reset instructions name the exact slot.
   run (`application_name` `laminar:<claim id>:…`) is ended first. A slot held by any other
   session fails the start with a retryable error that names its pid, `application_name` and
   client address.
+- A restart from a committed claim whose slot already exists adopts that slot from its
+  consistent point, in both snapshot modes. With `snapshot.mode=initial` the source also creates
+  a temporary slot `laminar_probe_<claim id>_<…>` to learn which transactions the copy must
+  include; PostgreSQL drops it when that session ends a moment later. Like any slot creation, it
+  waits for running transactions that have written something.
 - Other slots under the prefix are reported and never dropped. Each inactive one is logged with
   the WAL it retains and the statement that drops it, and counted in
   `postgres_cdc_orphaned_slots`. Give every source its own prefix: an inactive slot of another
@@ -337,22 +348,43 @@ timestamp fails the source. Snapshot and replication sessions pin `DateStyle`, `
 
 #### Initial snapshot
 
-The source creates the slot with an exported snapshot, imports it in a `REPEATABLE READ`
-transaction, copies the declared columns through a cursor, and then streams from the slot's
-consistent point. The copy holds exactly the transactions committed before that point and the
-stream every one after it: no gap and no overlap.
+The source streams from the slot's consistent point and, at the same time, copies the table in
+primary-key chunks. Each row reaches the target once as copied state, followed by every change
+committed after it was copied: no gap and no overlap.
 
+- Each chunk is one short `REPEATABLE READ, READ ONLY` transaction. It takes an `ACCESS SHARE`
+  lock on the table, reads its snapshot and WAL position, reads the next primary-key range (sized
+  from `max.buffered.bytes`, at most 65,536 rows), and writes an empty logical-decoding message.
+  The message lets the stream confirm it has passed that position even when nothing else is
+  written. No transaction stays open between chunks, so vacuum is not held back. A DDL
+  statement that needs a stronger lock waits for at most one chunk. A chunk transaction waits at
+  most 5 s for its lock, each statement in it runs for at most 20 s, and an attempt that takes
+  longer than 30 s is abandoned and retried on a new session. One poll can still take up to
+  60 s against a slow server, so keep the checkpoint timeout above that while a copy runs (the
+  default is 120 s): a poll that exceeds it fails the source, and in `changelog` mode that
+  failure needs the reset below.
+- A chunk is emitted once the stream has passed the position it was read at. Changes its
+  snapshot missed are merged into it first. A change is matched to a chunk by transaction
+  visibility, not by WAL position. A transaction that has committed but is not yet visible to
+  new snapshots, such as one waiting for a synchronous standby, pauses copying until it becomes
+  visible; streaming continues meanwhile. After 30 seconds the source logs the sessions it waits
+  for and their wait events.
 - No row is copied until a checkpoint naming the new slot commits, about one checkpoint interval
-  after the slot is created. A restart before that copies the table again from a new slot and
-  reports the first one as an orphan.
-- The copy keeps a transaction open from the slot's creation, so vacuum cannot remove dead rows
-  until it finishes. The source turns `idle_in_transaction_session_timeout` off for that
-  transaction, but a `transaction_timeout` must be longer than the whole copy. The slot retains
-  WAL from the start of the copy; the source checks the slot's `wal_status` every 10 seconds and
-  fails if `max_slot_wal_keep_size` removed WAL it needs.
-- Checkpoints keep committing during the copy, but an exported snapshot cannot be imported again,
-  so a restart after the copy has started and before it finishes fails and names the reset. Use
-  new or empty targets.
+  after the slot is created.
+- Checkpoints keep committing during the copy and confirm the slot's position, so PostgreSQL
+  releases WAL while the table is copied. The source also checks the slot's `wal_status` every 10
+  seconds and fails if `max_slot_wal_keep_size` removed WAL it needs.
+- A change to the table's columns, types, replica identity or primary key during the copy stops
+  the source before the next chunk is read. A table rewrite is not visible consistently to a
+  snapshot taken across it.
+- A restart inside the copy resumes it in `upsert` mode. Deletes are always forwarded during the
+  copy, so rows the target received before the restart are corrected. In `changelog` mode the
+  restart fails closed and names the reset: a changelog consumer would keep rows it received
+  before the restart that changed before they were copied again.
+- The copy needs a primary server, because it reads WAL insert positions. Primary-key columns
+  must use deterministic collations, the column's own collation in the index, and the default
+  operator class: keys are compared on the server in the index's order, and equal keys must be
+  equal texts. These are checked at startup, before any slot exists.
 
 #### Delivery, recovery and resources
 
@@ -368,10 +400,9 @@ stream every one after it: no gap and no overlap.
   when supervision is on (the server default; `LaminarDB::enable_supervision()` when embedded):
   the source reattaches to its slot at the last committed position. A restart before the first
   checkpoint commits makes a new claim. A restart after the claim commits but before a checkpoint
-  naming the slot commits has emitted nothing, so it creates the claimed slot, or uses it
-  (`snapshot.mode=never`, from its consistent point) or, with `snapshot.mode=initial`, leaves it
-  as an orphan and copies the table from a new slot; none of these needs a reset. A restart inside
-  the initial snapshot still does.
+  naming the slot commits has emitted nothing, so it creates the claimed slot or adopts it from
+  its consistent point; neither needs a reset. A restart inside the initial snapshot resumes the
+  copy in `upsert` mode and fails closed with the reset in `changelog` mode.
 - The PostgreSQL sink paces itself by how fast the target applied its recent statements. It
   flushes before the next batch would make a flush take more than half of `statement.timeout.ms`
   (30 s by default), and splits a flush into statements of about a quarter of it inside one

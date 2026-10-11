@@ -624,11 +624,13 @@ async fn connection_loss_recovers_from_the_committed_slot_position() {
     db.shutdown().await.expect("shutdown");
 }
 
-/// The source's replication connection, once its slot exists and streams.
+/// The source's replication connection, once its slot exists and streams. A session still
+/// creating the slot also holds it, but has not started replication.
 fn walsender_of(prefix: &str) -> String {
     format!(
-        "SELECT active_pid AS pid FROM pg_replication_slots \
-         WHERE starts_with(slot_name, '{prefix}_') AND active_pid IS NOT NULL"
+        "SELECT s.active_pid AS pid FROM pg_replication_slots AS s \
+         JOIN pg_stat_replication AS r ON r.pid = s.active_pid \
+         WHERE starts_with(s.slot_name, '{prefix}_') AND r.state IN ('catchup', 'streaming')"
     )
 }
 
@@ -837,9 +839,9 @@ async fn slot_creation_waits_for_running_transactions_and_survives_a_restart() {
 }
 
 /// A crash after the slot exists but before a cursor naming its snapshot commits emitted no row,
-/// so the restart copies the table again from a new slot and reports the first one.
+/// so the restart adopts that slot, takes the copy's floor from a probe slot, and copies exactly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_before_the_snapshot_cursor_commits_restarts_on_a_new_slot_exactly() {
+async fn crash_before_the_snapshot_cursor_commits_adopts_its_slot_exactly() {
     let Some(client) = postgres().await else {
         return;
     };
@@ -887,11 +889,10 @@ async fn crash_before_the_snapshot_cursor_commits_restarts_on_a_new_slot_exactly
     )
     .await;
     assert_eq!(observed, expected);
-    let slots = slots_under(&client, &capture.slot).await;
-    assert_eq!(slots.len(), 2, "{slots:?}");
-    assert!(
-        slots.contains(&first[0]),
-        "the first slot is reported, never dropped"
+    assert_eq!(
+        slots_under(&client, &capture.slot).await,
+        first,
+        "the claimed slot is adopted, not replaced"
     );
     db.shutdown().await.expect("shutdown");
 }
@@ -1281,6 +1282,17 @@ fn wide_pipeline(capture: &Capture) -> Vec<String> {
     ]
 }
 
+fn wide_changelog_pipeline(capture: &Capture) -> Vec<String> {
+    vec![
+        capture.source(
+            "orders",
+            CHANGELOG_COLUMNS,
+            ", 'max.buffered.bytes' = '1048576', 'output.mode' = 'changelog'",
+        ),
+        capture.upsert_sink("orders_mirror", "orders", "id"),
+    ]
+}
+
 /// Checkpoints keep committing while the snapshot copies, so a copy that outlives the
 /// checkpoint timeout neither stalls a barrier nor faults the pipeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1335,8 +1347,9 @@ async fn snapshot_longer_than_the_checkpoint_timeout_completes() {
     db.shutdown().await.expect("shutdown");
 }
 
-/// An exported snapshot cannot be re-imported, so a restart inside the initial snapshot fails
-/// closed with reset guidance instead of resuming from a partial copy.
+/// A changelog target fed before a restart inside the copy may keep a row the failed attempt
+/// copied and that changed before the range was copied again, so a changelog source fails closed
+/// with reset guidance instead of resuming the copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_inside_the_snapshot_fails_closed() {
     let Some(client) = postgres().await else {
@@ -1344,7 +1357,7 @@ async fn restart_inside_the_snapshot_fails_closed() {
     };
     let capture = wide_capture(&client).await;
     let storage = tempfile::tempdir().unwrap();
-    let statements = wide_pipeline(&capture);
+    let statements = wide_changelog_pipeline(&capture);
     let db = open_with_short_checkpoints(storage.path()).await;
     execute_all(&db, &statements).await;
     db.start().await.expect("start");
@@ -1376,6 +1389,260 @@ async fn restart_inside_the_snapshot_fails_closed() {
         "{error}"
     );
     let _ = db.shutdown().await;
+}
+
+/// A few writes spread over ids `1..=rows`: updates, deletes, inserts, and a primary-key change.
+/// A round that collides on a key fails as a whole; the table stays the reference.
+async fn light_churn(client: &tokio_postgres::Client, table: &str, round: i64, rows: i64) {
+    let id = |k: i64| (round * 7_919 + k * 104_729).rem_euclid(rows) + 1;
+    let _ = client
+        .batch_execute(&format!(
+            "UPDATE {table} SET qty = qty + 1, label = 'r{round}' WHERE id IN ({}, {}, {}); \
+             DELETE FROM {table} WHERE id IN ({}, {}); \
+             INSERT INTO {table} VALUES ({}, 'n{round}', 1), ({}, 'n{round}', 2) \
+             ON CONFLICT DO NOTHING; \
+             UPDATE {table} SET id = id + {rows} WHERE id = {};",
+            id(1),
+            id(2),
+            id(3),
+            id(4),
+            id(5),
+            id(6),
+            id(7),
+            id(8),
+        ))
+        .await;
+}
+
+/// [`light_churn`] on several tables every 20 ms until stopped.
+struct BackgroundChurn {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<i64>,
+}
+
+impl BackgroundChurn {
+    async fn start(tables: &[&str], rows: i64) -> Self {
+        let client = postgres().await.expect("churn session");
+        let tables: Vec<String> = tables.iter().map(ToString::to_string).collect();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let task = tokio::spawn(async move {
+            let mut round = 0;
+            while !stopping.load(Ordering::Acquire) {
+                for table in &tables {
+                    light_churn(&client, table, round, rows).await;
+                }
+                round += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            round
+        });
+        Self { stop, task }
+    }
+
+    async fn stop(self) -> i64 {
+        self.stop.store(true, Ordering::Release);
+        self.task.await.unwrap()
+    }
+}
+
+async fn converge_mirror(client: &tokio_postgres::Client, capture: &Capture, context: &str) {
+    let expected = rows(client, &capture.source_rows()).await;
+    let mirror_rows = capture.mirror_rows();
+    let observed = eventually(
+        CONVERGE,
+        || rows(client, &mirror_rows),
+        |rows| rows == &expected,
+    )
+    .await;
+    assert!(
+        observed == expected,
+        "{context}: mirror holds {} rows, the table {}",
+        observed.len(),
+        expected.len()
+    );
+}
+
+/// An upsert source restarted inside the copy resumes it from the last checkpoint. Rows the
+/// first run copied after that checkpoint and that changed while it was down are rewritten or
+/// deleted in the target, because the copy never suppresses tombstones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_inside_the_snapshot_resumes_exactly_in_upsert_mode() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = wide_capture(&client).await;
+    let storage = tempfile::tempdir().unwrap();
+    let statements = wide_pipeline(&capture);
+    let db = open_with_short_checkpoints(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let mirror_rows = capture.mirror_rows();
+    eventually(
+        CONVERGE,
+        || rows(&client, &mirror_rows),
+        |rows| rows.len() > 300,
+    )
+    .await;
+    db.shutdown().await.expect("shutdown");
+    let partial: Vec<i64> = rows(&client, &mirror_rows).await.into_keys().collect();
+    assert!(
+        partial.len() > 300 && partial.len() < WIDE_ROWS,
+        "the restart lands inside the copy ({} mirrored rows)",
+        partial.len()
+    );
+    let slots = slots_under(&client, &capture.slot).await;
+    assert_eq!(slots.len(), 1, "{slots:?}");
+
+    // Wide rows: one change per transaction keeps each within the source's small budget.
+    let t = &capture.table;
+    for (index, id) in partial.iter().rev().take(60).enumerate() {
+        let change = match index % 3 {
+            0 => format!("DELETE FROM {t} WHERE id = {id}"),
+            1 => format!("UPDATE {t} SET label = 'changed' WHERE id = {id}"),
+            _ => format!("UPDATE {t} SET id = id + 100000 WHERE id = {id}"),
+        };
+        client.batch_execute(&change).await.unwrap();
+    }
+    let db = reopen(storage.path(), &statements).await;
+    db.start()
+        .await
+        .expect("restart inside the copy resumes in upsert mode");
+    client
+        .batch_execute(&format!("DELETE FROM {t} WHERE id = {}", partial[0]))
+        .await
+        .unwrap();
+    converge_mirror(&client, &capture, "after the resumed copy").await;
+    assert_eq!(
+        slots_under(&client, &capture.slot).await,
+        slots,
+        "the copy resumes on its slot"
+    );
+    db.shutdown().await.expect("shutdown");
+}
+
+/// Replication faults during the copy, and right after it hands off to streaming, restart the
+/// pipeline in process from its last checkpoint. The upsert copy resumes wherever the restart
+/// lands, between chunks or while one is held, and the mirror converges exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervised_restarts_during_and_after_the_copy_converge_exactly() {
+    let _ = logs();
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let capture = wide_capture(&client).await;
+    let storage = tempfile::tempdir().unwrap();
+    let db = open_with_short_checkpoints(storage.path()).await;
+    db.enable_supervision();
+    execute_all(&db, &wide_pipeline(&capture)).await;
+    db.start().await.expect("start");
+    let rows_total = i64::try_from(WIDE_ROWS).unwrap();
+    let churn = BackgroundChurn::start(&[&capture.table], rows_total).await;
+    let walsender = walsender_of(&capture.slot);
+    let mirror_rows = capture.mirror_rows();
+    for copied in [400, 1_500] {
+        let partial = eventually(
+            CONVERGE,
+            || rows(&client, &mirror_rows),
+            |rows| rows.len() > copied,
+        )
+        .await;
+        assert!(
+            partial.len() > copied,
+            "the copy stalled: {:?}",
+            db.last_fault()
+        );
+        let terminated = eventually(
+            CONVERGE,
+            || terminate(&client, &walsender),
+            |terminated| *terminated > 0,
+        )
+        .await;
+        assert!(terminated > 0, "no replication session to end");
+    }
+    assert!(churn.stop().await > 0);
+    converge_mirror(&client, &capture, "after restarts inside the copy").await;
+
+    assert!(
+        terminate(&client, &walsender).await > 0,
+        "streaming after the copy"
+    );
+    for round in 0..5 {
+        light_churn(&client, &capture.table, 1_000 + round, rows_total).await;
+    }
+    converge_mirror(&client, &capture, "after a restart once streaming").await;
+    assert_eq!(slots_under(&client, &capture.slot).await.len(), 1);
+    db.shutdown().await.expect("shutdown");
+}
+
+const LARGE_ROWS: i64 = 30_000;
+
+/// Copies of large tables under continuous writes stay exact: an upsert mirror, maintained
+/// changelog aggregates, and a changelog source read straight into a keyed sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_copies_under_continuous_churn_stay_exact() {
+    let Some(client) = postgres().await else {
+        return;
+    };
+    let upserts = Capture::new(&client).await;
+    let changes = Capture::new(&client).await;
+    for capture in [&upserts, &changes] {
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {} SELECT g, CASE WHEN g % 3 = 0 THEN 'OPEN' ELSE 'CLOSED' END, g \
+                 FROM generate_series(1, {LARGE_ROWS}) g",
+                capture.table
+            ))
+            .await
+            .unwrap();
+    }
+    let totals_table = unique("totals");
+    let small = ", 'max.buffered.bytes' = '2097152'";
+    let statements = vec![
+        upserts.source("orders", ORDER_COLUMNS, small),
+        upserts.upsert_sink("orders_mirror", "orders", "id"),
+        changes.source(
+            "changes",
+            CHANGELOG_COLUMNS,
+            &format!("{small}, 'output.mode' = 'changelog'"),
+        ),
+        changes.upsert_sink("changes_mirror", "changes", "id"),
+        "CREATE STREAM change_totals AS SELECT label, SUM(qty) AS total, COUNT(*) AS n \
+         FROM changes GROUP BY label EMIT CHANGES"
+            .to_string(),
+        format!(
+            "CREATE SINK totals_sink FROM change_totals INTO \"postgres-sink\" ({PG_SINK}, \
+             'port' = '{port}', 'table.name' = '{totals_table}', 'write.mode' = 'upsert', \
+             'primary.key' = 'label', 'changelog.mode' = 'true', 'auto.create.table' = 'true')",
+            port = port()
+        ),
+    ];
+    let storage = tempfile::tempdir().unwrap();
+    let db = open(storage.path()).await;
+    execute_all(&db, &statements).await;
+    db.start().await.expect("start");
+    let churn = BackgroundChurn::start(&[&upserts.table, &changes.table], LARGE_ROWS).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(churn.stop().await > 10);
+    converge_mirror(&client, &upserts, "upsert mirror").await;
+    converge_mirror(&client, &changes, "changelog sink").await;
+    let expected = totals(
+        &client,
+        &format!(
+            "SELECT label, SUM(qty)::bigint, COUNT(*) FROM {} GROUP BY label",
+            changes.table
+        ),
+    )
+    .await;
+    let maintained = format!("SELECT label, total::bigint, n FROM {totals_table}");
+    let observed = eventually(
+        CONVERGE,
+        || totals(&client, &maintained),
+        |observed| observed == &expected,
+    )
+    .await;
+    assert_eq!(observed, expected, "maintained totals");
+    db.shutdown().await.expect("shutdown");
 }
 
 /// Latency and resource measurements for the direct PostgreSQL CDC path. The numbers are only

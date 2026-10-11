@@ -45,10 +45,12 @@ fn port() -> u16 {
 }
 
 async fn admin() -> Option<Client> {
-    let connection = format!(
-        "host=127.0.0.1 port={} user=laminar password={PASSWORD} dbname=cdc",
-        port()
-    );
+    admin_on(port()).await
+}
+
+async fn admin_on(port: u16) -> Option<Client> {
+    let connection =
+        format!("host=127.0.0.1 port={port} user=laminar password={PASSWORD} dbname=cdc");
     match tokio_postgres::connect(&connection, NoTls).await {
         Ok((client, driver)) => {
             tokio::spawn(async move {
@@ -70,6 +72,7 @@ async fn admin() -> Option<Client> {
 /// slot under the prefix, so a failed test leaks none.
 struct Fixture {
     admin: Client,
+    port: u16,
     table: String,
     slot: String,
     publication: String,
@@ -93,10 +96,15 @@ const PREFIX_SLOTS: &str = "SELECT slot_name::text, confirmed_flush_lsn::text, a
 
 impl Fixture {
     async fn new(columns: &str) -> Option<Self> {
-        let admin = admin().await?;
+        Self::on(port(), columns).await
+    }
+
+    async fn on(port: u16, columns: &str) -> Option<Self> {
+        let admin = admin_on(port).await?;
         let id = unique_id();
         let fixture = Self {
             admin,
+            port,
             table: format!("cdc_{id}"),
             slot: format!("slot_{id}"),
             publication: format!("pub_{id}"),
@@ -137,7 +145,7 @@ impl Fixture {
         ] {
             config.set(key, value);
         }
-        config.set("port", port().to_string());
+        config.set("port", self.port.to_string());
         config.set("slot.name", &self.slot);
         config.set("publication", &self.publication);
         config.set("table", format!("public.{}", self.table));
@@ -183,14 +191,14 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let prefix = format!("{}_", self.slot);
-        let _ = std::thread::spawn(move || drop_test_slots(&prefix)).join();
+        let (port, prefix) = (self.port, format!("{}_", self.slot));
+        let _ = std::thread::spawn(move || drop_test_slots(port, &prefix)).join();
     }
 }
 
 /// Test cleanup only: end every session on, then drop, every slot whose name starts with
 /// `prefix`.
-fn drop_test_slots(prefix: &str) {
+fn drop_test_slots(port: u16, prefix: &str) {
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -198,7 +206,7 @@ fn drop_test_slots(prefix: &str) {
         return;
     };
     runtime.block_on(async {
-        let Some(admin) = admin().await else {
+        let Some(admin) = admin_on(port).await else {
             return;
         };
         let _ = timeout(WAIT, async {
@@ -388,6 +396,20 @@ async fn poll_until(
     last
 }
 
+/// The next batch the source emits.
+async fn next_batch(source: &mut PostgresCdcSource) -> SourceBatch {
+    timeout(WAIT, async {
+        loop {
+            if let Some(batch) = source.poll_batch(64).await.expect("poll") {
+                return batch;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no batch arrived")
+}
+
 /// Poll until the source has left the snapshot and emitted every row up to the server's WAL end.
 async fn drain_to(source: &mut PostgresCdcSource, mirror: &mut Mirror, fixture: &Fixture) {
     let expected = table_state(fixture).await;
@@ -408,15 +430,17 @@ async fn snapshot_hands_off_to_wal_without_gap_or_overlap() {
     let config = fixture.config(&orders_schema(), &["id"], &[]);
     let mut source = started(start(&config)).await;
     let inside = source.try_checkpoint().unwrap().expect("snapshot cursor");
-    assert!(
-        inside.get_offset("lsn").is_none(),
-        "a cursor inside the snapshot carries no slot position"
+    assert_eq!(phase(&inside), "snapshot");
+    assert_eq!(
+        inside.get_offset("lsn"),
+        inside.get_metadata("consistent_point"),
+        "a cursor inside the copy carries the stream position, from the slot's consistent point"
     );
 
-    // The first fetch is in flight on the imported snapshot; these changes commit after the
-    // slot's consistent point and must arrive through WAL only.
+    // The first chunk is emitted; these changes commit after the slot's consistent point and
+    // reach the target either through WAL or through later chunks, once each.
     let mut mirror = Mirror::new();
-    let first = source.poll_batch(64).await.unwrap().expect("snapshot rows");
+    let first = next_batch(&mut source).await;
     apply(&mut mirror, &first);
     fixture
         .exec(&format!(
@@ -639,6 +663,14 @@ async fn idle_table_cursor_follows_keepalives_past_other_tables_writes() {
     resumed.close().await.unwrap();
 }
 
+fn changelog_schema() -> SchemaRef {
+    let mut fields = orders_schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("__weight", DataType::Int64, false)));
+    Arc::new(Schema::new(fields))
+}
+
+/// A changelog source cannot resume inside the copy: a target fed before the restart may keep a
+/// row the failed attempt copied and that was deleted before the range was copied again.
 #[tokio::test]
 async fn fresh_starts_leave_existing_slots_alone_and_an_interrupted_snapshot_fails_closed() {
     let Some(fixture) = Fixture::new(ORDERS).await else {
@@ -650,9 +682,13 @@ async fn fresh_starts_leave_existing_slots_alone_and_an_interrupted_snapshot_fai
             fixture.table
         ))
         .await;
-    let config = fixture.config(&orders_schema(), &["id"], &[]);
+    let config = fixture.config(
+        &changelog_schema(),
+        &["id"],
+        &[("output.mode", "changelog")],
+    );
     let mut source = started(start(&config)).await;
-    let mut batch = source.poll_batch(64).await.unwrap().expect("snapshot rows");
+    let mut batch = next_batch(&mut source).await;
     let Some(SourceBatchCursor::Complete(snapshot_cursor)) = batch.take_cursor() else {
         panic!("snapshot rows carry a cursor");
     };
@@ -677,7 +713,7 @@ async fn fresh_starts_leave_existing_slots_alone_and_an_interrupted_snapshot_fai
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("cannot be resumed"), "{error}");
+    assert!(error.contains("changelog source cannot resume"), "{error}");
     assert!(
         error.contains(&format!("SELECT pg_drop_replication_slot('{slot}')")),
         "{error}"
@@ -724,6 +760,12 @@ async fn contract_violations_fail_before_creating_a_slot() {
                 &[],
             ),
             "qty",
+        ),
+        (
+            "ALTER TABLE {t} DROP CONSTRAINT {t}_pkey; \
+             ALTER TABLE {t} ADD PRIMARY KEY (id) DEFERRABLE",
+            fixture.config(&schema, &["id"], &[]),
+            "DEFERRABLE",
         ),
     ];
     for (setup, config, expected) in cases {
@@ -906,7 +948,9 @@ async fn snapshot_and_wal_decode_every_supported_type_identically() {
     let mut inserted = false;
     timeout(WAIT, async {
         while batches.len() < 2 {
-            if !inserted && batches.len() == 1 && source.try_checkpoint().unwrap().is_some() {
+            // Inserted once the copy is complete, so the row arrives through WAL.
+            let copied = phase(&source.try_checkpoint().unwrap().unwrap()) == "streaming";
+            if !inserted && batches.len() == 1 && copied {
                 fixture
                     .exec(&format!(
                         "INSERT INTO {} VALUES (2, {values})",
@@ -1163,8 +1207,11 @@ async fn never_mode_emits_nothing_before_a_cursor_naming_its_slot_commits() {
     resumed.close().await.unwrap();
 }
 
+/// A crash after the claimed slot exists but before a cursor naming its copy commits emitted
+/// nothing. The restart adopts that slot from its consistent point and takes the copy's floor
+/// from a temporary probe slot, so changes committed meanwhile reach the target exactly once.
 #[tokio::test]
-async fn initial_mode_restarts_from_its_claim_on_a_new_slot_and_reports_the_old_one() {
+async fn initial_mode_adopts_its_claimed_slot_with_a_probe_floor_and_copies_exactly() {
     let Some(fixture) = Fixture::new(ORDERS).await else {
         return;
     };
@@ -1179,20 +1226,28 @@ async fn initial_mode_restarts_from_its_claim_on_a_new_slot_and_reports_the_old_
     first.start(start(&config)).await.unwrap();
     let claimed = first.try_checkpoint().unwrap().expect("a claim");
     first.notify_epoch_committed(1, &claimed).await.unwrap();
-    let old = slot_of(&poll_until_phase(&mut first, "snapshot").await);
-    // The process dies before a cursor naming the snapshot commits, so no row was emitted.
+    let slot = slot_of(&poll_until_phase(&mut first, "snapshot").await);
     first.close().await.unwrap();
+    fixture
+        .exec(&format!(
+            "UPDATE {t} SET label = 'down' WHERE id <= 3; DELETE FROM {t} WHERE id = 4; \
+             INSERT INTO {t} VALUES (31, 'down', 31)",
+            t = fixture.table
+        ))
+        .await;
 
     let registry = prometheus::Registry::new();
     let mut resumed = PostgresCdcSource::new(PostgresCdcConfig::default(), Some(&registry));
     resumed.start(resume(&config, claimed)).await.unwrap();
-    let reclaimed = resumed.try_checkpoint().unwrap().expect("a claim");
-    assert_eq!(phase(&reclaimed), "claimed");
-    let new = slot_of(&reclaimed);
-    assert_ne!(new, old);
-    assert_eq!(orphaned_slots(&registry), "postgres_cdc_orphaned_slots 1");
-
     commit_until_ready(&mut resumed).await;
+    let cursor = resumed.try_checkpoint().unwrap().expect("a cursor");
+    assert_eq!(phase(&cursor), "snapshot");
+    assert_eq!(slot_of(&cursor), slot, "the claimed slot is adopted");
+    assert!(
+        cursor.get_metadata("visibility_floor").is_some(),
+        "the probe slot provides the floor"
+    );
+    assert_eq!(orphaned_slots(&registry), "postgres_cdc_orphaned_slots 0");
     fixture
         .exec(&format!(
             "UPDATE {} SET label = 'later' WHERE id <= 5",
@@ -1202,11 +1257,21 @@ async fn initial_mode_restarts_from_its_claim_on_a_new_slot_and_reports_the_old_
     let mut mirror = Mirror::new();
     drain_to(&mut resumed, &mut mirror, &fixture).await;
     assert_eq!(mirror.len(), 30);
-    let slots = fixture.slots().await;
-    assert!(
-        slots.contains_key(&old) && slots.contains_key(&new),
-        "the orphan is reported, never dropped: {slots:?}"
+    assert_eq!(
+        fixture.slots().await.into_keys().collect::<Vec<_>>(),
+        [slot],
+        "adopted, not replaced"
     );
+    let probes: i64 = fixture
+        .admin
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'laminar_probe_%'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(probes, 0, "the probe slot ends with its session");
     resumed.close().await.unwrap();
 }
 
@@ -1446,4 +1511,842 @@ async fn lookup_open_requires_a_usable_single_key_unique_index() {
     PostgresLookupSource::open(lookup(format!("public.lookup_primary_{suffix}")))
         .await
         .expect("primary key must be admitted");
+}
+
+// ── Chunked copy ──
+
+/// Rows keyed by their primary-key texts, every column as text.
+type TextRows = BTreeMap<Vec<String>, Vec<Option<String>>>;
+
+/// The first `columns` values of `row` as text.
+fn row_texts(batch: &SourceBatch, row: usize, columns: usize) -> Vec<Option<String>> {
+    (0..columns)
+        .map(|column| {
+            let array = batch.records.column(column);
+            array
+                .is_valid(row)
+                .then(|| arrow_cast::display::array_value_to_string(array, row).unwrap())
+        })
+        .collect()
+}
+
+fn key_of(values: &[Option<String>], key: &[usize]) -> Vec<String> {
+    key.iter()
+        .map(|&column| values[column].clone().expect("key value"))
+        .collect()
+}
+
+/// Apply upsert puts and tombstones to `rows`.
+fn apply_keyed(rows: &mut TextRows, batch: &SourceBatch, key: &[usize], columns: usize) {
+    for row in 0..batch.num_rows() {
+        let values = row_texts(batch, row, columns);
+        match batch
+            .mutations()
+            .map_or(SourceMutation::Put, |all| all[row])
+        {
+            SourceMutation::Put => {
+                rows.insert(key_of(&values, key), values);
+            }
+            SourceMutation::Tombstone => {
+                rows.remove(&key_of(&values, key));
+            }
+        }
+    }
+}
+
+/// The table's rows as `columns` read them, as text.
+async fn table_texts(fixture: &Fixture, columns: &str, key: &[usize]) -> TextRows {
+    let messages = fixture
+        .admin
+        .simple_query(&format!("SELECT {columns} FROM {}", fixture.table))
+        .await
+        .unwrap();
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                let values: Vec<Option<String>> = (0..row.len())
+                    .map(|index| row.get(index).map(String::from))
+                    .collect();
+                Some((key_of(&values, key), values))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Writes that run concurrently with a copy until stopped: each round runs the next statement,
+/// with `{n}` replaced by the round number. Statements may fail, as a key change onto an
+/// existing key does; the table is the reference either way.
+struct Churn {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<u64>,
+}
+
+impl Churn {
+    fn start(statements: Vec<String>) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let task = tokio::spawn(async move {
+            let client = admin().await.expect("churn session");
+            let mut round = 0_u64;
+            while !stopping.load(Ordering::Acquire) {
+                let statement = &statements[usize::try_from(round).unwrap() % statements.len()];
+                let _ = client
+                    .batch_execute(&statement.replace("{n}", &round.to_string()))
+                    .await;
+                round += 1;
+                sleep(Duration::from_millis(2)).await;
+            }
+            round
+        });
+        Self { stop, task }
+    }
+
+    async fn stop(self) -> u64 {
+        self.stop.store(true, Ordering::Release);
+        self.task.await.unwrap()
+    }
+}
+
+/// The copy's chunk count recorded in a cursor.
+fn chunks_of(cursor: &SourceCheckpoint) -> u64 {
+    cursor
+        .get_metadata("snapshot_chunks")
+        .map_or(0, |chunks| chunks.parse().unwrap())
+}
+
+/// Copy the fixture's table while `churn` writes to it, then drain until the upsert mirror equals
+/// the table. Returns how many chunks the copy took.
+async fn upsert_copy_under_churn(
+    fixture: &Fixture,
+    schema: &Schema,
+    primary_key: &[&str],
+    select: &str,
+    key: &[usize],
+    churn: Vec<String>,
+) -> u64 {
+    let mut config = fixture.config(schema, primary_key, &[]);
+    config.set("max.buffered.bytes", "1048576");
+    let mut source = started(start(&config)).await;
+    let writes = Churn::start(churn);
+    let columns = schema.fields().len();
+    let mut mirror = TextRows::new();
+    let mut chunks = 0;
+    timeout(WAIT * 4, async {
+        loop {
+            match source.poll_batch(256).await.expect("poll") {
+                Some(mut batch) => {
+                    if let Some(SourceBatchCursor::Complete(cursor)) = batch.take_cursor() {
+                        chunks = chunks.max(chunks_of(&cursor));
+                    }
+                    apply_keyed(&mut mirror, &batch, key, columns);
+                }
+                None => sleep(Duration::from_millis(5)).await,
+            }
+            if phase(&source.try_checkpoint().unwrap().unwrap()) == "streaming" {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the copy did not finish");
+    assert!(writes.stop().await > 10, "writes ran during the copy");
+    let expected = table_texts(fixture, select, key).await;
+    timeout(WAIT, async {
+        while mirror != expected {
+            match source.poll_batch(256).await.expect("poll") {
+                Some(batch) => apply_keyed(&mut mirror, &batch, key, columns),
+                None => sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let missing: Vec<_> = expected
+            .keys()
+            .filter(|key| !mirror.contains_key(*key))
+            .take(5)
+            .collect();
+        let extra: Vec<_> = mirror
+            .keys()
+            .filter(|key| !expected.contains_key(*key))
+            .take(5)
+            .collect();
+        let stale: Vec<_> = expected
+            .iter()
+            .filter(|(key, row)| mirror.get(*key).is_some_and(|got| got != *row))
+            .map(|(key, _)| key)
+            .take(5)
+            .collect();
+        panic!("mirror != table: missing {missing:?}, extra {extra:?}, stale {stale:?}")
+    });
+    source.close().await.unwrap();
+    chunks
+}
+
+fn int_churn(table: &str) -> Vec<String> {
+    [
+        "UPDATE {t} SET label = 'u{n}' WHERE id = ({n} * 37) % 3000 + 1",
+        "DELETE FROM {t} WHERE id = ({n} * 53) % 3000 + 1",
+        "INSERT INTO {t} VALUES (({n} * 61) % 3000 + 1, 'back', {n}) \
+         ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty",
+        "UPDATE {t} SET id = id + 5000 WHERE id = ({n} * 71) % 3000 + 1",
+        "UPDATE {t} SET id = id - 5000 WHERE id = ({n} * 79) % 3000 + 5001",
+        "INSERT INTO {t} VALUES (10000 + {n}, 'new', {n})",
+    ]
+    .map(|statement| statement.replace("{t}", table))
+    .to_vec()
+}
+
+/// A copy of many chunks equals the table while inserts, updates, deletes, and key changes
+/// across chunk bounds run concurrently.
+#[tokio::test]
+async fn chunked_copy_equals_the_table_under_concurrent_writes_with_integer_keys() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} SELECT g, repeat('s', 2000), g FROM generate_series(1, 3000) g",
+            fixture.table
+        ))
+        .await;
+    let chunks = upsert_copy_under_churn(
+        &fixture,
+        &orders_schema(),
+        &["id"],
+        "id, label, qty",
+        &[0],
+        int_churn(&fixture.table),
+    )
+    .await;
+    assert!(chunks > 20, "{chunks} chunks");
+}
+
+/// Composite keys whose index order differs from the attribute order, with mixed-case text that
+/// `en_US.utf8` orders differently from bytes: chunk bounds and streamed keys are compared by
+/// the server under the index collation.
+#[tokio::test]
+async fn chunked_copy_equals_the_table_with_composite_collated_keys() {
+    let Some(fixture) = Fixture::new(
+        "label text, name text NOT NULL, tenant integer NOT NULL, PRIMARY KEY (tenant, name)",
+    )
+    .await
+    else {
+        return;
+    };
+    let t = &fixture.table;
+    fixture
+        .exec(&format!(
+            "INSERT INTO {t} SELECT repeat('s', 2000), \
+                    CASE WHEN g % 3 = 0 THEN initcap(md5(g::text)) ELSE md5(g::text) END, g % 7 \
+             FROM generate_series(1, 2500) g"
+        ))
+        .await;
+    let pick = |n: u32| {
+        format!("(SELECT tenant, name FROM {t} ORDER BY tenant, name OFFSET ({{n}} * {n}) % 2000 LIMIT 1)")
+    };
+    let churn = vec![
+        format!(
+            "UPDATE {t} SET label = 'u{{n}}' WHERE (tenant, name) = {}",
+            pick(37)
+        ),
+        format!("DELETE FROM {t} WHERE (tenant, name) = {}", pick(53)),
+        format!("INSERT INTO {t} VALUES ('i', initcap(md5('x{{n}}')), {{n}} % 7)"),
+        format!(
+            "UPDATE {t} SET name = upper(name) || 'z' WHERE (tenant, name) = {}",
+            pick(71)
+        ),
+        format!(
+            "UPDATE {t} SET tenant = (tenant + 4) % 7 WHERE (tenant, name) = {}",
+            pick(79)
+        ),
+    ];
+    let schema = Schema::new(vec![
+        Field::new("label", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("tenant", DataType::Int32, false),
+    ]);
+    let chunks = upsert_copy_under_churn(
+        &fixture,
+        &schema,
+        &["tenant", "name"],
+        "label, name, tenant",
+        &[2, 1],
+        churn,
+    )
+    .await;
+    assert!(chunks > 20, "{chunks} chunks");
+}
+
+/// A text key with its own column collation (`"C"`) inside an `en_US.utf8` database.
+#[tokio::test]
+async fn chunked_copy_equals_the_table_with_a_column_collation_key() {
+    let Some(fixture) = Fixture::new("code text COLLATE \"C\" PRIMARY KEY, label text").await
+    else {
+        return;
+    };
+    let t = &fixture.table;
+    fixture
+        .exec(&format!(
+            "INSERT INTO {t} SELECT CASE WHEN g % 2 = 0 THEN initcap(md5(g::text)) \
+                                         ELSE md5(g::text) END, repeat('s', 2000) \
+             FROM generate_series(1, 2500) g"
+        ))
+        .await;
+    let pick = |n: u32| {
+        format!("(SELECT code FROM {t} ORDER BY code OFFSET ({{n}} * {n}) % 2000 LIMIT 1)")
+    };
+    let churn = vec![
+        format!("UPDATE {t} SET label = 'u{{n}}' WHERE code = {}", pick(37)),
+        format!("DELETE FROM {t} WHERE code = {}", pick(53)),
+        format!("INSERT INTO {t} VALUES (initcap(md5('x{{n}}')), 'i')"),
+        format!(
+            "UPDATE {t} SET code = upper(code) WHERE code = {}",
+            pick(71)
+        ),
+        format!(
+            "UPDATE {t} SET code = lower(code) || 'a' WHERE code = {}",
+            pick(79)
+        ),
+    ];
+    let schema = Schema::new(vec![
+        Field::new("code", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+    let chunks =
+        upsert_copy_under_churn(&fixture, &schema, &["code"], "code, label", &[0], churn).await;
+    assert!(chunks > 20, "{chunks} chunks");
+}
+
+/// In changelog mode every row image's running weight stays 0 or 1, and the images at weight 1
+/// at the end are exactly the table.
+#[tokio::test]
+async fn changelog_copy_weights_sum_to_the_table_under_concurrent_writes() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} SELECT g, repeat('s', 2000), g FROM generate_series(1, 3000) g",
+            fixture.table
+        ))
+        .await;
+    let mut config = fixture.config(
+        &changelog_schema(),
+        &["id"],
+        &[("output.mode", "changelog")],
+    );
+    config.set("max.buffered.bytes", "1048576");
+    let mut source = started(start(&config)).await;
+    let writes = Churn::start(int_churn(&fixture.table));
+    let mut weights = Weights::new();
+    timeout(WAIT * 4, async {
+        while phase(&source.try_checkpoint().unwrap().unwrap()) != "streaming" {
+            match source.poll_batch(256).await.expect("poll") {
+                Some(batch) => add_weights(&mut weights, &batch),
+                None => sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .expect("the copy did not finish");
+    assert!(writes.stop().await > 10);
+    let expected: Vec<Vec<Option<String>>> = table_texts(&fixture, "id, label, qty", &[0])
+        .await
+        .into_values()
+        .collect();
+    let current = |weights: &Weights| {
+        weights
+            .iter()
+            .filter(|(_, weight)| **weight == 1)
+            .map(|(image, _)| image.clone())
+            .collect::<Vec<_>>()
+    };
+    timeout(WAIT, async {
+        while current(&weights) != expected {
+            match source.poll_batch(256).await.expect("poll") {
+                Some(batch) => add_weights(&mut weights, &batch),
+                None => sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("the changelog did not converge to the table");
+    source.close().await.unwrap();
+}
+
+/// The running weight of every row image of a changelog.
+type Weights = BTreeMap<Vec<Option<String>>, i64>;
+
+fn add_weights(weights: &mut Weights, batch: &SourceBatch) {
+    let weight = batch.records.column(3).as_primitive::<Int64Type>();
+    for row in 0..batch.num_rows() {
+        let image = row_texts(batch, row, 3);
+        let total = weights.entry(image.clone()).or_default();
+        *total += weight.value(row);
+        assert!(
+            (0..=1).contains(total),
+            "image {image:?} reached weight {total}"
+        );
+    }
+}
+
+/// Copy cursors carry the stream position, so committing them advances the slot while the copy
+/// is still running.
+#[tokio::test]
+async fn confirmed_flush_lsn_advances_during_the_copy() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} SELECT g, repeat('s', 2000), g FROM generate_series(1, 6000) g",
+            fixture.table
+        ))
+        .await;
+    let mut config = fixture.config(&orders_schema(), &["id"], &[]);
+    config.set("max.buffered.bytes", "1048576");
+    let mut source = started(start(&config)).await;
+    let gate = source.try_checkpoint().unwrap().unwrap();
+    let start_lsn: Lsn = gate.get_offset("lsn").unwrap().parse().unwrap();
+    let slot = slot_of(&gate);
+    let mut epoch = 2;
+    let advanced = timeout(WAIT, async {
+        loop {
+            fixture
+                .exec(&format!(
+                    "UPDATE {} SET qty = qty + 1 WHERE id = 6000",
+                    fixture.table
+                ))
+                .await;
+            let _ = source.poll_batch(256).await.expect("poll");
+            let cursor = source.try_checkpoint().unwrap().unwrap();
+            assert_eq!(phase(&cursor), "snapshot", "the copy finished first");
+            source.notify_epoch_committed(epoch, &cursor).await.unwrap();
+            epoch += 1;
+            let confirmed = fixture.slot(&slot).await.and_then(|slot| slot.0);
+            if confirmed.is_some_and(|confirmed| confirmed > start_lsn) {
+                return confirmed;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the slot must advance during the copy");
+    assert!(advanced > Some(start_lsn));
+    source.close().await.unwrap();
+}
+
+/// A table rewrite during the copy fails the source closed: a chunk snapshot taken across it
+/// would read an empty table and end the copy early.
+#[tokio::test]
+async fn a_column_type_change_during_the_copy_fails_closed_without_ending_it() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} SELECT g, repeat('s', 2000), g FROM generate_series(1, 3000) g",
+            fixture.table
+        ))
+        .await;
+    let mut config = fixture.config(&orders_schema(), &["id"], &[]);
+    config.set("max.buffered.bytes", "1048576");
+    let mut source = started(start(&config)).await;
+    let mut mirror = Mirror::new();
+    while mirror.len() < 100 {
+        apply(&mut mirror, &next_batch(&mut source).await);
+    }
+    fixture
+        .exec(&format!(
+            "ALTER TABLE {} ALTER COLUMN qty TYPE bigint",
+            fixture.table
+        ))
+        .await;
+    let error = timeout(WAIT, async {
+        loop {
+            match source.poll_batch(256).await {
+                Ok(Some(batch)) => apply(&mut mirror, &batch),
+                Ok(None) => sleep(Duration::from_millis(10)).await,
+                Err(error) => return error,
+            }
+            assert_ne!(
+                phase(&source.try_checkpoint().unwrap().unwrap()),
+                "streaming",
+                "the copy must never end early"
+            );
+        }
+    })
+    .await
+    .expect("the rewrite must stop the copy")
+    .to_string();
+    assert!(
+        error.contains("during the initial snapshot") || error.contains("bound layout"),
+        "{error}"
+    );
+    assert!(mirror.len() < 3000);
+    source.close().await.unwrap();
+}
+
+/// With no other writes on the server, each chunk's window closes as soon as the stream decodes
+/// the chunk's WAL marker.
+#[tokio::test]
+async fn an_idle_server_closes_each_chunk_window_promptly() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    fixture
+        .exec(&format!(
+            "INSERT INTO {} SELECT g, 'seed', g FROM generate_series(1, 5) g",
+            fixture.table
+        ))
+        .await;
+    let config = fixture.config(&orders_schema(), &["id"], &[]);
+    let mut source = started(start(&config)).await;
+    let began = std::time::Instant::now();
+    let mut mirror = Mirror::new();
+    while phase(&source.try_checkpoint().unwrap().unwrap()) != "streaming" {
+        match source.poll_batch(64).await.expect("poll") {
+            Some(batch) => apply(&mut mirror, &batch),
+            None => sleep(Duration::from_millis(5)).await,
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "the copy waited for an unrequested keepalive"
+        );
+    }
+    let elapsed = began.elapsed();
+    eprintln!("idle copy of two chunks took {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1_500), "{elapsed:?}");
+    assert_eq!(mirror.len(), 5);
+    source.close().await.unwrap();
+}
+
+/// Keys equal under a non-deterministic collation can differ as text, so the copy could not
+/// match streamed keys to copied ones; the source refuses before creating a slot.
+#[tokio::test]
+async fn a_non_deterministic_key_collation_is_rejected_before_any_slot() {
+    let Some(probe) = admin().await else {
+        return;
+    };
+    let collation = format!("ci_{}", unique_id());
+    probe
+        .batch_execute(&format!(
+            "CREATE COLLATION {collation} (provider = icu, locale = 'und-u-ks-level2', \
+             deterministic = false)"
+        ))
+        .await
+        .unwrap();
+    let Some(fixture) = Fixture::new(&format!(
+        "code text COLLATE {collation} PRIMARY KEY, label text"
+    ))
+    .await
+    else {
+        return;
+    };
+    let schema = Schema::new(vec![
+        Field::new("code", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+    let config = fixture.config(&schema, &["code"], &[]);
+    let mut source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let error = source.start(start(&config)).await.unwrap_err().to_string();
+    let never = fixture.config(&schema, &["code"], &[("snapshot.mode", "never")]);
+    let mut streaming = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    let streams = streaming.start(start(&never)).await;
+    fixture
+        .exec(&format!(
+            "DROP TABLE {}; DROP COLLATION {collation}",
+            fixture.table
+        ))
+        .await;
+    assert!(error.contains("non-deterministic collation"), "{error}");
+    assert!(streams.is_ok(), "only the copy compares keys");
+    streaming.close().await.unwrap();
+}
+
+/// An upsert source restarted from a cursor inside the copy converges on targets the failed
+/// attempt already wrote: rows it copied after the cursor and that were deleted, changed, or
+/// moved before the restart are deleted or rewritten, because tombstones are never suppressed.
+#[tokio::test]
+async fn an_upsert_restart_inside_the_copy_converges_on_rows_written_after_the_cursor() {
+    let Some(fixture) = Fixture::new(ORDERS).await else {
+        return;
+    };
+    let t = fixture.table.clone();
+    fixture
+        .exec(&format!(
+            "INSERT INTO {t} SELECT g, repeat('s', 2000), g FROM generate_series(1, 3000) g"
+        ))
+        .await;
+    let config = fixture.config(&orders_schema(), &["id"], &[]);
+    let mut first = started(start(&config)).await;
+    let mut target = Mirror::new();
+    let mut committed = None;
+    timeout(WAIT, async {
+        loop {
+            let mut batch = next_batch(&mut first).await;
+            let Some(SourceBatchCursor::Complete(cursor)) = batch.take_cursor() else {
+                panic!("a complete cursor");
+            };
+            apply(&mut target, &batch);
+            let chunks = chunks_of(&cursor);
+            if committed.is_none() && chunks >= 3 {
+                first.notify_epoch_committed(2, &cursor).await.unwrap();
+                committed = Some(cursor);
+            } else if chunks >= 8 {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the copy emitted chunks past the committed cursor");
+    let committed = committed.unwrap();
+    let bound: Vec<String> =
+        serde_json::from_str(committed.get_metadata("snapshot_bound").unwrap()).unwrap();
+    let bound: i64 = bound[0].parse().unwrap();
+    let written = target.keys().copied().filter(|&id| id > bound).count();
+    assert!(
+        written > 100,
+        "the failed attempt wrote rows after the cursor"
+    );
+    first.close().await.unwrap();
+
+    fixture
+        .exec(&format!(
+            "DELETE FROM {t} WHERE id BETWEEN {a} AND {b}; \
+             UPDATE {t} SET label = 'changed' WHERE id BETWEEN {c} AND {d}; \
+             UPDATE {t} SET id = id + 10000 WHERE id BETWEEN {e} AND {f}; \
+             UPDATE {t} SET id = {a} WHERE id = 2999;",
+            a = bound + 1,
+            b = bound + 40,
+            c = bound + 41,
+            d = bound + 80,
+            e = bound + 81,
+            f = bound + 100,
+        ))
+        .await;
+    let mut resumed = started(resume(&config, committed)).await;
+    fixture
+        .exec(&format!(
+            "DELETE FROM {t} WHERE id BETWEEN {} AND {}",
+            bound + 101,
+            bound + 120
+        ))
+        .await;
+    drain_to(&mut resumed, &mut target, &fixture).await;
+    resumed.close().await.unwrap();
+}
+
+// ── Visibility races (tests/docker/postgres-cdc-syncrep-compose.yml) ──
+
+const SYNCREP_PORT_ENV: &str = "LAMINAR_TEST_POSTGRES_SYNCREP_PORT";
+
+/// A fixture on the server whose synchronous standby never confirms, or `None` when
+/// `LAMINAR_TEST_POSTGRES_SYNCREP_PORT` is unset.
+async fn syncrep_fixture(columns: &str) -> Option<Fixture> {
+    let port = std::env::var(SYNCREP_PORT_ENV)
+        .ok()?
+        .parse()
+        .expect(SYNCREP_PORT_ENV);
+    let fixture = Fixture::on(port, columns)
+        .await
+        .expect("the sync-rep fixture is unreachable");
+    // A racer left waiting by a failed run would hold back every slot creation.
+    fixture
+        .exec("SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE wait_event = 'SyncRep'")
+        .await;
+    Some(fixture)
+}
+
+async fn until_true(fixture: &Fixture, query: &str) {
+    timeout(WAIT, async {
+        while !fixture
+            .admin
+            .query_one(query, &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never true: {query}"));
+}
+
+/// Run `sql` committing with `synchronous_commit = on`: the commit record is flushed and
+/// streamed, but the session waits for the standby and snapshots treat it as running. Returns
+/// the session's pid once it waits.
+async fn race(fixture: &Fixture, sql: String) -> i32 {
+    let racer = admin_on(fixture.port).await.unwrap();
+    let pid: i32 = racer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    tokio::spawn(async move {
+        let _ = racer
+            .batch_execute(&format!("SET synchronous_commit = on; {sql}"))
+            .await;
+    });
+    until_true(
+        fixture,
+        &format!("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = {pid} AND wait_event = 'SyncRep')"),
+    )
+    .await;
+    pid
+}
+
+/// End the standby wait; the commit, already durable locally, becomes visible.
+async fn release(fixture: &Fixture, pid: i32) {
+    fixture
+        .exec(&format!("SELECT pg_cancel_backend({pid})"))
+        .await;
+    until_true(
+        fixture,
+        &format!("SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = {pid} AND wait_event = 'SyncRep')"),
+    )
+    .await;
+}
+
+/// A transaction the stream delivered while snapshots still treat it as running is pending:
+/// copying holds until it is visible, so the chunk that copies its row includes it.
+#[tokio::test]
+#[ignore = "needs tests/docker/postgres-cdc-syncrep-compose.yml and LAMINAR_TEST_POSTGRES_SYNCREP_PORT"]
+async fn sync_rep_commits_streamed_before_they_are_visible_hold_the_copy() {
+    let Some(fixture) = syncrep_fixture(ORDERS).await else {
+        return;
+    };
+    let t = fixture.table.clone();
+    fixture
+        .exec(&format!(
+            "INSERT INTO {t} SELECT g, repeat('s', 2000), g FROM generate_series(1, 3000) g"
+        ))
+        .await;
+    let mut config = fixture.config(&orders_schema(), &["id"], &[]);
+    config.set("max.buffered.bytes", "1048576");
+    let mut source = started(start(&config)).await;
+    let mut mirror = Mirror::new();
+    apply(&mut mirror, &next_batch(&mut source).await);
+    let racer = race(
+        &fixture,
+        format!("UPDATE {t} SET label = 'raced' WHERE id = 2900"),
+    )
+    .await;
+
+    let poll_once = async |source: &mut PostgresCdcSource, mirror: &mut Mirror| {
+        if let Some(batch) = source.poll_batch(256).await.expect("poll") {
+            apply(mirror, &batch);
+        }
+        sleep(Duration::from_millis(10)).await;
+        source.try_checkpoint().unwrap().unwrap()
+    };
+    timeout(WAIT, async {
+        while poll_once(&mut source, &mut mirror)
+            .await
+            .get_metadata("pending_xids")
+            .is_none_or(str::is_empty)
+        {}
+    })
+    .await
+    .expect("the streamed racer becomes pending");
+    let settle = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < settle {
+        poll_once(&mut source, &mut mirror).await;
+    }
+    let held = chunks_of(&source.try_checkpoint().unwrap().unwrap());
+    let hold = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < hold {
+        let cursor = poll_once(&mut source, &mut mirror).await;
+        assert_eq!(chunks_of(&cursor), held, "copying waits for the racer");
+        assert_eq!(phase(&cursor), "snapshot");
+    }
+    assert!(!mirror.contains_key(&2900));
+
+    release(&fixture, racer).await;
+    drain_to(&mut source, &mut mirror, &fixture).await;
+    assert_eq!(mirror[&2900].0.as_deref(), Some("raced"));
+    source.close().await.unwrap();
+}
+
+/// The pid-free condition "a session of this source waits on transaction `xid`".
+fn creation_waits_on(xid: &str) -> String {
+    format!(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks AS l JOIN pg_stat_activity AS a ON a.pid = l.pid \
+         WHERE NOT l.granted AND l.locktype = 'transactionid' AND l.transactionid::text = '{xid}' \
+         AND a.application_name LIKE 'laminar:%')"
+    )
+}
+
+/// The slot counts a transaction as committed once it decoded its commit record, before the
+/// procarray does: such a transaction committed before the consistent point is not streamed,
+/// so copying holds until chunk snapshots see it.
+///
+/// Slot creation waits for the transactions running at each stage of its snapshot builder. The
+/// racer starts after the second stage began and commits before the last, so the builder decodes
+/// its commit while it still waits for the standby.
+#[tokio::test]
+#[ignore = "needs tests/docker/postgres-cdc-syncrep-compose.yml and LAMINAR_TEST_POSTGRES_SYNCREP_PORT"]
+async fn sync_rep_commits_before_the_consistent_point_hold_the_copy() {
+    let Some(fixture) = syncrep_fixture(ORDERS).await else {
+        return;
+    };
+    let t = fixture.table.clone();
+    fixture
+        .exec(&format!(
+            "CREATE TABLE {t}_other (id integer); \
+             INSERT INTO {t} SELECT g, 'seed', g FROM generate_series(1, 3000) g"
+        ))
+        .await;
+    let config = fixture.config(&orders_schema(), &["id"], &[]);
+    let open = async |id: i32| {
+        let session = admin_on(fixture.port).await.unwrap();
+        session
+            .batch_execute(&format!("BEGIN; INSERT INTO {t}_other VALUES ({id})"))
+            .await
+            .unwrap();
+        let xid: String = session
+            .query_one("SELECT pg_current_xact_id()::text", &[])
+            .await
+            .unwrap()
+            .get(0);
+        (session, xid)
+    };
+    let (first_blocker, first_xid) = open(1).await;
+    let mut source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
+    source.start(start(&config)).await.unwrap();
+    let claimed = source.try_checkpoint().unwrap().expect("a claim");
+    source.notify_epoch_committed(1, &claimed).await.unwrap();
+    until_true(&fixture, &creation_waits_on(&first_xid)).await;
+    let (second_blocker, second_xid) = open(2).await;
+    first_blocker.batch_execute("COMMIT").await.unwrap();
+    until_true(&fixture, &creation_waits_on(&second_xid)).await;
+    let racer = race(
+        &fixture,
+        format!("UPDATE {t} SET label = 'raced' WHERE id = 2900"),
+    )
+    .await;
+    second_blocker.batch_execute("COMMIT").await.unwrap();
+
+    commit_until_ready(&mut source).await;
+    let gate = source.try_checkpoint().unwrap().unwrap();
+    assert!(gate.get_metadata("visibility_floor").is_some());
+    let hold = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < hold {
+        assert!(
+            source.poll_batch(256).await.expect("poll").is_none(),
+            "no chunk while the racer the slot counted is invisible"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    release(&fixture, racer).await;
+    let mut mirror = Mirror::new();
+    drain_to(&mut source, &mut mirror, &fixture).await;
+    assert_eq!(mirror[&2900].0.as_deref(), Some("raced"));
+    source.close().await.unwrap();
+    fixture.exec(&format!("DROP TABLE {t}_other")).await;
 }

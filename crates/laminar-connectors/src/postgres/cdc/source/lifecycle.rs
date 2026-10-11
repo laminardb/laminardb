@@ -20,7 +20,7 @@ use super::checkpoint::{parse_cursor, validate_live_binding, write_cursor, Curso
 use super::claim::incarnation;
 use super::decoding::Decoded;
 use super::startup::{prepare, ReaderRuntime, StartInputs, StartPhase};
-use super::{reap_postgres_reader, Arc, Lsn, Notify, Phase, PostgresCdcSource};
+use super::{reap_postgres_reader, Arc, ChunkedSnapshot, Lsn, Notify, Phase, PostgresCdcSource};
 
 /// Minimum spacing of live publication/table revalidation at checkpoint commits.
 const CONTRACT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -43,6 +43,18 @@ impl PostgresCdcSource {
         &mut self,
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
+        self.decode_queued(max_records)?;
+        let batch = self.drain_committed(max_records)?;
+        if max_records > 0 && (!self.pending_payloads.is_empty() || !self.committed.is_empty()) {
+            self.data_ready.notify_one();
+        }
+        self.metrics
+            .set_replication_lag_bytes(self.replication_lag_bytes());
+        Ok(batch)
+    }
+
+    /// Decode queued WAL within one bounded work quantum; `true` when any payload was decoded.
+    pub(super) fn decode_queued(&mut self, max_records: usize) -> Result<bool, ConnectorError> {
         self.fail_on_terminal_wal_error()?;
         let payload_budget = max_records.max(1);
         let mut processed = 0_usize;
@@ -86,13 +98,7 @@ impl PostgresCdcSource {
                 "WAL reader task terminated unexpectedly — replication stream lost".to_string(),
             )));
         }
-        let batch = self.drain_committed(max_records)?;
-        if max_records > 0 && (!self.pending_payloads.is_empty() || !self.committed.is_empty()) {
-            self.data_ready.notify_one();
-        }
-        self.metrics
-            .set_replication_lag_bytes(self.replication_lag_bytes());
-        Ok(batch)
+        Ok(processed > 0)
     }
 
     /// Launch the replication reader of the owned slot at `start_lsn`.
@@ -114,21 +120,20 @@ impl PostgresCdcSource {
         .await;
         match launched {
             Ok(runtime) => {
-                self.enter_streaming(start_lsn, runtime);
+                self.install_reader(start_lsn, runtime);
                 Ok(())
             }
             Err(error) => Err(self.fail(error)),
         }
     }
 
-    fn enter_streaming(&mut self, start_lsn: Lsn, runtime: ReaderRuntime) {
+    fn install_reader(&mut self, start_lsn: Lsn, runtime: ReaderRuntime) {
         self.wal_rx = Some(runtime.wal_rx);
         self.wal_byte_budget = Some(runtime.wal_byte_budget);
         self.wal_terminal_error = Some(runtime.terminal_error);
         self.reader_handle = Some(runtime.reader_handle);
         self.reader_shutdown = Some(runtime.shutdown_tx);
         self.applied_lsn = Some(runtime.applied_lsn);
-        self.phase = Phase::Streaming;
         self.polled_lsn = start_lsn;
         self.write_lsn = self.write_lsn.max(start_lsn);
         self.confirmed_flush_lsn = start_lsn;
@@ -144,8 +149,8 @@ impl PostgresCdcSource {
         // barrier captured between a retried poll error and the fault may commit.
         let phase = match (&self.phase, self.consistent_point) {
             (Phase::Claiming(_), _) | (Phase::Idle, None) => CursorPhase::Claimed,
-            (Phase::Snapshot(_), Some(consistent_point)) => {
-                CursorPhase::Snapshot { consistent_point }
+            (Phase::Snapshot(snapshot), Some(consistent_point)) => {
+                CursorPhase::Snapshot(snapshot.position(consistent_point, self.polled_lsn))
             }
             (
                 Phase::AwaitingStream { .. } | Phase::Streaming | Phase::Idle,
@@ -284,6 +289,7 @@ impl SourceConnector for PostgresCdcSource {
         self.layout = Some(prepared.layout);
         self.relation = Some(prepared.relation);
         self.checkpoint_binding = Some(prepared.binding);
+        self.copy_plan = prepared.copy_plan.map(Arc::new);
         self.incarnation = incarnation;
         self.config = parsed;
         self.schema = declared;
@@ -301,6 +307,25 @@ impl SourceConnector for PostgresCdcSource {
                 self.polled_lsn = consistent_point;
                 self.phase = Phase::AwaitingStream { released: false };
             }
+            StartPhase::Snapshot {
+                claim,
+                position,
+                runtime,
+            } => {
+                let plan = self.copy_plan.clone().ok_or_else(|| {
+                    ConnectorError::Internal("PostgreSQL CDC resumes a copy without a plan".into())
+                })?;
+                let (consistent_point, lsn) = (position.consistent_point, position.lsn);
+                let snapshot = ChunkedSnapshot::resume(
+                    plan,
+                    claim.application_name(&self.incarnation),
+                    position,
+                )?;
+                self.consistent_point = Some(consistent_point);
+                self.install_reader(lsn, runtime);
+                self.claim = Some(claim);
+                self.phase = Phase::Snapshot(Box::new(snapshot));
+            }
             StartPhase::Stream {
                 claim,
                 consistent_point,
@@ -309,7 +334,8 @@ impl SourceConnector for PostgresCdcSource {
             } => {
                 self.claim = Some(claim);
                 self.consistent_point = Some(consistent_point);
-                self.enter_streaming(lsn, runtime);
+                self.install_reader(lsn, runtime);
+                self.phase = Phase::Streaming;
             }
         }
         self.state = ConnectorState::Running;
@@ -349,6 +375,7 @@ impl SourceConnector for PostgresCdcSource {
                     )
                 })?;
                 self.begin_streaming(start).await?;
+                self.phase = Phase::Streaming;
                 Ok(None)
             }
             Phase::Snapshot(_) => self.poll_snapshot(max_records).await,
@@ -405,8 +432,8 @@ impl SourceConnector for PostgresCdcSource {
                 task.commit();
                 return Ok(());
             }
-            (CursorPhase::Snapshot { .. }, Phase::Snapshot(reader)) => {
-                reader.release();
+            (CursorPhase::Snapshot(_), Phase::Snapshot(snapshot)) if !snapshot.released() => {
+                snapshot.release();
                 return Ok(());
             }
             (CursorPhase::Streaming { .. }, Phase::AwaitingStream { released }) => {
@@ -414,7 +441,10 @@ impl SourceConnector for PostgresCdcSource {
                 return Ok(());
             }
             (CursorPhase::Streaming { lsn, .. }, _) => lsn,
-            (CursorPhase::Claimed | CursorPhase::Snapshot { .. }, _) => return Ok(()),
+            // Released but the stream not opened yet: nothing past the consistent point was read.
+            (CursorPhase::Snapshot(_), _) if self.applied_lsn.is_none() => return Ok(()),
+            (CursorPhase::Snapshot(position), _) => position.lsn,
+            (CursorPhase::Claimed, _) => return Ok(()),
         };
         // Advance the slot only after the epoch is durably committed (manifest persisted and
         // sinks committed), so PostgreSQL never reclaims WAL for rows still in the pipeline.
@@ -485,7 +515,7 @@ impl SourceConnector for PostgresCdcSource {
         }
         match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Claiming(task) => task.cancel().await,
-            Phase::Snapshot(reader) => drop(reader),
+            Phase::Snapshot(snapshot) => drop(snapshot),
             Phase::Idle | Phase::AwaitingStream { .. } | Phase::Streaming => {}
         }
         self.reader_handle = None;

@@ -10,10 +10,11 @@ mod creation;
 
 use crate::connector::SourceBatch;
 
-use super::super::config::{PostgresCdcConfig, SnapshotMode};
+use super::super::config::{OutputMode, PostgresCdcConfig};
 use super::super::postgres_io::slots::{self, PrefixSlot, SlotFacts, SlotHolder};
 use super::super::postgres_io::{inspect_source, ControlConnection, PostgresCheckpointBinding};
 use super::checkpoint::{validate_live_binding, CursorPhase};
+use super::snapshot::{ChunkedSnapshot, PgSnapshot};
 use super::{Arc, ConnectorError, Lsn, Phase, PostgresCdcSource};
 
 pub(super) use creation::ClaimTask;
@@ -124,25 +125,32 @@ pub(super) enum ResumeAction {
 
 /// The restart matrix: the action a committed cursor `phase` takes on its claimed slot.
 pub(super) fn resume_action(
-    phase: CursorPhase,
+    phase: &CursorPhase,
     slot: Option<&SlotFacts>,
-    mode: SnapshotMode,
+    output: OutputMode,
     claim: &SlotClaim,
     incarnation: &str,
 ) -> ResumeAction {
     let name = claim.slot();
     match (phase, slot) {
-        (CursorPhase::Snapshot { .. }, _) => ResumeAction::FailClosed(format!(
-            "the checkpoint was captured inside the initial snapshot of slot '{name}', which \
-             cannot be resumed: {}",
-            reset_instructions(name)
-        )),
+        // A sink may already hold rows the failed attempt copied after this cursor. Upsert
+        // targets converge because tombstones are never suppressed during the copy; a changelog
+        // consumer would keep a row deleted before it was copied again.
+        (CursorPhase::Snapshot(_), _) if output == OutputMode::Changelog => {
+            ResumeAction::FailClosed(format!(
+                "the checkpoint was captured inside the initial snapshot of slot '{name}', \
+                 which a changelog source cannot resume: {}",
+                reset_instructions(name)
+            ))
+        }
         (CursorPhase::Claimed, None) => ResumeAction::Create,
-        (CursorPhase::Streaming { .. }, None) => ResumeAction::FailClosed(format!(
-            "cannot resume PostgreSQL CDC slot '{name}': the slot is missing and the WAL it \
-             retained is gone: {}",
-            reset_instructions(name)
-        )),
+        (CursorPhase::Snapshot(_) | CursorPhase::Streaming { .. }, None) => {
+            ResumeAction::FailClosed(format!(
+                "cannot resume PostgreSQL CDC slot '{name}': the slot is missing and the WAL it \
+                 retained is gone: {}",
+                reset_instructions(name)
+            ))
+        }
         (
             _,
             Some(SlotFacts {
@@ -159,39 +167,34 @@ pub(super) fn resume_action(
                 ..
             }),
         ) => ResumeAction::Busy(holder.clone()),
-        (CursorPhase::Claimed, Some(facts)) => claimed_action(facts, mode),
+        (CursorPhase::Claimed, Some(facts)) => claimed_action(facts),
+        (CursorPhase::Snapshot(position), Some(facts)) => {
+            position_action(facts, name, position.consistent_point, position.lsn)
+        }
         (
             CursorPhase::Streaming {
                 consistent_point,
                 lsn,
             },
             Some(facts),
-        ) => streaming_action(facts, name, consistent_point, lsn),
+        ) => position_action(facts, name, *consistent_point, *lsn),
     }
 }
 
-/// Nothing was emitted under a claimed cursor and no slot feedback was sent, so `never` mode
-/// adopts a healthy slot from its consistent point; `initial` mode needs the snapshot only a new
-/// slot exports.
-fn claimed_action(facts: &SlotFacts, mode: SnapshotMode) -> ResumeAction {
+/// Nothing was emitted under a claimed cursor and no slot feedback was sent, so a healthy slot
+/// is adopted from its consistent point. A copy takes its visibility floor from a temporary
+/// probe slot created then.
+fn claimed_action(facts: &SlotFacts) -> ResumeAction {
     if let Some(problem) = &facts.unusable {
         return ResumeAction::NewClaim(problem.clone());
     }
-    match (mode, facts.confirmed_flush_lsn) {
-        (SnapshotMode::Never, Some(confirmed)) => ResumeAction::Adopt(confirmed),
-        (SnapshotMode::Never, None) => ResumeAction::NewClaim("has no confirmed position".into()),
-        (SnapshotMode::Initial, _) => ResumeAction::NewClaim(
-            "can no longer provide the exported snapshot the initial copy needs".into(),
-        ),
+    match facts.confirmed_flush_lsn {
+        Some(confirmed) => ResumeAction::Adopt(confirmed),
+        None => ResumeAction::NewClaim("has no confirmed position".into()),
     }
 }
 
-fn streaming_action(
-    facts: &SlotFacts,
-    name: &str,
-    consistent_point: Lsn,
-    lsn: Lsn,
-) -> ResumeAction {
+fn position_action(facts: &SlotFacts, name: &str, consistent_point: Lsn, lsn: Lsn) -> ResumeAction {
     let reset = reset_instructions(name);
     if let Some(problem) = &facts.unusable {
         return ResumeAction::FailClosed(format!(
@@ -238,7 +241,7 @@ pub(super) async fn settle(
     config: &PostgresCdcConfig,
     claim: &SlotClaim,
     incarnation: &str,
-    phase: CursorPhase,
+    phase: &CursorPhase,
     binding: &PostgresCheckpointBinding,
 ) -> Result<ResumeAction, ConnectorError> {
     let decide = || async {
@@ -247,7 +250,7 @@ pub(super) async fn settle(
         Ok::<_, ConnectorError>(resume_action(
             phase,
             inspected.slot.as_ref(),
-            config.snapshot_mode,
+            config.output_mode,
             claim,
             incarnation,
         ))
@@ -336,7 +339,7 @@ impl PostgresCdcSource {
         claim: SlotClaim,
         committed: bool,
     ) -> Result<(), ConnectorError> {
-        let (Some(binding), Some(layout)) = (&self.checkpoint_binding, &self.layout) else {
+        let Some(binding) = &self.checkpoint_binding else {
             return Err(ConnectorError::Internal(
                 "PostgreSQL CDC claims a slot before startup bound the source".into(),
             ));
@@ -347,7 +350,6 @@ impl PostgresCdcSource {
             incarnation: self.incarnation.clone(),
             claim: claim.clone(),
             binding: binding.clone(),
-            layout: layout.clone(),
             admission: self.task_owner.admission(),
             data_ready: Arc::clone(&self.data_ready),
         };
@@ -361,6 +363,18 @@ impl PostgresCdcSource {
         self.claim = Some(claim);
         self.phase = Phase::Claiming(task);
         Ok(())
+    }
+
+    /// The copy of the claimed slot's table from its visibility snapshot `floor`.
+    pub(super) fn new_copy(&self, floor: PgSnapshot) -> Result<ChunkedSnapshot, ConnectorError> {
+        let plan = self.copy_plan.as_ref().ok_or_else(|| {
+            ConnectorError::Internal("PostgreSQL CDC copies without a copy plan".into())
+        })?;
+        Ok(ChunkedSnapshot::new(
+            Arc::clone(plan),
+            self.claim()?.application_name(&self.incarnation),
+            Some(floor),
+        ))
     }
 
     /// Install the slot once the creation task finished; until then intake stays held.
@@ -378,21 +392,19 @@ impl PostgresCdcSource {
             Err(error) => return Err(self.fail(error)),
         };
         match outcome {
-            ClaimOutcome::Created {
+            ClaimOutcome::Ready {
                 consistent_point,
-                snapshot: Some(reader),
+                floor,
             } => {
                 self.consistent_point = Some(consistent_point);
-                self.phase = Phase::Snapshot(reader);
-            }
-            ClaimOutcome::Created {
-                consistent_point,
-                snapshot: None,
-            }
-            | ClaimOutcome::Adopted(consistent_point) => {
-                self.consistent_point = Some(consistent_point);
                 self.polled_lsn = consistent_point;
-                self.phase = Phase::AwaitingStream { released: false };
+                self.phase = match floor {
+                    Some(floor) => match self.new_copy(floor) {
+                        Ok(copy) => Phase::Snapshot(Box::new(copy)),
+                        Err(error) => return Err(self.fail(error)),
+                    },
+                    None => Phase::AwaitingStream { released: false },
+                };
             }
             ClaimOutcome::NewClaim => {
                 let claim = SlotClaim::generate(&self.config.slot_name);

@@ -290,9 +290,10 @@ delete `/tmp/laminardb-pg-cdc`, and empty the target tables.
   stay exact. Exactly-once delivery isn't available.
 - Each source reads one table, which needs a primary key and `REPLICA IDENTITY FULL`, through a
   publication of exactly that table. The declared `PRIMARY KEY` must match the table's.
-- The initial copy (`snapshot.mode = 'initial'`, the default) keeps a transaction open until it
-  finishes, and a restart once the copy has started needs the reset above. `snapshot.mode =
-  'never'` skips the copy and follows changes from the first start.
+- The initial copy (`snapshot.mode = 'initial'`, the default) reads the table in short chunks
+  while it follows changes, so no transaction stays open and WAL is released as checkpoints
+  commit. A restart during the copy resumes it for an upsert source; a changelog source needs the
+  reset above. `snapshot.mode = 'never'` skips the copy and follows changes from the first start.
 - LaminarDB never drops a slot. A slot left behind by a restart is logged as an orphan with the
   statement that drops it.
 - PostgreSQL keeps WAL for the slot until LaminarDB has committed the changes. Set

@@ -5,15 +5,17 @@ use arrow_schema::SchemaRef;
 
 use super::super::config::{PostgresCdcConfig, SnapshotMode};
 use super::super::postgres_io::{
-    self, inspect_capture_table, inspect_source, unreadable_columns, CaptureTable,
-    ControlConnection, PostgresCheckpointBinding,
+    self, in_recovery, inspect_capture_table, inspect_source, layout_fingerprint,
+    primary_key_index, unreadable_columns, CaptureTable, ControlConnection,
+    PostgresCheckpointBinding,
 };
 use super::super::schema::RelationInfo;
 use super::super::schema_resolution::{bind_layout, validate_relation};
 use super::super::typed_rows::RowLayout;
-use super::checkpoint::{validate_live_binding, Cursor, CursorPhase};
+use super::checkpoint::{validate_live_binding, Cursor, CursorPhase, SnapshotPosition};
 use super::claim::{busy, report_orphans, settle, warn_orphaning, ResumeAction, SlotClaim};
 use super::reader::{run_wal_reader, OwnedWalPayload, WalPayloadRx, WalTerminalError};
+use super::snapshot::{copy_problem, CopyPlan};
 use super::{
     Arc, ConnectorError, ConnectorTaskOwner, Lsn, Notify, Semaphore, PGWIRE_IN_FLIGHT_EVENTS,
     RAW_WAL_QUEUE_CAPACITY,
@@ -30,6 +32,12 @@ pub(super) enum StartPhase {
         claim: SlotClaim,
         consistent_point: Lsn,
     },
+    /// Continue the copy from `position`, streaming the claim's slot from its `lsn`.
+    Snapshot {
+        claim: SlotClaim,
+        position: SnapshotPosition,
+        runtime: ReaderRuntime,
+    },
     /// Stream the claim's existing slot from `lsn`.
     Stream {
         claim: SlotClaim,
@@ -45,6 +53,8 @@ pub(super) struct PreparedStart {
     pub(super) relation: RelationInfo,
     pub(super) binding: PostgresCheckpointBinding,
     pub(super) phase: StartPhase,
+    /// The copy's SQL, when the source copies or may copy the table.
+    pub(super) copy_plan: Option<CopyPlan>,
     /// Orphaned slots under the prefix, when they could be listed.
     pub(super) orphans: Option<usize>,
 }
@@ -126,13 +136,17 @@ async fn prepare_on(
             config.relation_metadata_bytes()
         )));
     }
-    let copies = config.snapshot_mode == SnapshotMode::Initial
-        && cursor
-            .as_ref()
-            .is_none_or(|cursor| cursor.phase == CursorPhase::Claimed);
-    if copies {
-        admit_copy(control, config, &table, &layout).await?;
-    }
+    // The snapshot mode only matters until the slot exists; after that the cursor phase decides.
+    let copies = match cursor.as_ref().map(|cursor| &cursor.phase) {
+        None | Some(CursorPhase::Claimed) => config.snapshot_mode == SnapshotMode::Initial,
+        Some(CursorPhase::Snapshot(_)) => true,
+        Some(CursorPhase::Streaming { .. }) => false,
+    };
+    let copy_plan = if copies {
+        Some(admit_copy(control, config, &table, &layout).await?)
+    } else {
+        None
+    };
     let (binding, phase) = match cursor {
         None => (
             live.binding(config),
@@ -147,7 +161,7 @@ async fn prepare_on(
                 config,
                 &claim,
                 inputs.incarnation,
-                cursor.phase,
+                &cursor.phase,
                 &cursor.binding,
             )
             .await?;
@@ -158,6 +172,7 @@ async fn prepare_on(
     let current = match &phase {
         StartPhase::Claim { claim, .. }
         | StartPhase::AwaitStream { claim, .. }
+        | StartPhase::Snapshot { claim, .. }
         | StartPhase::Stream { claim, .. } => claim,
     };
     let orphans = report_orphans(control.client(), &config.slot_name, current).await;
@@ -166,18 +181,20 @@ async fn prepare_on(
         relation: table.relation,
         binding,
         phase,
+        copy_plan,
         orphans,
     })
 }
 
 /// Require the initial copy to read every row and declared column that logical replication
-/// streams, before any slot exists: a refused copy would otherwise fail after creating one.
+/// streams, and to order keys as the primary-key index does, before any slot exists: a refused
+/// copy would otherwise fail after creating one.
 async fn admit_copy(
     control: &ControlConnection,
     config: &PostgresCdcConfig,
     table: &CaptureTable,
     layout: &RowLayout,
-) -> Result<(), ConnectorError> {
+) -> Result<CopyPlan, ConnectorError> {
     let (user, name) = (&config.username, &config.table);
     if table.row_security {
         return Err(ConnectorError::ConfigurationError(format!(
@@ -201,7 +218,14 @@ async fn admit_copy(
             unreadable.join(", ")
         )));
     }
-    Ok(())
+    let relation_id = table.relation.relation_id;
+    let keys = primary_key_index(control.client(), relation_id).await?;
+    let standby = in_recovery(control.client()).await?;
+    if let Some(problem) = copy_problem(name, standby, &keys) {
+        return Err(ConnectorError::ConfigurationError(problem));
+    }
+    let fingerprint = layout_fingerprint(control.client(), relation_id).await?;
+    CopyPlan::new(name, layout, relation_id, &keys, fingerprint)
 }
 
 /// Carry out the restart matrix's decision for a committed cursor.
@@ -219,15 +243,26 @@ async fn resumed_phase(
             committed: true,
         }),
         ResumeAction::Adopt(lsn) => {
-            let CursorPhase::Streaming {
-                consistent_point, ..
-            } = cursor.phase
-            else {
-                tracing::info!(slot = claim.slot(), %lsn, "adopted the claimed PostgreSQL replication slot");
-                return Ok(StartPhase::AwaitStream {
-                    claim,
-                    consistent_point: lsn,
-                });
+            let consistent_point = match &cursor.phase {
+                // The copy's floor comes from a probe slot, which waits for running transactions
+                // and therefore runs on the creation task.
+                CursorPhase::Claimed if config.snapshot_mode == SnapshotMode::Initial => {
+                    return Ok(StartPhase::Claim {
+                        claim,
+                        committed: true,
+                    });
+                }
+                CursorPhase::Claimed => {
+                    tracing::info!(slot = claim.slot(), %lsn, "adopted the claimed PostgreSQL replication slot");
+                    return Ok(StartPhase::AwaitStream {
+                        claim,
+                        consistent_point: lsn,
+                    });
+                }
+                CursorPhase::Snapshot(position) => position.consistent_point,
+                CursorPhase::Streaming {
+                    consistent_point, ..
+                } => *consistent_point,
             };
             let runtime = launch_reader(
                 owner,
@@ -240,11 +275,18 @@ async fn resumed_phase(
             )
             .await?;
             tracing::info!(slot = claim.slot(), %lsn, "resuming PostgreSQL replication slot");
-            Ok(StartPhase::Stream {
-                claim,
-                consistent_point,
-                lsn,
-                runtime,
+            Ok(match &cursor.phase {
+                CursorPhase::Snapshot(position) => StartPhase::Snapshot {
+                    claim,
+                    position: position.clone(),
+                    runtime,
+                },
+                _ => StartPhase::Stream {
+                    claim,
+                    consistent_point,
+                    lsn,
+                    runtime,
+                },
             })
         }
         ResumeAction::NewClaim(reason) => {

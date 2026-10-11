@@ -13,6 +13,7 @@ pub(super) type WalTerminalError = Arc<std::sync::Mutex<Option<String>>>;
 pub(super) enum WalPayload {
     Begin {
         final_lsn: u64,
+        xid: u32,
         commit_ts_us: i64,
     },
     Commit {
@@ -139,11 +140,12 @@ fn reader_payload(event: pgwire_replication::ReplicationEvent) -> Result<ReaderP
     Ok(match event {
         ReplicationEvent::Begin {
             final_lsn,
+            xid,
             commit_time_micros,
-            ..
         } => (
             WalPayload::Begin {
                 final_lsn: final_lsn.as_u64(),
+                xid,
                 commit_ts_us: commit_time_micros,
             },
             None,

@@ -6,10 +6,11 @@ use crate::error::ConnectorError;
 use super::super::config::PostgresCdcConfig;
 use super::super::postgres_io::{source_config_digest, PostgresCheckpointBinding};
 use super::claim::{reset_instructions, SlotClaim};
+use super::snapshot::PgSnapshot;
 use super::Lsn;
 
 const CHECKPOINT_CONNECTOR: &str = "postgres-cdc";
-const CHECKPOINT_VERSION: &str = "5";
+const CHECKPOINT_VERSION: &str = "6";
 const PHASE_METADATA: &str = "phase";
 const PHASE_CLAIMED: &str = "claimed";
 const PHASE_SNAPSHOT: &str = "snapshot";
@@ -20,6 +21,10 @@ const SLOT_METADATA: &str = "slot";
 const V4_SLOT_METADATA: &str = "slot_name";
 const CONSISTENT_POINT_METADATA: &str = "consistent_point";
 const LSN_OFFSET: &str = "lsn";
+const BOUND_METADATA: &str = "snapshot_bound";
+const CHUNKS_METADATA: &str = "snapshot_chunks";
+const PENDING_METADATA: &str = "pending_xids";
+const FLOOR_METADATA: &str = "visibility_floor";
 const SYSTEM_IDENTIFIER_METADATA: &str = "system_identifier";
 const TIMELINE_ID_METADATA: &str = "timeline_id";
 const DATABASE_OID_METADATA: &str = "database_oid";
@@ -28,16 +33,32 @@ const PUBLICATION_DEFINITION_METADATA: &str = "publication_definition_sha256";
 const SOURCE_CONFIG_METADATA: &str = "source_config_sha256";
 
 /// The source position a cursor describes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CursorPhase {
     /// The slot name is claimed; the slot is created once this cursor commits. Nothing was
     /// emitted.
     Claimed,
-    /// Inside the initial snapshot of the slot created at `consistent_point`; not resumable.
-    Snapshot { consistent_point: Lsn },
+    /// Inside the chunked copy of the slot's table.
+    Snapshot(SnapshotPosition),
     /// After every transaction ending at or before `lsn` on the slot created at
     /// `consistent_point`.
     Streaming { consistent_point: Lsn, lsn: Lsn },
+}
+
+/// A position inside the copy: the stream after every transaction ending at or before `lsn`, and
+/// every key at or below `bound` copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SnapshotPosition {
+    pub(super) consistent_point: Lsn,
+    pub(super) lsn: Lsn,
+    /// Primary-key texts in index order; `None` before the first chunk.
+    pub(super) bound: Option<Vec<String>>,
+    /// Chunks emitted so far.
+    pub(super) chunks: u64,
+    /// Full xids every later chunk snapshot must see, ascending.
+    pub(super) pending: Vec<u64>,
+    /// The slot's visibility snapshot, until a chunk snapshot covered it.
+    pub(super) floor: Option<PgSnapshot>,
 }
 
 /// A committed cursor: the claim, the identity it was taken under, and the position.
@@ -68,10 +89,7 @@ pub(super) fn write_cursor(
     checkpoint.set_metadata(SLOT_METADATA, claim.slot());
     match phase {
         CursorPhase::Claimed => checkpoint.set_metadata(PHASE_METADATA, PHASE_CLAIMED),
-        CursorPhase::Snapshot { consistent_point } => {
-            checkpoint.set_metadata(PHASE_METADATA, PHASE_SNAPSHOT);
-            checkpoint.set_metadata(CONSISTENT_POINT_METADATA, consistent_point.to_string());
-        }
+        CursorPhase::Snapshot(position) => write_snapshot_position(&mut checkpoint, &position),
         CursorPhase::Streaming {
             consistent_point,
             lsn,
@@ -97,6 +115,66 @@ pub(super) fn write_cursor(
     );
     checkpoint.set_metadata(SOURCE_CONFIG_METADATA, &binding.source_config_sha256);
     checkpoint
+}
+
+fn write_snapshot_position(checkpoint: &mut SourceCheckpoint, position: &SnapshotPosition) {
+    checkpoint.set_metadata(PHASE_METADATA, PHASE_SNAPSHOT);
+    checkpoint.set_metadata(
+        CONSISTENT_POINT_METADATA,
+        position.consistent_point.to_string(),
+    );
+    checkpoint.set_offset(LSN_OFFSET, position.lsn.to_string());
+    if let Some(bound) = &position.bound {
+        checkpoint.set_metadata(
+            BOUND_METADATA,
+            serde_json::to_string(bound).unwrap_or_default(),
+        );
+    }
+    checkpoint.set_metadata(CHUNKS_METADATA, position.chunks.to_string());
+    let pending = position
+        .pending
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    checkpoint.set_metadata(PENDING_METADATA, pending);
+    if let Some(floor) = &position.floor {
+        checkpoint.set_metadata(FLOOR_METADATA, floor.to_string());
+    }
+}
+
+fn parse_snapshot_position(
+    checkpoint: &SourceCheckpoint,
+    context: &str,
+) -> Result<SnapshotPosition, ConnectorError> {
+    let invalid = |key: &str| {
+        ConnectorError::ConfigurationError(format!(
+            "PostgreSQL CDC {context} has invalid '{key}' metadata"
+        ))
+    };
+    let bound = checkpoint
+        .get_metadata(BOUND_METADATA)
+        .map(|text| serde_json::from_str::<Vec<String>>(text).map_err(|_| invalid(BOUND_METADATA)))
+        .transpose()?;
+    let pending = match required(checkpoint, PENDING_METADATA, context)? {
+        "" => Vec::new(),
+        list => list
+            .split(',')
+            .map(|xid| xid.parse::<u64>().map_err(|_| invalid(PENDING_METADATA)))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let floor = checkpoint
+        .get_metadata(FLOOR_METADATA)
+        .map(|text| PgSnapshot::parse(text).map_err(|_| invalid(FLOOR_METADATA)))
+        .transpose()?;
+    Ok(SnapshotPosition {
+        consistent_point: lsn(checkpoint.get_metadata(CONSISTENT_POINT_METADATA), context)?,
+        lsn: lsn(checkpoint.get_offset(LSN_OFFSET), context)?,
+        bound,
+        chunks: decimal(checkpoint, CHUNKS_METADATA, context)?,
+        pending,
+        floor,
+    })
 }
 
 /// Parse a committed cursor.
@@ -138,9 +216,7 @@ pub(super) fn parse_cursor(
     let claim = parse_claim(checkpoint, config, context)?;
     let phase = match required(checkpoint, PHASE_METADATA, context)? {
         PHASE_CLAIMED => CursorPhase::Claimed,
-        PHASE_SNAPSHOT => CursorPhase::Snapshot {
-            consistent_point: lsn(checkpoint.get_metadata(CONSISTENT_POINT_METADATA), context)?,
-        },
+        PHASE_SNAPSHOT => CursorPhase::Snapshot(parse_snapshot_position(checkpoint, context)?),
         PHASE_STREAMING => CursorPhase::Streaming {
             consistent_point: lsn(checkpoint.get_metadata(CONSISTENT_POINT_METADATA), context)?,
             lsn: lsn(checkpoint.get_offset(LSN_OFFSET), context)?,

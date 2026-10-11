@@ -8,9 +8,7 @@ use crate::error::ConnectorError;
 use super::{CommittedTransaction, Lsn, PostgresCdcSource};
 use crate::postgres::cdc::config::OutputMode;
 
-/// Order-key tag of snapshot rows; all of them sort before every streamed transaction.
-pub(super) const SNAPSHOT_ORDER_TAG: u8 = 0;
-/// Order-key tag of streamed rows, followed by the transaction's commit end LSN.
+/// Order-key tag of streamed rows and copied chunks, followed by an LSN.
 const WAL_ORDER_TAG: u8 = 1;
 
 impl PostgresCdcSource {
@@ -29,16 +27,13 @@ impl PostgresCdcSource {
 
     /// Number of leading committed transactions forming the next batch: always at least one,
     /// then whole transactions while the row target and Arrow-build budget allow.
-    fn select_transactions(&self, max_rows: usize) -> usize {
+    pub(super) fn select_transactions(&self, max_rows: usize) -> usize {
         let arrow_limit = self.config.arrow_build_bytes();
         let mut selected = 0_usize;
         let mut rows = 0_usize;
         let mut bytes = 0_usize;
         for transaction in &self.committed {
-            let transaction_rows = transaction
-                .records
-                .as_ref()
-                .map_or(0, RecordBatch::num_rows);
+            let transaction_rows = transaction.rows();
             let next_rows = rows.saturating_add(transaction_rows);
             let next_bytes = bytes.saturating_add(transaction.retained_bytes);
             if rows != 0
@@ -143,15 +138,19 @@ impl PostgresCdcSource {
     }
 }
 
-fn wal_order_key(end_lsn: Lsn) -> [u8; 9] {
+/// Order key of the rows of the transaction committing at `end_lsn`.
+pub(super) fn wal_order_key(end_lsn: Lsn) -> [u8; 9] {
     let mut key = [WAL_ORDER_TAG; 9];
     key[1..].copy_from_slice(&end_lsn.as_u64().to_be_bytes());
     key
 }
 
-/// Order key of the `ordinal`-th snapshot row.
-pub(super) fn snapshot_order_key(ordinal: u64) -> [u8; 9] {
-    let mut key = [SNAPSHOT_ORDER_TAG; 9];
-    key[1..].copy_from_slice(&ordinal.to_be_bytes());
+/// Order key of the `ordinal`-th copied chunk, emitted after every transaction ending at or
+/// before `high` and before any ending after it. A transaction's key is a prefix of it when they
+/// share the LSN, so it sorts first.
+pub(super) fn chunk_order_key(high: Lsn, ordinal: u64) -> [u8; 18] {
+    let mut key = [WAL_ORDER_TAG; 18];
+    key[1..9].copy_from_slice(&high.as_u64().to_be_bytes());
+    key[10..].copy_from_slice(&ordinal.to_be_bytes());
     key
 }

@@ -5,10 +5,11 @@ use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::Array;
 use arrow_schema::{DataType, Field};
 
-use super::checkpoint::{parse_cursor, write_cursor, Cursor, CursorPhase};
+use super::checkpoint::{parse_cursor, write_cursor, Cursor, CursorPhase, SnapshotPosition};
 use super::reader::{
     publish_terminal_wal_error, retained_wal_payload_bytes, send_wal_or_shutdown, WalPayloadTx,
 };
+use super::snapshot::PgSnapshot;
 use super::*;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
@@ -19,19 +20,20 @@ use crate::connector::{
 use crate::postgres::cdc::config::{OutputMode, TableName};
 use crate::postgres::cdc::postgres_io::{source_config_digest, CaptureTable};
 use crate::postgres::cdc::schema_resolution::bind_layout;
+use crate::postgres::cdc::typed_rows::RowLayout;
 use crate::postgres::cdc::types::{PgColumn, INT4_OID, INT8_OID, TEXT_OID};
 
-const OID: u32 = 7;
+pub(super) const OID: u32 = 7;
 
 /// One pgoutput tuple value.
 #[derive(Clone, Copy)]
-enum V<'a> {
+pub(super) enum V<'a> {
     T(&'a str),
     Null,
     Unchanged,
 }
 
-fn capture_table() -> CaptureTable {
+pub(super) fn capture_table() -> CaptureTable {
     CaptureTable {
         relation: RelationInfo {
             relation_id: OID,
@@ -51,7 +53,7 @@ fn capture_table() -> CaptureTable {
     }
 }
 
-fn source_config(output_mode: OutputMode) -> PostgresCdcConfig {
+pub(super) fn source_config(output_mode: OutputMode) -> PostgresCdcConfig {
     PostgresCdcConfig {
         ssl_mode: crate::postgres::SslMode::Disable,
         table: TableName::parse("public.orders").unwrap(),
@@ -85,9 +87,9 @@ fn test_binding(config: &PostgresCdcConfig) -> PostgresCheckpointBinding {
 }
 
 const CLAIM_ID: &str = "0123456789abcdef";
-const CONSISTENT_POINT: Lsn = Lsn::new(0x10);
+pub(super) const CONSISTENT_POINT: Lsn = Lsn::new(0x10);
 
-fn streaming_source(output_mode: OutputMode) -> PostgresCdcSource {
+pub(super) fn streaming_source(output_mode: OutputMode) -> PostgresCdcSource {
     let config = source_config(output_mode);
     let schema = declared(output_mode);
     let layout = bind_layout(&config, &schema, &["id".into()], &capture_table()).unwrap();
@@ -111,7 +113,7 @@ fn streaming_source(output_mode: OutputMode) -> PostgresCdcSource {
     source
 }
 
-fn relation_message() -> Vec<u8> {
+pub(super) fn relation_message() -> Vec<u8> {
     let mut buf = vec![b'R'];
     buf.extend_from_slice(&OID.to_be_bytes());
     buf.extend_from_slice(b"public\0orders\0f");
@@ -143,15 +145,16 @@ fn tuple(buf: &mut Vec<u8>, tag: u8, values: &[V<'_>]) {
     }
 }
 
-fn begin(final_lsn: u64) -> Vec<u8> {
+/// A BEGIN whose xid is the low word of `final_lsn`, so each test transaction has its own.
+pub(super) fn begin(final_lsn: u64) -> Vec<u8> {
     let mut buf = vec![b'B'];
     buf.extend_from_slice(&final_lsn.to_be_bytes());
     buf.extend_from_slice(&0_i64.to_be_bytes());
-    buf.extend_from_slice(&1_u32.to_be_bytes());
+    buf.extend_from_slice(&u32::try_from(final_lsn).unwrap().to_be_bytes());
     buf
 }
 
-fn commit(commit_lsn: u64, end_lsn: u64) -> Vec<u8> {
+pub(super) fn commit(commit_lsn: u64, end_lsn: u64) -> Vec<u8> {
     let mut buf = vec![b'C', 0];
     buf.extend_from_slice(&commit_lsn.to_be_bytes());
     buf.extend_from_slice(&end_lsn.to_be_bytes());
@@ -159,14 +162,14 @@ fn commit(commit_lsn: u64, end_lsn: u64) -> Vec<u8> {
     buf
 }
 
-fn insert(values: &[V<'_>]) -> Vec<u8> {
+pub(super) fn insert(values: &[V<'_>]) -> Vec<u8> {
     let mut buf = vec![b'I'];
     buf.extend_from_slice(&OID.to_be_bytes());
     tuple(&mut buf, b'N', values);
     buf
 }
 
-fn update(old_tag: Option<u8>, old: &[V<'_>], new: &[V<'_>]) -> Vec<u8> {
+pub(super) fn update(old_tag: Option<u8>, old: &[V<'_>], new: &[V<'_>]) -> Vec<u8> {
     let mut buf = vec![b'U'];
     buf.extend_from_slice(&OID.to_be_bytes());
     if let Some(tag) = old_tag {
@@ -176,18 +179,18 @@ fn update(old_tag: Option<u8>, old: &[V<'_>], new: &[V<'_>]) -> Vec<u8> {
     buf
 }
 
-fn delete(old_tag: u8, old: &[V<'_>]) -> Vec<u8> {
+pub(super) fn delete(old_tag: u8, old: &[V<'_>]) -> Vec<u8> {
     let mut buf = vec![b'D'];
     buf.extend_from_slice(&OID.to_be_bytes());
     tuple(&mut buf, old_tag, old);
     buf
 }
 
-fn row<'a>(id: &'a str, status: &'a str, qty: &'a str) -> [V<'a>; 4] {
+pub(super) fn row<'a>(id: &'a str, status: &'a str, qty: &'a str) -> [V<'a>; 4] {
     [V::T(id), V::T(status), V::T(qty), V::Null]
 }
 
-fn transaction(source: &mut PostgresCdcSource, final_lsn: u64, changes: Vec<Vec<u8>>) {
+pub(super) fn transaction(source: &mut PostgresCdcSource, final_lsn: u64, changes: Vec<Vec<u8>>) {
     source.enqueue_wal_data(begin(final_lsn));
     for change in changes {
         source.enqueue_wal_data(change);
@@ -215,7 +218,7 @@ fn statuses(batch: &SourceBatch) -> Vec<Option<String>> {
         .collect()
 }
 
-fn encoded(source: &PostgresCdcSource, batch: SourceBatch) -> arrow_array::RecordBatch {
+pub(super) fn encoded(source: &PostgresCdcSource, batch: SourceBatch) -> arrow_array::RecordBatch {
     use crate::connector::{
         schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
     };
@@ -561,38 +564,57 @@ fn cursor(source: &PostgresCdcSource, phase: CursorPhase) -> SourceCheckpoint {
     )
 }
 
+/// A copy position past its first chunk, with every field set.
+fn copy_position(lsn: u64) -> SnapshotPosition {
+    SnapshotPosition {
+        consistent_point: CONSISTENT_POINT,
+        lsn: Lsn::new(lsn),
+        bound: Some(vec!["it's \"42\", \\ ok".into(), "é".into()]),
+        chunks: 7,
+        pending: vec![5_000_000_000, 5_000_000_007],
+        floor: Some(PgSnapshot::parse("4999999990:5000000010:4999999991,5000000003").unwrap()),
+    }
+}
+
 #[test]
 fn cursors_round_trip_every_phase_bound_to_the_exact_slot() {
     let source = streaming_source(OutputMode::Upsert);
+    let gate = SnapshotPosition {
+        consistent_point: CONSISTENT_POINT,
+        lsn: CONSISTENT_POINT,
+        bound: None,
+        chunks: 0,
+        pending: Vec::new(),
+        floor: None,
+    };
     let phases = [
         CursorPhase::Claimed,
-        CursorPhase::Snapshot {
-            consistent_point: CONSISTENT_POINT,
-        },
+        CursorPhase::Snapshot(gate),
+        CursorPhase::Snapshot(copy_position(0x480)),
         CursorPhase::Streaming {
             consistent_point: CONSISTENT_POINT,
             lsn: Lsn::new(0x500),
         },
     ];
     for phase in phases {
-        let checkpoint = cursor(&source, phase);
+        let checkpoint = cursor(&source, phase.clone());
         assert_eq!(
             parse_cursor(&checkpoint, &source.config, "test").unwrap(),
             Cursor {
                 claim: source.claim.clone().unwrap(),
                 binding: source.checkpoint_binding.clone().unwrap(),
-                phase,
+                phase: phase.clone(),
             }
         );
-        assert_eq!(checkpoint.get_metadata("checkpoint_version"), Some("5"));
+        assert_eq!(checkpoint.get_metadata("checkpoint_version"), Some("6"));
         assert_eq!(
             checkpoint.get_metadata("slot"),
             Some("laminar_slot_0123456789abcdef")
         );
         assert_eq!(
             checkpoint.get_offset("lsn").is_some(),
-            matches!(phase, CursorPhase::Streaming { .. }),
-            "only a streaming cursor is slot feedback"
+            !matches!(phase, CursorPhase::Claimed),
+            "every cursor past the claim carries the stream position"
         );
     }
     let streaming = source.try_checkpoint().unwrap().unwrap();
@@ -644,6 +666,32 @@ fn older_formats_foreign_slots_and_drift_are_rejected() {
         error.contains("SELECT pg_drop_replication_slot('laminar_slot')"),
         "{error}"
     );
+
+    let mut v5 = streaming.clone();
+    v5.set_metadata("checkpoint_version", "5");
+    let error = parse_cursor(&v5, &source.config, "test")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("version '5'"), "{error}");
+    assert!(
+        error.contains("SELECT pg_drop_replication_slot('laminar_slot_0123456789abcdef')"),
+        "{error}"
+    );
+
+    let snapshot = cursor(&source, CursorPhase::Snapshot(copy_position(0x480)));
+    for (key, value) in [
+        ("snapshot_bound", "[\"unterminated"),
+        ("pending_xids", "1,x"),
+        ("visibility_floor", "9:3:"),
+        ("snapshot_chunks", "-1"),
+    ] {
+        let mut corrupt = snapshot.clone();
+        corrupt.set_metadata(key, value);
+        assert!(
+            parse_cursor(&corrupt, &source.config, "test").is_err(),
+            "{key}={value}"
+        );
+    }
 
     for (claim, slot) in [
         (CLAIM_ID, "laminar_slot_ffffffffffffffff"),
@@ -760,23 +808,112 @@ async fn never_mode_streams_only_after_a_cursor_naming_the_slot_commits() {
     );
 }
 
+pub(super) fn copy_plan() -> CopyPlan {
+    let layout = source_layout(OutputMode::Upsert);
+    let keys = [crate::postgres::cdc::postgres_io::IndexKeyColumn {
+        name: "id".into(),
+        type_sql: "bigint".into(),
+        collation: None,
+        deterministic: true,
+        column_collation: true,
+        default_opclass: true,
+    }];
+    CopyPlan::new(
+        &TableName::parse("public.orders").unwrap(),
+        &layout,
+        OID,
+        &keys,
+        "fingerprint".into(),
+    )
+    .unwrap()
+}
+
+pub(super) fn source_layout(output_mode: OutputMode) -> RowLayout {
+    bind_layout(
+        &source_config(output_mode),
+        &declared(output_mode),
+        &["id".into()],
+        &capture_table(),
+    )
+    .unwrap()
+}
+
+/// The copy of a new slot, waiting for a cursor naming it to commit.
+pub(super) fn copy_gate() -> ChunkedSnapshot {
+    ChunkedSnapshot::new(
+        Arc::new(copy_plan()),
+        "laminar:0123456789abcdef:89abcdef".into(),
+        Some(PgSnapshot::parse("900:905:901").unwrap()),
+    )
+}
+
+/// The gate opens on a committed cursor naming the slot's copy, without I/O or slot feedback.
+/// Later copy cursors carry the stream position and are feedback, so WAL is released during the
+/// copy.
 #[tokio::test]
-async fn a_snapshot_cursor_is_never_slot_feedback() {
+async fn copy_cursors_open_the_gate_then_give_slot_feedback() {
     let mut source = streaming_source(OutputMode::Upsert);
+    source.phase = Phase::Snapshot(Box::new(copy_gate()));
+    source.polled_lsn = CONSISTENT_POINT;
     let feedback = source.applied_lsn.clone().unwrap();
-    let snapshot = cursor(
-        &source,
-        CursorPhase::Snapshot {
+    let gate = source.try_checkpoint().unwrap().expect("a cursor");
+    let Cursor { phase, .. } = parse_cursor(&gate, &source.config, "test").unwrap();
+    assert_eq!(
+        phase,
+        CursorPhase::Snapshot(SnapshotPosition {
             consistent_point: CONSISTENT_POINT,
-        },
+            lsn: CONSISTENT_POINT,
+            bound: None,
+            chunks: 0,
+            pending: Vec::new(),
+            floor: Some(PgSnapshot::parse("900:905:901").unwrap()),
+        })
     );
-    source.notify_epoch_committed(1, &snapshot).await.unwrap();
-    assert_eq!(feedback.get().as_u64(), 0);
+    let released = |source: &PostgresCdcSource| match &source.phase {
+        Phase::Snapshot(snapshot) => snapshot.released(),
+        _ => panic!("the source left the copy"),
+    };
+
+    source
+        .notify_epoch_committed(1, &cursor(&source, CursorPhase::Claimed))
+        .await
+        .unwrap();
+    assert!(!released(&source), "a committed claim is not enough");
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        source.notify_epoch_committed(2, &gate),
+    )
+    .await
+    .expect("opening the gate does no I/O")
+    .unwrap();
+    assert!(released(&source));
+    assert_eq!(
+        feedback.get().as_u64(),
+        0,
+        "opening the gate is not feedback"
+    );
+
+    source.polled_lsn = Lsn::new(0x480);
+    source
+        .notify_epoch_committed(
+            3,
+            &cursor(&source, CursorPhase::Snapshot(copy_position(0x480))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        feedback.get().as_u64(),
+        0x480,
+        "a copy cursor is slot feedback"
+    );
 }
 
 // ── Bounded buffering ──
 
-async fn queue(source: &mut PostgresCdcSource, payloads: Vec<WalPayload>) -> WalPayloadTx {
+pub(super) async fn queue(
+    source: &mut PostgresCdcSource,
+    payloads: Vec<WalPayload>,
+) -> WalPayloadTx {
     let budget = Arc::new(Semaphore::new(64 * 1024 * 1024));
     let (tx, rx) = crossfire::mpsc::bounded_async::<OwnedWalPayload>(payloads.len().max(1));
     let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -802,6 +939,7 @@ fn xlog(data: Vec<u8>) -> WalPayload {
 fn wire_transaction(final_lsn: u64, rows: usize, note: &str) -> Vec<WalPayload> {
     let mut payloads = vec![WalPayload::Begin {
         final_lsn,
+        xid: u32::try_from(final_lsn).unwrap(),
         commit_ts_us: 0,
     }];
     for id in 0..rows {
@@ -946,6 +1084,29 @@ async fn keepalives_advance_the_cursor_only_when_nothing_is_in_flight() {
     let _quiet = queue(&mut source, vec![keepalive(0x800)]).await;
     assert!(source.poll_batch(100).await.unwrap().is_none());
     assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/800"));
+
+    // A held chunk is undrained work: the cursor follows keepalives only up to its `high`, and
+    // a keepalive at or past it closes the chunk's window.
+    let read_at = PgSnapshot::parse("1:1:").unwrap();
+    source.phase = Phase::Snapshot(Box::new(copy_gate().holding(read_at, Lsn::new(0x900))));
+    let _below = queue(&mut source, vec![keepalive(0x880)]).await;
+    source.decode_queued(100).unwrap();
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/880"));
+    let _past = queue(&mut source, vec![keepalive(0xa00)]).await;
+    source.decode_queued(100).unwrap();
+    assert_eq!(
+        source.checkpoint().get_offset("lsn"),
+        Some("0/900"),
+        "never past the held chunk's high"
+    );
+    assert!(
+        source.poll_batch(100).await.unwrap().is_none(),
+        "the passed empty final chunk ends the copy without rows"
+    );
+    assert!(matches!(source.phase, Phase::Streaming));
+    let _after = queue(&mut source, vec![keepalive(0xb00)]).await;
+    assert!(source.poll_batch(100).await.unwrap().is_none());
+    assert_eq!(source.checkpoint().get_offset("lsn"), Some("0/B00"));
     assert_eq!(
         feedback.get().as_u64(),
         0,
@@ -1021,17 +1182,13 @@ async fn feedback_never_passes_the_polled_cursor_or_a_drifted_binding() {
         .unwrap_err();
     assert!(error.to_string().contains("drifted"), "{error}");
 
-    let snapshot = cursor(
-        &source,
-        CursorPhase::Snapshot {
-            consistent_point: CONSISTENT_POINT,
-        },
-    );
-    source.notify_epoch_committed(1, &snapshot).await.unwrap();
+    let ahead = cursor(&source, CursorPhase::Snapshot(copy_position(0x200)));
+    let error = source.notify_epoch_committed(1, &ahead).await.unwrap_err();
+    assert!(error.to_string().contains("ahead"), "{error}");
     assert_eq!(
         handle.get().as_u64(),
         0,
-        "no feedback is ever sent for snapshot rows"
+        "a copy cursor never passes the polled cursor"
     );
 }
 

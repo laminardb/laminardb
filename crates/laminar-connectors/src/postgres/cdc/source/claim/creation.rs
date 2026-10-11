@@ -14,9 +14,8 @@ use crate::connector::{ConnectorTaskAdmission, ConnectorTaskGuard, ConnectorTask
 use super::super::super::config::{PostgresCdcConfig, SnapshotMode};
 use super::super::super::postgres_io::slots;
 use super::super::super::postgres_io::{self, ControlConnection, PostgresCheckpointBinding};
-use super::super::super::typed_rows::RowLayout;
 use super::super::checkpoint::CursorPhase;
-use super::super::snapshot::SnapshotReader;
+use super::super::snapshot::PgSnapshot;
 use super::super::{Arc, ConnectorError, Lsn, Notify};
 use super::{busy, other_claims, settle, warn_orphaning, ResumeAction, SlotClaim};
 
@@ -26,13 +25,12 @@ const BLOCKER_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// What the task leaves for the next poll to install.
 pub(super) enum ClaimOutcome {
-    /// The slot was created; `snapshot` holds the imported copy in `initial` mode.
-    Created {
+    /// The claimed slot exists, created or adopted, and streams from `consistent_point`. In
+    /// `initial` mode, `floor` holds the transactions committed before the stream starts.
+    Ready {
         consistent_point: Lsn,
-        snapshot: Option<Box<SnapshotReader>>,
+        floor: Option<PgSnapshot>,
     },
-    /// The claim's existing slot streams from its confirmed position.
-    Adopted(Lsn),
     /// The claimed slot cannot be used; the source claims another name.
     NewClaim,
 }
@@ -44,7 +42,6 @@ pub(super) struct ClaimJob {
     pub(super) incarnation: String,
     pub(super) application_name: String,
     pub(super) binding: PostgresCheckpointBinding,
-    pub(super) layout: RowLayout,
     pub(super) admission: ConnectorTaskAdmission,
     pub(super) data_ready: Arc<Notify>,
 }
@@ -207,15 +204,24 @@ impl ClaimJob {
             &self.config,
             &self.claim,
             &self.incarnation,
-            CursorPhase::Claimed,
+            &CursorPhase::Claimed,
             &self.binding,
         )
         .await?;
+        let copies = self.config.snapshot_mode == SnapshotMode::Initial;
         match action {
             ResumeAction::Create => {}
-            ResumeAction::Adopt(lsn) => {
-                tracing::info!(slot, %lsn, "adopted the claimed PostgreSQL replication slot");
-                return Ok(ClaimOutcome::Adopted(lsn));
+            ResumeAction::Adopt(consistent_point) => {
+                tracing::info!(slot, %consistent_point, "adopted the claimed PostgreSQL replication slot");
+                let floor = if copies {
+                    Some(self.probe_floor(control).await?)
+                } else {
+                    None
+                };
+                return Ok(ClaimOutcome::Ready {
+                    consistent_point,
+                    floor,
+                });
             }
             ResumeAction::NewClaim(reason) => {
                 warn_orphaning(slot, &reason);
@@ -228,35 +234,52 @@ impl ClaimJob {
                 return Err(ConnectorError::ConfigurationError(reason));
             }
         }
-        match self.create().await {
-            Ok(created) => self.finish(created).await,
-            Err(CreateFailure::Exists) => Err(ConnectorError::ConnectionFailed(format!(
-                "PostgreSQL replication slot '{slot}' appeared while it was being created"
-            ))),
-            Err(CreateFailure::SlotsFull(reason)) => Err(self.slots_full(control, &reason).await),
-            Err(CreateFailure::Transient(reason)) => Err(ConnectorError::ConnectionFailed(
-                format!("create PostgreSQL replication slot '{slot}': {reason}"),
-            )),
-            Err(CreateFailure::Fatal(reason)) => Err(ConnectorError::ConfigurationError(format!(
-                "create PostgreSQL replication slot '{slot}': {reason}"
+        let snapshot = if copies {
+            SlotSnapshot::Use
+        } else {
+            SlotSnapshot::Nothing
+        };
+        let created = match self.create(slot, snapshot, false).await {
+            Ok(created) => created,
+            Err(failure) => return Err(self.creation_error(control, slot, failure).await),
+        };
+        let (consistent_point, floor) = self.checked(slot, &created)?;
+        tracing::info!(slot, %consistent_point, "created PostgreSQL replication slot");
+        Ok(ClaimOutcome::Ready {
+            consistent_point,
+            floor,
+        })
+    }
+
+    /// The visibility snapshot at a fresh consistent point, read through a temporary slot that
+    /// ends with its session: an adopted slot can no longer provide its own. It sees at least
+    /// every transaction the adopted slot does not stream, which is what the copy's floor needs.
+    async fn probe_floor(&self, control: &ControlConnection) -> Result<PgSnapshot, ConnectorError> {
+        let probe = format!("laminar_probe_{}_{}", self.claim.id(), self.incarnation);
+        let created = match self.create(&probe, SlotSnapshot::Use, true).await {
+            Ok(created) => created,
+            Err(failure) => return Err(self.creation_error(control, &probe, failure).await),
+        };
+        match self.checked(&probe, &created)? {
+            (_, Some(floor)) => Ok(floor),
+            (_, None) => Err(ConnectorError::ReadError(format!(
+                "PostgreSQL returned no visibility snapshot for the probe slot '{probe}'"
             ))),
         }
     }
 
     /// The `CREATE` wait has no deadline: it ends with the transactions it waits for, or when
     /// `close` aborts the task. Every 30 s it reports what it waits for.
-    async fn create(&self) -> Result<CreatedSlot, CreateFailure> {
-        let snapshot = match self.config.snapshot_mode {
-            SnapshotMode::Initial => SlotSnapshot::Export,
-            SnapshotMode::Never => SlotSnapshot::Nothing,
-        };
-        let replication = postgres_io::build_replication_config(
-            &self.config,
-            self.claim.slot(),
-            &self.application_name,
-        );
+    async fn create(
+        &self,
+        slot: &str,
+        snapshot: SlotSnapshot,
+        temporary: bool,
+    ) -> Result<CreatedSlot, CreateFailure> {
+        let replication =
+            postgres_io::build_replication_config(&self.config, slot, &self.application_name);
         let started = tokio::time::Instant::now();
-        let create = pgwire_replication::create_logical_slot(&replication, snapshot);
+        let create = pgwire_replication::create_logical_slot(&replication, snapshot, temporary);
         tokio::pin!(create);
         loop {
             tokio::select! {
@@ -264,13 +287,33 @@ impl ClaimJob {
                     return created.map_err(|error| create_failure(&error));
                 }
                 () = tokio::time::sleep(BLOCKER_REPORT_INTERVAL) => {
-                    self.report_blockers(started.elapsed()).await;
+                    self.report_blockers(slot, started.elapsed()).await;
                 }
             }
         }
     }
 
-    async fn report_blockers(&self, waited: Duration) {
+    async fn creation_error(
+        &self,
+        control: &ControlConnection,
+        slot: &str,
+        failure: CreateFailure,
+    ) -> ConnectorError {
+        match failure {
+            CreateFailure::Exists => ConnectorError::ConnectionFailed(format!(
+                "PostgreSQL replication slot '{slot}' appeared while it was being created"
+            )),
+            CreateFailure::SlotsFull(reason) => self.slots_full(control, slot, &reason).await,
+            CreateFailure::Transient(reason) => ConnectorError::ConnectionFailed(format!(
+                "create PostgreSQL replication slot '{slot}': {reason}"
+            )),
+            CreateFailure::Fatal(reason) => ConnectorError::ConfigurationError(format!(
+                "create PostgreSQL replication slot '{slot}': {reason}"
+            )),
+        }
+    }
+
+    async fn report_blockers(&self, slot: &str, waited: Duration) {
         let listed = async {
             let control = self.connect().await?;
             let listed = slots::blocking_transactions(control.client()).await;
@@ -278,7 +321,6 @@ impl ClaimJob {
             listed
         }
         .await;
-        let slot = self.claim.slot();
         let waited_secs = waited.as_secs();
         match listed {
             Ok(blockers) => tracing::warn!(
@@ -297,8 +339,13 @@ impl ClaimJob {
         }
     }
 
-    async fn finish(&self, created: CreatedSlot) -> Result<ClaimOutcome, ConnectorError> {
-        let slot = self.claim.slot();
+    /// The consistent point and visibility snapshot of a slot created on the server the source
+    /// is bound to.
+    fn checked(
+        &self,
+        slot: &str,
+        created: &CreatedSlot,
+    ) -> Result<(Lsn, Option<PgSnapshot>), ConnectorError> {
         let created_on = (created.system_identifier, created.timeline_id);
         let bound_to = (self.binding.system_identifier, self.binding.timeline_id);
         if created_on != bound_to {
@@ -313,44 +360,20 @@ impl ClaimJob {
                 slots::drop_statement(slot)
             )));
         }
-        let consistent_point = Lsn::new(created.consistent_point.as_u64());
-        tracing::info!(slot, %consistent_point, "created PostgreSQL replication slot");
-        let snapshot = match self.config.snapshot_mode {
-            SnapshotMode::Initial => Some(self.import(&created, consistent_point).await?),
-            SnapshotMode::Never => None,
-        };
-        // The importer holds its own copy of the snapshot, so the exporting session can end now.
-        if let Err(error) = created.release().await {
-            tracing::debug!(%error, "PostgreSQL slot-creating session closed with an error");
-        }
-        Ok(ClaimOutcome::Created {
-            consistent_point,
-            snapshot,
-        })
-    }
-
-    async fn import(
-        &self,
-        created: &CreatedSlot,
-        consistent_point: Lsn,
-    ) -> Result<Box<SnapshotReader>, ConnectorError> {
-        let name = created
-            .snapshot_name
+        let floor = created
+            .visibility_snapshot
             .as_deref()
-            .ok_or_else(|| ConnectorError::ReadError("PostgreSQL exported no snapshot".into()))?;
-        let connection = self.connect().await?;
-        SnapshotReader::open(
-            connection,
-            &self.config,
-            &self.layout,
-            name,
-            consistent_point,
-        )
-        .await
-        .map(Box::new)
+            .map(PgSnapshot::parse)
+            .transpose()?;
+        Ok((Lsn::new(created.consistent_point.as_u64()), floor))
     }
 
-    async fn slots_full(&self, control: &ControlConnection, reason: &str) -> ConnectorError {
+    async fn slots_full(
+        &self,
+        control: &ControlConnection,
+        slot: &str,
+        reason: &str,
+    ) -> ConnectorError {
         let prefix = self.config.slot_name.as_str();
         let orphans = match slots::prefix_slots(control.client(), prefix).await {
             Ok(listed) => other_claims(&listed, prefix, &self.claim)
@@ -361,10 +384,9 @@ impl ClaimJob {
             Err(error) => format!("they could not be listed: {error}"),
         };
         ConnectorError::ConfigurationError(format!(
-            "PostgreSQL has no free replication slot to create '{}' ({reason}); raise \
+            "PostgreSQL has no free replication slot to create '{slot}' ({reason}); raise \
              max_replication_slots or drop slots no pipeline uses. Orphaned slots under \
-             slot.name '{prefix}': [{orphans}]",
-            self.claim.slot()
+             slot.name '{prefix}': [{orphans}]"
         ))
     }
 }

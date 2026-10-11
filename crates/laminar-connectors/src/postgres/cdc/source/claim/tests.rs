@@ -1,5 +1,6 @@
 use pgwire_replication::PgWireError;
 
+use super::super::checkpoint::SnapshotPosition;
 use super::creation::{create_failure, CreateFailure};
 use super::*;
 
@@ -142,7 +143,7 @@ fn only_another_incarnation_of_this_claim_is_a_stale_holder() {
     }
 }
 
-/// Every phase against every slot state and both modes.
+/// Every phase against every slot state and both output modes.
 #[test]
 fn restart_matrix() {
     use ResumeAction::{Adopt, Busy, Create, FailClosed, NewClaim, TerminateStale};
@@ -159,115 +160,123 @@ fn restart_matrix() {
     let held_unusable = slot(Some(0x500), Some(stale.clone()), Some("is invalidated"));
 
     let claimed = CursorPhase::Claimed;
-    let snapshot = CursorPhase::Snapshot {
-        consistent_point: Lsn::new(0x400),
-    };
     let streaming = |consistent_point, lsn| CursorPhase::Streaming {
         consistent_point: Lsn::new(consistent_point),
         lsn: Lsn::new(lsn),
     };
-    let at_cursor = streaming(0x400, 0x600);
-
-    let action = |phase, facts: Option<&SlotFacts>, mode| {
-        resume_action(phase, facts, mode, &claim(), INCARNATION)
+    let copying = |consistent_point, lsn| {
+        CursorPhase::Snapshot(SnapshotPosition {
+            consistent_point: Lsn::new(consistent_point),
+            lsn: Lsn::new(lsn),
+            bound: Some(vec!["17".into()]),
+            chunks: 3,
+            pending: vec![901],
+            floor: None,
+        })
     };
-    for mode in [SnapshotMode::Initial, SnapshotMode::Never] {
-        assert_eq!(action(claimed, None, mode), Create);
-        assert!(
-            matches!(action(claimed, Some(&unusable), mode), NewClaim(reason) if reason.contains("invalidated"))
-        );
-        assert_eq!(
-            action(claimed, Some(&held_stale), mode),
-            TerminateStale(stale.clone())
-        );
-        assert_eq!(
-            action(claimed, Some(&held_unusable), mode),
-            TerminateStale(stale.clone())
-        );
-        assert_eq!(
-            action(claimed, Some(&held_foreign), mode),
-            Busy(foreign.clone())
-        );
-        assert_eq!(
-            action(claimed, Some(&held_by_us), mode),
-            Busy(same_incarnation.clone())
-        );
 
-        for facts in [
-            None,
-            Some(&healthy),
-            Some(&unusable),
-            Some(&positionless),
-            Some(&held_stale),
-            Some(&held_foreign),
-        ] {
-            assert!(
-                matches!(action(snapshot, facts, mode), FailClosed(reason) if reason.contains("initial snapshot") && reason.contains("pg_drop_replication_slot('orders_0123456789abcdef')")),
-                "{facts:?}"
-            );
-        }
-
-        assert!(
-            matches!(action(at_cursor, None, mode), FailClosed(reason) if reason.contains("missing"))
-        );
+    let action = |phase: &CursorPhase, facts: Option<&SlotFacts>, output| {
+        resume_action(phase, facts, output, &claim(), INCARNATION)
+    };
+    for output in [OutputMode::Upsert, OutputMode::Changelog] {
+        assert_eq!(action(&claimed, None, output), Create);
+        // Nothing was emitted under a claim, so a healthy slot is adopted from its consistent
+        // point; a copy takes its floor from a probe slot.
         assert_eq!(
-            action(at_cursor, Some(&healthy), mode),
-            Adopt(Lsn::new(0x600))
-        );
-        assert!(
-            matches!(action(at_cursor, Some(&unusable), mode), FailClosed(reason) if reason.contains("invalidated"))
-        );
-        assert!(matches!(
-            action(at_cursor, Some(&positionless), mode),
-            FailClosed(_)
-        ));
-        assert_eq!(
-            action(at_cursor, Some(&held_stale), mode),
-            TerminateStale(stale.clone())
-        );
-        assert_eq!(
-            action(at_cursor, Some(&held_foreign), mode),
-            Busy(foreign.clone())
-        );
-        assert_eq!(
-            action(at_cursor, Some(&held_by_us), mode),
-            Busy(same_incarnation.clone())
-        );
-        // A slot behind the cursor is safe (slots persist at server checkpoints); one ahead lost
-        // WAL; one before the consistent point is not the slot the cursor was taken from.
-        assert_eq!(
-            action(streaming(0x400, 0x900), Some(&healthy), mode),
-            Adopt(Lsn::new(0x900))
-        );
-        assert_eq!(
-            action(streaming(0x500, 0x500), Some(&healthy), mode),
+            action(&claimed, Some(&healthy), output),
             Adopt(Lsn::new(0x500))
         );
+        assert!(matches!(
+            action(&claimed, Some(&positionless), output),
+            NewClaim(_)
+        ));
         assert!(
-            matches!(action(streaming(0x400, 0x4ff), Some(&healthy), mode), FailClosed(reason) if reason.contains("advanced"))
+            matches!(action(&claimed, Some(&unusable), output), NewClaim(reason) if reason.contains("invalidated"))
         );
+        assert_eq!(
+            action(&claimed, Some(&held_stale), output),
+            TerminateStale(stale.clone())
+        );
+        assert_eq!(
+            action(&claimed, Some(&held_unusable), output),
+            TerminateStale(stale.clone())
+        );
+        assert_eq!(
+            action(&claimed, Some(&held_foreign), output),
+            Busy(foreign.clone())
+        );
+        assert_eq!(
+            action(&claimed, Some(&held_by_us), output),
+            Busy(same_incarnation.clone())
+        );
+
+        for position in [streaming(0x400, 0x600), copying(0x400, 0x600)] {
+            if output == OutputMode::Changelog && matches!(position, CursorPhase::Snapshot(_)) {
+                continue;
+            }
+            assert!(
+                matches!(action(&position, None, output), FailClosed(reason) if reason.contains("missing"))
+            );
+            assert_eq!(
+                action(&position, Some(&healthy), output),
+                Adopt(Lsn::new(0x600))
+            );
+            assert!(
+                matches!(action(&position, Some(&unusable), output), FailClosed(reason) if reason.contains("invalidated"))
+            );
+            assert!(matches!(
+                action(&position, Some(&positionless), output),
+                FailClosed(_)
+            ));
+            assert_eq!(
+                action(&position, Some(&held_stale), output),
+                TerminateStale(stale.clone())
+            );
+            assert_eq!(
+                action(&position, Some(&held_foreign), output),
+                Busy(foreign.clone())
+            );
+            assert_eq!(
+                action(&position, Some(&held_by_us), output),
+                Busy(same_incarnation.clone())
+            );
+        }
+        // A slot behind the cursor is safe (slots persist at server checkpoints); one ahead lost
+        // WAL; one before the consistent point is not the slot the cursor was taken from.
+        for phase in [streaming as fn(u64, u64) -> CursorPhase, copying] {
+            if output == OutputMode::Changelog && matches!(phase(0, 0), CursorPhase::Snapshot(_)) {
+                continue;
+            }
+            assert_eq!(
+                action(&phase(0x400, 0x900), Some(&healthy), output),
+                Adopt(Lsn::new(0x900))
+            );
+            assert_eq!(
+                action(&phase(0x500, 0x500), Some(&healthy), output),
+                Adopt(Lsn::new(0x500))
+            );
+            assert!(
+                matches!(action(&phase(0x400, 0x4ff), Some(&healthy), output), FailClosed(reason) if reason.contains("advanced"))
+            );
+            assert!(
+                matches!(action(&phase(0x501, 0x900), Some(&healthy), output), FailClosed(reason) if reason.contains("consistent point"))
+            );
+        }
+    }
+    // An upsert copy resumes inside the snapshot; a changelog copy cannot, whatever the slot.
+    for facts in [
+        None,
+        Some(&healthy),
+        Some(&unusable),
+        Some(&positionless),
+        Some(&held_stale),
+        Some(&held_foreign),
+    ] {
         assert!(
-            matches!(action(streaming(0x501, 0x900), Some(&healthy), mode), FailClosed(reason) if reason.contains("consistent point"))
+            matches!(action(&copying(0x400, 0x600), facts, OutputMode::Changelog), FailClosed(reason) if reason.contains("initial snapshot") && reason.contains("pg_drop_replication_slot('orders_0123456789abcdef')")),
+            "{facts:?}"
         );
     }
-    // Neither mode emits a row before a cursor past the claim commits, so `never` mode adopts a
-    // healthy claimed slot from its consistent point; `initial` mode needs the snapshot only a new
-    // slot exports.
-    assert_eq!(
-        action(claimed, Some(&healthy), SnapshotMode::Never),
-        Adopt(Lsn::new(0x500))
-    );
-    assert!(
-        matches!(action(claimed, Some(&healthy), SnapshotMode::Initial), NewClaim(reason) if reason.contains("snapshot"))
-    );
-    assert!(matches!(
-        action(claimed, Some(&positionless), SnapshotMode::Never),
-        NewClaim(_)
-    ));
-    assert!(matches!(
-        action(claimed, Some(&positionless), SnapshotMode::Initial),
-        NewClaim(_)
-    ));
 }
 
 #[test]

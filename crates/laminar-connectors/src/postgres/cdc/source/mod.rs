@@ -3,8 +3,8 @@
 //! Streams the changes of one primary-keyed table from `PostgreSQL` logical replication
 //! (`pgoutput`) as typed Arrow rows of the declared source schema. A fresh source claims a new
 //! slot name and creates the slot once a checkpoint commits the claim; it then either copies the
-//! table at the slot's consistent point (`snapshot.mode=initial`) or starts at that point
-//! (`snapshot.mode=never`). Later starts resume from the engine checkpoint.
+//! table in chunks while streaming from the slot's consistent point (`snapshot.mode=initial`) or
+//! starts at that point (`snapshot.mode=never`). Later starts resume from the engine checkpoint.
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
@@ -36,7 +36,7 @@ mod startup;
 
 use claim::{ClaimTask, SlotClaim};
 use reader::{OwnedWalPayload, WalPayload, WalPayloadRx, WalTerminalError};
-use snapshot::SnapshotReader;
+use snapshot::{ChunkedSnapshot, CopyPlan};
 
 const PGWIRE_IN_FLIGHT_EVENTS: usize = 1;
 const RAW_WAL_QUEUE_CAPACITY: usize = 4_096;
@@ -51,25 +51,75 @@ enum Phase {
     /// a committed `streaming` cursor names it (`released`). A restart from the claim may stream
     /// from a later point on another slot, so nothing may be emitted under it.
     AwaitingStream { released: bool },
-    /// Copying the table from the exported snapshot, once a cursor naming the slot committed.
-    Snapshot(Box<SnapshotReader>),
+    /// Copying the table in chunks while streaming, once a cursor naming the slot committed.
+    Snapshot(Box<ChunkedSnapshot>),
     /// Streaming committed transactions from the slot.
     Streaming,
+}
+
+/// One emitted row: which image it reads and how it is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowImage {
+    Put,
+    Tombstone,
+    Weighted(i64),
+}
+
+impl RowImage {
+    /// Whether only key columns are emitted, the `__weight`, and the upsert mutation.
+    fn parts(self) -> (bool, Option<i64>, Option<SourceMutation>) {
+        match self {
+            Self::Put => (false, None, Some(SourceMutation::Put)),
+            Self::Tombstone => (true, None, Some(SourceMutation::Tombstone)),
+            Self::Weighted(weight) => (false, Some(weight), None),
+        }
+    }
+}
+
+/// Declared-column texts of one row; `None` is SQL `NULL`.
+type RowValues = Box<[Option<Box<[u8]>>]>;
+
+/// A row decoded during the copy, kept as texts until the drain knows where its key lies.
+struct StagedRow {
+    image: RowImage,
+    values: RowValues,
+    /// Planned retained bytes, charged to the decoded stage.
+    bytes: usize,
+}
+
+/// The staged rows of the open transaction.
+#[derive(Default)]
+struct StagedRows {
+    rows: Vec<StagedRow>,
+    bytes: usize,
 }
 
 /// The transaction being decoded; its rows become visible only at COMMIT.
 struct OpenTransaction {
     final_lsn: Lsn,
+    xid: u32,
+    /// Rows of a transaction decoded during the copy.
+    staged: Option<StagedRows>,
 }
 
 /// A decoded transaction, resumable only after every one of its rows has been emitted.
 struct CommittedTransaction {
     end_lsn: Lsn,
-    /// `None` when the transaction changed no captured rows.
+    xid: u32,
+    /// `None` when the transaction changed no captured rows, or was decoded during the copy.
     records: Option<RecordBatch>,
     /// Row mutations in upsert mode; empty in changelog mode.
     mutations: Box<[SourceMutation]>,
+    /// Rows of a transaction decoded during the copy, not built until drained.
+    staged: Option<Box<[StagedRow]>>,
     retained_bytes: usize,
+}
+
+impl CommittedTransaction {
+    fn rows(&self) -> usize {
+        self.records.as_ref().map_or(0, RecordBatch::num_rows)
+            + self.staged.as_ref().map_or(0, |staged| staged.len())
+    }
 }
 
 /// `PostgreSQL` CDC source connector.
@@ -117,6 +167,8 @@ pub struct PostgresCdcSource {
     incarnation: String,
     /// The owned slot's consistent point, once the slot exists.
     consistent_point: Option<Lsn>,
+    /// SQL of the initial copy, read at startup when the source copies.
+    copy_plan: Option<Arc<CopyPlan>>,
 
     #[cfg(test)]
     pending_messages: VecDeque<Vec<u8>>,
@@ -197,6 +249,7 @@ impl PostgresCdcSource {
             claim: None,
             incarnation: String::new(),
             consistent_point: None,
+            copy_plan: None,
             #[cfg(test)]
             pending_messages: VecDeque::new(),
             data_ready: Arc::new(Notify::new()),
@@ -240,17 +293,13 @@ impl PostgresCdcSource {
     /// Rows decoded but not yet emitted, across the open and committed transactions.
     #[must_use]
     pub fn buffered_rows(&self) -> usize {
-        let committed: usize = self
-            .committed
-            .iter()
-            .map(|transaction| {
-                transaction
-                    .records
-                    .as_ref()
-                    .map_or(0, RecordBatch::num_rows)
-            })
-            .sum();
-        committed + self.open_rows.as_ref().map_or(0, RowBuilder::len)
+        let committed: usize = self.committed.iter().map(CommittedTransaction::rows).sum();
+        let staged = self
+            .open_transaction
+            .as_ref()
+            .and_then(|transaction| transaction.staged.as_ref())
+            .map_or(0, |staged| staged.rows.len());
+        committed + staged + self.open_rows.as_ref().map_or(0, RowBuilder::len)
     }
 
     fn fail(&mut self, error: ConnectorError) -> ConnectorError {

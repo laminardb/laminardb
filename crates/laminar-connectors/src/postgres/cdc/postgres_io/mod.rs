@@ -3,7 +3,10 @@
 mod catalog;
 pub(super) mod slots;
 
-pub(super) use catalog::{inspect_capture_table, unreadable_columns, CaptureTable};
+pub(super) use catalog::{
+    in_recovery, inspect_capture_table, layout_fingerprint, layout_fingerprint_sql,
+    primary_key_index, unreadable_columns, CaptureTable, IndexKeyColumn,
+};
 
 use crate::connector::ConnectorTaskGuard;
 use crate::error::ConnectorError;

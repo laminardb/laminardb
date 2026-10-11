@@ -16,7 +16,8 @@ use super::super::schema_resolution::validate_relation;
 use super::super::typed_rows::{RowBuilder, RowLayout};
 use super::reader::logical_wal_payload_bytes;
 use super::{
-    CommittedTransaction, Lsn, OpenTransaction, OwnedWalPayload, PostgresCdcSource, WalPayload,
+    CommittedTransaction, Lsn, OpenTransaction, OwnedWalPayload, Phase, PostgresCdcSource,
+    RowImage, RowValues, StagedRow, StagedRows, WalPayload,
 };
 use crate::postgres::cdc::config::OutputMode;
 
@@ -27,18 +28,15 @@ pub(super) enum Decoded {
     Deferred(OwnedWalPayload),
 }
 
-/// One emitted row: which image it reads and how it is applied.
-#[derive(Clone, Copy)]
-enum RowImage {
-    Put,
-    Tombstone,
-    Weighted(i64),
-}
-
 impl PostgresCdcSource {
     /// Decoded bytes a drain can release.
     pub(super) fn drainable_bytes(&self) -> usize {
-        self.committed_bytes.saturating_add(
+        let staged = self
+            .open_transaction
+            .as_ref()
+            .and_then(|transaction| transaction.staged.as_ref())
+            .map_or(0, |staged| staged.bytes);
+        self.committed_bytes.saturating_add(staged).saturating_add(
             self.open_rows
                 .as_ref()
                 .map_or(0, RowBuilder::retained_bytes),
@@ -103,13 +101,13 @@ impl PostgresCdcSource {
             (
                 WalPayload::Begin {
                     final_lsn,
+                    xid,
                     commit_ts_us,
-                    ..
                 },
                 None,
             ) => {
                 Self::validate_timestamp(commit_ts_us, "BEGIN")?;
-                self.begin_transaction(Lsn::new(final_lsn))?;
+                self.begin_transaction(Lsn::new(final_lsn), xid)?;
             }
             (
                 WalPayload::Commit {
@@ -125,11 +123,15 @@ impl PostgresCdcSource {
             (WalPayload::KeepAlive { wal_end }, None) => {
                 let wal_end = Lsn::new(wal_end);
                 self.write_lsn = self.write_lsn.max(wal_end);
+                let reachable = match &mut self.phase {
+                    Phase::Snapshot(snapshot) => snapshot.observe_keepalive(wal_end),
+                    _ => wal_end,
+                };
                 // A logical keepalive carries the walsender's decoded position: every commit
                 // before it has already arrived. With nothing open or undrained, moving the
                 // cursor there lets an idle captured table release other tables' WAL.
                 if self.open_transaction.is_none() && self.committed.is_empty() {
-                    self.polled_lsn = self.polled_lsn.max(wal_end);
+                    self.polled_lsn = self.polled_lsn.max(reachable);
                 }
             }
             _ => {
@@ -154,7 +156,12 @@ impl PostgresCdcSource {
             .open_transaction
             .as_ref()
             .map_or(Lsn::ZERO, |transaction| transaction.final_lsn);
-        let rows = self.open_rows.as_ref().map_or(0, RowBuilder::len);
+        let staged = self
+            .open_transaction
+            .as_ref()
+            .and_then(|transaction| transaction.staged.as_ref())
+            .map_or(0, |staged| staged.rows.len());
+        let rows = self.open_rows.as_ref().map_or(0, RowBuilder::len) + staged;
         self.fail(ConnectorError::ReadError(format!(
             "PostgreSQL CDC transaction committing at {final_lsn} exceeds the decoded-stage \
              budget on its own: {} bytes retained after {rows} rows plus {planned} for the next \
@@ -197,7 +204,7 @@ impl PostgresCdcSource {
     /// Apply one decoded message without admission checks.
     pub(super) fn apply_message(&mut self, message: WalMessage) -> Result<(), ConnectorError> {
         match message {
-            WalMessage::Begin(begin) => self.begin_transaction(begin.final_lsn),
+            WalMessage::Begin(begin) => self.begin_transaction(begin.final_lsn, begin.xid),
             WalMessage::Commit(commit) => {
                 self.commit_transaction(commit.commit_lsn, commit.end_lsn)
             }
@@ -314,11 +321,24 @@ impl PostgresCdcSource {
             ))));
         }
         let planned = layout.planned_row_bytes(declared_text_bytes(layout, tuple, old))?;
-        let (key_only, weight, mutation) = match image {
-            RowImage::Put => (false, None, Some(SourceMutation::Put)),
-            RowImage::Tombstone => (true, None, Some(SourceMutation::Tombstone)),
-            RowImage::Weighted(weight) => (false, Some(weight), None),
-        };
+        let (key_only, weight, mutation) = image.parts();
+        if let Some(staged) = self
+            .open_transaction
+            .as_mut()
+            .and_then(|transaction| transaction.staged.as_mut())
+        {
+            let values = match staged_values(layout, tuple, old, key_only) {
+                Ok(values) => values,
+                Err(error) => return Err(self.fail(error)),
+            };
+            staged.rows.push(StagedRow {
+                image,
+                values,
+                bytes: planned,
+            });
+            staged.bytes = staged.bytes.saturating_add(planned);
+            return Ok(());
+        }
         let rows = self.open_rows.as_mut().ok_or_else(|| {
             ConnectorError::Internal("PostgreSQL CDC row builder is missing".into())
         })?;
@@ -375,13 +395,18 @@ impl PostgresCdcSource {
         Ok(())
     }
 
-    fn begin_transaction(&mut self, final_lsn: Lsn) -> Result<(), ConnectorError> {
+    fn begin_transaction(&mut self, final_lsn: Lsn, xid: u32) -> Result<(), ConnectorError> {
         if self.open_transaction.is_some() {
             return Err(self.fail(ConnectorError::ReadError(
                 "PostgreSQL CDC received BEGIN before the current transaction committed".into(),
             )));
         }
-        self.open_transaction = Some(OpenTransaction { final_lsn });
+        let staged = matches!(self.phase, Phase::Snapshot(_)).then(StagedRows::default);
+        self.open_transaction = Some(OpenTransaction {
+            final_lsn,
+            xid,
+            staged,
+        });
         Ok(())
     }
 
@@ -415,7 +440,11 @@ impl PostgresCdcSource {
                 "PostgreSQL CDC {reason}"
             ))));
         }
-        self.open_transaction = None;
+        let xid = transaction.xid;
+        let staged = self
+            .open_transaction
+            .take()
+            .and_then(|transaction| transaction.staged);
         let layout = self.layout.as_ref();
         let records = match (self.open_rows.as_mut(), layout) {
             (Some(rows), Some(layout)) if rows.len() > 0 => Some(rows.finish(layout)?),
@@ -425,12 +454,15 @@ impl PostgresCdcSource {
         let retained_bytes = records
             .as_ref()
             .map_or(0, arrow_array::RecordBatch::get_array_memory_size)
-            .saturating_add(mutations.len());
+            .saturating_add(mutations.len())
+            .saturating_add(staged.as_ref().map_or(0, |staged| staged.bytes));
         self.committed_bytes = self.committed_bytes.saturating_add(retained_bytes);
         self.committed.push_back(CommittedTransaction {
             end_lsn,
+            xid,
             records,
             mutations,
+            staged: staged.map(|staged| staged.rows.into_boxed_slice()),
             retained_bytes,
         });
         self.write_lsn = self.write_lsn.max(end_lsn);
@@ -489,6 +521,25 @@ fn resolve_value<'a>(
             "PostgreSQL CDC tuple is missing column {index}"
         ))),
     }
+}
+
+/// The declared-column texts of a row decoded during the copy; a key-only row keeps only its key.
+fn staged_values(
+    layout: &RowLayout,
+    tuple: &TupleData,
+    old: Option<&TupleData>,
+    key_only: bool,
+) -> Result<RowValues, ConnectorError> {
+    layout
+        .columns
+        .iter()
+        .map(|column| {
+            if key_only && !column.is_key {
+                return Ok(None);
+            }
+            resolve_value(tuple, old, column.tuple_index).map(|value| value.map(Box::from))
+        })
+        .collect()
 }
 
 fn declared_text_bytes(layout: &RowLayout, tuple: &TupleData, old: Option<&TupleData>) -> usize {
