@@ -259,3 +259,51 @@ fn test_factory_creates_iceberg_source() {
     let source = registry.create_source(&config, None);
     assert!(source.is_ok());
 }
+
+/// An on-demand lookup cannot renew vended credentials, so it refuses them at open.
+#[cfg(feature = "delta-lake-unity")]
+#[tokio::test]
+async fn delta_lookup_refuses_vended_unity_credentials() {
+    use crate::registry::LookupSourceFactory as _;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.1/unity-catalog/tables/main.lake.dims"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "dims", "catalog_name": "main", "schema_name": "lake",
+            "table_type": "EXTERNAL", "data_source_format": "DELTA", "columns": [],
+            "storage_location": "s3://bucket/dims", "properties": {},
+            "created_at": 0, "updated_at": 0, "table_id": "uc-dims"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.1/unity-catalog/temporary-table-credentials"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "aws_temp_credentials": {"access_key_id": "A", "secret_access_key": "S"},
+            "expiration_time": 4_102_444_800_000_i64, "url": "s3://bucket/dims"
+        })))
+        .mount(&server)
+        .await;
+    let mut config = crate::config::ConnectorConfig::new("delta-lake");
+    for (key, value) in [
+        ("table.path", "uc://main.lake.dims"),
+        ("catalog.type", "unity"),
+        ("catalog.workspace_url", server.uri().as_str()),
+        ("catalog.access_token", "dapi-test"),
+        ("catalog.name", "main"),
+        ("catalog.schema", "lake"),
+        ("_primary_key_columns", "id"),
+    ] {
+        config.set(key, value);
+    }
+    let error = DeltaLookupFactory
+        .build(config, None)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("cannot renew"), "{error}");
+}

@@ -18,17 +18,22 @@ pub(super) async fn delta_source(
 ) -> Result<SchemaBinding, ConnectorError> {
     let parsed = super::DeltaSourceConfig::from_config(config)?;
     let options = parsed.stable_storage_options();
-    let (path, options) = super::delta_io::resolve_catalog_options(
+    let resolved = super::delta_io::resolve_catalog_options(
         &parsed.catalog_type,
         parsed.catalog_database.as_deref(),
         parsed.catalog_name.as_deref(),
         parsed.catalog_schema.as_deref(),
         &parsed.table_path,
         &options,
+        super::delta_io::CatalogAccess::Read,
     )
     .await?;
-    let options = crate::storage::StorageCredentialResolver::resolve(&path, &options).options;
-    let table = super::delta_io::open_or_create_table(&path, options, None).await?;
+    let options = crate::storage::StorageCredentialResolver::resolve(
+        &resolved.location,
+        &resolved.storage_options,
+    )
+    .options;
+    let table = super::delta_io::open_table_metadata(&resolved.location, options).await?;
     let external = delta_read_schema(&super::delta_io::get_table_schema(&table)?);
     let origin = if explicit.is_some() {
         SchemaOrigin::Explicit
@@ -123,6 +128,9 @@ pub(super) async fn delta_sink_with_config(
     let mut binding = logical_binding(config, SchemaDirection::Sink, SchemaOrigin::Query, &input)?;
     let business = super::DeltaLakeSink::target_schema(&input, parsed.write_mode);
     validate_delta_creation_schema(&business)?;
+    if parsed.write_mode == super::DeltaWriteMode::Upsert {
+        super::DeltaLakeSink::validate_merge_key_fields(&business, &parsed.merge_key_columns)?;
+    }
     binding.control_fields = input
         .fields()
         .iter()
@@ -132,16 +140,8 @@ pub(super) async fn delta_sink_with_config(
     bind_external(&mut binding, &business)?;
     #[cfg(feature = "delta-lake-unity")]
     if parsed.auto_create {
-        if let super::delta_config::DeltaCatalogType::Unity {
-            workspace_url,
-            access_token,
-        } = &parsed.catalog_type
-        {
-            let name = parsed
-                .table_path
-                .strip_prefix("uc://")
-                .unwrap_or(&parsed.table_path);
-            if super::unity_catalog::find_table_storage_location(workspace_url, access_token, name)
+        if let super::delta_config::DeltaCatalogType::Unity(unity) = &parsed.catalog_type {
+            if super::unity_catalog::find_table(unity, &parsed.table_path)
                 .await?
                 .is_none()
             {
@@ -149,16 +149,20 @@ pub(super) async fn delta_sink_with_config(
             }
         }
     }
-    let (path, options) = super::delta_io::resolve_catalog_options(
+    let resolved = super::delta_io::resolve_catalog_options(
         &parsed.catalog_type,
         parsed.catalog_database.as_deref(),
         parsed.catalog_name.as_deref(),
         parsed.catalog_schema.as_deref(),
         &parsed.table_path,
         &parsed.storage_options,
+        super::delta_io::CatalogAccess::Write,
     )
     .await?;
-    let options = crate::storage::StorageCredentialResolver::resolve(&path, &options).options;
+    let path = resolved.location;
+    let options =
+        crate::storage::StorageCredentialResolver::resolve(&path, &resolved.storage_options)
+            .options;
     if missing_local_delta_directory(&path)?.is_some() {
         if parsed.auto_create {
             return Ok(binding);
@@ -212,16 +216,20 @@ pub(super) async fn prepare_delta_with_config(
         );
         super::delta::ensure_uc_table_exists(parsed, Some(&schema)).await?;
     }
-    let (path, options) = super::delta_io::resolve_catalog_options(
+    let resolved = super::delta_io::resolve_catalog_options(
         &parsed.catalog_type,
         parsed.catalog_database.as_deref(),
         parsed.catalog_name.as_deref(),
         parsed.catalog_schema.as_deref(),
         &parsed.table_path,
         &parsed.storage_options,
+        super::delta_io::CatalogAccess::Write,
     )
     .await?;
-    let options = crate::storage::StorageCredentialResolver::resolve(&path, &options).options;
+    let path = resolved.location;
+    let options =
+        crate::storage::StorageCredentialResolver::resolve(&path, &resolved.storage_options)
+            .options;
     if let Some(directory) = missing_local_delta_directory(&path)? {
         tokio::task::spawn_blocking(move || std::fs::create_dir_all(directory))
             .await
@@ -241,7 +249,13 @@ pub(super) async fn prepare_delta_with_config(
             .unwrap_or(&binding.logical)
             .clone(),
     );
-    let table = super::delta_io::open_or_create_table(&path, options, Some(&schema)).await?;
+    let table = super::delta_io::open_or_create_partitioned_table(
+        &path,
+        options,
+        Some(&schema),
+        &parsed.partition_columns,
+    )
+    .await?;
     delta_bind_writer(binding, &table)?;
     Ok(())
 }

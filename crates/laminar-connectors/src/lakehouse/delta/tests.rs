@@ -1665,3 +1665,356 @@ async fn coordinated_pre_commit_timeout_preserves_staged_data_until_rollback() {
     assert!(sink.staged_batches.is_empty());
     sink.close().await.unwrap();
 }
+
+// ── Writer-contract regressions ──
+
+#[cfg(feature = "delta-lake")]
+fn local_table_dir(dir: &tempfile::TempDir, name: &str) -> String {
+    let table_dir = dir.path().join(name);
+    std::fs::create_dir_all(&table_dir).unwrap();
+    table_dir.to_string_lossy().to_string()
+}
+
+#[cfg(feature = "delta-lake")]
+async fn opened_sink(config: DeltaLakeSinkConfig, schema: SchemaRef) -> DeltaLakeSink {
+    let mut sink = DeltaLakeSink::with_schema(config, schema);
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    sink
+}
+
+#[cfg(feature = "delta-lake")]
+async fn ids_in(path: &str) -> Vec<i64> {
+    let ctx = datafusion::prelude::SessionContext::new();
+    crate::lakehouse::delta_table_provider::register_delta_table(
+        &ctx,
+        "t",
+        path,
+        std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for batch in ctx
+        .sql("SELECT id FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+    {
+        let column = arrow_cast::cast(batch.column(0), &DataType::Int64).unwrap();
+        let column = column.as_any().downcast_ref::<Int64Array>().unwrap();
+        ids.extend(column.iter().flatten());
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// A failed write consumes the table handle; its retry must reopen only the bound table, never
+/// create a missing one or adopt a replacement at the same location.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn retry_reopen_rejects_missing_and_replaced_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = local_table_dir(&dir, "reopen");
+    let mut config = DeltaLakeSinkConfig::new(&path);
+    config.auto_create = true;
+    let mut sink = opened_sink(config, test_schema()).await;
+    flush_batch(&mut sink, &test_batch(2)).await;
+
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::create_dir_all(&path).unwrap();
+    sink.table = None;
+    sink.write_batch(&test_batch(1)).await.unwrap();
+    let error = sink.flush().await.unwrap_err().to_string();
+    assert!(error.contains("disappeared"), "{error}");
+    assert!(
+        !std::path::Path::new(&path).join("_delta_log").exists(),
+        "a retry must not recreate the dropped target"
+    );
+
+    super::super::delta_io::open_or_create_table(
+        &path,
+        std::collections::HashMap::new(),
+        Some(&test_schema()),
+    )
+    .await
+    .unwrap();
+    let error = sink.flush().await.unwrap_err().to_string();
+    assert!(error.contains("replaced"), "{error}");
+    assert!(
+        ids_in(&path).await.is_empty(),
+        "the replacement received no retried rows"
+    );
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn auto_create_applies_partition_columns_and_rejects_a_different_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, guarantee) in [
+        ("append", DeliveryGuarantee::AtLeastOnce),
+        ("coordinated", DeliveryGuarantee::ExactlyOnce),
+    ] {
+        let path = local_table_dir(&dir, name);
+        let mut config = DeltaLakeSinkConfig::new(&path);
+        config.auto_create = true;
+        config.delivery_guarantee = guarantee;
+        config.partition_columns = vec!["name".into()];
+        let mut sink = opened_sink(config.clone(), test_schema()).await;
+        let table = sink.table.as_ref().unwrap();
+        assert_eq!(
+            super::super::delta_io::get_partition_columns(table),
+            vec!["name".to_string()],
+            "{name}"
+        );
+        if guarantee == DeliveryGuarantee::AtLeastOnce {
+            flush_batch(&mut sink, &test_batch(3)).await;
+            assert!(std::path::Path::new(&path).join("name=test").is_dir());
+            assert_eq!(ids_in(&path).await, vec![0, 1, 2]);
+        }
+        sink.close().await.unwrap();
+
+        // A restart with the same layout reuses the table; another layout fails before writes.
+        opened_sink(config.clone(), test_schema())
+            .await
+            .close()
+            .await
+            .unwrap();
+        let mut other = config;
+        other.partition_columns = vec!["id".into()];
+        let mut sink = DeltaLakeSink::with_schema(other, test_schema());
+        let error = sink
+            .open(&ConnectorConfig::new("delta-lake"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("partition"), "{name}: {error}");
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn upsert_rejects_nullable_merge_keys_before_creating_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = local_table_dir(&dir, "nullable_key");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+    ]));
+    let mut config = DeltaLakeSinkConfig::new(&path);
+    config.auto_create = true;
+    config.write_mode = DeltaWriteMode::Upsert;
+    config.merge_key_columns = vec!["id".into()];
+    let mut sink = DeltaLakeSink::with_schema(config, schema);
+    let error = sink
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("must be non-nullable"), "{error}");
+    assert!(!std::path::Path::new(&path).join("_delta_log").exists());
+}
+
+/// Overwrite replaces the whole table on every flush, across partitions; it never scopes the
+/// replacement to the partitions present in the flush.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn overwrite_replaces_the_whole_table_on_each_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = local_table_dir(&dir, "overwrite");
+    let mut config = DeltaLakeSinkConfig::new(&path);
+    config.auto_create = true;
+    config.write_mode = DeltaWriteMode::Overwrite;
+    config.partition_columns = vec!["name".into()];
+    let mut sink = opened_sink(config, test_schema()).await;
+    let batch = |ids: &[i64], name: &str| {
+        RecordBatch::try_new(
+            test_schema(),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(vec![name; ids.len()])),
+                Arc::new(Float64Array::from(vec![1.0; ids.len()])),
+            ],
+        )
+        .unwrap()
+    };
+    sink.write_batch(&batch(&[1, 2], "a")).await.unwrap();
+    sink.write_batch(&batch(&[3], "b")).await.unwrap();
+    sink.flush().await.unwrap();
+    assert_eq!(ids_in(&path).await, vec![1, 2, 3]);
+
+    flush_batch(&mut sink, &batch(&[9], "a")).await;
+    assert_eq!(
+        ids_in(&path).await,
+        vec![9],
+        "partition 'b' is replaced too: overwrite scope is the whole table"
+    );
+    sink.close().await.unwrap();
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
+fn existing_table_types_must_match_without_lossy_casts() {
+    use arrow_schema::TimeUnit;
+
+    let table = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let pipeline = |id: DataType, ts: DataType| {
+        Arc::new(Schema::new(vec![
+            Field::new("id", id, false),
+            Field::new("ts", ts, false),
+        ]))
+    };
+    let micros = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let millis = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+    let nanos = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+    let other_zone = DataType::Timestamp(TimeUnit::Microsecond, Some("+05:00".into()));
+    for (pipeline, accepted) in [
+        (pipeline(DataType::Int64, micros.clone()), true),
+        (pipeline(DataType::Int64, millis), true),
+        (pipeline(DataType::Int32, micros.clone()), false),
+        (pipeline(DataType::Int64, nanos), false),
+        (pipeline(DataType::Int64, other_zone), false),
+        (pipeline(DataType::Utf8, micros), false),
+    ] {
+        let result = DeltaLakeSink::validate_existing_table_schema(&pipeline, &table, false, false);
+        assert_eq!(result.is_ok(), accepted, "{pipeline:?}: {result:?}");
+    }
+}
+
+/// Coordinated append stages rows without delta-rs row validation, so a table with CHECK
+/// constraints is rejected before staging, while at-least-once append still enforces them.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_append_rejects_unenforced_check_constraints() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = local_table_dir(&dir, "constrained");
+    super::super::delta_io::open_or_create_table(
+        &path,
+        std::collections::HashMap::new(),
+        Some(&test_schema()),
+    )
+    .await
+    .unwrap()
+    .add_constraint()
+    .with_constraint("id_positive", "id > 0")
+    .await
+    .unwrap();
+
+    let mut sink = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    let error = sink
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("CHECK constraint"), "{error}");
+
+    let mut sink = opened_sink(DeltaLakeSinkConfig::new(&path), test_schema()).await;
+    sink.write_batch(&test_batch(2)).await.unwrap();
+    assert!(
+        sink.flush().await.is_err(),
+        "delta-rs write rejects id = 0 under the constraint"
+    );
+}
+
+/// A Unity Catalog sink writes through `READ_WRITE` vended credentials, renews them before each
+/// flush once they near expiry, and refuses managed tables before any write.
+#[cfg(feature = "delta-lake-unity")]
+#[tokio::test]
+async fn unity_sink_writes_with_renewed_vended_credentials_and_rejects_managed_tables() {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_path = local_table_dir(&dir, "uc_target");
+    super::super::delta_io::open_or_create_table(
+        &table_path,
+        std::collections::HashMap::new(),
+        Some(&test_schema()),
+    )
+    .await
+    .unwrap();
+    let location = url::Url::from_directory_path(&table_path).unwrap();
+    let table_json = |table_type: &str| {
+        serde_json::json!({
+            "name": "events", "catalog_name": "main", "schema_name": "lake",
+            "table_type": table_type, "data_source_format": "DELTA", "columns": [],
+            "storage_location": location.as_str(), "properties": {},
+            "created_at": 0, "updated_at": 0, "table_id": "uc-1"
+        })
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.1/unity-catalog/tables/main.lake.events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(table_json("EXTERNAL")))
+        .up_to_n_times(100)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.1/unity-catalog/temporary-table-credentials"))
+        .and(body_partial_json(
+            serde_json::json!({"operation": "READ_WRITE"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "aws_temp_credentials": {
+                "access_key_id": "ASIAVENDED", "secret_access_key": "vended-secret"
+            },
+            "expiration_time": (chrono::Utc::now() + chrono::Duration::minutes(2))
+                .timestamp_millis(),
+            "url": "s3://bucket/lake/events"
+        })))
+        .mount(&server)
+        .await;
+
+    let mut connector = ConnectorConfig::new("delta-lake");
+    for (key, value) in [
+        ("table.path", "uc://main.lake.events"),
+        ("catalog.type", "unity"),
+        ("catalog.workspace_url", server.uri().as_str()),
+        ("catalog.access_token", "dapi-test"),
+    ] {
+        connector.set(key, value);
+    }
+    let config = DeltaLakeSinkConfig::from_config(&connector).unwrap();
+    let mut sink = opened_sink(config.clone(), test_schema()).await;
+    flush_batch(&mut sink, &test_batch(2)).await;
+    flush_batch(&mut sink, &test_batch(3)).await;
+    assert_eq!(ids_in(&table_path).await.len(), 5);
+    let vended = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path().ends_with("temporary-table-credentials"))
+        .count();
+    assert!(
+        vended >= 3,
+        "open plus a renewal before each flush: {vended}"
+    );
+    sink.close().await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(table_json("MANAGED")))
+        .mount(&server)
+        .await;
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+    let error = sink
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("catalog-managed"), "{error}");
+    assert_eq!(ids_in(&table_path).await.len(), 5);
+}

@@ -12,7 +12,8 @@ fn make_config(pairs: &[(&str, &str)]) -> ConnectorConfig {
 fn test_defaults() {
     let cfg = DeltaSourceConfig::default();
     assert!(cfg.table_path.is_empty());
-    assert!(cfg.starting_version.is_none());
+    assert_eq!(cfg.read_mode, DeltaReadMode::Changes);
+    assert_eq!(cfg.starting_version, DeltaStartingVersion::Snapshot);
     assert_eq!(cfg.poll_interval, Duration::from_secs(1));
 }
 
@@ -27,7 +28,7 @@ fn test_parse_required_fields() {
     let config = make_config(&[("table.path", "/data/warehouse/trades")]);
     let cfg = DeltaSourceConfig::from_config(&config).unwrap();
     assert_eq!(cfg.table_path, "/data/warehouse/trades");
-    assert!(cfg.starting_version.is_none());
+    assert_eq!(cfg.starting_version, DeltaStartingVersion::Snapshot);
 }
 
 #[test]
@@ -44,8 +45,28 @@ fn test_parse_optional_fields() {
         ("poll.interval.ms", "500"),
     ]);
     let cfg = DeltaSourceConfig::from_config(&config).unwrap();
-    assert_eq!(cfg.starting_version, Some(5));
+    assert_eq!(cfg.starting_version, DeltaStartingVersion::Version(5));
     assert_eq!(cfg.poll_interval, Duration::from_millis(500));
+}
+
+#[test]
+fn read_modes_and_starting_positions_parse() {
+    let parse = |pairs: &[(&str, &str)]| {
+        let mut all = vec![("table.path", "/data/test")];
+        all.extend_from_slice(pairs);
+        DeltaSourceConfig::from_config(&make_config(&all))
+    };
+    let latest = parse(&[("starting.version", "LATEST")]).unwrap();
+    assert_eq!(latest.starting_version, DeltaStartingVersion::Latest);
+    let snapshot = parse(&[("read.mode", "snapshot")]).unwrap();
+    assert_eq!(snapshot.read_mode, DeltaReadMode::Snapshot);
+    for invalid in [
+        &[("read.mode", "snapshot"), ("starting.version", "3")][..],
+        &[("read.mode", "incremental")],
+        &[("poll.interval.ms", "0")],
+    ] {
+        assert!(parse(invalid).is_err(), "{invalid:?}");
+    }
 }
 
 #[test]
@@ -66,7 +87,6 @@ fn test_empty_table_path_rejected() {
 #[test]
 fn removed_options_fail_closed() {
     for (key, value) in [
-        ("read.mode", "incremental"),
         ("cdf.enabled", "true"),
         ("partition.filter", ""),
         ("partition.filter", "date = '2024-01-01'"),

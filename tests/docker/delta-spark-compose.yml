@@ -1,0 +1,11 @@
+# Spark/Delta oracle for crates/laminar-connectors/tests/delta_spark_interop.rs.
+# Spark 4.2.0 with delta-spark 4.4.0; the Delta jars download from Maven on first use.
+name: laminar-delta-spark
+
+services:
+  delta-spark:
+    image: deltaio/delta-docker@sha256:21679900202aaec835b1c1586356aa71a2e090882cac2bc3e619ad27142caea4
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ../../target/delta-spark-interop:/lake
+      - ./delta-spark:/scripts:ro

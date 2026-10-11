@@ -7,7 +7,8 @@
 //! # Write Strategies
 //!
 //! - **Append mode**: Arrow-to-Parquet zero-copy writes for immutable streams
-//! - **Overwrite mode**: Replace partition contents for recomputation
+//! - **Overwrite mode**: every flush atomically replaces the *whole table* with that
+//!   flush's rows (no partition-scoped replacement)
 //! - **Upsert mode**: CDC MERGE via Z-set changelog integration
 //!
 //! Exactly-once append writes prepare immutable Parquet descriptors during the
@@ -143,6 +144,9 @@ pub struct DeltaLakeSink {
     /// Resolved storage options after catalog lookup.
     #[cfg(feature = "delta-lake")]
     resolved_storage_options: std::collections::HashMap<String, String>,
+    /// Expiry of catalog-vended credentials inside `resolved_storage_options`.
+    #[cfg(feature = "delta-lake")]
+    credentials_expire_at: Option<std::time::SystemTime>,
     /// Pre-built Parquet writer properties for hot-path writes. Built once
     /// in `init_delta_table()` from `config.parquet`; cloning this is far
     /// cheaper than rebuilding (string parsing, bloom-filter column setup)
@@ -173,13 +177,15 @@ pub(super) async fn ensure_uc_table_exists(
     config: &DeltaLakeSinkConfig,
     schema: Option<&SchemaRef>,
 ) -> Result<(), ConnectorError> {
-    let super::delta_config::DeltaCatalogType::Unity {
-        ref workspace_url,
-        ref access_token,
-    } = config.catalog_type
-    else {
+    let super::delta_config::DeltaCatalogType::Unity(ref unity) = config.catalog_type else {
         return Ok(());
     };
+    let super::delta_config::UnityAuth::Token(ref access_token) = unity.auth else {
+        return Err(ConnectorError::ConfigurationError(
+            "Unity Catalog table registration requires catalog.access_token".into(),
+        ));
+    };
+    let workspace_url = &unity.workspace_url;
 
     let Some(ref storage_location) = config.catalog_storage_location else {
         return Ok(());
@@ -201,7 +207,8 @@ pub(super) async fn ensure_uc_table_exists(
         .and_then(|s| s.rsplit('.').next())
         .unwrap_or(&config.table_path);
 
-    let columns = super::unity_catalog::arrow_to_uc_columns(arrow_schema);
+    let columns =
+        super::unity_catalog::arrow_to_uc_columns(arrow_schema, &config.partition_columns)?;
     super::unity_catalog::create_uc_table(
         workspace_url,
         access_token,

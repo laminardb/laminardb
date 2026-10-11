@@ -5,7 +5,7 @@ use super::ensure_uc_table_exists;
 #[cfg(feature = "delta-lake")]
 use super::{
     classify_delta_attempt_error, count_collapsed_ops, debug, retry_delta_metadata_until,
-    run_tracked_delta_task, DataType, DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode,
+    run_tracked_delta_task, DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode,
     WriteResult, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use super::{
@@ -56,6 +56,8 @@ impl DeltaLakeSink {
             resolved_table_path: String::new(),
             #[cfg(feature = "delta-lake")]
             resolved_storage_options: std::collections::HashMap::new(),
+            #[cfg(feature = "delta-lake")]
+            credentials_expire_at: None,
             #[cfg(feature = "delta-lake")]
             cached_writer_properties: None,
             #[cfg(feature = "delta-lake")]
@@ -114,46 +116,18 @@ impl DeltaLakeSink {
             })??;
         }
 
-        // Resolve catalog path: for Unity this calls GET to get the
-        // storage_location, bypassing delta-rs credential vending.
-        let (resolved_path, mut merged_options) = tokio::time::timeout_at(
-            deadline,
-            delta_io::resolve_catalog_options(
-                &self.config.catalog_type,
-                self.config.catalog_database.as_deref(),
-                self.config.catalog_name.as_deref(),
-                self.config.catalog_schema.as_deref(),
-                &self.config.table_path,
-                &self.config.storage_options,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            ConnectorError::ConnectionFailed(
-                "Delta catalog resolution exceeded the write deadline".into(),
-            )
-        })??;
+        let resolved = self.resolve_target(deadline).await?;
+        let resolved_path = resolved.location;
+        let merged_options = resolved.storage_options;
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             delta_io::validate_coordinated_storage_preflight(&resolved_path, &merged_options)?;
         }
 
-        // Inject default connection timeouts if not explicitly set.
-        // Azure load balancers close idle connections after ~4 minutes.
-        // Without these, a stale connection causes writes to hang forever.
-        merged_options
-            .entry("timeout".to_string())
-            .or_insert_with(|| "120s".to_string());
-        merged_options
-            .entry("connect_timeout".to_string())
-            .or_insert_with(|| "30s".to_string());
-        merged_options
-            .entry("pool_idle_timeout".to_string())
-            .or_insert_with(|| "60s".to_string());
-
         // Persist resolved values for reopen_table() on conflict retry.
         self.resolved_table_path.clone_from(&resolved_path);
         self.resolved_storage_options.clone_from(&merged_options);
+        self.credentials_expire_at = resolved.credentials_expire_at;
 
         // RECOVERY: retry only the read-only open. Table creation is a mutation and remains a
         // single dispatch so an uncertain create outcome is never duplicated by this layer.
@@ -172,10 +146,11 @@ impl DeltaLakeSink {
             }
             table = tokio::time::timeout_at(
                 deadline,
-                delta_io::open_or_create_table(
+                delta_io::open_or_create_partitioned_table(
                     &resolved_path,
                     merged_options.clone(),
                     self.schema.as_ref(),
+                    &self.config.partition_columns,
                 ),
             )
             .await
@@ -204,6 +179,10 @@ impl DeltaLakeSink {
                 Self::validate_weight_column(&table_schema, "Delta table")?;
                 self.schema = Some(table_schema);
             }
+            self.validate_partition_columns(&table)?;
+            if self.is_coordinated() {
+                delta_io::reject_unenforced_row_obligations(&table)?;
+            }
         }
 
         self.delta_version = table.version().unwrap_or(0);
@@ -221,6 +200,76 @@ impl DeltaLakeSink {
             self.merge_session = Some(datafusion::prelude::SessionContext::new());
         }
 
+        Ok(())
+    }
+
+    /// Resolve the target through its catalog for writing, with default client timeouts.
+    #[cfg(feature = "delta-lake")]
+    async fn resolve_target(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<super::super::delta_io::ResolvedCatalogTable, ConnectorError> {
+        let mut resolved = tokio::time::timeout_at(
+            deadline,
+            super::super::delta_io::resolve_catalog_options(
+                &self.config.catalog_type,
+                self.config.catalog_database.as_deref(),
+                self.config.catalog_name.as_deref(),
+                self.config.catalog_schema.as_deref(),
+                &self.config.table_path,
+                &self.config.storage_options,
+                super::super::delta_io::CatalogAccess::Write,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::ConnectionFailed(
+                "Delta catalog resolution exceeded the write deadline".into(),
+            )
+        })??;
+        // Azure load balancers close idle connections after ~4 minutes; without these a stale
+        // connection can hang a write past its deadline.
+        for (key, value) in [
+            ("timeout", "120s"),
+            ("connect_timeout", "30s"),
+            ("pool_idle_timeout", "60s"),
+        ] {
+            resolved
+                .storage_options
+                .entry(key.to_string())
+                .or_insert_with(|| value.to_string());
+        }
+        Ok(resolved)
+    }
+
+    /// Replace expiring vended credentials before the next storage I/O; the reopened handle
+    /// must still be the bound table at the same location.
+    #[cfg(feature = "delta-lake")]
+    pub(super) async fn renew_credentials_if_expiring(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        if !super::super::delta_io::credentials_need_refresh(self.credentials_expire_at) {
+            return Ok(());
+        }
+        let resolved = self.resolve_target(deadline).await?;
+        if resolved.location != self.resolved_table_path {
+            return Err(ConnectorError::ConfigurationError(
+                "the catalog moved the Delta target to another storage location".into(),
+            ));
+        }
+        self.resolved_storage_options = resolved.storage_options;
+        self.credentials_expire_at = resolved.credentials_expire_at;
+        self.table = None;
+        tokio::time::timeout_at(deadline, self.reopen_table())
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(
+                    "Delta table reopen after credential renewal exceeded the write deadline"
+                        .into(),
+                )
+            })??;
+        debug!("Delta Lake sink: renewed vended storage credentials");
         Ok(())
     }
 
@@ -283,113 +332,6 @@ impl DeltaLakeSink {
         false
     }
 
-    /// Changelog metadata columns stripped from the target Delta table schema
-    /// in upsert mode, so the table holds only user data — not the CDC `_op`/
-    /// `_ts_ms` envelope or the Z-set `__weight` column. `collapse_changelog`
-    /// strips the same columns from the MERGE source, keeping the two in sync.
-    const CHANGELOG_METADATA_COLUMNS: &'static [&'static str] =
-        &["_op", "_ts_ms", laminar_core::changelog::WEIGHT_COLUMN];
-
-    pub(in crate::lakehouse) fn target_schema(
-        batch_schema: &SchemaRef,
-        write_mode: DeltaWriteMode,
-    ) -> SchemaRef {
-        if write_mode == DeltaWriteMode::Upsert {
-            let fields: Vec<_> = batch_schema
-                .fields()
-                .iter()
-                .filter(|f| !Self::CHANGELOG_METADATA_COLUMNS.contains(&f.name().as_str()))
-                .cloned()
-                .collect();
-            Arc::new(arrow_schema::Schema::new(fields))
-        } else {
-            batch_schema.clone()
-        }
-    }
-
-    #[cfg(feature = "delta-lake")]
-    fn validate_weight_column(schema: &SchemaRef, owner: &str) -> Result<(), ConnectorError> {
-        let Ok(field) = schema.field_with_name(laminar_core::changelog::WEIGHT_COLUMN) else {
-            return Ok(());
-        };
-        if field.data_type() != &DataType::Int64 || field.is_nullable() {
-            return Err(ConnectorError::SchemaMismatch(format!(
-                "{owner} '{}' column must be non-null Int64",
-                laminar_core::changelog::WEIGHT_COLUMN
-            )));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "delta-lake")]
-    fn validate_existing_table_schema(
-        pipeline: &SchemaRef,
-        table: &SchemaRef,
-        schema_evolution: bool,
-        exact_schema_required: bool,
-    ) -> Result<(), ConnectorError> {
-        Self::validate_weight_column(pipeline, "pipeline")?;
-        Self::validate_weight_column(table, "Delta table")?;
-
-        let weight = laminar_core::changelog::WEIGHT_COLUMN;
-        if pipeline.field_with_name(weight).is_ok() != table.field_with_name(weight).is_ok() {
-            return Err(ConnectorError::SchemaMismatch(format!(
-                "pipeline and existing Delta table must both contain '{weight}' for a weighted changelog"
-            )));
-        }
-
-        // INVARIANT: identity is checked in Delta storage form (ms -> us).
-        let pipeline = super::super::delta_io::widen_millisecond_timestamps(pipeline);
-
-        if exact_schema_required {
-            if pipeline.as_ref() != table.as_ref() {
-                return Err(ConnectorError::SchemaMismatch(
-                    "pipeline schema must exactly match the existing Delta table for coordinated append"
-                        .into(),
-                ));
-            }
-            return Ok(());
-        }
-
-        let allow_evolution = schema_evolution;
-        for input_field in pipeline.fields() {
-            let Ok(table_field) = table.field_with_name(input_field.name()) else {
-                if allow_evolution {
-                    continue;
-                }
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "pipeline column '{}' is missing from the existing Delta table",
-                    input_field.name()
-                )));
-            };
-            if !arrow_cast::can_cast_types(input_field.data_type(), table_field.data_type()) {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "pipeline column '{}' cannot be written as Delta type {}",
-                    input_field.name(),
-                    table_field.data_type()
-                )));
-            }
-            if input_field.is_nullable() && !table_field.is_nullable() {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "nullable pipeline column '{}' cannot target a non-null Delta column",
-                    input_field.name()
-                )));
-            }
-        }
-
-        for table_field in table.fields() {
-            if pipeline.field_with_name(table_field.name()).is_err()
-                && (!allow_evolution || !table_field.is_nullable())
-            {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "existing Delta column '{}' is missing from the pipeline schema",
-                    table_field.name()
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// Estimates the byte size of a `RecordBatch`.
     #[must_use]
     pub fn estimate_batch_size(batch: &RecordBatch) -> u64 {
@@ -432,6 +374,9 @@ impl DeltaLakeSink {
     /// Re-opens the Delta Lake table after a failed write consumes the handle.
     /// Uses the resolved path/options from `open()`, not `config.*`, so that
     /// catalog-resolved paths (Unity/Glue) are used correctly.
+    ///
+    /// Reopen never creates: a missing or replaced target, or a table whose writer contract no
+    /// longer matches the bound schema, fails closed instead of receiving the retried batches.
     #[cfg(feature = "delta-lake")]
     async fn reopen_table(&mut self) -> Result<(), ConnectorError> {
         use super::super::delta_io;
@@ -439,9 +384,10 @@ impl DeltaLakeSink {
         let table = delta_io::open_or_create_table(
             &self.resolved_table_path,
             self.resolved_storage_options.clone(),
-            self.schema.as_ref(),
+            None,
         )
         .await?;
+        self.validate_reopened_table(&table)?;
 
         self.delta_version = table.version().unwrap_or(0);
         self.table = Some(table);
@@ -597,6 +543,7 @@ impl DeltaLakeSink {
             return Ok(());
         }
         self.ensure_write_generation_usable()?;
+        self.renew_credentials_if_expiring(deadline).await?;
 
         let binding =
             super::super::delta_io::coordinated_table_binding(self.table.as_ref().ok_or_else(
@@ -770,6 +717,7 @@ impl DeltaLakeSink {
             return Ok(WriteResult::new(0, 0));
         }
         self.ensure_write_generation_usable()?;
+        self.renew_credentials_if_expiring(deadline).await?;
         let write_timeout = self.config.write_timeout;
         self.collapse_staged_upsert_changelog()?;
 

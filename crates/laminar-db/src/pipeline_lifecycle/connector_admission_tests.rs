@@ -1025,6 +1025,37 @@ fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
     }
 }
 
+#[cfg(feature = "delta-lake")]
+#[test]
+fn delta_change_feed_is_a_local_replayable_changelog_route_source() {
+    use super::admit_source_recovery_contract;
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::lakehouse::register_delta_lake_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("delta-lake");
+    config.set("table.path", "/tmp/delta-orders");
+    let source = registry.create_source(&config, None).unwrap();
+    for mode in ["changes", "snapshot"] {
+        config.set("read.mode", mode);
+        let contract = source.contract(&config).unwrap();
+        assert_eq!(contract.input_mode, SourceInputMode::FullChangelog);
+        assert_eq!(
+            contract.row_positions,
+            SourceRowPositionCapability::OrderedDeterministic
+        );
+        let admit =
+            |delivery, runtime| admit_source_recovery_contract(contract, delivery, true, runtime);
+        assert_eq!(
+            admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Local),
+            Ok(())
+        );
+        assert!(admit(DeliveryGuarantee::AtLeastOnce, RuntimeMode::Cluster).is_err());
+        assert!(admit(DeliveryGuarantee::ExactlyOnce, RuntimeMode::Local)
+            .unwrap_err()
+            .contains("LDB-5037"));
+    }
+}
+
 #[test]
 fn cluster_best_effort_is_rejected_before_source_topology() {
     let contract = SourceContract::new(

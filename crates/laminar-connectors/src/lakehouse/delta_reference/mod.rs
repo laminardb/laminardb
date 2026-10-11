@@ -1,7 +1,5 @@
 //! Delta Lake startup snapshot source for reference tables.
 
-use std::collections::VecDeque;
-
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use deltalake::DeltaTable;
@@ -28,7 +26,8 @@ pub struct DeltaReferenceTableSource {
     declared_schema: SchemaRef,
     phase: Phase,
     table: Option<DeltaTable>,
-    pending_batches: VecDeque<RecordBatch>,
+    stream: Option<datafusion::physical_plan::SendableRecordBatchStream>,
+    emitted_rows: usize,
     binding: Option<crate::schema::resolution::SchemaBinding>,
 }
 
@@ -41,7 +40,8 @@ impl DeltaReferenceTableSource {
             declared_schema,
             phase: Phase::Ready,
             table: None,
-            pending_batches: VecDeque::new(),
+            stream: None,
+            emitted_rows: 0,
             binding: None,
         }
     }
@@ -64,17 +64,20 @@ impl DeltaReferenceTableSource {
     async fn open_table(&mut self) -> Result<(), ConnectorError> {
         use crate::lakehouse::delta_io;
 
-        let (resolved_path, resolved_options) = delta_io::resolve_catalog_options(
+        let resolved = delta_io::resolve_catalog_options(
             &self.config.catalog_type,
             self.config.catalog_database.as_deref(),
             self.config.catalog_name.as_deref(),
             self.config.catalog_schema.as_deref(),
             &self.config.table_path,
             &self.config.storage_options,
+            delta_io::CatalogAccess::Read,
         )
         .await?;
-        self.table =
-            Some(delta_io::open_or_create_table(&resolved_path, resolved_options, None).await?);
+        self.table = Some(
+            delta_io::open_or_create_table(&resolved.location, resolved.storage_options, None)
+                .await?,
+        );
         if let Some(table) = &self.table {
             super::schema_resolution::verify_identity(
                 self.binding.as_ref(),
@@ -87,41 +90,17 @@ impl DeltaReferenceTableSource {
     async fn load_snapshot(&mut self) -> Result<(), ConnectorError> {
         use crate::lakehouse::delta_io;
 
-        let version = delta_io::get_latest_version(
-            self.table
-                .as_mut()
-                .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
-        )
-        .await?;
-        let batches = delta_io::read_batches_at_version(
-            self.table
-                .as_mut()
-                .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
-            version,
-            usize::MAX,
-        )
-        .await?
-        .0;
-
-        if batches.is_empty() {
-            let table_schema = delta_io::get_table_schema(
-                self.table
-                    .as_ref()
-                    .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?,
-            )
-            .map_err(|error| {
-                ConnectorError::ReadError(format!("read Delta snapshot schema: {error}"))
-            })?;
-            validate_snapshot_schema(table_schema.as_ref(), self.declared_schema.as_ref())?;
-        }
-
-        let batches = batches
-            .into_iter()
-            .map(|batch| conform_snapshot_batch(&batch, &self.declared_schema))
-            .collect::<Result<Vec<_>, _>>()?;
-        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        info!(version, rows, "Delta reference snapshot loaded");
-        self.pending_batches = batches.into();
+        let table = self
+            .table
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Internal("Delta table is not open".into()))?;
+        let version = delta_io::get_latest_version(table).await?;
+        let table_schema = delta_io::get_table_schema(table).map_err(|error| {
+            ConnectorError::ReadError(format!("read Delta snapshot schema: {error}"))
+        })?;
+        validate_snapshot_schema(table_schema.as_ref(), self.declared_schema.as_ref())?;
+        self.stream = Some(delta_io::snapshot_stream(table, version).await?);
+        info!(version, "Delta reference snapshot streaming");
         Ok(())
     }
 }
@@ -153,16 +132,29 @@ impl ReferenceTableSource for DeltaReferenceTableSource {
             Phase::Draining => {}
         }
 
-        if let Some(batch) = self.pending_batches.pop_front() {
-            return Ok(Some(batch));
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| ConnectorError::Internal("Delta snapshot stream is not open".into()))?;
+        while let Some(batch) = tokio_stream::StreamExt::next(stream).await {
+            let batch = batch.map_err(|error| {
+                ConnectorError::ReadError(format!("Delta snapshot batch failed: {error}"))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            self.emitted_rows = self.emitted_rows.saturating_add(batch.num_rows());
+            return conform_snapshot_batch(&batch, &self.declared_schema).map(Some);
         }
+        info!(rows = self.emitted_rows, "Delta reference snapshot loaded");
+        self.stream = None;
         self.phase = Phase::Done;
         Ok(None)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.phase = Phase::Closed;
-        self.pending_batches.clear();
+        self.stream = None;
         self.table = None;
         Ok(())
     }

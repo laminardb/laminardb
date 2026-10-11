@@ -56,75 +56,54 @@ pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, Connector
     from_delta_version(version)
 }
 
-/// Reads record batches from a specific Delta Lake table version.
-///
-/// Loads the requested version, applies a `LIMIT` to bound memory usage,
-/// then streams results via `execute_stream` to avoid materializing the
-/// entire version in memory.
-///
-/// # Arguments
-///
-/// * `table` - Mutable reference to the Delta Lake table handle
-/// * `version` - The table version to read
-/// * `max_records` - Maximum number of records to return. Pass `usize::MAX`
-///   to read all records (unbounded).
+/// Streams the snapshot at `version` through the delta-rs table provider, which applies
+/// deletion vectors and column mapping. Batches are produced on demand, so a caller that
+/// consumes them one at a time never holds the whole snapshot.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` if the version cannot be loaded or scanned.
-///
-/// Returns `(batches, fully_consumed)` — `fully_consumed` is `false` when
-/// `max_records` truncated the result and more rows remain.
+/// Returns `ConnectorError::ReadError` if the version cannot be loaded or planned.
 #[cfg(feature = "delta-lake")]
-pub(crate) async fn read_batches_at_version(
+pub(crate) async fn snapshot_stream(
     table: &mut DeltaTable,
     version: i64,
-    max_records: usize,
-) -> Result<(Vec<RecordBatch>, bool), ConnectorError> {
+) -> Result<datafusion::physical_plan::SendableRecordBatchStream, ConnectorError> {
     use datafusion::prelude::SessionContext;
-    use tokio_stream::StreamExt;
 
-    // Load the specific version.
     let delta_version = to_delta_version(version)?;
     table
         .load_version(delta_version)
         .await
         .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
-
     debug!(version, "Delta Lake: loaded version for reading");
 
-    // Build a DeltaTableProvider via the builder and register it with DataFusion.
     let provider =
         table.table_provider().build().await.map_err(|e| {
             ConnectorError::ReadError(format!("failed to build table provider: {e}"))
         })?;
-
     let ctx = SessionContext::new();
     ctx.register_table("delta_source_scan", Arc::new(provider))
         .map_err(|e| ConnectorError::ReadError(format!("failed to register scan table: {e}")))?;
-
-    // Apply LIMIT to bound memory: prevents OOM on large versions.
-    let df = ctx
-        .sql("SELECT * FROM delta_source_scan")
+    ctx.sql("SELECT * FROM delta_source_scan")
         .await
-        .map_err(|e| ConnectorError::ReadError(format!("scan query failed: {e}")))?;
-
-    let df = if max_records < usize::MAX {
-        df.limit(0, Some(max_records))
-            .map_err(|e| ConnectorError::ReadError(format!("limit failed: {e}")))?
-    } else {
-        df
-    };
-
-    // Stream results instead of collect() to avoid materializing everything.
-    let mut stream = df
+        .map_err(|e| ConnectorError::ReadError(format!("scan query failed: {e}")))?
         .execute_stream()
         .await
-        .map_err(|e| ConnectorError::ReadError(format!("stream execution failed: {e}")))?;
+        .map_err(|e| ConnectorError::ReadError(format!("stream execution failed: {e}")))
+}
 
+/// Collects up to `max_records` rows of the snapshot at `version`.
+#[cfg(all(feature = "delta-lake", test))]
+pub(crate) async fn read_batches_at_version(
+    table: &mut DeltaTable,
+    version: i64,
+    max_records: usize,
+) -> Result<(Vec<RecordBatch>, bool), ConnectorError> {
+    use tokio_stream::StreamExt;
+
+    let mut stream = snapshot_stream(table, version).await?;
     let mut batches = Vec::new();
     let mut total_rows: usize = 0;
-
     while let Some(result) = stream.next().await {
         let batch =
             result.map_err(|e| ConnectorError::ReadError(format!("stream batch failed: {e}")))?;
@@ -133,142 +112,12 @@ pub(crate) async fn read_batches_at_version(
         }
         total_rows += batch.num_rows();
         batches.push(batch);
-
-        // Respect max_records even between DataFusion batches.
         if total_rows >= max_records {
             break;
         }
     }
-
-    // If we stopped due to max_records, probe whether the stream has more.
-    // Without this, a version with exactly max_records rows would be
-    // misclassified as truncated and re-read forever.
-    let fully_consumed = if total_rows >= max_records {
-        stream.next().await.is_none()
-    } else {
-        true
-    };
-
-    debug!(
-        version,
-        num_batches = batches.len(),
-        total_rows,
-        fully_consumed,
-        "Delta Lake: scanned version"
-    );
-
+    let fully_consumed = total_rows < max_records || stream.next().await.is_none();
     Ok((batches, fully_consumed))
-}
-
-/// Reads CDF batches for a version range via `scan_cdf()`.
-///
-/// `scan_cdf(self)` consumes the supplied `DeltaTable`; callers retaining a
-/// table handle can pass a clone.
-/// Output includes `_change_type`, `_commit_version`, `_commit_timestamp`.
-///
-/// # Errors
-///
-/// Returns a read error on scan failure or a non-transient configuration error
-/// when the collected version range exceeds either hard limit.
-#[cfg(feature = "delta-lake")]
-pub async fn read_cdf_batches(
-    table: DeltaTable,
-    start_version: i64,
-    end_version: i64,
-    max_rows: usize,
-    max_bytes: usize,
-) -> Result<Vec<RecordBatch>, ConnectorError> {
-    use datafusion::prelude::SessionContext;
-    use tokio_stream::StreamExt;
-
-    debug!(start_version, end_version, "reading CDF batches");
-
-    let ctx = SessionContext::new();
-
-    // Clone session state so the RwLockReadGuard is dropped before await.
-    let session_state = ctx.state();
-
-    let start_delta_version = to_delta_version(start_version)?;
-    let end_delta_version = to_delta_version(end_version)?;
-    let cdf_builder = table
-        .scan_cdf()
-        .with_starting_version(start_delta_version)
-        .with_ending_version(end_delta_version);
-
-    let plan = cdf_builder
-        .build(&session_state, None)
-        .await
-        .map_err(map_cdf_scan_build_error)?;
-
-    // Execute the plan via DataFusion to get record batches.
-    let task_ctx = ctx.task_ctx();
-    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
-        .map_err(|e| ConnectorError::ReadError(format!("CDF stream execution failed: {e}")))?;
-
-    let mut batches = Vec::new();
-    let mut rows = 0;
-    let mut bytes = 0;
-    while let Some(result) = stream.next().await {
-        let batch: RecordBatch = result
-            .map_err(|e| ConnectorError::ReadError(format!("CDF stream batch failed: {e}")))?;
-        if batch.num_rows() > 0 {
-            (rows, bytes) = checked_cdf_commit_usage(rows, bytes, &batch, max_rows, max_bytes)?;
-            batches.push(batch);
-        }
-    }
-
-    debug!(
-        start_version,
-        end_version,
-        num_batches = batches.len(),
-        rows,
-        bytes,
-        "CDF scan complete"
-    );
-
-    Ok(batches)
-}
-
-#[cfg(feature = "delta-lake")]
-pub(super) fn map_cdf_scan_build_error(error: deltalake::DeltaTableError) -> ConnectorError {
-    match error {
-        error @ (deltalake::DeltaTableError::ChangeDataNotEnabled { .. }
-        | deltalake::DeltaTableError::ChangeDataNotRecorded { .. }) => {
-            ConnectorError::ConfigurationError(format!(
-                "Delta CDF is unavailable for the requested history: {error}"
-            ))
-        }
-        error => ConnectorError::ReadError(format!("CDF scan build failed: {error}")),
-    }
-}
-
-#[cfg(feature = "delta-lake")]
-pub(super) fn checked_cdf_commit_usage(
-    rows: usize,
-    bytes: usize,
-    batch: &RecordBatch,
-    max_rows: usize,
-    max_bytes: usize,
-) -> Result<(usize, usize), ConnectorError> {
-    let rows = rows.checked_add(batch.num_rows()).ok_or_else(|| {
-        ConnectorError::ConfigurationError("Delta CDF commit row count overflowed".into())
-    })?;
-    let bytes = bytes
-        .checked_add(batch.get_array_memory_size())
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError("Delta CDF commit byte count overflowed".into())
-        })?;
-    if rows > max_rows {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "Delta CDF commit exceeds the hard row limit: rows={rows}, limit={max_rows}"
-        )));
-    }
-    if bytes > max_bytes {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "Delta CDF commit exceeds the hard byte limit: bytes={bytes}, limit={max_bytes}"
-        )));
-    }
-    Ok((rows, bytes))
 }
 
 /// Maps Delta CDF rows to the canonical signed-weight changelog and drops CDF

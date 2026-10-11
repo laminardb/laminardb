@@ -87,11 +87,65 @@ fn glue_lookup_error_category(error: &deltalake::data_catalog::DataCatalogError)
     }
 }
 
+/// Whether a catalog-resolved table is opened for reading or for commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogAccess {
+    /// Snapshot, change-feed, reference, or lookup reads.
+    Read,
+    /// Sink writes and table preparation.
+    Write,
+}
+
+/// A table location resolved through its catalog.
+#[derive(Clone)]
+pub struct ResolvedCatalogTable {
+    /// Storage URI of the Delta table root.
+    pub location: String,
+    /// Configured storage options plus any credentials the catalog vended for this access.
+    pub storage_options: HashMap<String, String>,
+    /// When vended credentials expire; `None` for credentials that do not expire here.
+    pub credentials_expire_at: Option<std::time::SystemTime>,
+}
+
+impl std::fmt::Debug for ResolvedCatalogTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCatalogTable")
+            .field("location", &self.location)
+            .field(
+                "storage_options",
+                &crate::storage::SecretMasker::display_map(&self.storage_options),
+            )
+            .field("credentials_expire_at", &self.credentials_expire_at)
+            .finish()
+    }
+}
+
+/// Vended credentials are renewed once less than this remains before they expire.
+const CREDENTIAL_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// When credentials expiring at `expire_at` are due for renewal.
+#[must_use]
+pub fn credentials_refresh_at(
+    expire_at: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    expire_at.map(|at| {
+        at.checked_sub(CREDENTIAL_REFRESH_MARGIN)
+            .unwrap_or(std::time::UNIX_EPOCH)
+    })
+}
+
+/// Whether credentials expiring at `expire_at` must be renewed before the next storage I/O.
+#[must_use]
+pub fn credentials_need_refresh(expire_at: Option<std::time::SystemTime>) -> bool {
+    credentials_refresh_at(expire_at).is_some_and(|at| std::time::SystemTime::now() >= at)
+}
+
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.
 ///
 /// - `None`: returns table path and storage options as-is.
 /// - `Glue`: calls AWS Glue API to resolve the table's S3 location.
-/// - `Unity`: injects workspace URL and access token into storage options.
+/// - `Unity`: looks the table up through the Unity Catalog API, rejects kinds that cannot serve
+///   `access`, and adds table-scoped vended credentials unless configured credentials are chosen.
 ///
 /// # Errors
 ///
@@ -105,11 +159,16 @@ pub async fn resolve_catalog_options(
     _catalog_schema: Option<&str>,
     table_path: &str,
     base_storage_options: &HashMap<String, String>,
-) -> Result<(String, HashMap<String, String>), ConnectorError> {
+    #[allow(unused_variables)] access: CatalogAccess,
+) -> Result<ResolvedCatalogTable, ConnectorError> {
     use super::super::delta_config::DeltaCatalogType;
 
     match catalog {
-        DeltaCatalogType::None => Ok((table_path.to_string(), base_storage_options.clone())),
+        DeltaCatalogType::None => Ok(ResolvedCatalogTable {
+            location: table_path.to_string(),
+            storage_options: base_storage_options.clone(),
+            credentials_expire_at: None,
+        }),
         #[cfg(feature = "delta-lake-glue")]
         DeltaCatalogType::Glue => {
             use deltalake::DataCatalog;
@@ -145,7 +204,11 @@ pub async fn resolve_catalog_options(
                     StorageProvider::detect_uri(&resolved).map_or("unknown", StorageProvider::name),
                 "resolved table path via Glue catalog"
             );
-            Ok((resolved, base_storage_options.clone()))
+            Ok(ResolvedCatalogTable {
+                location: resolved,
+                storage_options: base_storage_options.clone(),
+                credentials_expire_at: None,
+            })
         }
         #[cfg(not(feature = "delta-lake-glue"))]
         DeltaCatalogType::Glue => Err(ConnectorError::ConfigurationError(
@@ -154,28 +217,19 @@ pub async fn resolve_catalog_options(
                 .into(),
         )),
         #[cfg(feature = "delta-lake-unity")]
-        DeltaCatalogType::Unity {
-            workspace_url,
-            access_token,
-        } => {
-            // Resolve the table's actual storage location from Unity Catalog
-            // via REST API, then return that direct path (s3://, az://, gs://)
-            // instead of the uc:// URI. This bypasses delta-rs's built-in
-            // uc:// handling which requires credential vending — a feature
-            // that is denied outside Databricks compute environments.
-            let full_name = table_path.strip_prefix("uc://").unwrap_or(table_path);
-
-            let storage_location = super::super::unity_catalog::get_table_storage_location(
-                workspace_url,
-                access_token,
-                full_name,
-            )
-            .await?;
-
-            Ok((storage_location, base_storage_options.clone()))
+        DeltaCatalogType::Unity(unity) => {
+            let resolved =
+                super::super::unity_catalog::resolve_table(unity, table_path, access).await?;
+            let mut storage_options = base_storage_options.clone();
+            storage_options.extend(resolved.vended_options);
+            Ok(ResolvedCatalogTable {
+                location: resolved.storage_location,
+                storage_options,
+                credentials_expire_at: resolved.expires_at,
+            })
         }
         #[cfg(not(feature = "delta-lake-unity"))]
-        DeltaCatalogType::Unity { .. } => Err(ConnectorError::ConfigurationError(
+        DeltaCatalogType::Unity(_) => Err(ConnectorError::ConfigurationError(
             "Unity catalog requires the 'delta-lake-unity' feature. \
              Build with: cargo build --features delta-lake-unity"
                 .into(),

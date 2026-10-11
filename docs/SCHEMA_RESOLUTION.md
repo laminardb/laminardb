@@ -31,7 +31,7 @@ limitation before activation.
 | `postgres-cdc` | Streaming source | Declared typed columns of one published table; `output.mode=changelog` adds a trailing `__weight` | Explicit fields required | PostgreSQL 17+; the declared `PRIMARY KEY` must equal the table's and every column must map exactly; system, timeline, database, publication and table identities, the exact claimed slot (`<slot.name>_<claim id>`, recorded in the source checkpoint) and the relation layout are persisted and revalidated on resume; layout drift stops the source |
 | `postgres` | Reference / lookup source | PostgreSQL table catalog | Metadata | Database/relation OIDs, column OIDs/modifiers/defaults/constraints; keys separately declared and validated |
 | `postgres-sink` | Sink | Named PostgreSQL COPY / keyed writes | Bound query plus target metadata | Database/relation OIDs and target layout; explicit table-creation policy; no implicit evolution |
-| `delta-lake` | Streaming / reference / lookup source | Delta log/catalog metadata | Metadata | Table ID, native schema, protocol and column mapping; the SQL schema is pinned while the data cursor advances |
+| `delta-lake` | Streaming / reference / lookup source | Delta log/catalog metadata | Metadata | Table ID, native schema, protocol and column mapping; the SQL schema is pinned while the data cursor advances, and a later schema change fails the source |
 | `delta-lake` | Sink | Delta target metadata | Bound query | Table ID and validated writer mapping; `auto.create` is separate; durable bindings require `schema.evolution=false` |
 | `iceberg` | Streaming / reference / lookup source | Catalog/table metadata | Metadata | Table UUID, schema/field IDs, partition spec and sort order; data position remains a checkpoint concern |
 | `iceberg` | Sink | Iceberg target metadata | Bound query | ID-aware alignment and native commits; creation requires `auto.create`; provider features and existing exact certification still apply |
@@ -74,9 +74,9 @@ protocol metadata columns are separate. Keys, watermarks and event-time declarat
 are validated independently; a timestamp field or a sampled unique value grants
 no planner guarantee.
 
-The full Delta streaming-source contract includes its existing `__weight`
-changelog column. An explicit compatible projection can omit it. Delta reference
-and lookup tables expose business fields only.
+The Delta streaming source emits a full changelog, so its schema ends with
+`__weight BIGINT NOT NULL`; explicit columns must keep it. Delta reference and
+lookup tables expose business fields only.
 
 A sink begins with the bound input query schema and resolves the destination
 schema separately. It maps fields by name or native field identity, rejects extra

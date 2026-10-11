@@ -27,17 +27,18 @@ mod read;
 mod storage_preflight;
 mod table;
 
+pub use catalog::{credentials_need_refresh, credentials_refresh_at, CatalogAccess};
 #[cfg(feature = "delta-lake")]
-pub use catalog::resolve_catalog_options;
+pub use catalog::{resolve_catalog_options, ResolvedCatalogTable};
 #[cfg(feature = "delta-lake")]
 pub use merge::MergeResult;
 #[cfg(feature = "delta-lake")]
-pub use read::{
-    get_latest_version, get_partition_columns, get_table_schema, map_cdf_to_changelog,
-    read_cdf_batches,
-};
+pub use read::{get_latest_version, get_partition_columns, get_table_schema, map_cdf_to_changelog};
 #[cfg(feature = "delta-lake")]
-pub use table::{get_coordinated_cursor, open_or_create_table};
+pub use table::{
+    get_coordinated_cursor, open_or_create_partitioned_table, open_or_create_table,
+    open_table_metadata,
+};
 
 #[cfg(feature = "delta-lake")]
 pub(crate) use attempt_error::{
@@ -47,11 +48,14 @@ pub(crate) use attempt_error::{
 };
 #[cfg(feature = "delta-lake")]
 pub(crate) use merge::merge_changelog;
-#[cfg(feature = "delta-lake")]
+#[cfg(all(feature = "delta-lake", test))]
 pub(crate) use read::read_batches_at_version;
 #[cfg(feature = "delta-lake")]
+pub(crate) use read::snapshot_stream;
+#[cfg(feature = "delta-lake")]
 pub(crate) use table::{
-    widen_batch_millisecond_timestamps, widen_millisecond_timestamps, write_batches,
+    reject_unenforced_row_obligations, widen_batch_millisecond_timestamps,
+    widen_millisecond_timestamps, write_batches,
 };
 
 #[cfg(all(feature = "delta-lake", test))]
@@ -90,8 +94,6 @@ use descriptor::{
 };
 #[cfg(all(feature = "delta-lake", test))]
 use publication::validate_coordinated_retention;
-#[cfg(all(feature = "delta-lake", test))]
-use read::{checked_cdf_commit_usage, map_cdf_scan_build_error};
 #[cfg(all(feature = "delta-lake", test))]
 use storage_preflight::{
     custom_s3_endpoint_configured_with_env, is_certified_coordinated_log_store,

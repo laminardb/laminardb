@@ -42,6 +42,25 @@ before `cargo test`. Without these the `ssl` feature from
 `laminar-connectors` (or `laminar-db` dev-dependencies) tries to build OpenSSL from source via Perl, which
 fails on the stock Windows toolchain.
 
+## Delta Lake cross-engine oracle
+
+`delta-spark-compose.yml` runs Spark 4.2.0 with delta-spark 4.4.0 as an independent reader and
+writer. Spark writes a change-data-feed table with deletion vectors (INSERT, UPDATE, DELETE, MERGE,
+a key change, OPTIMIZE) and a column-mapped table; the LaminarDB source must reproduce Spark's
+tables from the change feed and from snapshots, and Spark must read LaminarDB's upsert mirror and
+partitioned append tables back exactly. Tables live under `target/delta-spark-interop`; create it
+before starting the container, because Docker otherwise creates the bind source owned by root and
+the image's non-root user cannot write to it.
+
+```
+mkdir -p target/delta-spark-interop
+docker compose -f tests/docker/delta-spark-compose.yml up -d
+LAMINAR_DELTA_SPARK_ORACLE=1 cargo test -p laminar-connectors --features delta-lake \
+  --test delta_spark_interop -- --nocapture
+```
+
+The first oracle call downloads the Delta jars from Maven. Without the variable the test skips.
+
 ## MongoDB CDC
 
 `mongodb-cdc-compose.yml` starts a single-member replica set (`127.0.0.1:27117`), a

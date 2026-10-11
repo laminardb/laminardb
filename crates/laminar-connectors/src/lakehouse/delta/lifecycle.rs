@@ -366,6 +366,7 @@ impl SinkConnector for DeltaLakeSink {
             self.ensure_coordinated_reconciled()?;
             self.ensure_write_generation_usable()?;
             let deadline = self.operation_deadline();
+            self.renew_credentials_if_expiring(deadline).await?;
             self.stage_coordinated_buffer(deadline).await?;
             if self.coordinated_adds.is_empty() {
                 if self.coordinated_binding.is_some() {
@@ -649,6 +650,12 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
                 None,
             )
             .await?;
+            // A replacement table carries no cursor; reading it as "never published" would
+            // replay committed output into a different table incarnation.
+            super::super::schema_resolution::verify_identity(
+                self.schema_binding.as_ref(),
+                &super::super::schema_resolution::delta_native(&table)?,
+            )?;
             super::super::delta_io::get_coordinated_cursor(&table, &external_key).await
         })
         .await?;

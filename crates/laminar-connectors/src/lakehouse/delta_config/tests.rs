@@ -345,11 +345,7 @@ fn test_catalog_type_display() {
     assert_eq!(DeltaCatalogType::None.to_string(), "none");
     assert_eq!(DeltaCatalogType::Glue.to_string(), "glue");
     assert_eq!(
-        DeltaCatalogType::Unity {
-            workspace_url: "url".into(),
-            access_token: "tok".into()
-        }
-        .to_string(),
+        DeltaCatalogType::Unity(UnityCatalogConfig::default()).to_string(),
         "unity"
     );
 }
@@ -404,17 +400,68 @@ fn test_catalog_unity_valid() {
     ]);
     let config = make_config(&pairs);
     let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
-    assert!(matches!(
-        cfg.catalog_type,
-        DeltaCatalogType::Unity {
-            ref workspace_url,
-            ref access_token
-        }
-        if workspace_url == "https://my.databricks.com"
-            && access_token == "dapi123"
-    ));
+    let DeltaCatalogType::Unity(unity) = &cfg.catalog_type else {
+        panic!("expected Unity, got {:?}", cfg.catalog_type);
+    };
+    assert_eq!(unity.workspace_url, "https://my.databricks.com");
+    assert_eq!(unity.auth, UnityAuth::Token("dapi123".into()));
+    assert_eq!(unity.storage_credentials, UnityStorageCredentials::Vended);
+    assert!(
+        !format!("{unity:?}").contains("dapi123"),
+        "the token is redacted"
+    );
     assert_eq!(cfg.catalog_name.as_deref(), Some("main"));
     assert_eq!(cfg.catalog_schema.as_deref(), Some("default"));
+}
+
+#[cfg(feature = "delta-lake-unity")]
+#[test]
+fn unity_oauth_and_credential_modes_parse_and_reject_ambiguity() {
+    let parse = |extra: &[(&str, &str)]| {
+        let mut pairs = required_pairs();
+        pairs.extend_from_slice(&[
+            ("catalog.type", "unity"),
+            ("catalog.workspace_url", "https://my.databricks.com"),
+        ]);
+        pairs.extend_from_slice(extra);
+        DeltaLakeSinkConfig::from_config(&make_config(&pairs))
+    };
+    let oauth = parse(&[
+        ("catalog.client_id", "sp-1"),
+        ("catalog.client_secret", "s3cret"),
+        ("catalog.storage.credentials", "configured"),
+    ])
+    .unwrap();
+    let DeltaCatalogType::Unity(unity) = &oauth.catalog_type else {
+        panic!("expected Unity");
+    };
+    assert!(matches!(&unity.auth, UnityAuth::OAuth { client_id, .. } if client_id == "sp-1"));
+    assert_eq!(
+        unity.storage_credentials,
+        UnityStorageCredentials::Configured
+    );
+    assert!(!format!("{unity:?}").contains("s3cret"));
+
+    for extra in [
+        &[("catalog.access_token", "t"), ("catalog.client_id", "sp-1")][..],
+        &[("catalog.client_id", "sp-1")],
+        &[
+            ("catalog.access_token", "t"),
+            ("catalog.storage.credentials", "ambient"),
+        ],
+    ] {
+        assert!(parse(extra).is_err(), "{extra:?}");
+    }
+    // Table registration posts with a token; OAuth registration is rejected up front.
+    let error = parse(&[
+        ("catalog.client_id", "sp-1"),
+        ("catalog.client_secret", "s3cret"),
+        ("catalog.name", "main"),
+        ("catalog.schema", "default"),
+        ("catalog.storage.location", "s3://bucket/t"),
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("access_token"), "{error}");
 }
 
 #[cfg(feature = "delta-lake-unity")]
@@ -449,6 +496,7 @@ fn test_catalog_unity_missing_access_token() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("access_token"), "error: {err}");
+    assert!(err.contains("client_id"), "error: {err}");
 }
 
 #[test]
