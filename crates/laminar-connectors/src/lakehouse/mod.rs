@@ -373,9 +373,8 @@ pub fn register_lakehouse_sources(
     register_iceberg_source(registry)
 }
 
-#[allow(clippy::too_many_lines)]
 fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
-    vec![
+    let mut keys = vec![
         ConfigKeySpec::required(
             "table.path",
             "Path to Delta Lake table (local, s3://, az://, gs://)",
@@ -415,44 +414,9 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "Key columns for upsert MERGE (required for upsert mode)",
             "",
         ),
-        // ── Catalog configuration ──
-        ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
-        ConfigKeySpec::optional(
-            "catalog.database",
-            "Catalog database name (required for Glue)",
-            "",
-        ),
-        ConfigKeySpec::optional("catalog.name", "Catalog name (required for Unity)", ""),
-        ConfigKeySpec::optional(
-            "catalog.schema",
-            "Catalog schema name (required for Unity)",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "catalog.workspace_url",
-            "Databricks workspace URL (required for Unity)",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "catalog.access_token",
-            "Unity Catalog token (PAT or service-principal token); or use client_id/client_secret",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "catalog.client_id",
-            "Unity Catalog OAuth M2M service-principal client id",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "catalog.client_secret",
-            "Unity Catalog OAuth M2M service-principal secret",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "catalog.storage.credentials",
-            "Unity storage credentials: vended (table-scoped, renewed) or configured (storage.*)",
-            "vended",
-        ),
+    ];
+    keys.extend(delta_catalog_config_keys());
+    keys.extend([
         ConfigKeySpec::optional(
             "catalog.storage.location",
             "Storage location for auto-created UC external tables (e.g. s3://bucket/path)",
@@ -530,32 +494,13 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "Inline GCS service account JSON (falls back to GOOGLE_SERVICE_ACCOUNT_KEY)",
             "",
         ),
-    ]
+    ]);
+    keys
 }
 
-fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
+/// Catalog keys shared by the Delta source and sink.
+fn delta_catalog_config_keys() -> Vec<ConfigKeySpec> {
     vec![
-        ConfigKeySpec::required(
-            "table.path",
-            "Path to Delta Lake table (local, s3://, az://, gs://)",
-        ),
-        ConfigKeySpec::optional(
-            "read.mode",
-            "changes (snapshot/history then the change data feed) or snapshot (one snapshot, then complete)",
-            "changes",
-        ),
-        ConfigKeySpec::optional(
-            "starting.version",
-            "Changes mode: first change version to read (inclusive), or 'latest' for commits after \
-             first start; unset emits the latest snapshot, then its later changes",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "poll.interval.ms",
-            "How often to poll for new versions (ms)",
-            "1000",
-        ),
-        // ── Catalog configuration ──
         ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
         ConfigKeySpec::optional(
             "catalog.database",
@@ -593,6 +538,34 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
             "Unity storage credentials: vended (table-scoped, renewed) or configured (storage.*)",
             "vended",
         ),
+    ]
+}
+
+fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
+    let mut keys = vec![
+        ConfigKeySpec::required(
+            "table.path",
+            "Path to Delta Lake table (local, s3://, az://, gs://)",
+        ),
+        ConfigKeySpec::optional(
+            "read.mode",
+            "changes (snapshot/history then the change data feed) or snapshot (one snapshot, then complete)",
+            "changes",
+        ),
+        ConfigKeySpec::optional(
+            "starting.version",
+            "Changes mode: first change version to read (inclusive), or 'latest' for commits after \
+             first start; unset emits the latest snapshot, then its later changes",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "poll.interval.ms",
+            "How often to poll for new versions (ms)",
+            "1000",
+        ),
+    ];
+    keys.extend(delta_catalog_config_keys());
+    keys.extend([
         // ── LogStore configuration ──
         ConfigKeySpec::optional(
             "storage.s3_locking_provider",
@@ -623,7 +596,8 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
             "Path to GCS service account JSON",
             "",
         ),
-    ]
+    ]);
+    keys
 }
 
 #[cfg(test)]
