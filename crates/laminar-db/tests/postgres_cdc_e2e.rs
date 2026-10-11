@@ -1772,11 +1772,11 @@ mod latency {
         }
     }
 
-    async fn connect() -> tokio_postgres::Client {
+    pub(super) async fn connect() -> tokio_postgres::Client {
         postgres().await.expect("PostgreSQL CDC fixture")
     }
 
-    fn percentiles(mut values: Vec<f64>) -> String {
+    pub(super) fn percentiles(mut values: Vec<f64>) -> String {
         if values.is_empty() {
             return "n/a".into();
         }
@@ -2004,14 +2004,14 @@ mod latency {
     }
 
     /// Per-row commit→sink milliseconds, and rows per second from the first source commit to the
-    /// last mirror commit.
+    /// last mirror commit, without the warm-up row.
     async fn sink_latency(client: &tokio_postgres::Client, capture: &Capture) -> (Vec<f64>, f64) {
         let rows = client
             .query(
                 &format!(
                     "SELECT (extract(epoch FROM pg_xact_commit_timestamp(m.xmin) \
                      - pg_xact_commit_timestamp(s.xmin)) * 1000)::float8 \
-                     FROM {} s JOIN {} m USING (id)",
+                     FROM {} s JOIN {} m USING (id) WHERE id <> 0",
                     capture.table, capture.mirror
                 ),
                 &[],
@@ -2022,10 +2022,11 @@ mod latency {
             .query_one(
                 &format!(
                     "SELECT count(*)::float8 / greatest(extract(epoch FROM \
-                     (SELECT max(pg_xact_commit_timestamp(xmin)) FROM {}) \
-                     - (SELECT min(pg_xact_commit_timestamp(xmin)) FROM {})), 0.001)::float8 \
-                     FROM {}",
-                    capture.mirror, capture.table, capture.table
+                     (SELECT max(pg_xact_commit_timestamp(xmin)) FROM {m} WHERE id <> 0) \
+                     - (SELECT min(pg_xact_commit_timestamp(xmin)) FROM {t} WHERE id <> 0)), \
+                     0.001)::float8 FROM {t} WHERE id <> 0",
+                    m = capture.mirror,
+                    t = capture.table
                 ),
                 &[],
             )
@@ -2037,7 +2038,7 @@ mod latency {
         )
     }
 
-    async fn open_db(storage: &Path, checkpoint_ms: u64) -> Arc<LaminarDB> {
+    pub(super) async fn open_db(storage: &Path, checkpoint_ms: u64) -> Arc<LaminarDB> {
         let db = LaminarDB::builder()
             .storage_dir(storage)
             .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
@@ -2103,6 +2104,39 @@ mod latency {
         (committed, latencies)
     }
 
+    /// Commit row 0 and wait until it reaches the mirror, and the subscription when one is
+    /// given. The measured writes then start on a streaming source: a new source claims and
+    /// creates its slot over two checkpoint intervals and copies what was committed meanwhile.
+    async fn warm_up(
+        client: &tokio_postgres::Client,
+        capture: &Capture,
+        subscription: Option<&mut laminar_db::TypedSubscription<Arrival>>,
+    ) {
+        client
+            .batch_execute(&insert(&capture.table, 0))
+            .await
+            .unwrap();
+        if let Some(subscription) = subscription {
+            loop {
+                let frame =
+                    tokio::time::timeout(Duration::from_secs(60), subscription.next_frame())
+                        .await
+                        .expect("the warm-up row reaches the subscription");
+                match frame {
+                    Ok(Some(TypedSubscriptionFrame::Rows { rows, .. }))
+                        if rows.iter().any(|Arrival(id, _)| *id == 0) =>
+                    {
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("the subscription ended during the warm-up"),
+                    Err(error) => panic!("subscription failed: {error}"),
+                }
+            }
+        }
+        converge(client, capture).await;
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run(scenario: Scenario) {
         let _ = tracing_subscriber::fmt()
@@ -2136,12 +2170,15 @@ mod latency {
             statements.push("CREATE STREAM visible AS SELECT id, qty FROM changes".into());
         }
         execute_all(&db, &statements).await;
+        let opened = Instant::now();
         db.start().await.expect("start");
         let mut subscription = if scenario.visible {
             Some(db.subscribe::<Arrival>("visible").await.unwrap())
         } else {
             None
         };
+        warm_up(&client, &capture, subscription.as_mut()).await;
+        let ready = opened.elapsed();
         let stop = Arc::new(AtomicBool::new(false));
         let sampler = tokio::spawn(sample_peaks(capture.slot.clone(), Arc::clone(&stop)));
         let started = Instant::now();
@@ -2158,7 +2195,8 @@ mod latency {
         let (sink, throughput) = sink_latency(&client, &capture).await;
         println!(
             "LATENCY {name}: checkpoint={ckpt}ms rows={rows} wrote={wrote:.1}s \
-             drained_after_writes={drained:.2}s throughput={throughput:.0} rows/s\n  \
+             drained_after_writes={drained:.2}s throughput={throughput:.0} rows/s \
+             streaming {ready:.2}s after start\n  \
              commit->sink ms {sink}\n  commit->visible ms {visible}\n  \
              peak RSS {rss} MiB, peak slot lag {lag} KiB, peak retained WAL {retained} KiB, \
              checkpoints {checkpoints}",
@@ -2167,6 +2205,7 @@ mod latency {
             rows = committed.len(),
             wrote = wrote.as_secs_f64(),
             drained = drained.as_secs_f64(),
+            ready = ready.as_secs_f64(),
             sink = percentiles(sink),
             visible = percentiles(visible),
             rss = peaks.rss_mib,
@@ -2351,5 +2390,462 @@ mod latency {
             caught_up.as_secs_f64()
         );
         db.shutdown().await.expect("shutdown");
+    }
+}
+
+/// Initial-snapshot throughput into a PostgreSQL upsert mirror, with and without concurrent
+/// writes. The numbers are only meaningful from a release build, and the benchmarks need a
+/// process of their own (they read the source's events):
+///
+/// ```text
+/// cargo test --release -p laminar-db --no-default-features --features postgres-cdc,postgres-sink \
+///     --test postgres_cdc_e2e copy_throughput -- --ignored --nocapture --test-threads=1
+/// ```
+///
+/// The copy spans from the slot's creation to the source's "initial snapshot complete" event, so
+/// its rate includes the sink's backpressure. How long each chunk was held until the stream
+/// passed its WAL position comes from the source's debug events.
+mod copy_throughput {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use super::latency::{connect, open_db, percentiles};
+    use super::{execute_all, Capture, ORDER_COLUMNS};
+
+    const COMPLETE: &str = "PostgreSQL CDC initial snapshot complete";
+    const EMITTED: &str = "PostgreSQL CDC chunk emitted";
+    /// Narrow rows per chunk at the default `max.buffered.bytes`.
+    const CHUNK_ROWS: i64 = 65_536;
+
+    /// The source's snapshot events, each with the instant it was logged.
+    type Events = Arc<Mutex<Vec<(Instant, String)>>>;
+
+    fn events() -> Events {
+        use tracing_subscriber::filter::{LevelFilter, Targets};
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+
+        #[derive(Clone)]
+        struct Stamped(Events);
+        impl std::io::Write for Stamped {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let line = String::from_utf8_lossy(buf).into_owned();
+                self.0.lock().unwrap().push((Instant::now(), line));
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        static EVENTS: OnceLock<Events> = OnceLock::new();
+        let events = Arc::clone(EVENTS.get_or_init(|| {
+            let events = Events::default();
+            let stamped = Stamped(Arc::clone(&events));
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_test_writer()
+                        .with_filter(tracing_subscriber::EnvFilter::from_default_env()),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(move || stamped.clone())
+                        .with_filter(Targets::new().with_target(
+                            "laminar_connectors::postgres::cdc::source::snapshot",
+                            LevelFilter::DEBUG,
+                        )),
+                )
+                .try_init()
+                .expect("another test installed a subscriber: filter by copy_throughput");
+            events
+        }));
+        events.lock().unwrap().clear();
+        events
+    }
+
+    /// The numeric field `name` of a logged event.
+    fn field(line: &str, name: &str) -> Option<u64> {
+        let start = line.find(&format!(" {name}="))? + name.len() + 2;
+        line[start..].split_whitespace().next()?.parse().ok()
+    }
+
+    struct Workload {
+        name: &'static str,
+        rows: i64,
+        /// Characters of `label` per row.
+        label: usize,
+        churn: bool,
+    }
+
+    impl Workload {
+        /// Rows in the table before the copy; `LAMINAR_COPY_ROWS` overrides them.
+        fn rows(&self) -> i64 {
+            std::env::var("LAMINAR_COPY_ROWS")
+                .ok()
+                .map_or(self.rows, |rows| rows.parse().expect("LAMINAR_COPY_ROWS"))
+        }
+    }
+
+    /// `max.buffered.bytes` from `LAMINAR_COPY_MAX_BUFFERED_BYTES`, or the source's default.
+    fn budget() -> Option<usize> {
+        std::env::var("LAMINAR_COPY_MAX_BUFFERED_BYTES")
+            .ok()
+            .map(|bytes| bytes.parse().expect("LAMINAR_COPY_MAX_BUFFERED_BYTES"))
+    }
+
+    /// Deterministic xorshift choices, so every run writes the same operation mix.
+    struct Choices(u64);
+
+    impl Choices {
+        fn below(&mut self, bound: i64) -> i64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            i64::try_from(self.0 % u64::try_from(bound).unwrap()).unwrap()
+        }
+    }
+
+    /// Write until `stop`, returning the committed transactions. Each one updates, deletes and
+    /// inserts keys anywhere in the table and next to the copy's progress (the mirror's highest
+    /// original key), and moves primary keys between copied and uncopied ranges: by `rows`, and by
+    /// up to two chunks across nearby chunk bounds.
+    async fn churn(table: String, mirror: String, rows: i64, stop: Arc<AtomicBool>) -> u64 {
+        let client = connect().await;
+        let mut random = Choices(0x5eed_c0de);
+        let mut progress = 1;
+        let mut next_progress = Instant::now();
+        let mut transactions = 0;
+        while !stop.load(Ordering::Relaxed) {
+            if Instant::now() >= next_progress {
+                next_progress = Instant::now() + Duration::from_millis(500);
+                if let Ok(row) = client
+                    .query_one(
+                        &format!("SELECT COALESCE(max(id), 1) FROM {mirror} WHERE id <= {rows}"),
+                        &[],
+                    )
+                    .await
+                {
+                    progress = row.get(0);
+                }
+            }
+            let mut near = || (progress + random.below(200) - 100).clamp(1, rows);
+            let (near_update, near_delete, near_insert) = (near(), near(), near());
+            let (behind, ahead) = (near(), near());
+            let any = |random: &mut Choices| 1 + random.below(rows);
+            let (update, relabel, delete, far, back) = (
+                any(&mut random),
+                any(&mut random),
+                any(&mut random),
+                any(&mut random),
+                any(&mut random),
+            );
+            let fresh = 1 + random.below(2 * rows);
+            let shift = 1 + random.below(2 * CHUNK_ROWS);
+            let statement = format!(
+                "BEGIN; \
+                 UPDATE {table} SET qty = qty + 1 WHERE id IN ({update}, {near_update}); \
+                 UPDATE {table} SET label = md5(label) WHERE id = {relabel}; \
+                 DELETE FROM {table} WHERE id IN ({delete}, {near_delete}); \
+                 INSERT INTO {table} VALUES ({fresh}, 'new', 1), ({near_insert}, 'new', 2) \
+                 ON CONFLICT (id) DO NOTHING; \
+                 UPDATE {table} SET id = id + {rows} WHERE id = {far} \
+                 AND NOT EXISTS (SELECT 1 FROM {table} WHERE id = {far} + {rows}); \
+                 UPDATE {table} SET id = id - {rows} WHERE id = {back} + {rows} \
+                 AND NOT EXISTS (SELECT 1 FROM {table} WHERE id = {back}); \
+                 UPDATE {table} SET id = id + {shift} WHERE id = {behind} \
+                 AND NOT EXISTS (SELECT 1 FROM {table} WHERE id = {behind} + {shift}); \
+                 UPDATE {table} SET id = id - {shift} WHERE id = {ahead} + {shift} \
+                 AND NOT EXISTS (SELECT 1 FROM {table} WHERE id = {ahead}); \
+                 COMMIT;"
+            );
+            if client.batch_execute(&statement).await.is_ok() {
+                transactions += 1;
+            } else {
+                let _ = client.batch_execute("ROLLBACK").await;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        transactions
+    }
+
+    /// The source slot's confirmed position, its walsender's sent position (`None` while no
+    /// walsender streams it), and the server's WAL position, in bytes.
+    struct SlotSample {
+        at: Instant,
+        confirmed: i64,
+        sent: Option<i64>,
+        written: i64,
+    }
+
+    /// Samples of the slot under `prefix` from its creation until `stop`.
+    async fn sample_slot(prefix: String, stop: Arc<AtomicBool>) -> Vec<SlotSample> {
+        let client = connect().await;
+        let mut samples = Vec::new();
+        while !stop.load(Ordering::Relaxed) {
+            if let Ok(Some(row)) = client
+                .query_opt(
+                    "SELECT pg_wal_lsn_diff(s.confirmed_flush_lsn, '0/0')::bigint, \
+                     pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint, \
+                     pg_wal_lsn_diff(r.sent_lsn, '0/0')::bigint \
+                     FROM pg_replication_slots s \
+                     LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid \
+                     WHERE starts_with(s.slot_name::text, $1)",
+                    &[&format!("{prefix}_")],
+                )
+                .await
+            {
+                if let Some(confirmed) = row.get::<_, Option<i64>>(0) {
+                    samples.push(SlotSample {
+                        at: Instant::now(),
+                        confirmed,
+                        sent: row.get(2),
+                        written: row.get(1),
+                    });
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        samples
+    }
+
+    /// Rows only in the table and rows only in the mirror; `None` until the mirror exists.
+    async fn differences(client: &tokio_postgres::Client, capture: &Capture) -> Option<(i64, i64)> {
+        let (table, mirror) = (&capture.table, &capture.mirror);
+        client
+            .query_one(
+                &format!(
+                    "SELECT (SELECT count(*) FROM (SELECT id, label, qty FROM {table} EXCEPT \
+                     SELECT id, label, qty FROM {mirror}) missing), \
+                     (SELECT count(*) FROM (SELECT id, label, qty FROM {mirror} EXCEPT \
+                     SELECT id, label, qty FROM {table}) extra)"
+                ),
+                &[],
+            )
+            .await
+            .ok()
+            .map(|row| (row.get(0), row.get(1)))
+    }
+
+    /// The copy's progress on the slot: how often and how far the confirmed position advanced
+    /// before `completed`, of how much WAL was written, and the most WAL it retained.
+    fn flush_progress(samples: &[SlotSample], completed: Instant) -> String {
+        let during: Vec<&SlotSample> = samples
+            .iter()
+            .take_while(|sample| sample.at <= completed)
+            .collect();
+        let (Some(first), Some(last)) = (during.first(), during.last()) else {
+            return "no samples".into();
+        };
+        let advances: Vec<String> = during
+            .windows(2)
+            .filter(|pair| pair[1].confirmed > pair[0].confirmed)
+            .map(|pair| format!("{:.1}", pair[1].at.duration_since(first.at).as_secs_f64()))
+            .collect();
+        let peak = |behind: fn(&SlotSample) -> Option<i64>| {
+            during.iter().copied().filter_map(behind).max().unwrap_or(0) >> 10
+        };
+        format!(
+            "confirmed_flush advanced {} times (at [{}] s) by {} KiB of {} KiB written, peak \
+             retained {} KiB, walsender peak {} KiB behind",
+            advances.len(),
+            advances.join(" "),
+            (last.confirmed - first.confirmed) >> 10,
+            (last.written - first.written) >> 10,
+            peak(|sample| Some(sample.written - sample.confirmed)),
+            peak(|sample| sample.sent.map(|sent| sample.written - sent)),
+        )
+    }
+
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    async fn run(copy: Workload) {
+        let events = events();
+        let client = connect().await;
+        let capture = Capture::new(&client).await;
+        let label = if copy.label <= 32 {
+            format!("left(md5(g::text), {})", copy.label)
+        } else {
+            format!("repeat(md5(g::text), {})", copy.label / 32)
+        };
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {} SELECT g, {label}, g FROM generate_series(1, {}) g",
+                capture.table,
+                copy.rows()
+            ))
+            .await
+            .unwrap();
+        client
+            .batch_execute(&format!("VACUUM (ANALYZE) {}", capture.table))
+            .await
+            .unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let db = open_db(storage.path(), 1_000).await;
+        execute_all(
+            &db,
+            &[
+                capture.source(
+                    "orders",
+                    ORDER_COLUMNS,
+                    &budget().map_or_else(String::new, |bytes| {
+                        format!(", 'max.buffered.bytes' = '{bytes}'")
+                    }),
+                ),
+                capture.upsert_sink("orders_mirror", "orders", "id"),
+            ],
+        )
+        .await;
+        let sampling = Arc::new(AtomicBool::new(false));
+        let sampler = tokio::spawn(sample_slot(capture.slot.clone(), Arc::clone(&sampling)));
+        let started = Instant::now();
+        db.start().await.expect("start");
+        let writing = Arc::new(AtomicBool::new(false));
+        let writer = copy.churn.then(|| {
+            tokio::spawn(churn(
+                capture.table.clone(),
+                capture.mirror.clone(),
+                copy.rows(),
+                Arc::clone(&writing),
+            ))
+        });
+        let mut down_since = None;
+        let (completed, summary) = loop {
+            let found = events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, line)| line.contains(COMPLETE))
+                .cloned();
+            if let Some(found) = found {
+                break found;
+            }
+            // Supervision restarts a faulted pipeline at once and gives up after a few faults.
+            let down = matches!(db.pipeline_state(), "Faulted" | "Stopped");
+            down_since = down.then(|| down_since.unwrap_or_else(Instant::now));
+            assert!(
+                started.elapsed() < Duration::from_secs(1_800)
+                    && down_since.is_none_or(|since| since.elapsed() < Duration::from_secs(10)),
+                "the copy did not finish: {:?}",
+                db.last_fault()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        writing.store(true, Ordering::Relaxed);
+        let transactions = match writer {
+            Some(writer) => writer.await.unwrap(),
+            None => 0,
+        };
+        let converging = Instant::now();
+        let mut left = differences(&client, &capture).await;
+        while left != Some((0, 0)) && converging.elapsed() < Duration::from_secs(600) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            left = differences(&client, &capture).await;
+        }
+        let converged = converging.elapsed();
+        sampling.store(true, Ordering::Relaxed);
+        let samples = sampler.await.unwrap();
+        let created = samples.first().map_or(started, |sample| sample.at);
+        let seconds = completed.duration_since(created).as_secs_f64();
+        let copied = field(&summary, "rows").unwrap_or(0);
+        let held: Vec<f64> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, line)| line.contains(EMITTED))
+            .filter_map(|(_, line)| field(line, "held_us"))
+            .map(|micros| micros as f64 / 1e3)
+            .collect();
+        let each: Vec<String> = held.iter().map(|ms| format!("{ms:.0}")).collect();
+        let checkpoints = db.checkpoint_stats().await.map_or_else(
+            || "n/a".into(),
+            |stats| {
+                format!(
+                    "completed={} failed={} p50={}ms p99={}ms",
+                    stats.completed, stats.failed, stats.duration_p50_ms, stats.duration_p99_ms
+                )
+            },
+        );
+        println!(
+            "COPY {name}: rows={rows} label={label}B max.buffered.bytes={budget} \
+             churn={transactions} transactions\n  \
+             slot created {slot:.1}s after start; copied {copied} rows in {seconds:.1}s \
+             ({rate:.0} rows/s) in {chunks} chunks; mirror exact {converged:.1}s after the copy\n  \
+             chunk held ms {held} [{each}]\n  during the copy: {flush}\n  \
+             checkpoints {checkpoints}",
+            each = each.join(" "),
+            name = copy.name,
+            rows = copy.rows(),
+            label = copy.label,
+            budget = budget().map_or_else(|| "default".into(), |bytes| bytes.to_string()),
+            slot = created.duration_since(started).as_secs_f64(),
+            rate = copied as f64 / seconds,
+            chunks = field(&summary, "chunks").map_or_else(|| "n/a".into(), |c| c.to_string()),
+            converged = converged.as_secs_f64(),
+            held = percentiles(held),
+            flush = flush_progress(&samples, completed),
+        );
+        db.shutdown().await.expect("shutdown");
+        let tables = format!(
+            "DROP TABLE {}, {}; DROP PUBLICATION {}",
+            capture.table, capture.mirror, capture.publication
+        );
+        drop(capture);
+        client.batch_execute(&tables).await.unwrap();
+        assert_eq!(
+            left,
+            Some((0, 0)),
+            "rows only in the table, only in the mirror"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "benchmark: run in release with --nocapture"]
+    async fn narrow_rows() {
+        run(Workload {
+            name: "narrow",
+            rows: 1_000_000,
+            label: 16,
+            churn: false,
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "benchmark: run in release with --nocapture"]
+    async fn narrow_rows_under_churn() {
+        run(Workload {
+            name: "narrow_churn",
+            rows: 1_000_000,
+            label: 16,
+            churn: true,
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "benchmark: run in release with --nocapture"]
+    async fn wide_rows() {
+        run(Workload {
+            name: "wide",
+            rows: 100_000,
+            label: 4_096,
+            churn: false,
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "benchmark: run in release with --nocapture"]
+    async fn wide_rows_under_churn() {
+        run(Workload {
+            name: "wide_churn",
+            rows: 100_000,
+            label: 4_096,
+            churn: true,
+        })
+        .await;
     }
 }

@@ -386,6 +386,13 @@ committed after it was copied: no gap and no overlap.
   must use deterministic collations, the column's own collation in the index, and the default
   operator class: keys are compared on the server in the index's order, and equal keys must be
   equal texts. These are checked at startup, before any slot exists.
+- Throughput: on the workstation of the latency figures below, 1,000,000 narrow rows were copied
+  into a PostgreSQL mirror on the same server in 4.9–6.1 s (17 chunks, about 165,000–200,000
+  rows/s), with or without concurrent writes, and 5,000,000 rows in 27.5 s; 100,000 rows of
+  4 KiB took about 4.5 s. A chunk waited about 10 ms (median) for the stream to pass its
+  position; the slowest waited up to 2 s, about as long as the slowest checkpoint. During the
+  5,000,000-row copy the slot's confirmed position advanced 11 times, and the slot retained at
+  most 190 MiB of the 937 MiB of WAL written meanwhile.
 
 #### Delivery, recovery and resources
 
@@ -426,10 +433,13 @@ committed after it was copied: no gap and no overlap.
   [Slots](#slots)), delete the pipeline's checkpoints, empty the targets, and start again.
 - Latency: rows reach the PostgreSQL sink mostly on its own flush schedule
   (`flush.interval.ms`, default 250 ms) rather than at checkpoints. On one Windows 11 workstation
-  (release build, PostgreSQL 17 in Docker, sink in the same server) single-row commits reached
-  the target in 125–131 ms p50 and under 280 ms p99 with 1 s checkpoints, and 80–97 ms p50 with
-  100 ms checkpoints; stream subscribers saw them in 8–12 ms p50 and 30–90 ms p99. A 200,000-row transaction arrived 2.8 s after commit (about
-  72,000 rows/s), and 200,000 rows written while stopped were caught up 2.7 s after a restart.
+  (release build, PostgreSQL 17 in Docker, sink in the same server), once the source streamed,
+  single-row commits reached the target in 120–128 ms p50 and under 270 ms p99 with 1 s
+  checkpoints, and 81–84 ms p50 with 100 ms checkpoints; stream subscribers saw them in 8–13 ms
+  p50 and 28–36 ms p99. A 200,000-row transaction arrived 2.3 s after commit (about 89,000
+  rows/s), and 200,000 rows written while stopped were caught up 1.7 s after a restart. A new
+  source streamed 2.6 s after it started with 1 s checkpoints and 0.6–0.8 s with 100 ms
+  checkpoints (see [Slots](#slots)); rows committed before that arrive with the initial copy.
   Rerun the ignored `latency` tests in `crates/laminar-db/tests/postgres_cdc_e2e.rs` on your own
   hardware before relying on a number.
 - Metrics: `postgres_cdc_events_received_total`, `postgres_cdc_inserts_total`,
