@@ -19,7 +19,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
-| Delta Lake Source | `delta-lake` | Ephemeral singleton full-changelog reader; ordinary streaming routes, durable delivery and cluster use reject it | Reader only |
+| Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog fails closed | Implemented |
 | File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
 
@@ -480,11 +480,42 @@ Latency depends on native fetch/write batching, queue bounds, acknowledgements, 
 frequency and provider calls. Connector I/O runs outside the compute runtime. Delivery
 admission does not establish a latency measurement.
 
-Delta's `cdf_contract_is_full_changelog` in [reader tests](src/lakehouse/delta_source/tests.rs)
-checks its reader contract. That contract is not an admitted append-only streaming source:
-`mutation_sources_fail_before_connector_io` in [engine admission tests](../laminar-db/src/pipeline_lifecycle/connector_admission_tests.rs)
-covers the ordinary route's rejection, and the positioned mutable join routes require ordering
-and recovery capabilities that this reader lacks. Finite reference/lookup reads are separate.
+### Delta Lake change data feed
+
+The `delta-lake` source reads a Delta table's change data feed (CDF) and snapshots with the Delta
+kernel and emits a full changelog: `__weight` is `+1` for inserts and update post-images and `-1`
+for deletes and update pre-images. Its consumers are the same as for a PostgreSQL CDC changelog:
+projections and filters, `COUNT`/`SUM`/`AVG` with `EMIT CHANGES`, and full-changelog sinks such as
+Delta `write.mode=upsert` or PostgreSQL upsert with `changelog.mode=true`. `MIN`/`MAX`,
+`DISTINCT` aggregates, and append-only sinks are rejected before any I/O.
+
+| Option | Meaning |
+|---|---|
+| `read.mode = 'changes'` (default), `starting.version` unset | Pin the version current at first start, emit that snapshot as inserts, then every later commit |
+| `starting.version = '<n>'` | Emit commits from version `n` (inclusive), without a snapshot. Rows that existed before `n` arrive only as their later updates and deletes |
+| `starting.version = 'latest'` | Emit only commits after the version current at first start |
+| `read.mode = 'snapshot'` | Emit the latest snapshot and then complete; no CDF needed |
+| `poll.interval.ms` (default 1000) | How often the log is checked for new commits |
+
+Changes mode requires `delta.enableChangeDataFeed = true`. The kernel applies deletion vectors
+(a vector added to a file becomes deletes of exactly those rows), reads `cdc` files when a commit
+has them instead of deriving changes from its `add`/`remove` actions, and skips
+`dataChange = false` rewrites such as `OPTIMIZE`. It rejects column-mapped tables in changes mode
+(snapshots read them) and any reader feature it does not support.
+
+Recovery is at-least-once in embedded and single-node mode; cluster mode and exactly-once reject
+the source. Replay units are one commit, or one file of the pinned snapshot in path order. The
+checkpoint cursor (table id, phase, next commit or completed files) only ever stands between
+units, so a barrier that arrives inside a commit waits for the commit's last row. A checkpoint
+therefore takes at least as long as reading the largest commit or snapshot file; keep the
+checkpoint timeout above that. Resuming re-reads the unit after the cursor and never resumes
+inside one. The reader runs on the blocking pool with at most 256 MiB of decoded rows queued and
+hands batches out in `max_records` slices; one decoded batch above that bound fails the read.
+
+A recreated table (new table id), a log that regressed behind the cursor, an expired or vacuumed
+commit or snapshot file, or a schema change fails the source instead of reading another position.
+Reset the source (DROP/CREATE) to start again. Reference tables stream their snapshot batch by
+batch; lookups are separate.
 
 ### On-demand lookup sources (partial cache mode)
 
@@ -513,7 +544,7 @@ backpressures rather than dropping rows.
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert, history `cdc_replay`, durable at-least-once | Implemented |
-| Delta Lake | `delta-lake` | Coordinated append; cluster EO is certified only for direct S3/S3A | Implemented |
+| Delta Lake | `delta-lake` | Coordinated append (cluster EO certified only for direct S3/S3A); at-least-once append, MERGE upsert on non-null keys, and whole-table overwrite | Implemented |
 | Iceberg | `iceberg` | Rolling append writer; direct ALO, coordinated local EO, and REST + direct S3/S3A cluster EO; MOR/COW fail closed | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |
@@ -524,6 +555,82 @@ Iceberg REST supports no authentication, a resolved static bearer token, or OAut
 Backend support and native-provider evidence are tracked independently in the
 [cloud object-store support matrix](../../docs/cloud-object-store-support.md). Azure Iceberg is
 experimental; remote Files source/sink URLs are unsupported.
+
+Delta sink write modes have distinct contracts. `append` writes every input row; a changelog input
+keeps its `__weight` column, so the table is a change log, not current state. `upsert` collapses
+each flush to one row per `merge.key.columns` value and MERGEs it; the keys must be non-nullable
+because SQL-equality MERGE never matches a NULL key. `overwrite` atomically replaces the whole
+table, every partition included, with each flush's rows. Only coordinated `append` is
+exactly-once. Coordinated append stages files with a writer that does not evaluate CHECK
+constraints, column invariants, or generation expressions, so tables declaring them are rejected
+for it; at-least-once `append` and `upsert` use delta-rs operations that enforce them. A configured
+`partition.columns` is applied when `auto.create` creates the table and must match an existing
+table's partitioning. A retry after a failed write reopens the table read-only and fails if the
+target disappeared, was recreated, or no longer matches the bound schema.
+
+#### Unity Catalog
+
+`catalog.type = 'unity'` addresses a table as `uc://<catalog>.<schema>.<table>` through the Unity
+Catalog API (`catalog.workspace_url`), with either `catalog.access_token` or OAuth
+machine-to-machine credentials (`catalog.client_id`, `catalog.client_secret`; tokens renew
+automatically). With the default `catalog.storage.credentials = 'vended'`, LaminarDB requests
+temporary credentials for that table — `READ` for sources, reference and lookup tables,
+`READ_WRITE` for sinks — and renews them before they expire, between replay units and before each
+flush or coordinated pre-commit. Vending needs external data access enabled on the metastore and
+`EXTERNAL USE SCHEMA` for the principal; a refusal fails the connector. `'configured'` uses the
+connector's own `storage.*` credentials or cloud identity instead and bypasses Unity Catalog's
+storage governance.
+
+External Delta tables can be read and written. Managed tables can be read with vended credentials
+and are never written: their commits belong to the catalog (catalog-managed commits), which the
+pinned delta-rs writer does not implement. Views and non-Delta formats are rejected. Registering
+a missing table (`catalog.storage.location`) requires `catalog.access_token`. Open-source Unity
+Catalog uses the same API; plain `http` is accepted only for a loopback server.
+
+```sql
+CREATE SOURCE orders FROM "delta-lake" (
+  'table.path' = 'uc://main.sales.orders',
+  'catalog.type' = 'unity',
+  'catalog.workspace_url' = 'https://<workspace>.cloud.databricks.com',
+  'catalog.client_id' = '${UC_CLIENT_ID}',
+  'catalog.client_secret' = '${UC_CLIENT_SECRET}',
+  'catalog.name' = 'main',
+  'catalog.schema' = 'sales'
+);
+-- Upsert merge keys must be non-nullable: region is NOT NULL in this table.
+CREATE STREAM revenue AS
+  SELECT region, SUM(amount) AS total, COUNT(*) AS orders FROM orders GROUP BY region EMIT CHANGES;
+CREATE SINK revenue_lake FROM revenue INTO "delta-lake" (
+  'table.path' = 's3://lake/revenue', 'write.mode' = 'upsert',
+  'merge.key.columns' = 'region', 'auto.create' = 'true'
+);
+```
+
+#### Delta support matrix
+
+delta-rs 0.32.4 with its Delta kernel (buoyant_kernel 0.22.2), Arrow 58, DataFusion 53. ALO is
+at-least-once; EO is exactly-once. "Local" means embedded and single-node; cluster rules are in
+the [object-store matrix](../../docs/cloud-object-store-support.md).
+
+| Table access | Snapshot / CDF read | Append | MERGE upsert | Overwrite | Evidence |
+|---|---|---|---|---|---|
+| Direct storage (`file`, `s3`, `az`, `gs`) | Yes / yes, local ALO | ALO; coordinated EO (cluster EO direct S3/S3A only) | ALO | ALO, whole table | Local tests; Spark 4.2 / delta-spark 4.4 oracle; cloud per object-store matrix |
+| Unity Catalog external table | Yes / yes, vended or configured credentials | ALO; coordinated EO local | ALO | ALO | Mocked Unity API tests; live Databricks and OSS UC unverified |
+| Unity Catalog managed table | Yes / yes, vended credentials only | Rejected | Rejected | Rejected | Mocked Unity API tests; live unverified |
+| Catalog-managed (`catalogManaged`, catalog commits) | Rejected | Rejected | Rejected | Rejected | Blocked: delta-rs has no catalog commit path ([delta-rs#4549](https://github.com/delta-io/delta-rs/issues/4549)); the kernel UC committer (`delta-kernel-unity-catalog` 0.1.0) is a separate delta_kernel 0.29 writer stack |
+| Row filters, column masks, ABAC | Rejected (Unity refuses vending) | Rejected | Rejected | Rejected | Blocked: Databricks enforces these for external engines only through Spark server-side planning; `configured` credentials would bypass them and must not be used for such tables |
+| AWS Glue | Location lookup, then as direct storage | As direct storage; no registration or schema sync | ALO | ALO | Existing Glue lookup tests |
+| Hive Metastore, Polaris generic tables, Delta Sharing | Not implemented | — | — | — | Polaris generic tables (beta) offer no commit coordination or credential vending; Delta Sharing is a read-only sharing protocol |
+
+Table features follow the libraries' own protocol checks. Reads: deletion vectors (snapshot and
+CDF, tested with Spark-written vectors), column mapping (snapshot only; CDF rejects it), and
+timestamp_ntz are supported; the kernel rejects reader features it does not support. Writes
+use delta-rs's writer feature list: append-only, invariants, CHECK constraints, generated columns,
+change data feed, deletion vectors, timestamp_ntz and variant are accepted (coordinated append
+additionally rejects invariants, CHECK constraints and generated columns); column mapping,
+identity columns, row tracking, clustering, type widening, UniForm (Iceberg compatibility) and
+catalog-managed tables are rejected before data is published. Only the cases named as tested
+have dedicated tests; the rest rely on the upstream check.
 
 ### Upsert sinks and changelog collapse
 

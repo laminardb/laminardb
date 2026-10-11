@@ -110,13 +110,21 @@ pub struct ResolvedCatalogTable {
 /// Vended credentials are renewed once less than this remains before they expire.
 const CREDENTIAL_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// When credentials expiring at `expire_at` are due for renewal.
+#[must_use]
+pub fn credentials_refresh_at(
+    expire_at: Option<std::time::SystemTime>,
+) -> Option<std::time::SystemTime> {
+    expire_at.map(|at| {
+        at.checked_sub(CREDENTIAL_REFRESH_MARGIN)
+            .unwrap_or(std::time::UNIX_EPOCH)
+    })
+}
+
 /// Whether credentials expiring at `expire_at` must be renewed before the next storage I/O.
 #[must_use]
 pub fn credentials_need_refresh(expire_at: Option<std::time::SystemTime>) -> bool {
-    expire_at.is_some_and(|at| {
-        at.duration_since(std::time::SystemTime::now())
-            .map_or(true, |left| left < CREDENTIAL_REFRESH_MARGIN)
-    })
+    credentials_refresh_at(expire_at).is_some_and(|at| std::time::SystemTime::now() >= at)
 }
 
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.

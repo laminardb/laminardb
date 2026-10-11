@@ -27,7 +27,7 @@ mod read;
 mod storage_preflight;
 mod table;
 
-pub use catalog::{credentials_need_refresh, CatalogAccess};
+pub use catalog::{credentials_need_refresh, credentials_refresh_at, CatalogAccess};
 #[cfg(feature = "delta-lake")]
 pub use catalog::{resolve_catalog_options, ResolvedCatalogTable};
 #[cfg(feature = "delta-lake")]

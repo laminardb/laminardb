@@ -205,6 +205,7 @@ impl DeltaSource {
             budget: Arc::new(tokio::sync::Semaphore::new(
                 reader::MAX_QUEUED_BYTES as usize,
             )),
+            renew_at: delta_io::credentials_refresh_at(resolved.credentials_expire_at),
         };
         info!(
             latest_version = latest,
@@ -263,6 +264,8 @@ impl DeltaSource {
         .await?;
         ensure_same_table(&table, &table_id)?;
         reader.context.engine = table.log_store().engine(None);
+        reader.context.renew_at =
+            super::delta_io::credentials_refresh_at(resolved.credentials_expire_at);
         reader.table = table;
         reader.resolved = resolved;
         info!("Delta Lake source: renewed vended storage credentials");
@@ -390,10 +393,11 @@ impl DeltaSource {
     /// Emit at most `max_records` rows of the received batch. Every fallible step precedes the
     /// cursor and unit bookkeeping, so a failed emission leaves the checkpointable state intact.
     fn emit_pending(&mut self, max_records: usize) -> Result<Option<SourceBatch>, ConnectorError> {
-        let Some(mut pending) = self.reader_mut()?.pending.take() else {
+        let open_unit = self.open_unit;
+        let Some(pending) = self.reader_mut()?.pending.as_ref() else {
             return Ok(None);
         };
-        let first_row = match self.open_unit {
+        let first_row = match open_unit {
             Some(open) if open.unit == pending.unit => open.rows_emitted,
             Some(_) => {
                 return Err(ConnectorError::Internal(
@@ -408,11 +412,12 @@ impl DeltaSource {
         let rows_emitted = u32::try_from(take)
             .ok()
             .and_then(|take| first_row.checked_add(take))
-            .ok_or_else(|| {
-                ConnectorError::ReadError(
-                    "one Delta commit or file exceeds the u32 row-position range".into(),
-                )
-            })?;
+            .ok_or_else(row_position_overflow)?;
+        let Some(mut pending) = self.reader_mut()?.pending.take() else {
+            return Err(ConnectorError::Internal(
+                "Delta pending batch vanished during emission".into(),
+            ));
+        };
 
         if take < rows {
             pending.batch = pending.batch.slice(take, rows - take);
@@ -607,6 +612,16 @@ fn ensure_same_table(table: &DeltaTable, table_id: &str) -> Result<(), Connector
     Ok(())
 }
 
+/// Retrying cannot shrink the unit, so the position overflow is terminal.
+#[cfg(feature = "delta-lake")]
+fn row_position_overflow() -> ConnectorError {
+    ConnectorError::ConfigurationError(
+        "one Delta commit or snapshot file has more than u32::MAX rows, beyond the source's \
+         row-position range"
+            .into(),
+    )
+}
+
 /// Attach replay positions: an empty partition (one channel), the unit's order key, and the
 /// row's ordinal within its unit.
 #[cfg(feature = "delta-lake")]
@@ -619,11 +634,7 @@ fn positioned(
     let end = u32::try_from(rows)
         .ok()
         .and_then(|rows| first_row.checked_add(rows))
-        .ok_or_else(|| {
-            ConnectorError::ReadError(
-                "one Delta commit or file exceeds the u32 row-position range".into(),
-            )
-        })?;
+        .ok_or_else(row_position_overflow)?;
     let key = unit.order_key();
     let positions = crate::connector::SourceRowPositions::try_new(
         BinaryArray::from_iter_values(std::iter::repeat_n(&[][..], rows)),

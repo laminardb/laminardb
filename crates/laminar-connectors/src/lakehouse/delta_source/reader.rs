@@ -77,6 +77,16 @@ pub(super) struct ReadContext {
     /// Rows are projected to this schema (table columns plus `__weight`) on the reader thread.
     pub(super) output_schema: SchemaRef,
     pub(super) budget: Arc<Semaphore>,
+    /// When vended storage credentials are due for renewal. A read past it stops at the next
+    /// unit boundary (after completing at least one unit) so the source can renew them.
+    pub(super) renew_at: Option<std::time::SystemTime>,
+}
+
+impl ReadContext {
+    fn renewal_due(&self) -> bool {
+        self.renew_at
+            .is_some_and(|at| std::time::SystemTime::now() >= at)
+    }
 }
 
 /// One snapshot replay unit and the cursor that follows it.
@@ -257,6 +267,9 @@ fn read_snapshot(sender: &mut Sender, read: SnapshotRead) -> Result<(), Connecto
     let physical_schema = Arc::clone(scan.physical_schema());
     let logical_schema = Arc::clone(scan.logical_schema());
     for (index, file) in files.iter().enumerate().skip(skip) {
+        if index > skip && context.renewal_due() {
+            return Ok(());
+        }
         let ordinal = u64::try_from(index).map_err(|_| snapshot_mismatch(&read))?;
         let unit = UnitKey::SnapshotFile(ordinal);
         let location = context
@@ -352,9 +365,9 @@ fn read_changes(sender: &mut Sender, start: u64, end: u64) -> Result<(), Connect
             )));
         }
         if open_version.is_some_and(|open| version > open)
-            && !sender.end_unit(DeltaPhase::Changes {
+            && (!sender.end_unit(DeltaPhase::Changes {
                 next_version: version,
-            })
+            }) || context.renewal_due())
         {
             return Ok(());
         }

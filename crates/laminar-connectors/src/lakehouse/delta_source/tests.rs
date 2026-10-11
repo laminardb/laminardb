@@ -913,6 +913,9 @@ async fn unity_source_reads_with_vended_credentials_and_renews_them() {
         .await
         .write(vec![rows(&[1, 2], "a")])
         .await
+        .unwrap()
+        .write(vec![rows(&[10], "c")])
+        .await
         .unwrap();
 
     let server = MockServer::start().await;
@@ -951,10 +954,24 @@ async fn unity_source_reads_with_vended_credentials_and_renews_them() {
     let mut source = start("uc://main.lake.events", &unity, SourcePosition::Initial)
         .await
         .unwrap();
+    let vend_requests = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("temporary-table-credentials"))
+            .count()
+    };
+    // Two snapshot files: the read stops after the first to renew before the second.
     let (snapshot, _) = drain(&mut source, 10).await;
     assert_eq!(
         sorted(snapshot),
-        vec![(1, "a".into(), 1), (2, "a".into(), 1)]
+        vec![(1, "a".into(), 1), (2, "a".into(), 1), (10, "c".into(), 1)]
+    );
+    assert!(
+        vend_requests().await >= 3,
+        "open plus a renewal per snapshot file"
     );
     table::open(&path_str)
         .await
@@ -963,12 +980,109 @@ async fn unity_source_reads_with_vended_credentials_and_renews_them() {
         .unwrap();
     assert_eq!(drain_until(&mut source, 1).await, vec![(3, "b".into(), 1)]);
 
-    let vended = server
-        .received_requests()
-        .await
-        .unwrap()
-        .iter()
-        .filter(|request| request.url.path().ends_with("temporary-table-credentials"))
-        .count();
-    assert!(vended >= 3, "start plus one renewal per read: {vended}");
+    assert!(
+        vend_requests().await >= 4,
+        "and a renewal before the change read"
+    );
+
+    // Revoked access: the next renewal is refused and the source fails instead of reading on
+    // with expiring credentials or falling back to another storage identity.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "events", "catalog_name": "main", "schema_name": "lake",
+            "table_type": "EXTERNAL", "data_source_format": "DELTA", "columns": [],
+            "storage_location": url::Url::from_directory_path(dir.path()).unwrap().as_str(),
+            "properties": {}, "created_at": 0, "updated_at": 0, "table_id": "uc-1"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error_code": "PERMISSION_DENIED", "message": "revoked"
+        })))
+        .mount(&server)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let error = source.poll_batch(10).await.unwrap_err();
+    assert!(error.to_string().contains("PERMISSION_DENIED"), "{error}");
+    assert!(!error.is_transient(), "{error}");
+}
+
+/// Latency from a commit becoming visible in the log to the source emitting its rows, and read
+/// throughput for a large snapshot and a large commit. Run with
+/// `cargo test -p laminar-connectors --features delta-lake --release --lib delta_source_measurements -- --ignored --nocapture`.
+#[cfg(feature = "delta-lake")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement harness; run explicitly"]
+async fn delta_source_measurements() {
+    fn percentile(samples: &mut [std::time::Duration], p: f64) -> std::time::Duration {
+        samples.sort_unstable();
+        let rank = ((samples.len() - 1) as f64 * p).round() as usize;
+        samples[rank]
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let mut table = cdf_table(&path).await;
+    let rows_per_write = 1_000_000_i64;
+    let ids: Vec<i64> = (0..rows_per_write).collect();
+    table = table.write(vec![rows(&ids, "snapshot")]).await.unwrap();
+
+    let started = std::time::Instant::now();
+    let mut source = start(
+        &path,
+        &[("poll.interval.ms", "10")],
+        SourcePosition::Initial,
+    )
+    .await
+    .unwrap();
+    let mut emitted = 0_usize;
+    while emitted < ids.len() {
+        if let Some(batch) = source.poll_batch(8192).await.unwrap() {
+            emitted += batch.num_rows();
+        }
+    }
+    let snapshot = started.elapsed();
+    println!(
+        "snapshot: {emitted} rows in {snapshot:?} = {:.0} rows/s",
+        emitted as f64 / snapshot.as_secs_f64()
+    );
+
+    table = table.write(vec![rows(&ids, "commit")]).await.unwrap();
+    let started = std::time::Instant::now();
+    let mut emitted = 0_usize;
+    while emitted < ids.len() {
+        match source.poll_batch(8192).await.unwrap() {
+            Some(batch) => emitted += batch.num_rows(),
+            None => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+        }
+    }
+    let commit = started.elapsed();
+    println!(
+        "one commit: {emitted} rows in {commit:?} = {:.0} rows/s (includes up to one poll interval)",
+        emitted as f64 / commit.as_secs_f64()
+    );
+
+    let mut latencies = Vec::new();
+    for round in 0..50_i64 {
+        table = table
+            .write(vec![rows(&[rows_per_write + round], "probe")])
+            .await
+            .unwrap();
+        let committed = std::time::Instant::now();
+        loop {
+            if source.poll_batch(8192).await.unwrap().is_some() {
+                latencies.push(committed.elapsed());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+    println!(
+        "commit -> emission (poll.interval.ms=10): p50 {:?} p95 {:?} max {:?}",
+        percentile(&mut latencies, 0.5),
+        percentile(&mut latencies, 0.95),
+        percentile(&mut latencies, 1.0)
+    );
 }

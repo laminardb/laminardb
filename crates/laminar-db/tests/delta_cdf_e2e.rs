@@ -330,3 +330,80 @@ async fn delta_change_feed_consumers_that_cannot_retract_are_rejected() {
         let _ = db.shutdown().await;
     }
 }
+
+/// End-to-end latency from a source commit to the row being readable in the Delta mirror, and
+/// the duration of a manual checkpoint (flush initiation to durable sink visibility). Run with
+/// `cargo test -p laminar-db --features delta-lake --release --test delta_cdf_e2e -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement harness; run explicitly"]
+async fn delta_change_feed_latency() {
+    fn percentile(samples: &mut [Duration], p: f64) -> Duration {
+        samples.sort_unstable();
+        samples[((samples.len() - 1) as f64 * p).round() as usize]
+    }
+
+    let lake = tempfile::tempdir().unwrap();
+    let source_path = lake.path().join("orders");
+    let mirror = lake.path().join("mirror");
+    source_table(&source_path, &[(0, "SEED", 0)]).await;
+    let storage = tempfile::tempdir().unwrap();
+    let db = LaminarDB::builder()
+        .storage_dir(storage.path())
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
+        .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .build()
+        .await
+        .unwrap();
+    let statements = [
+        format!(
+            "CREATE SOURCE orders FROM \"delta-lake\" ('table.path' = '{}', \
+             'poll.interval.ms' = '10')",
+            location(&source_path)
+        ),
+        format!(
+            "CREATE SINK mirror_sink FROM orders INTO \"delta-lake\" ('table.path' = '{}', \
+             'write.mode' = 'upsert', 'merge.key.columns' = 'id', 'auto.create' = 'true', \
+             'max.buffer.duration.ms' = '0')",
+            location(&mirror)
+        ),
+    ];
+    if let Some(error) = first_error(&db, &statements).await {
+        panic!("{error}");
+    }
+    db.start().await.unwrap();
+
+    let mut visible = Vec::new();
+    let mut checkpoints = Vec::new();
+    for id in 1..=20_i64 {
+        let table = open_or_create_table(&location(&source_path), HashMap::new(), None)
+            .await
+            .unwrap();
+        table.write(vec![orders(&[(id, "NEW", id)])]).await.unwrap();
+        let committed = tokio::time::Instant::now();
+        let probe = format!("SELECT id, qty FROM t WHERE id = {id}");
+        while query(&mirror, &probe).await.is_empty() {
+            assert!(committed.elapsed() < CONVERGE, "row {id} never arrived");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        visible.push(committed.elapsed());
+        let started = tokio::time::Instant::now();
+        assert!(db.checkpoint().await.unwrap().success);
+        checkpoints.push(started.elapsed());
+    }
+    println!(
+        "commit -> visible in Delta mirror: p50 {:?} p95 {:?} max {:?}",
+        percentile(&mut visible, 0.5),
+        percentile(&mut visible, 0.95),
+        percentile(&mut visible, 1.0)
+    );
+    println!(
+        "manual checkpoint (initiation -> durable): p50 {:?} p95 {:?} max {:?}",
+        percentile(&mut checkpoints, 0.5),
+        percentile(&mut checkpoints, 0.95),
+        percentile(&mut checkpoints, 1.0)
+    );
+    db.shutdown().await.unwrap();
+}
