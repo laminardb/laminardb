@@ -5,7 +5,7 @@ use super::ensure_uc_table_exists;
 #[cfg(feature = "delta-lake")]
 use super::{
     classify_delta_attempt_error, count_collapsed_ops, debug, retry_delta_metadata_until,
-    run_tracked_delta_task, DataType, DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode,
+    run_tracked_delta_task, DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode,
     WriteResult, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use super::{
@@ -172,10 +172,11 @@ impl DeltaLakeSink {
             }
             table = tokio::time::timeout_at(
                 deadline,
-                delta_io::open_or_create_table(
+                delta_io::open_or_create_partitioned_table(
                     &resolved_path,
                     merged_options.clone(),
                     self.schema.as_ref(),
+                    &self.config.partition_columns,
                 ),
             )
             .await
@@ -203,6 +204,10 @@ impl DeltaLakeSink {
             } else {
                 Self::validate_weight_column(&table_schema, "Delta table")?;
                 self.schema = Some(table_schema);
+            }
+            self.validate_partition_columns(&table)?;
+            if self.is_coordinated() {
+                delta_io::reject_unenforced_row_obligations(&table)?;
             }
         }
 
@@ -283,113 +288,6 @@ impl DeltaLakeSink {
         false
     }
 
-    /// Changelog metadata columns stripped from the target Delta table schema
-    /// in upsert mode, so the table holds only user data — not the CDC `_op`/
-    /// `_ts_ms` envelope or the Z-set `__weight` column. `collapse_changelog`
-    /// strips the same columns from the MERGE source, keeping the two in sync.
-    const CHANGELOG_METADATA_COLUMNS: &'static [&'static str] =
-        &["_op", "_ts_ms", laminar_core::changelog::WEIGHT_COLUMN];
-
-    pub(in crate::lakehouse) fn target_schema(
-        batch_schema: &SchemaRef,
-        write_mode: DeltaWriteMode,
-    ) -> SchemaRef {
-        if write_mode == DeltaWriteMode::Upsert {
-            let fields: Vec<_> = batch_schema
-                .fields()
-                .iter()
-                .filter(|f| !Self::CHANGELOG_METADATA_COLUMNS.contains(&f.name().as_str()))
-                .cloned()
-                .collect();
-            Arc::new(arrow_schema::Schema::new(fields))
-        } else {
-            batch_schema.clone()
-        }
-    }
-
-    #[cfg(feature = "delta-lake")]
-    fn validate_weight_column(schema: &SchemaRef, owner: &str) -> Result<(), ConnectorError> {
-        let Ok(field) = schema.field_with_name(laminar_core::changelog::WEIGHT_COLUMN) else {
-            return Ok(());
-        };
-        if field.data_type() != &DataType::Int64 || field.is_nullable() {
-            return Err(ConnectorError::SchemaMismatch(format!(
-                "{owner} '{}' column must be non-null Int64",
-                laminar_core::changelog::WEIGHT_COLUMN
-            )));
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "delta-lake")]
-    fn validate_existing_table_schema(
-        pipeline: &SchemaRef,
-        table: &SchemaRef,
-        schema_evolution: bool,
-        exact_schema_required: bool,
-    ) -> Result<(), ConnectorError> {
-        Self::validate_weight_column(pipeline, "pipeline")?;
-        Self::validate_weight_column(table, "Delta table")?;
-
-        let weight = laminar_core::changelog::WEIGHT_COLUMN;
-        if pipeline.field_with_name(weight).is_ok() != table.field_with_name(weight).is_ok() {
-            return Err(ConnectorError::SchemaMismatch(format!(
-                "pipeline and existing Delta table must both contain '{weight}' for a weighted changelog"
-            )));
-        }
-
-        // INVARIANT: identity is checked in Delta storage form (ms -> us).
-        let pipeline = super::super::delta_io::widen_millisecond_timestamps(pipeline);
-
-        if exact_schema_required {
-            if pipeline.as_ref() != table.as_ref() {
-                return Err(ConnectorError::SchemaMismatch(
-                    "pipeline schema must exactly match the existing Delta table for coordinated append"
-                        .into(),
-                ));
-            }
-            return Ok(());
-        }
-
-        let allow_evolution = schema_evolution;
-        for input_field in pipeline.fields() {
-            let Ok(table_field) = table.field_with_name(input_field.name()) else {
-                if allow_evolution {
-                    continue;
-                }
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "pipeline column '{}' is missing from the existing Delta table",
-                    input_field.name()
-                )));
-            };
-            if !arrow_cast::can_cast_types(input_field.data_type(), table_field.data_type()) {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "pipeline column '{}' cannot be written as Delta type {}",
-                    input_field.name(),
-                    table_field.data_type()
-                )));
-            }
-            if input_field.is_nullable() && !table_field.is_nullable() {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "nullable pipeline column '{}' cannot target a non-null Delta column",
-                    input_field.name()
-                )));
-            }
-        }
-
-        for table_field in table.fields() {
-            if pipeline.field_with_name(table_field.name()).is_err()
-                && (!allow_evolution || !table_field.is_nullable())
-            {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "existing Delta column '{}' is missing from the pipeline schema",
-                    table_field.name()
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// Estimates the byte size of a `RecordBatch`.
     #[must_use]
     pub fn estimate_batch_size(batch: &RecordBatch) -> u64 {
@@ -432,6 +330,9 @@ impl DeltaLakeSink {
     /// Re-opens the Delta Lake table after a failed write consumes the handle.
     /// Uses the resolved path/options from `open()`, not `config.*`, so that
     /// catalog-resolved paths (Unity/Glue) are used correctly.
+    ///
+    /// Reopen never creates: a missing or replaced target, or a table whose writer contract no
+    /// longer matches the bound schema, fails closed instead of receiving the retried batches.
     #[cfg(feature = "delta-lake")]
     async fn reopen_table(&mut self) -> Result<(), ConnectorError> {
         use super::super::delta_io;
@@ -439,9 +340,10 @@ impl DeltaLakeSink {
         let table = delta_io::open_or_create_table(
             &self.resolved_table_path,
             self.resolved_storage_options.clone(),
-            self.schema.as_ref(),
+            None,
         )
         .await?;
+        self.validate_reopened_table(&table)?;
 
         self.delta_version = table.version().unwrap_or(0);
         self.table = Some(table);

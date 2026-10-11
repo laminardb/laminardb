@@ -37,7 +37,7 @@ pub use read::{
     read_cdf_batches,
 };
 #[cfg(feature = "delta-lake")]
-pub use table::{get_coordinated_cursor, open_or_create_table};
+pub use table::{get_coordinated_cursor, open_or_create_partitioned_table, open_or_create_table};
 
 #[cfg(feature = "delta-lake")]
 pub(crate) use attempt_error::{
@@ -51,7 +51,8 @@ pub(crate) use merge::merge_changelog;
 pub(crate) use read::read_batches_at_version;
 #[cfg(feature = "delta-lake")]
 pub(crate) use table::{
-    widen_batch_millisecond_timestamps, widen_millisecond_timestamps, write_batches,
+    reject_unenforced_row_obligations, widen_batch_millisecond_timestamps,
+    widen_millisecond_timestamps, write_batches,
 };
 
 #[cfg(all(feature = "delta-lake", test))]

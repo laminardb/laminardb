@@ -1,5 +1,5 @@
 use super::*;
-use arrow_schema::{Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -17,104 +17,128 @@ fn test_schema() -> SchemaRef {
     ]))
 }
 
-#[test]
-fn test_arrow_to_uc_columns_basic() {
-    let schema = test_schema();
-    let cols = arrow_to_uc_columns(&schema);
+fn json_type(column: &ColumnInfo) -> serde_json::Value {
+    serde_json::from_str(column.type_json.as_deref().unwrap()).unwrap()
+}
 
+#[test]
+fn primitive_columns_use_delta_types_and_catalog_strings() {
+    let cols = arrow_to_uc_columns(&test_schema(), &["name".to_string()]).unwrap();
     assert_eq!(cols.len(), 4);
-
-    assert_eq!(cols[0]["name"], "id");
-    assert_eq!(cols[0]["type_name"], "LONG");
-    assert_eq!(cols[0]["type_text"], "bigint");
-    assert_eq!(cols[0]["type_json"], "\"bigint\"");
-    assert_eq!(cols[0]["position"], 0);
-    assert_eq!(cols[0]["nullable"], false);
-
-    assert_eq!(cols[1]["name"], "name");
-    assert_eq!(cols[1]["type_name"], "STRING");
-    assert_eq!(cols[1]["type_text"], "string");
-    assert_eq!(cols[1]["nullable"], true);
-
-    assert_eq!(cols[2]["name"], "price");
-    assert_eq!(cols[2]["type_name"], "DOUBLE");
-    assert_eq!(cols[2]["type_text"], "double");
-
-    assert_eq!(cols[3]["name"], "ts");
-    assert_eq!(cols[3]["type_name"], "TIMESTAMP");
-    assert_eq!(cols[3]["type_text"], "timestamp");
+    assert_eq!(cols[0].type_name, Some(ColumnTypeName::Long));
+    assert_eq!(cols[0].type_text.as_deref(), Some("bigint"));
+    assert_eq!(
+        json_type(&cols[0]),
+        serde_json::json!({"name": "id", "type": "long", "nullable": false, "metadata": {}})
+    );
+    assert_eq!((cols[0].position, cols[0].nullable), (0, false));
+    assert_eq!(cols[1].partition_index, Some(0));
+    assert_eq!(cols[0].partition_index, None);
+    assert_eq!(cols[2].type_text.as_deref(), Some("double"));
+    // Millisecond input is registered as the microsecond UTC timestamp Delta stores.
+    assert_eq!(cols[3].type_name, Some(ColumnTypeName::Timestamp));
+    assert_eq!(json_type(&cols[3])["type"], "timestamp");
 }
 
 #[test]
-fn test_arrow_to_uc_columns_decimal() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "amount",
-        DataType::Decimal128(10, 2),
-        false,
-    )]));
-    let cols = arrow_to_uc_columns(&schema);
-
-    assert_eq!(cols[0]["type_name"], "DECIMAL");
-    assert_eq!(cols[0]["type_text"], "decimal(10,2)");
-    assert_eq!(cols[0]["type_json"], "\"decimal(10,2)\"");
-    assert_eq!(cols[0]["type_precision"], 10);
-    assert_eq!(cols[0]["type_scale"], 2);
-}
-
-#[test]
-fn test_arrow_to_uc_columns_timestamp_ntz() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "created_at",
-        DataType::Timestamp(TimeUnit::Microsecond, None),
-        true,
-    )]));
-    let cols = arrow_to_uc_columns(&schema);
-
-    assert_eq!(cols[0]["type_name"], "TIMESTAMP_NTZ");
-    assert_eq!(cols[0]["type_text"], "timestamp_ntz");
-}
-
-#[test]
-fn test_arrow_to_uc_type_coverage() {
-    // Verify all common types map without panic.
-    let types = vec![
-        DataType::Boolean,
-        DataType::Int8,
-        DataType::Int16,
-        DataType::Int32,
-        DataType::Int64,
-        DataType::UInt8,
-        DataType::UInt16,
-        DataType::UInt32,
-        DataType::UInt64,
-        DataType::Float16,
-        DataType::Float32,
-        DataType::Float64,
-        DataType::Utf8,
-        DataType::LargeUtf8,
-        DataType::Binary,
-        DataType::LargeBinary,
-        DataType::Date32,
-        DataType::Date64,
-        DataType::Null,
-    ];
-    for dt in types {
-        let (name, text) = arrow_type_to_uc(&dt);
-        assert!(!name.is_empty());
-        assert!(!text.is_empty());
-    }
-}
-
-#[test]
-fn test_arrow_to_uc_columns_position_sequential() {
+fn decimal_and_ntz_columns_keep_precision_and_kind() {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Int32, false),
-        Field::new("b", DataType::Int32, false),
-        Field::new("c", DataType::Int32, false),
+        Field::new("amount", DataType::Decimal128(10, 2), false),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
     ]));
-    let cols = arrow_to_uc_columns(&schema);
-    for (i, col) in cols.iter().enumerate() {
-        assert_eq!(col["position"], i);
+    let cols = arrow_to_uc_columns(&schema, &[]).unwrap();
+    assert_eq!(cols[0].type_name, Some(ColumnTypeName::Decimal));
+    assert_eq!(cols[0].type_text.as_deref(), Some("decimal(10,2)"));
+    assert_eq!(
+        (cols[0].type_precision, cols[0].type_scale),
+        (Some(10), Some(2))
+    );
+    assert_eq!(json_type(&cols[0])["type"], "decimal(10,2)");
+    assert_eq!(cols[1].type_name, Some(ColumnTypeName::TimestampNtz));
+    assert_eq!(cols[1].type_text.as_deref(), Some("timestamp_ntz"));
+}
+
+#[test]
+fn nested_columns_keep_child_types_and_nullability() {
+    let point = DataType::Struct(
+        vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+        ]
+        .into(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "points",
+            DataType::List(Arc::new(Field::new("element", point, true))),
+            true,
+        ),
+        Field::new(
+            "scores",
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Decimal128(12, 3), true),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )),
+                false,
+            ),
+            false,
+        ),
+    ]));
+    let cols = arrow_to_uc_columns(&schema, &[]).unwrap();
+    assert_eq!(cols[0].type_name, Some(ColumnTypeName::Array));
+    assert_eq!(
+        cols[0].type_text.as_deref(),
+        Some("array<struct<x:int,label:string>>")
+    );
+    assert_eq!(
+        json_type(&cols[0])["type"],
+        serde_json::json!({
+            "type": "array",
+            "elementType": {"type": "struct", "fields": [
+                {"name": "x", "type": "integer", "nullable": false, "metadata": {}},
+                {"name": "label", "type": "string", "nullable": true, "metadata": {}}
+            ]},
+            "containsNull": true
+        })
+    );
+    assert_eq!(cols[1].type_name, Some(ColumnTypeName::Map));
+    assert_eq!(
+        cols[1].type_text.as_deref(),
+        Some("map<string,decimal(12,3)>")
+    );
+    assert_eq!(json_type(&cols[1])["type"]["valueContainsNull"], true);
+    assert!(!cols[1].nullable);
+}
+
+#[test]
+fn types_without_a_delta_representation_fail_closed() {
+    for data_type in [
+        DataType::Duration(TimeUnit::Second),
+        DataType::Interval(arrow_schema::IntervalUnit::DayTime),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            true,
+        ))),
+    ] {
+        let schema = Arc::new(Schema::new(vec![Field::new("c", data_type.clone(), true)]));
+        assert!(
+            arrow_to_uc_columns(&schema, &[]).is_err(),
+            "{data_type} must not be stringified or truncated"
+        );
     }
 }
 

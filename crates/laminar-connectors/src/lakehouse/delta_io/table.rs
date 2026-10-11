@@ -166,8 +166,27 @@ pub(super) fn apply_url_derived_options(
 #[allow(clippy::implicit_hasher)]
 pub async fn open_or_create_table(
     table_path: &str,
+    storage_options: HashMap<String, String>,
+    schema: Option<&SchemaRef>,
+) -> Result<DeltaTable, ConnectorError> {
+    open_or_create_partitioned_table(table_path, storage_options, schema, &[]).await
+}
+
+/// Opens an existing Delta table, or creates it with `schema` partitioned by
+/// `partition_columns` when it is absent and a schema is supplied. An existing
+/// table keeps its own partitioning; callers compare it with their configuration.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ConnectionFailed` if the table cannot be opened or created, or
+/// `ConnectorError::SchemaMismatch` when a partition column is absent from `schema`.
+#[cfg(feature = "delta-lake")]
+#[allow(clippy::implicit_hasher)]
+pub async fn open_or_create_partitioned_table(
+    table_path: &str,
     mut storage_options: HashMap<String, String>,
     schema: Option<&SchemaRef>,
+    partition_columns: &[String],
 ) -> Result<DeltaTable, ConnectorError> {
     let url = if table_path.contains("://") {
         let adapted = adapt_delta_location(table_path)?;
@@ -222,11 +241,20 @@ pub async fn open_or_create_table(
         .as_ref()
         .try_into_kernel()
         .map_err(|e| ConnectorError::SchemaMismatch(format!("schema conversion failed: {e}")))?;
+    if let Some(missing) = partition_columns
+        .iter()
+        .find(|column| delta_schema.field(column.as_str()).is_none())
+    {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "partition column '{missing}' is not a column of the Delta table schema"
+        )));
+    }
 
     // Create the table.
     let table = table
         .create()
         .with_columns(delta_schema.fields().cloned())
+        .with_partition_columns(partition_columns.to_vec())
         .await
         .map_err(|error| {
             ConnectorError::ConnectionFailed(
@@ -359,6 +387,62 @@ async fn delta_prepublication_fault_boundary() -> Result<(), DeltaWriteAttemptEr
         ))
     })?;
     std::future::pending::<Result<(), DeltaWriteAttemptError>>().await
+}
+
+/// Coordinated append stages files through delta-rs `RecordBatchWriter`, which does not evaluate
+/// CHECK constraints, column invariants, or generation expressions (the `write`/`merge`
+/// operations do). Tables carrying such row obligations, or writer features delta-rs cannot
+/// honor, are rejected before any data is staged.
+///
+/// # Errors
+/// Returns `ConnectorError::ConfigurationError` naming the obligation and the remediation.
+#[cfg(feature = "delta-lake")]
+pub(crate) fn reject_unenforced_row_obligations(table: &DeltaTable) -> Result<(), ConnectorError> {
+    use deltalake::kernel::StructTypeExt as _;
+    use deltalake::DataCheck as _;
+
+    let snapshot = table
+        .snapshot()
+        .map_err(|error| classify_delta_metadata_error("read Delta snapshot", &error))?;
+    deltalake::kernel::transaction::PROTOCOL
+        .can_write_to(snapshot)
+        .map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "Delta coordinated append cannot honor this table's writer protocol: {error}"
+            ))
+        })?;
+    let remediation = "coordinated exactly-once append stages rows without evaluating it; use \
+                       at-least-once append (delta-rs write validates it) or remove the obligation";
+    if let Some(key) = snapshot
+        .metadata()
+        .configuration()
+        .keys()
+        .find(|key| key.starts_with("delta.constraints."))
+    {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta table declares CHECK constraint '{key}'; {remediation}"
+        )));
+    }
+    let schema = snapshot.schema();
+    let invariants = schema.get_invariants().map_err(|error| {
+        ConnectorError::SchemaMismatch(format!("invalid Delta column invariant: {error}"))
+    })?;
+    if let Some(invariant) = invariants.first() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta column '{}' declares an invariant; {remediation}",
+            invariant.field_name
+        )));
+    }
+    let generated = schema.get_generated_columns().map_err(|error| {
+        ConnectorError::SchemaMismatch(format!("invalid Delta generated column: {error}"))
+    })?;
+    if let Some(column) = generated.first() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta column '{}' is generated; {remediation}",
+            column.get_name()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "delta-lake")]

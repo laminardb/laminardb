@@ -8,7 +8,9 @@
 
 use std::time::Duration;
 
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::SchemaRef;
+use deltalake::kernel::{DataType as KernelType, PrimitiveType, StructType};
+use deltalake::unity_catalog::models::{ColumnInfo, ColumnTypeName};
 use serde_json::json;
 use tracing::info;
 
@@ -80,68 +82,152 @@ fn storage_provider_name(location: &str) -> &'static str {
         .map_or("unknown", |provider| provider.name())
 }
 
-/// Converts an Arrow `SchemaRef` into Unity Catalog `ColumnInfo` JSON objects.
+/// Maximum nesting accepted when rendering a column type; deeper schemas are rejected.
+const MAX_TYPE_DEPTH: usize = 64;
+
+/// Converts an Arrow schema into Unity Catalog column registrations.
 ///
-/// Each column gets `type_name`, `type_text`, `type_json`, `type_precision`,
-/// `type_scale`, `position`, and `nullable` fields as required by the
-/// Databricks Unity Catalog REST API.
-pub(crate) fn arrow_to_uc_columns(schema: &SchemaRef) -> Vec<serde_json::Value> {
-    schema
+/// The schema goes through the same Delta kernel conversion that creates the table, so nested
+/// element, field, and value types, nullability, decimal precision/scale, and timestamp kind are
+/// the ones written to the Delta log. `type_json` is the Delta/Spark `StructField` JSON and
+/// `type_text` its catalog string; types without a Unity Catalog column type fail closed.
+pub(crate) fn arrow_to_uc_columns(
+    schema: &SchemaRef,
+    partition_columns: &[String],
+) -> Result<Vec<ColumnInfo>, ConnectorError> {
+    use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
+
+    let normalized = super::delta_io::widen_millisecond_timestamps(schema);
+    let kernel: StructType = normalized.as_ref().try_into_kernel().map_err(|error| {
+        ConnectorError::SchemaMismatch(format!(
+            "Unity Catalog registration cannot represent the Delta schema: {error}"
+        ))
+    })?;
+    kernel
         .fields()
-        .iter()
         .enumerate()
-        .map(|(pos, field)| {
-            let (type_name, type_text) = arrow_type_to_uc(field.data_type());
-            // Decimal needs precision/scale in type_text: "decimal(10,2)"
-            let (precision, scale, type_text) = match field.data_type() {
-                DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
-                    (i64::from(*p), i64::from(*s), format!("decimal({p},{s})"))
-                }
-                _ => (0, 0, type_text.to_string()),
+        .map(|(position, field)| {
+            let type_json = serde_json::to_string(field).map_err(|error| {
+                ConnectorError::SchemaMismatch(format!(
+                    "column '{}' type JSON encoding failed: {error}",
+                    field.name()
+                ))
+            })?;
+            let (type_precision, type_scale) = match field.data_type() {
+                KernelType::Primitive(PrimitiveType::Decimal(decimal)) => (
+                    Some(i32::from(decimal.precision())),
+                    Some(i32::from(decimal.scale())),
+                ),
+                _ => (None, None),
             };
-            json!({
-                "name": field.name(),
-                "type_name": type_name,
-                "type_text": type_text,
-                "type_json": format!("\"{type_text}\""),
-                "type_precision": precision,
-                "type_scale": scale,
-                "position": pos,
-                "nullable": field.is_nullable(),
+            let partition_index = partition_columns
+                .iter()
+                .position(|column| column == field.name())
+                .map(|index| {
+                    i32::try_from(index).map_err(|_| {
+                        ConnectorError::SchemaMismatch("too many partition columns".into())
+                    })
+                })
+                .transpose()?;
+            Ok(ColumnInfo {
+                name: field.name().clone(),
+                type_text: Some(catalog_string(field.data_type(), 0)?),
+                type_json: Some(type_json),
+                type_name: Some(column_type_name(field.data_type())?),
+                type_precision,
+                type_scale,
+                position: u32::try_from(position).map_err(|_| {
+                    ConnectorError::SchemaMismatch("too many Unity Catalog columns".into())
+                })?,
+                nullable: field.is_nullable(),
+                partition_index,
+                ..ColumnInfo::default()
             })
         })
         .collect()
 }
 
-/// Maps an Arrow `DataType` to `(UC type_name, UC type_text)`.
-#[allow(clippy::match_same_arms)] // explicit arms document the mapping
-fn arrow_type_to_uc(dt: &DataType) -> (&'static str, &'static str) {
-    match dt {
-        DataType::Boolean => ("BOOLEAN", "boolean"),
-        DataType::Int8 => ("BYTE", "tinyint"),
-        DataType::Int16 | DataType::UInt8 => ("SHORT", "smallint"),
-        DataType::Int32 | DataType::UInt16 => ("INT", "int"),
-        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => ("LONG", "bigint"),
-        DataType::Float16 | DataType::Float32 => ("FLOAT", "float"),
-        DataType::Float64 => ("DOUBLE", "double"),
-        DataType::Decimal128(..) | DataType::Decimal256(..) => ("DECIMAL", "decimal"),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => ("STRING", "string"),
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => ("BINARY", "binary"),
-        DataType::Date32 | DataType::Date64 => ("DATE", "date"),
-        DataType::Timestamp(_, Some(_)) => ("TIMESTAMP", "timestamp"),
-        DataType::Timestamp(_, None) => ("TIMESTAMP_NTZ", "timestamp_ntz"),
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-            ("ARRAY", "array")
+fn column_type_name(data_type: &KernelType) -> Result<ColumnTypeName, ConnectorError> {
+    Ok(match data_type {
+        KernelType::Primitive(primitive) => match primitive {
+            PrimitiveType::String => ColumnTypeName::String,
+            PrimitiveType::Long => ColumnTypeName::Long,
+            PrimitiveType::Integer => ColumnTypeName::Int,
+            PrimitiveType::Short => ColumnTypeName::Short,
+            PrimitiveType::Byte => ColumnTypeName::Byte,
+            PrimitiveType::Float => ColumnTypeName::Float,
+            PrimitiveType::Double => ColumnTypeName::Double,
+            PrimitiveType::Boolean => ColumnTypeName::Boolean,
+            PrimitiveType::Binary => ColumnTypeName::Binary,
+            PrimitiveType::Date => ColumnTypeName::Date,
+            PrimitiveType::Timestamp => ColumnTypeName::Timestamp,
+            PrimitiveType::TimestampNtz => ColumnTypeName::TimestampNtz,
+            PrimitiveType::Decimal(_) => ColumnTypeName::Decimal,
+        },
+        KernelType::Array(_) => ColumnTypeName::Array,
+        KernelType::Struct(_) => ColumnTypeName::Struct,
+        KernelType::Map(_) => ColumnTypeName::Map,
+        KernelType::Variant(_) => {
+            return Err(ConnectorError::SchemaMismatch(
+                "Unity Catalog column registration does not support the variant type".into(),
+            ))
         }
-        DataType::Map(_, _) => ("MAP", "map"),
-        DataType::Struct(_) => ("STRUCT", "struct"),
-        DataType::Null => ("NULL", "null"),
-        // Duration, Interval, RunEndEncoded, etc. — use STRING fallback.
-        _ => ("STRING", "string"),
+    })
+}
+
+/// Spark `catalogString` of a Delta type, as Unity Catalog stores in `type_text`.
+fn catalog_string(data_type: &KernelType, depth: usize) -> Result<String, ConnectorError> {
+    if depth > MAX_TYPE_DEPTH {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "column type nesting exceeds {MAX_TYPE_DEPTH} levels"
+        )));
     }
+    let next = depth + 1;
+    Ok(match data_type {
+        KernelType::Primitive(primitive) => match primitive {
+            PrimitiveType::String => "string".into(),
+            PrimitiveType::Long => "bigint".into(),
+            PrimitiveType::Integer => "int".into(),
+            PrimitiveType::Short => "smallint".into(),
+            PrimitiveType::Byte => "tinyint".into(),
+            PrimitiveType::Float => "float".into(),
+            PrimitiveType::Double => "double".into(),
+            PrimitiveType::Boolean => "boolean".into(),
+            PrimitiveType::Binary => "binary".into(),
+            PrimitiveType::Date => "date".into(),
+            PrimitiveType::Timestamp => "timestamp".into(),
+            PrimitiveType::TimestampNtz => "timestamp_ntz".into(),
+            PrimitiveType::Decimal(decimal) => {
+                format!("decimal({},{})", decimal.precision(), decimal.scale())
+            }
+        },
+        KernelType::Array(array) => {
+            format!("array<{}>", catalog_string(array.element_type(), next)?)
+        }
+        KernelType::Map(map) => format!(
+            "map<{},{}>",
+            catalog_string(map.key_type(), next)?,
+            catalog_string(map.value_type(), next)?
+        ),
+        KernelType::Struct(fields) => {
+            let fields = fields
+                .fields()
+                .map(|field| {
+                    Ok(format!(
+                        "{}:{}",
+                        field.name(),
+                        catalog_string(field.data_type(), next)?
+                    ))
+                })
+                .collect::<Result<Vec<_>, ConnectorError>>()?;
+            format!("struct<{}>", fields.join(","))
+        }
+        KernelType::Variant(_) => {
+            return Err(ConnectorError::SchemaMismatch(
+                "Unity Catalog column registration does not support the variant type".into(),
+            ))
+        }
+    })
 }
 
 /// Creates an external Delta table in Unity Catalog via the REST API.
@@ -156,7 +242,7 @@ pub(crate) async fn create_uc_table(
     schema_name: &str,
     table_name: &str,
     storage_location: &str,
-    columns: &[serde_json::Value],
+    columns: &[ColumnInfo],
 ) -> Result<(), ConnectorError> {
     let url = format!(
         "{}/api/2.1/unity-catalog/tables/",

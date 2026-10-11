@@ -445,7 +445,8 @@ impl DeltaLakeSinkConfig {
 pub enum DeltaWriteMode {
     /// Append-only: all records are inserts. Most efficient for immutable streams.
     Append,
-    /// Overwrite: replace partition contents. Used for batch-style recomputation.
+    /// Overwrite: every flush atomically replaces the whole table, including all partitions,
+    /// with the rows of that flush. There is no partition-scoped replacement.
     Overwrite,
     /// Upsert/Merge: CDC-style insert/update/delete via MERGE statement.
     /// Requires `merge_key_columns` to be set. Integrates with Z-sets.

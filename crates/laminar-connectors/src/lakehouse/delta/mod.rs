@@ -7,7 +7,8 @@
 //! # Write Strategies
 //!
 //! - **Append mode**: Arrow-to-Parquet zero-copy writes for immutable streams
-//! - **Overwrite mode**: Replace partition contents for recomputation
+//! - **Overwrite mode**: every flush atomically replaces the *whole table* with that
+//!   flush's rows (no partition-scoped replacement)
 //! - **Upsert mode**: CDC MERGE via Z-set changelog integration
 //!
 //! Exactly-once append writes prepare immutable Parquet descriptors during the
@@ -201,7 +202,8 @@ pub(super) async fn ensure_uc_table_exists(
         .and_then(|s| s.rsplit('.').next())
         .unwrap_or(&config.table_path);
 
-    let columns = super::unity_catalog::arrow_to_uc_columns(arrow_schema);
+    let columns =
+        super::unity_catalog::arrow_to_uc_columns(arrow_schema, &config.partition_columns)?;
     super::unity_catalog::create_uc_table(
         workspace_url,
         access_token,

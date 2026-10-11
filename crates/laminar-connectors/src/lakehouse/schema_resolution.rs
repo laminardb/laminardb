@@ -123,6 +123,9 @@ pub(super) async fn delta_sink_with_config(
     let mut binding = logical_binding(config, SchemaDirection::Sink, SchemaOrigin::Query, &input)?;
     let business = super::DeltaLakeSink::target_schema(&input, parsed.write_mode);
     validate_delta_creation_schema(&business)?;
+    if parsed.write_mode == super::DeltaWriteMode::Upsert {
+        super::DeltaLakeSink::validate_merge_key_fields(&business, &parsed.merge_key_columns)?;
+    }
     binding.control_fields = input
         .fields()
         .iter()
@@ -241,7 +244,13 @@ pub(super) async fn prepare_delta_with_config(
             .unwrap_or(&binding.logical)
             .clone(),
     );
-    let table = super::delta_io::open_or_create_table(&path, options, Some(&schema)).await?;
+    let table = super::delta_io::open_or_create_partitioned_table(
+        &path,
+        options,
+        Some(&schema),
+        &parsed.partition_columns,
+    )
+    .await?;
     delta_bind_writer(binding, &table)?;
     Ok(())
 }

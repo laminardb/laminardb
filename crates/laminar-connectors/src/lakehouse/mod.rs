@@ -406,7 +406,7 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "write.mode",
-            "Write mode: append, overwrite, upsert",
+            "Write mode: append, overwrite (each flush replaces the whole table), upsert",
             "append",
         ),
         ConfigKeySpec::optional(
