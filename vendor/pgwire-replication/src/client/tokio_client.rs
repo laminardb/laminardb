@@ -97,6 +97,12 @@ impl AppliedLsnHandle {
     pub fn update(&self, lsn: Lsn) {
         self.0.update_applied(lsn);
     }
+
+    /// Make the worker send a status update with `reply_requested` set at once, so the server
+    /// answers with a keepalive carrying its current sent position.
+    pub fn request_keepalive(&self) {
+        self.0.request_keepalive();
+    }
 }
 
 impl std::fmt::Debug for AppliedLsnHandle {

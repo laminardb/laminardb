@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::config::ReplicationConfig;
@@ -25,6 +25,8 @@ const SOCKET_READ_AHEAD_BYTES: usize = 128 * 1024;
 /// without async backpressure.
 pub struct SharedProgress {
     applied: AtomicU64,
+    keepalive_requested: AtomicBool,
+    keepalive_wake: Notify,
 }
 
 /// Reservation for the raw backend allocation retained by an event.
@@ -73,7 +75,19 @@ impl SharedProgress {
     pub fn new(start: Lsn) -> Self {
         Self {
             applied: AtomicU64::new(start.as_u64()),
+            keepalive_requested: AtomicBool::new(false),
+            keepalive_wake: Notify::new(),
         }
+    }
+
+    /// Ask the worker to send a status update that requests an immediate server keepalive.
+    pub fn request_keepalive(&self) {
+        self.keepalive_requested.store(true, Ordering::Release);
+        self.keepalive_wake.notify_one();
+    }
+
+    fn take_keepalive_request(&self) -> bool {
+        self.keepalive_requested.swap(false, Ordering::AcqRel)
     }
 
     #[inline]
@@ -322,6 +336,11 @@ impl WorkerState {
                 self.send_feedback(stream, last_applied, false).await?;
                 last_status_sent = Instant::now();
             }
+            if self.progress.take_keepalive_request() {
+                last_applied = self.progress.load_applied();
+                self.send_feedback(stream, last_applied, true).await?;
+                last_status_sent = Instant::now();
+            }
 
             // ── Drain phase: tight loop while BufReader has buffered data ──
             // The BufReader has a 128KB internal buffer. When the kernel delivers
@@ -403,6 +422,8 @@ impl WorkerState {
                     }
                     continue;
                 }
+
+                () = self.progress.keepalive_wake.notified() => continue,
 
                 msg_result = tokio::time::timeout(
                     wake_after,
@@ -636,6 +657,14 @@ impl WorkerState {
                     return Ok(true);
                 }
 
+                () = self.progress.keepalive_wake.notified() => {
+                    if self.progress.take_keepalive_request() {
+                        *last_applied = self.progress.load_applied();
+                        self.send_feedback(stream, *last_applied, true).await?;
+                        *last_status_sent = Instant::now();
+                    }
+                }
+
                 _ = tokio::time::sleep_until(feedback_deadline) => {
                     let applied = self.progress.load_applied();
                     *last_applied = applied;
@@ -818,6 +847,30 @@ pub(super) async fn query_single_text_row<S: AsyncRead + AsyncWrite + Unpin>(
             tag => {
                 return Err(PgWireError::Protocol(format!(
                     "unexpected backend message 0x{tag:02X} while reading {context}"
+                )));
+            }
+        }
+    }
+}
+
+/// Run a simple-query command that returns no rows, such as `BEGIN` or `COMMIT`.
+pub(super) async fn execute_command<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    sql: &str,
+    context: &str,
+) -> Result<()> {
+    write_query(stream, sql).await?;
+    let mut failure = None;
+    loop {
+        let message = read_backend_message_with_limit(stream, cfg.max_message_bytes).await?;
+        match message.tag {
+            b'E' => failure = Some(PgWireError::Server(parse_error_response(&message.payload))),
+            b'Z' => return failure.map_or(Ok(()), Err),
+            b'C' | b'N' | b'S' => {}
+            tag => {
+                return Err(PgWireError::Protocol(format!(
+                    "unexpected backend message 0x{tag:02X} while running {context}"
                 )));
             }
         }
@@ -1556,5 +1609,51 @@ mod tests {
 
         drop(rx.recv().await.unwrap());
         assert!(handle.await.unwrap().unwrap());
+    }
+
+    async fn read_status_update(peer: &mut tokio::io::DuplexStream) -> [u8; 39] {
+        use tokio::io::AsyncReadExt;
+
+        let mut update = [0_u8; 39];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            peer.read_exact(&mut update),
+        )
+        .await
+        .expect("a requested keepalive is sent at once")
+        .unwrap();
+        assert_eq!((update[0], update[5]), (b'd', b'r'));
+        update
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_request_sends_a_reply_requested_status_update_at_once() {
+        let config = ReplicationConfig {
+            status_interval: std::time::Duration::from_secs(3_600),
+            idle_wakeup_interval: std::time::Duration::from_secs(3_600),
+            ..ReplicationConfig::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let progress = Arc::new(SharedProgress::new(Lsn::from_u64(0x40)));
+        let budget = Arc::new(Semaphore::new(config.max_in_flight_bytes));
+        let mut worker = WorkerState::new(config, Arc::clone(&progress), stop_rx, tx, budget);
+        let (worker_stream, mut peer) = tokio::io::duplex(1024);
+        let loop_task = tokio::spawn(async move {
+            let mut stream = BufReader::new(worker_stream);
+            worker.stream_loop(&mut stream).await
+        });
+
+        let initial = read_status_update(&mut peer).await;
+        assert_eq!(initial[38], 0, "periodic feedback requests no reply");
+        progress.request_keepalive();
+        let requested = read_status_update(&mut peer).await;
+        assert_eq!(requested[38], 1, "the reply-requested flag is set");
+        assert_eq!(
+            &requested[6..14],
+            &0x40_u64.to_be_bytes(),
+            "reports the applied LSN"
+        );
+        loop_task.abort();
     }
 }

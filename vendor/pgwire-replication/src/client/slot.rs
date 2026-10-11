@@ -1,218 +1,106 @@
 //! Logical replication slot creation over a replication-protocol session.
 //!
-//! An exported snapshot is importable only while the session that created the
-//! slot stays open and idle, so a background task owns that session and keeps
-//! it open until [`CreatedSlot::release`] or drop.
+//! The session ends before [`create_logical_slot`] returns, so a temporary slot exists only for
+//! the duration of the call: it serves to read the visibility snapshot at a fresh consistent point.
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
 use crate::protocol::framing::write_terminate;
 
-use super::worker::{authenticate, query_single_text_row, required_text_column, startup};
+use super::worker::{
+    authenticate, execute_command, query_single_text_row, required_text_column, startup,
+};
 
 /// What `CREATE_REPLICATION_SLOT` does with the snapshot taken at the slot's consistent point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotSnapshot {
-    /// Export it for import by `SET TRANSACTION SNAPSHOT` in another session.
-    Export,
+    /// Read it as `pg_current_snapshot()` in the creating session's read-only transaction.
+    Use,
     /// Discard it; the slot only streams changes after its consistent point.
     Nothing,
 }
 
 /// A newly created logical slot and the server identity observed before creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedSlot {
-    /// First LSN the slot streams; the exported snapshot sees exactly the
-    /// transactions committed before it.
+    /// First LSN the slot streams.
     pub consistent_point: Lsn,
-    /// Name of the exported snapshot, present only for [`SlotSnapshot::Export`].
-    pub snapshot_name: Option<String>,
+    /// `pg_current_snapshot()` text of the slot's snapshot, present only for
+    /// [`SlotSnapshot::Use`]: it sees exactly the transactions the slot does not stream.
+    pub visibility_snapshot: Option<String>,
     /// `IDENTIFY_SYSTEM` system identifier of the server that created the slot.
     pub system_identifier: u64,
     /// `IDENTIFY_SYSTEM` timeline of the server that created the slot.
     pub timeline_id: u32,
-    release: Option<oneshot::Sender<()>>,
-    session: Option<JoinHandle<Result<()>>>,
 }
 
-impl CreatedSlot {
-    /// Close the creating session. An exported snapshot stops being importable,
-    /// so call this only after every importer ran `SET TRANSACTION SNAPSHOT`.
-    pub async fn release(mut self) -> Result<()> {
-        if let Some(release) = self.release.take() {
-            let _ = release.send(());
-        }
-        match self.session.take() {
-            Some(session) => session
-                .await
-                .map_err(|error| PgWireError::Task(format!("slot session task: {error}")))?,
-            None => Ok(()),
-        }
-    }
-}
-
-impl Drop for CreatedSlot {
-    fn drop(&mut self) {
-        if let Some(release) = self.release.take() {
-            let _ = release.send(());
-        }
-        if let Some(session) = self.session.take() {
-            session.abort();
-        }
-    }
-}
-
-impl std::fmt::Debug for CreatedSlot {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CreatedSlot")
-            .field("consistent_point", &self.consistent_point)
-            .field("snapshot_name", &self.snapshot_name)
-            .field("system_identifier", &self.system_identifier)
-            .field("timeline_id", &self.timeline_id)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Create the persistent logical `pgoutput` slot named by `cfg.slot`.
+/// Create the logical `pgoutput` slot named by `cfg.slot`, never two-phase or failover-enabled.
 ///
-/// The slot is never temporary, two-phase, or failover-enabled. If this future
-/// fails or is cancelled the session is closed, but the server may already have
-/// created the slot; the caller must reconcile that.
+/// A `temporary` slot is dropped when this call's session ends, before it returns. If this future
+/// fails or is cancelled the session is closed, but the server may already have created a
+/// persistent slot; the caller must reconcile that.
 pub async fn create_logical_slot(
     cfg: &ReplicationConfig,
     snapshot: SlotSnapshot,
+    temporary: bool,
 ) -> Result<CreatedSlot> {
     super::tokio_client::validate_config(cfg)?;
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
-    let task_cfg = cfg.clone();
-    let session = SessionTask(Some(tokio::spawn(async move {
-        run_slot_session(&task_cfg, snapshot, ready_tx, release_rx).await
-    })));
-    match ready_rx.await {
-        Ok(Ok(mut created)) => {
-            created.release = Some(release_tx);
-            created.session = session.into_inner();
-            Ok(created)
-        }
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(PgWireError::Task(
-            "slot session ended before reporting slot creation".into(),
-        )),
-    }
-}
 
-/// Aborts the session task unless ownership moved into a [`CreatedSlot`].
-struct SessionTask(Option<JoinHandle<Result<()>>>);
-
-impl SessionTask {
-    fn into_inner(mut self) -> Option<JoinHandle<Result<()>>> {
-        self.0.take()
-    }
-}
-
-impl Drop for SessionTask {
-    fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
-        }
-    }
-}
-
-async fn run_slot_session(
-    cfg: &ReplicationConfig,
-    snapshot: SlotSnapshot,
-    ready: oneshot::Sender<Result<CreatedSlot>>,
-    release: oneshot::Receiver<()>,
-) -> Result<()> {
     #[cfg(unix)]
     if cfg.is_unix_socket() {
         if cfg.tls.mode.requires_tls() {
-            return publish_failure(
-                ready,
-                PgWireError::Tls("TLS is not supported over Unix domain sockets".into()),
-            );
+            return Err(PgWireError::Tls(
+                "TLS is not supported over Unix domain sockets".into(),
+            ));
         }
-        let mut stream = match UnixStream::connect(cfg.unix_socket_path()).await {
-            Ok(stream) => stream,
-            Err(error) => return publish_failure(ready, error.into()),
-        };
-        return hold_slot_session(cfg, snapshot, &mut stream, ready, release).await;
+        let mut stream = UnixStream::connect(cfg.unix_socket_path()).await?;
+        return create_and_close(cfg, snapshot, temporary, &mut stream).await;
     }
 
-    let tcp = match TcpStream::connect((cfg.host.as_str(), cfg.port)).await {
-        Ok(tcp) => tcp,
-        Err(error) => return publish_failure(ready, error.into()),
-    };
-    if let Err(error) = tcp.set_nodelay(true) {
-        return publish_failure(ready, error.into());
-    }
+    let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
+    tcp.set_nodelay(true)?;
 
     #[cfg(feature = "tls-rustls")]
     {
-        let mut stream =
-            match crate::tls::rustls::maybe_upgrade_to_tls(tcp, &cfg.tls, &cfg.host).await {
-                Ok(stream) => stream,
-                Err(error) => return publish_failure(ready, error),
-            };
-        hold_slot_session(cfg, snapshot, &mut stream, ready, release).await
+        let mut stream = crate::tls::rustls::maybe_upgrade_to_tls(tcp, &cfg.tls, &cfg.host).await?;
+        create_and_close(cfg, snapshot, temporary, &mut stream).await
     }
 
     #[cfg(not(feature = "tls-rustls"))]
     {
         if !matches!(cfg.tls.mode, crate::config::SslMode::Disable) {
-            return publish_failure(
-                ready,
-                PgWireError::Tls("tls-rustls feature not enabled".into()),
-            );
+            return Err(PgWireError::Tls("tls-rustls feature not enabled".into()));
         }
         let mut stream = tcp;
-        hold_slot_session(cfg, snapshot, &mut stream, ready, release).await
+        create_and_close(cfg, snapshot, temporary, &mut stream).await
     }
 }
 
-fn publish_failure(ready: oneshot::Sender<Result<CreatedSlot>>, error: PgWireError) -> Result<()> {
-    let _ = ready.send(Err(error.clone()));
-    Err(error)
-}
-
-async fn hold_slot_session<S: AsyncRead + AsyncWrite + Unpin>(
+async fn create_and_close<S: AsyncRead + AsyncWrite + Unpin>(
     cfg: &ReplicationConfig,
     snapshot: SlotSnapshot,
+    temporary: bool,
     stream: &mut S,
-    ready: oneshot::Sender<Result<CreatedSlot>>,
-    release: oneshot::Receiver<()>,
-) -> Result<()> {
-    let created = create_on_stream(cfg, snapshot, stream).await;
-    let failure = created.as_ref().err().cloned();
-    if ready.send(created).is_err() {
-        let _ = write_terminate(stream).await;
-        return Ok(());
-    }
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    // Any further command would end the exported snapshot, so the session idles until released.
-    let _ = release.await;
-    write_terminate(stream).await
+) -> Result<CreatedSlot> {
+    let created = create_on_stream(cfg, snapshot, temporary, stream).await;
+    let _ = write_terminate(stream).await;
+    created
 }
 
 async fn create_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
     cfg: &ReplicationConfig,
     snapshot: SlotSnapshot,
+    temporary: bool,
     stream: &mut S,
 ) -> Result<CreatedSlot> {
     startup(cfg, stream).await?;
     authenticate(cfg, stream).await?;
-    // IDENTIFY_SYSTEM must precede slot creation: any later command ends the exported snapshot.
     let identity = query_single_text_row(cfg, stream, "IDENTIFY_SYSTEM", "IDENTIFY_SYSTEM").await?;
     let system_identifier = required_text_column(&identity, 0, "system identifier")?
         .parse::<u64>()
@@ -228,10 +116,20 @@ async fn create_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
         )));
     }
 
+    // `SNAPSHOT 'use'` must be the first command of a read-only repeatable-read transaction.
+    if snapshot == SlotSnapshot::Use {
+        execute_command(
+            cfg,
+            stream,
+            "BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ",
+            "BEGIN",
+        )
+        .await?;
+    }
     let row = query_single_text_row(
         cfg,
         stream,
-        &create_slot_query(cfg, snapshot),
+        &create_slot_query(cfg, snapshot, temporary),
         "CREATE_REPLICATION_SLOT",
     )
     .await?;
@@ -244,31 +142,43 @@ async fn create_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
     let consistent_point = required_text_column(&row, 1, "slot consistent point")?
         .parse::<Lsn>()
         .map_err(|error| PgWireError::Protocol(format!("invalid consistent point: {error}")))?;
-    let snapshot_name = row[2].clone();
-    if (snapshot == SlotSnapshot::Export) != snapshot_name.is_some() {
+    if row[2].is_some() {
         return Err(PgWireError::Protocol(
-            "CREATE_REPLICATION_SLOT snapshot name does not match the requested snapshot action"
-                .into(),
+            "CREATE_REPLICATION_SLOT exported a snapshot it was not asked for".into(),
         ));
     }
+    let visibility_snapshot = match snapshot {
+        SlotSnapshot::Use => {
+            let visible = query_single_text_row(
+                cfg,
+                stream,
+                "SELECT pg_catalog.pg_current_snapshot()::text",
+                "slot visibility snapshot",
+            )
+            .await?;
+            let text = required_text_column(&visible, 0, "slot visibility snapshot")?.to_owned();
+            execute_command(cfg, stream, "COMMIT", "COMMIT").await?;
+            Some(text)
+        }
+        SlotSnapshot::Nothing => None,
+    };
     Ok(CreatedSlot {
         consistent_point,
-        snapshot_name,
+        visibility_snapshot,
         system_identifier,
         timeline_id,
-        release: None,
-        session: None,
     })
 }
 
-fn create_slot_query(cfg: &ReplicationConfig, snapshot: SlotSnapshot) -> String {
+fn create_slot_query(cfg: &ReplicationConfig, snapshot: SlotSnapshot, temporary: bool) -> String {
     let action = match snapshot {
-        SlotSnapshot::Export => "export",
+        SlotSnapshot::Use => "use",
         SlotSnapshot::Nothing => "nothing",
     };
+    let temporary = if temporary { " TEMPORARY" } else { "" };
     // `validate_config` restricts the slot name to lower-case ASCII, digits, and underscore.
     format!(
-        "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput (SNAPSHOT '{action}')",
+        "CREATE_REPLICATION_SLOT {}{temporary} LOGICAL pgoutput (SNAPSHOT '{action}')",
         cfg.slot
     )
 }
@@ -284,11 +194,15 @@ mod tests {
             ..ReplicationConfig::default()
         };
         assert_eq!(
-            create_slot_query(&cfg, SlotSnapshot::Export),
-            "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput (SNAPSHOT 'export')"
+            create_slot_query(&cfg, SlotSnapshot::Use, false),
+            "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput (SNAPSHOT 'use')"
         );
         assert_eq!(
-            create_slot_query(&cfg, SlotSnapshot::Nothing),
+            create_slot_query(&cfg, SlotSnapshot::Use, true),
+            "CREATE_REPLICATION_SLOT orders_slot TEMPORARY LOGICAL pgoutput (SNAPSHOT 'use')"
+        );
+        assert_eq!(
+            create_slot_query(&cfg, SlotSnapshot::Nothing, false),
             "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput (SNAPSHOT 'nothing')"
         );
     }
@@ -332,74 +246,108 @@ mod tests {
 
     async fn reply_row(peer: &mut tokio::io::DuplexStream, values: &[Option<&str>]) {
         write_backend(peer, b'D', &data_row(values)).await;
-        write_backend(peer, b'C', b"OK ").await;
-        write_backend(peer, b'Z', b"I").await;
+        write_backend(peer, b'C', b"OK\0").await;
+        write_backend(peer, b'Z', b"T").await;
+    }
+
+    async fn reply_command(peer: &mut tokio::io::DuplexStream, tag: &[u8]) {
+        write_backend(peer, b'C', tag).await;
+        write_backend(peer, b'Z', b"T").await;
+    }
+
+    async fn expect_query(peer: &mut tokio::io::DuplexStream, expected: &str) {
+        let (tag, query) = read_frontend(peer, true).await;
+        assert_eq!(tag, b'Q');
+        assert_eq!(
+            std::str::from_utf8(&query[..query.len() - 1]).unwrap(),
+            expected
+        );
     }
 
     #[tokio::test]
-    async fn exporting_session_idles_until_release_then_terminates() {
+    async fn a_temporary_use_slot_reads_its_snapshot_in_one_read_only_transaction() {
+        let cfg = ReplicationConfig {
+            database: "orders".into(),
+            slot: "orders_probe".into(),
+            ..ReplicationConfig::default()
+        };
+        let (mut client, mut peer) = tokio::io::duplex(4096);
+        let created = tokio::spawn(async move {
+            create_and_close(&cfg, SlotSnapshot::Use, true, &mut client).await
+        });
+
+        read_frontend(&mut peer, false).await;
+        write_backend(&mut peer, b'R', &0_i32.to_be_bytes()).await;
+        write_backend(&mut peer, b'Z', b"I").await;
+        expect_query(&mut peer, "IDENTIFY_SYSTEM").await;
+        reply_row(
+            &mut peer,
+            &[Some("42"), Some("1"), Some("0/200"), Some("orders")],
+        )
+        .await;
+        expect_query(&mut peer, "BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ").await;
+        reply_command(&mut peer, b"BEGIN\0").await;
+        expect_query(
+            &mut peer,
+            "CREATE_REPLICATION_SLOT orders_probe TEMPORARY LOGICAL pgoutput (SNAPSHOT 'use')",
+        )
+        .await;
+        reply_row(
+            &mut peer,
+            &[Some("orders_probe"), Some("0/300"), None, Some("pgoutput")],
+        )
+        .await;
+        expect_query(&mut peer, "SELECT pg_catalog.pg_current_snapshot()::text").await;
+        reply_row(&mut peer, &[Some("907:909:907")]).await;
+        expect_query(&mut peer, "COMMIT").await;
+        reply_command(&mut peer, b"COMMIT\0").await;
+        let (tag, _) = read_frontend(&mut peer, true).await;
+        assert_eq!(tag, b'X', "the session ends, dropping the temporary slot");
+
+        let created = created.await.unwrap().unwrap();
+        assert_eq!(
+            created,
+            CreatedSlot {
+                consistent_point: Lsn::from_u64(0x300),
+                visibility_snapshot: Some("907:909:907".into()),
+                system_identifier: 42,
+                timeline_id: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_inside_the_transaction_fails_the_creation() {
         let cfg = ReplicationConfig {
             database: "orders".into(),
             slot: "orders_slot".into(),
             ..ReplicationConfig::default()
         };
         let (mut client, mut peer) = tokio::io::duplex(4096);
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let session = tokio::spawn(async move {
-            hold_slot_session(
-                &cfg,
-                SlotSnapshot::Export,
-                &mut client,
-                ready_tx,
-                release_rx,
-            )
-            .await
+        let created = tokio::spawn(async move {
+            create_and_close(&cfg, SlotSnapshot::Use, false, &mut client).await
         });
-
         read_frontend(&mut peer, false).await;
         write_backend(&mut peer, b'R', &0_i32.to_be_bytes()).await;
         write_backend(&mut peer, b'Z', b"I").await;
-        let (_, identify) = read_frontend(&mut peer, true).await;
-        assert_eq!(&identify[..identify.len() - 1], b"IDENTIFY_SYSTEM");
+        expect_query(&mut peer, "IDENTIFY_SYSTEM").await;
         reply_row(
             &mut peer,
             &[Some("42"), Some("1"), Some("0/200"), Some("orders")],
         )
         .await;
-        let (_, create) = read_frontend(&mut peer, true).await;
-        assert!(std::str::from_utf8(&create)
-            .unwrap()
-            .contains("SNAPSHOT 'export'"));
-        reply_row(
+        expect_query(&mut peer, "BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ").await;
+        write_backend(
             &mut peer,
-            &[
-                Some("orders_slot"),
-                Some("0/300"),
-                Some("00000003-1"),
-                Some("pgoutput"),
-            ],
+            b'E',
+            b"SERROR\0C25001\0Mmust be called before any query\0\0",
         )
         .await;
-
-        let created = ready_rx.await.unwrap().unwrap();
-        assert_eq!(created.consistent_point, Lsn::from_u64(0x300));
-        assert_eq!(created.snapshot_name.as_deref(), Some("00000003-1"));
-        assert_eq!(created.system_identifier, 42);
-        let idle = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            read_frontend(&mut peer, true),
-        )
-        .await;
-        assert!(
-            idle.is_err(),
-            "no command may follow the export before release"
-        );
-
-        release_tx.send(()).unwrap();
+        write_backend(&mut peer, b'Z', b"E").await;
         let (tag, _) = read_frontend(&mut peer, true).await;
         assert_eq!(tag, b'X');
-        session.await.unwrap().unwrap();
+        let error = created.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("25001"), "{error}");
     }
 
     #[tokio::test]
@@ -427,7 +375,7 @@ mod tests {
             slot: "Bad Slot".into(),
             ..ReplicationConfig::default()
         };
-        let error = create_logical_slot(&cfg, SlotSnapshot::Export)
+        let error = create_logical_slot(&cfg, SlotSnapshot::Use, false)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("slot"), "{error}");
