@@ -267,7 +267,8 @@ impl ChunkedSnapshot {
             .filter(|bound| bound.len() != plan.keys.len())
         {
             return Err(ConnectorError::ConfigurationError(format!(
-                "PostgreSQL CDC checkpoint records a snapshot bound of {} values for a primary key                  of {} columns",
+                "PostgreSQL CDC checkpoint records a snapshot bound of {} values for a primary key \
+                 of {} columns",
                 bound.len(),
                 plan.keys.len()
             )));
