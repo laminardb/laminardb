@@ -298,7 +298,10 @@ async fn read_columns(
     let columns = query(
         client.query(
             "SELECT a.attname::text, a.atttypid, a.atttypmod, a.attnotnull, \
-                    COALESCE(a.attnum = ANY(i.indkey), false), COALESCE(i.indimmediate, true) \
+                    COALESCE((SELECT k.ord <= i.indnkeyatts \
+                              FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \
+                              WHERE k.attnum = a.attnum), false), \
+                    COALESCE(i.indimmediate, true) \
              FROM pg_catalog.pg_attribute AS a \
              LEFT JOIN pg_catalog.pg_index AS i \
                     ON i.indrelid = a.attrelid AND i.indisprimary \

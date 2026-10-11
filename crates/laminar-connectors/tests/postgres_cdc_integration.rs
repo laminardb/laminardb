@@ -796,6 +796,29 @@ async fn contract_violations_fail_before_creating_a_slot() {
     }
 }
 
+/// Columns the primary-key index only `INCLUDE`s are not key columns: the declared key is the
+/// index's key columns alone, and a change to an included column keeps the row's key.
+#[tokio::test]
+async fn included_columns_of_the_primary_key_index_are_not_key_columns() {
+    let Some(fixture) =
+        Fixture::new("id bigint, label text, qty integer, PRIMARY KEY (id) INCLUDE (label)").await
+    else {
+        return;
+    };
+    let config = fixture.config(&orders_schema(), &["id"], &[("snapshot.mode", "never")]);
+    let mut source = started(start(&config)).await;
+    fixture
+        .exec(&format!(
+            "INSERT INTO {t} VALUES (1, 'a', 1); UPDATE {t} SET label = 'b' WHERE id = 1;",
+            t = fixture.table
+        ))
+        .await;
+    let expected = table_state(&fixture).await;
+    let mut mirror = Mirror::new();
+    poll_until(&mut source, &mut mirror, |mirror| *mirror == expected).await;
+    source.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn unchanged_toast_values_and_nulls_survive_real_wal() {
     let Some(fixture) = Fixture::new(ORDERS).await else {
