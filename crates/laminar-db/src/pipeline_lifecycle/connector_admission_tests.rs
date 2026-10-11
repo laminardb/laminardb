@@ -980,6 +980,51 @@ fn source_contract_admission_matrix_is_fail_closed() {
     }
 }
 
+#[cfg(feature = "postgres-cdc")]
+#[test]
+fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
+    use super::admit_source_recovery_contract;
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::postgres::register_postgres_cdc_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("postgres-cdc");
+    for (key, value) in [
+        ("host", "localhost"),
+        ("database", "app"),
+        ("slot.name", "laminar_app"),
+        ("publication", "laminar_app"),
+        ("table", "public.orders"),
+    ] {
+        config.set(key, value);
+    }
+    let source = registry.create_source(&config, None).unwrap();
+    for mode in ["upsert", "changelog"] {
+        config.set("output.mode", mode);
+        let contract = source.contract(&config).unwrap();
+        let admit = |delivery, checkpointing, runtime| {
+            admit_source_recovery_contract(contract, delivery, checkpointing, runtime)
+        };
+        assert_eq!(
+            admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Local),
+            Ok(()),
+            "{mode}"
+        );
+        assert_eq!(
+            admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster),
+            Err("cluster singleton sources require fenced singleton placement, which is not implemented"),
+            "{mode}"
+        );
+        assert!(
+            admit(DeliveryGuarantee::ExactlyOnce, true, RuntimeMode::Local).is_err(),
+            "{mode}"
+        );
+        assert!(
+            admit(DeliveryGuarantee::AtLeastOnce, false, RuntimeMode::Local).is_err(),
+            "{mode}"
+        );
+    }
+}
+
 #[test]
 fn cluster_best_effort_is_rejected_before_source_topology() {
     let contract = SourceContract::new(
@@ -2132,7 +2177,7 @@ async fn mutation_source_creation_revalidates_preexisting_consumers_and_plain_co
     assert!(
         error
             .to_string()
-            .contains("exactly one admitted temporal-right, bounded interval, or direct"),
+            .contains("exactly one admitted temporal-right, bounded interval, direct"),
         "{error}"
     );
     assert!(db.catalog.get_stream_entry("keyed_copy").is_none());
@@ -2483,8 +2528,14 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
                 subscription_certificate: None,
             },
         );
-        resolve_stream_output_schemas(&context, &streams, &Default::default(), &Default::default())
-            .await?;
+        resolve_stream_output_schemas(
+            &context,
+            &streams,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
         Ok(())
     }
     .await;

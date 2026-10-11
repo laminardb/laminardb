@@ -361,6 +361,13 @@ pub async fn write_copy_data<W: AsyncWrite + Unpin>(wr: &mut W, payload: &[u8]) 
     Ok(())
 }
 
+/// Write a Terminate message, closing the session cleanly.
+pub async fn write_terminate<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
+    wr.write_all(&[b'X', 0, 0, 0, 4]).await?;
+    wr.flush().await?;
+    Ok(())
+}
+
 pub async fn write_copy_done<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
     let mut buf = BytesMut::with_capacity(5);
     buf.put_u8(b'c'); // CopyDone

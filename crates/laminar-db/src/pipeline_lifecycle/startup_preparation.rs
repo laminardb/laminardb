@@ -89,7 +89,7 @@ impl LaminarDB {
                 startup_runtime,
             )
             .await?;
-        let direct_mutation_sources = self.validate_mutation_source_routes(
+        let mutation_routes = self.validate_mutation_source_routes(
             (&source_regs, &sink_regs, &stream_regs),
             &temporal_source_roles,
             &ordered_interval_admissions,
@@ -167,7 +167,7 @@ impl LaminarDB {
                 pipeline_identity,
                 temporal_source_roles,
                 ordered_interval_admissions,
-                direct_mutation_sources,
+                mutation_routes,
                 runtime_shutdown,
                 #[cfg(feature = "cluster")]
                 topology,

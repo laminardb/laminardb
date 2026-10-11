@@ -14,7 +14,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | Replayable ALO; exact-certified input for coordinated EO pipelines | Implemented |
-| PostgreSQL CDC | `postgres-cdc` | Raw JSON change envelopes lack canonical primary-keyed row/delete records; initial and resume admission reject before I/O | Not admitted |
+| PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
@@ -24,10 +24,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
 
 Feature flags compile connector implementations; startup validates the complete source/SQL/sink
-composition. PostgreSQL CDC remains rejected even when a stored resume position exists; see
-`postgres_cdc_admission_rejects_unexecuted_options_and_reference_use` in
-[CDC admission tests](tests/cdc_admission.rs). Its lookup connector and supported sinks are
-separate capabilities.
+composition before any connector I/O.
 
 ### MongoDB CDC
 
@@ -198,6 +195,266 @@ history consumers tolerate that. Resume tokens are never decoded.
 - Exactly-once is not available. Events are limited to 16 MiB unsplit;
   `$changeStreamSplitLargeEvent` is not supported.
 
+### PostgreSQL CDC
+
+`postgres-cdc` reads one table through PostgreSQL logical replication (`pgoutput`) and delivers
+typed rows straight to sinks or to retractable SQL: PostgreSQL → LaminarDB → destinations, with
+no broker or Debezium in between. It runs in embedded and single-node server mode; cluster mode
+rejects it.
+
+New to it? The [main README](../../README.md#postgresql-change-data-capture) walks through
+mirroring a table on your machine.
+
+| `output.mode` | Rows | Contract | Consumers |
+|---|---|---|---|
+| `upsert` (default) | Current row per primary key; delete → key-only tombstone; a primary-key change → tombstone for the old key, then the new row | Keyed upsert | A keyed sink reading the source directly; tested with the PostgreSQL upsert sink (`changelog.mode = 'true'`). Streams over it are rejected |
+| `changelog` | Z-set with a trailing `__weight BIGINT NOT NULL`: insert `+1`, delete `−1`, update `−1` old row then `+1` new row | Full changelog | A PostgreSQL upsert sink with `changelog.mode`, directly or through projections, filters, and non-windowed `COUNT`/`SUM`/`AVG` aggregates with `EMIT CHANGES`; windows, `MIN`/`MAX`, joins with other streams, and append sinks are rejected. Needs `snapshot.mode=initial` |
+
+`snapshot.mode=initial` (default) copies the table, then streams every later change.
+`snapshot.mode=never` streams only changes committed after the source creates its slot.
+
+#### Setup
+
+PostgreSQL 17 or newer with `wal_level = logical` (tested with 17 and 18). Prepare the table,
+publication and role once; LaminarDB creates and owns the replication slots (see
+[Slots](#slots)):
+
+```sql
+ALTER TABLE public.orders REPLICA IDENTITY FULL;
+CREATE PUBLICATION orders_pub FOR TABLE public.orders;
+CREATE ROLE laminar LOGIN REPLICATION PASSWORD '...';
+GRANT SELECT ON public.orders TO laminar;
+```
+
+Startup fails before it creates a slot unless:
+
+- the publication is `FOR TABLE` exactly this one table, publishes all of `insert, update,
+  delete, truncate` (the default), and has no row filter;
+- the table is an ordinary table (not partitioned, a view or a foreign table) with a primary key
+  and `REPLICA IDENTITY FULL`, so updates and deletes carry the complete old row and unchanged
+  TOAST values can be restored;
+- the primary key is not `DEFERRABLE`. A deferred key lets one transaction such as
+  `UPDATE t SET id = id + 1` move a key value between rows, so a row can arrive before the delete
+  of the row that held its key, and a consumer applying changes by key would then delete it;
+- the declared `PRIMARY KEY` equals the table's primary key, every declared column exists with a
+  supported type, and a column declared `NOT NULL` is `NOT NULL` in PostgreSQL. Declared columns
+  may be a subset of the table's columns;
+- with `snapshot.mode=initial`, the role can `SELECT` every declared column and row-level
+  security does not apply to its reads of the table. Logical replication ignores row-level security, so a filtered copy would miss rows the
+  stream later updates. Use a role with `BYPASSRLS`, or the table owner without
+  `FORCE ROW LEVEL SECURITY`;
+- with `snapshot.mode=initial`, the server is a primary, not a standby, and the primary-key
+  columns use deterministic collations, their own collation in the index, and default operator
+  classes (see [Initial snapshot](#initial-snapshot)).
+
+```sql
+CREATE SOURCE orders (
+    id BIGINT NOT NULL, status VARCHAR, amount DECIMAL(12,2), updated_at TIMESTAMP,
+    PRIMARY KEY (id)
+) FROM "postgres-cdc" (
+    'host' = 'pg', 'port' = '5432', 'database' = 'shop',
+    'username' = 'laminar', 'password' = '${PG_PASSWORD}', 'ssl.mode' = 'verify-full',
+    'publication' = 'orders_pub', 'slot.name' = 'laminar_orders', 'table' = 'public.orders'
+);
+
+CREATE SINK orders_mirror FROM orders INTO "postgres-sink" (
+    'hostname' = 'replica', 'port' = '5432', 'database' = 'mirror',
+    'username' = 'laminar', 'password' = '${MIRROR_PASSWORD}', 'table.name' = 'orders',
+    'write.mode' = 'upsert', 'primary.key' = 'id', 'changelog.mode' = 'true',
+    'auto.create.table' = 'true'
+);
+```
+
+Run with at-least-once delivery and checkpointing enabled. Secrets must be `${VAR}` references;
+in a server TOML `sql` block write `$${VAR}`.
+
+| Property | Default | Meaning |
+|---|---|---|
+| `host`, `port`, `database` | required, `5432`, required | Server and database |
+| `username`, `password` | `postgres`, none | Role with `REPLICATION` and `SELECT` on the table |
+| `ssl.mode`, `ssl.ca.cert.path` | `verify-full`, bundled public CA roots | `verify-full` or `disable` |
+| `publication`, `slot.name`, `table` | required | `slot.name` is a prefix of at most 46 bytes of lower-case letters, digits and `_` (see [Slots](#slots)); `table` is `schema.table` |
+| `snapshot.mode` | `initial` | `initial` or `never` |
+| `output.mode` | `upsert` | `upsert` or `changelog` |
+| `max.buffered.bytes` | `268435456` (256 MiB) | All source memory for raw WAL, decoded transactions and Arrow building; 1 MiB to 4 GiB |
+
+Removed keys (`table.include`, `table.exclude`, `start.lsn`, `max.buffered.events`,
+`max.poll.records`, `poll.timeout.ms`, …) are rejected with the reason.
+
+#### Slots
+
+A new source picks a random 16-hex-digit claim id and records it in a checkpoint before it
+touches PostgreSQL. After that checkpoint commits, it creates the slot `<slot.name>_<claim id>`,
+for example `laminar_orders_3f9a0c27d1e4b856`. A slot name is never reused. Logs, errors and
+reset instructions name the exact slot.
+
+- The source reads nothing until its claim commits, and emits no row until the next checkpoint,
+  which names the new slot, commits too. Rows therefore start flowing about two checkpoint
+  intervals after the source starts, in both snapshot modes. With a manual checkpoint schedule
+  the slot is created after the first `checkpoint()` and rows flow after the second.
+- Creating a logical slot waits for every running transaction that has written something. The
+  wait has no deadline. Every 30 seconds the source logs a warning that names those sessions and
+  any prepared transactions.
+- A restart uses only the slot its committed checkpoint names. The slot must be a logical
+  `pgoutput` slot of this database, not temporary, two-phase, failover or synced, not
+  invalidated, and must not have lost WAL. A session of the same claim left over from an earlier
+  run (`application_name` `laminar:<claim id>:…`) is ended first. A slot held by any other
+  session fails the start with a retryable error that names its pid, `application_name` and
+  client address.
+- A restart from a committed claim whose slot already exists adopts that slot from its
+  consistent point, in both snapshot modes. With `snapshot.mode=initial` the source also creates
+  a temporary slot `laminar_probe_<claim id>_<…>` to learn which transactions the copy must
+  include; PostgreSQL drops it when that session ends a moment later. Like any slot creation, it
+  waits for running transactions that have written something.
+- Other slots under the prefix are reported and never dropped. Each inactive one is logged with
+  the WAL it retains and the statement that drops it, and counted in
+  `postgres_cdc_orphaned_slots`. Give every source its own prefix: an inactive slot of another
+  source under the same prefix looks like an orphan. Drop orphans once no pipeline restores from
+  a checkpoint that names them:
+
+  ```sql
+  SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+  WHERE slot_name ~ '^<prefix>_[0-9a-f]{16}$' AND NOT active;
+  ```
+
+#### Types
+
+| PostgreSQL | Declare as |
+|---|---|
+| `bool` | `BOOLEAN` |
+| `int2` / `int4` / `int8` | `SMALLINT` / `INT` / `BIGINT` |
+| `float4` / `float8` | `REAL` / `DOUBLE`; NaN and infinities are kept |
+| `numeric(p,s)` with `p ≤ 38`, `s ≥ 0` | `DECIMAL(p,s)`, exact. Unconstrained `numeric`, NaN and infinities are rejected |
+| `text`, `varchar`, `char`, `name`, `json`, `jsonb`, `uuid` | `VARCHAR`; JSON as PostgreSQL prints it |
+| `bytea` | `BYTEA` |
+| `date`, `time` | `DATE`, `TIME` (microseconds) |
+| `timestamp`, `timestamptz` | `TIMESTAMP` (microseconds; `timestamptz` as UTC) |
+
+Other types, arrays, and mismatched declarations fail at startup; an `infinity` date or
+timestamp fails the source. Snapshot and replication sessions pin `DateStyle`, `TimeZone=UTC`,
+`extra_float_digits` and `bytea_output`, so a value decodes the same from either path.
+
+#### Row semantics
+
+- Rows arrive in commit order, one whole transaction at a time; a rolled-back transaction emits
+  nothing. Repeated changes to one key in a transaction are all delivered, in order.
+- `upsert` deletes carry only the key, so non-key columns must be nullable.
+- An unchanged TOAST value in an update is restored from the full old row.
+- `TRUNCATE` stops the source: it has no row images to apply. Reset as described below.
+- A change to the table's columns, types or replica identity stops the source at the first row
+  change after it. The publication and slot are rechecked, and orphaned slots reported, as
+  checkpoints commit, at most every 30 seconds; that check is best-effort, so restrict who can
+  alter them.
+
+#### Initial snapshot
+
+The source streams from the slot's consistent point and, at the same time, copies the table in
+primary-key chunks. Each row reaches the target once as copied state, followed by every change
+committed after it was copied: no gap and no overlap.
+
+- Each chunk is one short `REPEATABLE READ, READ ONLY` transaction. It takes an `ACCESS SHARE`
+  lock on the table, reads its snapshot and WAL position, reads the next primary-key range (sized
+  from `max.buffered.bytes`, at most 65,536 rows), and writes an empty logical-decoding message.
+  The message lets the stream confirm it has passed that position even when nothing else is
+  written. No transaction stays open between chunks, so vacuum is not held back. A DDL
+  statement that needs a stronger lock waits for at most one chunk. A chunk transaction waits at
+  most 5 s for its lock, each statement in it runs for at most 20 s, and an attempt that takes
+  longer than 30 s is abandoned and retried on a new session. One poll can still take up to
+  60 s against a slow server, so keep the checkpoint timeout above that while a copy runs (the
+  default is 120 s): a poll that exceeds it fails the source, and in `changelog` mode that
+  failure needs the reset below.
+- A chunk is emitted once the stream has passed the position it was read at, in batches of the
+  pipeline's poll size, so a chunk of wide rows still fits a sink's input limit. Changes its
+  snapshot missed are merged into it first. A change is matched to a chunk by transaction
+  visibility, not by WAL position. A transaction that has committed but is not yet visible to
+  new snapshots, such as one waiting for a synchronous standby, pauses copying until it becomes
+  visible; streaming continues meanwhile. After 30 seconds the source logs the sessions it waits
+  for and their wait events.
+- No row is copied until a checkpoint naming the new slot commits, about one checkpoint interval
+  after the slot is created.
+- Checkpoints keep committing during the copy and confirm the slot's position, so PostgreSQL
+  releases WAL while the table is copied. The source also checks the slot's `wal_status` every 10
+  seconds and fails if `max_slot_wal_keep_size` removed WAL it needs.
+- A change to the table's columns, types, replica identity or primary key during the copy stops
+  the source before the next chunk is read. A table rewrite is not visible consistently to a
+  snapshot taken across it.
+- A restart inside the copy resumes it in `upsert` mode. Deletes are always forwarded during the
+  copy, so rows the target received before the restart are corrected. In `changelog` mode the
+  restart fails closed and names the reset: a changelog consumer would keep rows it received
+  before the restart that changed before they were copied again.
+- The copy needs a primary server, because it reads WAL insert positions. Primary-key columns
+  must use deterministic collations, the column's own collation in the index, and the default
+  operator class: keys are compared on the server in the index's order, and equal keys must be
+  equal texts. These are checked at startup, before any slot exists.
+- Throughput: on the workstation of the latency figures below, 1,000,000 narrow rows were copied
+  into a PostgreSQL mirror on the same server in 4.9–6.1 s (17 chunks, about 165,000–200,000
+  rows/s), with or without concurrent writes, and 5,000,000 rows in 27.5 s; 100,000 rows of
+  4 KiB took about 4.5 s. A chunk waited about 10 ms (median) for the stream to pass its
+  position; the slowest waited up to 2 s, about as long as the slowest checkpoint. During the
+  5,000,000-row copy the slot's confirmed position advanced 11 times, and the slot retained at
+  most 190 MiB of the 937 MiB of WAL written meanwhile.
+
+#### Delivery, recovery and resources
+
+- At-least-once. The slot's confirmed position advances only after a checkpoint commits (sinks
+  flushed, manifest persisted), so PostgreSQL keeps WAL for every row still in the pipeline.
+  After a crash the source replays from the last committed position. Keyed sinks converge, and
+  aggregates restore their state from the same checkpoint, so replayed changes are not counted
+  twice. Exactly-once is not available.
+- A checkpoint records the server's system identifier and timeline, the database, publication,
+  table and exact slot. Resuming against another server, a promoted replica, or a changed
+  publication fails closed.
+- A lost replication connection, or another recoverable fault, restarts the pipeline in process
+  when supervision is on (the server default; `LaminarDB::enable_supervision()` when embedded):
+  the source reattaches to its slot at the last committed position. A restart before the first
+  checkpoint commits makes a new claim. A restart after the claim commits but before a checkpoint
+  naming the slot commits has emitted nothing, so it creates the claimed slot or adopts it from
+  its consistent point; neither needs a reset. A restart inside the initial snapshot resumes the
+  copy in `upsert` mode and fails closed with the reset in `changelog` mode.
+- The PostgreSQL sink paces itself by how fast the target applied its recent statements. It
+  flushes before the next batch would make a flush take more than half of `statement.timeout.ms`
+  (30 s by default), and splits a flush into statements of about a quarter of it inside one
+  target transaction, so a slow target receives more, smaller transactions instead of a
+  statement that times out. A batch is never split, and read directly from the source a batch
+  holds whole transactions, so one source transaction must apply within the sink's write
+  deadline (`statement.timeout.ms` plus 5 s; twice `statement.timeout.ms` plus 5 s with
+  `changelog.mode`; or `sink.write.timeout.ms` when set) and the checkpoint timeout (120 s by default). A larger transaction
+  faults the pipeline on every attempt: raise those limits, or speed up the target.
+- Retained WAL grows while the pipeline is stopped or slow. Set `max_slot_wal_keep_size` and
+  watch `postgres_cdc_replication_lag_bytes`; a slot that has lost WAL cannot resume. An idle
+  captured table does not hold back WAL written by other tables: once every received change has
+  been emitted, the source position follows the server's keepalives, and the next committed
+  checkpoint confirms it.
+- `max.buffered.bytes` bounds the source. One transaction may use about a sixth of it while it is
+  decoded; a larger one fails the source with a message naming the limit. While downstream is
+  slow the source stops reading WAL but still reports committed progress to the server.
+- Reset, when an error asks for it: stop the pipeline, run the
+  `SELECT pg_drop_replication_slot('<slot>')` the error names (or the prefix query under
+  [Slots](#slots)), delete the pipeline's checkpoints, empty the targets, and start again.
+- Latency: rows reach the PostgreSQL sink mostly on its own flush schedule
+  (`flush.interval.ms`, default 250 ms) rather than at checkpoints. On one Windows 11 workstation
+  (release build, PostgreSQL 17 in Docker, sink in the same server), once the source streamed,
+  single-row commits reached the target in 120–128 ms p50 and under 270 ms p99 with 1 s
+  checkpoints, and 81–84 ms p50 with 100 ms checkpoints; stream subscribers saw them in 8–13 ms
+  p50 and 28–36 ms p99. A 200,000-row transaction arrived 2.3 s after commit (about 89,000
+  rows/s), and 200,000 rows written while stopped were caught up 1.7 s after a restart. A new
+  source streamed 2.6 s after it started with 1 s checkpoints and 0.6–0.8 s with 100 ms
+  checkpoints (see [Slots](#slots)); rows committed before that arrive with the initial copy.
+  Rerun the ignored `latency` tests in `crates/laminar-db/tests/postgres_cdc_e2e.rs` on your own
+  hardware before relying on a number.
+- Metrics: `postgres_cdc_events_received_total`, `postgres_cdc_inserts_total`,
+  `postgres_cdc_updates_total`, `postgres_cdc_deletes_total`, `postgres_cdc_transactions_total`,
+  `postgres_cdc_snapshot_rows_total`, `postgres_cdc_confirmed_flush_lsn`,
+  `postgres_cdc_replication_lag_bytes`.
+
+#### Unique constraints on the target
+
+A primary-key change, or a unique value moving from one row to another, reaches the sink as a
+delete and an insert in the same epoch. The PostgreSQL sink applies each epoch in one transaction
+with `SET CONSTRAINTS ALL DEFERRED`, so other unique constraints on the target must be
+`DEFERRABLE`. Changelog upsert sinks reject non-deferrable unique or exclusion constraints and
+plain unique indexes at startup.
+
 ### Recovery and native client APIs
 
 The engine admits source and sink compositions through their typed contracts. Connectors
@@ -293,7 +550,7 @@ requirements:
 | `registry` | `ConnectorRegistry` for registering and looking up connectors by name |
 | `kafka` | Kafka source/sink, Avro serde, schema registry, partitioner, backpressure |
 | `postgres` | PostgreSQL durable at-least-once sink (COPY BINARY, upsert/changelog) |
-| `postgres/cdc` | PostgreSQL replication/decoding implementation; CDC source admission remains rejected |
+| `postgres/cdc` | PostgreSQL CDC source: catalog contract, snapshot, `pgoutput` decoding, typed rows, slot feedback |
 | `mongodb` | Change-stream CDC source (history and document modes, initial snapshot), lookup reads and durable at-least-once majority-journaled sink |
 | `otel` | OpenTelemetry OTLP/gRPC receiver for traces, metrics, and logs (tonic server) |
 | `websocket` | WebSocket client source and client/server sinks (fan-out, backpressure, reconnect) |
@@ -325,7 +582,7 @@ requirements:
 | Flag | Purpose |
 |------|---------|
 | `kafka` | rdkafka, Avro serde, schema registry (reqwest) |
-| `postgres-cdc` | PostgreSQL replication implementation (CDC source rejected); also builds the supported `postgres` lookup source |
+| `postgres-cdc` | PostgreSQL CDC source; also builds the `postgres` lookup source |
 | `postgres-sink` | PostgreSQL sink via tokio-postgres |
 | `mongodb-cdc` | MongoDB CDC source, sink, and lookup |
 | `nats` | NATS Core and JetStream source/sink via async-nats |

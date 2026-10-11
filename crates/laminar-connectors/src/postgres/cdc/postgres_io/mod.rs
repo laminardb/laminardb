@@ -1,16 +1,24 @@
 //! `PostgreSQL` logical replication connections and slot administration.
 
-#[cfg(not(test))]
-use super::lsn::Lsn;
+mod catalog;
+pub(super) mod slots;
+
+pub(super) use catalog::{
+    in_recovery, inspect_capture_table, layout_fingerprint, layout_fingerprint_sql,
+    primary_key_index, unreadable_columns, CaptureTable, IndexKeyColumn,
+};
+
 use crate::connector::ConnectorTaskGuard;
 use crate::error::ConnectorError;
 use sha2::{Digest, Sha256};
+use slots::{SlotAttributes, SlotFacts, SlotHolder};
 
 pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const MINIMUM_SERVER_VERSION_NUM: u32 = 170_000;
 
-/// Database-side identity that makes an engine checkpoint safe to resume.
+/// Database-side identity that makes an engine checkpoint safe to resume. The slot's own
+/// attributes are fixed by the adoption checks rather than recorded here.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct PostgresCheckpointBinding {
     pub system_identifier: u64,
@@ -19,16 +27,34 @@ pub(super) struct PostgresCheckpointBinding {
     pub publication_oid: u32,
     pub publication_definition_sha256: String,
     pub source_config_sha256: String,
-    pub slot_plugin: String,
-    pub slot_two_phase: bool,
-    pub slot_failover: bool,
 }
 
-/// Read-only projection of the recovery fields on an existing slot.
-pub(super) struct InspectedReplicationSlot {
-    #[cfg(not(test))]
-    pub confirmed_flush_lsn: Option<Lsn>,
-    pub binding: PostgresCheckpointBinding,
+/// Cluster, publication, and optional slot identity read from one catalog snapshot.
+#[derive(Debug, Clone)]
+pub(super) struct InspectedSource {
+    pub system_identifier: u64,
+    pub timeline_id: u32,
+    pub database_oid: u32,
+    pub publication_oid: u32,
+    pub publication_definition_sha256: String,
+    pub slot: Option<SlotFacts>,
+}
+
+impl InspectedSource {
+    /// The checkpoint binding of the live database and publication.
+    pub(super) fn binding(
+        &self,
+        config: &super::config::PostgresCdcConfig,
+    ) -> PostgresCheckpointBinding {
+        PostgresCheckpointBinding {
+            system_identifier: self.system_identifier,
+            timeline_id: self.timeline_id,
+            database_oid: self.database_oid,
+            publication_oid: self.publication_oid,
+            publication_definition_sha256: self.publication_definition_sha256.clone(),
+            source_config_sha256: source_config_digest(config),
+        }
+    }
 }
 
 fn digest_field(digest: &mut Sha256, value: &[u8]) {
@@ -36,30 +62,19 @@ fn digest_field(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
-/// Hashes only settings that change which logical changes Laminar emits.
-/// Connection endpoints and buffering limits deliberately remain restartable.
+/// Hashes only settings that change which logical changes Laminar emits and how.
+/// Connection endpoints, snapshot mode, and buffering limits deliberately remain restartable.
 #[must_use]
 pub(super) fn source_config_digest(config: &super::config::PostgresCdcConfig) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"laminardb-postgres-cdc-source-v1\0");
+    digest.update(b"laminardb-postgres-cdc-source-v2\0");
     digest_field(&mut digest, b"pgoutput");
     digest_field(&mut digest, b"proto_version=1");
     digest_field(&mut digest, b"messages=false");
-
-    for tables in [&config.table_include, &config.table_exclude] {
-        let mut canonical: Vec<&str> = tables.iter().map(String::as_str).collect();
-        canonical.sort_unstable();
-        canonical.dedup();
-        digest.update(
-            u64::try_from(canonical.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
-        for table in canonical {
-            digest_field(&mut digest, table.as_bytes());
-        }
-    }
-
+    digest_field(&mut digest, super::typed_rows::SESSION_OPTIONS.as_bytes());
+    digest_field(&mut digest, config.table.schema.as_bytes());
+    digest_field(&mut digest, config.table.name.as_bytes());
+    digest_field(&mut digest, config.output_mode.to_string().as_bytes());
     format!("{:x}", digest.finalize())
 }
 
@@ -91,18 +106,19 @@ impl Drop for ControlConnection {
     }
 }
 
-/// Opens the regular connection used for version and recovery-identity checks.
+/// Opens a regular connection with the canonical CDC session settings.
 ///
 /// # Errors
 ///
 /// Returns an error when TLS configuration is invalid or the connection cannot be opened.
 pub(super) async fn connect(
     config: &super::config::PostgresCdcConfig,
+    application_name: &str,
     driver_guard: ConnectorTaskGuard,
 ) -> Result<ControlConnection, ConnectorError> {
     use crate::postgres::SslMode;
 
-    let pg_config = config.control_connection_config()?;
+    let pg_config = config.control_connection_config(application_name)?;
     match config.ssl_mode {
         SslMode::Disable => {
             let (client, connection) =
@@ -154,31 +170,26 @@ pub(super) async fn connect(
     }
 }
 
-/// Inspects an existing logical replication slot and returns its durable cursor.
+/// Inspects the cluster, the publication, and the slot named `slot` without mutating any of them.
 ///
-/// This operation never creates, replaces, advances, or drops a slot. Recovery
-/// owns an exact engine checkpoint and must fail closed when the corresponding
-/// `PostgreSQL` slot is absent.
+/// A present slot carries its holder and the adoption checks' verdict.
 ///
 /// # Errors
 ///
-/// Returns an error when slot lookup, identity validation, or LSN parsing fails.
-pub(super) async fn inspect_replication_slot(
+/// Returns an error when identity validation, publication admission, or LSN parsing fails.
+pub(super) async fn inspect_source(
     client: &tokio_postgres::Client,
-    slot_name: &str,
-    plugin: &str,
-    database: &str,
-    publication: &str,
-    source_config_sha256: String,
-) -> Result<Option<InspectedReplicationSlot>, ConnectorError> {
+    config: &super::config::PostgresCdcConfig,
+    slot: Option<&str>,
+) -> Result<InspectedSource, ConnectorError> {
     let (system_identifier, timeline_id) = read_system_identity(client).await?;
 
-    // Keep the database, publication, and slot projection in one statement so
-    // its catalog rows come from one PostgreSQL snapshot. The JSONB rendering
-    // is deterministic and automatically includes new publication properties.
+    // Keep the database, publication, and slot projection in one statement so its catalog rows
+    // come from one PostgreSQL snapshot. The JSONB rendering is deterministic and automatically
+    // includes new publication properties.
     let row = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        client.query_opt(
+        client.query_one(
             "WITH publication_identity AS ( \
                  SELECT p.oid::text AS publication_oid, p.pubtruncate, \
                         jsonb_build_object( \
@@ -203,15 +214,18 @@ pub(super) async fn inspect_replication_slot(
                  FROM pg_catalog.pg_publication AS p \
                  WHERE p.pubname = $2 \
              ) \
-             SELECT s.confirmed_flush_lsn::text, s.plugin, s.slot_type, \
-                    s.database::text, s.temporary, s.two_phase, s.failover, \
-                    s.invalidation_reason, db.oid::text, publication_identity.publication_oid, \
-                    publication_identity.definition, publication_identity.pubtruncate \
-             FROM pg_catalog.pg_replication_slots AS s \
-             CROSS JOIN pg_catalog.pg_database AS db \
+             SELECT db.oid::text, publication_identity.publication_oid, \
+                    publication_identity.definition, publication_identity.pubtruncate, \
+                    s.slot_name IS NOT NULL, s.confirmed_flush_lsn::text, s.slot_type, s.plugin, \
+                    s.database::text, s.datoid::text, s.temporary, s.two_phase, s.failover, \
+                    s.synced, s.invalidation_reason, s.conflicting, s.wal_status, \
+                    s.active_pid, a.application_name, a.client_addr::text \
+             FROM pg_catalog.pg_database AS db \
+             LEFT JOIN pg_catalog.pg_replication_slots AS s ON s.slot_name = $1 \
+             LEFT JOIN pg_catalog.pg_stat_activity AS a ON a.pid = s.active_pid \
              LEFT JOIN publication_identity ON TRUE \
-             WHERE s.slot_name = $1 AND db.datname = current_database()",
-            &[&slot_name, &publication],
+             WHERE db.datname = current_database()",
+            &[&slot, &config.publication],
         ),
     )
     .await
@@ -224,68 +238,81 @@ pub(super) async fn inspect_replication_slot(
         ))
     })?;
 
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let configured_plugin: Option<&str> = row.get(1);
-    let slot_type: &str = row.get(2);
-    let configured_database: Option<&str> = row.get(3);
-    let temporary: bool = row.get(4);
-    let two_phase: bool = row.get(5);
-    let failover: bool = row.get(6);
-    let invalidation_reason: Option<&str> = row.get(7);
-    validate_replication_slot(
-        slot_name,
-        plugin,
-        database,
-        configured_plugin,
-        slot_type,
-        configured_database,
-        temporary,
-        invalidation_reason,
-    )?;
     let (database_oid, publication_oid, publication_definition_sha256) =
-        read_publication_identity(&row, publication)?;
-    tracing::info!(
-        slot = slot_name,
-        two_phase,
-        failover,
-        "using logical replication slot"
-    );
+        read_publication_identity(&row, &config.publication)?;
+    let slot = match slot {
+        Some(name) if row.get::<_, bool>(4) => {
+            Some(read_slot(&row, name, &config.database, database_oid)?)
+        }
+        _ => None,
+    };
+    Ok(InspectedSource {
+        system_identifier,
+        timeline_id,
+        database_oid,
+        publication_oid,
+        publication_definition_sha256,
+        slot,
+    })
+}
 
-    #[cfg(not(test))]
-    let confirmed_flush_lsn = {
-        let lsn: Option<&str> = row.get(0);
-        lsn.map(|value| {
+/// The slot columns of [`inspect_source`]'s row, from column 5 on.
+fn read_slot(
+    row: &tokio_postgres::Row,
+    name: &str,
+    database: &str,
+    database_oid: u32,
+) -> Result<SlotFacts, ConnectorError> {
+    let confirmed: Option<&str> = row.get(5);
+    let confirmed_flush_lsn = confirmed
+        .map(|value| {
             value.parse().map_err(|error| {
                 ConnectorError::ReadError(format!("invalid confirmed_flush_lsn: {error}"))
             })
         })
-        .transpose()?
+        .transpose()?;
+    let datoid: Option<&str> = row.get(9);
+    let attributes = SlotAttributes {
+        slot_type: row.get(6),
+        plugin: row.get(7),
+        database: row.get(8),
+        database_oid: datoid
+            .map(|oid| parse_decimal_identity::<u32>(oid, "slot database OID"))
+            .transpose()?,
+        temporary: row.get::<_, Option<bool>>(10).unwrap_or(false),
+        two_phase: row.get::<_, Option<bool>>(11).unwrap_or(false),
+        failover: row.get::<_, Option<bool>>(12).unwrap_or(false),
+        synced: row.get::<_, Option<bool>>(13).unwrap_or(false),
+        invalidation_reason: row.get(14),
+        conflicting: row.get::<_, Option<bool>>(15).unwrap_or(false),
+        wal_status: row.get(16),
     };
-    Ok(Some(InspectedReplicationSlot {
-        #[cfg(not(test))]
+    let holder = row.get::<_, Option<i32>>(17).map(|pid| SlotHolder {
+        pid,
+        application_name: row.get::<_, Option<String>>(18).unwrap_or_default(),
+        client_addr: row.get(19),
+    });
+    if attributes.wal_status.as_deref() == Some("unreserved") {
+        tracing::warn!(
+            slot = name,
+            "PostgreSQL replication slot no longer reserves all the WAL it needs; the next \
+             checkpoint removes some of it unless the slot catches up (wal_status = unreserved, \
+             max_slot_wal_keep_size)"
+        );
+    }
+    Ok(SlotFacts {
         confirmed_flush_lsn,
-        binding: PostgresCheckpointBinding {
-            system_identifier,
-            timeline_id,
-            database_oid,
-            publication_oid,
-            publication_definition_sha256,
-            source_config_sha256,
-            slot_plugin: configured_plugin.unwrap_or_default().to_string(),
-            slot_two_phase: two_phase,
-            slot_failover: failover,
-        },
-    }))
+        holder,
+        unusable: attributes.problem(database, database_oid),
+    })
 }
 
 fn read_publication_identity(
     row: &tokio_postgres::Row,
     publication: &str,
 ) -> Result<(u32, u32, String), ConnectorError> {
-    let database_oid = parse_decimal_identity::<u32>(row.get(8), "database OID")?;
-    let publication_oid_text: Option<&str> = row.get(9);
+    let database_oid = parse_decimal_identity::<u32>(row.get(0), "database OID")?;
+    let publication_oid_text: Option<&str> = row.get(1);
     let publication_oid = publication_oid_text
         .ok_or_else(|| {
             ConnectorError::ConfigurationError(format!(
@@ -293,16 +320,18 @@ fn read_publication_identity(
             ))
         })
         .and_then(|value| parse_decimal_identity::<u32>(value, "publication OID"))?;
-    let publication_definition: Option<&str> = row.get(10);
+    let publication_definition: Option<&str> = row.get(2);
     let publication_definition = publication_definition.ok_or_else(|| {
         ConnectorError::ConfigurationError(format!(
             "PostgreSQL publication '{publication}' has no readable definition"
         ))
     })?;
-    let publication_truncates: Option<bool> = row.get(11);
-    if publication_truncates != Some(false) {
+    let publication_truncates: Option<bool> = row.get(3);
+    if publication_truncates != Some(true) {
         return Err(ConnectorError::ConfigurationError(format!(
-            "PostgreSQL publication '{publication}' publishes TRUNCATE, which this CDC source cannot represent; recreate or alter it with publish='insert,update,delete'"
+            "PostgreSQL publication '{publication}' must publish TRUNCATE so a source truncation \
+             stops the pipeline instead of silently diverging the target; use the default \
+             publish='insert, update, delete, truncate'"
         )));
     }
     let mut publication_digest = Sha256::new();
@@ -373,6 +402,39 @@ async fn read_system_identity(
     Ok((system_identifier, timeline_id))
 }
 
+/// WAL retention state of a slot (`pg_replication_slots.wal_status`, `safe_wal_size`).
+///
+/// # Errors
+///
+/// Returns an error when the slot is missing or the query fails.
+pub(super) async fn slot_wal_status(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+) -> Result<(String, Option<i64>), ConnectorError> {
+    let row = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.query_opt(
+            "SELECT wal_status, safe_wal_size FROM pg_catalog.pg_replication_slots \
+             WHERE slot_name = $1",
+            &[&slot_name],
+        ),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::ConnectionFailed("query slot WAL status timed out after 10 seconds".into())
+    })?
+    .map_err(|error| ConnectorError::ConnectionFailed(format!("query slot WAL status: {error}")))?
+    .ok_or_else(|| {
+        ConnectorError::ReadError(format!(
+            "PostgreSQL replication slot '{slot_name}' disappeared"
+        ))
+    })?;
+    Ok((
+        row.get::<_, Option<String>>(0).unwrap_or_default(),
+        row.get(1),
+    ))
+}
+
 fn validate_server_version_num(version_num: u32) -> Result<(), ConnectorError> {
     if version_num < MINIMUM_SERVER_VERSION_NUM {
         return Err(ConnectorError::ConfigurationError(format!(
@@ -380,6 +442,12 @@ fn validate_server_version_num(version_num: u32) -> Result<(), ConnectorError> {
         )));
     }
     Ok(())
+}
+
+/// Whether a failed statement may succeed on a new connection: no SQLSTATE (the connection was
+/// lost), a connection exception (`08`), or a server shutdown or restart (`57P0`).
+pub(super) fn is_connection_failure(sqlstate: Option<&str>) -> bool {
+    sqlstate.is_none_or(|code| code.starts_with("08") || code.starts_with("57P0"))
 }
 
 fn parse_decimal_identity<T>(value: &str, label: &str) -> Result<T, ConnectorError>
@@ -404,44 +472,12 @@ fn map_control_system_query_error(error: &tokio_postgres::Error) -> ConnectorErr
     ))
 }
 
-fn validate_replication_slot(
-    slot_name: &str,
-    expected_plugin: &str,
-    expected_database: &str,
-    configured_plugin: Option<&str>,
-    slot_type: &str,
-    configured_database: Option<&str>,
-    temporary: bool,
-    invalidation_reason: Option<&str>,
-) -> Result<(), ConnectorError> {
-    if slot_type != "logical" || configured_plugin != Some(expected_plugin) {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "PostgreSQL replication slot '{slot_name}' is not a logical {expected_plugin} slot"
-        )));
-    }
-    if configured_database != Some(expected_database) {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "PostgreSQL replication slot '{slot_name}' belongs to database '{}', not configured database '{expected_database}'",
-            configured_database.unwrap_or("<none>")
-        )));
-    }
-    if temporary {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "PostgreSQL replication slot '{slot_name}' is temporary and cannot provide durable recovery"
-        )));
-    }
-    if let Some(reason) = invalidation_reason {
-        return Err(ConnectorError::ReadError(format!(
-            "PostgreSQL replication slot '{slot_name}' is invalidated: {reason}"
-        )));
-    }
-    Ok(())
-}
-
-/// Builds the replication client configuration from the validated source config.
+/// Builds the replication client configuration for `slot` from the validated source config.
 #[must_use]
 pub(super) fn build_replication_config(
     config: &super::config::PostgresCdcConfig,
+    slot: &str,
+    application_name: &str,
 ) -> pgwire_replication::ReplicationConfig {
     pgwire_replication::ReplicationConfig {
         host: config.host.clone(),
@@ -455,10 +491,10 @@ pub(super) fn build_replication_config(
                 pgwire_replication::TlsConfig::verify_full(config.ssl_ca_cert_path.clone())
             }
         },
-        slot: config.slot_name.clone(),
+        slot: slot.to_string(),
         publication: config.publication.clone(),
-        // The exact slot/checkpoint cursor is installed by `PostgresCdcSource::start` after it
-        // validates the durable slot. A user-supplied cursor is never accepted as configuration.
+        // The reader launch sets the position once the source has adopted or created its slot;
+        // a user-supplied cursor is never accepted as configuration.
         start_lsn: pgwire_replication::Lsn::ZERO,
         expected_recovery_identity: None,
         stop_at_lsn: None,
@@ -466,6 +502,8 @@ pub(super) fn build_replication_config(
         idle_wakeup_interval: std::time::Duration::from_secs(1),
         buffer_events: 8192,
         max_message_bytes: config.raw_wal_bytes(),
+        session_options: Some(super::typed_rows::SESSION_OPTIONS.into()),
+        application_name: application_name.to_string(),
         max_in_flight_bytes: config.raw_wal_bytes(),
     }
 }

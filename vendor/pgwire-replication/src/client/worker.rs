@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use crate::config::ReplicationConfig;
@@ -25,6 +25,8 @@ const SOCKET_READ_AHEAD_BYTES: usize = 128 * 1024;
 /// without async backpressure.
 pub struct SharedProgress {
     applied: AtomicU64,
+    keepalive_requested: AtomicBool,
+    keepalive_wake: Notify,
 }
 
 /// Reservation for the raw backend allocation retained by an event.
@@ -73,7 +75,19 @@ impl SharedProgress {
     pub fn new(start: Lsn) -> Self {
         Self {
             applied: AtomicU64::new(start.as_u64()),
+            keepalive_requested: AtomicBool::new(false),
+            keepalive_wake: Notify::new(),
         }
+    }
+
+    /// Ask the worker to send a status update that requests an immediate server keepalive.
+    pub fn request_keepalive(&self) {
+        self.keepalive_requested.store(true, Ordering::Release);
+        self.keepalive_wake.notify_one();
+    }
+
+    fn take_keepalive_request(&self) -> bool {
+        self.keepalive_requested.swap(false, Ordering::AcqRel)
     }
 
     #[inline]
@@ -226,8 +240,8 @@ impl WorkerState {
         // so writes (standby status replies, etc.) are unaffected.
         let mut stream = BufReader::with_capacity(SOCKET_READ_AHEAD_BYTES, stream);
         let startup = async {
-            self.startup(&mut stream).await?;
-            self.authenticate(&mut stream).await?;
+            startup(&self.cfg, &mut stream).await?;
+            authenticate(&self.cfg, &mut stream).await?;
             self.validate_recovery_identity(&mut stream).await?;
             self.start_replication(&mut stream).await
         }
@@ -241,18 +255,6 @@ impl WorkerState {
         // this exact protocol boundary.
         self.publish_startup(Ok(()));
         self.stream_loop(&mut stream).await
-    }
-
-    /// Send startup message with replication parameters.
-    async fn startup<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<()> {
-        let params = [
-            ("user", self.cfg.user.as_str()),
-            ("database", self.cfg.database.as_str()),
-            ("replication", "database"),
-            ("client_encoding", "UTF8"),
-            ("application_name", "pgwire-replication"),
-        ];
-        write_startup_message(stream, 196608, &params).await
     }
 
     /// Start the logical replication stream.
@@ -283,9 +285,8 @@ impl WorkerState {
             return Ok(());
         }
 
-        let identity = self
-            .query_single_text_row(stream, "IDENTIFY_SYSTEM", "IDENTIFY_SYSTEM")
-            .await?;
+        let identity =
+            query_single_text_row(&self.cfg, stream, "IDENTIFY_SYSTEM", "IDENTIFY_SYSTEM").await?;
         validate_identify_system(&self.cfg, &identity)?;
 
         let slot = escape_string_literal(&self.cfg.slot);
@@ -293,46 +294,10 @@ impl WorkerState {
             "SELECT confirmed_flush_lsn::text FROM pg_catalog.pg_replication_slots \
              WHERE slot_name = {slot}"
         );
-        let slot_row = self
-            .query_single_text_row(stream, &sql, "replication-slot recovery cursor")
-            .await?;
+        let slot_row =
+            query_single_text_row(&self.cfg, stream, &sql, "replication-slot recovery cursor")
+                .await?;
         validate_slot_cursor(&self.cfg, &slot_row)
-    }
-
-    async fn query_single_text_row<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        stream: &mut S,
-        sql: &str,
-        context: &str,
-    ) -> Result<Vec<Option<String>>> {
-        write_query(stream, sql).await?;
-        let mut row = None;
-        loop {
-            let message =
-                read_backend_message_with_limit(stream, self.cfg.max_message_bytes).await?;
-            match message.tag {
-                b'D' => {
-                    if row.is_some() {
-                        return Err(PgWireError::Protocol(format!(
-                            "{context} returned more than one row"
-                        )));
-                    }
-                    row = Some(parse_text_data_row(&message.payload, context)?);
-                }
-                b'E' => return Err(PgWireError::Server(parse_error_response(&message.payload))),
-                b'Z' => {
-                    return row.ok_or_else(|| {
-                        PgWireError::Configuration(format!("{context} returned no rows"))
-                    });
-                }
-                b'T' | b'C' | b'N' | b'S' | b'A' => {}
-                tag => {
-                    return Err(PgWireError::Protocol(format!(
-                        "unexpected backend message 0x{tag:02X} while reading {context}"
-                    )));
-                }
-            }
-        }
     }
 
     /// Main replication streaming loop.
@@ -369,6 +334,11 @@ impl WorkerState {
             // Send periodic status feedback
             if last_status_sent.elapsed() >= self.cfg.status_interval {
                 self.send_feedback(stream, last_applied, false).await?;
+                last_status_sent = Instant::now();
+            }
+            if self.progress.take_keepalive_request() {
+                last_applied = self.progress.load_applied();
+                self.send_feedback(stream, last_applied, true).await?;
                 last_status_sent = Instant::now();
             }
 
@@ -452,6 +422,8 @@ impl WorkerState {
                     }
                     continue;
                 }
+
+                () = self.progress.keepalive_wake.notified() => continue,
 
                 msg_result = tokio::time::timeout(
                     wake_after,
@@ -685,6 +657,14 @@ impl WorkerState {
                     return Ok(true);
                 }
 
+                () = self.progress.keepalive_wake.notified() => {
+                    if self.progress.take_keepalive_request() {
+                        *last_applied = self.progress.load_applied();
+                        self.send_feedback(stream, *last_applied, true).await?;
+                        *last_status_sent = Instant::now();
+                    }
+                }
+
                 _ = tokio::time::sleep_until(feedback_deadline) => {
                     let applied = self.progress.load_applied();
                     *last_applied = applied;
@@ -692,118 +672,6 @@ impl WorkerState {
                     *last_status_sent = Instant::now();
                 }
             }
-        }
-    }
-
-    /// Handle PostgreSQL authentication exchange.
-    async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
-        &mut self,
-        stream: &mut S,
-    ) -> Result<()> {
-        loop {
-            let msg = read_backend_message_with_limit(stream, self.cfg.max_message_bytes).await?;
-            match msg.tag {
-                b'R' => {
-                    let (code, rest) = parse_auth_request(&msg.payload)?;
-                    self.handle_auth_request(stream, code, rest).await?;
-                }
-                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                b'S' | b'K' => {}      // ParameterStatus, BackendKeyData - ignore
-                b'Z' => return Ok(()), // ReadyForQuery - auth complete
-                _ => {}
-            }
-        }
-    }
-
-    /// Handle a specific authentication request.
-    async fn handle_auth_request<S: AsyncRead + AsyncWrite + Unpin>(
-        &mut self,
-        stream: &mut S,
-        code: i32,
-        data: &[u8],
-    ) -> Result<()> {
-        match code {
-            0 => Ok(()), // AuthenticationOk
-            3 => {
-                // Cleartext password
-                let mut payload = Vec::from(self.cfg.password.as_bytes());
-                payload.push(0);
-                write_password_message(stream, &payload).await
-            }
-            10 => {
-                // SASL (SCRAM-SHA-256)
-                self.auth_scram(stream, data).await
-            }
-            #[cfg(feature = "md5")]
-            5 => {
-                // MD5 password
-                if data.len() != 4 {
-                    return Err(PgWireError::Protocol(
-                        "MD5 auth: expected 4-byte salt".into(),
-                    ));
-                }
-                let mut salt = [0u8; 4];
-                salt.copy_from_slice(&data[..4]);
-
-                let hash = postgres_md5(&self.cfg.password, &self.cfg.user, &salt);
-                let mut payload = hash.into_bytes();
-                payload.push(0);
-                write_password_message(stream, &payload).await
-            }
-            _ => Err(PgWireError::Auth(format!(
-                "unsupported auth method code: {code}"
-            ))),
-        }
-    }
-
-    /// Perform SCRAM-SHA-256 authentication.
-    async fn auth_scram<S: AsyncRead + AsyncWrite + Unpin>(
-        &mut self,
-        stream: &mut S,
-        mechanisms_data: &[u8],
-    ) -> Result<()> {
-        // Parse offered mechanisms
-        let mechanisms = parse_sasl_mechanisms(mechanisms_data);
-
-        if !mechanisms.iter().any(|m| m == "SCRAM-SHA-256") {
-            return Err(PgWireError::Auth(format!(
-                "server doesn't offer SCRAM-SHA-256, available: {mechanisms:?}"
-            )));
-        }
-
-        #[cfg(not(feature = "scram"))]
-        return Err(PgWireError::Auth(
-            "SCRAM authentication required but 'scram' feature not enabled".into(),
-        ));
-
-        #[cfg(feature = "scram")]
-        {
-            use crate::auth::scram::ScramClient;
-
-            let scram = ScramClient::new(&self.cfg.user);
-
-            // Send SASLInitialResponse
-            let mut init = Vec::new();
-            init.extend_from_slice(b"SCRAM-SHA-256\0");
-            init.extend_from_slice(&(scram.client_first.len() as i32).to_be_bytes());
-            init.extend_from_slice(scram.client_first.as_bytes());
-            write_password_message(stream, &init).await?;
-
-            // Receive AuthenticationSASLContinue (code 11)
-            let server_first = read_auth_data(stream, 11, self.cfg.max_message_bytes).await?;
-            let server_first_str = String::from_utf8_lossy(&server_first);
-
-            // Compute and send client-final
-            let (client_final, auth_message, salted_password) =
-                scram.client_final(&self.cfg.password, &server_first_str)?;
-            write_password_message(stream, client_final.as_bytes()).await?;
-
-            // Receive and verify AuthenticationSASLFinal (code 12)
-            let server_final = read_auth_data(stream, 12, self.cfg.max_message_bytes).await?;
-            let server_final_str = String::from_utf8_lossy(&server_final);
-            ScramClient::verify_server_final(&server_final_str, &salted_password, &auth_message)?;
-
-            Ok(())
         }
     }
 
@@ -817,6 +685,195 @@ impl WorkerState {
         let client_time = current_pg_timestamp();
         let payload = encode_standby_status_update(applied, client_time, reply_requested);
         write_copy_data(stream, &payload).await
+    }
+}
+
+/// Send startup message with replication parameters.
+pub(super) async fn startup<S: AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+) -> Result<()> {
+    let mut params = vec![
+        ("user", cfg.user.as_str()),
+        ("database", cfg.database.as_str()),
+        ("replication", "database"),
+        ("client_encoding", "UTF8"),
+        ("application_name", cfg.application_name.as_str()),
+    ];
+    if let Some(options) = cfg.session_options.as_deref() {
+        params.push(("options", options));
+    }
+    write_startup_message(stream, 196608, &params).await
+}
+
+/// Handle PostgreSQL authentication exchange.
+pub(super) async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+) -> Result<()> {
+    loop {
+        let msg = read_backend_message_with_limit(stream, cfg.max_message_bytes).await?;
+        match msg.tag {
+            b'R' => {
+                let (code, rest) = parse_auth_request(&msg.payload)?;
+                handle_auth_request(cfg, stream, code, rest).await?;
+            }
+            b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+            b'S' | b'K' => {}      // ParameterStatus, BackendKeyData - ignore
+            b'Z' => return Ok(()), // ReadyForQuery - auth complete
+            _ => {}
+        }
+    }
+}
+
+/// Handle a specific authentication request.
+async fn handle_auth_request<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    code: i32,
+    data: &[u8],
+) -> Result<()> {
+    match code {
+        0 => Ok(()), // AuthenticationOk
+        3 => {
+            // Cleartext password
+            let mut payload = Vec::from(cfg.password.as_bytes());
+            payload.push(0);
+            write_password_message(stream, &payload).await
+        }
+        10 => {
+            // SASL (SCRAM-SHA-256)
+            auth_scram(cfg, stream, data).await
+        }
+        #[cfg(feature = "md5")]
+        5 => {
+            // MD5 password
+            if data.len() != 4 {
+                return Err(PgWireError::Protocol(
+                    "MD5 auth: expected 4-byte salt".into(),
+                ));
+            }
+            let mut salt = [0u8; 4];
+            salt.copy_from_slice(&data[..4]);
+
+            let hash = postgres_md5(&cfg.password, &cfg.user, &salt);
+            let mut payload = hash.into_bytes();
+            payload.push(0);
+            write_password_message(stream, &payload).await
+        }
+        _ => Err(PgWireError::Auth(format!(
+            "unsupported auth method code: {code}"
+        ))),
+    }
+}
+
+/// Perform SCRAM-SHA-256 authentication.
+async fn auth_scram<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    mechanisms_data: &[u8],
+) -> Result<()> {
+    // Parse offered mechanisms
+    let mechanisms = parse_sasl_mechanisms(mechanisms_data);
+
+    if !mechanisms.iter().any(|m| m == "SCRAM-SHA-256") {
+        return Err(PgWireError::Auth(format!(
+            "server doesn't offer SCRAM-SHA-256, available: {mechanisms:?}"
+        )));
+    }
+
+    #[cfg(not(feature = "scram"))]
+    return Err(PgWireError::Auth(
+        "SCRAM authentication required but 'scram' feature not enabled".into(),
+    ));
+
+    #[cfg(feature = "scram")]
+    {
+        use crate::auth::scram::ScramClient;
+
+        let scram = ScramClient::new(&cfg.user);
+
+        // Send SASLInitialResponse
+        let mut init = Vec::new();
+        init.extend_from_slice(b"SCRAM-SHA-256\0");
+        init.extend_from_slice(&(scram.client_first.len() as i32).to_be_bytes());
+        init.extend_from_slice(scram.client_first.as_bytes());
+        write_password_message(stream, &init).await?;
+
+        // Receive AuthenticationSASLContinue (code 11)
+        let server_first = read_auth_data(stream, 11, cfg.max_message_bytes).await?;
+        let server_first_str = String::from_utf8_lossy(&server_first);
+
+        // Compute and send client-final
+        let (client_final, auth_message, salted_password) =
+            scram.client_final(&cfg.password, &server_first_str)?;
+        write_password_message(stream, client_final.as_bytes()).await?;
+
+        // Receive and verify AuthenticationSASLFinal (code 12)
+        let server_final = read_auth_data(stream, 12, cfg.max_message_bytes).await?;
+        let server_final_str = String::from_utf8_lossy(&server_final);
+        ScramClient::verify_server_final(&server_final_str, &salted_password, &auth_message)?;
+
+        Ok(())
+    }
+}
+
+pub(super) async fn query_single_text_row<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    sql: &str,
+    context: &str,
+) -> Result<Vec<Option<String>>> {
+    write_query(stream, sql).await?;
+    let mut row = None;
+    loop {
+        let message = read_backend_message_with_limit(stream, cfg.max_message_bytes).await?;
+        match message.tag {
+            b'D' => {
+                if row.is_some() {
+                    return Err(PgWireError::Protocol(format!(
+                        "{context} returned more than one row"
+                    )));
+                }
+                row = Some(parse_text_data_row(&message.payload, context)?);
+            }
+            b'E' => return Err(PgWireError::Server(parse_error_response(&message.payload))),
+            b'Z' => {
+                return row.ok_or_else(|| {
+                    PgWireError::Configuration(format!("{context} returned no rows"))
+                });
+            }
+            b'T' | b'C' | b'N' | b'S' | b'A' => {}
+            tag => {
+                return Err(PgWireError::Protocol(format!(
+                    "unexpected backend message 0x{tag:02X} while reading {context}"
+                )));
+            }
+        }
+    }
+}
+
+/// Run a simple-query command that returns no rows, such as `BEGIN` or `COMMIT`.
+pub(super) async fn execute_command<S: AsyncRead + AsyncWrite + Unpin>(
+    cfg: &ReplicationConfig,
+    stream: &mut S,
+    sql: &str,
+    context: &str,
+) -> Result<()> {
+    write_query(stream, sql).await?;
+    let mut failure = None;
+    loop {
+        let message = read_backend_message_with_limit(stream, cfg.max_message_bytes).await?;
+        match message.tag {
+            b'E' => failure = Some(PgWireError::Server(parse_error_response(&message.payload))),
+            b'Z' => return failure.map_or(Ok(()), Err),
+            b'C' | b'N' | b'S' => {}
+            tag => {
+                return Err(PgWireError::Protocol(format!(
+                    "unexpected backend message 0x{tag:02X} while running {context}"
+                )));
+            }
+        }
     }
 }
 
@@ -874,7 +931,7 @@ fn parse_text_data_row(payload: &[u8], context: &str) -> Result<Vec<Option<Strin
     Ok(columns)
 }
 
-fn required_text_column<'a>(
+pub(super) fn required_text_column<'a>(
     row: &'a [Option<String>],
     index: usize,
     label: &str,
@@ -1552,5 +1609,51 @@ mod tests {
 
         drop(rx.recv().await.unwrap());
         assert!(handle.await.unwrap().unwrap());
+    }
+
+    async fn read_status_update(peer: &mut tokio::io::DuplexStream) -> [u8; 39] {
+        use tokio::io::AsyncReadExt;
+
+        let mut update = [0_u8; 39];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            peer.read_exact(&mut update),
+        )
+        .await
+        .expect("a requested keepalive is sent at once")
+        .unwrap();
+        assert_eq!((update[0], update[5]), (b'd', b'r'));
+        update
+    }
+
+    #[tokio::test]
+    async fn a_keepalive_request_sends_a_reply_requested_status_update_at_once() {
+        let config = ReplicationConfig {
+            status_interval: std::time::Duration::from_secs(3_600),
+            idle_wakeup_interval: std::time::Duration::from_secs(3_600),
+            ..ReplicationConfig::default()
+        };
+        let (tx, _rx) = mpsc::channel(1);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let progress = Arc::new(SharedProgress::new(Lsn::from_u64(0x40)));
+        let budget = Arc::new(Semaphore::new(config.max_in_flight_bytes));
+        let mut worker = WorkerState::new(config, Arc::clone(&progress), stop_rx, tx, budget);
+        let (worker_stream, mut peer) = tokio::io::duplex(1024);
+        let loop_task = tokio::spawn(async move {
+            let mut stream = BufReader::new(worker_stream);
+            worker.stream_loop(&mut stream).await
+        });
+
+        let initial = read_status_update(&mut peer).await;
+        assert_eq!(initial[38], 0, "periodic feedback requests no reply");
+        progress.request_keepalive();
+        let requested = read_status_update(&mut peer).await;
+        assert_eq!(requested[38], 1, "the reply-requested flag is set");
+        assert_eq!(
+            &requested[6..14],
+            &0x40_u64.to_be_bytes(),
+            "reports the applied LSN"
+        );
+        loop_task.abort();
     }
 }

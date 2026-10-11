@@ -86,7 +86,10 @@ pub mod lsn;
 pub mod protocol;
 pub mod tls;
 
-pub use client::{ReplicationClient, ReplicationEvent, ReplicationEventReceiver, WireBytesGuard};
+pub use client::{
+    create_logical_slot, AppliedLsnHandle, CreatedSlot, ReplicationClient, ReplicationEvent,
+    ReplicationEventReceiver, SlotSnapshot, WireBytesGuard,
+};
 pub use config::{ExpectedRecoveryIdentity, ReplicationConfig, SslMode, TlsConfig};
 pub use error::{PgWireError, Result};
 pub use lsn::Lsn;

@@ -1,0 +1,42 @@
+# PostgreSQL CDC visibility-race fixture: a primary whose synchronous standby never connects.
+#
+# A transaction committed with synchronous_commit=on waits in SyncRep after its commit record is
+# flushed, so logical decoding already sends it while snapshots still treat it as running.
+# Every other session uses the configured synchronous_commit=local and never waits.
+#
+# Its own compose project, network, and port; it does not touch the shared `docker` project.
+#
+# Bring up:   docker compose -f tests/docker/postgres-cdc-syncrep-compose.yml up -d --wait
+# Tear down:  docker compose -f tests/docker/postgres-cdc-syncrep-compose.yml down -v
+# Run:        LAMINAR_TEST_POSTGRES_SYNCREP_PORT=15534 cargo test -p laminar-connectors \
+#               --no-default-features --features postgres-cdc --test postgres_cdc_integration \
+#               -- --ignored --test-threads=1 sync_rep
+name: laminardb-pg-cdc-syncrep
+
+services:
+  postgres-syncrep:
+    image: postgres:17
+    container_name: laminardb-pg-cdc-syncrep
+    environment:
+      POSTGRES_USER: laminar
+      POSTGRES_PASSWORD: laminar-test-secret
+      POSTGRES_DB: cdc
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=16
+      - -c
+      - max_wal_senders=16
+      - -c
+      - synchronous_standby_names=nosuchstandby
+      - -c
+      - synchronous_commit=local
+    ports:
+      - "127.0.0.1:15534:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "laminar", "-d", "cdc"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

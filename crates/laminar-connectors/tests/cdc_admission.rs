@@ -5,7 +5,11 @@ use laminar_connectors::registry::ConnectorRegistry;
 
 #[cfg(feature = "postgres-cdc")]
 #[test]
-fn postgres_cdc_admission_rejects_unexecuted_options_and_reference_use() {
+fn postgres_cdc_admission_declares_keyed_and_changelog_contracts() {
+    use laminar_connectors::connector::{
+        SourceConsistency, SourceInputMode, SourceRowPositionCapability, SourceTopology,
+    };
+
     let registry = ConnectorRegistry::new();
     laminar_connectors::postgres::register_postgres_cdc_source(&registry).unwrap();
     let mut config = ConnectorConfig::new("postgres-cdc");
@@ -13,16 +17,41 @@ fn postgres_cdc_admission_rejects_unexecuted_options_and_reference_use() {
     config.set("database", "app");
     config.set("slot.name", "laminar_app");
     config.set("publication", "laminar_app");
+    config.set("table", "public.orders");
     config.set("ssl.mode", "disable");
 
     let source = registry.create_source(&config, None).unwrap();
-    let error = source.contract(&config).unwrap_err();
-    assert!(error.to_string().contains("raw JSON change envelope"));
+    let keyed = source.contract(&config).unwrap();
+    assert_eq!(keyed.input_mode, SourceInputMode::KeyedUpsert);
+    assert_eq!(keyed.consistency, SourceConsistency::CommitCoupled);
+    assert_eq!(keyed.topology, SourceTopology::Singleton);
+    assert_eq!(
+        keyed.row_positions,
+        SourceRowPositionCapability::OrderedDeterministic
+    );
+    assert!(!keyed.is_exact_delivery_certified());
+
+    let mut changelog = config.clone();
+    changelog.set("output.mode", "changelog");
+    assert_eq!(
+        source.contract(&changelog).unwrap().input_mode,
+        SourceInputMode::FullChangelog
+    );
+    changelog.set("snapshot.mode", "never");
+    let error = source.contract(&changelog).unwrap_err();
+    assert!(
+        error.to_string().contains("snapshot.mode=initial"),
+        "{error}"
+    );
 
     let mut removed = config.clone();
-    removed.set("snapshot.mode", "initial");
+    removed.set("start.lsn", "0/16B3748");
     let error = source.contract(&removed).unwrap_err();
-    assert!(error.to_string().contains("snapshot.mode"));
+    assert!(error.to_string().contains("start.lsn"));
+    let mut multi_table = config.clone();
+    multi_table.set("table.include", "public.orders,public.lines");
+    let error = source.contract(&multi_table).unwrap_err();
+    assert!(error.to_string().contains("exactly one table"), "{error}");
 
     let error = registry
         .create_table_source(&config, std::sync::Arc::new(arrow_schema::Schema::empty()))

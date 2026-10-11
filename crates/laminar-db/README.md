@@ -263,9 +263,9 @@ need additional headroom and retain their existing separate guards.
 | `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
 | `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
 | `kafka` | Kafka source/sink connector |
-| `postgres-cdc` | PostgreSQL CDC implementation (source admission rejected); also builds the supported `postgres` lookup connector |
+| `postgres-cdc` | PostgreSQL CDC source (embedded/single-node); also builds the `postgres` lookup connector |
 | `postgres-sink` | PostgreSQL sink |
-| `mongodb-cdc` | MongoDB sink/lookup and CDC implementation (CDC source admission rejected) |
+| `mongodb-cdc` | MongoDB CDC source (embedded/single-node), sink, and lookup |
 | `delta-lake` | Delta Lake sink and source |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
 | `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |
