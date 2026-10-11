@@ -184,6 +184,7 @@ struct HeldChunk {
     /// A keepalive reached `high`, so every transaction ending by `high` has arrived.
     passed: bool,
     keepalive_requested: Instant,
+    fetched: Instant,
     /// Rows emitted so far, and the slot of `rows` the next piece starts at.
     emitted: usize,
     next_slot: usize,
@@ -330,6 +331,7 @@ impl ChunkedSnapshot {
             rows: HeldRows::default(),
             passed: false,
             keepalive_requested: Instant::now(),
+            fetched: Instant::now(),
             emitted: 0,
             next_slot: 0,
         });
@@ -367,6 +369,12 @@ impl ChunkedSnapshot {
             return;
         };
         self.chunks = self.chunks.saturating_add(1);
+        tracing::debug!(
+            chunk = self.chunks,
+            rows = held.emitted,
+            held_us = u64::try_from(held.fetched.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "PostgreSQL CDC chunk emitted"
+        );
         if let Upper::Key(upper) = held.upper {
             self.bound = Some(upper);
         }

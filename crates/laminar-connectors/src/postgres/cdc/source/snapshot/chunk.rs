@@ -429,6 +429,7 @@ impl ChunkedSnapshot {
             rows: read.rows,
             passed: false,
             keepalive_requested: Instant::now(),
+            fetched: Instant::now(),
             emitted: 0,
             next_slot: 0,
         })
