@@ -471,12 +471,20 @@ async fn delta_native_writer_mapping_and_frozen_reader_follow_new_data_versions(
         directory.path().join("table").to_str().unwrap(),
     );
     config.set("auto.create", "true");
-    config.set("poll.interval.ms", "0");
+    config.set("poll.interval.ms", "1");
     let mut pending = registry.resolve_sink_schema(&config, native).await.unwrap();
     registry
         .create_sink(&config, None)
         .unwrap()
         .prepare_schema(&config, &mut pending)
+        .await
+        .unwrap();
+    // The source follows new versions through the change data feed.
+    deltalake::open_table(url::Url::from_directory_path(directory.path().join("table")).unwrap())
+        .await
+        .unwrap()
+        .set_tbl_properties()
+        .with_properties([("delta.enableChangeDataFeed".to_string(), "true".to_string())].into())
         .await
         .unwrap();
     let reader_binding = registry.resolve_source_schema(&config, None).await.unwrap();
