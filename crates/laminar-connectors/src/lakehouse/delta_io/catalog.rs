@@ -97,7 +97,7 @@ pub enum CatalogAccess {
 }
 
 /// A table location resolved through its catalog.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedCatalogTable {
     /// Storage URI of the Delta table root.
     pub location: String,
@@ -105,6 +105,19 @@ pub struct ResolvedCatalogTable {
     pub storage_options: HashMap<String, String>,
     /// When vended credentials expire; `None` for credentials that do not expire here.
     pub credentials_expire_at: Option<std::time::SystemTime>,
+}
+
+impl std::fmt::Debug for ResolvedCatalogTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCatalogTable")
+            .field("location", &self.location)
+            .field(
+                "storage_options",
+                &crate::storage::SecretMasker::display_map(&self.storage_options),
+            )
+            .field("credentials_expire_at", &self.credentials_expire_at)
+            .finish()
+    }
 }
 
 /// Vended credentials are renewed once less than this remains before they expire.

@@ -484,6 +484,29 @@ async fn explicit_starting_version_is_inclusive_and_latest_skips_history() {
 
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
+async fn a_known_backlog_is_read_without_waiting_for_the_poll_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let mut table = cdf_table(&path).await;
+    let commits = i64::try_from(super::MAX_COMMITS_PER_SCAN).unwrap() + 6;
+    for id in 1..=commits {
+        table = table.write(vec![rows(&[id], "v")]).await.unwrap();
+    }
+
+    let mut source = start(
+        &path,
+        &[("starting.version", "1"), ("poll.interval.ms", "600000")],
+        SourcePosition::Initial,
+    )
+    .await
+    .unwrap();
+    let emitted = drain_until(&mut source, usize::try_from(commits).unwrap()).await;
+    let expected: Vec<_> = (1..=commits).map(|id| (id, "v".into(), 1)).collect();
+    assert_eq!(sorted(emitted), expected);
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
 async fn snapshot_mode_completes_and_reads_tables_without_change_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_string_lossy().to_string();

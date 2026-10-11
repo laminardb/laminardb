@@ -48,9 +48,12 @@ fails on the stock Windows toolchain.
 writer. Spark writes a change-data-feed table with deletion vectors (INSERT, UPDATE, DELETE, MERGE,
 a key change, OPTIMIZE) and a column-mapped table; the LaminarDB source must reproduce Spark's
 tables from the change feed and from snapshots, and Spark must read LaminarDB's upsert mirror and
-partitioned append tables back exactly. Tables live under `target/delta-spark-interop`.
+partitioned append tables back exactly. Tables live under `target/delta-spark-interop`; create it
+before starting the container, because Docker otherwise creates the bind source owned by root and
+the image's non-root user cannot write to it.
 
 ```
+mkdir -p target/delta-spark-interop
 docker compose -f tests/docker/delta-spark-compose.yml up -d
 LAMINAR_DELTA_SPARK_ORACLE=1 cargo test -p laminar-connectors --features delta-lake \
   --test delta_spark_interop -- --nocapture

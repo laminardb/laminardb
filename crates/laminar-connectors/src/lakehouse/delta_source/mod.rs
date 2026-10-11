@@ -107,6 +107,8 @@ struct Reader {
     scan: Option<reader::ScanTask>,
     pending: Option<Pending>,
     last_version_check: Option<Instant>,
+    /// Latest committed version the last check observed.
+    known_latest: Option<u64>,
 }
 
 impl DeltaSource {
@@ -220,6 +222,7 @@ impl DeltaSource {
             scan: None,
             pending: None,
             last_version_check: None,
+            known_latest: None,
         });
         Ok(())
     }
@@ -512,14 +515,21 @@ impl DeltaSource {
             }
             DeltaPhase::Changes { next_version } => {
                 let poll_interval = self.config.poll_interval;
-                if self
-                    .reader_mut()?
-                    .last_version_check
-                    .is_some_and(|checked| checked.elapsed() < poll_interval)
+                let reader = self.reader_mut()?;
+                // A scan reads a bounded slice of the log, so commits already seen are read
+                // without waiting for the next poll.
+                let backlog = reader
+                    .known_latest
+                    .is_some_and(|known| next_version <= known);
+                if !backlog
+                    && reader
+                        .last_version_check
+                        .is_some_and(|checked| checked.elapsed() < poll_interval)
                 {
                     return Ok(false);
                 }
                 let latest = self.refresh_table(next_version).await?;
+                self.reader_mut()?.known_latest = Some(latest);
                 if latest < next_version {
                     return Ok(false);
                 }

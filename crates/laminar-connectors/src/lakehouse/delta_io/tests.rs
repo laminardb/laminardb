@@ -252,6 +252,29 @@ fn delta_storage_errors_do_not_echo_signed_request_urls() {
     assert!(!metadata.contains("account.blob.example"), "{metadata}");
 }
 
+#[test]
+fn resolved_catalog_table_debug_masks_vended_credentials() {
+    let resolved = ResolvedCatalogTable {
+        location: "s3://bucket/table".into(),
+        storage_options: HashMap::from([
+            ("aws_access_key_id".into(), "AKIA-do-not-disclose".into()),
+            (
+                "aws_secret_access_key".into(),
+                "secret-do-not-disclose".into(),
+            ),
+            ("aws_session_token".into(), "token-do-not-disclose".into()),
+            ("aws_region".into(), "us-east-1".into()),
+        ]),
+        credentials_expire_at: None,
+    };
+    let debug = format!("{resolved:?}");
+    assert!(!debug.contains("do-not-disclose"), "{debug}");
+    assert!(
+        debug.contains("s3://bucket/table") && debug.contains("us-east-1"),
+        "{debug}"
+    );
+}
+
 #[tokio::test]
 async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
     use object_store::aws::AmazonS3Builder;
