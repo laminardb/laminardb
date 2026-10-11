@@ -209,7 +209,9 @@ jobs:
         run: cargo test -p laminar-db --no-default-features --features postgres-cdc,postgres-sink --test postgres_cdc_e2e -- --test-threads=1
       - name: Fixture logs
         if: failure()
-        run: docker compose -f tests/docker/postgres-cdc-compose.yml logs --tail=200
+        run: |
+          docker compose -f tests/docker/postgres-cdc-compose.yml logs --tail=200
+          docker compose -f tests/docker/postgres-cdc-syncrep-compose.yml logs --tail=200 || true
 
   # ============================================
   # MongoDB CDC direct pipelines
