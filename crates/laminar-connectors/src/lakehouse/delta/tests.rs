@@ -1926,3 +1926,95 @@ async fn coordinated_append_rejects_unenforced_check_constraints() {
         "delta-rs write rejects id = 0 under the constraint"
     );
 }
+
+/// A Unity Catalog sink writes through `READ_WRITE` vended credentials, renews them before each
+/// flush once they near expiry, and refuses managed tables before any write.
+#[cfg(feature = "delta-lake-unity")]
+#[tokio::test]
+async fn unity_sink_writes_with_renewed_vended_credentials_and_rejects_managed_tables() {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_path = local_table_dir(&dir, "uc_target");
+    super::super::delta_io::open_or_create_table(
+        &table_path,
+        std::collections::HashMap::new(),
+        Some(&test_schema()),
+    )
+    .await
+    .unwrap();
+    let location = url::Url::from_directory_path(&table_path).unwrap();
+    let table_json = |table_type: &str| {
+        serde_json::json!({
+            "name": "events", "catalog_name": "main", "schema_name": "lake",
+            "table_type": table_type, "data_source_format": "DELTA", "columns": [],
+            "storage_location": location.as_str(), "properties": {},
+            "created_at": 0, "updated_at": 0, "table_id": "uc-1"
+        })
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.1/unity-catalog/tables/main.lake.events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(table_json("EXTERNAL")))
+        .up_to_n_times(100)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.1/unity-catalog/temporary-table-credentials"))
+        .and(body_partial_json(
+            serde_json::json!({"operation": "READ_WRITE"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "aws_temp_credentials": {
+                "access_key_id": "ASIAVENDED", "secret_access_key": "vended-secret"
+            },
+            "expiration_time": (chrono::Utc::now() + chrono::Duration::minutes(2))
+                .timestamp_millis(),
+            "url": "s3://bucket/lake/events"
+        })))
+        .mount(&server)
+        .await;
+
+    let mut connector = ConnectorConfig::new("delta-lake");
+    for (key, value) in [
+        ("table.path", "uc://main.lake.events"),
+        ("catalog.type", "unity"),
+        ("catalog.workspace_url", server.uri().as_str()),
+        ("catalog.access_token", "dapi-test"),
+    ] {
+        connector.set(key, value);
+    }
+    let config = DeltaLakeSinkConfig::from_config(&connector).unwrap();
+    let mut sink = opened_sink(config.clone(), test_schema()).await;
+    flush_batch(&mut sink, &test_batch(2)).await;
+    flush_batch(&mut sink, &test_batch(3)).await;
+    assert_eq!(ids_in(&table_path).await.len(), 5);
+    let vended = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path().ends_with("temporary-table-credentials"))
+        .count();
+    assert!(
+        vended >= 3,
+        "open plus a renewal before each flush: {vended}"
+    );
+    sink.close().await.unwrap();
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(table_json("MANAGED")))
+        .mount(&server)
+        .await;
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+    let error = sink
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("catalog-managed"), "{error}");
+    assert_eq!(ids_in(&table_path).await.len(), 5);
+}

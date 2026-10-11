@@ -774,3 +774,201 @@ async fn a_large_commit_streams_under_the_byte_budget() {
 fn source_reader(source: &DeltaSource) -> &Reader {
     source.reader.as_ref().unwrap()
 }
+
+/// Kernel reads produce exactly the bound Arrow types for partition columns, timestamps (with
+/// and without zone), decimals, and nested columns, in both snapshot and change-feed units.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn typed_partitioned_rows_keep_their_bound_types() {
+    use arrow_array::{
+        builder::{ListBuilder, StringBuilder},
+        Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, true),
+        Field::new(
+            "at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new(
+            "local",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("amount", DataType::Decimal128(12, 3), true),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8, true))),
+            true,
+        ),
+    ]));
+    let batch = |ids: &[i64], region: &str| {
+        let mut tags = ListBuilder::new(StringBuilder::new()).with_field(Arc::new(Field::new(
+            "element",
+            DataType::Utf8,
+            true,
+        )));
+        for id in ids {
+            tags.values().append_value(format!("t{id}"));
+            tags.append(true);
+        }
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(vec![region; ids.len()])),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![1_700_000_000_123_456; ids.len()])
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_700_000_000_000_001;
+                    ids.len()
+                ])),
+                Arc::new(
+                    Decimal128Array::from(vec![12_345_i128; ids.len()])
+                        .with_precision_and_scale(12, 3)
+                        .unwrap(),
+                ),
+                Arc::new(tags.finish()),
+            ],
+        )
+        .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let columns: deltalake::kernel::StructType = schema.as_ref().try_into_kernel().unwrap();
+    let table =
+        super::super::delta_io::open_or_create_table(&path, std::collections::HashMap::new(), None)
+            .await
+            .unwrap()
+            .create()
+            .with_columns(columns.fields().cloned())
+            .with_partition_columns(["region"])
+            .with_configuration_property(
+                deltalake::TableProperty::EnableChangeDataFeed,
+                Some("true"),
+            )
+            .await
+            .unwrap();
+    table.write(vec![batch(&[1, 2], "eu")]).await.unwrap();
+
+    let mut source = start(&path, &[], SourcePosition::Initial).await.unwrap();
+    table::open(&path)
+        .await
+        .write(vec![batch(&[3], "us")])
+        .await
+        .unwrap()
+        .delete()
+        .with_predicate("id = 1")
+        .await
+        .unwrap();
+
+    let expected = source.schema();
+    assert_eq!(
+        expected.field_with_name("region").unwrap().data_type(),
+        &DataType::Utf8
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut rows = 0;
+    while rows < 4 {
+        assert!(std::time::Instant::now() < deadline);
+        let Some(batch) = source.poll_batch(100).await.unwrap() else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            continue;
+        };
+        assert_eq!(batch.records.schema(), expected);
+        let at = batch
+            .records
+            .column_by_name("at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(at
+            .values()
+            .iter()
+            .all(|value| *value == 1_700_000_000_123_456));
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, 4, "two snapshot rows, one insert, one delete");
+}
+
+/// A Unity Catalog source reads through vended credentials and renews them, outside any open
+/// replay unit, before they expire.
+#[cfg(feature = "delta-lake-unity")]
+#[tokio::test]
+async fn unity_source_reads_with_vended_credentials_and_renews_them() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path_str = dir.path().to_string_lossy().to_string();
+    cdf_table(&path_str)
+        .await
+        .write(vec![rows(&[1, 2], "a")])
+        .await
+        .unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.1/unity-catalog/tables/main.lake.events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "events", "catalog_name": "main", "schema_name": "lake",
+            "table_type": "EXTERNAL", "data_source_format": "DELTA", "columns": [],
+            "storage_location": url::Url::from_directory_path(dir.path()).unwrap().as_str(),
+            "properties": {}, "created_at": 0, "updated_at": 0, "table_id": "uc-1"
+        })))
+        .mount(&server)
+        .await;
+    // Credentials that are already inside the renewal margin force a renewal before each read.
+    Mock::given(method("POST"))
+        .and(path("/api/2.1/unity-catalog/temporary-table-credentials"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "aws_temp_credentials": {
+                "access_key_id": "ASIAVENDED", "secret_access_key": "vended-secret"
+            },
+            "expiration_time": (chrono::Utc::now() + chrono::Duration::minutes(2))
+                .timestamp_millis(),
+            "url": "s3://bucket/lake/events"
+        })))
+        .mount(&server)
+        .await;
+
+    let workspace = server.uri();
+    let unity = [
+        ("catalog.type", "unity"),
+        ("catalog.workspace_url", workspace.as_str()),
+        ("catalog.access_token", "dapi-test"),
+        ("catalog.name", "main"),
+        ("catalog.schema", "lake"),
+    ];
+    let mut source = start("uc://main.lake.events", &unity, SourcePosition::Initial)
+        .await
+        .unwrap();
+    let (snapshot, _) = drain(&mut source, 10).await;
+    assert_eq!(
+        sorted(snapshot),
+        vec![(1, "a".into(), 1), (2, "a".into(), 1)]
+    );
+    table::open(&path_str)
+        .await
+        .write(vec![rows(&[3], "b")])
+        .await
+        .unwrap();
+    assert_eq!(drain_until(&mut source, 1).await, vec![(3, "b".into(), 1)]);
+
+    let vended = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path().ends_with("temporary-table-credentials"))
+        .count();
+    assert!(vended >= 3, "start plus one renewal per read: {vended}");
+}

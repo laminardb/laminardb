@@ -144,13 +144,7 @@ impl DeltaSourceConfig {
         }
 
         // ── Catalog configuration ──
-        if let Some(v) = config.get("catalog.type") {
-            cfg.catalog_type = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid catalog.type: '{v}' (expected 'none', 'glue', or 'unity')"
-                ))
-            })?;
-        }
+        cfg.catalog_type = DeltaCatalogType::from_config(config)?;
         if let Some(v) = config.get("catalog.database") {
             cfg.catalog_database = Some(v.to_string());
         }
@@ -159,18 +153,6 @@ impl DeltaSourceConfig {
         }
         if let Some(v) = config.get("catalog.schema") {
             cfg.catalog_schema = Some(v.to_string());
-        }
-        if let DeltaCatalogType::Unity {
-            ref mut workspace_url,
-            ref mut access_token,
-        } = cfg.catalog_type
-        {
-            if let Some(v) = config.get("catalog.workspace_url") {
-                *workspace_url = v.to_string();
-            }
-            if let Some(v) = config.get("catalog.access_token") {
-                *access_token = v.to_string();
-            }
         }
         // Resolve storage credentials.
         let explicit_storage = config.properties_with_prefix("storage.");
@@ -240,28 +222,12 @@ impl DeltaSourceConfig {
                     ));
                 }
             }
-            DeltaCatalogType::Unity {
-                workspace_url,
-                access_token,
-            } => {
-                if workspace_url.is_empty() {
+            DeltaCatalogType::Unity(unity) => {
+                unity.validate()?;
+                if self.catalog_name.is_none() || self.catalog_schema.is_none() {
                     return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.workspace_url' to be set".into(),
-                    ));
-                }
-                if access_token.is_empty() {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.access_token' to be set".into(),
-                    ));
-                }
-                if self.catalog_name.is_none() {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.name' to be set".into(),
-                    ));
-                }
-                if self.catalog_schema.is_none() {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.schema' to be set".into(),
+                        "Unity catalog requires 'catalog.name' and 'catalog.schema' to be set"
+                            .into(),
                     ));
                 }
             }

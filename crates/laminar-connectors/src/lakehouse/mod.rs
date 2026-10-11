@@ -193,19 +193,20 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
 
         let src_config = DeltaSourceConfig::from_config(&config)?;
 
-        let (resolved_path, resolved_opts) = crate::lakehouse::delta_io::resolve_catalog_options(
+        let resolved = crate::lakehouse::delta_io::resolve_catalog_options(
             &src_config.catalog_type,
             src_config.catalog_database.as_deref(),
             src_config.catalog_name.as_deref(),
             src_config.catalog_schema.as_deref(),
             &src_config.table_path,
             &src_config.storage_options,
+            crate::lakehouse::delta_io::CatalogAccess::Read,
         )
         .await?;
 
         let lookup_config = DeltaLookupSourceConfig {
-            table_path: resolved_path,
-            storage_options: resolved_opts,
+            table_path: resolved.location,
+            storage_options: resolved.storage_options,
             primary_key_columns: pk_columns,
             table_name: "delta_lookup".to_string(),
         };
@@ -434,8 +435,23 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "catalog.access_token",
-            "Databricks access token (required for Unity)",
+            "Unity Catalog token (PAT or service-principal token); or use client_id/client_secret",
             "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.client_id",
+            "Unity Catalog OAuth M2M service-principal client id",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.client_secret",
+            "Unity Catalog OAuth M2M service-principal secret",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.storage.credentials",
+            "Unity storage credentials: vended (table-scoped, renewed) or configured (storage.*)",
+            "vended",
         ),
         ConfigKeySpec::optional(
             "catalog.storage.location",
@@ -559,8 +575,23 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "catalog.access_token",
-            "Databricks access token (required for Unity)",
+            "Unity Catalog token (PAT or service-principal token); or use client_id/client_secret",
             "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.client_id",
+            "Unity Catalog OAuth M2M service-principal client id",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.client_secret",
+            "Unity Catalog OAuth M2M service-principal secret",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.storage.credentials",
+            "Unity storage credentials: vended (table-scoped, renewed) or configured (storage.*)",
+            "vended",
         ),
         // ── LogStore configuration ──
         ConfigKeySpec::optional(

@@ -1,10 +1,12 @@
-//! Unity Catalog REST client for auto-creating external Delta tables.
+//! Unity Catalog integration: table resolution and credential vending through the delta-rs
+//! Unity client, and registration of external Delta tables.
 //!
-//! When the sink targets a `uc://` table that doesn't yet exist in Unity
-//! Catalog, this module creates it via the Databricks REST API before
-//! delta-rs opens it.
-//!
-//! Endpoint: `POST /api/2.1/unity-catalog/tables/`
+//! The pinned client has no table-creation call, so registration posts
+//! `POST /api/2.1/unity-catalog/tables/` directly.
+
+mod resolve;
+
+pub(crate) use resolve::{find_table, resolve_table};
 
 use std::time::Duration;
 
@@ -319,92 +321,6 @@ pub(crate) async fn create_uc_table(
     Err(ConnectorError::ConnectionFailed(format!(
         "Unity Catalog create table failed (HTTP {status})"
     )))
-}
-
-/// Resolves a Unity Catalog table's storage location via the REST API.
-///
-/// Calls `GET /api/2.1/unity-catalog/tables/{full_name}` and extracts
-/// the `storage_location` field from the response. This bypasses
-/// delta-rs's built-in `uc://` handling which requires credential vending
-/// (denied outside Databricks compute).
-pub(crate) async fn get_table_storage_location(
-    workspace_url: &str,
-    access_token: &str,
-    full_table_name: &str,
-) -> Result<String, ConnectorError> {
-    find_table_storage_location(workspace_url, access_token, full_table_name).await?
-        .ok_or_else(|| ConnectorError::ConfigurationError(
-            "Unity Catalog table is absent; create it separately or explicitly authorize target preparation".into()))
-}
-
-pub(crate) async fn find_table_storage_location(
-    workspace_url: &str,
-    access_token: &str,
-    full_table_name: &str,
-) -> Result<Option<String>, ConnectorError> {
-    let url = format!(
-        "{}/api/2.1/unity-catalog/tables/{}",
-        workspace_url.trim_end_matches('/'),
-        full_table_name,
-    );
-
-    let client = http_client()?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(access_token)
-        .send()
-        .await
-        .map_err(|error| request_error(&error))?;
-
-    let status = resp.status();
-    if status.as_u16() == 401 || status.as_u16() == 403 {
-        // Non-transient — credentials are wrong, retry won't help.
-        return Err(ConnectorError::ConfigurationError(format!(
-            "Unity Catalog auth failed (HTTP {status}); verify the configured access token"
-        )));
-    }
-
-    if status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(ConnectorError::ConnectionFailed(format!(
-            "Unity Catalog get table failed (HTTP {status})"
-        )));
-    }
-
-    let mut response = resp;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| {
-        ConnectorError::ConnectionFailed("Unity Catalog metadata response failed".into())
-    })? {
-        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
-            return Err(ConnectorError::SchemaMismatch(
-                "Unity Catalog metadata exceeds 1 MiB".into(),
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let body: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-        ConnectorError::SchemaMismatch("Unity Catalog metadata is malformed".into())
-    })?;
-
-    let location = body["storage_location"]
-        .as_str()
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError(
-                "Unity Catalog table response missing 'storage_location' field".into(),
-            )
-        })?
-        .to_string();
-
-    info!(
-        table = full_table_name,
-        storage_provider = storage_provider_name(&location),
-        "resolved storage location from Unity Catalog"
-    );
-
-    Ok(Some(location))
 }
 
 #[cfg(test)]

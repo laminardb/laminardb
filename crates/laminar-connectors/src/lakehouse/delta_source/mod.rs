@@ -101,8 +101,8 @@ struct Pending {
 struct Reader {
     /// Metadata-only handle used to discover new commits and confirm the table incarnation.
     table: DeltaTable,
-    resolved_table_path: String,
-    stable_storage_options: std::collections::HashMap<String, String>,
+    /// Catalog resolution in use, including vended credentials and their expiry.
+    resolved: super::delta_io::ResolvedCatalogTable,
     context: reader::ReadContext,
     scan: Option<reader::ScanTask>,
     pending: Option<Pending>,
@@ -156,18 +156,11 @@ impl DeltaSource {
     ) -> Result<(), ConnectorError> {
         use super::delta_io;
 
-        let stable_options = self.config.stable_storage_options();
-        let (resolved_path, stable_options) = delta_io::resolve_catalog_options(
-            &self.config.catalog_type,
-            self.config.catalog_database.as_deref(),
-            self.config.catalog_name.as_deref(),
-            self.config.catalog_schema.as_deref(),
-            &self.config.table_path,
-            &stable_options,
-        )
-        .await?;
-        let resolved_storage =
-            crate::storage::StorageCredentialResolver::resolve(&resolved_path, &stable_options);
+        let resolved = self.resolve_table().await?;
+        let resolved_storage = crate::storage::StorageCredentialResolver::resolve(
+            &resolved.location,
+            &resolved.storage_options,
+        );
         info!(
             operation_class = "connector-open",
             storage_provider = %resolved_storage.provider,
@@ -178,7 +171,9 @@ impl DeltaSource {
             resumed = recovered.is_some(),
             "opening Delta Lake source connector"
         );
-        let table = delta_io::open_table_metadata(&resolved_path, resolved_storage.options).await?;
+        let table =
+            delta_io::open_table_metadata(&resolved.location, resolved.storage_options.clone())
+                .await?;
         self.install_reader_contract(config, &table)?;
         let snapshot = table.snapshot().map_err(|error| {
             delta_io::classify_delta_metadata_error("read Delta table metadata", &error)
@@ -219,13 +214,58 @@ impl DeltaSource {
         self.cursor = Some(cursor);
         self.reader = Some(Reader {
             table,
-            resolved_table_path: resolved_path,
-            stable_storage_options: stable_options,
+            resolved,
             context,
             scan: None,
             pending: None,
             last_version_check: None,
         });
+        Ok(())
+    }
+
+    /// Resolve the table through its catalog for reading. Environment credential fallbacks are
+    /// resolved again each time rather than retained from the first start.
+    async fn resolve_table(&self) -> Result<super::delta_io::ResolvedCatalogTable, ConnectorError> {
+        let mut resolved = super::delta_io::resolve_catalog_options(
+            &self.config.catalog_type,
+            self.config.catalog_database.as_deref(),
+            self.config.catalog_name.as_deref(),
+            self.config.catalog_schema.as_deref(),
+            &self.config.table_path,
+            &self.config.stable_storage_options(),
+            super::delta_io::CatalogAccess::Read,
+        )
+        .await?;
+        resolved.storage_options = crate::storage::StorageCredentialResolver::resolve(
+            &resolved.location,
+            &resolved.storage_options,
+        )
+        .options;
+        Ok(resolved)
+    }
+
+    /// Replace expiring vended credentials before the next read. Only the storage access
+    /// changes; the table must keep its location and incarnation.
+    async fn renew_credentials(&mut self) -> Result<(), ConnectorError> {
+        let resolved = self.resolve_table().await?;
+        let table_id = self.cursor()?.table_id.clone();
+        let reader = self.reader_mut()?;
+        if resolved.location != reader.resolved.location {
+            return Err(ConnectorError::ConfigurationError(
+                "the catalog moved the Delta table to another storage location; reset the source"
+                    .into(),
+            ));
+        }
+        let table = super::delta_io::open_table_metadata(
+            &resolved.location,
+            resolved.storage_options.clone(),
+        )
+        .await?;
+        ensure_same_table(&table, &table_id)?;
+        reader.context.engine = table.log_store().engine(None);
+        reader.table = table;
+        reader.resolved = resolved;
+        info!("Delta Lake source: renewed vended storage credentials");
         Ok(())
     }
 
@@ -438,6 +478,13 @@ impl DeltaSource {
     /// Start reading the unit(s) after the cursor. Returns `false` when there is nothing to read.
     async fn start_next_scan(&mut self) -> Result<bool, ConnectorError> {
         let phase = self.cursor()?.phase.clone();
+        if !matches!(phase, DeltaPhase::Complete { .. })
+            && super::delta_io::credentials_need_refresh(
+                self.reader_mut()?.resolved.credentials_expire_at,
+            )
+        {
+            self.renew_credentials().await?;
+        }
         let guard = self.task_owner.track().ok_or(ConnectorError::Closed)?;
         match phase {
             DeltaPhase::Complete { .. } => Ok(false),
@@ -506,12 +553,8 @@ impl DeltaSource {
         // New commits (or an unreadable listing): load the metadata from scratch, so a
         // replacement's own metaData action is the one compared with the cursor.
         let fresh = delta_io::open_table_metadata(
-            &reader.resolved_table_path,
-            crate::storage::StorageCredentialResolver::resolve(
-                &reader.resolved_table_path,
-                &reader.stable_storage_options,
-            )
-            .options,
+            &reader.resolved.location,
+            reader.resolved.storage_options.clone(),
         )
         .await?;
         ensure_same_table(&fresh, &table_id)?;

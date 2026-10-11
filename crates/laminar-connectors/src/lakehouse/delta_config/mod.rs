@@ -187,29 +187,10 @@ impl DeltaLakeSinkConfig {
         }
 
         // ── Catalog configuration ──
-        if let Some(v) = config.get("catalog.type") {
-            cfg.catalog_type = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid catalog.type: '{v}' (expected 'none', 'glue', or 'unity')"
-                ))
-            })?;
-        }
+        cfg.catalog_type = DeltaCatalogType::from_config(config)?;
         cfg.catalog_database = config.get("catalog.database").map(str::to_owned);
         cfg.catalog_name = config.get("catalog.name").map(str::to_owned);
         cfg.catalog_schema = config.get("catalog.schema").map(str::to_owned);
-        // Unity-specific: populate workspace_url and access_token into the enum variant.
-        if let DeltaCatalogType::Unity {
-            ref mut workspace_url,
-            ref mut access_token,
-        } = cfg.catalog_type
-        {
-            if let Some(v) = config.get("catalog.workspace_url") {
-                *workspace_url = v.to_string();
-            }
-            if let Some(v) = config.get("catalog.access_token") {
-                *access_token = v.to_string();
-            }
-        }
         if let Some(v) = config.get("catalog.storage.location") {
             cfg.catalog_storage_location = Some(v.to_string());
         }
@@ -394,44 +375,23 @@ impl DeltaLakeSinkConfig {
                     ));
                 }
             }
-            DeltaCatalogType::Unity {
-                workspace_url,
-                access_token,
-            } => {
-                #[cfg(not(feature = "delta-lake-unity"))]
-                {
-                    let _ = (workspace_url, access_token);
-                    return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires the 'delta-lake-unity' feature. \
-                         Build with: cargo build --features delta-lake-unity"
-                            .into(),
-                    ));
-                }
-                #[cfg(feature = "delta-lake-unity")]
-                {
-                    if workspace_url.is_empty() {
+            DeltaCatalogType::Unity(unity) => {
+                unity.validate()?;
+                if self.catalog_storage_location.is_some() {
+                    if self.catalog_name.is_none() || self.catalog_schema.is_none() {
                         return Err(ConnectorError::ConfigurationError(
-                            "Unity catalog requires 'catalog.workspace_url' to be set".into(),
+                            "Unity catalog auto-create requires 'catalog.name' and \
+                             'catalog.schema' to be set"
+                                .into(),
                         ));
                     }
-                    if access_token.is_empty() {
+                    if !matches!(unity.auth, UnityAuth::Token(_)) {
                         return Err(ConnectorError::ConfigurationError(
-                            "Unity catalog requires 'catalog.access_token' to be set".into(),
+                            "Unity catalog table registration (catalog.storage.location) \
+                             authenticates with catalog.access_token; the pinned Unity client \
+                             cannot register tables over OAuth, so create the table first"
+                                .into(),
                         ));
-                    }
-                    if self.catalog_storage_location.is_some() {
-                        if self.catalog_name.is_none() {
-                            return Err(ConnectorError::ConfigurationError(
-                                "Unity catalog auto-create requires 'catalog.name' to be set"
-                                    .into(),
-                            ));
-                        }
-                        if self.catalog_schema.is_none() {
-                            return Err(ConnectorError::ConfigurationError(
-                                "Unity catalog auto-create requires 'catalog.schema' to be set"
-                                    .into(),
-                            ));
-                        }
                     }
                 }
             }
@@ -486,13 +446,144 @@ pub enum DeltaCatalogType {
     None,
     /// AWS Glue Data Catalog.
     Glue,
-    /// Databricks Unity Catalog.
-    Unity {
-        /// Databricks workspace URL (e.g., `https://xxx.cloud.databricks.com`).
-        workspace_url: String,
-        /// Databricks access token.
-        access_token: String,
+    /// Databricks or open-source Unity Catalog.
+    Unity(UnityCatalogConfig),
+}
+
+impl DeltaCatalogType {
+    /// Parse `catalog.type` and, for Unity, its connection and credential options.
+    ///
+    /// # Errors
+    /// Returns `ConnectorError::ConfigurationError` for an unknown catalog type or an invalid
+    /// Unity credential mode.
+    pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        let Some(kind) = config.get("catalog.type") else {
+            return Ok(Self::None);
+        };
+        let mut catalog: Self = kind.parse().map_err(|_| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid catalog.type: '{kind}' (expected 'none', 'glue', or 'unity')"
+            ))
+        })?;
+        if let Self::Unity(unity) = &mut catalog {
+            unity.workspace_url = config
+                .get("catalog.workspace_url")
+                .unwrap_or_default()
+                .to_string();
+            let token = config.get("catalog.access_token").map(str::to_string);
+            let client = config.get("catalog.client_id").map(str::to_string);
+            let secret = config.get("catalog.client_secret").map(str::to_string);
+            unity.auth = match (token, client, secret) {
+                (Some(token), None, None) => UnityAuth::Token(token),
+                (None, Some(client_id), Some(client_secret)) => UnityAuth::OAuth {
+                    client_id,
+                    client_secret,
+                },
+                (None, None, None) => UnityAuth::Unset,
+                _ => {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog authenticates with either catalog.access_token or both \
+                         catalog.client_id and catalog.client_secret"
+                            .into(),
+                    ))
+                }
+            };
+            if let Some(mode) = config.get("catalog.storage.credentials") {
+                unity.storage_credentials = match mode.to_ascii_lowercase().as_str() {
+                    "vended" => UnityStorageCredentials::Vended,
+                    "configured" => UnityStorageCredentials::Configured,
+                    _ => {
+                        return Err(ConnectorError::ConfigurationError(format!(
+                            "invalid catalog.storage.credentials: '{mode}' (expected 'vended' \
+                             or 'configured')"
+                        )))
+                    }
+                };
+            }
+        }
+        Ok(catalog)
+    }
+}
+
+/// Unity Catalog connection for one table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UnityCatalogConfig {
+    /// Workspace (or open-source server) URL, e.g. `https://xxx.cloud.databricks.com`.
+    pub workspace_url: String,
+    /// Credential presented to the catalog API.
+    pub auth: UnityAuth,
+    /// Where storage credentials for the table's files come from.
+    pub storage_credentials: UnityStorageCredentials,
+}
+
+impl UnityCatalogConfig {
+    pub(crate) fn validate(&self) -> Result<(), ConnectorError> {
+        if !cfg!(feature = "delta-lake-unity") {
+            return Err(ConnectorError::ConfigurationError(
+                "Unity catalog requires the 'delta-lake-unity' feature. \
+                 Build with: cargo build --features delta-lake-unity"
+                    .into(),
+            ));
+        }
+        if self.workspace_url.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "Unity catalog requires 'catalog.workspace_url' to be set".into(),
+            ));
+        }
+        if self.auth == UnityAuth::Unset {
+            return Err(ConnectorError::ConfigurationError(
+                "Unity catalog requires 'catalog.access_token' or 'catalog.client_id' with \
+                 'catalog.client_secret'"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Credential `LaminarDB` presents to the Unity Catalog API.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub enum UnityAuth {
+    /// No credential configured; rejected by validation.
+    #[default]
+    Unset,
+    /// A personal access token or a service-principal token (`catalog.access_token`).
+    Token(String),
+    /// Databricks OAuth machine-to-machine client credentials. The client fetches workspace
+    /// tokens and renews them before they expire.
+    OAuth {
+        /// Service principal application (client) id.
+        client_id: String,
+        /// Service principal OAuth secret.
+        client_secret: String,
     },
+}
+
+impl fmt::Debug for UnityAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unset => write!(f, "Unset"),
+            Self::Token(_) => write!(f, "Token(***)"),
+            Self::OAuth { client_id, .. } => {
+                write!(
+                    f,
+                    "OAuth {{ client_id: {client_id:?}, client_secret: *** }}"
+                )
+            }
+        }
+    }
+}
+
+/// Source of the storage credentials used to read or write a Unity Catalog table's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnityStorageCredentials {
+    /// Temporary credentials vended by Unity Catalog for this table and operation, renewed
+    /// before they expire. The governed route; requires external data access on the metastore.
+    #[default]
+    Vended,
+    /// The connector's own `storage.*` credentials or cloud identity; bypasses Unity Catalog
+    /// storage governance and is never used unless configured.
+    Configured,
 }
 
 impl FromStr for DeltaCatalogType {
@@ -502,10 +593,7 @@ impl FromStr for DeltaCatalogType {
         match s.to_lowercase().as_str() {
             "none" | "" => Ok(Self::None),
             "glue" => Ok(Self::Glue),
-            "unity" => Ok(Self::Unity {
-                workspace_url: String::new(),
-                access_token: String::new(),
-            }),
+            "unity" => Ok(Self::Unity(UnityCatalogConfig::default())),
             other => Err(format!("unknown catalog type: '{other}'")),
         }
     }
@@ -516,7 +604,7 @@ impl fmt::Display for DeltaCatalogType {
         match self {
             Self::None => write!(f, "none"),
             Self::Glue => write!(f, "glue"),
-            Self::Unity { .. } => write!(f, "unity"),
+            Self::Unity(_) => write!(f, "unity"),
         }
     }
 }

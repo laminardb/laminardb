@@ -57,6 +57,8 @@ impl DeltaLakeSink {
             #[cfg(feature = "delta-lake")]
             resolved_storage_options: std::collections::HashMap::new(),
             #[cfg(feature = "delta-lake")]
+            credentials_expire_at: None,
+            #[cfg(feature = "delta-lake")]
             cached_writer_properties: None,
             #[cfg(feature = "delta-lake")]
             merge_session: None,
@@ -114,46 +116,18 @@ impl DeltaLakeSink {
             })??;
         }
 
-        // Resolve catalog path: for Unity this calls GET to get the
-        // storage_location, bypassing delta-rs credential vending.
-        let (resolved_path, mut merged_options) = tokio::time::timeout_at(
-            deadline,
-            delta_io::resolve_catalog_options(
-                &self.config.catalog_type,
-                self.config.catalog_database.as_deref(),
-                self.config.catalog_name.as_deref(),
-                self.config.catalog_schema.as_deref(),
-                &self.config.table_path,
-                &self.config.storage_options,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            ConnectorError::ConnectionFailed(
-                "Delta catalog resolution exceeded the write deadline".into(),
-            )
-        })??;
+        let resolved = self.resolve_target(deadline).await?;
+        let resolved_path = resolved.location;
+        let merged_options = resolved.storage_options;
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             delta_io::validate_coordinated_storage_preflight(&resolved_path, &merged_options)?;
         }
 
-        // Inject default connection timeouts if not explicitly set.
-        // Azure load balancers close idle connections after ~4 minutes.
-        // Without these, a stale connection causes writes to hang forever.
-        merged_options
-            .entry("timeout".to_string())
-            .or_insert_with(|| "120s".to_string());
-        merged_options
-            .entry("connect_timeout".to_string())
-            .or_insert_with(|| "30s".to_string());
-        merged_options
-            .entry("pool_idle_timeout".to_string())
-            .or_insert_with(|| "60s".to_string());
-
         // Persist resolved values for reopen_table() on conflict retry.
         self.resolved_table_path.clone_from(&resolved_path);
         self.resolved_storage_options.clone_from(&merged_options);
+        self.credentials_expire_at = resolved.credentials_expire_at;
 
         // RECOVERY: retry only the read-only open. Table creation is a mutation and remains a
         // single dispatch so an uncertain create outcome is never duplicated by this layer.
@@ -226,6 +200,76 @@ impl DeltaLakeSink {
             self.merge_session = Some(datafusion::prelude::SessionContext::new());
         }
 
+        Ok(())
+    }
+
+    /// Resolve the target through its catalog for writing, with default client timeouts.
+    #[cfg(feature = "delta-lake")]
+    async fn resolve_target(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<super::super::delta_io::ResolvedCatalogTable, ConnectorError> {
+        let mut resolved = tokio::time::timeout_at(
+            deadline,
+            super::super::delta_io::resolve_catalog_options(
+                &self.config.catalog_type,
+                self.config.catalog_database.as_deref(),
+                self.config.catalog_name.as_deref(),
+                self.config.catalog_schema.as_deref(),
+                &self.config.table_path,
+                &self.config.storage_options,
+                super::super::delta_io::CatalogAccess::Write,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::ConnectionFailed(
+                "Delta catalog resolution exceeded the write deadline".into(),
+            )
+        })??;
+        // Azure load balancers close idle connections after ~4 minutes; without these a stale
+        // connection can hang a write past its deadline.
+        for (key, value) in [
+            ("timeout", "120s"),
+            ("connect_timeout", "30s"),
+            ("pool_idle_timeout", "60s"),
+        ] {
+            resolved
+                .storage_options
+                .entry(key.to_string())
+                .or_insert_with(|| value.to_string());
+        }
+        Ok(resolved)
+    }
+
+    /// Replace expiring vended credentials before the next storage I/O; the reopened handle
+    /// must still be the bound table at the same location.
+    #[cfg(feature = "delta-lake")]
+    pub(super) async fn renew_credentials_if_expiring(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        if !super::super::delta_io::credentials_need_refresh(self.credentials_expire_at) {
+            return Ok(());
+        }
+        let resolved = self.resolve_target(deadline).await?;
+        if resolved.location != self.resolved_table_path {
+            return Err(ConnectorError::ConfigurationError(
+                "the catalog moved the Delta target to another storage location".into(),
+            ));
+        }
+        self.resolved_storage_options = resolved.storage_options;
+        self.credentials_expire_at = resolved.credentials_expire_at;
+        self.table = None;
+        tokio::time::timeout_at(deadline, self.reopen_table())
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(
+                    "Delta table reopen after credential renewal exceeded the write deadline"
+                        .into(),
+                )
+            })??;
+        debug!("Delta Lake sink: renewed vended storage credentials");
         Ok(())
     }
 
@@ -499,6 +543,7 @@ impl DeltaLakeSink {
             return Ok(());
         }
         self.ensure_write_generation_usable()?;
+        self.renew_credentials_if_expiring(deadline).await?;
 
         let binding =
             super::super::delta_io::coordinated_table_binding(self.table.as_ref().ok_or_else(
@@ -672,6 +717,7 @@ impl DeltaLakeSink {
             return Ok(WriteResult::new(0, 0));
         }
         self.ensure_write_generation_usable()?;
+        self.renew_credentials_if_expiring(deadline).await?;
         let write_timeout = self.config.write_timeout;
         self.collapse_staged_upsert_changelog()?;
 

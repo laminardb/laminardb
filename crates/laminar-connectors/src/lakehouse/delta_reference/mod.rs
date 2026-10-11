@@ -64,17 +64,20 @@ impl DeltaReferenceTableSource {
     async fn open_table(&mut self) -> Result<(), ConnectorError> {
         use crate::lakehouse::delta_io;
 
-        let (resolved_path, resolved_options) = delta_io::resolve_catalog_options(
+        let resolved = delta_io::resolve_catalog_options(
             &self.config.catalog_type,
             self.config.catalog_database.as_deref(),
             self.config.catalog_name.as_deref(),
             self.config.catalog_schema.as_deref(),
             &self.config.table_path,
             &self.config.storage_options,
+            delta_io::CatalogAccess::Read,
         )
         .await?;
-        self.table =
-            Some(delta_io::open_or_create_table(&resolved_path, resolved_options, None).await?);
+        self.table = Some(
+            delta_io::open_or_create_table(&resolved.location, resolved.storage_options, None)
+                .await?,
+        );
         if let Some(table) = &self.table {
             super::schema_resolution::verify_identity(
                 self.binding.as_ref(),

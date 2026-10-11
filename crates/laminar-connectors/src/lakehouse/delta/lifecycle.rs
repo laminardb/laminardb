@@ -366,6 +366,7 @@ impl SinkConnector for DeltaLakeSink {
             self.ensure_coordinated_reconciled()?;
             self.ensure_write_generation_usable()?;
             let deadline = self.operation_deadline();
+            self.renew_credentials_if_expiring(deadline).await?;
             self.stage_coordinated_buffer(deadline).await?;
             if self.coordinated_adds.is_empty() {
                 if self.coordinated_binding.is_some() {
