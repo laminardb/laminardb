@@ -524,8 +524,14 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
             "Path to Delta Lake table (local, s3://, az://, gs://)",
         ),
         ConfigKeySpec::optional(
+            "read.mode",
+            "changes (snapshot/history then the change data feed) or snapshot (one snapshot, then complete)",
+            "changes",
+        ),
+        ConfigKeySpec::optional(
             "starting.version",
-            "First version to read (default: only versions committed after startup)",
+            "Changes mode: first change version to read (inclusive), or 'latest' for commits after \
+             first start; unset emits the latest snapshot, then its later changes",
             "",
         ),
         ConfigKeySpec::optional(

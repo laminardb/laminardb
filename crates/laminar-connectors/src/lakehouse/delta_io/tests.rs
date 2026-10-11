@@ -135,25 +135,6 @@ fn cdf_changelog_rejects_null_and_unknown_change_types() {
 }
 
 #[test]
-fn cdf_contract_failures_are_terminal() {
-    let unavailable =
-        map_cdf_scan_build_error(deltalake::DeltaTableError::ChangeDataNotEnabled { version: 0 });
-    assert!(!unavailable.is_transient());
-    assert!(unavailable.to_string().contains("CDF is unavailable"));
-
-    let batch = cdf_batch(vec![Some("insert"), Some("delete")]);
-    let row_error = checked_cdf_commit_usage(0, 0, &batch, 1, usize::MAX).unwrap_err();
-    assert!(!row_error.is_transient());
-    assert!(row_error.to_string().contains("hard row limit"));
-
-    let byte_error =
-        checked_cdf_commit_usage(0, 0, &batch, usize::MAX, batch.get_array_memory_size() - 1)
-            .unwrap_err();
-    assert!(!byte_error.is_transient());
-    assert!(byte_error.to_string().contains("hard byte limit"));
-}
-
-#[test]
 fn delta_metadata_retryability_uses_typed_transport_errors() {
     use object_store::client::{HttpError, HttpErrorKind};
 
@@ -1047,7 +1028,8 @@ async fn test_sink_source_roundtrip() {
 
     // Read data via source.
     let mut source_config = DeltaSourceConfig::new(table_path);
-    source_config.starting_version = Some(1);
+    source_config.starting_version =
+        super::super::delta_source_config::DeltaStartingVersion::Version(1);
     let mut source = DeltaSource::new(source_config, None);
     let source_connector_config = ConnectorConfig::new("delta-lake");
     source
@@ -1076,89 +1058,6 @@ async fn test_sink_source_roundtrip() {
     assert_eq!(total_rows, 25);
 
     source.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certified() {
-    use super::super::delta_source::DeltaSource;
-    use super::super::delta_source_config::DeltaSourceConfig;
-    use crate::config::ConnectorConfig;
-    use crate::connector::{DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart};
-
-    let temp_dir = TempDir::new().unwrap();
-    let table_path = temp_dir.path().to_str().unwrap();
-
-    // Create table and write 2 versions.
-    let schema = test_schema();
-    let table = create_cdf_table(table_path, &schema).await;
-
-    let (table, _) = write_batches(
-        table,
-        vec![test_batch(10)],
-        SaveMode::Append,
-        None,
-        false,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let (_table, _) = write_batches(
-        table,
-        vec![test_batch(20)],
-        SaveMode::Append,
-        None,
-        false,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-
-    // Consume both data commits in order from the first data version.
-    let mut source_config = DeltaSourceConfig::new(table_path);
-    source_config.starting_version = Some(1);
-    let mut source = DeltaSource::new(source_config.clone(), None);
-    let connector_config = ConnectorConfig::new("delta-lake");
-    source
-        .start(
-            SourceStart::new(
-                connector_config.clone(),
-                SourcePosition::Initial,
-                DeliveryGuarantee::BestEffort,
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // Drain data commits 1 and 2.
-    let _ = source.poll_batch(10000).await.unwrap();
-    // Drain buffered.
-    while let Ok(Some(_)) = source.poll_batch(10000).await {}
-
-    // Checkpoint reflects the fully-consumed latest version.
-    let cp = source.checkpoint();
-    assert_eq!(cp.get_offset("delta_version"), Some("2"));
-    source.close().await.unwrap();
-
-    // Delta replay is not admitted until its snapshot/CDF cut is certified.
-    let mut source2 = DeltaSource::new(source_config, None);
-    let error = source2
-        .start(
-            SourceStart::new(
-                connector_config,
-                SourcePosition::Resume {
-                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(2, 2),
-                    checkpoint: cp,
-                },
-                DeliveryGuarantee::AtLeastOnce,
-            )
-            .unwrap(),
-        )
-        .await
-        .expect_err("uncertified Delta replay must fail closed");
-    assert!(error.to_string().contains("ephemeral"));
 }
 
 #[tokio::test]

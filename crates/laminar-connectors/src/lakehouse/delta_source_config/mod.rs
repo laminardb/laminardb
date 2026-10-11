@@ -19,8 +19,11 @@ pub struct DeltaSourceConfig {
     /// Path to the Delta Lake table (local, `s3://`, `az://`, `gs://`).
     pub table_path: String,
 
-    /// First table version to read. `None` reads only versions committed after startup.
-    pub starting_version: Option<i64>,
+    /// Whether the source follows the change data feed or reads one snapshot.
+    pub read_mode: DeltaReadMode,
+
+    /// Where a change-feed source begins on its first start.
+    pub starting_version: DeltaStartingVersion,
 
     /// How often to poll for new versions (default: 1 second).
     pub poll_interval: Duration,
@@ -48,7 +51,8 @@ impl Default for DeltaSourceConfig {
     fn default() -> Self {
         Self {
             table_path: String::new(),
-            starting_version: None,
+            read_mode: DeltaReadMode::Changes,
+            starting_version: DeltaStartingVersion::Snapshot,
             poll_interval: Duration::from_secs(1),
             storage_options: HashMap::new(),
             env_resolved_storage_keys: Vec::new(),
@@ -86,21 +90,41 @@ impl DeltaSourceConfig {
             ..Self::default()
         };
 
+        if let Some(v) = config.get("read.mode") {
+            cfg.read_mode = match v.to_ascii_lowercase().as_str() {
+                "changes" => DeltaReadMode::Changes,
+                "snapshot" => DeltaReadMode::Snapshot,
+                _ => {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "invalid read.mode: '{v}' (expected 'changes' or 'snapshot')"
+                    )))
+                }
+            };
+        }
         if let Some(v) = config.get("starting.version") {
-            cfg.starting_version = Some(v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid starting.version: '{v}'"))
-            })?);
+            if cfg.read_mode == DeltaReadMode::Snapshot {
+                return Err(ConnectorError::ConfigurationError(
+                    "starting.version applies only to read.mode=changes; read.mode=snapshot \
+                     reads the latest version"
+                        .into(),
+                ));
+            }
+            cfg.starting_version = if v.eq_ignore_ascii_case("latest") {
+                DeltaStartingVersion::Latest
+            } else {
+                DeltaStartingVersion::Version(v.parse().map_err(|_| {
+                    ConnectorError::ConfigurationError(format!(
+                        "invalid starting.version: '{v}' (expected a non-negative version or \
+                         'latest')"
+                    ))
+                })?)
+            };
         }
         if let Some(v) = config.get("poll.interval.ms") {
             let ms: u64 = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!("invalid poll.interval.ms: '{v}'"))
             })?;
             cfg.poll_interval = Duration::from_millis(ms);
-        }
-        if config.get("read.mode").is_some() {
-            return Err(ConnectorError::ConfigurationError(
-                "Delta source does not support read.mode".into(),
-            ));
         }
         if config.get("cdf.enabled").is_some() {
             return Err(ConnectorError::ConfigurationError(
@@ -193,9 +217,16 @@ impl DeltaSourceConfig {
         if self.table_path.is_empty() {
             return Err(ConnectorError::missing_config("table.path"));
         }
-        if self.starting_version.is_some_and(|version| version < 0) {
+        if self.read_mode == DeltaReadMode::Snapshot
+            && self.starting_version != DeltaStartingVersion::Snapshot
+        {
             return Err(ConnectorError::ConfigurationError(
-                "starting.version must be non-negative".into(),
+                "starting.version applies only to read.mode=changes".into(),
+            ));
+        }
+        if self.poll_interval.is_zero() {
+            return Err(ConnectorError::ConfigurationError(
+                "poll.interval.ms must be > 0".into(),
             ));
         }
 
@@ -247,6 +278,30 @@ impl DeltaSourceConfig {
 
         Ok(())
     }
+}
+
+/// What a Delta source reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaReadMode {
+    /// Follow the table's change data feed (`read.mode = 'changes'`, the default).
+    Changes,
+    /// Emit the latest snapshot as inserts and then finish (`read.mode = 'snapshot'`).
+    Snapshot,
+}
+
+/// Where a change-feed source begins on its first start. Recovery always resumes from the
+/// checkpointed cursor instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaStartingVersion {
+    /// Emit the snapshot at the version current at first start as inserts, then every change
+    /// committed after it (`starting.version` unset).
+    Snapshot,
+    /// Emit only changes committed after the version current at first start
+    /// (`starting.version = 'latest'`).
+    Latest,
+    /// Emit changes from this version, inclusive, without a snapshot. Rows that existed
+    /// before it reach consumers only through their later updates and deletes.
+    Version(u64),
 }
 
 #[cfg(test)]
