@@ -146,12 +146,18 @@ pub fn register_kafka_sink(
     registry.register_sink(
         "kafka",
         info,
-        Arc::new(|_config, registry: Option<&Arc<prometheus::Registry>>| {
+        Arc::new(|config, registry: Option<&Arc<prometheus::Registry>>| {
             // Empty schema — the sink's schema is bound from the upstream query at build time.
             let empty = Arc::new(arrow_schema::Schema::empty());
+            // Exactly-once admission inspects the committer before `open`, so parse up front.
+            let parsed = if config.properties().is_empty() {
+                KafkaSinkConfig::default()
+            } else {
+                KafkaSinkConfig::from_config(config)?
+            };
             Ok(Box::new(KafkaSink::new(
                 empty,
-                KafkaSinkConfig::default(),
+                parsed,
                 registry.map(Arc::as_ref),
             )))
         }),
@@ -426,8 +432,37 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
             "120000",
         ),
         // Partitioning
-        ConfigKeySpec::optional("key.column", "Column name to use as Kafka message key", ""),
+        ConfigKeySpec::optional(
+            "key.column",
+            "Key column, or comma-separated columns with key.format = json",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "key.format",
+            "Key bytes (native/kafka/text/json)",
+            "native",
+        ),
+        ConfigKeySpec::optional(
+            "partition.count",
+            "Partition count keyed records hash over; required for envelope = upsert",
+            "",
+        ),
         ConfigKeySpec::optional("envelope", "Output envelope (append/upsert)", "append"),
+        ConfigKeySpec::optional(
+            "commit.topic",
+            "Compacted topic holding exactly-once commit markers (exactly-once only)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "transaction.timeout.ms",
+            "Exactly-once transaction timeout in milliseconds",
+            "60000",
+        ),
+        ConfigKeySpec::optional(
+            "epoch.max.bytes",
+            "Exactly-once bound on one epoch's staged output bytes",
+            "67108864",
+        ),
         ConfigKeySpec::optional(
             "partitioner",
             "Partitioning strategy (key-hash/round-robin/sticky)",

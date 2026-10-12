@@ -1,0 +1,32 @@
+# Single-node Apache Kafka (KRaft) for Kafka protocol qualification: transactions, KIP-848 and
+# client compatibility that Redpanda results do not establish.
+#
+# Bring up:  docker compose -f tests/docker/kafka-apache-compose.yml up -d --wait
+# Run:       LAMINAR_KAFKA_BROKERS=127.0.0.1:29092 cargo test -p laminar-connectors \
+#              --features kafka --test kafka_exactly_once --test kafka_record_fidelity
+# Tear down: docker compose -f tests/docker/kafka-apache-compose.yml down -v
+
+services:
+  kafka:
+    image: apache/kafka:4.1.1
+    container_name: laminardb-apache-kafka
+    ports:
+      - "127.0.0.1:29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:29093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_CLEANER_MIN_COMPACTION_LAG_MS: 0
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:29092 >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 10s
+      retries: 30

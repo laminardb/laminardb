@@ -73,13 +73,29 @@ impl KafkaSink {
     }
 
     pub(super) fn ensure_schema_ready(&mut self, schema: &SchemaRef) -> Result<(), ConnectorError> {
-        if schema.fields() != self.schema.fields() {
-            return Err(ConnectorError::SchemaMismatch(
-                "Kafka sink input differs from its committed query schema; migrate the catalog"
-                    .into(),
-            ));
+        if schema.fields() == self.schema.fields() {
+            return Ok(());
         }
-        Ok(())
+        let difference = self
+            .schema
+            .fields()
+            .iter()
+            .zip(schema.fields().iter())
+            .find(|(committed, input)| committed != input)
+            .map_or_else(
+                || {
+                    format!(
+                        "{} committed columns, {} input columns",
+                        self.schema.fields().len(),
+                        schema.fields().len()
+                    )
+                },
+                |(committed, input)| format!("committed {committed:?}, input {input:?}"),
+            );
+        Err(ConnectorError::SchemaMismatch(format!(
+            "Kafka sink input differs from its committed query schema ({difference}); migrate \
+             the catalog"
+        )))
     }
 }
 

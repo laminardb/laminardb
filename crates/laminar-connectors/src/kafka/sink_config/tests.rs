@@ -406,3 +406,40 @@ fn test_enum_parse() {
         CompressionType::Zstd
     );
 }
+
+#[test]
+fn exactly_once_requires_a_separate_commit_topic_and_no_dlq() {
+    let exactly_once = |extra: &[(&'static str, &'static str)]| {
+        let mut pairs = required_pairs();
+        pairs.push(("delivery.guarantee", "exactly_once"));
+        pairs.extend_from_slice(extra);
+        KafkaSinkConfig::from_config(&make_config(&pairs))
+    };
+    let missing = exactly_once(&[]).unwrap_err();
+    assert!(missing.to_string().contains("commit.topic"), "{missing}");
+    let topic = required_pairs()
+        .into_iter()
+        .find(|(key, _)| *key == "topic")
+        .unwrap()
+        .1;
+    assert!(exactly_once(&[("commit.topic", topic)]).is_err());
+    let dlq = exactly_once(&[("commit.topic", "commits"), ("dlq.topic", "dead")]).unwrap_err();
+    assert!(dlq.to_string().contains("dlq.topic"), "{dlq}");
+    assert!(exactly_once(&[("commit.topic", "commits"), ("transaction.timeout.ms", "0")]).is_err());
+
+    let cfg = exactly_once(&[("commit.topic", "commits")]).unwrap();
+    assert_eq!(cfg.delivery, DeliveryGuarantee::ExactlyOnce);
+    let producer = cfg.transactional_rdkafka_config("laminardb-ldb-c3-test");
+    assert_eq!(
+        producer.get("transactional.id"),
+        Some("laminardb-ldb-c3-test")
+    );
+    assert_eq!(producer.get("transaction.timeout.ms"), Some("60000"));
+    assert_eq!(producer.get("message.timeout.ms"), Some("60000"));
+    assert_eq!(producer.get("enable.idempotence"), Some("true"));
+
+    let mut pairs = required_pairs();
+    pairs.push(("commit.topic", "commits"));
+    let alo = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+    assert!(alo.to_string().contains("exactly-once"), "{alo}");
+}

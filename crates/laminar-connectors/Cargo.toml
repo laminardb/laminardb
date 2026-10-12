@@ -16,6 +16,8 @@ laminar-core = { path = "../laminar-core", version = "0.32.0" }
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
 arrow-avro = { workspace = true, optional = true }
+# Compresses exactly-once epoch descriptors staged in checkpoints.
+zstd = { workspace = true, optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 
 # Database drivers for CDC and sinks
@@ -133,7 +135,7 @@ default = [
     "parquet-lookup",
 ]
 testing = []
-kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest", "changelog-collapse"]
+kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest", "dep:zstd", "changelog-collapse"]
 # zstd record compression in librdkafka. zstd-sys generates its bindings with bindgen, so this
 # build additionally needs libclang.
 kafka-zstd = ["kafka", "rdkafka/zstd"]

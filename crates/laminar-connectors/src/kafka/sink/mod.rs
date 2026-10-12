@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    ConnectorTaskOwner, ConnectorTaskTracker, SinkConnector, SinkConsistency, SinkContract,
-    SinkInputMode, SinkTopology, WriteResult,
+    ConnectorTaskOwner, ConnectorTaskTracker, CoordinatedCommitter, DeliveryGuarantee,
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 use crate::serde::RecordSerializer;
@@ -28,12 +28,16 @@ use super::schema_registry::SchemaRegistryClient;
 use super::sink_config::{KafkaSinkConfig, PartitionStrategy, SinkEnvelope};
 use super::sink_metrics::KafkaSinkMetrics;
 
+mod commit_marker;
+mod exact_commit;
 mod failure;
 mod keys;
 mod lifecycle;
 mod serialization;
+mod staged_epoch;
 mod upsert;
 
+use exact_commit::KafkaExactCommitter;
 use failure::{
     kafka_write_timeout, producer_creation_error, queue_retry_delay, record_failure,
     unresolved_delivery_error, validate_payload_cardinality, KafkaFailure, KafkaFailureCertainty,
@@ -41,7 +45,7 @@ use failure::{
 };
 use keys::{KeyBuffer, KeyEncoder};
 use serialization::select_serializer;
-use upsert::{project_upsert_values, validate_upsert_keys};
+use staged_epoch::StagedEpoch;
 
 fn required_producer(producer: Option<&FutureProducer>) -> Result<&FutureProducer, ConnectorError> {
     producer.ok_or_else(|| ConnectorError::InvalidState {
@@ -97,6 +101,11 @@ pub struct KafkaSink {
     json_keys: crate::serde::json::JsonSerializer,
     /// Partition for records without a key in the current batch; advances once per batch.
     unkeyed_partition: i32,
+    /// Exactly-once only: the open epoch's routed records, published by the committer after the
+    /// checkpoint commits.
+    staged: Option<StagedEpoch>,
+    /// Exactly-once only: the designated committer for this sink's namespace.
+    exact: Option<Arc<KafkaExactCommitter>>,
     /// Sole admission authority for detached producer destruction.
     task_owner: ConnectorTaskOwner,
     /// Cloneable terminal observer returned to the connector runtime.
@@ -122,6 +131,7 @@ impl KafkaSink {
                 .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
         let (task_owner, task_tracker) = ConnectorTaskOwner::new();
+        let (staged, exact) = exactly_once_parts(&config, &task_owner);
 
         Self {
             producer: None,
@@ -140,6 +150,8 @@ impl KafkaSink {
             key_encoder: None,
             json_keys: crate::serde::json::JsonSerializer::new(),
             unkeyed_partition: 0,
+            staged,
+            exact,
             task_owner,
             task_tracker,
         }
@@ -168,6 +180,7 @@ impl KafkaSink {
         .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
         let (task_owner, task_tracker) = ConnectorTaskOwner::new();
+        let (staged, exact) = exactly_once_parts(&config, &task_owner);
 
         Self {
             producer: None,
@@ -186,6 +199,8 @@ impl KafkaSink {
             key_encoder: None,
             json_keys: crate::serde::json::JsonSerializer::new(),
             unkeyed_partition: 0,
+            staged,
+            exact,
             task_owner,
             task_tracker,
         }
@@ -276,6 +291,26 @@ impl KafkaSink {
         self.unkeyed_partition = (self.unkeyed_partition + 1) % partition_count;
     }
 
+    /// Each row's encoded key and target partition; the batch's unkeyed rows share one partition.
+    fn route_batch(
+        &mut self,
+        batch: &arrow_array::RecordBatch,
+        rows: usize,
+    ) -> Result<(Option<KeyBuffer>, Vec<i32>), ConnectorError> {
+        let keys = self.extract_keys(batch)?;
+        let partition_count = self.required_partition_count()?;
+        let partitions = (0..rows)
+            .map(|row| {
+                self.route(
+                    keys.as_ref().and_then(|keys| keys.key(row)),
+                    partition_count,
+                )
+            })
+            .collect();
+        self.rotate_unkeyed_partition(partition_count);
+        Ok((keys, partitions))
+    }
+
     /// Enqueues a definitely rejected record to the dead letter queue. The
     /// caller retains and drains the returned delivery future with all other
     /// accepted main/DLQ records from the write.
@@ -358,136 +393,6 @@ impl KafkaSink {
             }
         }
     }
-
-    /// Upsert-envelope produce: collapse the Z-set changelog to one record per merge key, then
-    /// emit a keyed value for a live group (`_op = U`) or a null-value tombstone for a removed group
-    /// (`_op = D`). The topic must be log-compacted and keyed on the merge key for the tombstones to
-    /// GC and for the latest-per-key state to be recoverable from offset 0.
-    #[allow(clippy::cast_possible_truncation)]
-    async fn write_upsert_batch(
-        &mut self,
-        batch: &arrow_array::RecordBatch,
-    ) -> Result<WriteResult, ConnectorError> {
-        self.ensure_schema_ready(&batch.schema())?;
-        let collapsed = self.collapse_upsert_changelog(batch)?;
-        let rows = collapsed.num_rows();
-        if rows == 0 {
-            return Ok(WriteResult::new(0, 0));
-        }
-        let (value_batch, ops) = project_upsert_values(&collapsed)?;
-
-        let payloads = self.serialize_payloads(&value_batch)?;
-        let keys = self.extract_keys(&collapsed)?.ok_or_else(|| {
-            ConnectorError::ConfigurationError("envelope = 'upsert' requires 'key.column'".into())
-        })?;
-        // Reject NULL merge keys before producing any record: a compacted topic cannot represent
-        // an unkeyed row, and a mid-loop bail would leave earlier rows already enqueued.
-        validate_upsert_keys(&keys, payloads.len())?;
-
-        let partition_count = self.required_partition_count()?;
-        let partitions = (0..rows)
-            .map(|row| self.route(keys.key(row), partition_count))
-            .collect::<Vec<_>>();
-        let producer = required_producer(self.producer.as_ref())?;
-
-        let mut delivery_futures = Vec::with_capacity(rows);
-        let mut enqueue_failure: Option<(KafkaFailure, usize)> = None;
-        let queue_deadline = Instant::now() + QUEUE_RETRY_TIMEOUT;
-        for (i, payload) in payloads.iter().enumerate() {
-            let is_delete = ops.value(i) == "D";
-            // No `.payload()` for a delete → null value = Kafka tombstone.
-            let mut record: FutureRecord<'_, [u8], [u8]> =
-                FutureRecord::to(&self.config.topic).partition(partitions[i]);
-            if let Some(key) = keys.key(i) {
-                record = record.key(key);
-            }
-            if !is_delete {
-                record = record.payload(payload.as_slice());
-            }
-            match Self::enqueue_with_queue_retry(producer, record, queue_deadline).await {
-                Ok(future) => delivery_futures.push((Instant::now(), future, is_delete, i)),
-                Err(error) => {
-                    let mut failure = KafkaFailure::enqueue(&error, "Kafka upsert");
-                    let affected = rows - i;
-                    if affected > 1 {
-                        let _ = write!(
-                            failure.detail,
-                            "; {} later record(s) were not attempted",
-                            affected - 1
-                        );
-                    }
-                    enqueue_failure = Some((failure, affected));
-                    break;
-                }
-            }
-        }
-
-        let mut records_written: usize = 0;
-        let mut bytes_written: u64 = 0;
-        let mut definitely_not_persisted: usize = 0;
-        let mut ambiguous: usize = 0;
-        let mut first_error: Option<String> = None;
-        let mut retryable = true;
-        for (send_time, future, is_delete, i) in delivery_futures {
-            match future.await {
-                Ok(Ok(_)) => {
-                    self.metrics
-                        .record_produce_latency(send_time.elapsed().as_micros() as u64);
-                    records_written += 1;
-                    if !is_delete {
-                        bytes_written += payloads[i].len() as u64;
-                    }
-                }
-                Ok(Err((err, _))) => {
-                    let failure = KafkaFailure::delivery(&err, "Kafka upsert");
-                    record_failure(
-                        &failure,
-                        1,
-                        &mut definitely_not_persisted,
-                        &mut ambiguous,
-                        &mut first_error,
-                        &mut retryable,
-                    );
-                }
-                Err(_canceled) => {
-                    let failure = KafkaFailure::canceled("Kafka upsert");
-                    record_failure(
-                        &failure,
-                        1,
-                        &mut definitely_not_persisted,
-                        &mut ambiguous,
-                        &mut first_error,
-                        &mut retryable,
-                    );
-                }
-            }
-        }
-        if let Some((failure, affected)) = enqueue_failure {
-            record_failure(
-                &failure,
-                affected,
-                &mut definitely_not_persisted,
-                &mut ambiguous,
-                &mut first_error,
-                &mut retryable,
-            );
-        }
-        self.metrics
-            .record_write(records_written as u64, bytes_written);
-        if definitely_not_persisted > 0 || ambiguous > 0 {
-            self.metrics.record_error();
-            return Err(unresolved_delivery_error(
-                "upsert produce",
-                rows,
-                records_written,
-                definitely_not_persisted,
-                ambiguous,
-                first_error,
-                retryable,
-            ));
-        }
-        Ok(WriteResult::new(records_written, bytes_written))
-    }
 }
 
 #[async_trait]
@@ -502,13 +407,16 @@ impl SinkConnector for KafkaSink {
         } else {
             KafkaSinkConfig::from_config(config)?
         };
-        // Kafka acknowledges these idempotent writes with all in-sync replicas,
-        // but this connector does not expose an external checkpoint cursor.
-        let consistency = SinkConsistency::DurableAtLeastOnce;
-        // Append records from independent writers compose safely. Upsert records do not carry a
-        // fenced generation, so an old writer can otherwise overwrite a newer value for the same
-        // compacted key after ownership handoff.
-        let topology = if cfg.envelope == SinkEnvelope::Upsert {
+        let exactly_once = cfg.delivery == DeliveryGuarantee::ExactlyOnce;
+        let consistency = if exactly_once {
+            SinkConsistency::CheckpointCommittable
+        } else {
+            SinkConsistency::DurableAtLeastOnce
+        };
+        // Exactly-once output is published only by the fenced designated committer, so staged
+        // upserts from any participant compose. Without it, an upsert record carries no fenced
+        // generation and a former owner could overwrite a newer value for the same compacted key.
+        let topology = if cfg.envelope == SinkEnvelope::Upsert && !exactly_once {
             SinkTopology::Singleton
         } else {
             SinkTopology::MultiWriter
@@ -655,6 +563,7 @@ impl SinkConnector for KafkaSink {
             }
         }
 
+        (self.staged, self.exact) = exactly_once_parts(&self.config, &self.task_owner);
         self.state = ConnectorState::Running;
         info!("Kafka sink connector opened successfully");
         Ok(())
@@ -687,17 +596,11 @@ impl SinkConnector for KafkaSink {
 
         let payloads = self.serialize_payloads(batch)?;
 
-        let keys = self.extract_keys(batch)?;
-        let partition_count = self.required_partition_count()?;
-        let partitions = (0..payloads.len())
-            .map(|row| {
-                self.route(
-                    keys.as_ref().and_then(|keys| keys.key(row)),
-                    partition_count,
-                )
-            })
-            .collect::<Vec<_>>();
-        self.rotate_unkeyed_partition(partition_count);
+        let (keys, partitions) = self.route_batch(batch, payloads.len())?;
+        if let Some(stage) = self.staged.as_mut() {
+            let values = payloads.iter().map(|payload| Some(payload.as_slice()));
+            return stage_records(stage, &partitions, keys.as_ref(), values);
+        }
         let producer = required_producer(self.producer.as_ref())?;
 
         // Phase 1: enqueue every record into librdkafka's bounded internal queue.
@@ -905,6 +808,47 @@ impl SinkConnector for KafkaSink {
         self.schema.clone()
     }
 
+    async fn begin_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+        if self.staged.as_ref().is_some_and(|stage| !stage.is_empty()) {
+            return Err(ConnectorError::InvalidState {
+                expected: "the previous exactly-once epoch to be prepared or rolled back".into(),
+                actual: "staged Kafka output remains".into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
+        let Some(stage) = self.staged.as_mut() else {
+            return Ok(None);
+        };
+        if stage.is_empty() {
+            return Ok(None);
+        }
+        let partition_count =
+            self.topic_partition_count
+                .ok_or_else(|| ConnectorError::InvalidState {
+                    expected: "broker topic metadata installed".into(),
+                    actual: "partition count is unavailable".into(),
+                })?;
+        let descriptor = stage.encode(&self.config.topic, partition_count)?;
+        stage.clear();
+        Ok(Some(descriptor))
+    }
+
+    async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+        if let Some(stage) = self.staged.as_mut() {
+            stage.clear();
+        }
+        Ok(())
+    }
+
+    fn as_coordinated_committer(&self) -> Option<&dyn CoordinatedCommitter> {
+        self.exact
+            .as_deref()
+            .map(|committer| committer as &dyn CoordinatedCommitter)
+    }
+
     fn suggested_write_timeout(&self) -> Duration {
         // The runtime deadline must dominate librdkafka's delivery deadline.
         // Main and DLQ deliveries are concurrent, so only bounded queue retry
@@ -946,6 +890,41 @@ impl std::fmt::Debug for KafkaSink {
             .field("topic", &self.config.topic)
             .field("format", &self.config.format)
             .finish_non_exhaustive()
+    }
+}
+
+/// Exactly-once: hold routed records for the checkpoint's transaction instead of producing them.
+fn stage_records<'a>(
+    stage: &mut StagedEpoch,
+    partitions: &[i32],
+    keys: Option<&KeyBuffer>,
+    values: impl ExactSizeIterator<Item = Option<&'a [u8]>>,
+) -> Result<WriteResult, ConnectorError> {
+    let rows = values.len();
+    for (row, value) in values.enumerate() {
+        stage.push(partitions[row], keys.and_then(|keys| keys.key(row)), value)?;
+    }
+    Ok(WriteResult::new(rows, 0))
+}
+
+/// The epoch stage and designated committer of an exactly-once sink; `None` otherwise.
+fn exactly_once_parts(
+    config: &KafkaSinkConfig,
+    task_owner: &ConnectorTaskOwner,
+) -> (Option<StagedEpoch>, Option<Arc<KafkaExactCommitter>>) {
+    match (config.delivery, config.commit_topic.as_ref()) {
+        (DeliveryGuarantee::ExactlyOnce, Some(commit_topic)) => (
+            Some(StagedEpoch::new(
+                config.epoch_max_bytes,
+                config.message_max_bytes().unwrap_or(usize::MAX),
+            )),
+            Some(Arc::new(KafkaExactCommitter::new(
+                config.clone(),
+                commit_topic.clone(),
+                task_owner.admission(),
+            ))),
+        ),
+        _ => (None, None),
     }
 }
 

@@ -70,14 +70,28 @@ pub(crate) fn compacts(config: &HashMap<String, String>) -> bool {
         .is_some_and(|policy| policy.split(',').any(|item| item.trim() == "compact"))
 }
 
+/// Whether `cleanup.policy` is exactly `compact`: every key's newest record is retained and no
+/// record is removed by age.
+pub(crate) fn is_compact_only(config: &HashMap<String, String>) -> bool {
+    config.get("cleanup.policy").is_some_and(|policy| {
+        let mut policies = policy.split(',').map(str::trim);
+        policies.next() == Some("compact") && policies.next().is_none()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn compaction_is_detected_in_any_policy_list() {
+    fn compact_only_rejects_delete_and_mixed_policies() {
         let policy =
             |value: &str| HashMap::from([("cleanup.policy".to_string(), value.to_string())]);
+        assert!(is_compact_only(&policy("compact")));
+        assert!(is_compact_only(&policy(" compact ")));
+        assert!(!is_compact_only(&policy("delete")));
+        assert!(!is_compact_only(&policy("compact,delete")));
+        assert!(!is_compact_only(&HashMap::new()));
         assert!(compacts(&policy("delete, compact")));
         assert!(!compacts(&policy("delete")));
         assert!(!compacts(&HashMap::new()));

@@ -60,6 +60,7 @@ const ALWAYS_PROTECTED: &[&str] = &[
     "auto.commit.interval.ms",
     "isolation.level",
     "group.protocol",
+    "partitioner",
 ];
 
 const PROTECTED_PREFIXES: &[&str] = &["sasl.kerberos.", "sasl.oauthbearer."];
