@@ -3,11 +3,14 @@
 // Source modules
 pub mod avro;
 pub mod config;
+pub mod latency_profile;
+mod librdkafka;
 mod metadata_error;
 pub mod metrics;
 mod offsets;
 pub mod rebalance;
 pub mod source;
+mod topic_config;
 mod vnode_routing;
 
 // Sink modules
@@ -27,9 +30,9 @@ mod schema_resolution;
 // Source re-exports
 pub use avro::AvroDeserializer;
 pub use config::{
-    AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
-    SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
-    TopicSubscription,
+    AssignmentStrategy, CompatibilityLevel, GroupProtocol, IsolationLevel, KafkaMetadataColumn,
+    KafkaMetadataColumns, KafkaSourceConfig, LatencyProfile, OffsetReset, SaslMechanism,
+    SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode, TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
 pub use source::KafkaSource;
@@ -40,7 +43,7 @@ pub use partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 pub use sink::KafkaSink;
-pub use sink_config::{CompressionType, KafkaSinkConfig, PartitionStrategy};
+pub use sink_config::{CompressionType, KafkaSinkConfig, KeyFormat, PartitionStrategy};
 pub use sink_metrics::KafkaSinkMetrics;
 
 /// Test-only access to Kafka-specific routing probes.
@@ -143,12 +146,18 @@ pub fn register_kafka_sink(
     registry.register_sink(
         "kafka",
         info,
-        Arc::new(|_config, registry: Option<&Arc<prometheus::Registry>>| {
+        Arc::new(|config, registry: Option<&Arc<prometheus::Registry>>| {
             // Empty schema — the sink's schema is bound from the upstream query at build time.
             let empty = Arc::new(arrow_schema::Schema::empty());
+            // Exactly-once admission inspects the committer before `open`, so parse up front.
+            let parsed = if config.properties().is_empty() {
+                KafkaSinkConfig::default()
+            } else {
+                KafkaSinkConfig::from_config(config)?
+            };
             Ok(Box::new(KafkaSink::new(
                 empty,
-                KafkaSinkConfig::default(),
+                parsed,
                 registry.map(Arc::as_ref),
             )))
         }),
@@ -293,6 +302,16 @@ fn kafka_source_consumer_config_keys() -> Vec<ConfigKeySpec> {
             "Transaction isolation (read_uncommitted/read_committed)",
             "read_committed",
         ),
+        ConfigKeySpec::optional(
+            "latency.profile",
+            "Fetch preset (low_latency/balanced/throughput); explicit options override it",
+            "balanced",
+        ),
+        ConfigKeySpec::optional(
+            "group.protocol",
+            "Consumer group protocol (classic/consumer); consumer is KIP-848",
+            "classic",
+        ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
         ConfigKeySpec::optional(
             "partition.assignment.strategy",
@@ -334,11 +353,25 @@ fn kafka_source_consumer_config_keys() -> Vec<ConfigKeySpec> {
         ),
         // Metadata
         ConfigKeySpec::optional(
-            "include.metadata",
-            "Include _partition/_offset/_timestamp columns",
-            "false",
+            "metadata.columns",
+            "Typed record metadata (key,topic,partition,offset,timestamp,timestamp_type,headers)",
+            "",
         ),
-        ConfigKeySpec::optional("include.headers", "Include _headers column", "false"),
+        ConfigKeySpec::optional(
+            "max.poll.bytes",
+            "Key, value and header bytes staged per poll (at least one record)",
+            "16777216",
+        ),
+        ConfigKeySpec::optional(
+            "reader.channel.max.bytes",
+            "Key, value and header bytes the reader queue may hold",
+            "67108864",
+        ),
+        ConfigKeySpec::optional(
+            "record.max.bytes",
+            "Largest accepted record key and value; larger records fail or are skipped",
+            "16777216",
+        ),
         // Backpressure
         ConfigKeySpec::optional(
             "backpressure.high.watermark",
@@ -399,14 +432,48 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
             "120000",
         ),
         // Partitioning
-        ConfigKeySpec::optional("key.column", "Column name to use as Kafka message key", ""),
+        ConfigKeySpec::optional(
+            "key.column",
+            "Key column, or comma-separated columns with key.format = json",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "key.format",
+            "Key bytes (native/kafka/text/json)",
+            "native",
+        ),
+        ConfigKeySpec::optional(
+            "partition.count",
+            "Partition count keyed records hash over; required for envelope = upsert",
+            "",
+        ),
         ConfigKeySpec::optional("envelope", "Output envelope (append/upsert)", "append"),
+        ConfigKeySpec::optional(
+            "commit.topic",
+            "Compacted topic holding exactly-once commit markers (exactly-once only)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "transaction.timeout.ms",
+            "Exactly-once transaction timeout in milliseconds",
+            "60000",
+        ),
+        ConfigKeySpec::optional(
+            "epoch.max.bytes",
+            "Exactly-once bound on one epoch's staged output bytes",
+            "67108864",
+        ),
         ConfigKeySpec::optional(
             "partitioner",
             "Partitioning strategy (key-hash/round-robin/sticky)",
             "key-hash",
         ),
         // Batching & Compression
+        ConfigKeySpec::optional(
+            "latency.profile",
+            "Producer batching preset (low_latency/balanced/throughput); explicit options override it",
+            "balanced",
+        ),
         ConfigKeySpec::optional("linger.ms", "Producer linger time in milliseconds", "5"),
         ConfigKeySpec::optional("batch.size", "Producer batch size in bytes", "16384"),
         ConfigKeySpec::optional("batch.num.messages", "Max messages per batch", "10000"),

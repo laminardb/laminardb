@@ -120,7 +120,7 @@ fn test_extract_confluent_id_too_short() {
 fn test_new_deserializer() {
     let deser = AvroDeserializer::new();
     assert!(deser.schema_registry.is_none());
-    assert!(deser.known_ids.is_empty());
+    assert!(deser.writers.is_empty());
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn test_register_schema() {
     let mut deser = AvroDeserializer::new();
     let result = deser.register_schema(1, TEST_AVRO_SCHEMA);
     assert!(result.is_ok());
-    assert!(deser.known_ids.contains(&1));
+    assert!(deser.is_registered(1));
 }
 
 #[tokio::test]
@@ -218,4 +218,62 @@ fn test_extract_confluent_id_edge_cases() {
         AvroDeserializer::extract_confluent_id(&data),
         Some(i32::MIN)
     );
+}
+
+#[tokio::test]
+async fn registry_backed_writer_schemas_are_evicted_least_recently_used_outside_the_batch() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let body = serde_json::json!({ "schema": TEST_AVRO_SCHEMA }).to_string();
+    Mock::given(method("GET"))
+        .and(path_regex("^/schemas/ids/[0-9]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let registry = Arc::new(SchemaRegistryClient::new(server.uri(), None).unwrap());
+    let mut deser = AvroDeserializer::with_schema_registry(registry);
+
+    // More writer schemas over a source's lifetime than the cache holds keep decoding.
+    for id in 1..=(WRITER_SCHEMA_CAPACITY as i32 + 6) {
+        deser.begin_batch();
+        assert!(deser.ensure_schema_registered(id).await.unwrap());
+    }
+    assert!(!deser.is_registered(1));
+    assert!(deser.is_registered(WRITER_SCHEMA_CAPACITY as i32 + 6));
+    deser.begin_batch();
+    assert!(deser.ensure_schema_registered(1).await.unwrap());
+
+    // A schema seen again is most recently used, so a newcomer evicts an idle one instead.
+    let hot = WRITER_SCHEMA_CAPACITY as i32 / 2;
+    deser.begin_batch();
+    assert!(!deser.ensure_schema_registered(hot).await.unwrap());
+    let oldest = deser.writers.front().map(|(id, _)| *id).unwrap();
+    assert_ne!(oldest, hot);
+    deser.begin_batch();
+    assert!(deser.ensure_schema_registered(400).await.unwrap());
+    assert!(deser.is_registered(hot));
+    assert!(!deser.is_registered(oldest));
+
+    // One batch that needs more schemas than the cache holds is rejected, not truncated.
+    deser.begin_batch();
+    for id in 100..(100 + WRITER_SCHEMA_CAPACITY as i32) {
+        deser.ensure_schema_registered(id).await.unwrap();
+    }
+    let error = deser.ensure_schema_registered(500).await.unwrap_err();
+    assert!(error.to_string().contains("max.poll.records"), "{error}");
+}
+
+#[test]
+fn manual_registration_without_a_registry_keeps_the_fixed_bound() {
+    let mut deser = AvroDeserializer::new();
+    for id in 1..=WRITER_SCHEMA_CAPACITY as i32 {
+        deser.register_schema(id, TEST_AVRO_SCHEMA).unwrap();
+    }
+    assert!(deser.register_schema(1, TEST_AVRO_SCHEMA).is_ok());
+    let error = deser
+        .register_schema(WRITER_SCHEMA_CAPACITY as i32 + 1, TEST_AVRO_SCHEMA)
+        .unwrap_err();
+    assert!(error.to_string().contains("Schema Registry"), "{error}");
 }

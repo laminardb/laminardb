@@ -1,10 +1,10 @@
 //! Source contract, drain lifecycle, polling, checkpointing, and shutdown.
 
 use super::{
-    async_trait, info, join_background_task, kafka_output_schema, reap_last_arc_off_runtime, warn,
-    Arc, CommitMode, ConnectorConfig, ConnectorError, ConnectorState, ConnectorTaskTracker,
-    Consumer, Format, KafkaReaderDrainCommand, KafkaSource, KafkaSourceConfig, KafkaSourceDrain,
-    Notify, OffsetTracker, Ordering, SchemaRef, SourceBatch, SourceCheckpoint, SourceConnector,
+    async_trait, info, join_background_task, reap_last_arc_off_runtime, warn, Arc, CommitMode,
+    ConnectorConfig, ConnectorError, ConnectorState, ConnectorTaskTracker, Consumer, Format,
+    KafkaReaderDrainCommand, KafkaSource, KafkaSourceConfig, KafkaSourceDrain, Notify,
+    OffsetTracker, Ordering, SchemaRef, SourceBatch, SourceCheckpoint, SourceConnector,
     SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainResolution, SourceInputMode,
     SourceRowPositionCapability, SourceStart, SourceTopology, KAFKA_BACKGROUND_CLOSE_BUDGET,
 };
@@ -221,11 +221,7 @@ impl SourceConnector for KafkaSource {
         let config = crate::config::ConnectorConfig::with_properties("kafka", properties.clone());
         let binding = super::super::schema_resolution::resolve_source(&config, None).await?;
         let parsed = KafkaSourceConfig::from_config(&config)?;
-        self.schema = super::super::schema_resolution::payload_schema(
-            &binding,
-            parsed.include_metadata,
-            parsed.include_headers,
-        )?;
+        self.schema = super::super::schema_resolution::payload_schema(&binding, &parsed.metadata)?;
         Ok(())
     }
 
@@ -237,11 +233,7 @@ impl SourceConnector for KafkaSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        kafka_output_schema(
-            &self.schema,
-            self.config.include_metadata,
-            self.config.include_headers,
-        )
+        self.config.metadata.output_schema(&self.schema)
     }
 
     fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {

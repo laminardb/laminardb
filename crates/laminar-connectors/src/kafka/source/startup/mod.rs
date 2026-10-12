@@ -6,13 +6,13 @@ use super::{
     fetch_partition_low_watermarks, fetch_partition_watermarks, info,
     kafka_bootstrap_is_unassigned, kafka_input_channels, kafka_partition_routes,
     kafka_partition_set, lock_or_recover, resolve_timestamp_offsets, select_deserializer,
-    startup_default_offset, validate_kafka_assignment, validate_kafka_output_schema,
-    validate_kafka_partition_results, validate_partition_baselines, validate_positions_not_expired,
-    validate_resume_input_channels, Arc, AvroDeserializer, ClientConfig, ConnectorError,
-    ConnectorState, Consumer, DeliveryGuarantee, Format, KafkaAssignmentPublication,
-    KafkaPartitionBaselines, KafkaPartitionRoutes, KafkaPartitionSet, KafkaRotationBaselines,
-    KafkaSource, KafkaSourceConfig, KafkaStartPlan, LaminarConsumerContext, OffsetTracker,
-    Ordering, SourcePosition, SourceStart, StartupMode, StreamConsumer, TopicPartitionList,
+    startup_default_offset, validate_kafka_assignment, validate_kafka_partition_results,
+    validate_partition_baselines, validate_positions_not_expired, validate_resume_input_channels,
+    Arc, AvroDeserializer, ClientConfig, ConnectorError, ConnectorState, Consumer,
+    DeliveryGuarantee, Format, KafkaAssignmentPublication, KafkaPartitionBaselines,
+    KafkaPartitionRoutes, KafkaPartitionSet, KafkaRotationBaselines, KafkaSource,
+    KafkaSourceConfig, KafkaStartPlan, LaminarConsumerContext, OffsetTracker, Ordering,
+    SourcePosition, SourceStart, StartupMode, StreamConsumer, TopicPartitionList,
     TopicSubscription,
 };
 
@@ -21,6 +21,52 @@ mod validation;
 mod vnode;
 
 use validation::VnodeStartInventory;
+
+/// A guaranteed append source replays its exact history from a checkpoint, which compaction may
+/// remove inside the replay range. A Debezium source applies keyed upserts, whose current state
+/// converges on a compacted topic. A topic whose configuration cannot be read (no
+/// `DescribeConfigs` permission, or no answer in time) is accepted with a warning, so the check
+/// never blocks a deployment that worked before it.
+async fn validate_retention_contract(
+    config: &KafkaSourceConfig,
+    client: &ClientConfig,
+) -> Result<(), ConnectorError> {
+    if config.format == Format::Debezium {
+        return Ok(());
+    }
+    let TopicSubscription::Topics(topics) = &config.subscription else {
+        return Ok(());
+    };
+    let connection = crate::kafka::librdkafka::connection_subset(client);
+    for topic in topics {
+        let settings = match crate::kafka::topic_config::describe_topic(
+            &connection,
+            topic,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(settings) => settings,
+            Err(error) => {
+                tracing::warn!(
+                    topic = %topic,
+                    %error,
+                    "cannot verify the Kafka topic's cleanup.policy; a compacted topic can lose \
+                     records inside a recovery replay range"
+                );
+                continue;
+            }
+        };
+        if crate::kafka::topic_config::compacts(&settings) {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Kafka topic '{topic}' is compacted: compaction can remove records inside a \
+                 recovery replay range, so an append source cannot guarantee delivery from it. \
+                 Use cleanup.policy=delete or best-effort delivery"
+            )));
+        }
+    }
+    Ok(())
+}
 
 impl KafkaSource {
     pub(super) async fn start_with_contract(
@@ -102,6 +148,11 @@ impl KafkaSource {
         if has_saved_position {
             rdkafka_config.set("allow.auto.create.topics", "false");
         }
+        info!(
+            source = %self.source_name,
+            settings = ?crate::kafka::librdkafka::redacted_settings(&rdkafka_config),
+            "Kafka consumer effective configuration"
+        );
         let context = LaminarConsumerContext::new(
             Arc::clone(&self.rebalance_state),
             Arc::clone(&self.rebalance_counter),
@@ -121,6 +172,9 @@ impl KafkaSource {
         // the bounded blocking reaper instead of running librdkafka Drop on a Tokio worker.
         let consumer = Arc::new(consumer);
         self.consumer = Some(Arc::clone(&consumer));
+        if delivery != DeliveryGuarantee::BestEffort {
+            validate_retention_contract(&kafka_config, &rdkafka_config).await?;
+        }
 
         let vnode_assigned = self
             .assign_vnode_partitions(

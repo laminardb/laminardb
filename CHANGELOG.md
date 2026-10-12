@@ -1,5 +1,43 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Kafka exactly-once output in embedded and single-node deployments: each checkpoint's records are
+  published by one fenced transactional committer together with a cursor marker in a compacted
+  `commit.topic`, so `read_committed` readers see every committed record once across crashes.
+  Cluster Kafka output remains at-least-once.
+- Kafka `latency.profile` (`low_latency`, `balanced`, `throughput`), `group.protocol`
+  (`classic`, `consumer`), sink `key.format` and `partition.count`, and source
+  `metadata.columns` (`key`, `topic`, `partition`, `offset`, `timestamp`, `timestamp_type`,
+  `headers`).
+
+### Changed
+
+- librdkafka is 2.16.0 through a vendored `rdkafka-sys`; zstd compression needs the `kafka-zstd`
+  feature.
+- `kafka.*` passthrough properties that override a connector-owned or protected setting are
+  rejected instead of ignored, and SASL mechanisms, TLS and codecs are checked against the linked
+  librdkafka before a client is created. OAUTHBEARER is rejected.
+- Kafka sinks route keyed records to `murmur2(key) % partitions` explicitly; upsert sinks require
+  `partition.count`. Kafka sources preserve NULL versus empty keys and values, keep binary,
+  duplicate and NULL headers in order, and advance their cursor over records that produce no row.
+- Guaranteed Kafka append sources reject compacted input topics when the broker reports the
+  topic's `cleanup.policy`; without DescribeConfigs permission the source starts with a warning.
+  The Avro writer-schema cache evicts least recently used schemas instead of failing after 64,
+  and a Schema Registry client certificate applies without a private CA.
+
+### Fixed
+
+- A sink reading an incremental materialized view directly binds the view's changelog, including
+  its weight column, so a keyed Kafka upsert sink over a `GROUP BY` view no longer fails with a
+  schema mismatch on its first write.
+
+### Removed
+
+- Kafka source `include.metadata` and `include.headers`; use `metadata.columns`.
+
 ## [0.28.0]
 
 ### Changed

@@ -20,6 +20,19 @@ pub(super) struct Spec {
     pub checkpoint_ms: u64,
     pub fault: Fault,
     pub limits: Option<Limits>,
+    #[serde(default)]
+    pub delivery: Delivery,
+    /// Kafka `latency.profile` for the source and sink; `None` keeps the explicit batching knobs.
+    #[serde(default)]
+    pub latency_profile: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Delivery {
+    #[default]
+    AtLeastOnce,
+    ExactlyOnce,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -36,6 +49,9 @@ pub(super) enum Fault {
     None,
     ProcessKill,
     SourcePause,
+    /// Exactly-once only: hard kills while the committed checkpoint's Kafka publication is
+    /// pending, right after it returns, and at an unaligned moment.
+    CommitBoundaryKills,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -59,6 +75,20 @@ impl Spec {
         ensure!(
             self.fault != Fault::SourcePause || self.seconds >= 20,
             "source pause needs at least 20 seconds"
+        );
+        ensure!(
+            self.fault != Fault::CommitBoundaryKills || self.delivery == Delivery::ExactlyOnce,
+            "commit-boundary kills need exactly-once delivery"
+        );
+        ensure!(
+            self.fault != Fault::CommitBoundaryKills || self.seconds >= 40,
+            "commit-boundary kills need at least 40 seconds"
+        );
+        ensure!(
+            self.latency_profile.as_deref().is_none_or(|profile| {
+                matches!(profile, "low_latency" | "balanced" | "throughput")
+            }),
+            "latency_profile must be low_latency, balanced or throughput"
         );
         ensure!(
             self.warmup_seconds < self.seconds / 2,

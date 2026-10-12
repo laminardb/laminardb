@@ -51,14 +51,11 @@ pub(super) fn registry_client(
             ))
         }
     };
-    if let Some(ca) = config.get("schema.registry.ssl.ca.location") {
-        SchemaRegistryClient::with_tls_mtls(
-            url,
-            auth,
-            ca,
-            config.get("schema.registry.ssl.certificate.location"),
-            config.get("schema.registry.ssl.key.location"),
-        )
+    let ca = config.get("schema.registry.ssl.ca.location");
+    let certificate = config.get("schema.registry.ssl.certificate.location");
+    let key = config.get("schema.registry.ssl.key.location");
+    if ca.is_some() || certificate.is_some() || key.is_some() {
+        SchemaRegistryClient::with_tls_mtls(url, auth, ca, certificate, key)
     } else {
         SchemaRegistryClient::new(url, auth)
     }
@@ -82,16 +79,8 @@ pub(super) async fn resolve_source_with_registry(
         let reader =
             crate::serde::schema_contract::reader_binding(config, parsed.format, explicit)?;
         let schema = Arc::new(reader.logical);
-        super::source::validate_kafka_output_schema(
-            &schema,
-            parsed.include_metadata,
-            parsed.include_headers,
-        )?;
-        let output = super::source::kafka_output_schema(
-            &schema,
-            parsed.include_metadata,
-            parsed.include_headers,
-        );
+        parsed.metadata.validate_payload(&schema)?;
+        let output = parsed.metadata.output_schema(&schema);
         return logical_binding(config, SchemaDirection::Source, reader.origin, &output);
     }
     reject_unsupported_key_codec(config)?;
@@ -119,24 +108,12 @@ pub(super) async fn resolve_source_with_registry(
         SchemaOrigin::Metadata
     };
     let payload = explicit.unwrap_or_else(|| Arc::clone(&cached.arrow_schema));
-    super::source::validate_kafka_output_schema(
-        &payload,
-        parsed.include_metadata,
-        parsed.include_headers,
-    )?;
-    let logical = super::source::kafka_output_schema(
-        &payload,
-        parsed.include_metadata,
-        parsed.include_headers,
-    );
+    parsed.metadata.validate_payload(&payload)?;
+    let logical = parsed.metadata.output_schema(&payload);
     let mut binding = logical_binding(config, SchemaDirection::Source, origin, &logical)?;
     bind_external(
         &mut binding,
-        &super::source::kafka_output_schema(
-            &cached.arrow_schema,
-            parsed.include_metadata,
-            parsed.include_headers,
-        ),
+        &parsed.metadata.output_schema(&cached.arrow_schema),
     )?;
     binding.value = Some(native_contract(config, &subject, cached)?);
     Ok(binding)
@@ -412,15 +389,13 @@ pub(super) fn contract_schema_id(binding: &SchemaBinding) -> Result<u32, Connect
 
 pub(crate) fn payload_schema(
     binding: &SchemaBinding,
-    metadata: bool,
-    headers: bool,
+    metadata: &super::source::KafkaMetadataColumns,
 ) -> Result<SchemaRef, ConnectorError> {
-    let appended = usize::from(metadata) * 3 + usize::from(headers);
     let length = binding
         .logical
         .fields()
         .len()
-        .checked_sub(appended)
+        .checked_sub(metadata.len())
         .ok_or_else(|| {
             ConnectorError::SchemaMismatch("reader metadata fields are missing".into())
         })?;
@@ -428,8 +403,7 @@ pub(crate) fn payload_schema(
         binding.logical.fields()[..length].to_vec(),
         binding.logical.metadata().clone(),
     ));
-    if super::source::kafka_output_schema(&payload, metadata, headers).as_ref() != &binding.logical
-    {
+    if metadata.output_schema(&payload).as_ref() != &binding.logical {
         return Err(ConnectorError::SchemaMismatch(
             "committed Kafka metadata fields differ from the configured protocol".into(),
         ));

@@ -1,0 +1,18 @@
+{
+  "hardware": "local diagnostic host; record actual hardware in the evidence bundle",
+  "seconds": 60,
+  "warmup_seconds": 2,
+  "drain_seconds": 90,
+  "pipelines": 1,
+  "rps_per_pipeline": 200,
+  "partitions": 4,
+  "payload_bytes": 128,
+  "keys": 1024,
+  "seed": 42,
+  "distribution": "uniform",
+  "checkpoint_ms": 500,
+  "fault": "commit_boundary_kills",
+  "limits": null,
+  "delivery": "exactly_once",
+  "latency_profile": null
+}

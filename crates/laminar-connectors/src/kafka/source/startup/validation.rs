@@ -1,12 +1,12 @@
 //! Fail-closed startup policy and durable-position installation.
 
 use super::{
-    decode_partition_baselines, info, lock_or_recover, select_deserializer,
-    validate_kafka_output_schema, Arc, AvroDeserializer, ConnectorError, ConnectorState,
-    DeliveryGuarantee, Format, KafkaAssignmentPublication, KafkaPartitionBaselines,
-    KafkaPartitionRoutes, KafkaSource, KafkaSourceConfig, KafkaStartPlan, OffsetTracker, Ordering,
-    SourcePosition, SourceStart, StartupMode, TopicSubscription,
+    decode_partition_baselines, info, lock_or_recover, select_deserializer, Arc, AvroDeserializer,
+    ConnectorError, ConnectorState, DeliveryGuarantee, Format, KafkaAssignmentPublication,
+    KafkaPartitionBaselines, KafkaPartitionRoutes, KafkaSource, KafkaSourceConfig, KafkaStartPlan,
+    OffsetTracker, Ordering, SourcePosition, SourceStart, StartupMode, TopicSubscription,
 };
+use crate::kafka::config::IsolationLevel;
 
 struct PreparedStartPosition {
     offsets: OffsetTracker,
@@ -113,8 +113,7 @@ impl KafkaSource {
         if let Some(binding) = config.schema_binding() {
             self.schema = super::super::super::schema_resolution::payload_schema(
                 binding,
-                kafka_config.include_metadata,
-                kafka_config.include_headers,
+                &kafka_config.metadata,
             )?;
             if let Some(avro) = self
                 .deserializer
@@ -134,11 +133,7 @@ impl KafkaSource {
             );
             self.schema = schema;
         }
-        validate_kafka_output_schema(
-            &self.schema,
-            kafka_config.include_metadata,
-            kafka_config.include_headers,
-        )?;
+        kafka_config.metadata.validate_payload(&self.schema)?;
 
         info!(
             brokers = %kafka_config.bootstrap_servers,
@@ -199,6 +194,24 @@ impl KafkaSource {
                     "invalid Kafka specific position {partition}:{offset}: partition and offset must be non-negative"
                 )));
             }
+        }
+        if delivery != DeliveryGuarantee::BestEffort
+            && config.isolation_level != IsolationLevel::ReadCommitted
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka guaranteed delivery requires isolation.level = read_committed; \
+                 read_uncommitted exposes records of transactions that may later abort"
+                    .into(),
+            ));
+        }
+        if delivery != DeliveryGuarantee::BestEffort
+            && config.kafka_properties.contains_key("group.instance.id")
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka static membership (group.instance.id) has no effect under guaranteed \
+                 delivery, which assigns partitions manually without joining the group"
+                    .into(),
+            ));
         }
         if delivery != DeliveryGuarantee::BestEffort
             && matches!(&config.startup_mode, StartupMode::GroupOffsets)

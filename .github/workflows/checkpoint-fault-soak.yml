@@ -60,7 +60,7 @@ jobs:
         # and retry the identical package set.
         run: |
           set -euo pipefail
-          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler"
+          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler"
           for attempt in 1 2 3 4 5; do
             if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
               exit 0
@@ -225,7 +225,7 @@ jobs:
         # and retry the identical package set.
         run: |
           set -euo pipefail
-          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler"
+          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler"
           for attempt in 1 2 3 4 5; do
             if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
               exit 0
@@ -347,7 +347,7 @@ jobs:
         # and retry the identical package set.
         run: |
           set -euo pipefail
-          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler"
+          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler"
           for attempt in 1 2 3 4 5; do
             if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
               exit 0

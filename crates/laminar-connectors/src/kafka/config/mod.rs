@@ -9,6 +9,13 @@ use rdkafka::config::ClientConfig;
 use crate::error::ConnectorError;
 use crate::serde::Format;
 
+pub use super::latency_profile::LatencyProfile;
+pub use super::source::{KafkaMetadataColumn, KafkaMetadataColumns};
+
+const DEFAULT_READER_CHANNEL_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_POLL_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_RECORD_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 mod source_options;
 
 /// Kafka security protocol for broker connections.
@@ -310,6 +317,25 @@ str_enum!(fromstr AssignmentStrategy, lowercase_nodash, ConnectorError,
     CooperativeSticky => "cooperative-sticky", "cooperative_sticky"
 );
 
+/// Consumer group rebalance protocol (`group.protocol`).
+///
+/// `consumer` is the KIP-848 protocol. It moves assignment, session and heartbeat timing to the
+/// broker, so the classic client-side settings are neither sent nor accepted with it. Guaranteed
+/// delivery assigns partitions manually and uses the group only for advisory offset commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupProtocol {
+    /// Client-side assignment with session and heartbeat timing (librdkafka default).
+    #[default]
+    Classic,
+    /// Broker-side assignment (KIP-848).
+    Consumer,
+}
+
+str_enum!(GroupProtocol, lowercase, ConnectorError, "invalid group.protocol",
+    Classic => "classic";
+    Consumer => "consumer"
+);
+
 /// Schema Registry compatibility level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatibilityLevel {
@@ -527,10 +553,8 @@ pub struct KafkaSourceConfig {
     /// Deadline for Schema Registry lookups performed during schema
     /// auto-discovery at DDL time. Default: 10s.
     pub schema_registry_discovery_timeout: Duration,
-    /// Whether to include Kafka metadata columns (_partition, _offset, _timestamp).
-    pub include_metadata: bool,
-    /// Whether to include Kafka headers as a map column (_headers).
-    pub include_headers: bool,
+    /// Record metadata columns appended after the decoded value columns.
+    pub metadata: KafkaMetadataColumns,
 
     // -- Consumer tuning --
     /// Consumer startup mode (controls initial offset positioning).
@@ -543,6 +567,10 @@ pub struct KafkaSourceConfig {
     pub max_poll_records: usize,
     /// Partition assignment strategy.
     pub partition_assignment_strategy: AssignmentStrategy,
+    /// Consumer group rebalance protocol.
+    pub group_protocol: GroupProtocol,
+    /// Latency preset that supplied the fetch defaults.
+    pub latency_profile: LatencyProfile,
     /// Minimum bytes to return from a fetch (allows batching).
     pub fetch_min_bytes: Option<i32>,
     /// Maximum bytes to return from broker per request.
@@ -585,6 +613,16 @@ pub struct KafkaSourceConfig {
     /// Capacity of the bounded channel between the background Kafka reader
     /// task and `poll_batch()` (default: 8192). Must be >= `max_poll_records`.
     pub reader_channel_capacity: usize,
+    /// Key, value and header bytes the reader channel may hold (default: 64 MiB). The reader
+    /// waits for the poll path to drain before queueing more.
+    pub reader_channel_max_bytes: usize,
+    /// Key, value and header bytes one poll stages before decoding (default: 16 MiB). A poll
+    /// always takes at least one record.
+    pub max_poll_bytes: usize,
+    /// Largest accepted record (key, value and headers; default: 16 MiB). A larger record is
+    /// handled like an undecodable one: it fails a guaranteed-delivery source and is skipped by
+    /// a best-effort source.
+    pub record_max_bytes: usize,
     /// Channel fill ratio at which to pause consumption.
     pub backpressure_high_watermark: f64,
     /// Channel fill ratio at which to resume consumption.
@@ -649,13 +687,14 @@ impl Default for KafkaSourceConfig {
             schema_registry_subject_strategy: SubjectNameStrategy::default(),
             schema_registry_record_name: None,
             schema_registry_discovery_timeout: Duration::from_secs(10),
-            include_metadata: false,
-            include_headers: false,
+            metadata: KafkaMetadataColumns::default(),
             startup_mode: StartupMode::default(),
             auto_offset_reset: OffsetReset::Earliest,
             isolation_level: IsolationLevel::default(),
             max_poll_records: 1000,
             partition_assignment_strategy: AssignmentStrategy::Range,
+            group_protocol: GroupProtocol::default(),
+            latency_profile: LatencyProfile::default(),
             fetch_min_bytes: None,
             fetch_max_bytes: None,
             fetch_max_wait_ms: None,
@@ -666,6 +705,9 @@ impl Default for KafkaSourceConfig {
             queued_max_messages_kbytes: 16384,
             broker_commit_on_checkpoint: true,
             reader_channel_capacity: 8192,
+            reader_channel_max_bytes: DEFAULT_READER_CHANNEL_MAX_BYTES,
+            max_poll_bytes: DEFAULT_MAX_POLL_BYTES,
+            record_max_bytes: DEFAULT_RECORD_MAX_BYTES,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.25,
             max_deser_error_rate: 0.5,
@@ -707,6 +749,52 @@ impl KafkaSourceConfig {
             _ => {}
         }
 
+        self.validate_memory_bounds()?;
+        self.validate_security()?;
+        if self.max_poll_interval.as_secs() < 60 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "max.poll.interval.ms ({}) must be >= 60000 (60s)",
+                self.max_poll_interval.as_millis()
+            )));
+        }
+
+        // Kafka broker requires heartbeat_interval * 3 < session_timeout.
+        if self.group_protocol == GroupProtocol::Classic
+            && self.heartbeat_interval.as_millis() * 3 >= self.session_timeout.as_millis()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "heartbeat.interval.ms ({}) * 3 must be < session.timeout.ms ({})",
+                self.heartbeat_interval.as_millis(),
+                self.session_timeout.as_millis()
+            )));
+        }
+
+        self.validate_backpressure()?;
+        if !(0.0..=1.0).contains(&self.max_deser_error_rate) {
+            return Err(ConnectorError::ConfigurationError(
+                "max.deser.error.rate must be between 0.0 and 1.0".into(),
+            ));
+        }
+
+        if self.format == Format::Avro && self.schema_registry_url.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "schema.registry.url is required when format is 'avro'".into(),
+            ));
+        }
+
+        super::librdkafka::require_supported_client(
+            self.security_protocol,
+            self.sasl_mechanism,
+            None,
+        )?;
+        super::librdkafka::validate_passthrough(
+            &self.owned_rdkafka_config(),
+            &self.kafka_properties,
+        )
+    }
+
+    /// Poll batching and reader-queue bounds: every limit is positive and one record always fits.
+    fn validate_memory_bounds(&self) -> Result<(), ConnectorError> {
         if self.max_poll_records == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "max.poll.records must be > 0".into(),
@@ -718,7 +806,27 @@ impl KafkaSourceConfig {
                 self.reader_channel_capacity, self.max_poll_records
             )));
         }
+        if self.max_poll_bytes == 0 || self.record_max_bytes == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "max.poll.bytes and record.max.bytes must be > 0".into(),
+            ));
+        }
+        if self.record_max_bytes > self.reader_channel_max_bytes
+            || u32::try_from(self.reader_channel_max_bytes).is_err()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "record.max.bytes ({}) must be <= reader.channel.max.bytes ({}), which must be \
+                 <= {}",
+                self.record_max_bytes,
+                self.reader_channel_max_bytes,
+                u32::MAX
+            )));
+        }
+        Ok(())
+    }
 
+    /// SASL mechanisms carry their credentials, and an explicit CA path is not empty.
+    fn validate_security(&self) -> Result<(), ConnectorError> {
         if self.security_protocol.uses_sasl() && self.sasl_mechanism.is_none() {
             return Err(ConnectorError::ConfigurationError(
                 "sasl.mechanism is required when security.protocol is sasl_plaintext or sasl_ssl"
@@ -745,23 +853,10 @@ impl KafkaSourceConfig {
                 }
             }
         }
+        Ok(())
+    }
 
-        if self.max_poll_interval.as_secs() < 60 {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "max.poll.interval.ms ({}) must be >= 60000 (60s)",
-                self.max_poll_interval.as_millis()
-            )));
-        }
-
-        // Kafka broker requires heartbeat_interval * 3 < session_timeout.
-        if self.heartbeat_interval.as_millis() * 3 >= self.session_timeout.as_millis() {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "heartbeat.interval.ms ({}) * 3 must be < session.timeout.ms ({})",
-                self.heartbeat_interval.as_millis(),
-                self.session_timeout.as_millis()
-            )));
-        }
-
+    fn validate_backpressure(&self) -> Result<(), ConnectorError> {
         if self.backpressure_high_watermark <= self.backpressure_low_watermark {
             return Err(ConnectorError::ConfigurationError(
                 "backpressure.high.watermark must be > backpressure.low.watermark".into(),
@@ -777,25 +872,19 @@ impl KafkaSourceConfig {
                 "backpressure.low.watermark must be between 0.0 and 1.0".into(),
             ));
         }
-
-        if !(0.0..=1.0).contains(&self.max_deser_error_rate) {
-            return Err(ConnectorError::ConfigurationError(
-                "max.deser.error.rate must be between 0.0 and 1.0".into(),
-            ));
-        }
-
-        if self.format == Format::Avro && self.schema_registry_url.is_none() {
-            return Err(ConnectorError::ConfigurationError(
-                "schema.registry.url is required when format is 'avro'".into(),
-            ));
-        }
-
         Ok(())
     }
 
-    /// Builds an rdkafka [`ClientConfig`] from this configuration.
+    /// Builds the rdkafka [`ClientConfig`]: connector-owned settings, then the validated
+    /// `kafka.*` passthrough properties.
     #[must_use]
     pub fn to_rdkafka_config(&self) -> ClientConfig {
+        let mut config = self.owned_rdkafka_config();
+        super::librdkafka::apply_passthrough(&mut config, &self.kafka_properties);
+        config
+    }
+
+    fn owned_rdkafka_config(&self) -> ClientConfig {
         let mut config = ClientConfig::new();
 
         config.set("bootstrap.servers", &self.bootstrap_servers);
@@ -803,10 +892,21 @@ impl KafkaSourceConfig {
         config.set("enable.auto.commit", "false");
         config.set("enable.auto.offset.store", "false");
         config.set("auto.offset.reset", self.auto_offset_reset.as_rdkafka_str());
-        config.set(
-            "partition.assignment.strategy",
-            self.partition_assignment_strategy.as_rdkafka_str(),
-        );
+        config.set("group.protocol", self.group_protocol.to_string());
+        if self.group_protocol == GroupProtocol::Classic {
+            config.set(
+                "partition.assignment.strategy",
+                self.partition_assignment_strategy.as_rdkafka_str(),
+            );
+            config.set(
+                "session.timeout.ms",
+                self.session_timeout.as_millis().to_string(),
+            );
+            config.set(
+                "heartbeat.interval.ms",
+                self.heartbeat_interval.as_millis().to_string(),
+            );
+        }
         config.set("security.protocol", self.security_protocol.as_rdkafka_str());
 
         if let Some(ref mechanism) = self.sasl_mechanism {
@@ -833,14 +933,6 @@ impl KafkaSourceConfig {
 
         config.set("isolation.level", self.isolation_level.as_rdkafka_str());
         config.set(
-            "session.timeout.ms",
-            self.session_timeout.as_millis().to_string(),
-        );
-        config.set(
-            "heartbeat.interval.ms",
-            self.heartbeat_interval.as_millis().to_string(),
-        );
-        config.set(
             "queued.max.messages.kbytes",
             self.queued_max_messages_kbytes.to_string(),
         );
@@ -865,50 +957,8 @@ impl KafkaSourceConfig {
             config.set("max.partition.fetch.bytes", partition_max.to_string());
         }
 
-        // Apply pass-through properties, blocking security-critical keys
-        // that could silently downgrade authentication or break semantics.
-        for (key, value) in &self.kafka_properties {
-            if is_blocked_passthrough_key(key) {
-                tracing::warn!(
-                    key,
-                    "ignoring kafka.* pass-through property that overrides a security setting"
-                );
-                continue;
-            }
-            config.set(key, value);
-        }
-
         config
     }
-}
-
-/// Returns `true` if a pass-through kafka.* key must not override explicit settings.
-fn is_blocked_passthrough_key(key: &str) -> bool {
-    key.starts_with("sasl.kerberos.")
-        || matches!(
-            key,
-            "security.protocol"
-                | "sasl.mechanism"
-                | "sasl.username"
-                | "sasl.password"
-                | "sasl.oauthbearer.config"
-                | "ssl.ca.location"
-                | "ssl.certificate.location"
-                | "ssl.key.location"
-                | "ssl.key.password"
-                | "ssl.endpoint.identification.algorithm"
-                | "enable.auto.commit"
-                | "enable.auto.offset.store"
-                | "enable.idempotence"
-                | "auto.offset.reset"
-                | "session.timeout.ms"
-                | "heartbeat.interval.ms"
-                | "max.poll.interval.ms"
-                | "queued.max.messages.kbytes"
-                // librdkafka's own auto-commit interval — only meaningful
-                // when `enable.auto.commit=true`, which we hard-disable.
-                | "auto.commit.interval.ms"
-        )
 }
 
 /// Parses a specific offsets string in the format "partition:offset,partition:offset,...".

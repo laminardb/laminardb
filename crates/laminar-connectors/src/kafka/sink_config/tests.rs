@@ -93,7 +93,7 @@ fn test_parse_all_optional_fields() {
         ("linger.ms", "10"),
         ("batch.size", "32768"),
         ("batch.num.messages", "5000"),
-        ("compression.type", "zstd"),
+        ("compression.type", "lz4"),
         ("max.in.flight.requests", "3"),
         ("delivery.timeout.ms", "60000"),
         ("dlq.topic", "my-dlq"),
@@ -111,7 +111,7 @@ fn test_parse_all_optional_fields() {
     assert_eq!(cfg.linger_ms, 10);
     assert_eq!(cfg.batch_size, 32_768);
     assert_eq!(cfg.batch_num_messages, Some(5000));
-    assert_eq!(cfg.compression, CompressionType::Zstd);
+    assert_eq!(cfg.compression, CompressionType::Lz4);
     assert_eq!(cfg.max_in_flight, 3);
     assert_eq!(cfg.delivery_timeout, Duration::from_secs(60));
     assert_eq!(cfg.dlq_topic.as_deref(), Some("my-dlq"));
@@ -271,34 +271,86 @@ fn test_kafka_passthrough_properties() {
 
 #[test]
 fn passthrough_cannot_disable_delivery_deadline() {
-    let mut pairs = required_pairs();
-    pairs.push(("kafka.message.timeout.ms", "0"));
-    pairs.push(("kafka.delivery.timeout.ms", "0"));
-    let config = make_config(&pairs);
-    let cfg = KafkaSinkConfig::from_config(&config).unwrap();
-
-    assert_eq!(
-        cfg.to_rdkafka_config().get("message.timeout.ms"),
-        Some("120000")
-    );
-    assert_eq!(
-        cfg.to_dlq_rdkafka_config().get("message.timeout.ms"),
-        Some("120000")
-    );
+    for key in ["kafka.message.timeout.ms", "kafka.delivery.timeout.ms"] {
+        let mut pairs = required_pairs();
+        pairs.push((key, "0"));
+        let error = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+        assert!(error.to_string().contains(key), "{error}");
+    }
 }
 
 #[test]
 fn passthrough_cannot_override_idempotent_delivery_invariants() {
-    let mut pairs = required_pairs();
-    pairs.push(("kafka.acks", "0"));
-    pairs.push(("kafka.max.in.flight", "99"));
-    pairs.push(("kafka.max.in.flight.requests.per.connection", "99"));
-    let cfg = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap();
-
-    for rdk in [cfg.to_rdkafka_config(), cfg.to_dlq_rdkafka_config()] {
-        assert_eq!(rdk.get("acks"), Some("all"));
-        assert_eq!(rdk.get("max.in.flight.requests.per.connection"), Some("5"));
+    for key in [
+        "kafka.acks",
+        "kafka.request.required.acks",
+        "kafka.max.in.flight",
+        "kafka.max.in.flight.requests.per.connection",
+        "kafka.enable.idempotence",
+        "kafka.transactional.id",
+        "kafka.linger.ms",
+        "kafka.queue.buffering.max.ms",
+        "kafka.compression.codec",
+    ] {
+        let mut pairs = required_pairs();
+        pairs.push((key, "0"));
+        let error = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+        assert!(error.to_string().contains(key), "{error}");
     }
+}
+
+#[test]
+fn upsert_requires_key_affinity_and_a_pinned_partition_count() {
+    let upsert = |extra: &[(&'static str, &'static str)]| {
+        let mut pairs = required_pairs();
+        pairs.extend([("envelope", "upsert"), ("key.column", "id")]);
+        pairs.extend_from_slice(extra);
+        KafkaSinkConfig::from_config(&make_config(&pairs))
+    };
+    let missing_pin = upsert(&[]).unwrap_err();
+    assert!(
+        missing_pin.to_string().contains("partition.count"),
+        "{missing_pin}"
+    );
+    for strategy in ["round-robin", "sticky"] {
+        let error = upsert(&[("partition.count", "6"), ("partitioner", strategy)]).unwrap_err();
+        assert!(
+            error.to_string().contains("key-hash"),
+            "{strategy}: {error}"
+        );
+    }
+    let accepted = upsert(&[("partition.count", "6")]).unwrap();
+    assert_eq!(accepted.partition_count, Some(6));
+    assert!(upsert(&[("partition.count", "0")]).is_err());
+}
+
+#[test]
+fn key_columns_and_format_parse() {
+    let mut pairs = required_pairs();
+    pairs.extend([("key.column", " a , b "), ("key.format", "json")]);
+    let cfg = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap();
+    assert_eq!(cfg.key_columns(), vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(cfg.key_format, KeyFormat::Json);
+    let mut pairs = required_pairs();
+    pairs.push(("key.format", "display"));
+    assert!(KafkaSinkConfig::from_config(&make_config(&pairs)).is_err());
+}
+
+#[test]
+fn sink_latency_profile_supplies_defaults_below_explicit_options() {
+    let mut pairs = required_pairs();
+    pairs.push(("latency.profile", "throughput"));
+    let cfg = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap();
+    assert_eq!(cfg.linger_ms, 50);
+    assert_eq!(cfg.compression, CompressionType::Lz4);
+
+    let mut pairs = required_pairs();
+    pairs.extend([("latency.profile", "low_latency"), ("linger.ms", "2")]);
+    let cfg = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap();
+    assert_eq!(cfg.linger_ms, 2);
+    let rdkafka = cfg.to_rdkafka_config();
+    assert_eq!(rdkafka.get("acks"), Some("all"));
+    assert_eq!(rdkafka.get("enable.idempotence"), Some("true"));
 }
 
 #[test]
@@ -353,4 +405,41 @@ fn test_enum_parse() {
         "zstd".parse::<CompressionType>().unwrap(),
         CompressionType::Zstd
     );
+}
+
+#[test]
+fn exactly_once_requires_a_separate_commit_topic_and_no_dlq() {
+    let exactly_once = |extra: &[(&'static str, &'static str)]| {
+        let mut pairs = required_pairs();
+        pairs.push(("delivery.guarantee", "exactly_once"));
+        pairs.extend_from_slice(extra);
+        KafkaSinkConfig::from_config(&make_config(&pairs))
+    };
+    let missing = exactly_once(&[]).unwrap_err();
+    assert!(missing.to_string().contains("commit.topic"), "{missing}");
+    let topic = required_pairs()
+        .into_iter()
+        .find(|(key, _)| *key == "topic")
+        .unwrap()
+        .1;
+    assert!(exactly_once(&[("commit.topic", topic)]).is_err());
+    let dlq = exactly_once(&[("commit.topic", "commits"), ("dlq.topic", "dead")]).unwrap_err();
+    assert!(dlq.to_string().contains("dlq.topic"), "{dlq}");
+    assert!(exactly_once(&[("commit.topic", "commits"), ("transaction.timeout.ms", "0")]).is_err());
+
+    let cfg = exactly_once(&[("commit.topic", "commits")]).unwrap();
+    assert_eq!(cfg.delivery, DeliveryGuarantee::ExactlyOnce);
+    let producer = cfg.transactional_rdkafka_config("laminardb-ldb-c3-test");
+    assert_eq!(
+        producer.get("transactional.id"),
+        Some("laminardb-ldb-c3-test")
+    );
+    assert_eq!(producer.get("transaction.timeout.ms"), Some("60000"));
+    assert_eq!(producer.get("message.timeout.ms"), Some("60000"));
+    assert_eq!(producer.get("enable.idempotence"), Some("true"));
+
+    let mut pairs = required_pairs();
+    pairs.push(("commit.topic", "commits"));
+    let alo = KafkaSinkConfig::from_config(&make_config(&pairs)).unwrap_err();
+    assert!(alo.to_string().contains("exactly-once"), "{alo}");
 }

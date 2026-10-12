@@ -13,7 +13,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | Replayable ALO; exact-certified input for coordinated EO pipelines | Implemented |
+| Kafka | `kafka` | Replayable ALO with typed record metadata; exact-certified input for coordinated EO pipelines | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
@@ -480,6 +480,175 @@ Latency depends on native fetch/write batching, queue bounds, acknowledgements, 
 frequency and provider calls. Connector I/O runs outside the compute runtime. Delivery
 admission does not establish a latency measurement.
 
+### Kafka
+
+Client: rust-rdkafka 0.39.0 over librdkafka 2.16.0 (a vendored `rdkafka-sys` with regenerated
+bindings, static CMake build; see `vendor/rdkafka-sys/VENDORED.md`). The table records what this
+tree implements; "rejected" means startup fails before connector I/O with the stated reason.
+
+| Capability | Embedded / single-node | Cluster |
+|---|---|---|
+| Source, append event log, at-least-once | Implemented; a compacted topic (`cleanup.policy` includes `compact`) is rejected under a guarantee | Implemented (engine-assigned partitions per vnode) |
+| Source as exactly-once input | Implemented (exact-certified, `read_committed` required) | Implemented with a certified exactly-once sink |
+| Source, Debezium envelope (keyed upsert by `PRIMARY KEY`) | Temporal-join right side, bounded interval join, direct keyed sinks | Rejected outside the admitted join routes |
+| Source, Kafka table (key + value = upsert, key + null = delete) | Not implemented | Not implemented |
+| Source, regex subscription or partition/topic additions under a guarantee | Rejected | Rejected |
+| Sink, append, at-least-once | Implemented | Implemented (independent writers) |
+| Sink, upsert (compacted topic), at-least-once | Implemented (singleton writer) | Rejected: no fencing for a former owner's delayed writes |
+| Sink, exactly-once (append and upsert) | Implemented: checkpoint-staged output published by one fenced transactional committer | Rejected until the cluster kill-9 qualification passes; the protocol already handles multiple participants and leader fencing tokens |
+| Sink, upsert under exactly-once | Implemented (any participant may stage; only the fenced committer writes) | Rejected with cluster exactly-once |
+
+Remaining known gaps, tracked until fixed: OAUTHBEARER has no token provider (rejected); GSSAPI
+works only where librdkafka reports `sasl_gssapi` (the Windows build uses SSPI; Linux builds do
+not include Cyrus SASL); snappy is not built on Windows; zstd requires the `kafka-zstd` feature.
+
+#### Client configuration
+
+Every option the connector sets has a typed option. A `kafka.*` passthrough property that sets one
+of them, or a librdkafka alias of one (`linger.ms`/`queue.buffering.max.ms`,
+`acks`/`request.required.acks`, ...), or a protected property (credentials, TLS, idempotence,
+transactions, `isolation.level`, `group.protocol`, offset storage) fails validation. SASL
+mechanisms, TLS and compression codecs are checked against librdkafka's `builtin.features`
+before a client is created. Sources and sinks log their effective configuration with secrets
+replaced by `***`.
+
+`latency.profile` supplies batching defaults beneath explicit options; it never changes acks,
+idempotence, isolation or the delivery guarantee:
+
+| Profile | Source `max.poll.records` / `fetch.min.bytes` / `fetch.max.wait.ms` | Sink `linger.ms` / `batch.size` / `compression.type` |
+|---|---|---|
+| `low_latency` | 256 / 1 / 10 | 0 / 16384 / none |
+| `balanced` (default) | 1000 / librdkafka default (1) / librdkafka default (500) | 5 / 16384 / none |
+| `throughput` | 8192 / 65536 / 100 | 50 / 1048576 / lz4 |
+
+`group.protocol = consumer` selects KIP-848 and rejects the classic `session.timeout.ms`,
+`heartbeat.interval.ms` and `partition.assignment.strategy`. Guaranteed delivery assigns partitions
+manually, so the group protocol and static membership affect only best-effort subscriptions and
+advisory offset commits; guaranteed delivery rejects `group.instance.id`.
+
+#### Source records
+
+- `metadata.columns` appends typed columns after the value columns, in this order: `_key`
+  (nullable Binary), `_topic`, `_partition`, `_offset`, `_timestamp` (nullable ms timestamp),
+  `_timestamp_type` (`create_time`, `log_append_time`, `not_available`) and `_headers`
+  (`List<Struct<key Utf8, value nullable Binary>>`, in record order with duplicates). A value
+  field with one of those names is rejected. Keys and headers are copied only when selected.
+- A record with a NULL value produces no row in an append or Debezium source (for Debezium it is
+  the tombstone that follows a delete, which the `d` event already applied) and still advances
+  the cursor; a poll of only such records emits a zero-row batch that carries the cursor.
+- A record larger than `record.max.bytes` (key and value; default 16 MiB) or with a non-UTF-8
+  header name cannot become a row. It fails a guaranteed source at that offset and is skipped,
+  with its offset, by a best-effort one, like an undecodable record.
+- Retention: a guaranteed append source checks each subscribed topic's `cleanup.policy` at
+  startup and rejects `compact`, which can delete records inside a checkpoint's replay range
+  (read with DescribeConfigs; when that is denied or unanswered the source starts and logs a
+  warning). A Debezium source reads compacted topics: its keyed state converges on the newest
+  record per key. Records that `retention.ms` or `retention.bytes` remove before a restart cannot
+  be replayed; the source then fails at startup instead of skipping them.
+- Avro writer schemas: with a Schema Registry, at most 64 writer schemas are registered at once;
+  the least recently used one that the current poll does not need is evicted and fetched again
+  when it reappears. A single poll needing more than 64 fails with a `max.poll.records` hint.
+  Registry TLS uses the default trust roots unless `schema.registry.ssl.ca.location` is set, and a
+  client certificate (`schema.registry.ssl.certificate.location` plus `.key.location`) applies in
+  both cases.
+- Memory: the reader queue holds at most `reader.channel.capacity` records and
+  `reader.channel.max.bytes` connector-owned bytes (default 64 MiB); a poll stages at most
+  `max.poll.records` records and `max.poll.bytes` bytes (default 16 MiB, at least one record).
+  librdkafka's own prefetch is bounded per partition by `queued.max.messages.kbytes` (16 MiB),
+  which it may overshoot by one fetch response (`fetch.message.max.bytes`), or by a single larger
+  message up to `receive.message.max.bytes`.
+
+#### Sink keys and partitions
+
+`key.column` names one column, or several with `key.format = 'json'`. `key.format` decides the
+key bytes:
+
+| `key.format` | Key bytes | Column types |
+|---|---|---|
+| `native` (default) | UTF-8 for strings, raw bytes for binary (Java `StringSerializer`/`ByteArraySerializer`) | Utf8, LargeUtf8, Utf8View, Binary, LargeBinary, BinaryView, FixedSizeBinary |
+| `kafka` | `native` plus big-endian `Short`/`Integer`/`Long`/`Float`/`Double` serializer bytes | adds Int16, Int32, Int64, Float32, Float64 |
+| `text` | The SQL text rendering of the value | any single column |
+| `json` | A JSON object of the key columns, NULLs written explicitly | any; never a NULL key |
+
+A SQL NULL key is a record without a key, distinct from an empty key. Keyed records are routed
+with Kafka's Java partitioner, `toPositive(murmur2(key)) % partitions`, checked against Java
+reference vectors; records without a key rotate partitions once per written batch. Every record
+carries an explicit partition, and records within a partition keep their write order; there is no
+order across partitions.
+
+`partition.count` pins the partition count keys are hashed over. Opening fails if the topic has
+fewer partitions; added partitions receive no keyed records, so existing keys keep their
+partition. `envelope = 'upsert'` requires `partition.count` and the `key-hash` partitioner (the
+`round-robin` and `sticky` strategies ignore the key), and rejects NULL merge keys before
+producing a batch. Without a pin, an append sink hashes over the count it observed at open, so
+partitions added before a restart move keys from then on.
+
+#### Exactly-once sink protocol
+
+librdkafka (2.16.0 included) cannot resume another producer's open transaction (no KIP-939), so an epoch's
+output must be recoverable without the process that buffered it. The sink stages it in the
+checkpoint itself and publishes it only after the engine's durable Commit decision:
+
+1. During epoch `N`, `write_batch` serializes and routes each record (explicit partition, key,
+   value, headers) into a bounded in-memory epoch buffer. No broker I/O.
+2. `pre_commit(N)` returns the compressed buffer as the phase-one descriptor. The engine
+   persists it in the checkpoint manifest with source positions and operator state, publishes
+   the committed index and records Commit.
+3. The designated committer (the single process in embedded/single-node mode, the leader in
+   cluster mode, or whichever process recovers) owns one transactional producer whose
+   `transactional.id` is derived from the deployment-scoped commit namespace (pipeline identity,
+   deployment UUID, sink id). Every committer of that sink uses the same id, so
+   `init_transactions` fences the predecessor and resolves its open transaction.
+4. The committer reads the sink's cursor marker from the compacted commit topic under
+   `read_committed`. If it already shows checkpoint `N`, the commit is done. Otherwise one
+   transaction produces every participant's staged records in participant and record order
+   plus the marker `{checkpoint, fencing token, batch fingerprint}`, then commits.
+5. Source acknowledgements and advisory broker offset commits follow the engine's committed
+   checkpoint; they are never recovery authority.
+
+| Failure point | What is durable | Recovery |
+|---|---|---|
+| Before `pre_commit` returns | Nothing for `N` | Restore `N-1`, replay input; nothing external |
+| After `pre_commit`, before Commit | Possibly a manifest, no Commit | Abort `N`, replay; nothing external |
+| After Commit, before publication | Checkpoint `N` with staged output | Fence, cursor shows `N-1`, publish `N` |
+| Mid-transaction (partial produce) | Open transaction | Successor `init_transactions` aborts it; publish `N` |
+| Commit response lost | Unknown | Fence, then the marker decides: visible means done, absent means publish again |
+| After commit, before the engine observes it | Marker `N` | Cursor equals `N`: already committed |
+| Transaction timeout or abortable error | Nothing visible | Abort and publish again from the staged descriptor |
+| Fenced by a successor | Nothing more from this producer can commit | Outcome unknown; the successor's fenced cursor read decides |
+
+Configuration: `delivery = exactly_once` (pipeline-wide) plus `commit.topic`, an existing topic
+with `cleanup.policy=compact` (checked before fencing; one topic may serve several sinks, each
+under its own key). `transaction.timeout.ms` (default 60000, at most 900000) bounds publication;
+the delivery deadline is capped to it. `epoch.max.bytes` (default 64 MiB) bounds one epoch's
+staged key and value bytes: a write past it fails with a sizing error (output bytes per second x
+checkpoint interval), and an epoch whose compressed descriptor exceeds the engine's 16 MiB
+descriptor limit fails its checkpoint. `dlq.topic` is rejected because dead-lettered records
+would escape the transaction. Output becomes visible when its checkpoint commits, so visibility
+latency is about half the checkpoint interval plus checkpoint persistence and one transaction;
+the latency profile tunes the publication batching only. The first transactional use of a fresh
+Apache Kafka cluster creates `__transaction_state`, which can outlast one commit deadline; the
+engine retries the commit.
+
+Fencing: a committer reads the newest marker before `init_transactions` and refuses to fence
+when it carries a newer fencing token, so an obsolete committer cannot abort a successor that has
+already committed. An obsolete committer that fences a successor which has not yet committed can
+only make that successor's in-flight commit fail with an unknown outcome; the successor's retry
+fences back, and the cursor check stops the obsolete committer from publishing. Only the engine's
+leadership lease keeps an obsolete committer from repeating that interruption.
+
+Evidence: `tests/kafka_exactly_once.rs` (real broker) covers invisible staging and an idempotent
+retried commit, a successor publishing a cut its predecessor never published, a successor
+fencing an open predecessor transaction (its records exist but are aborted), a lost commit
+response reconciled by the marker, obsolete-committer fencing and token regression, multiple
+participants with an overlapping recovery batch and empty participants, and upsert tombstones.
+It passes on Redpanda 26.1.13 and Apache Kafka 4.1.1.
+
+Scope: each committed checkpoint's output becomes visible atomically to `read_committed`
+consumers of the output topic, once per logical output record. It does not deduplicate equal
+input records, cover side effects inside UDFs, or make several sinks' commits one atomic
+snapshot.
+
 ### Delta Lake change data feed
 
 The `delta-lake` source reads a Delta table's change data feed (CDF) and snapshots with the Delta
@@ -540,7 +709,7 @@ backpressures rather than dropping rows.
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | Durable broker-acknowledged at-least-once; no transactional commit | Implemented |
+| Kafka | `kafka` | Durable broker-acknowledged at-least-once (append, or upsert from a singleton writer); exactly-once append and upsert in embedded/single-node mode via checkpoint-staged output and one fenced transactional committer | Implemented |
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert, history `cdc_replay`, durable at-least-once | Implemented |

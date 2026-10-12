@@ -71,7 +71,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
         env:
@@ -132,7 +132,7 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
@@ -189,7 +189,7 @@ jobs:
         with:
           key: postgres-cdc-${{ matrix.postgres.version }}
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
       - name: Start PostgreSQL ${{ matrix.postgres.version }}
         run: docker compose -f tests/docker/postgres-cdc-compose.yml up -d --wait postgres-${{ matrix.postgres.version }}
       - name: Connector replication, snapshot, and admission tests
@@ -229,7 +229,7 @@ jobs:
         with:
           key: mongodb-cdc
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
       - name: Start MongoDB, PostgreSQL, and Iceberg fixtures
         run: |
           docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
@@ -279,7 +279,7 @@ jobs:
         with:
           key: release
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
       - name: Build release
         run: cargo build --workspace --release --all-features
         env:
@@ -307,7 +307,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
 
       - name: Check no default features
         run: cargo check --workspace --no-default-features
@@ -391,7 +391,7 @@ jobs:
         with:
           key: iceberg-integration
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
       - name: Start Iceberg REST, MinIO, and Redpanda
         run: |
           docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml up -d --wait
@@ -454,7 +454,7 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev protobuf-compiler
       - run: cargo check --workspace
 
   # ============================================
@@ -479,7 +479,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
       - name: Build docs
         run: cargo +nightly doc --workspace --no-deps --all-features
         env:

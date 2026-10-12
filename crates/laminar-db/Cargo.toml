@@ -26,6 +26,7 @@ default = [
 api = []  # FFI-friendly API module for language bindings
 ffi = ["api", "arrow/ffi"]  # C FFI layer (extern "C" functions, cbindgen headers, Arrow C Data Interface)
 kafka = ["laminar-connectors/kafka", "dep:rdkafka"]
+kafka-zstd = ["kafka", "laminar-connectors/kafka-zstd"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
 delta-lake = ["laminar-connectors/delta-lake"]

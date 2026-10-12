@@ -1,11 +1,11 @@
 //! Partition positions, recovery baselines, and checkpoint capture.
 
 use super::{
-    lock_or_recover, try_capture_at_assignment_fence, Arc, BinaryBuilder, ConnectorError, DataType,
-    Field, KafkaAssignmentPublication, KafkaError, KafkaPartitionBaselines, KafkaPartitionSet,
+    lock_or_recover, try_capture_at_assignment_fence, Arc, BinaryBuilder, ConnectorError,
+    KafkaAssignmentPublication, KafkaError, KafkaPartitionBaselines, KafkaPartitionSet,
     KafkaRotationBaselines, KafkaSource, NonZeroU64, OffsetReset, OffsetTracker, RecordBatch,
-    Schema, SchemaRef, SourceCheckpoint, SourceCheckpointDelta, SourceMutation, SourceRowPositions,
-    StartupMode, TimeUnit, TopicPartitionList, UInt32Array, KAFKA_PARTITION_BASELINE_PREFIX,
+    SourceCheckpoint, SourceCheckpointDelta, SourceMutation, SourceRowPositions, StartupMode,
+    TopicPartitionList, UInt32Array, KAFKA_PARTITION_BASELINE_PREFIX,
 };
 
 impl KafkaSource {
@@ -57,8 +57,12 @@ impl KafkaSource {
                 }
             })?;
         let mut touched = rustc_hash::FxHashMap::<(&str, i32), i64>::default();
-        touched.reserve(self.poll_staged_offsets.len());
-        for (topic, partition, offset) in &self.poll_staged_offsets {
+        touched.reserve(self.poll_staged_offsets.len() + self.poll_progress_offsets.len());
+        for (topic, partition, offset) in self
+            .poll_staged_offsets
+            .iter()
+            .chain(&self.poll_progress_offsets)
+        {
             touched
                 .entry((topic.as_ref(), *partition))
                 .and_modify(|current| *current = (*current).max(*offset))
@@ -717,63 +721,6 @@ pub(super) fn kafka_row_positions(
         order_keys.finish(),
         UInt32Array::from(vec![0; row_count]),
     )
-}
-
-const KAFKA_METADATA_COLUMNS: [&str; 3] = ["_partition", "_offset", "_timestamp"];
-const KAFKA_HEADERS_COLUMN: &str = "_headers";
-
-pub(crate) fn validate_kafka_output_schema(
-    payload_schema: &SchemaRef,
-    include_metadata: bool,
-    include_headers: bool,
-) -> Result<(), ConnectorError> {
-    let collision = payload_schema.fields().iter().find(|field| {
-        (include_metadata
-            && KAFKA_METADATA_COLUMNS
-                .iter()
-                .any(|name| field.name().eq_ignore_ascii_case(name)))
-            || (include_headers && field.name().eq_ignore_ascii_case(KAFKA_HEADERS_COLUMN))
-    });
-    if let Some(field) = collision {
-        return Err(ConnectorError::SchemaMismatch(format!(
-            "Kafka payload schema contains configured connector metadata column '{}'",
-            field.name()
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn kafka_output_schema(
-    payload_schema: &SchemaRef,
-    include_metadata: bool,
-    include_headers: bool,
-) -> SchemaRef {
-    if !include_metadata && !include_headers {
-        return Arc::clone(payload_schema);
-    }
-    let mut fields = payload_schema.fields().to_vec();
-    if include_metadata {
-        fields.extend([
-            Arc::new(Field::new("_partition", DataType::Int32, false)),
-            Arc::new(Field::new("_offset", DataType::Int64, false)),
-            Arc::new(Field::new(
-                "_timestamp",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                true,
-            )),
-        ]);
-    }
-    if include_headers {
-        fields.push(Arc::new(Field::new(
-            KAFKA_HEADERS_COLUMN,
-            DataType::Utf8,
-            true,
-        )));
-    }
-    Arc::new(Schema::new_with_metadata(
-        fields,
-        payload_schema.metadata().clone(),
-    ))
 }
 
 pub(super) type NormalizedDebeziumBatch = (RecordBatch, Option<Box<[SourceMutation]>>);

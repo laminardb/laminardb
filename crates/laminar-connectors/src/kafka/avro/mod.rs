@@ -5,7 +5,7 @@
 //! natively supports the Confluent wire format (`0x00` + 4-byte BE schema ID
 //! + Avro payload).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -19,6 +19,10 @@ use crate::kafka::schema_registry::SchemaRegistryClient;
 use crate::serde::{Format, RecordDeserializer};
 
 const DECODER_BATCH_CAPACITY: usize = 8192;
+
+/// Writer schemas kept registered at once. With a Schema Registry, the least recently used schema
+/// that the batch being decoded does not use is evicted and fetched again when it reappears.
+const WRITER_SCHEMA_CAPACITY: usize = 64;
 
 /// Confluent wire format magic byte.
 const CONFLUENT_MAGIC: u8 = 0x00;
@@ -36,8 +40,10 @@ pub struct AvroDeserializer {
     schema_store: SchemaStore,
     /// Optional Schema Registry client for resolving unknown IDs.
     schema_registry: Option<Arc<SchemaRegistryClient>>,
-    /// Set of schema IDs already registered in the store.
-    known_ids: HashSet<i32>,
+    /// Registered writer schemas, least recently used first.
+    writers: VecDeque<(i32, AvroSchema)>,
+    /// Writer schemas the batch being decoded uses; never evicted before it decodes.
+    batch_ids: HashSet<i32>,
     /// Reused across batches; rebuilt when `register_schema` runs.
     decoder: Mutex<Option<Decoder>>,
     reader_schema: Option<AvroSchema>,
@@ -54,7 +60,8 @@ impl AvroDeserializer {
         Self {
             schema_store: SchemaStore::new_with_type(FingerprintAlgorithm::Id),
             schema_registry: None,
-            known_ids: HashSet::new(),
+            writers: VecDeque::new(),
+            batch_ids: HashSet::new(),
             decoder: Mutex::new(None),
             reader_schema: None,
             projection: None,
@@ -71,7 +78,8 @@ impl AvroDeserializer {
         Self {
             schema_store: SchemaStore::new_with_type(FingerprintAlgorithm::Id),
             schema_registry: Some(registry),
-            known_ids: HashSet::new(),
+            writers: VecDeque::new(),
+            batch_ids: HashSet::new(),
             decoder: Mutex::new(None),
             reader_schema: None,
             projection: None,
@@ -142,23 +150,77 @@ impl AvroDeserializer {
                 "invalid schema ID or schema exceeds 1 MiB".into(),
             ));
         }
-        if !self.known_ids.contains(&schema_id) && self.known_ids.len() >= 64 {
-            return Err(SerdeError::MalformedInput(
-                "writer schema cache limit (64) reached; controlled restart is required".into(),
-            ));
+        if self.touch(schema_id) {
+            return Ok(());
+        }
+        if self.writers.len() >= WRITER_SCHEMA_CAPACITY {
+            self.evict_one()?;
         }
         let avro_schema = AvroSchema::new(avro_schema_json.to_string());
         // Use Fingerprint::Id directly — NOT load_fingerprint_id which
         // applies from_be byte-swap meant for raw wire bytes.
         let fp = Fingerprint::Id(schema_id as u32);
         self.schema_store
-            .set(fp, avro_schema)
+            .set(fp, avro_schema.clone())
             .map_err(|e| SerdeError::MalformedInput(format!("failed to register schema: {e}")))?;
-        self.known_ids.insert(schema_id);
+        self.writers.push_back((schema_id, avro_schema));
         // Schema store changed — drop the cached decoder so it rebuilds
         // against the new store on the next deserialize_batch call.
         *self.decoder.lock() = None;
         Ok(())
+    }
+
+    /// Drop the least recently used writer schema the current batch does not use, rebuilding the
+    /// schema store without it. Only a registry-backed deserializer can fetch it again.
+    #[allow(clippy::cast_sign_loss)]
+    fn evict_one(&mut self) -> Result<(), SerdeError> {
+        if self.schema_registry.is_none() {
+            return Err(SerdeError::MalformedInput(format!(
+                "at most {WRITER_SCHEMA_CAPACITY} writer schemas can be registered without a \
+                 Schema Registry to fetch evicted ones"
+            )));
+        }
+        let position = self
+            .writers
+            .iter()
+            .position(|(id, _)| !self.batch_ids.contains(id))
+            .ok_or_else(|| {
+                SerdeError::MalformedInput(format!(
+                    "one poll references more than {WRITER_SCHEMA_CAPACITY} Avro writer \
+                     schemas; lower max.poll.records"
+                ))
+            })?;
+        self.writers.remove(position);
+        let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
+        for (id, schema) in &self.writers {
+            store
+                .set(Fingerprint::Id(*id as u32), schema.clone())
+                .map_err(|e| SerdeError::MalformedInput(format!("rebuild schema store: {e}")))?;
+        }
+        self.schema_store = store;
+        Ok(())
+    }
+
+    /// Mark `schema_id` most recently used; `false` when it is not registered.
+    fn touch(&mut self, schema_id: i32) -> bool {
+        let Some(position) = self.writers.iter().position(|(id, _)| *id == schema_id) else {
+            return false;
+        };
+        if let Some(entry) = self.writers.remove(position) {
+            self.writers.push_back(entry);
+        }
+        true
+    }
+
+    /// Start resolving a new poll's writer schemas; earlier batches no longer pin any.
+    pub(crate) fn begin_batch(&mut self) {
+        self.batch_ids.clear();
+    }
+
+    /// Whether `schema_id` is currently registered.
+    #[must_use]
+    pub fn is_registered(&self, schema_id: i32) -> bool {
+        self.writers.iter().any(|(id, _)| *id == schema_id)
     }
 
     /// Ensures a schema ID is registered, fetching from SR if needed.
@@ -177,7 +239,8 @@ impl AvroDeserializer {
         &mut self,
         schema_id: i32,
     ) -> Result<bool, ConnectorError> {
-        if self.known_ids.contains(&schema_id) {
+        self.batch_ids.insert(schema_id);
+        if self.touch(schema_id) {
             return Ok(false);
         }
 
@@ -304,7 +367,10 @@ impl RecordDeserializer for AvroDeserializer {
 impl std::fmt::Debug for AvroDeserializer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AvroDeserializer")
-            .field("known_ids", &self.known_ids)
+            .field(
+                "writer_ids",
+                &self.writers.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            )
             .field("has_registry", &self.schema_registry.is_some())
             .finish_non_exhaustive()
     }

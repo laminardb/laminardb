@@ -85,7 +85,7 @@ jobs:
       # toolchain are what let the extractor resolve generated/native call
       # targets and clear the analysis-quality threshold.
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3

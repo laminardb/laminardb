@@ -44,8 +44,9 @@ pub(super) fn source(config: &ConnectorConfig, typed: &KafkaSourceConfig) -> Con
         "schema.registry.subject.name.strategy",
         typed.schema_registry_subject_strategy.to_string(),
     );
-    effective.set("include.metadata", typed.include_metadata.to_string());
-    effective.set("include.headers", typed.include_headers.to_string());
+    if !typed.metadata.is_empty() {
+        effective.set("metadata.columns", typed.metadata.option_value());
+    }
     effective
 }
 

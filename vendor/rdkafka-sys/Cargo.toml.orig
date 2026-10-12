@@ -1,0 +1,102 @@
+[package]
+name = "rdkafka-sys"
+version = "4.10.0+2.16.0"
+authors = ["Federico Giraud <giraud.federico@gmail.com>"]
+build = "build.rs"
+links = "rdkafka"
+repository = "https://github.com/fede1024/rust-rdkafka"
+license = "MIT"
+description = "Native bindings to the librdkafka library"
+keywords = ["kafka", "rdkafka"]
+categories = ["external-ffi-bindings"]
+edition = "2021"
+rust-version = "1.74"
+
+[dependencies]
+num_enum = "0.7.3"
+libc = "0.2.172"
+openssl-sys = { version = "0.9.108", optional = true }
+libz-sys = { version = "1.1.22", optional = true }
+curl-sys = { version = "0.4.80", optional = true }
+zstd-sys = { version = "2.0.15", optional = true }
+lz4-sys = { version = "1.11.1", optional = true }
+sasl2-sys = { version = "0.1.22", optional = true }
+
+[build-dependencies]
+pkg-config = "0.3.32"
+cmake = { version = "0.1.54", optional = true }
+
+[lib]
+name = "rdkafka_sys"
+path = "src/lib.rs"
+
+[features]
+default = ["libz"]
+
+# Build librdkafka with its CMake build system, rather than its default "mklove"
+# build system. This feature requires that the system has CMake installed.
+cmake-build = ["cmake"]
+
+# Deprecated alias for the `cmake-build` feature.
+cmake_build = ["cmake-build"]
+
+# Dynamically link the system's librdkafka, rather than building and linking the
+# bundled version statically. This feature requires that the system has
+# librdkafka installed somewhere where pkg-config can find it.
+dynamic-linking = []
+
+# Deprecated alias for the `dynamic-linking` feature.
+dynamic_linking = ["dynamic-linking"]
+
+# Enable SSL support.
+ssl = ["openssl-sys"]
+
+# Build and link against the version of OpenSSL bundled with the openssl-sys
+# crate.
+ssl-vendored = ["ssl", "openssl-sys/vendored"]
+
+# Enable SASL GSSAPI support with Cyrus libsasl2.
+gssapi = ["ssl", "sasl2-sys"]
+
+# Build and link against the libsasl2 bundled with the sasl2-sys crate.
+gssapi-vendored = ["gssapi", "sasl2-sys/gssapi-vendored"]
+
+# Deprecated alias for the `gssapi` feature.
+sasl = ["gssapi"]
+
+# Enable support for libz compression.
+libz = ["libz-sys"]
+
+# Link against the version of libz bundled with the libz-sys crate, rather than
+# the system's version.
+libz-static = ["libz", "libz-sys/static"]
+
+# Enable support for HTTP client via curl.
+curl = ["curl-sys"]
+
+# Link against the version of curl bundled with the curl-sys crate, rather than
+# the system's version.
+curl-static = ["curl-sys/static-curl"]
+
+# Enable support for zstd compression.
+zstd = ["zstd-sys"]
+
+# Link against the system's version of libzstd, rather than the version bundled
+# with the zstd-sys crate.
+zstd-pkg-config = ["zstd", "zstd-sys/pkg-config"]
+
+# Link against the lz4 compression library that is bundled with the lz4-sys
+# crate. By default, librdkafka builds and statically links against its own
+# bundled copy of lz4.
+external-lz4 = ["lz4-sys"]
+
+# Deprecated alias for the `external-lz4` feature.
+external_lz4 = ["external-lz4"]
+
+# Link against precompiled static build of librdkafka
+static-linking = []
+
+[package.metadata.docs.rs]
+# docs.rs doesn't allow writing to ~/.cargo/registry (reasonably), so we have to
+# use the CMake build for a proper out-of-tree build.
+features = ["cmake_build"]

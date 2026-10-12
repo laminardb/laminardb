@@ -363,6 +363,41 @@ while let Some(rows) = sub.poll() {
 
 **Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter, only position does.
 
+### Kafka
+
+Kafka partitions do not decide aggregation groups. Every row is routed by its `GROUP BY` key, so
+rows with the same key aggregate into one group even when they arrive on different partitions:
+
+```sql
+CREATE SOURCE orders (id BIGINT NOT NULL, customer BIGINT NOT NULL, amount BIGINT NOT NULL)
+FROM KAFKA ('bootstrap.servers' = 'broker:9092', 'topic' = 'orders',
+            'group.id' = 'orders-app', 'startup.mode' = 'earliest',
+            'latency.profile' = 'low_latency') FORMAT JSON;
+
+CREATE MATERIALIZED VIEW customer_totals AS
+SELECT customer, SUM(amount) AS total, COUNT(*) AS orders FROM orders GROUP BY customer;
+
+-- One record per change; the newest record per customer is the current total.
+CREATE SINK customer_totals_out FROM customer_totals INTO KAFKA (
+    'bootstrap.servers' = 'broker:9092', 'topic' = 'customer-totals',
+    'key.column' = 'customer', 'key.format' = 'text',
+    'envelope' = 'upsert', 'partition.count' = '6') FORMAT JSON;
+```
+
+`envelope = 'upsert'` writes each key to `murmur2(key) % partition.count` and a NULL value when a
+key is deleted; it rejects a topic whose partition count differs, because a changed count would
+split one key's history across partitions. Append sinks route keyed records the same way and
+spread unkeyed batches across partitions. `latency.profile` (`low_latency`, `balanced`,
+`throughput`) supplies batching defaults; explicit options still win.
+
+With exactly-once delivery (`delivery_guarantee: ExactlyOnce` embedded, `delivery =
+"exactly_once"` in the server) each Kafka sink also needs `'commit.topic'`, a topic with
+`cleanup.policy=compact`. Output then becomes visible to `isolation.level=read_committed` readers
+once per committed checkpoint, after a crash at any point included; `read_uncommitted` readers can
+also see aborted attempts. Cluster deployments keep Kafka output at-least-once. A Kafka source
+keyed by message key (key + value = upsert, key + NULL = delete) is not available; use the
+Debezium envelope for keyed changes.
+
 ### Cluster SQL boundary
 
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,

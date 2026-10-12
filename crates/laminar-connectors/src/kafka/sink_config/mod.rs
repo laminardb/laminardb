@@ -6,14 +6,22 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arrow_schema::DataType;
 use rdkafka::ClientConfig;
 
 use crate::config::ConnectorConfig;
+use crate::connector::DeliveryGuarantee;
 use crate::error::ConnectorError;
 use crate::kafka::config::{CompatibilityLevel, SaslMechanism, SecurityProtocol, SrAuth};
+use crate::kafka::latency_profile::LatencyProfile;
 use crate::serde::Format;
 
 const MAX_DELIVERY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Kafka's default broker `transaction.max.timeout.ms`.
+const MAX_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(900);
+const DEFAULT_EPOCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Largest `epoch.max.bytes`; also the protocol bound on any staged descriptor's body.
+pub(crate) const MAX_EPOCH_BYTES: usize = 256 * 1024 * 1024;
 
 /// Configuration for the Kafka Sink Connector.
 ///
@@ -57,9 +65,15 @@ pub struct KafkaSinkConfig {
     pub max_in_flight: usize,
     /// Maximum time to wait for delivery confirmation.
     pub delivery_timeout: Duration,
-    /// Key column name for partitioning. In `envelope = upsert` mode this is the merge key
-    /// (the group identity), and is required.
+    /// Comma-separated key column names. In `envelope = upsert` mode they are the merge key (the
+    /// group identity) and are required.
     pub key_column: Option<String>,
+    /// How key column values become Kafka record-key bytes.
+    pub key_format: KeyFormat,
+    /// Partition count keyed records are hashed over. When set, the topic must have at least this
+    /// many partitions, and later partition additions do not move existing keys. Required for
+    /// `envelope = upsert`.
+    pub partition_count: Option<i32>,
     /// How an updating (changelog) input is encoded to the topic (`append` vs `upsert`).
     pub envelope: SinkEnvelope,
     /// Partitioning strategy.
@@ -74,6 +88,16 @@ pub struct KafkaSinkConfig {
     pub compression: CompressionType,
     /// Dead letter queue topic for failed records.
     pub dlq_topic: Option<String>,
+    /// Latency preset that supplied the batching defaults.
+    pub latency_profile: LatencyProfile,
+    /// Pipeline delivery guarantee, injected by the runtime.
+    pub delivery: DeliveryGuarantee,
+    /// Compacted topic holding one commit marker per exactly-once checkpoint (exactly-once only).
+    pub commit_topic: Option<String>,
+    /// Broker transaction timeout for exactly-once publication.
+    pub transaction_timeout: Duration,
+    /// Bound on one exactly-once epoch's staged key and value bytes.
+    pub epoch_max_bytes: usize,
     /// Additional rdkafka client properties (pass-through).
     pub kafka_properties: HashMap<String, String>,
 }
@@ -129,6 +153,8 @@ impl Default for KafkaSinkConfig {
             max_in_flight: 5,
             delivery_timeout: Duration::from_secs(120),
             key_column: None,
+            key_format: KeyFormat::default(),
+            partition_count: None,
             envelope: SinkEnvelope::default(),
             partitioner: PartitionStrategy::KeyHash,
             linger_ms: 5,
@@ -136,6 +162,11 @@ impl Default for KafkaSinkConfig {
             batch_num_messages: None,
             compression: CompressionType::None,
             dlq_topic: None,
+            latency_profile: LatencyProfile::Balanced,
+            delivery: DeliveryGuarantee::AtLeastOnce,
+            commit_topic: None,
+            transaction_timeout: Duration::from_secs(60),
+            epoch_max_bytes: DEFAULT_EPOCH_MAX_BYTES,
             kafka_properties: HashMap::new(),
         }
     }
@@ -223,6 +254,10 @@ impl KafkaSinkConfig {
         }
 
         cfg.key_column = config.get("key.column").map(String::from);
+        cfg.key_format = config
+            .get("key.format")
+            .map_or(Ok(KeyFormat::default()), str::parse)?;
+        cfg.partition_count = config.get_parsed::<i32>("partition.count")?;
 
         cfg.envelope = match config
             .get("envelope")
@@ -248,37 +283,8 @@ impl KafkaSinkConfig {
             ));
         }
 
-        if let Some(p) = config.get("partitioner") {
-            cfg.partitioner = p.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid partitioner: '{p}' (expected 'key-hash', 'round-robin', or 'sticky')"
-                ))
-            })?;
-        }
-
-        if let Some(v) = config.get("linger.ms") {
-            cfg.linger_ms = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid linger.ms: '{v}'"))
-            })?;
-        }
-
-        if let Some(v) = config.get("batch.size") {
-            cfg.batch_size = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid batch.size: '{v}'"))
-            })?;
-        }
-
-        if let Some(v) = config.get("batch.num.messages") {
-            cfg.batch_num_messages = Some(v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid batch.num.messages: '{v}'"))
-            })?);
-        }
-
-        if let Some(c) = config.get("compression.type") {
-            cfg.compression = c.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid compression.type: '{c}'"))
-            })?;
-        }
+        cfg.parse_batching(config)?;
+        cfg.parse_delivery(config)?;
 
         cfg.dlq_topic = config.get("dlq.topic").map(String::from);
         if cfg.dlq_topic.is_some() && cfg.envelope == SinkEnvelope::Upsert {
@@ -297,6 +303,67 @@ impl KafkaSinkConfig {
 
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Producer batching: `latency.profile` defaults first, then explicit options override them.
+    fn parse_batching(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        self.latency_profile = config
+            .get("latency.profile")
+            .map_or(Ok(LatencyProfile::default()), str::parse)?;
+        let profile = self.latency_profile.sink_defaults();
+        self.linger_ms = profile.linger_ms;
+        self.batch_size = profile.batch_size;
+        self.compression = profile.compression;
+
+        if let Some(p) = config.get("partitioner") {
+            self.partitioner = p.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid partitioner: '{p}' (expected 'key-hash', 'round-robin', or 'sticky')"
+                ))
+            })?;
+        }
+
+        if let Some(v) = config.get("linger.ms") {
+            self.linger_ms = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid linger.ms: '{v}'"))
+            })?;
+        }
+
+        if let Some(v) = config.get("batch.size") {
+            self.batch_size = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid batch.size: '{v}'"))
+            })?;
+        }
+
+        if let Some(v) = config.get("batch.num.messages") {
+            self.batch_num_messages = Some(v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid batch.num.messages: '{v}'"))
+            })?);
+        }
+
+        if let Some(c) = config.get("compression.type") {
+            self.compression = c.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid compression.type: '{c}'"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The injected delivery guarantee and the exactly-once publication options.
+    fn parse_delivery(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if let Some(delivery) = config.get("delivery.guarantee") {
+            self.delivery = delivery.parse().map_err(|error| {
+                ConnectorError::ConfigurationError(format!("invalid delivery.guarantee: {error}"))
+            })?;
+        }
+        self.commit_topic = config.get("commit.topic").map(String::from);
+        if let Some(ms) = config.get_parsed::<u64>("transaction.timeout.ms")? {
+            self.transaction_timeout = Duration::from_millis(ms);
+        }
+        if let Some(bytes) = config.get_parsed::<usize>("epoch.max.bytes")? {
+            self.epoch_max_bytes = bytes;
+        }
+        Ok(())
     }
 
     /// Validates the configuration.
@@ -345,6 +412,26 @@ impl KafkaSinkConfig {
             ));
         }
 
+        if self.partition_count.is_some_and(|count| count <= 0) {
+            return Err(ConnectorError::ConfigurationError(
+                "partition.count must be positive".into(),
+            ));
+        }
+        if self.envelope == SinkEnvelope::Upsert && self.partition_count.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "envelope = 'upsert' requires partition.count: a compacted topic's keys must keep \
+                 their partition when partitions are added"
+                    .into(),
+            ));
+        }
+        if self.envelope == SinkEnvelope::Upsert && self.partitioner != PartitionStrategy::KeyHash {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "envelope = 'upsert' requires partitioner = 'key-hash': '{}' ignores the key, so \
+                 a key's updates and tombstone could land in different partitions",
+                self.partitioner
+            )));
+        }
+
         if self.format == Format::Avro && self.schema_registry_url.is_none() {
             return Err(ConnectorError::ConfigurationError(
                 "Avro format requires 'schema.registry.url'".into(),
@@ -370,47 +457,162 @@ impl KafkaSinkConfig {
             )));
         }
 
+        self.validate_exactly_once()?;
+        super::librdkafka::require_supported_client(
+            self.security_protocol,
+            self.sasl_mechanism,
+            Some(self.compression.as_rdkafka_str()),
+        )?;
+        super::librdkafka::validate_passthrough(
+            &self.owned_rdkafka_config(),
+            &self.kafka_properties,
+        )
+    }
+
+    fn validate_exactly_once(&self) -> Result<(), ConnectorError> {
+        if self.delivery != DeliveryGuarantee::ExactlyOnce {
+            if self.commit_topic.is_some() {
+                return Err(ConnectorError::ConfigurationError(
+                    "commit.topic is used only with exactly-once delivery".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let commit_topic = self.commit_topic.as_deref().unwrap_or_default();
+        if commit_topic.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "exactly-once Kafka output requires 'commit.topic', a compacted topic that \
+                 records each committed checkpoint"
+                    .into(),
+            ));
+        }
+        if commit_topic == self.topic {
+            return Err(ConnectorError::ConfigurationError(
+                "commit.topic must differ from the output topic".into(),
+            ));
+        }
+        if self.dlq_topic.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "'dlq.topic' is not supported with exactly-once delivery: dead-lettered records \
+                 would be visible outside the checkpoint transaction"
+                    .into(),
+            ));
+        }
+        if self.transaction_timeout.is_zero() || self.transaction_timeout > MAX_TRANSACTION_TIMEOUT
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "transaction.timeout.ms must be in 1..={}",
+                MAX_TRANSACTION_TIMEOUT.as_millis()
+            )));
+        }
+        if self.epoch_max_bytes == 0 || self.epoch_max_bytes > MAX_EPOCH_BYTES {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "epoch.max.bytes must be in 1..={MAX_EPOCH_BYTES}"
+            )));
+        }
+        self.message_max_bytes()?;
         Ok(())
     }
 
-    /// Builds an rdkafka [`ClientConfig`] from this configuration.
+    /// The producer's largest record, from `kafka.message.max.bytes` or librdkafka's default.
+    ///
+    /// # Errors
+    /// Returns a configuration error when the passthrough value is not a positive integer.
+    pub fn message_max_bytes(&self) -> Result<usize, ConnectorError> {
+        const LIBRDKAFKA_DEFAULT: usize = 1_000_000;
+        self.kafka_properties
+            .get("message.max.bytes")
+            .map_or(Ok(LIBRDKAFKA_DEFAULT), |value| {
+                value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| {
+                        ConnectorError::ConfigurationError(format!(
+                            "invalid kafka.message.max.bytes: '{value}'"
+                        ))
+                    })
+            })
+    }
+
+    /// Broker address and transport security, shared by every client the sink creates.
+    #[must_use]
+    pub fn connection_rdkafka_config(&self) -> ClientConfig {
+        let mut config = ClientConfig::new();
+        config.set("bootstrap.servers", &self.bootstrap_servers);
+        config.set("security.protocol", self.security_protocol.as_rdkafka_str());
+        for (key, value) in [
+            (
+                "sasl.mechanism",
+                self.sasl_mechanism
+                    .map(|mechanism| mechanism.as_rdkafka_str()),
+            ),
+            ("sasl.username", self.sasl_username.as_deref()),
+            ("sasl.password", self.sasl_password.as_deref()),
+            ("ssl.ca.location", self.ssl_ca_location.as_deref()),
+            (
+                "ssl.certificate.location",
+                self.ssl_certificate_location.as_deref(),
+            ),
+            ("ssl.key.location", self.ssl_key_location.as_deref()),
+            ("ssl.key.password", self.ssl_key_password.as_deref()),
+        ] {
+            if let Some(value) = value {
+                config.set(key, value);
+            }
+        }
+        config
+    }
+
+    /// The exactly-once committer's producer: the configured producer settings plus a stable
+    /// `transactional.id`, with the delivery deadline capped by the transaction timeout as
+    /// librdkafka requires.
+    #[must_use]
+    pub fn transactional_rdkafka_config(&self, transactional_id: &str) -> ClientConfig {
+        let mut config = self.to_rdkafka_config();
+        let message_timeout = self.delivery_timeout.min(self.transaction_timeout);
+        config
+            .set("transactional.id", transactional_id)
+            .set(
+                "transaction.timeout.ms",
+                self.transaction_timeout.as_millis().to_string(),
+            )
+            .set(
+                "message.timeout.ms",
+                message_timeout.as_millis().to_string(),
+            );
+        config
+    }
+
+    /// Configured key column names, in key order.
+    #[must_use]
+    pub fn key_columns(&self) -> Vec<String> {
+        self.key_column
+            .as_deref()
+            .map(|columns| {
+                columns
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|column| !column.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Builds the rdkafka [`ClientConfig`]: connector-owned settings, then the validated
+    /// `kafka.*` passthrough properties.
     ///
     /// Always sets `enable.idempotence=true` for durable at-least-once writes.
     #[must_use]
     pub fn to_rdkafka_config(&self) -> ClientConfig {
-        let mut config = ClientConfig::new();
+        let mut config = self.owned_rdkafka_config();
+        super::librdkafka::apply_passthrough(&mut config, &self.kafka_properties);
+        config
+    }
 
-        config.set("bootstrap.servers", &self.bootstrap_servers);
-        config.set("security.protocol", self.security_protocol.as_rdkafka_str());
-
-        if let Some(ref mechanism) = self.sasl_mechanism {
-            config.set("sasl.mechanism", mechanism.as_rdkafka_str());
-        }
-
-        if let Some(ref username) = self.sasl_username {
-            config.set("sasl.username", username);
-        }
-
-        if let Some(ref password) = self.sasl_password {
-            config.set("sasl.password", password);
-        }
-
-        if let Some(ref ca) = self.ssl_ca_location {
-            config.set("ssl.ca.location", ca);
-        }
-
-        if let Some(ref cert) = self.ssl_certificate_location {
-            config.set("ssl.certificate.location", cert);
-        }
-
-        if let Some(ref key) = self.ssl_key_location {
-            config.set("ssl.key.location", key);
-        }
-
-        if let Some(ref key_pass) = self.ssl_key_password {
-            config.set("ssl.key.password", key_pass);
-        }
-
+    fn owned_rdkafka_config(&self) -> ClientConfig {
+        let mut config = self.connection_rdkafka_config();
         config
             .set("enable.idempotence", "true")
             .set("acks", "all")
@@ -430,19 +632,6 @@ impl KafkaSinkConfig {
             config.set("batch.num.messages", num_msgs.to_string());
         }
 
-        // Apply pass-through properties, blocking security-critical keys
-        // that could silently downgrade authentication or break semantics.
-        for (key, value) in &self.kafka_properties {
-            if is_blocked_passthrough_key(key) {
-                tracing::warn!(
-                    key,
-                    "ignoring kafka.* pass-through property that overrides a protected connector setting"
-                );
-                continue;
-            }
-            config.set(key, value);
-        }
-
         config
     }
 
@@ -452,33 +641,7 @@ impl KafkaSinkConfig {
     /// non-transactional. Does not set `transactional.id`.
     #[must_use]
     pub fn to_dlq_rdkafka_config(&self) -> ClientConfig {
-        let mut config = ClientConfig::new();
-
-        config.set("bootstrap.servers", &self.bootstrap_servers);
-        config.set("security.protocol", self.security_protocol.as_rdkafka_str());
-
-        if let Some(ref mechanism) = self.sasl_mechanism {
-            config.set("sasl.mechanism", mechanism.as_rdkafka_str());
-        }
-        if let Some(ref username) = self.sasl_username {
-            config.set("sasl.username", username);
-        }
-        if let Some(ref password) = self.sasl_password {
-            config.set("sasl.password", password);
-        }
-        if let Some(ref ca) = self.ssl_ca_location {
-            config.set("ssl.ca.location", ca);
-        }
-        if let Some(ref cert) = self.ssl_certificate_location {
-            config.set("ssl.certificate.location", cert);
-        }
-        if let Some(ref key) = self.ssl_key_location {
-            config.set("ssl.key.location", key);
-        }
-        if let Some(ref key_pass) = self.ssl_key_password {
-            config.set("ssl.key.password", key_pass);
-        }
-
+        let mut config = self.connection_rdkafka_config();
         config
             .set("enable.idempotence", "true")
             .set("acks", "all")
@@ -495,30 +658,69 @@ impl KafkaSinkConfig {
     }
 }
 
-/// Returns `true` if a pass-through kafka.* key must not override explicit settings.
-fn is_blocked_passthrough_key(key: &str) -> bool {
-    key.starts_with("sasl.kerberos.")
-        || matches!(
-            key,
-            "security.protocol"
-                | "sasl.mechanism"
-                | "sasl.username"
-                | "sasl.password"
-                | "sasl.oauthbearer.config"
-                | "ssl.ca.location"
-                | "ssl.certificate.location"
-                | "ssl.key.location"
-                | "ssl.key.password"
-                | "ssl.endpoint.identification.algorithm"
-                | "enable.auto.commit"
-                | "enable.idempotence"
-                | "acks"
-                | "max.in.flight"
-                | "max.in.flight.requests.per.connection"
-                | "message.timeout.ms"
-                | "delivery.timeout.ms"
-                | "transactional.id"
-        )
+/// How `key.column` values become Kafka record-key bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyFormat {
+    /// UTF-8 for string columns and raw bytes for binary columns, as Kafka's Java
+    /// `StringSerializer` and `ByteArraySerializer` write them. Other types need an explicit format.
+    #[default]
+    Native,
+    /// The SQL text rendering of one column of any type.
+    Text,
+    /// Kafka's Java serializer bytes: `Native` plus big-endian `Short`, `Integer`, `Long`, `Float`
+    /// and `Double`.
+    Kafka,
+    /// A JSON object of one or more key columns with NULLs written explicitly; never a NULL key.
+    Json,
+}
+
+str_enum!(KeyFormat, lowercase, ConnectorError, "invalid key.format",
+    Native => "native";
+    Text => "text";
+    Kafka => "kafka";
+    Json => "json"
+);
+
+impl KeyFormat {
+    /// Whether this format can encode a key column of `data_type`.
+    #[must_use]
+    pub fn encodes(self, data_type: &DataType) -> bool {
+        let native = matches!(
+            data_type,
+            DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+        );
+        match self {
+            Self::Native => native,
+            Self::Kafka => {
+                native
+                    || matches!(
+                        data_type,
+                        DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Float32
+                            | DataType::Float64
+                    )
+            }
+            Self::Text | Self::Json => true,
+        }
+    }
+
+    pub(crate) const fn remedy(self) -> &'static str {
+        match self {
+            Self::Native => {
+                "set key.format to 'kafka' (Java serializer bytes), 'text' (SQL text) or 'json'"
+            }
+            Self::Kafka => "use key.format = 'text' or 'json' for this type",
+            Self::Text | Self::Json => "choose a supported key column type",
+        }
+    }
 }
 
 /// Partitioning strategy for distributing records across Kafka partitions.
