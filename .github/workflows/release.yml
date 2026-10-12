@@ -134,7 +134,7 @@ jobs:
 
       - name: Install system dependencies (Linux native)
         if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev protobuf-compiler
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'

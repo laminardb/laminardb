@@ -12,12 +12,15 @@ exclude = [
     "vendor/pgwire",
     "vendor/pgwire-replication",
     "vendor/quick-xml",
+    "vendor/rdkafka-sys",
 ]
 resolver = "2"
 
 [patch.crates-io]
 # Compatible security backport; provenance and review deadline live in security/.
 quick-xml = { path = "vendor/quick-xml" }
+# librdkafka 2.16.0 with regenerated bindings; provenance in vendor/rdkafka-sys/VENDORED.md.
+rdkafka-sys = { path = "vendor/rdkafka-sys" }
 
 [workspace.package]
 version = "0.32.0"
