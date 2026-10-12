@@ -749,6 +749,52 @@ impl KafkaSourceConfig {
             _ => {}
         }
 
+        self.validate_memory_bounds()?;
+        self.validate_security()?;
+        if self.max_poll_interval.as_secs() < 60 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "max.poll.interval.ms ({}) must be >= 60000 (60s)",
+                self.max_poll_interval.as_millis()
+            )));
+        }
+
+        // Kafka broker requires heartbeat_interval * 3 < session_timeout.
+        if self.group_protocol == GroupProtocol::Classic
+            && self.heartbeat_interval.as_millis() * 3 >= self.session_timeout.as_millis()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "heartbeat.interval.ms ({}) * 3 must be < session.timeout.ms ({})",
+                self.heartbeat_interval.as_millis(),
+                self.session_timeout.as_millis()
+            )));
+        }
+
+        self.validate_backpressure()?;
+        if !(0.0..=1.0).contains(&self.max_deser_error_rate) {
+            return Err(ConnectorError::ConfigurationError(
+                "max.deser.error.rate must be between 0.0 and 1.0".into(),
+            ));
+        }
+
+        if self.format == Format::Avro && self.schema_registry_url.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "schema.registry.url is required when format is 'avro'".into(),
+            ));
+        }
+
+        super::librdkafka::require_supported_client(
+            self.security_protocol,
+            self.sasl_mechanism,
+            None,
+        )?;
+        super::librdkafka::validate_passthrough(
+            &self.owned_rdkafka_config(),
+            &self.kafka_properties,
+        )
+    }
+
+    /// Poll batching and reader-queue bounds: every limit is positive and one record always fits.
+    fn validate_memory_bounds(&self) -> Result<(), ConnectorError> {
         if self.max_poll_records == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "max.poll.records must be > 0".into(),
@@ -766,17 +812,21 @@ impl KafkaSourceConfig {
             ));
         }
         if self.record_max_bytes > self.reader_channel_max_bytes
-            || self.reader_channel_max_bytes > tokio::sync::Semaphore::MAX_PERMITS
+            || u32::try_from(self.reader_channel_max_bytes).is_err()
         {
             return Err(ConnectorError::ConfigurationError(format!(
                 "record.max.bytes ({}) must be <= reader.channel.max.bytes ({}), which must be \
                  <= {}",
                 self.record_max_bytes,
                 self.reader_channel_max_bytes,
-                tokio::sync::Semaphore::MAX_PERMITS
+                u32::MAX
             )));
         }
+        Ok(())
+    }
 
+    /// SASL mechanisms carry their credentials, and an explicit CA path is not empty.
+    fn validate_security(&self) -> Result<(), ConnectorError> {
         if self.security_protocol.uses_sasl() && self.sasl_mechanism.is_none() {
             return Err(ConnectorError::ConfigurationError(
                 "sasl.mechanism is required when security.protocol is sasl_plaintext or sasl_ssl"
@@ -803,25 +853,10 @@ impl KafkaSourceConfig {
                 }
             }
         }
+        Ok(())
+    }
 
-        if self.max_poll_interval.as_secs() < 60 {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "max.poll.interval.ms ({}) must be >= 60000 (60s)",
-                self.max_poll_interval.as_millis()
-            )));
-        }
-
-        // Kafka broker requires heartbeat_interval * 3 < session_timeout.
-        if self.group_protocol == GroupProtocol::Classic
-            && self.heartbeat_interval.as_millis() * 3 >= self.session_timeout.as_millis()
-        {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "heartbeat.interval.ms ({}) * 3 must be < session.timeout.ms ({})",
-                self.heartbeat_interval.as_millis(),
-                self.session_timeout.as_millis()
-            )));
-        }
-
+    fn validate_backpressure(&self) -> Result<(), ConnectorError> {
         if self.backpressure_high_watermark <= self.backpressure_low_watermark {
             return Err(ConnectorError::ConfigurationError(
                 "backpressure.high.watermark must be > backpressure.low.watermark".into(),
@@ -837,28 +872,7 @@ impl KafkaSourceConfig {
                 "backpressure.low.watermark must be between 0.0 and 1.0".into(),
             ));
         }
-
-        if !(0.0..=1.0).contains(&self.max_deser_error_rate) {
-            return Err(ConnectorError::ConfigurationError(
-                "max.deser.error.rate must be between 0.0 and 1.0".into(),
-            ));
-        }
-
-        if self.format == Format::Avro && self.schema_registry_url.is_none() {
-            return Err(ConnectorError::ConfigurationError(
-                "schema.registry.url is required when format is 'avro'".into(),
-            ));
-        }
-
-        super::librdkafka::require_supported_client(
-            self.security_protocol,
-            self.sasl_mechanism,
-            None,
-        )?;
-        super::librdkafka::validate_passthrough(
-            &self.owned_rdkafka_config(),
-            &self.kafka_properties,
-        )
+        Ok(())
     }
 
     /// Builds the rdkafka [`ClientConfig`]: connector-owned settings, then the validated

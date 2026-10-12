@@ -35,6 +35,14 @@ impl KafkaSourceConfig {
                 "Kafka replay.order is unsupported; cross-partition replay ordering belongs to the engine".into(),
             ));
         }
+        if config.get("envelope").is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka sources have no 'envelope' option: a table source keyed by the message key \
+                 (key + value = upsert, key + NULL = delete) is not supported; use \
+                 format = 'debezium' for keyed changes"
+                    .into(),
+            ));
+        }
         let mut parsed = Self::default();
         parsed.parse_connection(config)?;
         parsed.parse_schema(config)?;

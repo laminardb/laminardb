@@ -10,6 +10,7 @@ pub mod metrics;
 mod offsets;
 pub mod rebalance;
 pub mod source;
+mod topic_config;
 mod vnode_routing;
 
 // Sink modules
@@ -346,11 +347,25 @@ fn kafka_source_consumer_config_keys() -> Vec<ConfigKeySpec> {
         ),
         // Metadata
         ConfigKeySpec::optional(
-            "include.metadata",
-            "Include _partition/_offset/_timestamp columns",
-            "false",
+            "metadata.columns",
+            "Typed record metadata (key,topic,partition,offset,timestamp,timestamp_type,headers)",
+            "",
         ),
-        ConfigKeySpec::optional("include.headers", "Include _headers column", "false"),
+        ConfigKeySpec::optional(
+            "max.poll.bytes",
+            "Key, value and header bytes staged per poll (at least one record)",
+            "16777216",
+        ),
+        ConfigKeySpec::optional(
+            "reader.channel.max.bytes",
+            "Key, value and header bytes the reader queue may hold",
+            "67108864",
+        ),
+        ConfigKeySpec::optional(
+            "record.max.bytes",
+            "Largest accepted record key and value; larger records fail or are skipped",
+            "16777216",
+        ),
         // Backpressure
         ConfigKeySpec::optional(
             "backpressure.high.watermark",

@@ -40,7 +40,7 @@ fn broker() -> Result<Option<String>, String> {
         )
         .create()
         .map_err(|error| format!("invalid Kafka broker configuration '{brokers}': {error}"))?;
-    match consumer.fetch_metadata(None, Duration::from_secs(1)) {
+    match consumer.fetch_metadata(None, Duration::from_secs(10)) {
         Ok(metadata) if !metadata.brokers().is_empty() => Ok(Some(brokers)),
         Ok(_) | Err(_) if configured.is_none() => Ok(None),
         Ok(_) => Err(format!(
@@ -53,19 +53,51 @@ fn broker() -> Result<Option<String>, String> {
 }
 
 async fn create_topic(brokers: &str, topic: &str) {
+    create_topic_with_config(brokers, topic, &[]).await;
+}
+
+async fn create_topic_with_config(brokers: &str, topic: &str, config: &[(&str, &str)]) {
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()
         .expect("admin client");
+    let mut new_topic = NewTopic::new(topic, 1, TopicReplication::Fixed(1));
+    for &(key, value) in config {
+        new_topic = new_topic.set(key, value);
+    }
     let results = admin
-        .create_topics(
-            [&NewTopic::new(topic, 1, TopicReplication::Fixed(1))],
-            &AdminOptions::new(),
-        )
+        .create_topics([&new_topic], &AdminOptions::new())
         .await
         .expect("create_topics request");
     for result in results {
         result.expect("create topic");
+    }
+    // New topics take a moment to gain a leader on Apache Kafka.
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("metadata client");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !consumer
+        .fetch_metadata(Some(topic), Duration::from_secs(5))
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .topics()
+                .iter()
+                .find(|candidate| candidate.name() == topic)
+                .map(|candidate| {
+                    candidate.error().is_none()
+                        && candidate.partitions().iter().all(|p| p.leader() >= 0)
+                })
+        })
+        .unwrap_or(false)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{topic} has no leader"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -166,6 +198,22 @@ fn schema() -> SchemaRef {
 }
 
 async fn started_source(brokers: &str, topic: &str, delivery: DeliveryGuarantee) -> KafkaSource {
+    let mut source = KafkaSource::new(schema(), KafkaSourceConfig::default(), None);
+    source
+        .start(
+            SourceStart::new(
+                source_config(brokers, topic),
+                SourcePosition::Initial,
+                delivery,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    source
+}
+
+fn source_config(brokers: &str, topic: &str) -> ConnectorConfig {
     let mut config = ConnectorConfig::new("kafka");
     for (key, value) in [
         ("bootstrap.servers", brokers.to_string()),
@@ -181,12 +229,7 @@ async fn started_source(brokers: &str, topic: &str, delivery: DeliveryGuarantee)
     ] {
         config.set(key, value);
     }
-    let mut source = KafkaSource::new(schema(), KafkaSourceConfig::default(), None);
-    source
-        .start(SourceStart::new(config, SourcePosition::Initial, delivery).unwrap())
-        .await
-        .unwrap();
-    source
+    config
 }
 
 /// Poll until the cursor for partition 0 has accepted `last_offset`, returning every emitted batch.
@@ -337,5 +380,29 @@ async fn source_preserves_record_bytes_and_advances_over_null_values() {
     let batches = poll_to(&mut best_effort, &topic, 5).await;
     let emitted = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
     assert_eq!(emitted, 3);
+    best_effort.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn guaranteed_append_sources_reject_compacted_topics() {
+    let Some(brokers) = broker().unwrap() else {
+        eprintln!("skipping: no Kafka broker at {DEFAULT_BROKERS}");
+        return;
+    };
+    let topic = format!("fidelity-compacted-{}", uuid::Uuid::new_v4());
+    create_topic_with_config(&brokers, &topic, &[("cleanup.policy", "compact")]).await;
+
+    let mut guaranteed = KafkaSource::new(schema(), KafkaSourceConfig::default(), None);
+    let start = SourceStart::new(
+        source_config(&brokers, &topic),
+        SourcePosition::Initial,
+        DeliveryGuarantee::AtLeastOnce,
+    )
+    .unwrap();
+    let error = guaranteed.start(start).await.unwrap_err();
+    assert!(error.to_string().contains("compacted"), "{error}");
+    guaranteed.close().await.unwrap();
+
+    let mut best_effort = started_source(&brokers, &topic, DeliveryGuarantee::BestEffort).await;
     best_effort.close().await.unwrap();
 }

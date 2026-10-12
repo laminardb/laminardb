@@ -114,6 +114,24 @@ pub(crate) fn apply_passthrough(config: &mut ClientConfig, passthrough: &HashMap
     }
 }
 
+/// The broker address and transport-security settings of `config`, for auxiliary clients such as
+/// the admin client.
+#[must_use]
+pub(crate) fn connection_subset(config: &ClientConfig) -> ClientConfig {
+    let mut connection = ClientConfig::new();
+    for (key, value) in config.config_map() {
+        let canonical = canonical_property(key);
+        if canonical == "metadata.broker.list"
+            || key == "security.protocol"
+            || key.starts_with("sasl.")
+            || key.starts_with("ssl.")
+        {
+            connection.set(key, value);
+        }
+    }
+    connection
+}
+
 /// Configuration rendered for logs: secrets are replaced by `***`.
 #[must_use]
 pub(crate) fn redacted_settings(config: &ClientConfig) -> Vec<(String, String)> {

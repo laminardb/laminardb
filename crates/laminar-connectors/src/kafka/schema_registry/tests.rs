@@ -769,3 +769,32 @@ fn test_complex_type_roundtrip() {
         DataType::Map(_, _)
     ));
 }
+
+#[test]
+fn client_certificates_apply_without_a_private_ca() {
+    // Before the fix a certificate without `ssl.ca.location` was silently dropped; now the
+    // identity is loaded (and its absence is a configuration error) with default trust roots.
+    let Err(error) = SchemaRegistryClient::with_tls_mtls(
+        "https://registry.example",
+        None,
+        None,
+        Some("missing-client-cert.pem"),
+        Some("missing-client-key.pem"),
+    ) else {
+        panic!("a missing client certificate must not be ignored");
+    };
+    assert!(error.to_string().contains("client cert"), "{error}");
+
+    let Err(mismatched) = SchemaRegistryClient::with_tls_mtls(
+        "https://registry.example",
+        None,
+        None,
+        Some("client.pem"),
+        None,
+    ) else {
+        panic!("a certificate without its key is rejected");
+    };
+    assert!(mismatched.to_string().contains("both"), "{mismatched}");
+    SchemaRegistryClient::with_tls_mtls("https://registry.example", None, None, None, None)
+        .expect("public trust roots need no files");
+}

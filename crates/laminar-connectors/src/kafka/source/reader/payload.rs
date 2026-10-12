@@ -7,13 +7,35 @@ use super::{
     ReaderLoopAction, StreamConsumer,
 };
 
+/// The reader queue's budget of connector-owned bytes not yet taken by the poll path.
+pub(super) struct KafkaByteBudget {
+    permits: Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+}
+
+impl KafkaByteBudget {
+    pub(super) fn new(capacity: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+
+    fn fill(&self) -> f64 {
+        let held = self
+            .capacity
+            .saturating_sub(self.permits.available_permits());
+        u32::try_from(held).map_or(1.0, f64::from)
+            / u32::try_from(self.capacity).map_or(f64::from(u32::MAX), f64::from)
+    }
+}
+
 pub(super) struct KafkaBackpressureContext<'a> {
     pub(super) consumer: &'a Arc<StreamConsumer<LaminarConsumerContext>>,
     pub(super) channel_len: &'a Arc<AtomicUsize>,
     pub(super) channel_capacity: usize,
     pub(super) channel_capacity_f64: f64,
-    pub(super) byte_budget: &'a Arc<tokio::sync::Semaphore>,
-    pub(super) byte_budget_capacity: usize,
+    pub(super) byte_budget: &'a KafkaByteBudget,
     pub(super) pause_threshold: f64,
     pub(super) resume_threshold: f64,
     pub(super) drain_active: bool,
@@ -30,12 +52,7 @@ pub(super) fn update_reader_backpressure(
     } else {
         0.0
     };
-    let held_bytes = context
-        .byte_budget_capacity
-        .saturating_sub(context.byte_budget.available_permits());
-    let byte_fill = u32::try_from(held_bytes).map_or(1.0, f64::from)
-        / u32::try_from(context.byte_budget_capacity).map_or(f64::from(u32::MAX), f64::from);
-    let fill = record_fill.max(byte_fill);
+    let fill = record_fill.max(context.byte_budget.fill());
     if context.drain_active {
         return ReaderLoopAction::Proceed;
     }
@@ -247,28 +264,31 @@ fn read_headers(
 
 pub(super) struct KafkaByteBudgetContext<'a> {
     pub(super) consumer: &'a Arc<StreamConsumer<LaminarConsumerContext>>,
-    pub(super) byte_budget: &'a Arc<tokio::sync::Semaphore>,
+    pub(super) byte_budget: &'a KafkaByteBudget,
     pub(super) reader_shutdown: &'a mut tokio::sync::watch::Receiver<bool>,
 }
 
-/// Reserve `bytes` of the reader-channel byte budget for one record, pausing consumption while
-/// the poll path drains. Returns `None` when the reader is shutting down; a record without
-/// connector-owned bytes reserves nothing.
+/// Reserve `payload`'s connector-owned bytes from the reader-channel byte budget, pausing
+/// consumption while the poll path drains. A record larger than the whole budget (its headers are
+/// not bounded by `record.max.bytes`) reserves the whole budget, so the queue holds at most the
+/// budget plus one record. Returns `false` when the reader is shutting down.
 pub(super) async fn acquire_reader_bytes(
     context: KafkaByteBudgetContext<'_>,
-    bytes: usize,
+    payload: &mut KafkaPayload,
     is_paused: &mut bool,
-) -> Option<Option<tokio::sync::OwnedSemaphorePermit>> {
-    // Configuration bounds the budget by u32::MAX and each record by the budget.
-    let Ok(permits) = u32::try_from(bytes) else {
-        return None;
-    };
+) -> bool {
+    let budget = context.byte_budget;
+    // Configuration bounds the budget by u32::MAX.
+    let permits = u32::try_from(payload.retained_bytes().min(budget.capacity)).unwrap_or(u32::MAX);
     if permits == 0 {
-        return Some(None);
+        return true;
     }
-    match Arc::clone(context.byte_budget).try_acquire_many_owned(permits) {
-        Ok(permit) => return Some(Some(permit)),
-        Err(tokio::sync::TryAcquireError::Closed) => return None,
+    match Arc::clone(&budget.permits).try_acquire_many_owned(permits) {
+        Ok(permit) => {
+            payload.budget = Some(permit);
+            return true;
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => return false,
         Err(tokio::sync::TryAcquireError::NoPermits) => {}
     }
     if !*is_paused {
@@ -287,13 +307,41 @@ pub(super) async fn acquire_reader_bytes(
             }
         }
     }
-    tokio::select! {
+    payload.budget = tokio::select! {
         biased;
         _ = context.reader_shutdown.changed() => None,
-        permit = Arc::clone(context.byte_budget).acquire_many_owned(permits) => {
-            permit.ok().map(Some)
-        }
+        permit = Arc::clone(&budget.permits).acquire_many_owned(permits) => permit.ok(),
+    };
+    payload.budget.is_some()
+}
+
+/// Report a reader output channel that closed while the source was still running.
+pub(super) fn report_closed_output(
+    reader_shutdown: &tokio::sync::watch::Receiver<bool>,
+    reader_fault: &Arc<Mutex<Option<Arc<str>>>>,
+    data_ready: &Arc<Notify>,
+) {
+    if !*reader_shutdown.borrow() {
+        publish_reader_fault(
+            reader_fault,
+            data_ready,
+            "reader output channel disconnected unexpectedly",
+        );
     }
+}
+
+/// Report a consumer error the reader cannot continue past.
+pub(super) fn report_consumer_error(
+    error: &rdkafka::error::KafkaError,
+    reader_fault: &Arc<Mutex<Option<Arc<str>>>>,
+    data_ready: &Arc<Notify>,
+) {
+    warn!(%error, "Kafka consumer error");
+    publish_reader_fault(
+        reader_fault,
+        data_ready,
+        format!("terminal Kafka consumer error: {error}"),
+    );
 }
 
 pub(super) struct KafkaFullQueueContext<'a> {

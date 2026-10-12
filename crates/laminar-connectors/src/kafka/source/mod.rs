@@ -251,13 +251,16 @@ impl KafkaSource {
         let Some(sr_url) = config.schema_registry_url.as_ref() else {
             return Ok(None);
         };
-        let client = if let Some(ca) = config.schema_registry_ssl_ca_location.as_deref() {
+        let ca = config.schema_registry_ssl_ca_location.as_deref();
+        let certificate = config.schema_registry_ssl_certificate_location.as_deref();
+        let key = config.schema_registry_ssl_key_location.as_deref();
+        let client = if ca.is_some() || certificate.is_some() || key.is_some() {
             SchemaRegistryClient::with_tls_mtls(
                 sr_url.clone(),
                 config.schema_registry_auth.clone(),
                 ca,
-                config.schema_registry_ssl_certificate_location.as_deref(),
-                config.schema_registry_ssl_key_location.as_deref(),
+                certificate,
+                key,
             )?
         } else {
             SchemaRegistryClient::new(sr_url.clone(), config.schema_registry_auth.clone())?

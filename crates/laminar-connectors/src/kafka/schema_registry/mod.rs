@@ -278,10 +278,11 @@ impl SchemaRegistryClient {
         auth: Option<SrAuth>,
         ca_cert_path: &str,
     ) -> Result<Self, ConnectorError> {
-        Self::with_tls_mtls(base_url, auth, ca_cert_path, None, None)
+        Self::with_tls_mtls(base_url, auth, Some(ca_cert_path), None, None)
     }
 
-    /// Creates a client with full TLS/mTLS support.
+    /// Creates a client with full TLS/mTLS support. Without `ca_cert_path` the server is
+    /// verified against the default trust roots; a client certificate applies either way.
     ///
     /// # Errors
     ///
@@ -290,23 +291,24 @@ impl SchemaRegistryClient {
     pub fn with_tls_mtls(
         base_url: impl Into<String>,
         auth: Option<SrAuth>,
-        ca_cert_path: &str,
+        ca_cert_path: Option<&str>,
         client_cert_path: Option<&str>,
         client_key_path: Option<&str>,
     ) -> Result<Self, ConnectorError> {
-        let pem = std::fs::read(ca_cert_path).map_err(|e| {
-            ConnectorError::ConfigurationError(format!(
-                "failed to read SR CA cert at '{ca_cert_path}': {e}"
-            ))
-        })?;
-        let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
-            ConnectorError::ConfigurationError(format!(
-                "invalid PEM CA cert at '{ca_cert_path}': {e}"
-            ))
-        })?;
-
-        let mut builder =
-            http_client_builder(SCHEMA_REGISTRY_HTTP_TIMEOUTS).add_root_certificate(cert);
+        let mut builder = http_client_builder(SCHEMA_REGISTRY_HTTP_TIMEOUTS);
+        if let Some(ca_cert_path) = ca_cert_path {
+            let pem = std::fs::read(ca_cert_path).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "failed to read SR CA cert at '{ca_cert_path}': {e}"
+                ))
+            })?;
+            let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid PEM CA cert at '{ca_cert_path}': {e}"
+                ))
+            })?;
+            builder = builder.add_root_certificate(cert);
+        }
 
         if client_cert_path.is_some() != client_key_path.is_some() {
             return Err(ConnectorError::ConfigurationError(

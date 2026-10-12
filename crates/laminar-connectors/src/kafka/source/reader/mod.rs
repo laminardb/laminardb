@@ -26,8 +26,9 @@ use drain_control::{
     KafkaDrainHoldContext,
 };
 use payload::{
-    acquire_reader_bytes, build_reader_payload, send_full_reader_item, update_reader_backpressure,
-    KafkaBackpressureContext, KafkaByteBudgetContext, KafkaFullQueueContext, KafkaRecordCapture,
+    acquire_reader_bytes, build_reader_payload, report_closed_output, report_consumer_error,
+    send_full_reader_item, update_reader_backpressure, KafkaBackpressureContext, KafkaByteBudget,
+    KafkaByteBudgetContext, KafkaFullQueueContext, KafkaRecordCapture,
 };
 use positioning::{position_reader_assignment, KafkaPositioningContext};
 use rotation::reconcile_vnode_assignment;
@@ -48,8 +49,7 @@ struct KafkaReaderTask {
     reader_fault: Arc<Mutex<Option<Arc<str>>>>,
     channel_len: Arc<AtomicUsize>,
     capture: KafkaRecordCapture,
-    byte_budget: Arc<tokio::sync::Semaphore>,
-    byte_budget_capacity: usize,
+    byte_budget: KafkaByteBudget,
     reader_channel_capacity: usize,
     reader_channel_capacity_f64: f64,
     assign_generation: Arc<AtomicU64>,
@@ -142,8 +142,7 @@ impl KafkaSource {
                 .contains(super::KafkaMetadataColumn::Headers),
             record_max_bytes: self.config.record_max_bytes,
         };
-        let byte_budget_capacity = self.config.reader_channel_max_bytes;
-        let byte_budget = Arc::new(tokio::sync::Semaphore::new(byte_budget_capacity));
+        let byte_budget = KafkaByteBudget::new(self.config.reader_channel_max_bytes);
         let reader_channel_capacity = self.config.reader_channel_capacity;
         let reader_channel_capacity_f64 =
             u32::try_from(reader_channel_capacity).map_or(f64::from(u32::MAX), f64::from);
@@ -182,7 +181,6 @@ impl KafkaSource {
             channel_len,
             capture,
             byte_budget,
-            byte_budget_capacity,
             reader_channel_capacity,
             reader_channel_capacity_f64,
             assign_generation,
@@ -231,7 +229,6 @@ impl KafkaReaderTask {
             channel_len,
             capture,
             byte_budget,
-            byte_budget_capacity,
             reader_channel_capacity,
             reader_channel_capacity_f64,
             assign_generation,
@@ -260,8 +257,7 @@ impl KafkaReaderTask {
         // Starting from that fence detects even a self→other→self sequence that lands before
         // this lazy reader gets its first turn; boot-unassigned sources legitimately start 0.
         let mut last_assignment_version = reconciled_assignment_version.load(Ordering::Acquire);
-        let mut drain_paused: std::collections::HashSet<(Arc<str>, i32)> =
-            std::collections::HashSet::new();
+        let mut drain_paused = std::collections::HashSet::<(Arc<str>, i32)>::new();
         let mut active_drain: Option<KafkaReaderDrain> = None;
         let mut deferred_drain_command = None;
 
@@ -394,7 +390,6 @@ impl KafkaReaderTask {
                     channel_capacity: reader_channel_capacity,
                     channel_capacity_f64: reader_channel_capacity_f64,
                     byte_budget: &byte_budget,
-                    byte_budget_capacity,
                     pause_threshold,
                     resume_threshold,
                     drain_active: active_drain.is_some(),
@@ -470,20 +465,19 @@ impl KafkaReaderTask {
                     ) else {
                         return;
                     };
-                    let Some(budget) = acquire_reader_bytes(
+                    let reserved = acquire_reader_bytes(
                         KafkaByteBudgetContext {
                             consumer: &consumer,
                             byte_budget: &byte_budget,
                             reader_shutdown: &mut reader_shutdown,
                         },
-                        payload.retained_bytes(),
+                        &mut payload,
                         &mut is_paused,
                     )
-                    .await
-                    else {
+                    .await;
+                    if !reserved {
                         break;
-                    };
-                    payload.budget = budget;
+                    }
                     let item = KafkaReaderItem::Payload(payload);
                     match msg_tx.try_send(item) {
                         Ok(()) => {
@@ -508,13 +502,7 @@ impl KafkaReaderTask {
                             }
                         }
                         Err(crossfire::TrySendError::Disconnected(_)) => {
-                            if !*reader_shutdown.borrow() {
-                                publish_reader_fault(
-                                    &reader_fault,
-                                    &data_ready,
-                                    "reader output channel disconnected unexpectedly",
-                                );
-                            }
+                            report_closed_output(&reader_shutdown, &reader_fault, &data_ready);
                             break;
                         }
                     }
@@ -524,12 +512,7 @@ impl KafkaReaderTask {
                     debug!(error = %e, "Kafka consumer poll event");
                 }
                 Err(e) => {
-                    warn!(error = %e, "Kafka consumer error");
-                    publish_reader_fault(
-                        &reader_fault,
-                        &data_ready,
-                        format!("terminal Kafka consumer error: {e}"),
-                    );
+                    report_consumer_error(&e, &reader_fault, &data_ready);
                     break;
                 }
             }

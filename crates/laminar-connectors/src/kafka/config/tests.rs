@@ -40,6 +40,13 @@ fn source_rejects_connector_owned_replay_order() {
 }
 
 #[test]
+fn source_rejects_an_upsert_envelope_instead_of_reading_append() {
+    let error =
+        KafkaSourceConfig::from_config(&make_config(&[("envelope", "upsert")])).unwrap_err();
+    assert!(error.to_string().contains("debezium"), "{error}");
+}
+
+#[test]
 #[allow(deprecated)]
 fn test_parse_multi_topic() {
     let cfg = KafkaSourceConfig::from_config(&make_config(&[("topic", "a, b, c")])).unwrap();

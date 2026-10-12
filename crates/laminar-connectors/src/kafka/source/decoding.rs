@@ -22,6 +22,7 @@ impl KafkaSource {
             .as_any_mut()
             .and_then(|any| any.downcast_mut::<AvroDeserializer>())
         {
+            avro_deser.begin_batch();
             let mut new_schema_ids = Vec::new();
             let mut prepared_records = 0_u64;
             for &(start, len) in &self.poll_payload_offsets {

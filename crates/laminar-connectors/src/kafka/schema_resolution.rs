@@ -51,14 +51,11 @@ pub(super) fn registry_client(
             ))
         }
     };
-    if let Some(ca) = config.get("schema.registry.ssl.ca.location") {
-        SchemaRegistryClient::with_tls_mtls(
-            url,
-            auth,
-            ca,
-            config.get("schema.registry.ssl.certificate.location"),
-            config.get("schema.registry.ssl.key.location"),
-        )
+    let ca = config.get("schema.registry.ssl.ca.location");
+    let certificate = config.get("schema.registry.ssl.certificate.location");
+    let key = config.get("schema.registry.ssl.key.location");
+    if ca.is_some() || certificate.is_some() || key.is_some() {
+        SchemaRegistryClient::with_tls_mtls(url, auth, ca, certificate, key)
     } else {
         SchemaRegistryClient::new(url, auth)
     }
