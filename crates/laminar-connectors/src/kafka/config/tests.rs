@@ -194,23 +194,80 @@ fn test_parse_fetch_tuning() {
 #[test]
 fn test_parse_kafka_passthrough() {
     let cfg = KafkaSourceConfig::from_config(&make_config(&[
-        ("kafka.session.timeout.ms", "30000"),
-        ("kafka.max.poll.interval.ms", "300000"),
         ("kafka.fetch.message.max.bytes", "2097152"),
+        ("kafka.socket.keepalive.enable", "true"),
     ]))
     .unwrap();
 
-    assert_eq!(cfg.kafka_properties.len(), 3);
-    // session.timeout.ms and max.poll.interval.ms are passed through as
-    // kafka_properties, but blocked by is_blocked_passthrough_key() in
-    // to_rdkafka_config() — they won't override explicit settings.
+    assert_eq!(cfg.kafka_properties.len(), 2);
+    let rdkafka = cfg.to_rdkafka_config();
+    assert_eq!(rdkafka.get("fetch.message.max.bytes"), Some("2097152"));
+    assert_eq!(rdkafka.get("socket.keepalive.enable"), Some("true"));
+}
+
+#[test]
+fn passthrough_rejects_connector_owned_and_protected_settings() {
+    for key in [
+        "kafka.session.timeout.ms",
+        "kafka.max.poll.interval.ms",
+        "kafka.isolation.level",
+        "kafka.group.protocol",
+        "kafka.enable.auto.commit",
+        "kafka.auto.offset.reset",
+        "kafka.group.id",
+        "kafka.metadata.broker.list",
+    ] {
+        let error = KafkaSourceConfig::from_config(&make_config(&[(key, "x")])).unwrap_err();
+        assert!(error.to_string().contains(key), "{key}: {error}");
+    }
+}
+
+#[test]
+fn consumer_group_protocol_omits_classic_settings() {
+    let cfg =
+        KafkaSourceConfig::from_config(&make_config(&[("group.protocol", "consumer")])).unwrap();
+    let rdkafka = cfg.to_rdkafka_config();
+    assert_eq!(rdkafka.get("group.protocol"), Some("consumer"));
+    for classic in [
+        "session.timeout.ms",
+        "heartbeat.interval.ms",
+        "partition.assignment.strategy",
+    ] {
+        assert_eq!(rdkafka.get(classic), None, "{classic}");
+        let error = KafkaSourceConfig::from_config(&make_config(&[
+            ("group.protocol", "consumer"),
+            (classic, "1"),
+        ]))
+        .unwrap_err();
+        assert!(error.to_string().contains(classic), "{error}");
+    }
+}
+
+#[test]
+fn latency_profile_supplies_defaults_below_explicit_options() {
+    let low = KafkaSourceConfig::from_config(&make_config(&[("latency.profile", "low_latency")]))
+        .unwrap();
+    assert_eq!(low.max_poll_records, 256);
+    assert_eq!(low.to_rdkafka_config().get("fetch.wait.max.ms"), Some("10"));
+
+    let overridden = KafkaSourceConfig::from_config(&make_config(&[
+        ("latency.profile", "throughput"),
+        ("max.poll.records", "300"),
+        ("fetch.min.bytes", "1"),
+    ]))
+    .unwrap();
+    assert_eq!(overridden.max_poll_records, 300);
     assert_eq!(
-        cfg.kafka_properties.get("session.timeout.ms"),
-        Some(&"30000".to_string())
+        overridden.to_rdkafka_config().get("fetch.min.bytes"),
+        Some("1")
     );
     assert_eq!(
-        cfg.kafka_properties.get("max.poll.interval.ms"),
-        Some(&"300000".to_string())
+        overridden.to_rdkafka_config().get("fetch.wait.max.ms"),
+        Some("100")
+    );
+    assert_eq!(
+        overridden.to_rdkafka_config().get("isolation.level"),
+        Some("read_committed")
     );
 }
 
@@ -723,16 +780,6 @@ fn test_session_timeout_heartbeat_in_rdkafka_config() {
     let rdkafka = cfg.to_rdkafka_config();
     assert_eq!(rdkafka.get("session.timeout.ms"), Some("60000"));
     assert_eq!(rdkafka.get("heartbeat.interval.ms"), Some("15000"));
-}
-
-#[test]
-fn test_session_timeout_passthrough_blocked() {
-    let cfg =
-        KafkaSourceConfig::from_config(&make_config(&[("kafka.session.timeout.ms", "99999")]))
-            .unwrap();
-    // The pass-through should be blocked; rdkafka config should use the default (45000).
-    let rdkafka = cfg.to_rdkafka_config();
-    assert_eq!(rdkafka.get("session.timeout.ms"), Some("45000"));
 }
 
 // -- queued.max.messages.kbytes --

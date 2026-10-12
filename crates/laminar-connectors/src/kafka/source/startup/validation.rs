@@ -7,6 +7,7 @@ use super::{
     KafkaPartitionRoutes, KafkaSource, KafkaSourceConfig, KafkaStartPlan, OffsetTracker, Ordering,
     SourcePosition, SourceStart, StartupMode, TopicSubscription,
 };
+use crate::kafka::config::IsolationLevel;
 
 struct PreparedStartPosition {
     offsets: OffsetTracker,
@@ -199,6 +200,24 @@ impl KafkaSource {
                     "invalid Kafka specific position {partition}:{offset}: partition and offset must be non-negative"
                 )));
             }
+        }
+        if delivery != DeliveryGuarantee::BestEffort
+            && config.isolation_level != IsolationLevel::ReadCommitted
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka guaranteed delivery requires isolation.level = read_committed; \
+                 read_uncommitted exposes records of transactions that may later abort"
+                    .into(),
+            ));
+        }
+        if delivery != DeliveryGuarantee::BestEffort
+            && config.kafka_properties.contains_key("group.instance.id")
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Kafka static membership (group.instance.id) has no effect under guaranteed \
+                 delivery, which assigns partitions manually without joining the group"
+                    .into(),
+            ));
         }
         if delivery != DeliveryGuarantee::BestEffort
             && matches!(&config.startup_mode, StartupMode::GroupOffsets)

@@ -9,6 +9,8 @@ use rdkafka::config::ClientConfig;
 use crate::error::ConnectorError;
 use crate::serde::Format;
 
+pub use super::latency_profile::LatencyProfile;
+
 mod source_options;
 
 /// Kafka security protocol for broker connections.
@@ -310,6 +312,25 @@ str_enum!(fromstr AssignmentStrategy, lowercase_nodash, ConnectorError,
     CooperativeSticky => "cooperative-sticky", "cooperative_sticky"
 );
 
+/// Consumer group rebalance protocol (`group.protocol`).
+///
+/// `consumer` is the KIP-848 protocol. It moves assignment, session and heartbeat timing to the
+/// broker, so the classic client-side settings are neither sent nor accepted with it. Guaranteed
+/// delivery assigns partitions manually and uses the group only for advisory offset commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupProtocol {
+    /// Client-side assignment with session and heartbeat timing (librdkafka default).
+    #[default]
+    Classic,
+    /// Broker-side assignment (KIP-848).
+    Consumer,
+}
+
+str_enum!(GroupProtocol, lowercase, ConnectorError, "invalid group.protocol",
+    Classic => "classic";
+    Consumer => "consumer"
+);
+
 /// Schema Registry compatibility level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatibilityLevel {
@@ -543,6 +564,10 @@ pub struct KafkaSourceConfig {
     pub max_poll_records: usize,
     /// Partition assignment strategy.
     pub partition_assignment_strategy: AssignmentStrategy,
+    /// Consumer group rebalance protocol.
+    pub group_protocol: GroupProtocol,
+    /// Latency preset that supplied the fetch defaults.
+    pub latency_profile: LatencyProfile,
     /// Minimum bytes to return from a fetch (allows batching).
     pub fetch_min_bytes: Option<i32>,
     /// Maximum bytes to return from broker per request.
@@ -656,6 +681,8 @@ impl Default for KafkaSourceConfig {
             isolation_level: IsolationLevel::default(),
             max_poll_records: 1000,
             partition_assignment_strategy: AssignmentStrategy::Range,
+            group_protocol: GroupProtocol::default(),
+            latency_profile: LatencyProfile::default(),
             fetch_min_bytes: None,
             fetch_max_bytes: None,
             fetch_max_wait_ms: None,
@@ -754,7 +781,9 @@ impl KafkaSourceConfig {
         }
 
         // Kafka broker requires heartbeat_interval * 3 < session_timeout.
-        if self.heartbeat_interval.as_millis() * 3 >= self.session_timeout.as_millis() {
+        if self.group_protocol == GroupProtocol::Classic
+            && self.heartbeat_interval.as_millis() * 3 >= self.session_timeout.as_millis()
+        {
             return Err(ConnectorError::ConfigurationError(format!(
                 "heartbeat.interval.ms ({}) * 3 must be < session.timeout.ms ({})",
                 self.heartbeat_interval.as_millis(),
@@ -790,12 +819,27 @@ impl KafkaSourceConfig {
             ));
         }
 
-        Ok(())
+        super::librdkafka::require_supported_client(
+            self.security_protocol,
+            self.sasl_mechanism,
+            None,
+        )?;
+        super::librdkafka::validate_passthrough(
+            &self.owned_rdkafka_config(),
+            &self.kafka_properties,
+        )
     }
 
-    /// Builds an rdkafka [`ClientConfig`] from this configuration.
+    /// Builds the rdkafka [`ClientConfig`]: connector-owned settings, then the validated
+    /// `kafka.*` passthrough properties.
     #[must_use]
     pub fn to_rdkafka_config(&self) -> ClientConfig {
+        let mut config = self.owned_rdkafka_config();
+        super::librdkafka::apply_passthrough(&mut config, &self.kafka_properties);
+        config
+    }
+
+    fn owned_rdkafka_config(&self) -> ClientConfig {
         let mut config = ClientConfig::new();
 
         config.set("bootstrap.servers", &self.bootstrap_servers);
@@ -803,10 +847,21 @@ impl KafkaSourceConfig {
         config.set("enable.auto.commit", "false");
         config.set("enable.auto.offset.store", "false");
         config.set("auto.offset.reset", self.auto_offset_reset.as_rdkafka_str());
-        config.set(
-            "partition.assignment.strategy",
-            self.partition_assignment_strategy.as_rdkafka_str(),
-        );
+        config.set("group.protocol", self.group_protocol.to_string());
+        if self.group_protocol == GroupProtocol::Classic {
+            config.set(
+                "partition.assignment.strategy",
+                self.partition_assignment_strategy.as_rdkafka_str(),
+            );
+            config.set(
+                "session.timeout.ms",
+                self.session_timeout.as_millis().to_string(),
+            );
+            config.set(
+                "heartbeat.interval.ms",
+                self.heartbeat_interval.as_millis().to_string(),
+            );
+        }
         config.set("security.protocol", self.security_protocol.as_rdkafka_str());
 
         if let Some(ref mechanism) = self.sasl_mechanism {
@@ -833,14 +888,6 @@ impl KafkaSourceConfig {
 
         config.set("isolation.level", self.isolation_level.as_rdkafka_str());
         config.set(
-            "session.timeout.ms",
-            self.session_timeout.as_millis().to_string(),
-        );
-        config.set(
-            "heartbeat.interval.ms",
-            self.heartbeat_interval.as_millis().to_string(),
-        );
-        config.set(
             "queued.max.messages.kbytes",
             self.queued_max_messages_kbytes.to_string(),
         );
@@ -865,50 +912,8 @@ impl KafkaSourceConfig {
             config.set("max.partition.fetch.bytes", partition_max.to_string());
         }
 
-        // Apply pass-through properties, blocking security-critical keys
-        // that could silently downgrade authentication or break semantics.
-        for (key, value) in &self.kafka_properties {
-            if is_blocked_passthrough_key(key) {
-                tracing::warn!(
-                    key,
-                    "ignoring kafka.* pass-through property that overrides a security setting"
-                );
-                continue;
-            }
-            config.set(key, value);
-        }
-
         config
     }
-}
-
-/// Returns `true` if a pass-through kafka.* key must not override explicit settings.
-fn is_blocked_passthrough_key(key: &str) -> bool {
-    key.starts_with("sasl.kerberos.")
-        || matches!(
-            key,
-            "security.protocol"
-                | "sasl.mechanism"
-                | "sasl.username"
-                | "sasl.password"
-                | "sasl.oauthbearer.config"
-                | "ssl.ca.location"
-                | "ssl.certificate.location"
-                | "ssl.key.location"
-                | "ssl.key.password"
-                | "ssl.endpoint.identification.algorithm"
-                | "enable.auto.commit"
-                | "enable.auto.offset.store"
-                | "enable.idempotence"
-                | "auto.offset.reset"
-                | "session.timeout.ms"
-                | "heartbeat.interval.ms"
-                | "max.poll.interval.ms"
-                | "queued.max.messages.kbytes"
-                // librdkafka's own auto-commit interval — only meaningful
-                // when `enable.auto.commit=true`, which we hard-disable.
-                | "auto.commit.interval.ms"
-        )
 }
 
 /// Parses a specific offsets string in the format "partition:offset,partition:offset,...".

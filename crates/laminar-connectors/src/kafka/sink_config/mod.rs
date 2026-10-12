@@ -6,11 +6,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use arrow_schema::DataType;
 use rdkafka::ClientConfig;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::kafka::config::{CompatibilityLevel, SaslMechanism, SecurityProtocol, SrAuth};
+use crate::kafka::latency_profile::LatencyProfile;
 use crate::serde::Format;
 
 const MAX_DELIVERY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -57,9 +59,15 @@ pub struct KafkaSinkConfig {
     pub max_in_flight: usize,
     /// Maximum time to wait for delivery confirmation.
     pub delivery_timeout: Duration,
-    /// Key column name for partitioning. In `envelope = upsert` mode this is the merge key
-    /// (the group identity), and is required.
+    /// Comma-separated key column names. In `envelope = upsert` mode they are the merge key (the
+    /// group identity) and are required.
     pub key_column: Option<String>,
+    /// How key column values become Kafka record-key bytes.
+    pub key_format: KeyFormat,
+    /// Partition count keyed records are hashed over. When set, the topic must have at least this
+    /// many partitions, and later partition additions do not move existing keys. Required for
+    /// `envelope = upsert`.
+    pub partition_count: Option<i32>,
     /// How an updating (changelog) input is encoded to the topic (`append` vs `upsert`).
     pub envelope: SinkEnvelope,
     /// Partitioning strategy.
@@ -74,6 +82,8 @@ pub struct KafkaSinkConfig {
     pub compression: CompressionType,
     /// Dead letter queue topic for failed records.
     pub dlq_topic: Option<String>,
+    /// Latency preset that supplied the batching defaults.
+    pub latency_profile: LatencyProfile,
     /// Additional rdkafka client properties (pass-through).
     pub kafka_properties: HashMap<String, String>,
 }
@@ -129,6 +139,8 @@ impl Default for KafkaSinkConfig {
             max_in_flight: 5,
             delivery_timeout: Duration::from_secs(120),
             key_column: None,
+            key_format: KeyFormat::default(),
+            partition_count: None,
             envelope: SinkEnvelope::default(),
             partitioner: PartitionStrategy::KeyHash,
             linger_ms: 5,
@@ -136,6 +148,7 @@ impl Default for KafkaSinkConfig {
             batch_num_messages: None,
             compression: CompressionType::None,
             dlq_topic: None,
+            latency_profile: LatencyProfile::Balanced,
             kafka_properties: HashMap::new(),
         }
     }
@@ -223,6 +236,10 @@ impl KafkaSinkConfig {
         }
 
         cfg.key_column = config.get("key.column").map(String::from);
+        cfg.key_format = config
+            .get("key.format")
+            .map_or(Ok(KeyFormat::default()), str::parse)?;
+        cfg.partition_count = config.get_parsed::<i32>("partition.count")?;
 
         cfg.envelope = match config
             .get("envelope")
@@ -247,6 +264,14 @@ impl KafkaSinkConfig {
                 "envelope = 'upsert' requires a non-empty 'key.column' (the merge key)".into(),
             ));
         }
+
+        cfg.latency_profile = config
+            .get("latency.profile")
+            .map_or(Ok(LatencyProfile::default()), str::parse)?;
+        let profile = cfg.latency_profile.sink_defaults();
+        cfg.linger_ms = profile.linger_ms;
+        cfg.batch_size = profile.batch_size;
+        cfg.compression = profile.compression;
 
         if let Some(p) = config.get("partitioner") {
             cfg.partitioner = p.parse().map_err(|_| {
@@ -345,6 +370,26 @@ impl KafkaSinkConfig {
             ));
         }
 
+        if self.partition_count.is_some_and(|count| count <= 0) {
+            return Err(ConnectorError::ConfigurationError(
+                "partition.count must be positive".into(),
+            ));
+        }
+        if self.envelope == SinkEnvelope::Upsert && self.partition_count.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "envelope = 'upsert' requires partition.count: a compacted topic's keys must keep \
+                 their partition when partitions are added"
+                    .into(),
+            ));
+        }
+        if self.envelope == SinkEnvelope::Upsert && self.partitioner != PartitionStrategy::KeyHash {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "envelope = 'upsert' requires partitioner = 'key-hash': '{}' ignores the key, so \
+                 a key's updates and tombstone could land in different partitions",
+                self.partitioner
+            )));
+        }
+
         if self.format == Format::Avro && self.schema_registry_url.is_none() {
             return Err(ConnectorError::ConfigurationError(
                 "Avro format requires 'schema.registry.url'".into(),
@@ -370,14 +415,45 @@ impl KafkaSinkConfig {
             )));
         }
 
-        Ok(())
+        super::librdkafka::require_supported_client(
+            self.security_protocol,
+            self.sasl_mechanism,
+            Some(self.compression.as_rdkafka_str()),
+        )?;
+        super::librdkafka::validate_passthrough(
+            &self.owned_rdkafka_config(),
+            &self.kafka_properties,
+        )
     }
 
-    /// Builds an rdkafka [`ClientConfig`] from this configuration.
+    /// Configured key column names, in key order.
+    #[must_use]
+    pub fn key_columns(&self) -> Vec<String> {
+        self.key_column
+            .as_deref()
+            .map(|columns| {
+                columns
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|column| !column.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Builds the rdkafka [`ClientConfig`]: connector-owned settings, then the validated
+    /// `kafka.*` passthrough properties.
     ///
     /// Always sets `enable.idempotence=true` for durable at-least-once writes.
     #[must_use]
     pub fn to_rdkafka_config(&self) -> ClientConfig {
+        let mut config = self.owned_rdkafka_config();
+        super::librdkafka::apply_passthrough(&mut config, &self.kafka_properties);
+        config
+    }
+
+    fn owned_rdkafka_config(&self) -> ClientConfig {
         let mut config = ClientConfig::new();
 
         config.set("bootstrap.servers", &self.bootstrap_servers);
@@ -428,19 +504,6 @@ impl KafkaSinkConfig {
 
         if let Some(num_msgs) = self.batch_num_messages {
             config.set("batch.num.messages", num_msgs.to_string());
-        }
-
-        // Apply pass-through properties, blocking security-critical keys
-        // that could silently downgrade authentication or break semantics.
-        for (key, value) in &self.kafka_properties {
-            if is_blocked_passthrough_key(key) {
-                tracing::warn!(
-                    key,
-                    "ignoring kafka.* pass-through property that overrides a protected connector setting"
-                );
-                continue;
-            }
-            config.set(key, value);
         }
 
         config
@@ -495,30 +558,69 @@ impl KafkaSinkConfig {
     }
 }
 
-/// Returns `true` if a pass-through kafka.* key must not override explicit settings.
-fn is_blocked_passthrough_key(key: &str) -> bool {
-    key.starts_with("sasl.kerberos.")
-        || matches!(
-            key,
-            "security.protocol"
-                | "sasl.mechanism"
-                | "sasl.username"
-                | "sasl.password"
-                | "sasl.oauthbearer.config"
-                | "ssl.ca.location"
-                | "ssl.certificate.location"
-                | "ssl.key.location"
-                | "ssl.key.password"
-                | "ssl.endpoint.identification.algorithm"
-                | "enable.auto.commit"
-                | "enable.idempotence"
-                | "acks"
-                | "max.in.flight"
-                | "max.in.flight.requests.per.connection"
-                | "message.timeout.ms"
-                | "delivery.timeout.ms"
-                | "transactional.id"
-        )
+/// How `key.column` values become Kafka record-key bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyFormat {
+    /// UTF-8 for string columns and raw bytes for binary columns, as Kafka's Java
+    /// `StringSerializer` and `ByteArraySerializer` write them. Other types need an explicit format.
+    #[default]
+    Native,
+    /// The SQL text rendering of one column of any type.
+    Text,
+    /// Kafka's Java serializer bytes: `Native` plus big-endian `Short`, `Integer`, `Long`, `Float`
+    /// and `Double`.
+    Kafka,
+    /// A JSON object of one or more key columns with NULLs written explicitly; never a NULL key.
+    Json,
+}
+
+str_enum!(KeyFormat, lowercase, ConnectorError, "invalid key.format",
+    Native => "native";
+    Text => "text";
+    Kafka => "kafka";
+    Json => "json"
+);
+
+impl KeyFormat {
+    /// Whether this format can encode a key column of `data_type`.
+    #[must_use]
+    pub fn encodes(self, data_type: &DataType) -> bool {
+        let native = matches!(
+            data_type,
+            DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+        );
+        match self {
+            Self::Native => native,
+            Self::Kafka => {
+                native
+                    || matches!(
+                        data_type,
+                        DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Float32
+                            | DataType::Float64
+                    )
+            }
+            Self::Text | Self::Json => true,
+        }
+    }
+
+    pub(crate) const fn remedy(self) -> &'static str {
+        match self {
+            Self::Native => {
+                "set key.format to 'kafka' (Java serializer bytes), 'text' (SQL text) or 'json'"
+            }
+            Self::Kafka => "use key.format = 'text' or 'json' for this type",
+            Self::Text | Self::Json => "choose a supported key column type",
+        }
+    }
 }
 
 /// Partitioning strategy for distributing records across Kafka partitions.

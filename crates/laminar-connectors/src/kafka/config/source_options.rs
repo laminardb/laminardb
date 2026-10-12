@@ -10,10 +10,17 @@ use crate::error::ConnectorError;
 use crate::serde::Format;
 
 use super::{
-    parse_specific_offsets, AssignmentStrategy, IsolationLevel, KafkaSourceConfig, OffsetReset,
-    SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode, SubjectNameStrategy,
-    TopicSubscription,
+    parse_specific_offsets, AssignmentStrategy, GroupProtocol, IsolationLevel, KafkaSourceConfig,
+    LatencyProfile, OffsetReset, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
+    SubjectNameStrategy, TopicSubscription,
 };
+
+/// Classic-protocol settings that KIP-848 moves to the broker.
+const CLASSIC_GROUP_OPTIONS: [&str; 3] = [
+    "session.timeout.ms",
+    "heartbeat.interval.ms",
+    "partition.assignment.strategy",
+];
 
 impl KafkaSourceConfig {
     /// Parses a Kafka source configuration from connector properties.
@@ -123,20 +130,42 @@ impl KafkaSourceConfig {
         self.isolation_level = config
             .get("isolation.level")
             .map_or(Ok(IsolationLevel::default()), str::parse)?;
+        self.latency_profile = config
+            .get("latency.profile")
+            .map_or(Ok(LatencyProfile::default()), str::parse)?;
+        let profile = self.latency_profile.source_defaults();
         self.max_poll_records = config
             .get_parsed::<usize>("max.poll.records")?
-            .unwrap_or(1000);
+            .unwrap_or(profile.max_poll_records);
         self.partition_assignment_strategy = config
             .get("partition.assignment.strategy")
             .map_or(Ok(AssignmentStrategy::Range), str::parse)?;
-        self.fetch_min_bytes = config.get_parsed::<i32>("fetch.min.bytes")?;
+        self.fetch_min_bytes = config
+            .get_parsed::<i32>("fetch.min.bytes")?
+            .or(profile.fetch_min_bytes);
         self.fetch_max_bytes = config.get_parsed::<i32>("fetch.max.bytes")?;
-        self.fetch_max_wait_ms = config.get_parsed::<i32>("fetch.max.wait.ms")?;
+        self.fetch_max_wait_ms = config
+            .get_parsed::<i32>("fetch.max.wait.ms")?
+            .or(profile.fetch_max_wait_ms);
         self.max_partition_fetch_bytes = config.get_parsed::<i32>("max.partition.fetch.bytes")?;
         Ok(())
     }
 
     fn parse_group_timing(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        self.group_protocol = config
+            .get("group.protocol")
+            .map_or(Ok(GroupProtocol::default()), str::parse)?;
+        if self.group_protocol == GroupProtocol::Consumer {
+            if let Some(key) = CLASSIC_GROUP_OPTIONS
+                .iter()
+                .find(|key| config.get(key).is_some())
+            {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "'{key}' is a classic consumer-group setting; group.protocol = consumer \
+                     (KIP-848) assigns partitions and times sessions on the broker"
+                )));
+            }
+        }
         let session_timeout_ms = config
             .get_parsed::<u64>("session.timeout.ms")?
             .unwrap_or(45_000);

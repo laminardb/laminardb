@@ -3,6 +3,8 @@
 // Source modules
 pub mod avro;
 pub mod config;
+pub mod latency_profile;
+mod librdkafka;
 mod metadata_error;
 pub mod metrics;
 mod offsets;
@@ -293,6 +295,16 @@ fn kafka_source_consumer_config_keys() -> Vec<ConfigKeySpec> {
             "Transaction isolation (read_uncommitted/read_committed)",
             "read_committed",
         ),
+        ConfigKeySpec::optional(
+            "latency.profile",
+            "Fetch preset (low_latency/balanced/throughput); explicit options override it",
+            "balanced",
+        ),
+        ConfigKeySpec::optional(
+            "group.protocol",
+            "Consumer group protocol (classic/consumer); consumer is KIP-848",
+            "classic",
+        ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
         ConfigKeySpec::optional(
             "partition.assignment.strategy",
@@ -407,6 +419,11 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
             "key-hash",
         ),
         // Batching & Compression
+        ConfigKeySpec::optional(
+            "latency.profile",
+            "Producer batching preset (low_latency/balanced/throughput); explicit options override it",
+            "balanced",
+        ),
         ConfigKeySpec::optional("linger.ms", "Producer linger time in milliseconds", "5"),
         ConfigKeySpec::optional("batch.size", "Producer batch size in bytes", "16384"),
         ConfigKeySpec::optional("batch.num.messages", "Max messages per batch", "10000"),
