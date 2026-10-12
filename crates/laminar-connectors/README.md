@@ -13,7 +13,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | Replayable ALO; exact-certified input for coordinated EO pipelines | Implemented |
+| Kafka | `kafka` | Replayable ALO with typed record metadata; exact-certified input for coordinated EO pipelines | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
@@ -488,14 +488,15 @@ tree implements; "rejected" means startup fails before connector I/O with the st
 
 | Capability | Embedded / single-node | Cluster |
 |---|---|---|
-| Source, append event log, at-least-once | Implemented | Implemented (engine-assigned partitions per vnode) |
+| Source, append event log, at-least-once | Implemented; a compacted topic (`cleanup.policy` includes `compact`) is rejected under a guarantee | Implemented (engine-assigned partitions per vnode) |
 | Source as exactly-once input | Implemented (exact-certified, `read_committed` required) | Implemented with a certified exactly-once sink |
 | Source, Debezium envelope (keyed upsert by `PRIMARY KEY`) | Temporal-join right side, bounded interval join, direct keyed sinks | Rejected outside the admitted join routes |
 | Source, Kafka table (key + value = upsert, key + null = delete) | Not implemented | Not implemented |
 | Source, regex subscription or partition/topic additions under a guarantee | Rejected | Rejected |
 | Sink, append, at-least-once | Implemented | Implemented (independent writers) |
 | Sink, upsert (compacted topic), at-least-once | Implemented (singleton writer) | Rejected: no fencing for a former owner's delayed writes |
-| Sink, exactly-once | Rejected (`LDB-5035`) | Rejected |
+| Sink, exactly-once (append and upsert) | Implemented: checkpoint-staged output published by one fenced transactional committer | Rejected until the cluster kill-9 qualification passes; the protocol already handles multiple participants and leader fencing tokens |
+| Sink, upsert under exactly-once | Implemented (any participant may stage; only the fenced committer writes) | Rejected with cluster exactly-once |
 
 Remaining known gaps, tracked until fixed: OAUTHBEARER has no token provider (rejected); GSSAPI
 works only where librdkafka reports `sasl_gssapi` (the Windows build uses SSPI; Linux builds do
@@ -538,6 +539,18 @@ advisory offset commits; guaranteed delivery rejects `group.instance.id`.
 - A record larger than `record.max.bytes` (key and value; default 16 MiB) or with a non-UTF-8
   header name cannot become a row. It fails a guaranteed source at that offset and is skipped,
   with its offset, by a best-effort one, like an undecodable record.
+- Retention: a guaranteed append source checks each subscribed topic's `cleanup.policy` at
+  startup and rejects `compact`, which can delete records inside a checkpoint's replay range
+  (read with DescribeConfigs; when that is denied or unanswered the source starts and logs a
+  warning). A Debezium source reads compacted topics: its keyed state converges on the newest
+  record per key. Records that `retention.ms` or `retention.bytes` remove before a restart cannot
+  be replayed; the source then fails at startup instead of skipping them.
+- Avro writer schemas: with a Schema Registry, at most 64 writer schemas are registered at once;
+  the least recently used one that the current poll does not need is evicted and fetched again
+  when it reappears. A single poll needing more than 64 fails with a `max.poll.records` hint.
+  Registry TLS uses the default trust roots unless `schema.registry.ssl.ca.location` is set, and a
+  client certificate (`schema.registry.ssl.certificate.location` plus `.key.location`) applies in
+  both cases.
 - Memory: the reader queue holds at most `reader.channel.capacity` records and
   `reader.channel.max.bytes` connector-owned bytes (default 64 MiB); a poll stages at most
   `max.poll.records` records and `max.poll.bytes` bytes (default 16 MiB, at least one record).
@@ -604,6 +617,33 @@ checkpoint itself and publishes it only after the engine's durable Commit decisi
 | Transaction timeout or abortable error | Nothing visible | Abort and publish again from the staged descriptor |
 | Fenced by a successor | Nothing more from this producer can commit | Outcome unknown; the successor's fenced cursor read decides |
 
+Configuration: `delivery = exactly_once` (pipeline-wide) plus `commit.topic`, an existing topic
+with `cleanup.policy=compact` (checked before fencing; one topic may serve several sinks, each
+under its own key). `transaction.timeout.ms` (default 60000, at most 900000) bounds publication;
+the delivery deadline is capped to it. `epoch.max.bytes` (default 64 MiB) bounds one epoch's
+staged key and value bytes: a write past it fails with a sizing error (output bytes per second x
+checkpoint interval), and an epoch whose compressed descriptor exceeds the engine's 16 MiB
+descriptor limit fails its checkpoint. `dlq.topic` is rejected because dead-lettered records
+would escape the transaction. Output becomes visible when its checkpoint commits, so visibility
+latency is about half the checkpoint interval plus checkpoint persistence and one transaction;
+the latency profile tunes the publication batching only. The first transactional use of a fresh
+Apache Kafka cluster creates `__transaction_state`, which can outlast one commit deadline; the
+engine retries the commit.
+
+Fencing: a committer reads the newest marker before `init_transactions` and refuses to fence
+when it carries a newer fencing token, so an obsolete committer cannot abort a successor that has
+already committed. An obsolete committer that fences a successor which has not yet committed can
+only make that successor's in-flight commit fail with an unknown outcome; the successor's retry
+fences back, and the cursor check stops the obsolete committer from publishing. Only the engine's
+leadership lease keeps an obsolete committer from repeating that interruption.
+
+Evidence: `tests/kafka_exactly_once.rs` (real broker) covers invisible staging and an idempotent
+retried commit, a successor publishing a cut its predecessor never published, a successor
+fencing an open predecessor transaction (its records exist but are aborted), a lost commit
+response reconciled by the marker, obsolete-committer fencing and token regression, multiple
+participants with an overlapping recovery batch and empty participants, and upsert tombstones.
+It passes on Redpanda 26.1.13 and Apache Kafka 4.1.1.
+
 Scope: each committed checkpoint's output becomes visible atomically to `read_committed`
 consumers of the output topic, once per logical output record. It does not deduplicate equal
 input records, cover side effects inside UDFs, or make several sinks' commits one atomic
@@ -669,7 +709,7 @@ backpressures rather than dropping rows.
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | Durable broker-acknowledged at-least-once; no transactional commit | Implemented |
+| Kafka | `kafka` | Durable broker-acknowledged at-least-once (append, or upsert from a singleton writer); exactly-once append and upsert in embedded/single-node mode via checkpoint-staged output and one fenced transactional committer | Implemented |
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert, history `cdc_replay`, durable at-least-once | Implemented |

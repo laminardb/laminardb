@@ -1855,7 +1855,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
             <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
-            <td>Single-node requires an exclusively locked local checkpoint directory, a replayable source with exact recovery, and a coordinated sink. Cluster mode requires a shared checkpoint URL and Kafka input with either an S3/S3A append-mode Delta Lake sink or a REST-catalog Iceberg append sink backed by S3/S3A storage. Kafka output remains at-least-once. Unsupported combinations fail before connector I/O.</td>
+            <td>Single-node requires an exclusively locked local checkpoint directory, a replayable source with exact recovery, and a coordinated sink. Cluster mode requires a shared checkpoint URL and Kafka input with either an S3/S3A append-mode Delta Lake sink or a REST-catalog Iceberg append sink backed by S3/S3A storage. Kafka output is exactly-once in embedded and single-node mode through checkpoint-staged transactions and a fenced committer; cluster Kafka output remains at-least-once. Unsupported combinations fail before connector I/O.</td>
           </tr>
         </tbody>
       </table>
