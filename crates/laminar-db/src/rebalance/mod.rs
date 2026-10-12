@@ -3166,7 +3166,7 @@ fn authorize_recovery_successor<'a>(
         let authority = controller
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-        // A committed topology cannot restore on a survivor map. Wait for complete-slot
+        // A live topology migration cannot restore on a survivor map. Wait for complete-slot
         // replacement before closing authority or taking over any predecessor process lease.
         tokio::time::timeout_at(
             deadline,

@@ -2639,15 +2639,13 @@ impl LeaderLeaseStore {
         let topology = current
             .committed_topology_operation()
             .and_then(|operation| operation.commit.as_ref());
-        let release_matches_topology = topology.is_none_or(|commit| {
-            current
-                .committed_topology_operation()
-                .is_some_and(|operation| operation.phase == super::TopologyAdmissionPhase::Active)
+        let release_matches_topology = current.live_topology_migration().is_none_or(|operation| {
+            operation.phase == super::TopologyAdmissionPhase::Active
                 && snapshot
                     .committed_release
                     .as_ref()
                     .and_then(|release| release.round.topology_binding())
-                    .is_some_and(|binding| binding.commit() == commit)
+                    .is_some_and(|binding| Some(binding.commit()) == operation.commit.as_ref())
         });
         Ok(topology == snapshot.topology.as_ref()
             && release_matches_topology

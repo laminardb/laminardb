@@ -44,6 +44,18 @@ pub struct ClusterTopologyStatus {
 }
 
 impl LaminarDB {
+    /// Commit of a migration that still owns startup, assignment and recovery authority.
+    pub(crate) async fn live_topology_commit(
+        &self,
+    ) -> Result<Option<laminar_core::cluster::control::TopologyCommit>, DbError> {
+        let store = self
+            .catalog_manifest_store
+            .lock()
+            .clone()
+            .ok_or(laminar_core::cluster::control::TopologyError::Fenced)?;
+        Ok(store.live_topology_commit().await?)
+    }
+
     /// Read an admitted request's definitive status; no request ownership depends on this call.
     ///
     /// # Errors
@@ -83,11 +95,13 @@ impl LaminarDB {
         let committed_version = catalog.committed_version();
         let replayed_version = *self.replayed_topology_version.lock();
         let controller = self.cluster_controller.lock().clone();
+        let live = store.live_topology_commit().await?;
+        // A settled target is an ordinary deployment: running with open gates is its activation.
         let release_observed = match &catalog {
             TopologyCatalogState::Versioned {
                 committed: Some(commit),
                 ..
-            } => {
+            } if live.as_ref() == Some(commit) => {
                 let binding = self.installed_topology_runtime.lock().clone();
                 match binding.filter(|binding| {
                     binding.input.operation().commit.as_ref() == Some(commit)

@@ -289,30 +289,7 @@ impl TopologyDriver {
                     db.certify_installed_cluster_topology(operation).await?;
                 }
             }
-            TopologyAdmissionPhase::Active => {
-                let recovered = db
-                    .installed_topology_runtime
-                    .lock()
-                    .clone()
-                    .filter(|binding| {
-                        binding.input.operation().operation_id == operation
-                            && binding.recovery.is_some()
-                    });
-                if let Some(binding) = recovered {
-                    if !db.recovered_topology_runtime_is_active(&binding).await? {
-                        self.request_recovery(db, controller);
-                        return Err(TopologyError::Fenced.into());
-                    }
-                    self.image = None;
-                    self.completed = Some((operation, status.status_sequence));
-                    return Ok(());
-                }
-                // Original Release only authorizes its exact runtime UUID. Never reconstruct a
-                // post-Release failure from the parent root or reuse another runtime's receipt.
-                db.apply_cluster_topology_release(operation).await?;
-                self.image = None;
-                self.completed = Some((operation, status.status_sequence));
-            }
+            TopologyAdmissionPhase::Active => self.advance_active(db, controller, status).await?,
             TopologyAdmissionPhase::Aborted { .. } => {
                 return Err(TopologyError::Conflict(
                     "aborted topology cannot advance a target phase".into(),
@@ -320,6 +297,40 @@ impl TopologyDriver {
                 .into());
             }
         }
+        Ok(())
+    }
+
+    async fn advance_active(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        status: &TopologyAdmissionStatus,
+    ) -> Result<(), DbError> {
+        let operation = status.operation_id;
+        if db.live_topology_commit().await?.as_ref() == status.commit.as_ref() {
+            let recovered = db
+                .installed_topology_runtime
+                .lock()
+                .clone()
+                .filter(|binding| {
+                    binding.input.operation().operation_id == operation
+                        && binding.recovery.is_some()
+                });
+            if let Some(binding) = recovered {
+                if !db.recovered_topology_runtime_is_active(&binding).await? {
+                    self.request_recovery(db, controller);
+                    return Err(TopologyError::Fenced.into());
+                }
+            } else {
+                // Original Release only authorizes its exact runtime UUID. Never reconstruct a
+                // post-Release failure from the parent root or reuse another runtime's receipt.
+                db.apply_cluster_topology_release(operation).await?;
+            }
+        }
+        // A settled target may restart or reassign through ordinary recovery; no installed
+        // topology runtime remains to audit.
+        self.image = None;
+        self.completed = Some((operation, status.status_sequence));
         Ok(())
     }
 }
