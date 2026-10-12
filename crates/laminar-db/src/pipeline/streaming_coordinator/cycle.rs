@@ -102,7 +102,8 @@ impl StreamingCoordinator {
             }
         };
         *cycle_events += visible.num_rows() as u64;
-        if let Some(filtered) = filtered {
+        // A row-less batch carries only its cursor, staged above.
+        if let Some(filtered) = filtered.filter(|filtered| filtered.num_rows() > 0) {
             self.source_batches_buf
                 .entry(Arc::clone(&name))
                 .or_default()

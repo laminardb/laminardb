@@ -26,7 +26,9 @@ use laminar_connectors::connector::{
     SourceDrainResolution, SourcePosition, SourceStart,
 };
 use laminar_connectors::kafka::testing::partition_vnodes;
-use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, StartupMode, TopicSubscription};
+use laminar_connectors::kafka::{
+    KafkaMetadataColumns, KafkaSource, KafkaSourceConfig, StartupMode, TopicSubscription,
+};
 use laminar_core::checkpoint::AssignmentDrainId;
 use laminar_core::checkpoint::CheckpointAttempt;
 use laminar_core::state::{NodeId, VnodeRegistry};
@@ -275,7 +277,7 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
         group_id: format!("global-drain-grp-{run_id}"),
         subscription: TopicSubscription::Topics(vec![topic.clone()]),
         startup_mode: StartupMode::Earliest,
-        include_metadata: true,
+        metadata: KafkaMetadataColumns::parse("partition,offset,timestamp").unwrap(),
         ..KafkaSourceConfig::default()
     };
     let mut source = KafkaSource::new(schema(), cfg.clone(), None);

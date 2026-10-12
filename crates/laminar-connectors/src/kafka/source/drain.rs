@@ -2,9 +2,9 @@
 
 use super::{
     warn, Arc, AtomicU64, AtomicU8, ConnectorError, ConnectorState, Consumer, DeliveryGuarantee,
-    KafkaBlockingTasks, KafkaSource, KafkaSourceConfig, KafkaSourceMetrics, LaminarConsumerContext,
-    Mutex, Notify, Ordering, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution,
-    StreamConsumer, TopicPartitionList,
+    KafkaBlockingTasks, KafkaHeader, KafkaSource, KafkaSourceConfig, KafkaSourceMetrics,
+    KafkaTimestampType, LaminarConsumerContext, Mutex, Notify, Ordering, SourceDrainOutcome,
+    SourceDrainRequest, SourceDrainResolution, StreamConsumer, TopicPartitionList,
 };
 
 /// Locks a mutex, recovering from poison if a prior holder panicked.
@@ -63,17 +63,38 @@ pub(super) fn terminalize_guaranteed_poll_error(
     }
 }
 
-/// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
+/// One record sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
 pub(super) struct KafkaPayload {
-    pub(super) data: Vec<u8>,
+    /// Value bytes; `None` for a record whose value is null.
+    pub(super) data: Option<Vec<u8>>,
     pub(super) topic: Arc<str>,
     pub(super) partition: i32,
     /// Precomputed route for cluster-owned inputs; absent for local readers.
     pub(super) partition_vnode: Option<u32>,
     pub(super) offset: i64,
     pub(super) timestamp_ms: Option<i64>,
-    /// Message headers as a JSON string; populated only when `include_headers` is set.
-    pub(super) headers_json: Option<String>,
+    pub(super) timestamp_type: KafkaTimestampType,
+    /// Key bytes, captured only when the `key` metadata column is selected.
+    pub(super) key: Option<Vec<u8>>,
+    /// Headers in order, captured only when the `headers` metadata column is selected.
+    pub(super) headers: Vec<KafkaHeader>,
+    /// Why this record cannot become a row: it exceeds `record.max.bytes` or carries a header name
+    /// that is not UTF-8. Such a record is handled like an undecodable one.
+    pub(super) rejected: Option<Box<str>>,
+    /// Reader-channel byte budget, returned when the poll path drops the record.
+    pub(super) budget: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl KafkaPayload {
+    /// Bytes this record holds outside librdkafka: value, key and header names and values.
+    pub(super) fn retained_bytes(&self) -> usize {
+        let headers = self
+            .headers
+            .iter()
+            .map(|header| header.key.len() + header.value.as_ref().map_or(0, Vec::len))
+            .sum::<usize>();
+        self.data.as_ref().map_or(0, Vec::len) + self.key.as_ref().map_or(0, Vec::len) + headers
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

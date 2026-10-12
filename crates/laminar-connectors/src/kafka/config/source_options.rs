@@ -10,9 +10,9 @@ use crate::error::ConnectorError;
 use crate::serde::Format;
 
 use super::{
-    parse_specific_offsets, AssignmentStrategy, GroupProtocol, IsolationLevel, KafkaSourceConfig,
-    LatencyProfile, OffsetReset, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
-    SubjectNameStrategy, TopicSubscription,
+    parse_specific_offsets, AssignmentStrategy, GroupProtocol, IsolationLevel,
+    KafkaMetadataColumns, KafkaSourceConfig, LatencyProfile, OffsetReset, SchemaEvolutionStrategy,
+    SecurityProtocol, SrAuth, StartupMode, SubjectNameStrategy, TopicSubscription,
 };
 
 /// Classic-protocol settings that KIP-848 moves to the broker.
@@ -109,12 +109,19 @@ impl KafkaSourceConfig {
         self.schema_registry_discovery_timeout = config
             .get_parsed::<u64>("schema.registry.discovery.timeout.ms")?
             .map_or(Duration::from_secs(10), Duration::from_millis);
-        self.include_metadata = config
-            .get_parsed::<bool>("include.metadata")?
-            .unwrap_or(false);
-        self.include_headers = config
-            .get_parsed::<bool>("include.headers")?
-            .unwrap_or(false);
+        if let Some(key) = ["include.metadata", "include.headers"]
+            .into_iter()
+            .find(|key| config.get(key).is_some())
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "'{key}' was replaced by metadata.columns (key, topic, partition, offset, \
+                 timestamp, timestamp_type, headers)"
+            )));
+        }
+        self.metadata = config.get("metadata.columns").map_or(
+            Ok(KafkaMetadataColumns::default()),
+            KafkaMetadataColumns::parse,
+        )?;
         Ok(())
     }
 
@@ -193,6 +200,15 @@ impl KafkaSourceConfig {
         self.reader_channel_capacity = config
             .get_parsed::<usize>("reader.channel.capacity")?
             .unwrap_or(8192);
+        if let Some(bytes) = config.get_parsed::<usize>("reader.channel.max.bytes")? {
+            self.reader_channel_max_bytes = bytes;
+        }
+        if let Some(bytes) = config.get_parsed::<usize>("max.poll.bytes")? {
+            self.max_poll_bytes = bytes;
+        }
+        if let Some(bytes) = config.get_parsed::<usize>("record.max.bytes")? {
+            self.record_max_bytes = bytes;
+        }
         self.backpressure_high_watermark = config
             .get_parsed::<f64>("backpressure.high.watermark")?
             .unwrap_or(0.8);

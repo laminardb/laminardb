@@ -1,11 +1,10 @@
 //! Fail-closed startup policy and durable-position installation.
 
 use super::{
-    decode_partition_baselines, info, lock_or_recover, select_deserializer,
-    validate_kafka_output_schema, Arc, AvroDeserializer, ConnectorError, ConnectorState,
-    DeliveryGuarantee, Format, KafkaAssignmentPublication, KafkaPartitionBaselines,
-    KafkaPartitionRoutes, KafkaSource, KafkaSourceConfig, KafkaStartPlan, OffsetTracker, Ordering,
-    SourcePosition, SourceStart, StartupMode, TopicSubscription,
+    decode_partition_baselines, info, lock_or_recover, select_deserializer, Arc, AvroDeserializer,
+    ConnectorError, ConnectorState, DeliveryGuarantee, Format, KafkaAssignmentPublication,
+    KafkaPartitionBaselines, KafkaPartitionRoutes, KafkaSource, KafkaSourceConfig, KafkaStartPlan,
+    OffsetTracker, Ordering, SourcePosition, SourceStart, StartupMode, TopicSubscription,
 };
 use crate::kafka::config::IsolationLevel;
 
@@ -114,8 +113,7 @@ impl KafkaSource {
         if let Some(binding) = config.schema_binding() {
             self.schema = super::super::super::schema_resolution::payload_schema(
                 binding,
-                kafka_config.include_metadata,
-                kafka_config.include_headers,
+                &kafka_config.metadata,
             )?;
             if let Some(avro) = self
                 .deserializer
@@ -135,11 +133,7 @@ impl KafkaSource {
             );
             self.schema = schema;
         }
-        validate_kafka_output_schema(
-            &self.schema,
-            kafka_config.include_metadata,
-            kafka_config.include_headers,
-        )?;
+        kafka_config.metadata.validate_payload(&self.schema)?;
 
         info!(
             brokers = %kafka_config.bootstrap_servers,

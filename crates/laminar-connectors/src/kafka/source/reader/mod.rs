@@ -9,10 +9,11 @@ use super::{
     update_rotation_baselines, validate_kafka_assignment, validate_kafka_partition_results,
     validate_positions_not_expired, warn, Arc, AtomicBool, AtomicU64, AtomicU8, AtomicUsize,
     Consumer, KafkaAssignmentPublication, KafkaBlockingTaskError, KafkaBlockingTasks,
-    KafkaDrainBoundary, KafkaDrainPosition, KafkaPartitionBaselines, KafkaPartitionRoutes,
-    KafkaPartitionSet, KafkaPayload, KafkaReaderDrain, KafkaReaderDrainCommand, KafkaReaderItem,
-    KafkaSource, LaminarConsumerContext, Message, Mutex, Notify, OffsetTracker, Ordering,
-    RebalanceState, SourceDrainRequest, SourceDrainResolution, StreamConsumer, TopicPartitionList,
+    KafkaDrainBoundary, KafkaDrainPosition, KafkaHeader, KafkaPartitionBaselines,
+    KafkaPartitionRoutes, KafkaPartitionSet, KafkaPayload, KafkaReaderDrain,
+    KafkaReaderDrainCommand, KafkaReaderItem, KafkaSource, KafkaTimestampType,
+    LaminarConsumerContext, Message, Mutex, Notify, OffsetTracker, Ordering, RebalanceState,
+    SourceDrainRequest, SourceDrainResolution, StreamConsumer, TopicPartitionList,
 };
 
 mod drain_control;
@@ -25,8 +26,8 @@ use drain_control::{
     KafkaDrainHoldContext,
 };
 use payload::{
-    build_reader_payload, send_full_reader_item, update_reader_backpressure,
-    KafkaBackpressureContext, KafkaFullQueueContext,
+    acquire_reader_bytes, build_reader_payload, send_full_reader_item, update_reader_backpressure,
+    KafkaBackpressureContext, KafkaByteBudgetContext, KafkaFullQueueContext, KafkaRecordCapture,
 };
 use positioning::{position_reader_assignment, KafkaPositioningContext};
 use rotation::reconcile_vnode_assignment;
@@ -46,7 +47,9 @@ struct KafkaReaderTask {
     data_ready: Arc<Notify>,
     reader_fault: Arc<Mutex<Option<Arc<str>>>>,
     channel_len: Arc<AtomicUsize>,
-    capture_headers: bool,
+    capture: KafkaRecordCapture,
+    byte_budget: Arc<tokio::sync::Semaphore>,
+    byte_budget_capacity: usize,
     reader_channel_capacity: usize,
     reader_channel_capacity_f64: f64,
     assign_generation: Arc<AtomicU64>,
@@ -128,7 +131,19 @@ impl KafkaSource {
         let data_ready = Arc::clone(&self.data_ready);
         let reader_fault = Arc::clone(&self.reader_fault);
         let channel_len = Arc::clone(&self.channel_len);
-        let capture_headers = self.config.include_headers;
+        let capture = KafkaRecordCapture {
+            key: self
+                .config
+                .metadata
+                .contains(super::KafkaMetadataColumn::Key),
+            headers: self
+                .config
+                .metadata
+                .contains(super::KafkaMetadataColumn::Headers),
+            record_max_bytes: self.config.record_max_bytes,
+        };
+        let byte_budget_capacity = self.config.reader_channel_max_bytes;
+        let byte_budget = Arc::new(tokio::sync::Semaphore::new(byte_budget_capacity));
         let reader_channel_capacity = self.config.reader_channel_capacity;
         let reader_channel_capacity_f64 =
             u32::try_from(reader_channel_capacity).map_or(f64::from(u32::MAX), f64::from);
@@ -165,7 +180,9 @@ impl KafkaSource {
             data_ready,
             reader_fault,
             channel_len,
-            capture_headers,
+            capture,
+            byte_budget,
+            byte_budget_capacity,
             reader_channel_capacity,
             reader_channel_capacity_f64,
             assign_generation,
@@ -212,7 +229,9 @@ impl KafkaReaderTask {
             data_ready,
             reader_fault,
             channel_len,
-            capture_headers,
+            capture,
+            byte_budget,
+            byte_budget_capacity,
             reader_channel_capacity,
             reader_channel_capacity_f64,
             assign_generation,
@@ -374,6 +393,8 @@ impl KafkaReaderTask {
                     channel_len: &channel_len,
                     channel_capacity: reader_channel_capacity,
                     channel_capacity_f64: reader_channel_capacity_f64,
+                    byte_budget: &byte_budget,
+                    byte_budget_capacity,
                     pause_threshold,
                     resume_threshold,
                     drain_active: active_drain.is_some(),
@@ -437,11 +458,11 @@ impl KafkaReaderTask {
             };
             match msg_result {
                 Ok(msg) => {
-                    let Ok(payload) = build_reader_payload(
+                    let Ok(mut payload) = build_reader_payload(
                         &msg,
                         vnode_reassign.is_some(),
                         &vnode_partition_routes,
-                        capture_headers,
+                        capture,
                         &mut cached_topic,
                         &mut cached_topic_routes,
                         &reader_fault,
@@ -449,9 +470,20 @@ impl KafkaReaderTask {
                     ) else {
                         return;
                     };
-                    let Some(payload) = payload else {
-                        continue;
+                    let Some(budget) = acquire_reader_bytes(
+                        KafkaByteBudgetContext {
+                            consumer: &consumer,
+                            byte_budget: &byte_budget,
+                            reader_shutdown: &mut reader_shutdown,
+                        },
+                        payload.retained_bytes(),
+                        &mut is_paused,
+                    )
+                    .await
+                    else {
+                        break;
                     };
+                    payload.budget = budget;
                     let item = KafkaReaderItem::Payload(payload);
                     match msg_tx.try_send(item) {
                         Ok(()) => {

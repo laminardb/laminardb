@@ -53,13 +53,17 @@ fn drain_request() -> SourceDrainRequest {
 
 fn payload(offset: i64) -> KafkaPayload {
     KafkaPayload {
-        data: vec![u8::try_from(offset).unwrap_or_default()],
+        data: Some(vec![u8::try_from(offset).unwrap_or_default()]),
         topic: Arc::from("events"),
         partition: 1,
         partition_vnode: None,
         offset,
         timestamp_ms: None,
-        headers_json: None,
+        timestamp_type: KafkaTimestampType::CreateTime,
+        key: None,
+        headers: Vec::new(),
+        rejected: None,
+        budget: None,
     }
 }
 
@@ -147,13 +151,17 @@ async fn guaranteed_delivery_rejects_any_decode_failure_without_advancing_cursor
         (12, br#"{"id":12,"value":"good"}"#.as_slice()),
     ] {
         tx.send(KafkaReaderItem::Payload(KafkaPayload {
-            data: data.to_vec(),
+            data: Some(data.to_vec()),
             topic: Arc::from("events"),
             partition: 1,
             partition_vnode: None,
             offset,
             timestamp_ms: None,
-            headers_json: None,
+            timestamp_type: KafkaTimestampType::CreateTime,
+            key: None,
+            headers: Vec::new(),
+            rejected: None,
+            budget: None,
         }))
         .await
         .unwrap();
@@ -173,6 +181,167 @@ async fn guaranteed_delivery_rejects_any_decode_failure_without_advancing_cursor
         Some(9)
     );
     assert_eq!(source.try_checkpoint().unwrap().unwrap(), checkpoint_before);
+}
+
+fn record(offset: i64, data: Option<&[u8]>) -> KafkaReaderItem {
+    KafkaReaderItem::Payload(KafkaPayload {
+        data: data.map(<[u8]>::to_vec),
+        topic: Arc::from("events"),
+        partition: 1,
+        partition_vnode: None,
+        offset,
+        timestamp_ms: Some(offset),
+        timestamp_type: KafkaTimestampType::LogAppendTime,
+        key: None,
+        headers: Vec::new(),
+        rejected: None,
+        budget: None,
+    })
+}
+
+type ReaderTx = crossfire::MAsyncTx<crossfire::mpsc::Array<KafkaReaderItem>>;
+
+/// A running source whose reader queue holds `items`; the returned sender keeps it connected.
+fn queued_source(
+    config: KafkaSourceConfig,
+    delivery: DeliveryGuarantee,
+    items: Vec<KafkaReaderItem>,
+) -> (KafkaSource, ReaderTx) {
+    let mut source = KafkaSource::new(test_schema(), config, None);
+    source.source_name = Arc::from("events-source");
+    source.state = ConnectorState::Running;
+    source.delivery = delivery;
+    let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(items.len().max(1));
+    let count = items.len();
+    for item in items {
+        tx.try_send(item).ok().unwrap();
+    }
+    source.channel_len.store(count, Ordering::Release);
+    source.msg_rx = Some(rx);
+    (source, tx)
+}
+
+#[tokio::test]
+async fn null_value_records_advance_the_cursor_without_rows() {
+    let good = br#"{"id":10,"value":"v"}"#.as_slice();
+    let (mut source, _tx) = queued_source(
+        test_config(),
+        DeliveryGuarantee::AtLeastOnce,
+        vec![record(10, Some(good)), record(11, None), record(12, None)],
+    );
+
+    let batch = source.poll_batch(2).await.unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(source.offsets.get("events", 1), Some(11));
+
+    // A poll of only null values still returns a batch so the cursor reaches the tail.
+    let tail = source.poll_batch(10).await.unwrap().unwrap();
+    assert_eq!(tail.num_rows(), 0);
+    assert_eq!(tail.records.schema(), source.schema());
+    assert_eq!(tail.row_positions().unwrap().partition().len(), 0);
+    assert_eq!(source.offsets.get("events", 1), Some(12));
+    assert!(source.poll_batch(10).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn metadata_columns_are_typed_and_keep_binary_headers() {
+    let mut config = test_config();
+    config.metadata =
+        KafkaMetadataColumns::parse("key,topic,partition,offset,timestamp_type,headers").unwrap();
+    let KafkaReaderItem::Payload(mut keyed) = record(5, Some(br#"{"id":5,"value":"a"}"#)) else {
+        unreachable!()
+    };
+    keyed.key = Some(vec![0xff, 0x00]);
+    keyed.headers = vec![
+        KafkaHeader {
+            key: "trace".into(),
+            value: Some(vec![0x80]),
+        },
+        KafkaHeader {
+            key: "trace".into(),
+            value: None,
+        },
+    ];
+    let (mut source, _tx) = queued_source(
+        config,
+        DeliveryGuarantee::AtLeastOnce,
+        vec![
+            KafkaReaderItem::Payload(keyed),
+            record(6, Some(br#"{"id":6,"value":"b"}"#)),
+        ],
+    );
+
+    let batch = source.poll_batch(10).await.unwrap().unwrap();
+    let records = &batch.records;
+    assert_eq!(records.schema(), source.schema());
+    let keys = records
+        .column_by_name("_key")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .unwrap();
+    assert_eq!(keys.value(0), &[0xff, 0x00]);
+    assert!(keys.is_null(1));
+    let types = records
+        .column_by_name("_timestamp_type")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(types.value(0), "log_append_time");
+    let headers = records
+        .column_by_name("_headers")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::ListArray>()
+        .unwrap();
+    assert_eq!(headers.value(0).len(), 2);
+    assert_eq!(headers.value(1).len(), 0);
+}
+
+#[tokio::test]
+async fn rejected_records_fail_guaranteed_sources_and_are_skipped_best_effort() {
+    let rejected = || {
+        let KafkaReaderItem::Payload(mut payload) = record(20, None) else {
+            unreachable!()
+        };
+        payload.rejected = Some("too large".into());
+        KafkaReaderItem::Payload(payload)
+    };
+    let (mut guaranteed, _guaranteed_tx) = queued_source(
+        test_config(),
+        DeliveryGuarantee::AtLeastOnce,
+        vec![rejected()],
+    );
+    let error = guaranteed.poll_batch(10).await.unwrap_err();
+    assert!(error.to_string().contains("too large"), "{error}");
+    assert_eq!(guaranteed.state, ConnectorState::Failed);
+    assert_eq!(guaranteed.offsets.get("events", 1), None);
+
+    let (mut best_effort, _best_effort_tx) = queued_source(
+        test_config(),
+        DeliveryGuarantee::BestEffort,
+        vec![rejected(), record(21, Some(br#"{"id":21,"value":"ok"}"#))],
+    );
+    let batch = best_effort.poll_batch(10).await.unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(best_effort.offsets.get("events", 1), Some(21));
+}
+
+#[tokio::test]
+async fn max_poll_bytes_bounds_a_poll_but_always_takes_one_record() {
+    let mut config = test_config();
+    config.max_poll_bytes = 1;
+    let (mut source, _tx) = queued_source(
+        config,
+        DeliveryGuarantee::AtLeastOnce,
+        vec![
+            record(1, Some(br#"{"id":1,"value":"a"}"#)),
+            record(2, Some(br#"{"id":2,"value":"b"}"#)),
+        ],
+    );
+    assert_eq!(source.poll_batch(10).await.unwrap().unwrap().num_rows(), 1);
+    assert_eq!(source.poll_batch(10).await.unwrap().unwrap().num_rows(), 1);
 }
 
 #[tokio::test]
@@ -207,13 +376,17 @@ async fn guaranteed_post_drain_registry_failure_requires_a_fresh_generation() {
 
     let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(1);
     tx.send(KafkaReaderItem::Payload(KafkaPayload {
-        data: vec![0, 0, 0, 0, 42],
+        data: Some(vec![0, 0, 0, 0, 42]),
         topic: Arc::from("events"),
         partition: 1,
         partition_vnode: None,
         offset: 10,
         timestamp_ms: None,
-        headers_json: None,
+        timestamp_type: KafkaTimestampType::CreateTime,
+        key: None,
+        headers: Vec::new(),
+        rejected: None,
+        budget: None,
     }))
     .await
     .unwrap();
@@ -251,13 +424,17 @@ async fn best_effort_retains_explicit_poison_pill_threshold() {
         (12, br#"{"id":12,"value":"good"}"#.as_slice()),
     ] {
         tx.send(KafkaReaderItem::Payload(KafkaPayload {
-            data: data.to_vec(),
+            data: Some(data.to_vec()),
             topic: Arc::from("events"),
             partition: 1,
             partition_vnode: None,
             offset,
             timestamp_ms: None,
-            headers_json: None,
+            timestamp_type: KafkaTimestampType::CreateTime,
+            key: None,
+            headers: Vec::new(),
+            rejected: None,
+            budget: None,
         }))
         .await
         .unwrap();
@@ -311,13 +488,17 @@ async fn decoded_row_count_mismatch_preserves_cursor_and_rotation_baseline() {
     let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(2);
     for offset in [10, 11] {
         tx.send(KafkaReaderItem::Payload(KafkaPayload {
-            data: format!(r#"{{"id":{offset},"value":"good"}}"#).into_bytes(),
+            data: Some(format!(r#"{{"id":{offset},"value":"good"}}"#).into_bytes()),
             topic: Arc::from("events"),
             partition: 1,
             partition_vnode: Some(0),
             offset,
             timestamp_ms: None,
-            headers_json: None,
+            timestamp_type: KafkaTimestampType::CreateTime,
+            key: None,
+            headers: Vec::new(),
+            rejected: None,
+            budget: None,
         }))
         .await
         .unwrap();
@@ -406,13 +587,17 @@ async fn decoded_batch_retains_the_assignment_cut_pinned_during_drain() {
 
     let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(1);
     tx.send(KafkaReaderItem::Payload(KafkaPayload {
-        data: br#"{"id":10,"value":"accepted"}"#.to_vec(),
+        data: Some(br#"{"id":10,"value":"accepted"}"#.to_vec()),
         topic: Arc::from("events"),
         partition: 0,
         partition_vnode: Some(0),
         offset: 10,
         timestamp_ms: None,
-        headers_json: None,
+        timestamp_type: KafkaTimestampType::CreateTime,
+        key: None,
+        headers: Vec::new(),
+        rejected: None,
+        budget: None,
     }))
     .await
     .unwrap();
@@ -473,13 +658,17 @@ async fn assignment_batch_cursor_is_complete_once_then_incremental_until_rotatio
     let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(3);
     for (partition, partition_vnode, offset) in [(0, 0, 10), (1, 1, 20), (0, 0, 12)] {
         tx.send(KafkaReaderItem::Payload(KafkaPayload {
-            data: format!(r#"{{"id":{offset},"value":"accepted"}}"#).into_bytes(),
+            data: Some(format!(r#"{{"id":{offset},"value":"accepted"}}"#).into_bytes()),
             topic: Arc::from("events"),
             partition,
             partition_vnode: Some(partition_vnode),
             offset,
             timestamp_ms: None,
-            headers_json: None,
+            timestamp_type: KafkaTimestampType::CreateTime,
+            key: None,
+            headers: Vec::new(),
+            rejected: None,
+            budget: None,
         }))
         .await
         .unwrap();
@@ -963,8 +1152,7 @@ fn debezium_operations_are_validated_and_normalized() {
 async fn debezium_poll_returns_declared_schema_with_positions_and_mutations() {
     let mut config = test_config();
     config.format = Format::Debezium;
-    config.include_metadata = true;
-    config.include_headers = true;
+    config.metadata = KafkaMetadataColumns::parse("partition,offset,timestamp,headers").unwrap();
     let mut source = KafkaSource::new(test_schema(), config, None);
     source.state = ConnectorState::Running;
     source.source_name = Arc::from("inventory");
@@ -981,13 +1169,20 @@ async fn debezium_poll_returns_declared_schema_with_positions_and_mutations() {
         ),
     ] {
         tx.send(KafkaReaderItem::Payload(KafkaPayload {
-            data: data.to_vec(),
+            data: Some(data.to_vec()),
             topic: Arc::from("events"),
             partition: 1,
             partition_vnode: None,
             offset,
             timestamp_ms: Some(offset),
-            headers_json: Some(format!(r#"{{"offset":{offset}}}"#)),
+            timestamp_type: KafkaTimestampType::CreateTime,
+            key: None,
+            headers: vec![KafkaHeader {
+                key: "offset".into(),
+                value: Some(offset.to_string().into_bytes()),
+            }],
+            rejected: None,
+            budget: None,
         }))
         .await
         .unwrap();

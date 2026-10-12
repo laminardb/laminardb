@@ -10,6 +10,11 @@ use crate::error::ConnectorError;
 use crate::serde::Format;
 
 pub use super::latency_profile::LatencyProfile;
+pub use super::source::{KafkaMetadataColumn, KafkaMetadataColumns};
+
+const DEFAULT_READER_CHANNEL_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_MAX_POLL_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_RECORD_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 mod source_options;
 
@@ -548,10 +553,8 @@ pub struct KafkaSourceConfig {
     /// Deadline for Schema Registry lookups performed during schema
     /// auto-discovery at DDL time. Default: 10s.
     pub schema_registry_discovery_timeout: Duration,
-    /// Whether to include Kafka metadata columns (_partition, _offset, _timestamp).
-    pub include_metadata: bool,
-    /// Whether to include Kafka headers as a map column (_headers).
-    pub include_headers: bool,
+    /// Record metadata columns appended after the decoded value columns.
+    pub metadata: KafkaMetadataColumns,
 
     // -- Consumer tuning --
     /// Consumer startup mode (controls initial offset positioning).
@@ -610,6 +613,16 @@ pub struct KafkaSourceConfig {
     /// Capacity of the bounded channel between the background Kafka reader
     /// task and `poll_batch()` (default: 8192). Must be >= `max_poll_records`.
     pub reader_channel_capacity: usize,
+    /// Key, value and header bytes the reader channel may hold (default: 64 MiB). The reader
+    /// waits for the poll path to drain before queueing more.
+    pub reader_channel_max_bytes: usize,
+    /// Key, value and header bytes one poll stages before decoding (default: 16 MiB). A poll
+    /// always takes at least one record.
+    pub max_poll_bytes: usize,
+    /// Largest accepted record (key, value and headers; default: 16 MiB). A larger record is
+    /// handled like an undecodable one: it fails a guaranteed-delivery source and is skipped by
+    /// a best-effort source.
+    pub record_max_bytes: usize,
     /// Channel fill ratio at which to pause consumption.
     pub backpressure_high_watermark: f64,
     /// Channel fill ratio at which to resume consumption.
@@ -674,8 +687,7 @@ impl Default for KafkaSourceConfig {
             schema_registry_subject_strategy: SubjectNameStrategy::default(),
             schema_registry_record_name: None,
             schema_registry_discovery_timeout: Duration::from_secs(10),
-            include_metadata: false,
-            include_headers: false,
+            metadata: KafkaMetadataColumns::default(),
             startup_mode: StartupMode::default(),
             auto_offset_reset: OffsetReset::Earliest,
             isolation_level: IsolationLevel::default(),
@@ -693,6 +705,9 @@ impl Default for KafkaSourceConfig {
             queued_max_messages_kbytes: 16384,
             broker_commit_on_checkpoint: true,
             reader_channel_capacity: 8192,
+            reader_channel_max_bytes: DEFAULT_READER_CHANNEL_MAX_BYTES,
+            max_poll_bytes: DEFAULT_MAX_POLL_BYTES,
+            record_max_bytes: DEFAULT_RECORD_MAX_BYTES,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.25,
             max_deser_error_rate: 0.5,
@@ -743,6 +758,22 @@ impl KafkaSourceConfig {
             return Err(ConnectorError::ConfigurationError(format!(
                 "reader.channel.capacity ({}) must be >= max.poll.records ({})",
                 self.reader_channel_capacity, self.max_poll_records
+            )));
+        }
+        if self.max_poll_bytes == 0 || self.record_max_bytes == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "max.poll.bytes and record.max.bytes must be > 0".into(),
+            ));
+        }
+        if self.record_max_bytes > self.reader_channel_max_bytes
+            || self.reader_channel_max_bytes > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "record.max.bytes ({}) must be <= reader.channel.max.bytes ({}), which must be \
+                 <= {}",
+                self.record_max_bytes,
+                self.reader_channel_max_bytes,
+                tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
 

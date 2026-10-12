@@ -1,9 +1,9 @@
 //! Payload decoding, Debezium normalization, and metadata column assembly.
 
 use super::{
-    info, kafka_output_schema, terminalize_guaranteed_poll_error, warn, Arc, AvroDeserializer,
-    CompatibilityMode, ConnectorError, DeliveryGuarantee, EvolutionVerdict, KafkaSource,
-    SchemaEvolution, SchemaEvolutionStrategy, SerdeError,
+    info, terminalize_guaranteed_poll_error, warn, Arc, AvroDeserializer, CompatibilityMode,
+    ConnectorError, DeliveryGuarantee, EvolutionVerdict, KafkaSource, SchemaEvolution,
+    SchemaEvolutionStrategy, SerdeError,
 };
 
 impl KafkaSource {
@@ -237,34 +237,19 @@ impl KafkaSource {
         &mut self,
         batch: arrow_array::RecordBatch,
         good_indices: Option<&[usize]>,
-        include_metadata: bool,
-        include_headers: bool,
     ) -> Result<arrow_array::RecordBatch, ConnectorError> {
-        // If poison pill fallback filtered records, also filter metadata
-        // vectors so their lengths match the deserialized batch row count.
-        if let Some(idx) = good_indices {
-            if include_metadata {
-                self.poll_meta_partitions =
-                    idx.iter().map(|&i| self.poll_meta_partitions[i]).collect();
-                self.poll_meta_offsets = idx.iter().map(|&i| self.poll_meta_offsets[i]).collect();
-                self.poll_meta_timestamps =
-                    idx.iter().map(|&i| self.poll_meta_timestamps[i]).collect();
-            }
-            if include_headers {
-                self.poll_meta_headers = idx
-                    .iter()
-                    .map(|&i| std::mem::take(&mut self.poll_meta_headers[i]))
-                    .collect();
-            }
+        if self.config.metadata.is_empty() {
+            return Ok(batch);
         }
-
-        let rows = batch.num_rows();
-        let metadata_aligned = !include_metadata
-            || (self.poll_meta_partitions.len() == rows
-                && self.poll_meta_offsets.len() == rows
-                && self.poll_meta_timestamps.len() == rows);
-        let headers_aligned = !include_headers || self.poll_meta_headers.len() == rows;
-        if !metadata_aligned || !headers_aligned {
+        // Poison-pill isolation can drop rows; keep the metadata of the decoded ones only.
+        if let Some(indices) = good_indices {
+            let kept = indices
+                .iter()
+                .filter_map(|&index| self.poll_row_metadata.get(index).cloned())
+                .collect::<Vec<_>>();
+            self.poll_row_metadata = kept;
+        }
+        if self.poll_row_metadata.len() != batch.num_rows() {
             return Err(terminalize_guaranteed_poll_error(
                 self.delivery,
                 &mut self.state,
@@ -275,43 +260,31 @@ impl KafkaSource {
                 ),
             ));
         }
-
-        let batch = if include_metadata || include_headers {
-            let output_schema =
-                kafka_output_schema(&batch.schema(), include_metadata, include_headers);
-            let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
-
-            if include_metadata {
-                use arrow_array::{Int32Array, Int64Array, TimestampMillisecondArray};
-                columns.push(Arc::new(Int32Array::from(std::mem::take(
-                    &mut self.poll_meta_partitions,
-                ))));
-                columns.push(Arc::new(Int64Array::from(std::mem::take(
-                    &mut self.poll_meta_offsets,
-                ))));
-                columns.push(Arc::new(TimestampMillisecondArray::from(std::mem::take(
-                    &mut self.poll_meta_timestamps,
-                ))));
-            }
-            if include_headers {
-                columns.push(Arc::new(arrow_array::StringArray::from(std::mem::take(
-                    &mut self.poll_meta_headers,
-                ))));
-            }
-
-            arrow_array::RecordBatch::try_new(output_schema, columns).map_err(|e| {
-                terminalize_guaranteed_poll_error(
-                    self.delivery,
-                    &mut self.state,
-                    &self.metrics,
-                    self.reader_shutdown.as_ref(),
-                    ConnectorError::Internal(format!("failed to append metadata columns: {e}")),
+        let output_schema = self.config.metadata.output_schema(&batch.schema());
+        let mut columns = batch.columns().to_vec();
+        let appended = self
+            .config
+            .metadata
+            .arrays(&self.poll_row_metadata)
+            .and_then(|arrays| {
+                columns.extend(arrays);
+                arrow_array::RecordBatch::try_new_with_options(
+                    output_schema,
+                    columns,
+                    &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
                 )
-            })?
-        } else {
-            batch
-        };
-
-        Ok(batch)
+                .map_err(|error| {
+                    ConnectorError::Internal(format!("failed to append metadata columns: {error}"))
+                })
+            });
+        appended.map_err(|error| {
+            terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                error,
+            )
+        })
     }
 }

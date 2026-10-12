@@ -3,9 +3,9 @@
 use super::{
     debug, kafka_row_positions, lock_or_recover, normalize_kafka_debezium_batch,
     retire_accepted_rotation_baselines, rotation_baselines_len, rotation_partition_baseline,
-    terminalize_guaranteed_poll_error, vnode_payload_is_current, Arc, ConnectorError,
-    ConnectorState, Format, KafkaAssignmentPublication, KafkaPayload, KafkaReaderItem, KafkaSource,
-    Ordering, SourceBatch,
+    terminalize_guaranteed_poll_error, vnode_payload_is_current, warn, Arc, ConnectorError,
+    ConnectorState, DeliveryGuarantee, Format, KafkaAssignmentPublication, KafkaPayload,
+    KafkaReaderItem, KafkaRowMetadata, KafkaSource, Ordering, SourceBatch,
 };
 
 struct DrainedQueue {
@@ -26,23 +26,19 @@ impl KafkaSource {
     ) -> Result<Option<SourceBatch>, ConnectorError> {
         let limit = self.prepare_poll(max_records)?;
 
-        let include_metadata = self.config.include_metadata;
-        let include_headers = self.config.include_headers;
-
         let Some(drained) = self.drain_reader_queue(limit)? else {
             return Ok(None);
         };
         // Decode can await, so retain the immutable assignment cut by value and release its locks.
-        let total_bytes = self.stage_poll_payloads(include_metadata, include_headers);
+        let total_bytes = self.stage_poll_payloads()?;
         self.reconcile_reader_control_state();
 
-        if self.poll_payload_offsets.is_empty() {
+        if self.poll_staged_offsets.is_empty() && self.poll_progress_offsets.is_empty() {
             return Ok(None);
         }
 
-        let output = self
-            .decode_poll_output(include_metadata, include_headers)
-            .await?;
+        // A poll of only row-less records still emits an empty batch so its cursor advances.
+        let output = self.decode_poll_output().await?;
         let num_rows = output.num_rows();
 
         self.publish_staged_offsets();
@@ -52,6 +48,7 @@ impl KafkaSource {
             drained.retires_rotation_baseline,
         )?;
         self.poll_staged_offsets.clear();
+        self.poll_progress_offsets.clear();
 
         self.metrics.record_poll(num_rows as u64, total_bytes);
         if let Some(progress) = &self.progress {
@@ -102,7 +99,10 @@ impl KafkaSource {
                 .as_ref()
                 .map(|(published, self_id)| (published.owners(), *self_id));
 
-            while self.poll_payloads.len() < limit {
+            let mut staged_bytes = 0_usize;
+            while self.poll_payloads.len() < limit
+                && (self.poll_payloads.is_empty() || staged_bytes < self.config.max_poll_bytes)
+            {
                 let Some(item) = self.try_take_reader_item()? else {
                     break;
                 };
@@ -110,7 +110,10 @@ impl KafkaSource {
                     .as_ref()
                     .map(|(owners, self_id)| (*owners, *self_id));
                 match self.classify_reader_item(item, ownership, rotation_baselines)? {
-                    QueueItemDecision::Accept(payload) => self.poll_payloads.push(payload),
+                    QueueItemDecision::Accept(payload) => {
+                        staged_bytes = staged_bytes.saturating_add(payload.retained_bytes());
+                        self.poll_payloads.push(payload);
+                    }
                     QueueItemDecision::Skip => {}
                     QueueItemDecision::Boundary => break,
                 }
@@ -247,32 +250,33 @@ impl KafkaSource {
         self.poll_payloads.clear();
         self.poll_payload_buf.clear();
         self.poll_payload_offsets.clear();
+        self.poll_row_metadata.clear();
         self.poll_staged_offsets.clear();
-        self.poll_meta_partitions.clear();
-        self.poll_meta_offsets.clear();
-        self.poll_meta_timestamps.clear();
-        self.poll_meta_headers.clear();
+        self.poll_progress_offsets.clear();
         Ok(max_records.min(self.config.max_poll_records))
     }
 
-    async fn decode_poll_output(
-        &mut self,
-        include_metadata: bool,
-        include_headers: bool,
-    ) -> Result<SourceBatch, ConnectorError> {
-        let (batch, good_indices) = self.decode_polled_payloads().await?;
-        let (batch, mutations) = if self.config.format == Format::Debezium {
-            normalize_kafka_debezium_batch(&batch, &self.schema).map_err(|error| {
-                terminalize_guaranteed_poll_error(
-                    self.delivery,
-                    &mut self.state,
-                    &self.metrics,
-                    self.reader_shutdown.as_ref(),
-                    error,
-                )
-            })?
+    async fn decode_poll_output(&mut self) -> Result<SourceBatch, ConnectorError> {
+        let (batch, good_indices, mutations) = if self.poll_payload_offsets.is_empty() {
+            let empty = arrow_array::RecordBatch::new_empty(Arc::clone(&self.schema));
+            (empty, None, None)
         } else {
-            (batch, None)
+            let (batch, good_indices) = self.decode_polled_payloads().await?;
+            if self.config.format == Format::Debezium {
+                let (batch, mutations) = normalize_kafka_debezium_batch(&batch, &self.schema)
+                    .map_err(|error| {
+                        terminalize_guaranteed_poll_error(
+                            self.delivery,
+                            &mut self.state,
+                            &self.metrics,
+                            self.reader_shutdown.as_ref(),
+                            error,
+                        )
+                    })?;
+                (batch, good_indices, mutations)
+            } else {
+                (batch, good_indices, None)
+            }
         };
         let row_positions = kafka_row_positions(
             self.source_name.as_ref(),
@@ -289,12 +293,7 @@ impl KafkaSource {
             )
         })?;
 
-        let batch = self.append_metadata_columns(
-            batch,
-            good_indices.as_deref(),
-            include_metadata,
-            include_headers,
-        )?;
+        let batch = self.append_metadata_columns(batch, good_indices.as_deref())?;
         // Construct the complete output before publishing its cursor. In particular,
         // metadata/header column validation above is fallible and must not retire a rotation
         // baseline or advance the recovery position for a batch that cannot be returned.
@@ -322,29 +321,63 @@ impl KafkaSource {
         }
     }
 
-    fn stage_poll_payloads(&mut self, include_metadata: bool, include_headers: bool) -> u64 {
-        let mut total_bytes = 0;
-        for payload in self.poll_payloads.drain(..) {
-            total_bytes += payload.data.len() as u64;
-            let start = self.poll_payload_buf.len();
-            self.poll_payload_buf.extend_from_slice(&payload.data);
-            self.poll_payload_offsets.push((start, payload.data.len()));
-            self.poll_staged_offsets.push((
+    /// Copy accepted values into the decode buffer. A record with a null value produces no row in
+    /// an append or Debezium source (for Debezium it is the tombstone that follows a delete) but
+    /// still advances the cursor. A rejected record fails a guaranteed source and is skipped with
+    /// its cursor by a best-effort one, like an undecodable record.
+    fn stage_poll_payloads(&mut self) -> Result<u64, ConnectorError> {
+        let capture_metadata = !self.config.metadata.is_empty();
+        let mut total_bytes = 0_u64;
+        let mut payloads = std::mem::take(&mut self.poll_payloads);
+        let mut guaranteed_rejection = None;
+        for mut payload in payloads.drain(..) {
+            total_bytes += payload.retained_bytes() as u64;
+            let position = (
                 Arc::clone(&payload.topic),
                 payload.partition,
                 payload.offset,
-            ));
-
-            if include_metadata {
-                self.poll_meta_partitions.push(payload.partition);
-                self.poll_meta_offsets.push(payload.offset);
-                self.poll_meta_timestamps.push(payload.timestamp_ms);
+            );
+            if let Some(reason) = payload.rejected.take() {
+                if self.delivery != DeliveryGuarantee::BestEffort {
+                    guaranteed_rejection = Some(reason);
+                    break;
+                }
+                self.metrics.record_error();
+                warn!(%reason, "skipping rejected Kafka record");
+                self.poll_progress_offsets.push(position);
+                continue;
             }
-            if include_headers {
-                self.poll_meta_headers.push(payload.headers_json);
+            let Some(data) = payload.data.as_deref() else {
+                self.poll_progress_offsets.push(position);
+                continue;
+            };
+            let start = self.poll_payload_buf.len();
+            self.poll_payload_buf.extend_from_slice(data);
+            self.poll_payload_offsets.push((start, data.len()));
+            self.poll_staged_offsets.push(position);
+            if capture_metadata {
+                self.poll_row_metadata.push(KafkaRowMetadata {
+                    key: payload.key.take(),
+                    topic: Arc::clone(&payload.topic),
+                    partition: payload.partition,
+                    offset: payload.offset,
+                    timestamp_ms: payload.timestamp_ms,
+                    timestamp_type: payload.timestamp_type,
+                    headers: std::mem::take(&mut payload.headers),
+                });
             }
         }
-        total_bytes
+        self.poll_payloads = payloads;
+        match guaranteed_rejection {
+            None => Ok(total_bytes),
+            Some(reason) => Err(terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                ConnectorError::ReadError(reason.into_string()),
+            )),
+        }
     }
 
     fn reconcile_reader_control_state(&mut self) {
@@ -372,11 +405,15 @@ impl KafkaSource {
     }
 
     fn publish_staged_offsets(&mut self) {
-        if self.poll_staged_offsets.is_empty() {
+        if self.poll_staged_offsets.is_empty() && self.poll_progress_offsets.is_empty() {
             return;
         }
         let mut snapshot = lock_or_recover(&self.offset_snapshot);
-        for (topic, partition, offset) in &self.poll_staged_offsets {
+        for (topic, partition, offset) in self
+            .poll_staged_offsets
+            .iter()
+            .chain(&self.poll_progress_offsets)
+        {
             self.offsets.update_arc(topic, *partition, *offset);
             snapshot.update_arc(topic, *partition, *offset);
         }
@@ -405,6 +442,10 @@ impl KafkaSource {
                                     &mut publication.baselines,
                                     &self.poll_staged_offsets,
                                 );
+                                retire_accepted_rotation_baselines(
+                                    &mut publication.baselines,
+                                    &self.poll_progress_offsets,
+                                );
                                 let count = rotation_baselines_len(&publication.baselines);
                                 self.rotation_partition_baseline_count
                                     .store(count, Ordering::Release);
@@ -420,6 +461,10 @@ impl KafkaSource {
                     retire_accepted_rotation_baselines(
                         &mut accepted.baselines,
                         &self.poll_staged_offsets,
+                    );
+                    retire_accepted_rotation_baselines(
+                        &mut accepted.baselines,
+                        &self.poll_progress_offsets,
                     );
                     Arc::new(accepted)
                 } else {

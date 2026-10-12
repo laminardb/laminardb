@@ -3,7 +3,7 @@
 
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StringArray, UInt32Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
@@ -52,7 +52,11 @@ mod metadata;
 mod polling;
 mod progress;
 mod reader;
+mod record_metadata;
 mod startup;
+
+use record_metadata::{KafkaHeader, KafkaRowMetadata, KafkaTimestampType};
+pub use record_metadata::{KafkaMetadataColumn, KafkaMetadataColumns};
 
 use background::{
     ensure_background_task_reaper, join_background_task, reap_last_arc_off_runtime,
@@ -67,7 +71,6 @@ use checkpoint::{
     validate_positions_not_expired, validate_resume_input_channels, vnode_payload_is_current,
     NormalizedDebeziumBatch,
 };
-pub(crate) use checkpoint::{kafka_output_schema, validate_kafka_output_schema};
 use debezium::normalize_kafka_debezium_batch;
 use drain::{
     cached_partition_vnode, kafka_bootstrap_is_unassigned, kafka_drain_partitions,
@@ -196,14 +199,15 @@ pub struct KafkaSource {
     poll_payloads: Vec<KafkaPayload>,
     poll_payload_buf: Vec<u8>,
     poll_payload_offsets: Vec<(usize, usize)>,
-    poll_meta_partitions: Vec<i32>,
-    poll_meta_offsets: Vec<i64>,
-    poll_meta_timestamps: Vec<Option<i64>>,
-    poll_meta_headers: Vec<Option<String>>,
-    /// This poll's (topic, partition, offset) triples, folded into `offsets` only after the complete
-    /// output batch is constructed — so decode or finalization failure cannot advance beyond data
-    /// that was never emitted. Reused across polls.
+    /// Metadata of each staged row, populated only when metadata columns are selected.
+    poll_row_metadata: Vec<KafkaRowMetadata>,
+    /// This poll's (topic, partition, offset) triples for decoded rows, folded into `offsets`
+    /// only after the complete output batch is constructed — so decode or finalization failure
+    /// cannot advance beyond data that was never emitted. Reused across polls.
     poll_staged_offsets: Vec<(Arc<str>, i32, i64)>,
+    /// Accepted records that produce no row (a null value in an append or Debezium source).
+    /// They advance the cursor with the same batch as `poll_staged_offsets`.
+    poll_progress_offsets: Vec<(Arc<str>, i32, i64)>,
 }
 
 impl KafkaSource {
@@ -322,11 +326,9 @@ impl KafkaSource {
             poll_payloads: Vec::new(),
             poll_payload_buf: Vec::new(),
             poll_payload_offsets: Vec::new(),
-            poll_meta_partitions: Vec::new(),
-            poll_meta_offsets: Vec::new(),
-            poll_meta_timestamps: Vec::new(),
-            poll_meta_headers: Vec::new(),
+            poll_row_metadata: Vec::new(),
             poll_staged_offsets: Vec::new(),
+            poll_progress_offsets: Vec::new(),
         }
     }
 

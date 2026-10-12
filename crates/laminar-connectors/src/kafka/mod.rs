@@ -29,9 +29,9 @@ mod schema_resolution;
 // Source re-exports
 pub use avro::AvroDeserializer;
 pub use config::{
-    AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
-    SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
-    TopicSubscription,
+    AssignmentStrategy, CompatibilityLevel, GroupProtocol, IsolationLevel, KafkaMetadataColumn,
+    KafkaMetadataColumns, KafkaSourceConfig, LatencyProfile, OffsetReset, SaslMechanism,
+    SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode, TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
 pub use source::KafkaSource;
@@ -42,7 +42,7 @@ pub use partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 pub use sink::KafkaSink;
-pub use sink_config::{CompressionType, KafkaSinkConfig, PartitionStrategy};
+pub use sink_config::{CompressionType, KafkaSinkConfig, KeyFormat, PartitionStrategy};
 pub use sink_metrics::KafkaSinkMetrics;
 
 /// Test-only access to Kafka-specific routing probes.
