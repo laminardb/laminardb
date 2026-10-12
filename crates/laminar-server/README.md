@@ -77,8 +77,10 @@ reference_table_max_rows = 1000000 # independently per local reference table; mu
 reference_table_max_bytes = 268435456 # retained-memory charge per local table; 256 MiB default
 materialized_view_max_rows = 1000000 # per local MV; distinct rows for multiset storage
 materialized_view_max_bytes = 268435456 # retained-memory charge per local MV; must be > 0
+# pipeline_max_managed_state_bytes = 268435456 # managed operator state charge; 256 MiB default
 # pipeline_max_input_buf_batches = 256 # per graph input port; 0 disables count limit
 # pipeline_max_input_buf_bytes = 33554432 # optional per-port Arrow bytes; unset disables
+# drain_timeout = "150s" # cluster SIGTERM handoff allowance; default checkpoint.timeout + 30s
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -296,6 +298,47 @@ placement_isolation_tier = 1     # 0=region, 1=zone, 2=rack — what counts as a
 
 `placement_vnodes_per_domain{domain}` and `placement_blast_radius_ratio` (the largest domain's share of vnodes — the state that goes into recovery if that domain fails at once) are exported; see the "Failure-Domain Placement" row in the cluster Grafana dashboard. Unlabeled nodes collapse into one shared `unknown` domain. Placement itself is plain rendezvous hashing — this surfaces the blast radius, it does not yet act on it.
 
+## Cluster rescaling, drain and recovery
+
+Three layers are independent. **Source partitions** (for example Kafka partitions) bound how
+input is read. **Vnodes** (`server.key_groups`, fixed per deployment) are the unit of keyed state,
+routing, checkpoint framing and ownership; changing their count requires a new deployment.
+**Owners** are stable `node_id` processes; the leader assigns vnodes to owners with unweighted
+rendezvous hashing, which suits homogeneous workers. `GET /api/v1/cluster/vnodes` returns the
+current owner of every vnode and `placement_vnodes_per_domain` summarises it by failure domain.
+
+Ownership changes reuse one protocol: the leader takes a checkpoint, publishes the next
+assignment, and the new owners range-restore the committed donor frames before intake resumes.
+
+- **Scale out:** start another node with a new stable `node_id`. The leader adds it after the
+  rebalance debounce and a handoff checkpoint.
+- **Graceful scale in:** send SIGTERM. The node announces `Draining` and waits up to
+  `server.drain_timeout` (default `checkpoint.timeout` + 30 s) for the leader to move its vnodes.
+  The value must be at least `checkpoint.timeout`. If the allowance runs out, the node stops
+  fenced and exits with `graceful drain incomplete`. Its process lease then expires and survivors
+  recover its vnodes from the last committed checkpoint, the same as a failed owner. Lease loss
+  during the drain takes precedence.
+- **Failed owner:** when a process lease expires, survivors take its vnodes through a coordinated
+  recovery round from the last committed checkpoint. At-least-once output may replay.
+
+A node restarted with the same `node_id` and a new boot is a new process incarnation; stale
+incarnations are fenced. Before you remove a node permanently, confirm that the assignment no
+longer names it. More owners do not split a hot key, add source partitions or speed up a slow
+sink.
+
+After a [topology migration](../../docs/architecture/DISTRIBUTED_STATE.md) commits, the
+complete owner map stays frozen until the new topology is Active **and** has committed its own
+checkpoint. Until then, only same-slot replacement of a failed process is admitted. Do not scale
+in or out while `GET /api/v1/cluster/topology` reports `live_migration`. Afterwards all three ownership changes work normally, and a later
+migration freezes whatever owner map is current when it is admitted. Upgrade every node before
+rescaling a migrated deployment: older binaries reject a changed owner map after a migration
+and stay fenced.
+
+The topology request journal keeps every admitted request identity, including finished ones, so
+a retried request returns its original outcome. It holds 64 requests and does not compact yet.
+`GET /api/v1/cluster/topology` reports `journal.retained` and `journal.capacity`. Once it is full,
+new topology requests are rejected; retries of existing identities still work.
+
 ## Cluster Control-Plane TLS (mTLS)
 
 In `mode = "cluster"`, the inter-node control plane (barrier sync and row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
@@ -333,16 +376,21 @@ bytes in `laminardb.toml`; the example under [Configuration](#configuration) sho
 |---|---:|---|
 | `server.datafusion_memory_limit_bytes` | 256 MiB | Shared participating DataFusion reservations; DB-owned contexts do not spill to disk. |
 | `server.source_queue_max_bytes` | 64 MiB | Shared connector-to-coordinator Arrow queue, including parked input; each source's waiting batch must also fit. Must be positive and at most `MAX_SOURCE_QUEUE_BYTES`. |
+| `server.pipeline_max_managed_state_bytes` | 256 MiB | Charged bytes of managed operator state (keyed aggregates, windows, joins) per pipeline; must be positive. Lower bound, not RSS. |
 | `server.pipeline_max_input_buf_batches` | 256 | Each graph input port; `0` disables the count limit. |
 | `server.pipeline_max_input_buf_bytes` | unset | Each graph input port; a configured value must be positive. |
 | `server.reference_table_max_rows` / `server.reference_table_max_bytes` | 1,000,000 / 256 MiB | Each local reference table; both values must be positive. |
 | `server.materialized_view_max_rows` / `server.materialized_view_max_bytes` | 1,000,000 / 256 MiB | Each local materialized view; both values must be positive. |
 | `checkpoint.max_node_data_bytes` | 512 MiB | Maximum participant checkpoint data object and in-flight captured-state admission, separate from live-state limits. |
 
-The engine also defaults to a 256 MiB charged-byte budget for managed operator working state.
-Embedded users can set `pipeline_max_managed_state_bytes` through `LaminarConfig` or the builder;
-the server TOML does not expose this setting. Its accounting is a lower bound and is not RSS.
-Reference tables and materialized views are local only; cluster plans requiring them remain rejected.
+`server.pipeline_max_managed_state_bytes` is the same budget embedded users set through
+`LaminarConfig` or the builder. Exceeding it fails with a typed managed-state budget error at
+startup, restore or during a cycle; its accounting is a lower bound and is not RSS. In a cluster,
+each node charges only the vnodes it owns, so rescaling changes per-node state but a single hot
+key still lands on one owner. Recovery and reassignment stage restored frames against the same
+budget, so leave headroom for restore. Shuffle queues have fixed per-peer and per-node byte
+budgets that are not configurable. Reference tables and materialized views are local only;
+cluster plans requiring them remain rejected.
 
 For a production deployment, start with a representative peak workload and a durable checkpoint
 location. Record **peak process/container RSS**, source lag, cycle backpressure, graph input bytes,

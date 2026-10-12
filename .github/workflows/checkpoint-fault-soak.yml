@@ -162,6 +162,20 @@ jobs:
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
+          - label: Cluster ALO topology migration and rescaling (gossip)
+            test: three_node_alo_public_topology_migration_restart_soak
+            features: cluster,aws,kafka
+            delivery: alo
+            topology: cluster-migration
+            discovery: gossip
+            emulator: "0"
+            # Public migrations, then post-settlement kills: survivors take the failed owner's
+            # vnodes, the node rejoins, the cluster restarts and admits another migration.
+            checkpoint_ms: "250"
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
           - label: Cluster ALO stateful joins (static)
             test: three_node_alo_join_kill9_soak
             features: cluster,aws,kafka

@@ -292,10 +292,15 @@ impl MigrationProbe {
     }
 
     fn wait_output(&mut self, nodes: &mut [Node], ceiling: Duration) {
+        let live = (0..nodes.len()).collect();
+        self.wait_live_output(nodes, &live, ceiling);
+    }
+
+    fn wait_live_output(&mut self, nodes: &mut [Node], live: &BTreeSet<usize>, ceiling: Duration) {
         let mut boundary = vec![0; 3];
         wait_for("every deterministic new-pipeline output", ceiling, || {
-            for node in nodes.iter_mut() {
-                node.assert_running();
+            for node in live {
+                nodes[*node].assert_running();
             }
             self.output.drain(&self.expected, &mut boundary);
             let observed = Instant::now();
@@ -387,79 +392,76 @@ impl MigrationProbe {
         checkpoint.unwrap()
     }
 
-    pub(super) fn recover_replaced_process(
-        &self,
+    /// After settlement a kill reassigns vnodes through an ordinary, unbound recovery round
+    /// (scale-in) and a rejoin rotates them back (scale-out); exact output must continue.
+    pub(super) fn assert_rescaled_output(
+        &mut self,
         nodes: &mut [Node],
-        victim: usize,
-        ceiling: Duration,
-        started: Instant,
+        live: &BTreeSet<usize>,
         round: u32,
+        ceiling: Duration,
     ) {
-        let operation = *self.operations.last().unwrap();
-        let status = self.status(operation);
-        let version = status.commit.unwrap().topology_version.get();
-        let before = status.activation.unwrap();
-        let prior_recovery = self.recovery_release();
-        let executable = nodes[victim].verify_executable_for_spawn();
-        nodes[victim].spawn(executable);
-        self.wait_active(
-            nodes,
-            operation,
-            version,
-            ceiling,
-            started,
-            &format!("kill-{round}"),
-        );
-        wait_for("full roster after process replacement", ceiling, || {
-            super::has_full_membership(nodes)
-        });
-        let after = self.status(operation).activation.unwrap();
-        assert_eq!(
-            after, before,
-            "recovery rewrote the original immutable Release"
-        );
-        let recovered = self
+        let rescaled = if live.len() < nodes.len() {
+            "survivors"
+        } else {
+            "rejoined"
+        };
+        let first = 1_000 + u64::from(round) * 10 + if live.len() < nodes.len() { 0 } else { 5 };
+        let sent = self.produce(first);
+        self.wait_live_output(nodes, live, ceiling);
+        let release = self
             .recovery_release()
-            .expect("ready target requires a durable recovery Release");
-        assert_ne!(
-            prior_recovery.as_ref().map(|(_, release)| release.round.id),
-            Some(recovered.1.round.id)
-        );
-        let binding = recovered.1.round.topology_binding().unwrap();
-        assert_eq!(
-            binding.commit(),
-            self.status(operation).commit.as_ref().unwrap()
-        );
-        assert_eq!(binding.processes().len(), nodes.len());
-        assert_eq!(
-            recovered
-                .1
-                .round
-                .assignment_fence
-                .participants
-                .iter()
-                .map(|participant| participant.node_id)
-                .collect::<Vec<_>>(),
-            before
-                .assignment
-                .participants
-                .iter()
-                .map(|participant| participant.node_id)
-                .collect::<Vec<_>>()
+            .expect("post-kill reassignment requires a durable recovery Release");
+        assert!(
+            release.1.round.topology_binding().is_none(),
+            "a settled topology must recover through an ordinary round"
         );
         let report = serde_json::json!({
-            "scope": "Replacement of the killed process with the complete original owner map; no survivor resharding is certified.",
-            "victim": victim, "round": round,
-            "kill_to_full_target_release_ms": started.elapsed().as_millis(),
-            "original_activation": before, "prior_recovery_release": prior_recovery,
-            "recovered_release": recovered,
+            "scope": "Committed topology after its own checkpoint; vnode ownership changed by ordinary failed-owner recovery or rejoin rotation.",
+            "round": round, "phase": rescaled, "live_nodes": live,
+            "assignment_participants": release.1.round.assignment_fence.participants,
+            "send_to_visible_ms": sent.elapsed().as_millis(),
         });
         std::fs::write(
             self.evidence_dir
-                .join(format!("public-topology-kill-{round}.json")),
+                .join(format!("public-topology-rescale-{round}-{rescaled}.json")),
             serde_json::to_vec_pretty(&report).unwrap(),
         )
         .unwrap();
+    }
+
+    /// A topology change after rescaling freezes the current owner map as its new plan.
+    pub(super) fn change_after_rescale(&mut self, nodes: &mut [Node], ceiling: Duration) {
+        let parent = self
+            .status(*self.operations.last().unwrap())
+            .commit
+            .unwrap()
+            .topology_version;
+        let version = parent.successor().unwrap().get();
+        let request = laminar_db::ClusterTopologyRequest {
+            operation_id: uuid::Uuid::new_v4().try_into().unwrap(),
+            expected_parent_version: parent,
+            statements: vec!["CREATE STREAM topology_live_after_rescale AS SELECT value, COUNT(*) AS total FROM topology_live_source GROUP BY value".into()],
+        };
+        let started = Instant::now();
+        self.submit(&nodes[2], &request);
+        self.operations.push(request.operation_id);
+        self.wait_active(
+            nodes,
+            request.operation_id,
+            version,
+            ceiling,
+            started,
+            "after-rescale",
+        );
+        self.produce(2_000);
+        self.wait_output(nodes, ceiling);
+        let checkpoint = self.checkpoint(ceiling, version);
+        eprintln!(
+            "soak: topology {version} admitted after rescaling, activated and checkpointed at epoch {} in {:?}",
+            checkpoint.epoch,
+            started.elapsed()
+        );
     }
 
     pub(super) fn restart_all(&mut self, nodes: &mut [Node], ceiling: Duration) {
