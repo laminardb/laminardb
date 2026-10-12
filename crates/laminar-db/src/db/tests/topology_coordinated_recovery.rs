@@ -549,7 +549,17 @@ async fn topology_coordinated_recovery_uses_real_target_checkpoint_and_continues
         .await
         .unwrap();
     outputs(&probe, 45).await;
+    let version = committed.commit.as_ref().unwrap().topology_version;
+    let live = |status: crate::db::ClusterTopologyStatus| status.live_migration;
+    assert_eq!(
+        live(fixture.db.cluster_topology_status().await.unwrap()),
+        Some(version)
+    );
     fixture.db.checkpoint().await.unwrap();
+    assert_eq!(
+        live(fixture.db.cluster_topology_status().await.unwrap()),
+        None
+    );
     let selected = fixture
         .authority
         .controller

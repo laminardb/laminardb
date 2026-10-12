@@ -494,6 +494,48 @@ async fn topology_recovery_round_live_target_rejects_survivor_rescaling() {
 }
 
 #[tokio::test]
+async fn topology_settled_target_admits_graceful_scale_in_drain() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let current = fixture.assignments.load().await.unwrap().unwrap();
+    let proof = input.current_leader().unwrap();
+    let mut owners = current.vnodes.clone();
+    for owner in owners.values_mut() {
+        *owner = NodeId(1);
+    }
+    let survivors = current
+        .participants
+        .iter()
+        .filter(|participant| participant.node_id == 1)
+        .copied()
+        .collect();
+    let drain = current
+        .next_draining(owners, survivors, proof.clone())
+        .unwrap();
+    // The live migration still owns placement: a scale-in drain is rejected before any write.
+    let before = authority.load_record().await.unwrap();
+    assert!(authority
+        .publish_assignment_drain(&proof, &fixture.assignments, &drain)
+        .await
+        .is_err());
+    assert_eq!(authority.load_record().await.unwrap(), before);
+    assert_eq!(
+        fixture.assignments.load().await.unwrap(),
+        Some(current.clone())
+    );
+
+    target_checkpoint(&authority, &fixture, &input, 2).await;
+    authority
+        .publish_assignment_drain(&proof, &fixture.assignments, &drain)
+        .await
+        .unwrap();
+    let head = fixture.assignments.load().await.unwrap().unwrap();
+    assert!(head.draining);
+    assert_eq!(head.version, current.version + 1);
+    assert!(head.vnodes.values().all(|owner| *owner == NodeId(1)));
+}
+
+#[tokio::test]
 async fn topology_recovery_round_settled_target_redistributes_failed_owner_with_handoff_pin() {
     use crate::cluster::control::{ProcessLeaseFence, ProcessLeaseOutcome, ProcessLeaseStore};
 

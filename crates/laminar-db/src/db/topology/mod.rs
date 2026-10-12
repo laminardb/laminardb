@@ -42,6 +42,9 @@ pub struct ClusterTopologyStatus {
     /// Version replayed by this process and running with live authority and intake released.
     /// A persisted inventory alone never sets this field.
     pub locally_active_version: Option<TopologyVersion>,
+    /// Committed version whose migration still freezes the complete owner map: it is not yet
+    /// Active with its own committed checkpoint. Rescale only when this is absent.
+    pub live_migration: Option<TopologyVersion>,
     /// Bounded request journal occupancy; new requests are rejected once it is full.
     pub journal: TopologyJournalUsage,
 }
@@ -163,6 +166,7 @@ impl LaminarDB {
             catalog,
             committed_version,
             locally_active_version,
+            live_migration: live.map(|commit| commit.topology_version),
             journal: store.topology_journal_usage().await?,
         })
     }
