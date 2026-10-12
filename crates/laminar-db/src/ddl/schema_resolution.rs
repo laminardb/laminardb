@@ -138,7 +138,7 @@ impl LaminarDB {
             })?;
         let input_schema = match self.keyed_mutation_source(&input)? {
             Some(source) => crate::direct_mutation::sink_input_schema(&source.schema),
-            None => provider.schema(),
+            None => self.changelog_view_sink_schema(&input, provider.schema())?,
         };
         config.set(
             "_arrow_schema",

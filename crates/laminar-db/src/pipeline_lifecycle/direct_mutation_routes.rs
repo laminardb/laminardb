@@ -185,7 +185,27 @@ impl LaminarDB {
             .table_provider(crate::db::exact_table_reference(input))
             .await?
             .schema();
-        Ok((schema, false))
+        Ok((self.changelog_view_sink_schema(input, schema)?, false))
+    }
+
+    /// An incremental materialized view's provider serves its snapshot, but its sinks receive
+    /// the changelog with the trailing weight the runtime advertises for it.
+    pub(crate) fn changelog_view_sink_schema(
+        &self,
+        input: &str,
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<arrow_schema::SchemaRef, DbError> {
+        let incremental = self
+            .connector_manager
+            .lock()
+            .streams()
+            .get(input)
+            .is_some_and(|stream| stream.incremental);
+        if incremental {
+            crate::pipeline_lifecycle::advertise_changelog_schema(input, &schema)
+        } else {
+            Ok(schema)
+        }
     }
 
     /// The per-cycle input owner for every sink that reads a source by name.
