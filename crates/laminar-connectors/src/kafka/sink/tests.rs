@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::SerdeError;
 use crate::serde::Format;
-use arrow_array::Int64Array;
+use arrow_array::{Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 
 struct MismatchedSerializer;
@@ -440,7 +440,8 @@ fn test_extract_keys_no_key_column() {
 fn test_extract_keys_with_key_column() {
     let mut cfg = test_config();
     cfg.key_column = Some("value".into());
-    let sink = KafkaSink::new(test_schema(), cfg, None);
+    let mut sink = KafkaSink::new(test_schema(), cfg, None);
+    sink.bind_keys().unwrap();
     let batch = arrow_array::RecordBatch::try_new(
         test_schema(),
         vec![
@@ -450,6 +451,6 @@ fn test_extract_keys_with_key_column() {
     )
     .unwrap();
     let keys = sink.extract_keys(&batch).unwrap().unwrap();
-    assert_eq!(&keys[0], b"key-a");
-    assert_eq!(&keys[1], b"key-b");
+    assert_eq!(keys.key(0), Some(&b"key-a"[..]));
+    assert_eq!(keys.key(1), Some(&b"key-b"[..]));
 }

@@ -4,7 +4,6 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow_array::{Array, StringArray};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -40,7 +39,7 @@ use failure::{
     unresolved_delivery_error, validate_payload_cardinality, KafkaFailure, KafkaFailureCertainty,
     KafkaFailureScope, QUEUE_RETRY_TIMEOUT,
 };
-use keys::KeyBuffer;
+use keys::{KeyBuffer, KeyEncoder};
 use serialization::select_serializer;
 use upsert::{project_upsert_values, validate_upsert_keys};
 
@@ -89,8 +88,15 @@ pub struct KafkaSink {
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     /// Shared Avro schema ID (updated after SR registration).
     avro_schema_id: Arc<std::sync::atomic::AtomicU32>,
-    /// Cached topic partition count (queried from broker metadata after open).
+    /// Partition count keyed records hash over: `partition.count` when pinned, otherwise the
+    /// broker count observed at open.
     topic_partition_count: Option<i32>,
+    /// Key columns bound to the input schema at open.
+    key_encoder: Option<KeyEncoder>,
+    /// Serializer for `key.format = 'json'`.
+    json_keys: crate::serde::json::JsonSerializer,
+    /// Partition for records without a key in the current batch; advances once per batch.
+    unkeyed_partition: i32,
     /// Sole admission authority for detached producer destruction.
     task_owner: ConnectorTaskOwner,
     /// Cloneable terminal observer returned to the connector runtime.
@@ -131,6 +137,9 @@ impl KafkaSink {
             schema_registry: None,
             avro_schema_id,
             topic_partition_count: None,
+            key_encoder: None,
+            json_keys: crate::serde::json::JsonSerializer::new(),
+            unkeyed_partition: 0,
             task_owner,
             task_tracker,
         }
@@ -174,6 +183,9 @@ impl KafkaSink {
             schema_registry: Some(sr),
             avro_schema_id,
             topic_partition_count: None,
+            key_encoder: None,
+            json_keys: crate::serde::json::JsonSerializer::new(),
+            unkeyed_partition: 0,
             task_owner,
             task_tracker,
         }
@@ -217,6 +229,21 @@ impl KafkaSink {
         Ok(payloads)
     }
 
+    /// Bind the configured key columns to the committed input schema.
+    fn bind_keys(&mut self) -> Result<(), ConnectorError> {
+        let columns = self.config.key_columns();
+        self.key_encoder = if columns.is_empty() {
+            None
+        } else {
+            Some(KeyEncoder::bind(
+                &self.schema,
+                &columns,
+                self.config.key_format,
+            )?)
+        };
+        Ok(())
+    }
+
     fn required_partition_count(&self) -> Result<i32, ConnectorError> {
         self.topic_partition_count
             .ok_or_else(|| ConnectorError::InvalidState {
@@ -225,60 +252,28 @@ impl KafkaSink {
             })
     }
 
-    /// Contiguous key buffer: all key bytes in one allocation with per-row offsets.
-    ///
-    /// Returns `None` if no key column is configured.
+    /// Encoded keys for every row, or `None` when no key column is configured.
     fn extract_keys(
         &self,
         batch: &arrow_array::RecordBatch,
     ) -> Result<Option<KeyBuffer>, ConnectorError> {
-        let Some(key_col) = &self.config.key_column else {
-            return Ok(None);
-        };
+        self.key_encoder
+            .as_ref()
+            .map(|encoder| encoder.encode(batch, &self.json_keys))
+            .transpose()
+    }
 
-        let col_idx = batch.schema().index_of(key_col).map_err(|_| {
-            ConnectorError::ConfigurationError(format!(
-                "key column '{key_col}' not found in schema"
-            ))
-        })?;
+    /// Route one record: the configured strategy, falling back to the batch's rotating partition
+    /// for a record without a key under key-hash routing.
+    fn route(&mut self, key: Option<&[u8]>, partition_count: i32) -> i32 {
+        self.partitioner
+            .partition(key, partition_count)
+            .unwrap_or(self.unkeyed_partition)
+    }
 
-        let array = batch.column(col_idx);
-        let num_rows = batch.num_rows();
-        let mut buf = KeyBuffer::with_capacity(num_rows, 32);
-
-        // Try to get string values; fall back to display representation.
-        if let Some(str_array) = array.as_any().downcast_ref::<StringArray>() {
-            for i in 0..num_rows {
-                if str_array.is_null(i) {
-                    buf.push_empty();
-                } else {
-                    buf.push(str_array.value(i).as_bytes());
-                }
-            }
-        } else {
-            use std::fmt::Write;
-            let formatter = arrow_cast::display::ArrayFormatter::try_new(
-                array,
-                &arrow_cast::display::FormatOptions::default(),
-            )
-            .map_err(|e| {
-                ConnectorError::Internal(format!(
-                    "failed to create array formatter for key column: {e}"
-                ))
-            })?;
-            let mut fmt_buf = String::with_capacity(64);
-            for i in 0..num_rows {
-                if array.is_null(i) {
-                    buf.push_empty();
-                } else {
-                    fmt_buf.clear();
-                    let _ = write!(fmt_buf, "{}", formatter.value(i));
-                    buf.push(fmt_buf.as_bytes());
-                }
-            }
-        }
-
-        Ok(Some(buf))
+    /// Advance the partition used by unkeyed records, once per written batch.
+    fn rotate_unkeyed_partition(&mut self, partition_count: i32) {
+        self.unkeyed_partition = (self.unkeyed_partition + 1) % partition_count;
     }
 
     /// Enqueues a definitely rejected record to the dead letter queue. The
@@ -382,31 +377,32 @@ impl KafkaSink {
         let (value_batch, ops) = project_upsert_values(&collapsed)?;
 
         let payloads = self.serialize_payloads(&value_batch)?;
-        let keys = self.extract_keys(&collapsed)?;
-        // Reject empty/NULL merge keys before producing ANY record: a compacted topic can't
-        // represent an unkeyed row, and a mid-loop bail would leave earlier rows already enqueued.
-        validate_upsert_keys(keys.as_ref(), payloads.len())?;
+        let keys = self.extract_keys(&collapsed)?.ok_or_else(|| {
+            ConnectorError::ConfigurationError("envelope = 'upsert' requires 'key.column'".into())
+        })?;
+        // Reject NULL merge keys before producing any record: a compacted topic cannot represent
+        // an unkeyed row, and a mid-loop bail would leave earlier rows already enqueued.
+        validate_upsert_keys(&keys, payloads.len())?;
 
         let partition_count = self.required_partition_count()?;
+        let partitions = (0..rows)
+            .map(|row| self.route(keys.key(row), partition_count))
+            .collect::<Vec<_>>();
         let producer = required_producer(self.producer.as_ref())?;
 
         let mut delivery_futures = Vec::with_capacity(rows);
         let mut enqueue_failure: Option<(KafkaFailure, usize)> = None;
         let queue_deadline = Instant::now() + QUEUE_RETRY_TIMEOUT;
         for (i, payload) in payloads.iter().enumerate() {
-            let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i));
             let is_delete = ops.value(i) == "D";
-            let partition = self.partitioner.partition(key, partition_count);
             // No `.payload()` for a delete → null value = Kafka tombstone.
-            let mut record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(&self.config.topic);
-            if let Some(k) = key {
-                record = record.key(k);
+            let mut record: FutureRecord<'_, [u8], [u8]> =
+                FutureRecord::to(&self.config.topic).partition(partitions[i]);
+            if let Some(key) = keys.key(i) {
+                record = record.key(key);
             }
             if !is_delete {
                 record = record.payload(payload.as_slice());
-            }
-            if let Some(p) = partition {
-                record = record.partition(p);
             }
             match Self::enqueue_with_queue_retry(producer, record, queue_deadline).await {
                 Ok(future) => delivery_futures.push((Instant::now(), future, is_delete, i)),
@@ -564,6 +560,11 @@ impl SinkConnector for KafkaSink {
         );
 
         self.install_schema_contract(config).await?;
+        self.bind_keys()?;
+        info!(
+            settings = ?super::librdkafka::redacted_settings(&self.config.to_rdkafka_config()),
+            "Kafka producer effective configuration"
+        );
 
         let rdkafka_config: ClientConfig = self.config.to_rdkafka_config();
         let producer: FutureProducer = rdkafka_config
@@ -620,10 +621,24 @@ impl SinkConnector for KafkaSink {
         .await;
         match metadata {
             Ok(Ok(count)) => {
-                self.topic_partition_count = Some(count);
+                let routed = match self.config.partition_count {
+                    Some(pinned) if count < pinned => {
+                        self.retire_producers();
+                        return Err(ConnectorError::ConfigurationError(format!(
+                            "Kafka topic '{}' has {count} partitions but partition.count is \
+                             {pinned}; keyed records would route to partitions that do not exist",
+                            self.config.topic
+                        )));
+                    }
+                    Some(pinned) => pinned,
+                    None => count,
+                };
+                self.topic_partition_count = Some(routed);
+                self.unkeyed_partition = 0;
                 info!(
                     topic = %self.config.topic,
                     partitions = count,
+                    routed_partitions = routed,
                     "queried topic partition count from broker"
                 );
             }
@@ -674,6 +689,15 @@ impl SinkConnector for KafkaSink {
 
         let keys = self.extract_keys(batch)?;
         let partition_count = self.required_partition_count()?;
+        let partitions = (0..payloads.len())
+            .map(|row| {
+                self.route(
+                    keys.as_ref().and_then(|keys| keys.key(row)),
+                    partition_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.rotate_unkeyed_partition(partition_count);
         let producer = required_producer(self.producer.as_ref())?;
 
         // Phase 1: enqueue every record into librdkafka's bounded internal queue.
@@ -685,15 +709,11 @@ impl SinkConnector for KafkaSink {
         let mut enqueue_failure: Option<(KafkaFailure, usize)> = None;
         let main_queue_deadline = Instant::now() + QUEUE_RETRY_TIMEOUT;
         for (i, payload) in payloads.iter().enumerate() {
-            let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
-            let partition = self.partitioner.partition(key, partition_count);
-
-            let mut record = FutureRecord::to(&self.config.topic).payload(payload.as_slice());
-            if let Some(k) = key {
-                record = record.key(k);
-            }
-            if let Some(p) = partition {
-                record = record.partition(p);
+            let mut record = FutureRecord::to(&self.config.topic)
+                .payload(payload.as_slice())
+                .partition(partitions[i]);
+            if let Some(key) = keys.as_ref().and_then(|keys| keys.key(i)) {
+                record = record.key(key);
             }
 
             match Self::enqueue_with_queue_retry(producer, record, main_queue_deadline).await {
@@ -729,10 +749,7 @@ impl SinkConnector for KafkaSink {
         let mut dlq_enqueue_failure: Option<(KafkaFailure, usize)> = None;
         let dlq_queue_deadline = Instant::now() + QUEUE_RETRY_TIMEOUT;
         for (position, (row, original_error)) in dlq_candidates.into_iter().enumerate() {
-            let key = keys
-                .as_ref()
-                .map(|buffer| buffer.key(row))
-                .filter(|key| !key.is_empty());
+            let key = keys.as_ref().and_then(|buffer| buffer.key(row));
             match self
                 .enqueue_dlq(&payloads[row], key, &original_error, dlq_queue_deadline)
                 .await

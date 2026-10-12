@@ -28,19 +28,18 @@ pub(super) fn project_upsert_values(
     Ok((values, operations))
 }
 
-pub(super) fn validate_upsert_keys(
-    keys: Option<&KeyBuffer>,
-    rows: usize,
-) -> Result<(), ConnectorError> {
-    let Some(keys) = keys else {
-        return Ok(());
-    };
-    for row in 0..rows {
-        if keys.key(row).is_empty() {
-            return Err(ConnectorError::WriteError(format!(
-                "upsert envelope: row {row} has an empty/NULL merge key"
-            )));
-        }
+pub(super) fn validate_upsert_keys(keys: &KeyBuffer, rows: usize) -> Result<(), ConnectorError> {
+    if keys.len() != rows {
+        return Err(ConnectorError::Internal(format!(
+            "upsert envelope: {} keys for {rows} rows",
+            keys.len()
+        )));
+    }
+    if let Some(row) = (0..rows).find(|row| keys.key(*row).is_none()) {
+        return Err(ConnectorError::WriteError(format!(
+            "upsert envelope: row {row} has a NULL merge key; a compacted topic needs a key \
+             (use key.format = 'json' to encode nullable key columns)"
+        )));
     }
     Ok(())
 }
@@ -50,9 +49,12 @@ impl KafkaSink {
         &self,
         batch: &arrow_array::RecordBatch,
     ) -> Result<arrow_array::RecordBatch, ConnectorError> {
-        let key_column = self.config.key_column.as_ref().ok_or_else(|| {
-            ConnectorError::ConfigurationError("envelope = 'upsert' requires 'key.column'".into())
-        })?;
-        collapse_changelog(batch, std::slice::from_ref(key_column))
+        let key_columns = self.config.key_columns();
+        if key_columns.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "envelope = 'upsert' requires 'key.column'".into(),
+            ));
+        }
+        collapse_changelog(batch, &key_columns)
     }
 }

@@ -10356,6 +10356,7 @@ format = "json"
 "bootstrap.servers" = "{brokers}"
 topic = "{output_topic}"
 "key.column" = "left_id"
+"key.format" = "text"
 "linger.ms" = "{SOAK_KAFKA_SINK_LINGER_MS}"
 "#,
     )
@@ -10425,6 +10426,7 @@ format = "json"
 topic = "{output_topic}"
 "key.column" = "join_case"
 envelope = "upsert"
+"partition.count" = "{OUTPUT_TOPIC_PARTITIONS}"
 "linger.ms" = "{SOAK_KAFKA_SINK_LINGER_MS}"
 "#,
             )
@@ -10941,7 +10943,9 @@ format = "json"
 "bootstrap.servers" = "{brokers}"
 topic = "{output_topic}"
 "key.column" = "left_id"
+"key.format" = "text"
 envelope = "upsert"
+"partition.count" = "{OUTPUT_TOPIC_PARTITIONS}"
 "linger.ms" = "{SOAK_KAFKA_SINK_LINGER_MS}"
 "#,
     )

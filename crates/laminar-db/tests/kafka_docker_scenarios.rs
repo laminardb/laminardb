@@ -876,6 +876,8 @@ async fn run_upsert_scenario(
              'bootstrap.servers' = '{brokers}', \
              'topic' = '{out_topic}', \
              'key.column' = 'k', \
+             'key.format' = 'text', \
+             'partition.count' = '1', \
              'envelope' = 'upsert') FORMAT JSON"
     );
     db.execute(&ddl_sink).await.expect("upsert sink");

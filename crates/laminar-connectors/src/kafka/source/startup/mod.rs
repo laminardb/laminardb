@@ -102,6 +102,11 @@ impl KafkaSource {
         if has_saved_position {
             rdkafka_config.set("allow.auto.create.topics", "false");
         }
+        info!(
+            source = %self.source_name,
+            settings = ?crate::kafka::librdkafka::redacted_settings(&rdkafka_config),
+            "Kafka consumer effective configuration"
+        );
         let context = LaminarConsumerContext::new(
             Arc::clone(&self.rebalance_state),
             Arc::clone(&self.rebalance_counter),
