@@ -15,8 +15,11 @@ use super::{CheckpointCoordinator, DbError, RegisteredSink};
 const MAX_EXTERNAL_SINK_COMMIT_CONCURRENCY: usize = 8;
 pub(super) const MAX_EXTERNAL_SINK_DESCRIPTOR_READ_CONCURRENCY: usize = 8;
 
+/// Debug fault hook: park at `gate` (`<sink>` after publication, `before:<sink>` before it) while
+/// the gate file names it, so a test can kill the process at that exact boundary.
 #[cfg(all(debug_assertions, feature = "cluster"))]
 async fn external_sink_commit_gate(
+    gate: &str,
     sink_name: &str,
     attempt: CheckpointAttempt,
     fencing_token: u64,
@@ -30,7 +33,7 @@ async fn external_sink_commit_gate(
     };
     if std::fs::read_to_string(gate_file)
         .ok()
-        .is_none_or(|requested| requested.trim() != sink_name)
+        .is_none_or(|requested| requested.trim() != gate)
     {
         return;
     }
@@ -432,6 +435,11 @@ impl CheckpointCoordinator {
         batch.validate_shape().map_err(|error| {
             DbError::Checkpoint(format!("sink '{}' commit batch: {error}", sink.name))
         })?;
+        #[cfg(all(debug_assertions, feature = "cluster"))]
+        if has_payload {
+            let gate = format!("before:{}", sink.name);
+            external_sink_commit_gate(&gate, &sink.name, attempt, fencing_token).await;
+        }
         tokio::time::timeout_at(deadline, sink.handle.commit_aggregated(batch))
             .await
             .map_err(|_| {
@@ -445,7 +453,7 @@ impl CheckpointCoordinator {
             })?;
         #[cfg(all(debug_assertions, feature = "cluster"))]
         if has_payload {
-            external_sink_commit_gate(&sink.name, attempt, fencing_token).await;
+            external_sink_commit_gate(&sink.name, &sink.name, attempt, fencing_token).await;
         }
         Ok(())
     }

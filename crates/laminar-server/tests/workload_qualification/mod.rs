@@ -20,7 +20,7 @@ use super::{kafka_create_topic, Node, ResolvedExecutable, SOAK_CONSOLE_TOKEN};
 use evidence::Evidence;
 use load::{Counts, Producer};
 use observer::Observer;
-use spec::{Fault, Spec};
+use spec::{Delivery, Fault, Spec};
 
 #[test]
 #[ignore = "requires real Kafka, a workload spec and an exclusive evidence directory"]
@@ -73,6 +73,15 @@ fn run(spec: &Spec, directory: &Path) -> Result<()> {
     for topic in &outputs {
         kafka_create_topic(&sink_brokers, topic, 1);
     }
+    let commit_topic = format!("qualification-{run_id}-commits");
+    if spec.delivery == Delivery::ExactlyOnce {
+        super::kafka_create_topic_with_config(
+            &sink_brokers,
+            &commit_topic,
+            1,
+            &[("cleanup.policy", "compact")],
+        );
+    }
     let mut node = make_node(
         spec,
         directory,
@@ -81,7 +90,11 @@ fn run(spec: &Spec, directory: &Path) -> Result<()> {
         &sink_brokers,
         &inputs,
         &outputs,
+        &commit_topic,
     )?;
+    // Inherited by every server generation; the gate parks only while its file names a sink.
+    let commit_gate = directory.join("external-sink-commit.gate");
+    std::env::set_var("LAMINAR_EXTERNAL_SINK_COMMIT_GATE_FILE", &commit_gate);
     let verified = node.verify_executable_for_spawn();
     node.spawn(verified);
     let ready_deadline = Instant::now() + Duration::from_secs(60);
@@ -120,6 +133,7 @@ fn run(spec: &Spec, directory: &Path) -> Result<()> {
         &mut producer,
         &mut observer,
         &mut evidence,
+        &commit_gate,
     )?;
     let producer_lag = producer.finish()?;
     ensure!(
@@ -132,7 +146,8 @@ fn run(spec: &Spec, directory: &Path) -> Result<()> {
     let report = json!({
         "schema":"laminardb-workload-observation/v2", "s12_qualified":false,
         "status":if verdict.is_err() { "failed" } else if spec.limits.is_some() { "run_limits_passed" } else { "observed" },
-        "mode":"single", "delivery":"at_least_once", "composition":"kafka_to_kafka",
+        "mode":"single", "delivery":spec.delivery, "latency_profile":spec.latency_profile,
+        "composition":"kafka_to_kafka",
         "clock":"one observer-process monotonic Instant; includes producer delay and external consumer polling",
         "latency_resolution":"1us minimum bucket; 1 percent bucket spacing; finite-range overflow is unresolved",
         "spec":spec, "resources":summary, "producer_schedule_lag":producer_lag,
@@ -157,8 +172,14 @@ fn check_limits(
     recovery_ms: Option<f64>,
 ) -> Result<()> {
     ensure!(
-        spec.fault != Fault::ProcessKill || recovery_ms.is_some(),
+        !matches!(spec.fault, Fault::ProcessKill | Fault::CommitBoundaryKills)
+            || recovery_ms.is_some(),
         "requested process kill has no verified post-death recovery"
+    );
+    ensure!(
+        spec.delivery != Delivery::ExactlyOnce || output.duplicates == 0,
+        "exactly-once output was observed {} extra times by a read_committed consumer",
+        output.duplicates
     );
     summary.check(spec, recovery_ms)?;
     if let Some(limits) = &spec.limits {
@@ -171,6 +192,35 @@ fn check_limits(
     Ok(())
 }
 
+/// Hard kills planned by the fault: `(fraction of the run, commit gate to park at)`.
+fn planned_kills(spec: &Spec) -> Vec<(f64, Option<&'static str>)> {
+    match spec.fault {
+        Fault::ProcessKill => vec![(0.5, None)],
+        Fault::CommitBoundaryKills => vec![
+            (0.25, Some("before:output_0")),
+            (0.5, Some("output_0")),
+            (0.75, None),
+        ],
+        Fault::None | Fault::SourcePause => Vec::new(),
+    }
+}
+
+/// Wait until the server parks at `gate`, or `None` when it does not within the bound.
+fn wait_for_gate(node: &mut Node, gate_file: &Path, gate: &str) -> Option<()> {
+    std::fs::write(gate_file, gate).ok()?;
+    let ready = gate_file.with_extension("ready");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        node.assert_running();
+        if ready.is_file() {
+            return Some(());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn monitor(
     spec: &Spec,
     node: &mut Node,
@@ -179,10 +229,11 @@ fn monitor(
     producer: &mut Producer,
     observer: &mut Observer,
     evidence: &mut Evidence,
+    commit_gate: &Path,
 ) -> Result<Option<f64>> {
     let deadline = start + Duration::from_secs(spec.seconds + spec.drain_seconds);
     let mut next_sample = start;
-    let mut killed = false;
+    let mut kills = planned_kills(spec).into_iter().peekable();
     let mut recovery = None;
     let mut recovery_ms = None;
     let mut drain_checkpoint = None;
@@ -204,13 +255,23 @@ fn monitor(
         let elapsed = start.elapsed();
         next_sample = Instant::now() + Duration::from_secs(1);
         evidence.sample(spec, node, counts, elapsed)?;
-        if spec.fault == Fault::ProcessKill && !killed && elapsed.as_secs() >= spec.seconds / 2 {
+        let due = kills.peek().is_some_and(|(fraction, _)| {
+            recovery.is_none() && elapsed.as_secs_f64() >= spec.seconds as f64 * fraction
+        });
+        if due {
+            let (_, gate) = kills.next().context("planned kill vanished")?;
             let permit = node.verify_executable_for_spawn();
             let committed = node
                 .durable_checkpoint_status()
                 .context("cannot kill without a committed checkpoint")?;
+            if let Some(gate) = gate {
+                wait_for_gate(node, commit_gate, gate)
+                    .with_context(|| format!("server never reached commit gate {gate}"))?;
+            }
             let killed_at = Instant::now();
             node.kill9();
+            let _ = std::fs::remove_file(commit_gate);
+            let _ = std::fs::remove_file(commit_gate.with_extension("ready"));
             // Require an ID scheduled after confirmed process death, not an already-visible prefix.
             let confirmed_dead = start.elapsed();
             let target = spec.offered(confirmed_dead) / spec.pipelines as u64;
@@ -218,13 +279,13 @@ fn monitor(
                 confirmed_dead,
                 json!({
                     "kind": "process_killed", "generation": node.process_generation,
+                    "commit_gate": gate,
                     "kill_started_ns": killed_at.duration_since(start).as_nanos(),
                     "target_id": target, "predecessor_checkpoint_id": committed.checkpoint_id
                 }),
             )?;
             node.spawn(permit);
             recovery = Some((killed_at, target, committed.checkpoint_id));
-            killed = true;
         }
         if let Some((killed_at, target, checkpoint)) = recovery {
             let completed = node.commits();
@@ -237,12 +298,14 @@ fn monitor(
                 && current.is_some_and(|c| c.checkpoint_id > checkpoint)
             {
                 let recovered_at = Instant::now();
-                recovery_ms = Some(recovered_at.duration_since(killed_at).as_secs_f64() * 1_000.0);
+                let this_recovery = recovered_at.duration_since(killed_at).as_secs_f64() * 1_000.0;
+                recovery_ms =
+                    Some(recovery_ms.map_or(this_recovery, |worst: f64| worst.max(this_recovery)));
                 evidence.event(
                     recovered_at.duration_since(start),
                     json!({
                         "kind": "process_recovered", "generation": node.process_generation,
-                        "target_id": target, "recovery_ms": recovery_ms,
+                        "target_id": target, "recovery_ms": this_recovery,
                         "post_restart_completed_checkpoints": completed,
                         "checkpoint_id": current.map(|c| c.checkpoint_id)
                     }),
@@ -250,7 +313,11 @@ fn monitor(
                 recovery = None;
             }
         }
-        if producer.is_finished() && counts.observed.load(Ordering::Acquire) == spec.total_rows() {
+        if producer.is_finished()
+            && kills.peek().is_none()
+            && recovery.is_none()
+            && counts.observed.load(Ordering::Acquire) == spec.total_rows()
+        {
             let committed = node.durable_checkpoint_status();
             match (drain_checkpoint, committed) {
                 (Some(previous), Some(current)) if current.checkpoint_id > previous => {
@@ -278,6 +345,7 @@ fn monitor(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_node(
     spec: &Spec,
     directory: &Path,
@@ -286,6 +354,7 @@ fn make_node(
     sink_brokers: &str,
     inputs: &[String],
     outputs: &[String],
+    commit_topic: &str,
 ) -> Result<Node> {
     let port = std::net::TcpListener::bind("127.0.0.1:0")?
         .local_addr()?
@@ -312,7 +381,7 @@ fn make_node(
 [server]
 mode = "single"
 bind = "127.0.0.1:{port}"
-delivery = "at_least_once"
+delivery = "{delivery}"
 console_token = "{SOAK_CONSOLE_TOKEN}"
 datafusion_memory_limit_bytes = 268435456
 source_queue_max_bytes = 67108864
@@ -322,8 +391,29 @@ url = {checkpoint_url:?}
 interval = "{}ms"
 timeout = "30s"
 "#,
-        spec.checkpoint_ms
+        spec.checkpoint_ms,
+        delivery = match spec.delivery {
+            Delivery::AtLeastOnce => "at_least_once",
+            Delivery::ExactlyOnce => "exactly_once",
+        },
     );
+    // A profile replaces the explicit batching knobs; without one the measured knobs are the
+    // historical balanced defaults written out.
+    let (source_tuning, sink_tuning) = match &spec.latency_profile {
+        Some(profile) => (
+            format!("\"latency.profile\" = {profile:?}\n\"reader.channel.capacity\" = \"8192\""),
+            format!("\"latency.profile\" = {profile:?}"),
+        ),
+        None => (
+            "\"max.poll.records\" = \"1000\"\n\"reader.channel.capacity\" = \"8192\"".to_string(),
+            "\"linger.ms\" = \"5\"\n\"batch.size\" = \"16384\"".to_string(),
+        ),
+    };
+    let exactly_once = if spec.delivery == Delivery::ExactlyOnce {
+        format!("\"commit.topic\" = {commit_topic:?}\n\"transaction.timeout.ms\" = \"60000\"")
+    } else {
+        String::new()
+    };
     for (pipeline, (input, output)) in inputs.iter().zip(outputs).enumerate() {
         use std::fmt::Write as _;
         writeln!(
@@ -338,8 +428,7 @@ format = "json"
 topic = {input:?}
 "group.id" = {input:?}
 "startup.mode" = "earliest"
-"max.poll.records" = "1000"
-"reader.channel.capacity" = "8192"
+{source_tuning}
 [[source.schema]]
 name = "origin"
 type = "BIGINT"
@@ -367,8 +456,8 @@ format = "json"
 [sink.properties]
 "bootstrap.servers" = {sink_brokers:?}
 topic = {output:?}
-"linger.ms" = "5"
-"batch.size" = "16384"
+{sink_tuning}
+{exactly_once}
 "#
         )?;
     }

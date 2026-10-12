@@ -66,13 +66,13 @@ def execute(args, log_path, timeout, env):
             "elapsed_seconds": time.time() - started, "log": log_path.name}
 
 
-def build(output, features, offline, env):
-    args = ["cargo", "test", "--profile", "release", "-p", "laminar-server",
+def build(output, features, profile, offline, env):
+    args = ["cargo", "test", "--profile", profile, "-p", "laminar-server",
             "--test", "cluster_soak", "--no-default-features", "--features", features,
             "--locked", "-j1", "--no-run", "--message-format=json"]
     if offline:
         args.append("--offline")
-    print("Building release server and process harness", flush=True)
+    print(f"Building {profile} server and process harness", flush=True)
     result = execute(args, output / "build.log", 7200, env)
     write_json(output / "build.json", result)
     if result["exit_code"]:
@@ -109,7 +109,7 @@ def run(args, output):
     write_json(output / "identity.json", {
         "head": capture(["git", "rev-parse", "HEAD"]), "platform": platform.platform(),
         "machine": platform.machine(), "logical_cpus": os.cpu_count(),
-        "features": args.features, "default_features": False, "profile": "release",
+        "features": args.features, "default_features": False, "profile": args.profile,
         "rustc": capture(["rustc", "-Vv"]), "cargo": capture(["cargo", "-V"]),
         "lockfile_sha256": digest(ROOT / "Cargo.lock"), "clock": "one monotonic observer process",
         "build_environment": {key: value for key, value in os.environ.items()
@@ -122,7 +122,7 @@ def run(args, output):
             shutil.copyfile(path, output / path.name)
     env = os.environ.copy()
     env.update(CARGO_BUILD_JOBS="1", RUST_MIN_STACK="8388608")
-    artifacts = build(output, args.features, args.offline, env)
+    artifacts = build(output, args.features, args.profile, args.offline, env)
     if source_identity() != identity:
         raise RuntimeError("source changed during the build; evidence is invalid")
     env["LAMINAR_SOAK_LAMINARDB_EXE"] = artifacts["laminardb"]["path"]
@@ -153,6 +153,8 @@ def main():
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--features", default="cluster,kafka")
+    # `soak` keeps debug assertions, which compile the commit-boundary fault gates.
+    parser.add_argument("--profile", choices=("release", "soak"), default="release")
     parser.add_argument("--repetitions", type=int, choices=range(1, 4), default=1)
     parser.add_argument("--offline", action="store_true")
     args = parser.parse_args()

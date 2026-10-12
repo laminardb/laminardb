@@ -5,7 +5,7 @@ use super::evidence::slope;
 use super::latency::Latency;
 use super::load::{Counts, Inputs};
 use super::observer::Ledger;
-use super::spec::{Distribution, Fault, Limits, Spec};
+use super::spec::{Delivery, Distribution, Fault, Limits, Spec};
 
 fn spec() -> Spec {
     Spec {
@@ -23,6 +23,8 @@ fn spec() -> Spec {
         checkpoint_ms: 500,
         fault: Fault::None,
         limits: None,
+        delivery: Delivery::AtLeastOnce,
+        latency_profile: None,
     }
 }
 
