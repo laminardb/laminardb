@@ -179,7 +179,6 @@ fn observe(
     mut raw: BufWriter<File>,
 ) -> Result<Observation> {
     let deadline = start + Duration::from_secs(spec.seconds + spec.drain_seconds + 10);
-    let mut consumed = vec![0; topics.len()];
     let mut frozen = None;
     let mut stable_since = Instant::now();
     while Instant::now() < deadline {
@@ -204,7 +203,6 @@ fn observe(
             ensure!(message.partition() == 0, "unexpected output partition");
             let value = serde_json::from_slice(message.payload().context("unexpected tombstone")?)?;
             let first = ledger.observe(pipeline, &value, elapsed, &counts)?;
-            consumed[pipeline] = message.offset() + 1;
             writeln!(
                 raw,
                 "{}",
@@ -226,6 +224,7 @@ fn observe(
                         .map(|(_, high)| high)
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            let consumed = positions(&consumer, &topics)?;
             if frozen.as_ref() == Some(&boundary)
                 && consumed.iter().zip(&boundary).all(|(c, b)| c >= b)
             {
@@ -253,4 +252,19 @@ fn observe(
         ledger.unique_rows,
         spec.total_rows()
     )
+}
+
+/// The consumer's position in each output partition. A transactional partition ends in a commit
+/// marker that is never delivered as a message, but the position advances past it.
+fn positions(consumer: &BaseConsumer, topics: &[String]) -> Result<Vec<i64>> {
+    let assigned = consumer.position()?;
+    Ok(topics
+        .iter()
+        .map(
+            |topic| match assigned.find_partition(topic, 0).map(|p| p.offset()) {
+                Some(rdkafka::Offset::Offset(offset)) => offset,
+                _ => 0,
+            },
+        )
+        .collect())
 }
