@@ -1,7 +1,8 @@
 //! Durable topology status, admission and exact committed runtime lifecycle.
 
 use laminar_core::cluster::control::{
-    TopologyAdmissionStatus, TopologyCatalogState, TopologyOperationId, TopologyVersion,
+    TopologyAdmissionStatus, TopologyCatalogState, TopologyJournalUsage, TopologyOperationId,
+    TopologyVersion,
 };
 use std::sync::atomic::Ordering;
 
@@ -41,6 +42,8 @@ pub struct ClusterTopologyStatus {
     /// Version replayed by this process and running with live authority and intake released.
     /// A persisted inventory alone never sets this field.
     pub locally_active_version: Option<TopologyVersion>,
+    /// Bounded request journal occupancy; new requests are rejected once it is full.
+    pub journal: TopologyJournalUsage,
 }
 
 impl LaminarDB {
@@ -160,6 +163,7 @@ impl LaminarDB {
             catalog,
             committed_version,
             locally_active_version,
+            journal: store.topology_journal_usage().await?,
         })
     }
 }

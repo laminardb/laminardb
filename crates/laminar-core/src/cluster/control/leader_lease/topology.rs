@@ -13,7 +13,8 @@ use super::{
 };
 use crate::cluster::control::topology::{
     LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyCommit,
-    TopologyError, TopologyOperationId, TopologyVersion, TOPOLOGY_PROTOCOL_VERSION,
+    TopologyError, TopologyJournalUsage, TopologyOperationId, TopologyVersion,
+    MAX_TOPOLOGY_OPERATIONS, TOPOLOGY_PROTOCOL_VERSION,
 };
 use crate::cluster::control::CatalogManifestRef;
 
@@ -122,6 +123,25 @@ impl LeaderLeaseStore {
             };
             self.audit_topology_operation(operation).await?;
             Ok(operation.commit.clone())
+        })
+        .await
+        .map_err(|_| TopologyError::ReadTimedOut)?
+    }
+
+    /// Retained topology request identities against the fixed journal capacity.
+    ///
+    /// # Errors
+    /// Fails closed on malformed authority or the bounded read deadline.
+    pub async fn topology_journal_usage(&self) -> Result<TopologyJournalUsage, TopologyError> {
+        tokio::time::timeout(TOPOLOGY_READ_TIMEOUT, async {
+            let retained = self
+                .load_record()
+                .await?
+                .map_or(0, |head| head.topology_operations.len());
+            Ok(TopologyJournalUsage {
+                retained,
+                capacity: MAX_TOPOLOGY_OPERATIONS,
+            })
         })
         .await
         .map_err(|_| TopologyError::ReadTimedOut)?

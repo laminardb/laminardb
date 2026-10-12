@@ -29,7 +29,8 @@ pub use activation::{
 pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
 pub use admission::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
-    TopologyCheckpointCut, TopologyCutCommit, TopologyPlanRef, MAX_TOPOLOGY_OPERATIONS,
+    TopologyCheckpointCut, TopologyCutCommit, TopologyJournalUsage, TopologyPlanRef,
+    MAX_TOPOLOGY_OPERATIONS,
 };
 pub use commit::{TopologyCommit, TOPOLOGY_COMMIT_PROTOCOL_VERSION};
 pub use compatibility::{

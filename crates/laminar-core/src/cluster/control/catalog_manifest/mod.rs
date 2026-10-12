@@ -324,6 +324,16 @@ impl CatalogManifestStore {
         self.authority.live_topology_commit().await
     }
 
+    /// Retained topology request identities against the fixed journal capacity.
+    ///
+    /// # Errors
+    /// Fails closed when the authority is invalid or the read exceeds its deadline.
+    pub async fn topology_journal_usage(
+        &self,
+    ) -> Result<super::topology::TopologyJournalUsage, super::topology::TopologyError> {
+        self.authority.topology_journal_usage().await
+    }
+
     /// Subscription certificates preserved by the newest committed migration.
     ///
     /// # Errors
