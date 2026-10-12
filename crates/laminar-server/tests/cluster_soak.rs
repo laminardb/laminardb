@@ -14496,6 +14496,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
             });
         let failover_started = Instant::now();
         let failover_deadline = failover_started + recovery_ceiling;
+        let prior_release = migration_probe
+            .as_ref()
+            .and_then(topology_migration::MigrationProbe::recovery_release);
         nodes[victim].kill9();
         nodes[victim].disarm_checkpoint_kill();
         if victim_role == "follower" {
@@ -14575,6 +14578,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 &mut nodes[..],
                 &survivor_nodes,
                 round,
+                prior_release.as_ref(),
                 remaining_progress_window(failover_deadline, "rescaled topology output"),
             );
         }
@@ -14684,6 +14688,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 &mut nodes[..],
                 &all_live_nodes,
                 round,
+                prior_release.as_ref(),
                 remaining_progress_window(rejoin_deadline, "scale-out topology output"),
             );
         }

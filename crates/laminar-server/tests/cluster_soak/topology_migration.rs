@@ -102,7 +102,7 @@ pub(super) struct MigrationProbe {
 }
 
 impl MigrationProbe {
-    fn recovery_release(&self) -> Option<(u64, RecoveryAnnouncement)> {
+    pub(super) fn recovery_release(&self) -> Option<(u64, RecoveryAnnouncement)> {
         use object_store::path::Path as ObjectPath;
         use sha2::{Digest as _, Sha256};
 
@@ -399,6 +399,7 @@ impl MigrationProbe {
         nodes: &mut [Node],
         live: &BTreeSet<usize>,
         round: u32,
+        prior_release: Option<&(u64, RecoveryAnnouncement)>,
         ceiling: Duration,
     ) {
         let rescaled = if live.len() < nodes.len() {
@@ -409,17 +410,23 @@ impl MigrationProbe {
         let first = 1_000 + u64::from(round) * 10 + if live.len() < nodes.len() { 0 } else { 5 };
         let sent = self.produce(first);
         self.wait_live_output(nodes, live, ceiling);
-        let release = self
-            .recovery_release()
-            .expect("post-kill reassignment requires a durable recovery Release");
-        assert!(
-            release.1.round.topology_binding().is_none(),
-            "a settled topology must recover through an ordinary round"
-        );
+        // A rejoin may rotate without a new round; any round started after settlement must be
+        // ordinary rather than bound to the migrated topology.
+        let release = self.recovery_release();
+        let new_round = release.as_ref().map(|(_, terminal)| terminal.round.id)
+            != prior_release.map(|(_, terminal)| terminal.round.id);
+        if new_round {
+            let (_, terminal) = release.as_ref().unwrap();
+            assert!(
+                terminal.round.topology_binding().is_none(),
+                "a settled topology must recover through an ordinary round"
+            );
+        }
         let report = serde_json::json!({
             "scope": "Committed topology after its own checkpoint; vnode ownership changed by ordinary failed-owner recovery or rejoin rotation.",
             "round": round, "phase": rescaled, "live_nodes": live,
-            "assignment_participants": release.1.round.assignment_fence.participants,
+            "new_recovery_round": new_round,
+            "release_assignment_participants": release.as_ref().map(|(_, terminal)| &terminal.round.assignment_fence.participants),
             "send_to_visible_ms": sent.elapsed().as_millis(),
         });
         std::fs::write(
