@@ -16,6 +16,25 @@ spec:
     name: {{ include "laminardb.fullname" . }}
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  {{- $scaleDown := .Values.autoscaling.scaleDown | default dict }}
+  {{- $scaleUp := .Values.autoscaling.scaleUp | default dict }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: {{ $scaleUp.stabilizationWindowSeconds | default 120 }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: {{ $scaleDown.stabilizationWindowSeconds | default 600 }}
+      {{- if and (eq .Values.laminardb.mode "cluster") (not $scaleDown.enabled) }}
+      selectPolicy: Disabled
+      {{- else }}
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+      {{- end }}
   metrics:
     {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource

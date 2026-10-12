@@ -59,6 +59,17 @@ pub fn validate_reference_table_limits(rows: usize, bytes: usize) -> Result<(), 
     Ok(())
 }
 
+/// Validate the pipeline-wide managed operator state budget.
+///
+/// # Errors
+/// Returns an error if the budget is zero.
+pub fn validate_managed_state_max_bytes(bytes: usize) -> Result<(), &'static str> {
+    if bytes == 0 {
+        return Err("pipeline_max_managed_state_bytes must be greater than zero");
+    }
+    Ok(())
+}
+
 /// Largest source queue budget supported by byte-sized semaphore reservations.
 pub const MAX_SOURCE_QUEUE_BYTES: usize = if tokio::sync::Semaphore::MAX_PERMITS < u32::MAX as usize
 {
@@ -301,11 +312,8 @@ impl LaminarConfig {
         let max_managed_state_bytes = self
             .pipeline_max_managed_state_bytes
             .unwrap_or(DEFAULT_MAX_MANAGED_STATE_BYTES);
-        if max_managed_state_bytes == 0 {
-            return Err(DbError::Config(
-                "pipeline_max_managed_state_bytes must be greater than zero".into(),
-            ));
-        }
+        validate_managed_state_max_bytes(max_managed_state_bytes)
+            .map_err(|error| DbError::Config(error.into()))?;
         self.pipeline_max_managed_state_bytes = Some(max_managed_state_bytes);
 
         if let Some(checkpoint) = self.checkpoint.as_mut() {

@@ -809,6 +809,9 @@ pub(super) async fn activate_cluster_serving(
     workers: &[laminar_db::process_function::remote::LocalPythonWorker],
 ) -> Result<ClusterHandle, ClusterStartupError> {
     let node_id_str = formed.local_node.name.clone();
+    let drain_timeout = config
+        .server
+        .effective_drain_timeout(config.checkpoint.timeout);
     let leader_authority_timeout =
         verify_catalog_and_authority_budget(&runtime, &mut gate, &identity, &mut formed).await?;
 
@@ -848,6 +851,7 @@ pub(super) async fn activate_cluster_serving(
             api_handle,
             app_state,
             leader_authority_timeout,
+            drain_timeout,
         },
         #[cfg(feature = "process-remote")]
         workers,

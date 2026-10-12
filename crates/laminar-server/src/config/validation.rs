@@ -383,6 +383,18 @@ fn collect_delivery_errors(config: &ServerConfig, errors: &mut Vec<String>) {
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
         }
+        // The leader's handoff checkpoint may take the full checkpoint timeout.
+        let drain = config
+            .server
+            .effective_drain_timeout(config.checkpoint.timeout);
+        if drain < config.checkpoint.timeout {
+            errors.push(format!(
+                "mode = \"cluster\": server.drain_timeout = {drain:?} must be at least                  checkpoint.timeout = {:?}",
+                config.checkpoint.timeout,
+            ));
+        } else if tokio::time::Instant::now().checked_add(drain).is_none() {
+            errors.push("server.drain_timeout exceeds the platform clock range".to_string());
+        }
         // WHY: below 100ms the capture-quorum round trip dominates the barrier.
         if config.checkpoint.interval < Duration::from_millis(100) {
             errors.push(format!(

@@ -793,8 +793,21 @@ async fn leader_lease_runtime_cancels_and_joins_its_task() {
     assert!(runtime.task.is_none());
 }
 
-#[tokio::test]
-async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
+/// A manually wired cluster handle whose owned tasks are inert, plus observers of its authority.
+struct TestClusterHandle {
+    handle: ClusterHandle,
+    snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
+    controller: Arc<laminar_core::cluster::control::ClusterController>,
+    db: Arc<LaminarDB>,
+    serving_gate: Arc<crate::http::ServingGate>,
+    leader_shutdown: tokio_util::sync::CancellationToken,
+    process_terminal: tokio_util::sync::CancellationToken,
+    process_deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    live_tx: watch::Sender<bool>,
+    tasks: [tokio::task::AbortHandle; 7],
+}
+
+async fn test_cluster_handle(drain_timeout: std::time::Duration) -> TestClusterHandle {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
 
     let node = NodeId(47);
@@ -802,6 +815,7 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let snapshot_store =
         Arc::new(laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::clone(&store)));
+    let snapshot_store_observer = Arc::clone(&snapshot_store);
     let acquired = acquire_test_process_lease(Arc::clone(&store), node, boot, 10_000).await;
     let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
     let participant = laminar_core::checkpoint::CheckpointParticipant {
@@ -913,6 +927,7 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
         cluster_controller: Arc::clone(&controller),
         snapshot_store,
         vnode_count: 1,
+        drain_timeout,
         leader_lease,
         process_lease,
         rebalance_tasks: vec![rebalance_task],
@@ -920,33 +935,98 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
         #[cfg(feature = "process-remote")]
         process_workers: Vec::new(),
     };
-    assert!(controller.process_lease_is_live());
+    TestClusterHandle {
+        handle,
+        snapshot_store: Arc::clone(&snapshot_store_observer),
+        controller,
+        db,
+        serving_gate,
+        leader_shutdown,
+        process_terminal: process_terminal_observer,
+        process_deadline: process_deadline_observer,
+        live_tx,
+        tasks: [
+            api_abort,
+            watcher_abort,
+            membership_abort,
+            rebalance_abort,
+            leader_abort,
+            terminal_abort,
+            renewal_abort,
+        ],
+    }
+}
 
-    drop(handle);
-    assert!(!process_deadline_observer.is_live());
-    assert!(process_terminal_observer.is_cancelled());
-    drop(live_tx);
+#[tokio::test]
+async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
+    let fixture = test_cluster_handle(std::time::Duration::from_secs(30)).await;
+    assert!(fixture.controller.process_lease_is_live());
 
-    assert!(!serving_gate.open());
-    assert!(!controller.process_lease_is_live());
-    assert!(db.cluster_intake_fenced());
-    assert!(leader_shutdown.is_cancelled());
-    let tasks = [
-        api_abort,
-        watcher_abort,
-        membership_abort,
-        rebalance_abort,
-        leader_abort,
-        terminal_abort,
-        renewal_abort,
-    ];
+    drop(fixture.handle);
+    assert!(!fixture.process_deadline.is_live());
+    assert!(fixture.process_terminal.is_cancelled());
+    drop(fixture.live_tx);
+
+    assert!(!fixture.serving_gate.open());
+    assert!(!fixture.controller.process_lease_is_live());
+    assert!(fixture.db.cluster_intake_fenced());
+    assert!(fixture.leader_shutdown.is_cancelled());
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while tasks.iter().any(|task| !task.is_finished()) {
+        while fixture.tasks.iter().any(|task| !task.is_finished()) {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("owned runtime tasks must terminate");
+}
+
+#[tokio::test]
+async fn drain_reports_completion_exhaustion_and_authority_loss_distinctly() {
+    use super::shutdown::{drain_local_vnodes, DrainOutcome};
+
+    let owner = laminar_core::cluster::control::AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, laminar_core::state::NodeId(47))]),
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: 47,
+                boot_incarnation: uuid::Uuid::from_u128(477),
+            }],
+        )
+        .unwrap();
+    let elsewhere = laminar_core::cluster::control::AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, laminar_core::state::NodeId(48))]),
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: 48,
+                boot_incarnation: uuid::Uuid::from_u128(488),
+            }],
+        )
+        .unwrap();
+    for (head, cancel_first, expected) in [
+        (&elsewhere, false, DrainOutcome::Drained),
+        (&owner, false, DrainOutcome::Incomplete),
+        (&owner, true, DrainOutcome::AuthorityLost),
+    ] {
+        let mut fixture = test_cluster_handle(std::time::Duration::from_millis(300)).await;
+        fixture.controller.set_leader_lease_store(Arc::new(
+            laminar_core::cluster::control::LeaderLeaseStore::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                10_000,
+            ),
+        ));
+        fixture.snapshot_store.save_if_absent(head).await.unwrap();
+        if cancel_first {
+            fixture.process_terminal.cancel();
+        }
+        let terminal = fixture.process_terminal.clone();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_local_vnodes(&mut fixture.handle, &terminal),
+        )
+        .await
+        .expect("drain is bounded by its allowance");
+        assert_eq!(outcome, expected);
+    }
 }
 
 #[tokio::test]

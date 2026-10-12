@@ -4027,6 +4027,31 @@ async fn wait_until_drained_true_when_owning_none() {
     assert!(drained, "owns no vnode → drained quickly");
 }
 
+#[tokio::test(start_paused = true)]
+async fn wait_until_drained_honors_an_allowance_beyond_thirty_seconds() {
+    let me = NodeId(1);
+    for (allowance, expected) in [
+        (Duration::from_secs(30), false),
+        (Duration::from_secs(150), true),
+    ] {
+        let store = Arc::new(store());
+        // Ownership stays unproven until the leader's handoff, which outlasts the former fixed
+        // 30-second wait; an audit-free first head keeps this test about the allowance only.
+        let handoff = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(45)).await;
+                let reassigned = snapshot(BTreeMap::from([(0, NodeId(2)), (1, NodeId(2))]));
+                store.save_if_absent(&reassigned).await.unwrap();
+            })
+        };
+        let drained =
+            wait_until_drained(&store, None, me, 2, Duration::from_secs(1), allowance).await;
+        assert_eq!(drained, expected, "allowance {allowance:?}");
+        handoff.abort();
+    }
+}
+
 #[tokio::test]
 async fn wait_until_drained_fails_closed_when_no_snapshot() {
     let s = store();
