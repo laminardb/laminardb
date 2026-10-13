@@ -43,9 +43,8 @@ impl LaminarDB {
             return Ok(None);
         }
         if binding.recovery.is_some() {
-            let binding = &binding;
             if binding.input.assignment() != fence
-                || !self.recovered_topology_runtime_is_active(binding).await?
+                || !self.recovered_topology_runtime_is_active(&binding).await?
             {
                 return Err(TopologyError::Fenced.into());
             }
