@@ -332,7 +332,9 @@ checkpoint. Until then, only same-slot replacement of a failed process is admitt
 in or out while `GET /api/v1/cluster/topology` reports `live_migration`. Afterwards all three ownership changes work normally, and a later
 migration freezes whatever owner map is current when it is admitted. Upgrade every node before
 rescaling a migrated deployment: older binaries reject a changed owner map after a migration
-and stay fenced.
+and stay fenced. A joining or restarted node that owns no vnodes yet starts its sources from
+the last committed checkpoint, so sources a migration created with a non-replayable start
+policy (such as Kafka `latest`) remain startable.
 
 The topology request journal keeps every admitted request identity, including finished ones, so
 a retried request returns its original outcome. It holds 64 requests and does not compact yet.
