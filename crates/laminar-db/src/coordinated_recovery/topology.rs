@@ -125,7 +125,14 @@ impl TopologyDriver {
             .ok_or_else(|| {
                 TopologyError::Conflict("retained topology operation disappeared".into())
             })?;
-        if self.progress.is_none_or(|(operation, sequence, _)| {
+        if status.phase == TopologyAdmissionPhase::Active {
+            // Active is terminal. Its age must not turn later recoveries or fault observations,
+            // which clear `completed`, into requests for yet another recovery round.
+            if self.progress.take().is_some() {
+                tracing::info!(operation = %status.operation_id.get(), phase = ?status.phase,
+                    "observed durable topology progress");
+            }
+        } else if self.progress.is_none_or(|(operation, sequence, _)| {
             operation != status.operation_id || sequence != status.status_sequence
         }) {
             self.progress = Some((
