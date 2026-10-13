@@ -27,7 +27,7 @@ jobs:
       # Coverage instrumentation grows the same large async recovery test frames exercised by CI.
       RUST_MIN_STACK: 4194304
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # The --all-features build under -C instrument-coverage (run 3x in this
       # job) overflowed the runner disk ("No space left on device" -> ld bus
       # error). Use the same aggressive cleanup + swap as the CI Test job.
