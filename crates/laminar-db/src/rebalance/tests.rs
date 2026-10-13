@@ -3851,29 +3851,6 @@ fn drain_certificate_binds_the_durable_target_map_and_boot_roster() {
 }
 
 #[test]
-fn publish_placement_metrics_labels_by_domain() {
-    let prom = prometheus::Registry::new();
-    let metrics = EngineMetrics::new(&prom);
-
-    // 4 vnodes: node 1 owns two, node 2 owns one, one is unassigned.
-    let vreg = VnodeRegistry::new(4);
-    vreg.set_assignment(vec![NodeId(1), NodeId(1), NodeId(2), NodeId::UNASSIGNED].into());
-    let nodes = vec![
-        (NodeId(1), Locality::parse("region=r;zone=z1")),
-        (NodeId(2), Locality::parse("region=r;zone=z2")),
-    ];
-
-    publish_placement_metrics(&metrics, &vreg, &nodes, 1); // isolation_tier 1 = zone
-
-    let g = &metrics.placement_vnodes_per_domain;
-    assert_eq!(g.with_label_values(&["r;z1"]).get(), 2);
-    assert_eq!(g.with_label_values(&["r;z2"]).get(), 1);
-    assert_eq!(g.with_label_values(&["unknown"]).get(), 1); // the unassigned vnode
-                                                            // Blast radius = largest domain (2) / total vnodes (4).
-    assert!((metrics.placement_blast_radius_ratio.get() - 0.5).abs() < 1e-9);
-}
-
-#[test]
 fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
     fn participant(node_id: u64, boot: u64) -> CheckpointParticipant {
         CheckpointParticipant {
@@ -4025,6 +4002,79 @@ async fn wait_until_drained_true_when_owning_none() {
     )
     .await;
     assert!(drained, "owns no vnode → drained quickly");
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_until_drained_honors_an_allowance_beyond_thirty_seconds() {
+    let me = NodeId(1);
+    for (allowance, expected) in [
+        (Duration::from_secs(30), false),
+        (Duration::from_secs(150), true),
+    ] {
+        let store = Arc::new(store());
+        // Ownership stays unproven until the leader's handoff, which outlasts the former fixed
+        // 30-second wait; an audit-free first head keeps this test about the allowance only.
+        let handoff = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(45)).await;
+                let reassigned = snapshot(BTreeMap::from([(0, NodeId(2)), (1, NodeId(2))]));
+                store.save_if_absent(&reassigned).await.unwrap();
+            })
+        };
+        let drained =
+            wait_until_drained(&store, None, me, 2, Duration::from_secs(1), allowance).await;
+        assert_eq!(drained, expected, "allowance {allowance:?}");
+        handoff.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn wait_until_drained_never_certifies_an_unfinished_handoff() {
+    let me = NodeId(1);
+    let survivor = CheckpointParticipant {
+        node_id: 2,
+        boot_incarnation: uuid::Uuid::from_u128(2),
+    };
+    let committed = snapshot(BTreeMap::from([(0, me), (1, NodeId(2))]));
+    // The target already excludes this node, but its leader departed before the handoff cut.
+    let draining = draining_snapshot(
+        &committed,
+        BTreeMap::from([(0, NodeId(2)), (1, NodeId(2))]),
+        vec![survivor],
+    );
+    let store = Arc::new(store());
+    store.save_if_absent(&committed).await.unwrap();
+    assert!(matches!(
+        store
+            .save_if_version(&draining, committed.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let settle = {
+        let store = Arc::clone(&store);
+        let draining = draining.clone();
+        let aborted = draining.aborted_target(&committed).unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            store.finalize_drain(&draining, &aborted).await.unwrap()
+        })
+    };
+    let drained = wait_until_drained(
+        &store,
+        None,
+        me,
+        2,
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        !drained,
+        "neither the unfinished target nor the successor's abort releases this node's vnodes"
+    );
+    assert!(matches!(settle.await.unwrap(), RotateOutcome::Rotated));
 }
 
 #[tokio::test]

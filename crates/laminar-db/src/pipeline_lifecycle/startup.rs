@@ -136,19 +136,13 @@ impl LaminarDB {
         if self.is_cluster_runtime() {
             let catalog = self.catalog_manifest_store.lock().clone();
             if let Some(catalog) = catalog {
-                let topology = catalog.topology_state().await.map_err(|error| {
+                let live = catalog.live_topology_commit().await.map_err(|error| {
                     DbError::Pipeline(format!(
                         "[{}] catalog manifest load failed: {error}",
                         laminar_core::error_codes::RECOVERY_FAILED
                     ))
                 })?;
-                if matches!(
-                    topology,
-                    laminar_core::cluster::control::TopologyCatalogState::Versioned {
-                        committed: Some(_),
-                        ..
-                    }
-                ) {
+                if live.is_some() {
                     return Err(laminar_core::cluster::control::TopologyError::Conflict(
                         "committed target requires migration-root reconstruction, installation and Release; ordinary startup cannot restore the parent checkpoint".into(),
                     ).into());

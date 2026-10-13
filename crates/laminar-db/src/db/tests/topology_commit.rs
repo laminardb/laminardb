@@ -370,7 +370,11 @@ async fn topology_commit_db_created_replay_accepts_original_bootstrap_and_gates_
         7
     );
     assert_eq!(
-        *fresh.db.replayed_topology_version.lock(),
+        fresh
+            .db
+            .replayed_topology
+            .lock()
+            .map(|replayed| replayed.version),
         Some(TopologyVersion::new(2).unwrap())
     );
     assert!(matches!(

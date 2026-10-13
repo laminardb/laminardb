@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_core::cluster::control::{
-    CatalogManifestRef, ClusterController, LegacyTopologyBaseline, TopologyAdmissionPlan,
+    AssignmentSnapshotStore, CatalogManifest, CatalogManifestRef, ClusterController, LeaderProof,
+    LegacyTopologyBaseline, LocalProcessAuthorityIdentity, TopologyAdmissionPlan,
     TopologyAdoptionOutcome, TopologyError, TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
 };
 use laminar_sql::parser::StreamingStatement;
@@ -184,28 +185,9 @@ impl LaminarDB {
                     assignment,
                     compatibility: Some(compatibility),
                 };
-                let admitted = loop {
-                    self.ensure_topology_submission_available()?;
-                    if !controller.proof_is_live(&proof)
-                        || controller.try_live_local_process_authority_identity().ok()
-                            != Some(before)
-                    {
-                        return Err(TopologyError::Fenced.into());
-                    }
-                    match authority
-                        .admit_topology_plan(&proof, assignments, &plan, &target)
-                        .await
-                    {
-                        Ok(admitted) => break admitted,
-                        Err(TopologyError::Contended) => {
-                            // Do not rebuild or change the operation UUID after checkpoint/CAS
-                            // contention. The outer timeout bounds this control-path retry, and
-                            // authority rereads resolve a lost successful append response.
-                            tokio::time::sleep(Duration::from_millis(25)).await;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                };
+                let admitted = self
+                    .admit_submitted_plan(&controller, &proof, before, assignments, &plan, &target)
+                    .await?;
                 tracing::info!(operation = %request.operation_id.get(), phase = ?admitted.phase,
                 "admitted durable topology request; coordinator owns further progress");
                 Ok(admitted)
@@ -213,6 +195,43 @@ impl LaminarDB {
         )
         .await
         .map_err(|_| TopologyError::Contended)?
+    }
+
+    /// Retry one immutable plan until admitted while this leader holds periodic checkpoints.
+    async fn admit_submitted_plan(
+        &self,
+        controller: &ClusterController,
+        proof: &LeaderProof,
+        before: LocalProcessAuthorityIdentity,
+        assignments: &AssignmentSnapshotStore,
+        plan: &TopologyAdmissionPlan,
+        target: &CatalogManifest,
+    ) -> Result<TopologyAdmissionStatus, DbError> {
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?;
+        let _checkpoints = controller.hold_periodic_checkpoints();
+        loop {
+            self.ensure_topology_submission_available()?;
+            if !controller.proof_is_live(proof)
+                || controller.try_live_local_process_authority_identity().ok() != Some(before)
+            {
+                return Err(TopologyError::Fenced.into());
+            }
+            match authority
+                .admit_topology_plan(proof, assignments, plan, target)
+                .await
+            {
+                Ok(admitted) => return Ok(admitted),
+                Err(TopologyError::Contended) => {
+                    // Do not rebuild or change the operation UUID after checkpoint/CAS
+                    // contention. The caller's timeout bounds this retry and the hold, and
+                    // authority rereads resolve a lost successful append response.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Explicitly adopt topology one without rewriting the existing catalog or checkpoint storage.
@@ -292,7 +311,7 @@ impl LaminarDB {
             if !controller.proof_is_live(&proof) {
                 return Err(TopologyError::Fenced.into());
             }
-            *self.replayed_topology_version.lock() = Some(TopologyVersion::LEGACY_BASELINE);
+            *self.replayed_topology.lock() = Some(super::ReplayedTopology::LEGACY_BASELINE);
             Ok(baseline)
         }).await.map_err(|_| TopologyError::Contended)?
     }

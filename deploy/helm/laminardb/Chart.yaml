@@ -2,7 +2,7 @@ apiVersion: v2
 name: laminardb
 description: LaminarDB - Embedded Streaming SQL Database for stream processing
 type: application
-version: 0.25.1
+version: 0.25.2
 appVersion: "0.25.1"
 kubeVersion: ">=1.25.0-0"
 keywords:

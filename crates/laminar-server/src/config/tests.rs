@@ -1742,6 +1742,94 @@ fn graph_input_limit_default_override_and_zero_validation() {
         .contains("pipeline_max_input_buf_bytes"));
 }
 #[tokio::test]
+async fn managed_state_budget_parses_validates_and_reaches_database() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.pipeline_max_managed_state_bytes, None);
+    let invalid: ServerConfig = toml::from_str(
+        "[server]
+pipeline_max_managed_state_bytes = 0",
+    )
+    .unwrap();
+    assert!(validate_config(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("pipeline_max_managed_state_bytes"));
+    let configured: ServerConfig = toml::from_str(
+        "[server]
+pipeline_max_managed_state_bytes = 1",
+    )
+    .unwrap();
+    validate_config(&configured).unwrap();
+    let db = configured
+        .server
+        .apply_memory_limits(laminar_db::LaminarDB::builder())
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE generated (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, value VARCHAR NOT NULL) FROM GENERATOR ('rows.per.second' = '1000', 'max.rows' = '64')").await.unwrap();
+    db.execute(
+        "CREATE STREAM counts AS SELECT value, COUNT(*) AS total FROM generated GROUP BY value",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        db.start().await,
+        Err(laminar_db::DbError::ManagedStateBudgetExceeded { limit_bytes: 1, .. })
+    ));
+}
+
+#[test]
+fn cluster_drain_timeout_covers_the_handoff_checkpoint() {
+    let cluster = |extra: &str| -> ServerConfig {
+        toml::from_str(&format!(
+            "node_id = \"n1\"
+[server]
+mode = \"cluster\"
+{extra}
+[checkpoint]
+timeout = \"120s\"
+[discovery]
+strategy = \"static\"
+seeds = [\"x:1\"]"
+        ))
+        .unwrap()
+    };
+    let derived = cluster("");
+    assert_eq!(derived.server.drain_timeout, None);
+    assert_eq!(
+        derived
+            .server
+            .effective_drain_timeout(derived.checkpoint.timeout),
+        std::time::Duration::from_secs(150)
+    );
+    let configured = cluster("drain_timeout = \"10m\"");
+    assert_eq!(
+        configured
+            .server
+            .effective_drain_timeout(configured.checkpoint.timeout),
+        std::time::Duration::from_secs(600)
+    );
+    for config in [derived, configured] {
+        let errors = match validate_config(&config) {
+            Err(ConfigError::ValidationErrors { errors }) => errors,
+            Ok(()) => Vec::new(),
+            Err(error) => panic!("unexpected error {error}"),
+        };
+        assert!(!errors.iter().any(|error| error.contains("drain_timeout")));
+    }
+    let short = cluster("drain_timeout = \"30s\"");
+    match validate_config(&short).unwrap_err() {
+        ConfigError::ValidationErrors { errors } => assert!(
+            errors.iter().any(
+                |error| error.contains("drain_timeout") && error.contains("checkpoint.timeout")
+            ),
+            "{errors:?}"
+        ),
+        error => panic!("expected ValidationErrors, got {error}"),
+    }
+}
+
+#[tokio::test]
 async fn reference_table_memory_limits_parse_validate_and_reach_database() {
     let default: ServerConfig = toml::from_str("").unwrap();
     assert_eq!(default.server.reference_table_max_rows, 1_000_000);

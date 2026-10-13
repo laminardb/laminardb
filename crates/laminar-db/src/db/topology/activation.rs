@@ -34,13 +34,17 @@ impl LaminarDB {
         revision: u64,
         deadline: tokio::time::Instant,
     ) -> Result<Option<crate::db::AssignmentAuthorityActivation>, DbError> {
-        let binding = self.installed_topology_runtime.lock().clone();
-        if let Some(binding) = binding
-            .as_ref()
-            .filter(|binding| binding.recovery.is_some())
+        let Some(binding) = self.installed_topology_runtime.lock().clone() else {
+            return Ok(None);
+        };
+        // A settled target is an ordinary deployment; its runtime adopts ordinary reassignment.
+        if self.live_topology_commit().await?.as_ref() != binding.input.operation().commit.as_ref()
         {
+            return Ok(None);
+        }
+        if binding.recovery.is_some() {
             if binding.input.assignment() != fence
-                || !self.recovered_topology_runtime_is_active(binding).await?
+                || !self.recovered_topology_runtime_is_active(&binding).await?
             {
                 return Err(TopologyError::Fenced.into());
             }
@@ -60,9 +64,9 @@ impl LaminarDB {
                 .await?,
             ));
         }
-        let Some(binding) = binding.filter(|binding| binding.released_sequence.is_some()) else {
+        if binding.released_sequence.is_none() {
             return Ok(None);
-        };
+        }
         let fresh = controller
             .committed_topology_restore_input(binding.input.operation().operation_id)
             .await?;

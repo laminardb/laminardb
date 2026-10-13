@@ -2,6 +2,15 @@
 {{- if and (eq .Values.laminardb.mode "cluster") (eq .Values.laminardb.delivery "best_effort") -}}
 {{- fail "cluster mode requires laminardb.delivery=at_least_once or exactly_once" -}}
 {{- end -}}
+{{- if eq .Values.laminardb.mode "cluster" -}}
+{{- $drain := int ((.Values.laminardb.cluster | default dict).drainTimeoutSeconds | default 150) -}}
+{{- if lt (int .Values.terminationGracePeriodSeconds) (add $drain 60) -}}
+{{- fail (printf "terminationGracePeriodSeconds must be at least laminardb.cluster.drainTimeoutSeconds + 60 (%d)" (add $drain 60)) -}}
+{{- end -}}
+{{- if and .Values.autoscaling.enabled (eq ((.Values.laminardb.cluster | default dict).discovery | default dict).strategy "static") -}}
+{{- fail "autoscaling requires gossip discovery; static seeds cannot include autoscaled pods" -}}
+{{- end -}}
+{{- end -}}
 {{- if and (ne .Values.laminardb.delivery "best_effort") (hasPrefix "file://" $checkpointUrl) (not .Values.persistence.checkpoints.enabled) -}}
 {{- fail "at_least_once/exactly_once with a file:// checkpoint URL requires persistence.checkpoints.enabled=true" -}}
 {{- end -}}
@@ -27,6 +36,9 @@ data:
     delivery = "{{ .Values.laminardb.delivery }}"
     bind = "{{ .Values.laminardb.httpBind }}"
     key_groups = {{ .Values.laminardb.keyGroups }}
+    {{- if $isCluster }}
+    drain_timeout = "{{ $cluster.drainTimeoutSeconds | default 150 }}s"
+    {{- end }}
     {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
     # Resolved from the pod env at config load; the token never enters the ConfigMap.
     console_token = "${LAMINAR_CONSOLE_TOKEN}"

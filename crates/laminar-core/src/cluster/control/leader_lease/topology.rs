@@ -12,8 +12,9 @@ use super::{
     TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION,
 };
 use crate::cluster::control::topology::{
-    LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
-    TopologyOperationId, TopologyVersion, TOPOLOGY_PROTOCOL_VERSION,
+    LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyCommit,
+    TopologyError, TopologyJournalUsage, TopologyOperationId, TopologyVersion,
+    MAX_TOPOLOGY_OPERATIONS, TOPOLOGY_PROTOCOL_VERSION,
 };
 use crate::cluster::control::CatalogManifestRef;
 
@@ -104,6 +105,77 @@ impl LeaderLeaseStore {
             .catalog_with_topology()
             .await?
             .map_or(TopologyCatalogState::Uninitialized, |(_, state)| state))
+    }
+
+    /// Commit of the newest migration while it still owns startup, assignment and recovery.
+    /// `None` means no committed migration or a settled target: Active with its own committed
+    /// checkpoint, which then follows ordinary startup, reassignment and recovery.
+    ///
+    /// # Errors
+    /// Fails closed on malformed or missing referenced evidence or the bounded read deadline.
+    pub async fn live_topology_commit(&self) -> Result<Option<TopologyCommit>, TopologyError> {
+        tokio::time::timeout(TOPOLOGY_READ_TIMEOUT, async {
+            let Some(head) = self.load_record().await? else {
+                return Ok(None);
+            };
+            let Some(operation) = head.live_topology_migration() else {
+                return Ok(None);
+            };
+            self.audit_topology_operation(operation).await?;
+            Ok(operation.commit.clone())
+        })
+        .await
+        .map_err(|_| TopologyError::ReadTimedOut)?
+    }
+
+    /// Retained topology request identities against the fixed journal capacity.
+    ///
+    /// # Errors
+    /// Fails closed on malformed authority or the bounded read deadline.
+    pub async fn topology_journal_usage(&self) -> Result<TopologyJournalUsage, TopologyError> {
+        tokio::time::timeout(TOPOLOGY_READ_TIMEOUT, async {
+            let retained = self
+                .load_record()
+                .await?
+                .map_or(0, |head| head.topology_operations.len());
+            Ok(TopologyJournalUsage {
+                retained,
+                capacity: MAX_TOPOLOGY_OPERATIONS,
+            })
+        })
+        .await
+        .map_err(|_| TopologyError::ReadTimedOut)?
+    }
+
+    /// Subscription certificates preserved by the newest committed migration. Ordinary startup
+    /// of a settled target binds these exact generations; deriving them from the changed pipeline
+    /// identity would silently start new subscription streams.
+    ///
+    /// # Errors
+    /// Fails closed on malformed or missing referenced evidence or the bounded read deadline.
+    pub async fn committed_topology_subscriptions(
+        &self,
+    ) -> Result<Vec<crate::checkpoint::OutputDistributionCertificate>, TopologyError> {
+        tokio::time::timeout(TOPOLOGY_READ_TIMEOUT, async {
+            let Some(head) = self.load_record().await? else {
+                return Ok(Vec::new());
+            };
+            let Some(operation) = head.committed_topology_operation() else {
+                return Ok(Vec::new());
+            };
+            self.audit_topology_operation(operation).await?;
+            let binding = operation.migration_root.as_ref().ok_or_else(|| {
+                TopologyError::Invalid("committed topology has no migration root".into())
+            })?;
+            let root = self.load_topology_root(&binding.root).await?;
+            Ok(root
+                .subscriptions
+                .into_iter()
+                .map(|subscription| subscription.target_certificate)
+                .collect())
+        })
+        .await
+        .map_err(|_| TopologyError::ReadTimedOut)?
     }
 
     pub(in crate::cluster::control) async fn catalog_with_topology(

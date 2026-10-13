@@ -70,6 +70,10 @@ pub enum ClusterStartupError {
     EngineShutdown(String),
     #[error("cluster authority lost: {0}")]
     AuthorityLost(String),
+    /// The leader did not reassign this node's vnodes within the drain allowance. The node exits
+    /// fenced; its expiring process lease drives failed-owner recovery for the remaining vnodes.
+    #[error("graceful drain incomplete: {0}")]
+    DrainIncomplete(String),
 }
 
 pub struct ClusterHandle {
@@ -92,6 +96,8 @@ pub struct ClusterHandle {
     snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     /// Fixed vnode cardinality used to validate the durable drain head before shutdown.
     vnode_count: u32,
+    /// Graceful-drain allowance covering the leader's handoff checkpoint and reassignment.
+    drain_timeout: std::time::Duration,
     /// Cancels the leader-lease renewal loop on shutdown so a draining
     /// node stops renewing and its lease expires promptly.
     leader_lease: LeaderLeaseRuntime,

@@ -105,6 +105,31 @@ helm install my-laminardb deploy/helm/laminardb -f cluster-values.yaml
 
 ---
 
+## Scaling a cluster
+
+Changing the replica count and completing the state handoff are separate steps. Kubernetes
+changes pods; the LaminarDB leader then moves vnodes with a checkpoint and a fenced assignment.
+
+1. Check `GET /api/v1/cluster/topology`. Do not scale while `live_migration` is set: a
+   committed topology migration has not yet reached `Active` with its own checkpoint, and until
+   then only same-slot pod replacement is supported.
+2. Scale out with `kubectl scale statefulset <release>-laminardb --replicas=N+1`. With gossip
+   discovery, generated seeds come from `replicaCount`; also raise `replicaCount` in your values
+   so later upgrades keep the same seeds.
+3. Scale in one pod at a time. The highest ordinal receives SIGTERM, drains for up to
+   `drainTimeoutSeconds` and exits once the leader has reassigned its vnodes. Wait until
+   `GET /api/v1/cluster/vnodes` no longer lists that node before removing the next one.
+4. If a drain runs out of time the pod exits with `graceful drain incomplete`. Survivors then
+   recover its vnodes from the last committed checkpoint. With at-least-once delivery, output
+   may replay.
+
+Readiness probes and PodDisruptionBudgets do not stop a StatefulSet scale-down. They only limit
+voluntary evictions. The optional HPA (`autoscaling.enabled`) scales on average CPU only. It
+does not see migrations, source partition counts, hot keys or slow sinks. In cluster mode the
+chart disables HPA scale-down (`selectPolicy: Disabled`) unless
+`autoscaling.scaleDown.enabled=true`, and it requires gossip discovery. Use the manual steps
+above for production.
+
 ## 🔑 Custom Secrets, Credentials, & Kafka Configuration
 
 If you connect to external sources (like Kafka, Postgres CDC, or Azure Event Hubs), you can inject credential configurations via standard environment variables or files:
@@ -176,6 +201,10 @@ checkpoint progress alerts using the existing `prometheusRule.rules` setting.
 | `laminardb.checkpoint.url` | Provider-neutral checkpoint URL: `s3://` (including R2/MinIO), `gs://`, `az://`, `abfs(s)://`, or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
+| `laminardb.cluster.drainTimeoutSeconds` | SIGTERM handoff allowance rendered as `server.drain_timeout`; at least `checkpoint.timeout` | `150` |
+| `terminationGracePeriodSeconds` | Pod grace period; a cluster render fails below `drainTimeoutSeconds + 60` | `240` |
+| `autoscaling.enabled` | Optional coarse CPU HPA (see [Scaling](#scaling-a-cluster)) | `false` |
+| `autoscaling.scaleDown.enabled` | Allow HPA replica reduction in cluster mode | `false` |
 | `persistence.checkpoints.enabled` | Provision a dedicated checkpoints PVC. Off by default — prefer an object store via `laminardb.checkpoint.url`. | `false` |
 | `guaranteedQoS` | Pin requests == limits for guaranteed CPU/Mem | `false` |
 | `extraEnvFrom` | Inject variables from ConfigMaps / Secrets | `[]` |

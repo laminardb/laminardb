@@ -7,6 +7,36 @@ use crate::cluster::control::topology::{
     TopologyAdmissionStatus, TopologyError, TopologyOperationId, TopologyPlanRef,
 };
 
+/// Keeps this process from admitting periodic checkpoints until dropped.
+#[derive(Debug)]
+#[must_use = "periodic checkpoints resume as soon as the hold is dropped"]
+pub struct PeriodicCheckpointHold<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for PeriodicCheckpointHold<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl ClusterController {
+    /// Hold periodic checkpoint admission so a topology admission observes a gap between
+    /// checkpoint artifact reservations; back-to-back periodic cuts otherwise leave none.
+    /// Manual checkpoints are unaffected, and the caller's deadline bounds the hold.
+    pub fn hold_periodic_checkpoints(&self) -> PeriodicCheckpointHold<'_> {
+        self.topology_admission_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        PeriodicCheckpointHold(&self.topology_admission_waiters)
+    }
+
+    /// Whether a local topology admission is waiting for a checkpoint gap.
+    #[must_use]
+    pub fn periodic_checkpoints_held(&self) -> bool {
+        self.topology_admission_waiters
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+}
+
 impl ClusterController {
     /// Audit permission to open this exact installed runtime under a durable topology Release.
     ///

@@ -297,6 +297,7 @@ pub(super) struct ServingLaunch {
     pub(super) api_handle: tokio::task::JoinHandle<()>,
     pub(super) app_state: Arc<crate::http::AppState>,
     pub(super) leader_authority_timeout: std::time::Duration,
+    pub(super) drain_timeout: std::time::Duration,
 }
 
 /// Wait for coordinated startup recovery to release source intake, bounded by
@@ -442,6 +443,7 @@ pub(super) async fn open_cluster_serving(
         mut api_handle,
         app_state,
         leader_authority_timeout: _,
+        drain_timeout,
     } = launch;
     let FormedCluster { mut discovery, .. } = formed;
 
@@ -490,8 +492,7 @@ pub(super) async fn open_cluster_serving(
         return Err(ClusterStartupError::EngineConstruction(reason.into()));
     }
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
-    let membership_rx = discovery.membership_watch();
-    let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
+    let membership_handle = spawn_membership_watcher(&node_id_str, discovery.membership_watch());
     info!("Membership watcher started");
 
     info!("Cluster node '{node_id_str}' started");
@@ -508,6 +509,7 @@ pub(super) async fn open_cluster_serving(
         cluster_controller: cluster_controller.clone(),
         snapshot_store: runtime.snapshot_store.clone(),
         vnode_count: vnode_registry.vnode_count(),
+        drain_timeout,
         leader_lease: gate.leader_lease,
         process_lease: identity.process_lease,
         rebalance_tasks: rebalance.tasks,

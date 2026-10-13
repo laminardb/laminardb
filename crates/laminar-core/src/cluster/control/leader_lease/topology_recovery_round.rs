@@ -13,12 +13,13 @@ use crate::cluster::control::{
 impl LeaderLeaseStore {
     /// Check placement compatibility before fencing processes for an assignment recovery.
     /// This is read-only preflight; the shared assignment append rechecks the same constraint.
-    /// An irreversible topology Commit currently supports replacement in the same node slots,
-    /// with its complete vnode map, rather than membership changes or state redistribution.
+    /// Until a committed target is Active and has committed its own checkpoint, it supports only
+    /// replacement in the same node slots with its complete vnode map. Afterwards ordinary
+    /// membership changes and state redistribution apply.
     ///
     /// # Errors
-    /// Rejects uncommitted preparation, changed placement, corrupt evidence or a bounded read
-    /// failure. Committed/Activating targets may replace processes before their first checkpoint.
+    /// Rejects uncommitted preparation, changed placement of a live migration, corrupt evidence
+    /// or a bounded read failure.
     pub async fn validate_topology_assignment_proposal(
         &self,
         proposal: &CheckpointAssignmentFence,
@@ -55,7 +56,7 @@ impl LeaderLeaseStore {
         if !proposal.is_canonical() {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
-        let Some(operation) = current.committed_topology_operation() else {
+        let Some(operation) = current.live_topology_migration() else {
             return Ok(());
         };
         self.audit_topology_operation(operation).await?;
@@ -94,7 +95,7 @@ impl LeaderLeaseStore {
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            let binding = if let Some(operation) = before.committed_topology_operation() {
+            let binding = if let Some(operation) = before.live_topology_migration() {
                 let (assignments, processes) = context.ok_or_else(|| {
                     DecisionError::Conflict(
                         "topology recovery requires configured assignment and process authority"
@@ -172,11 +173,17 @@ impl LeaderLeaseStore {
         head: &LeaderAuthorityRecord,
         round: &RecoveryRound,
     ) -> bool {
-        head.committed_topology_operation()
-            .and_then(|operation| operation.commit.as_ref())
-            == round
-                .topology_binding()
-                .map(TopologyRecoveryBinding::commit)
+        match round
+            .topology_binding()
+            .map(TopologyRecoveryBinding::commit)
+        {
+            Some(commit) => {
+                head.committed_topology_operation()
+                    .and_then(|operation| operation.commit.as_ref())
+                    == Some(commit)
+            }
+            None => head.live_topology_migration().is_none(),
+        }
     }
 
     /// Audit the target and, when selecting/installing/committing Release, its exact greatest cut.
@@ -224,7 +231,7 @@ impl LeaderLeaseStore {
         context: Option<(&AssignmentSnapshotStore, &ProcessLeaseAuthority)>,
     ) -> Result<(), ClusterCheckpointAuthorityError> {
         if round.topology_binding().is_none() {
-            head.reject_pending_topology_commit()?;
+            head.reject_unbound_topology_recovery(epoch)?;
         }
         if !Self::recovery_topology_matches(head, round) {
             return Err(DecisionError::Conflict(
@@ -232,7 +239,7 @@ impl LeaderLeaseStore {
             )
             .into());
         }
-        let Some(binding) = round.topology_binding() else {
+        let Some(binding) = head.audited_topology_binding(round, epoch) else {
             return Ok(());
         };
         let (assignments, processes) = context.ok_or_else(|| {

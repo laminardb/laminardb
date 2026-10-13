@@ -199,6 +199,7 @@ impl LaminarDB {
             // Fresh definition binding would overwrite their public catalog certificates.
             stream_regs.clone_from(image.candidate.connector_manager.lock().streams());
         } else {
+            self.bind_replayed_topology_fence()?;
             self.bind_subscription_output_certificates(stream_regs, pipeline_identity)
                 .await?;
         }
@@ -248,6 +249,12 @@ impl LaminarDB {
             ))
         })?;
 
+        let catalog = self.catalog_manifest_store.lock().clone();
+        let preserved = match catalog {
+            Some(catalog) => catalog.committed_topology_subscriptions().await?,
+            None => Vec::new(),
+        };
+
         let mut names = stream_regs.keys().cloned().collect::<Vec<_>>();
         names.sort_unstable();
         for name in names {
@@ -284,7 +291,7 @@ impl LaminarDB {
             };
             let schema_fingerprint =
                 crate::pipeline_identity::subscription_schema_fingerprint(&schema)?;
-            registration.subscription_certificate = Some(output.bind(
+            let derived = output.bind(
                 deployment_id,
                 registration.catalog_generation,
                 &name,
@@ -292,7 +299,9 @@ impl LaminarDB {
                 registration.subscription_retention_bytes,
                 pipeline_identity.clone(),
                 self.checkpoint_key_groups(),
-            )?);
+            )?;
+            registration.subscription_certificate =
+                Some(preserved_subscription_certificate(&preserved, derived)?);
         }
         Ok(())
     }
@@ -327,4 +336,31 @@ impl LaminarDB {
         }
         Ok(has_ownership_partitioned_state)
     }
+}
+
+/// A stream preserved by the committed migration keeps its root generation; every other field
+/// must equal the fresh derivation, or the restored catalog is not the certified incarnation.
+#[cfg(feature = "cluster")]
+fn preserved_subscription_certificate(
+    preserved: &[laminar_core::checkpoint::OutputDistributionCertificate],
+    derived: laminar_core::checkpoint::OutputDistributionCertificate,
+) -> Result<laminar_core::checkpoint::OutputDistributionCertificate, DbError> {
+    let Some(target) = preserved
+        .iter()
+        .find(|certificate| certificate.stream_id == derived.stream_id)
+    else {
+        return Ok(derived);
+    };
+    let expected = laminar_core::checkpoint::OutputDistributionCertificate {
+        stream_generation: target.stream_generation,
+        ..derived
+    };
+    if &expected != target {
+        return Err(laminar_core::cluster::control::TopologyError::Conflict(format!(
+            "stream '{}' differs from the subscription incarnation preserved by its committed topology",
+            target.stream_id
+        ))
+        .into());
+    }
+    Ok(expected)
 }

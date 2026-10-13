@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_types)] // cold path
 
 mod head_validation;
+mod placement_metrics;
 use head_validation::{assignment_publication_error, validate_local_assignment_head};
 
 use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
@@ -25,9 +26,7 @@ use laminar_core::cluster::control::{
     RecordAssignmentRecoveryDecisionResult, RotateOutcome, SnapshotError,
 };
 use laminar_core::cluster::discovery::NodeState;
-use laminar_core::state::{
-    owners_per_domain, rendezvous_assignment, Locality, NodeId, VnodeRegistry,
-};
+use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 #[cfg(test)]
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -36,7 +35,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::db::{DbState, LaminarDB};
-use crate::engine_metrics::EngineMetrics;
 
 mod recovery_adoption;
 use recovery_adoption::{
@@ -524,11 +522,11 @@ impl SnapshotWatcher {
         if version != self.metrics_version {
             self.metrics_version = version;
             if let (Some(c), Some(metrics)) = (self.controller.as_ref(), self.db.engine_metrics()) {
-                let nodes = c.assignable_with_locality();
-                publish_placement_metrics(
-                    &metrics,
+                placement_metrics::publish(
+                    &metrics.placement,
                     &self.registry,
-                    &nodes,
+                    NodeId(c.instance_id().0),
+                    &c.assignable_with_locality(),
                     self.config.placement_isolation_tier,
                 );
             }
@@ -2847,36 +2845,6 @@ async fn prepare_and_announce_local_drain(
         .map_err(|_| "durable drain acknowledgement publication timed out".to_string())?
 }
 
-/// Publish per-domain owner counts. Resets the gauge so disappeared domains don't leave stale series.
-fn publish_placement_metrics(
-    metrics: &EngineMetrics,
-    registry: &VnodeRegistry,
-    nodes: &[(NodeId, Locality)],
-    isolation_tier: usize,
-) {
-    let owners = registry.snapshot();
-    let total = u32::try_from(owners.len().max(1)).unwrap_or(u32::MAX);
-    let counts = owners_per_domain(&owners, nodes, isolation_tier);
-
-    metrics.placement_vnodes_per_domain.reset();
-    let mut max = 0u32;
-    for (domain, &count) in &counts {
-        let label = if domain.is_empty() {
-            "unknown"
-        } else {
-            domain.as_str()
-        };
-        metrics
-            .placement_vnodes_per_domain
-            .with_label_values(&[label])
-            .set(i64::from(count));
-        max = max.max(count);
-    }
-    metrics
-        .placement_blast_radius_ratio
-        .set(f64::from(max) / f64::from(total));
-}
-
 /// Spawn the leader-gated rebalance controller. Runs on every node;
 /// leadership is re-checked after the debounce.
 pub fn spawn_rebalance_controller(
@@ -3166,7 +3134,7 @@ fn authorize_recovery_successor<'a>(
         let authority = controller
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-        // A committed topology cannot restore on a survivor map. Wait for complete-slot
+        // A live topology migration cannot restore on a survivor map. Wait for complete-slot
         // replacement before closing authority or taking over any predecessor process lease.
         tokio::time::timeout_at(
             deadline,
