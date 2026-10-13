@@ -21,7 +21,7 @@ pub use barrier::{
     InMemoryKv, Phase, QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 #[cfg(feature = "cluster")]
-pub use controller::CheckpointPrepareObservation;
+pub use controller::{CheckpointPrepareObservation, PeriodicCheckpointHold};
 pub use controller::{
     ClusterController, LocalProcessAuthorityEvidence, LocalProcessAuthorityEvidenceError,
     LocalProcessAuthorityIdentity, RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement,
@@ -66,12 +66,12 @@ pub use topology::{
     TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
     TopologyAdoptionOutcome, TopologyCatalogState, TopologyCheckpointCut, TopologyCommit,
     TopologyCompatibilityRef, TopologyCutCommit, TopologyError, TopologyInstallationReceipt,
-    TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
-    TopologyOperationId, TopologyParticipantCertificate, TopologyPlanRef, TopologyPreparation,
-    TopologyPreservedObject, TopologyRecoveryBinding, TopologyRecoveryCut, TopologyRecoveryInput,
-    TopologyRelease, TopologyRestoreInput, TopologySourceInitialization, TopologySubscriptionRoot,
-    TopologyTargetPreparationReceipt, TopologyVersion, MAX_TOPOLOGY_OPERATIONS,
-    MAX_TOPOLOGY_ROOT_MANIFEST_BYTES, MAX_TOPOLOGY_SOURCE_CHANNELS,
+    TopologyJournalUsage, TopologyMigrationRoot, TopologyMigrationRootBinding,
+    TopologyMigrationRootRef, TopologyOperationId, TopologyParticipantCertificate, TopologyPlanRef,
+    TopologyPreparation, TopologyPreservedObject, TopologyRecoveryBinding, TopologyRecoveryCut,
+    TopologyRecoveryInput, TopologyRelease, TopologyRestoreInput, TopologySourceInitialization,
+    TopologySubscriptionRoot, TopologyTargetPreparationReceipt, TopologyVersion,
+    MAX_TOPOLOGY_OPERATIONS, MAX_TOPOLOGY_ROOT_MANIFEST_BYTES, MAX_TOPOLOGY_SOURCE_CHANNELS,
     TOPOLOGY_COMMIT_PROTOCOL_VERSION, TOPOLOGY_INSTALLATION_PROTOCOL_VERSION,
     TOPOLOGY_PREPARATION_PROTOCOL_VERSION, TOPOLOGY_PROTOCOL_VERSION,
     TOPOLOGY_RECOVERY_PROTOCOL_VERSION, TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,

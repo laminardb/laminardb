@@ -100,6 +100,10 @@ laminardb:
   cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
+    # -- SIGTERM drain allowance in seconds: the leader checkpoints and reassigns this pod's
+    # -- vnodes within it. Must be at least checkpoint.timeout; terminationGracePeriodSeconds
+    # -- must exceed it by at least 60 seconds of teardown headroom.
+    drainTimeoutSeconds: 150
     discovery:
       # -- Discovery strategy: "gossip" (recommended) or "static"
       strategy: gossip
@@ -253,9 +257,10 @@ tolerations: []
 # -- Affinity rules
 affinity: {}
 
-# -- Shutdown grace period. Cluster mode drains owned vnodes on SIGTERM (<=30s);
-# -- keep this above that so Kubernetes does not SIGKILL mid-drain.
-terminationGracePeriodSeconds: 60
+# -- Shutdown grace period. Cluster mode drains owned vnodes on SIGTERM for up to
+# -- laminardb.cluster.drainTimeoutSeconds, then needs about 60s to stop tasks and the database;
+# -- the chart rejects a cluster grace period below drain + 60.
+terminationGracePeriodSeconds: 240
 
 # -- For thread-per-core: request guaranteed CPU.
 # -- Set to true to use Guaranteed QoS class (requests == limits).
@@ -270,12 +275,23 @@ podDisruptionBudget:
   minAvailable: 1
   # maxUnavailable: 1
 
-# -- Autoscaling (mainly for cluster mode)
+# -- Optional coarse CPU autoscaling. It is not workload-aware and cannot see topology migrations,
+# -- source partition limits or slow sinks. In cluster mode scale-down is disabled unless
+# -- scaleDown.enabled is set: a pod removed during a live topology migration cannot hand off its
+# -- vnodes until the target checkpoint commits. Prefer the manual workflow in the chart README.
 autoscaling:
   enabled: false
   minReplicas: 1
   maxReplicas: 5
   targetCPUUtilizationPercentage: 70
+  scaleDown:
+    # -- Allow HPA replica reduction in cluster mode (always allowed in single mode).
+    enabled: false
+    # -- Seconds of sustained low utilization before a reduction.
+    stabilizationWindowSeconds: 600
+  scaleUp:
+    # -- Seconds of sustained high utilization before an increase.
+    stabilizationWindowSeconds: 120
 
 # -- ServiceMonitor for Prometheus Operator
 serviceMonitor:

@@ -386,6 +386,7 @@ impl Rig {
         }
     }
 
+    #[cfg_attr(not(feature = "process-remote"), allow(clippy::unused_async))]
     async fn handler(
         &mut self,
         binding: &mut ProcessFunctionDescriptor,

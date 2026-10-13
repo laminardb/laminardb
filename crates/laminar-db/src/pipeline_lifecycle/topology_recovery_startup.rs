@@ -9,7 +9,8 @@ use super::{DbError, DbState, LaminarDB, RuntimeMode};
 impl LaminarDB {
     /// Prepare a cold committed target for the existing coordinated recovery supervisor.
     /// Returns true when that supervisor must restore and release the actual target actors;
-    /// false means there is no topology Commit and ordinary startup remains applicable.
+    /// false means there is no live topology Commit and ordinary startup remains applicable: a
+    /// settled target restores its own committed checkpoint like any other deployment.
     /// No actors, sink epochs or intake are started here. The DB remains Created and fenced.
     ///
     /// # Errors
@@ -25,11 +26,10 @@ impl LaminarDB {
             .clone()
             .ok_or(TopologyError::Fenced)?;
         let state = catalog.topology_state().await?;
-        let TopologyCatalogState::Versioned {
-            committed: Some(commit),
-            ..
-        } = state.clone()
-        else {
+        // Any other live Commit makes ordinary startup fail closed on its own recheck.
+        let Some(commit) = catalog.live_topology_commit().await?.filter(|live| {
+            matches!(&state, TopologyCatalogState::Versioned { committed: Some(commit), .. } if commit == live)
+        }) else {
             return Ok(false);
         };
         let controller = self

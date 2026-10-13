@@ -200,22 +200,8 @@ async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery(
         selected.cut(),
         laminar_core::cluster::control::TopologyRecoveryCut::TargetCheckpoint
     );
-    fixture.db.fence_coordinated_recovery_lifecycle();
-    fixture.authority.controller.set_recovering(true);
-    fixture
-        .db
-        .stop_pipeline_for_coordinated_recovery()
-        .await
-        .unwrap();
-    assert!(fixture
-        .db
-        .prepare_committed_cluster_topology_startup()
-        .await
-        .unwrap());
     probe.output.lock().clear();
-    probe.block_start.store(true, Ordering::Release);
-    fixture.db.enable_coordinated_recovery().unwrap();
-    super::recovery::held_start(&fixture, &probe, 2).await;
+    super::recovery::restart_settled_target(&fixture, &probe, 2).await;
     probe.input.lock().insert(
         "trades".into(),
         std::collections::VecDeque::from([runtime_probe::positioned(
@@ -792,30 +778,16 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
         .iter()
         .map(|entry| entry.ddl.clone())
         .collect::<Vec<_>>();
-    fixture.db.fence_coordinated_recovery_lifecycle();
-    fixture.authority.controller.set_recovering(true);
-    fixture
-        .db
-        .stop_pipeline_for_coordinated_recovery()
-        .await
-        .unwrap();
-    assert!(fixture
-        .db
-        .prepare_committed_cluster_topology_startup()
-        .await
-        .unwrap());
-    // Recovery keeps catalog assertions fenced until installation and Release settle.
+    probe.output.lock().clear();
+    let prior_starts = probe.starts.lock().len();
+    super::recovery::restart_settled_target(&fixture, &probe, prior_starts).await;
+    // The parent baseline never matches the committed target catalog during recovery.
     let baseline = original[..3].to_vec();
     assert!(fixture
         .db
         .execute_cluster_bootstrap_batch(&baseline)
         .await
         .is_err());
-    probe.output.lock().clear();
-    probe.block_start.store(true, Ordering::Release);
-    let prior_starts = probe.starts.lock().len();
-    fixture.db.enable_coordinated_recovery().unwrap();
-    super::recovery::held_start(&fixture, &probe, prior_starts).await;
     probe.input.lock().insert(
         "added_source".into(),
         std::collections::VecDeque::from([runtime_probe::positioned(
@@ -1153,23 +1125,9 @@ async fn topology_pipeline_reset_separates_incarnations_and_recovers_future_inpu
     assert!(!selected.source_offsets["trades"]
         .offsets
         .contains_key("old.cursor"));
-    fixture.db.fence_coordinated_recovery_lifecycle();
-    fixture.authority.controller.set_recovering(true);
-    fixture
-        .db
-        .stop_pipeline_for_coordinated_recovery()
-        .await
-        .unwrap();
-    assert!(fixture
-        .db
-        .prepare_committed_cluster_topology_startup()
-        .await
-        .unwrap());
     probe.output.lock().clear();
-    probe.block_start.store(true, Ordering::Release);
     let prior_starts = probe.starts.lock().len();
-    fixture.db.enable_coordinated_recovery().unwrap();
-    super::recovery::held_start(&fixture, &probe, prior_starts).await;
+    super::recovery::restart_settled_target(&fixture, &probe, prior_starts).await;
     probe.input.lock().insert(
         "trades".into(),
         std::collections::VecDeque::from([runtime_probe::positioned(

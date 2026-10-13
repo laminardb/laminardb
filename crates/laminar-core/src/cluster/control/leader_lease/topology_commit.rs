@@ -22,6 +22,21 @@ impl LeaderAuthorityRecord {
             .find(|operation| operation.commit.is_some())
     }
 
+    /// The newest committed migration while it still owns assignment and recovery authority.
+    /// Its scope ends once the target is Active and a later checkpoint has committed: that cut
+    /// carries the target pipeline identity, so ordinary reassignment and recovery apply. Only
+    /// the newest Commit can be live because the next cut itself settles its predecessor.
+    pub(super) fn live_topology_migration(&self) -> Option<&TopologyAdmissionStatus> {
+        self.committed_topology_operation().filter(|operation| {
+            operation.phase != TopologyAdmissionPhase::Active
+                || self
+                    .commit_head
+                    .as_ref()
+                    .zip(operation.commit.as_ref())
+                    .is_none_or(|(head, commit)| head.sequence <= commit.authority_sequence)
+        })
+    }
+
     pub(super) fn committed_topology_identity(
         &self,
     ) -> Option<(TopologyVersion, &CatalogManifestRef)> {
@@ -134,6 +149,43 @@ impl LeaderAuthorityRecord {
                     }))
         }) {
             return Err(DecisionError::Conflict("committed topology requires target installation and Release; parent recovery cannot release intake".into()).into());
+        }
+        Ok(())
+    }
+
+    /// The binding a recovery audit must check against the frozen migration owner map. A settled
+    /// target no longer pins that map or its process roster, so consuming its historical Release
+    /// (no selected epoch) must not fail after an ordinary reassignment.
+    pub(super) fn audited_topology_binding<'a>(
+        &self,
+        round: &'a crate::cluster::control::RecoveryRound,
+        epoch: Option<u64>,
+    ) -> Option<&'a crate::cluster::control::TopologyRecoveryBinding> {
+        round
+            .topology_binding()
+            .filter(|_| epoch.is_some() || self.live_topology_migration().is_some())
+    }
+
+    /// An unbound round requires a settled migration and restores target progress, never the
+    /// parent root or anything older; those cuts carry a pipeline the committed catalog replaced.
+    pub(super) fn reject_unbound_topology_recovery(
+        &self,
+        epoch: Option<u64>,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        self.reject_pending_topology_commit()?;
+        let root_epoch = self
+            .committed_topology_operation()
+            .and_then(|operation| operation.cut.as_ref())
+            .and_then(|cut| cut.committed.as_ref())
+            .map(|cut| cut.checkpoint.epoch);
+        if epoch
+            .zip(root_epoch)
+            .is_some_and(|(epoch, root)| epoch <= root)
+        {
+            return Err(DecisionError::Conflict(
+                "committed topology cannot release its parent or an older cut".into(),
+            )
+            .into());
         }
         Ok(())
     }

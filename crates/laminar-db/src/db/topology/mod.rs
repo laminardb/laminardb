@@ -1,7 +1,8 @@
 //! Durable topology status, admission and exact committed runtime lifecycle.
 
 use laminar_core::cluster::control::{
-    TopologyAdmissionStatus, TopologyCatalogState, TopologyOperationId, TopologyVersion,
+    TopologyAdmissionStatus, TopologyCatalogState, TopologyJournalUsage, TopologyOperationId,
+    TopologyVersion,
 };
 use std::sync::atomic::Ordering;
 
@@ -31,6 +32,41 @@ pub use planning::{
 pub(crate) use restore::TopologyRuntimeMetadata;
 pub use restore::{PreparedTopologyRestore, PreparedTopologySourcePosition};
 
+/// Committed catalog version this process replayed, with the shuffle generation peers expect.
+/// Topology one is the legacy fabric and carries no fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayedTopology {
+    pub(crate) version: TopologyVersion,
+    pub(crate) fence: Option<laminar_core::shuffle::ShuffleTopologyFence>,
+}
+
+impl ReplayedTopology {
+    pub(crate) const LEGACY_BASELINE: Self = Self {
+        version: TopologyVersion::LEGACY_BASELINE,
+        fence: None,
+    };
+
+    pub(crate) fn from_catalog(catalog: &TopologyCatalogState) -> Result<Option<Self>, DbError> {
+        let TopologyCatalogState::Versioned { committed, .. } = catalog else {
+            return Ok(None);
+        };
+        let Some(commit) = committed else {
+            return Ok(Some(Self::LEGACY_BASELINE));
+        };
+        let fence = laminar_core::shuffle::ShuffleTopologyFence::from_manifest(
+            commit.topology_version,
+            &commit.manifest,
+        )
+        .map_err(|error| {
+            laminar_core::cluster::control::TopologyError::Invalid(error.to_string())
+        })?;
+        Ok(Some(Self {
+            version: commit.topology_version,
+            fence: Some(fence),
+        }))
+    }
+}
+
 /// Durable catalog version and this process's independently observed runtime activation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClusterTopologyStatus {
@@ -41,9 +77,26 @@ pub struct ClusterTopologyStatus {
     /// Version replayed by this process and running with live authority and intake released.
     /// A persisted inventory alone never sets this field.
     pub locally_active_version: Option<TopologyVersion>,
+    /// Committed version whose migration still freezes the complete owner map: it is not yet
+    /// Active with its own committed checkpoint. Rescale only when this is absent.
+    pub live_migration: Option<TopologyVersion>,
+    /// Bounded request journal occupancy; new requests are rejected once it is full.
+    pub journal: TopologyJournalUsage,
 }
 
 impl LaminarDB {
+    /// Commit of a migration that still owns startup, assignment and recovery authority.
+    pub(crate) async fn live_topology_commit(
+        &self,
+    ) -> Result<Option<laminar_core::cluster::control::TopologyCommit>, DbError> {
+        let store = self
+            .catalog_manifest_store
+            .lock()
+            .clone()
+            .ok_or(laminar_core::cluster::control::TopologyError::Fenced)?;
+        Ok(store.live_topology_commit().await?)
+    }
+
     /// Read an admitted request's definitive status; no request ownership depends on this call.
     ///
     /// # Errors
@@ -81,13 +134,18 @@ impl LaminarDB {
         })?;
         let catalog = store.topology_state().await?;
         let committed_version = catalog.committed_version();
-        let replayed_version = *self.replayed_topology_version.lock();
+        let replayed_version = self
+            .replayed_topology
+            .lock()
+            .map(|replayed| replayed.version);
         let controller = self.cluster_controller.lock().clone();
+        let live = store.live_topology_commit().await?;
+        // A settled target is an ordinary deployment: running with open gates is its activation.
         let release_observed = match &catalog {
             TopologyCatalogState::Versioned {
                 committed: Some(commit),
                 ..
-            } => {
+            } if live.as_ref() == Some(commit) => {
                 let binding = self.installed_topology_runtime.lock().clone();
                 match binding.filter(|binding| {
                     binding.input.operation().commit.as_ref() == Some(commit)
@@ -146,6 +204,8 @@ impl LaminarDB {
             catalog,
             committed_version,
             locally_active_version,
+            live_migration: live.map(|commit| commit.topology_version),
+            journal: store.topology_journal_usage().await?,
         })
     }
 }

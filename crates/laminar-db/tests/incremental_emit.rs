@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
 use laminar_core::streaming::StreamCheckpointConfig;
-use laminar_db::{DbError, ExecuteResult, LaminarConfig, LaminarDB};
+use laminar_db::{ExecuteResult, LaminarConfig, LaminarDB};
 
 fn config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
     LaminarConfig {
@@ -456,7 +456,7 @@ async fn sink_from_incremental_mv_rejects_noncapable_sink_at_ddl() {
         .await
         .expect_err("an append-only sink cannot consume incremental retractions");
     assert!(
-        matches!(error, DbError::Config(ref detail) if detail.contains("FullChangelog")),
+        matches!(error, laminar_db::DbError::Config(ref detail) if detail.contains("FullChangelog")),
         "{error}"
     );
     assert!(db.sinks().is_empty());

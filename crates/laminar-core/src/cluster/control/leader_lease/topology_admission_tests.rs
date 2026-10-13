@@ -631,6 +631,36 @@ async fn journal_exhaustion_fails_before_staging_another_request() {
             .await
             .unwrap();
     }
+    assert_eq!(
+        authority.topology_journal_usage().await.unwrap(),
+        crate::cluster::control::TopologyJournalUsage {
+            retained: MAX_TOPOLOGY_OPERATIONS,
+            capacity: MAX_TOPOLOGY_OPERATIONS,
+        }
+    );
+    // A full journal still answers an exact retry with its original outcome and still rejects
+    // an old identity bound to a different payload; neither consumes capacity.
+    let mut retry = plan.clone();
+    retry.operation_id = operation(100);
+    let original = authority
+        .topology_operation_status(retry.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        authority
+            .admit_topology_plan(&lease.proof(), &assignments, &retry, &target)
+            .await
+            .unwrap(),
+        original
+    );
+    retry.expected_parent = TopologyVersion::new(9).unwrap();
+    assert!(matches!(
+        authority
+            .admit_topology_plan(&lease.proof(), &assignments, &retry, &target)
+            .await,
+        Err(TopologyError::Conflict(_))
+    ));
     plan.operation_id = operation(1000);
     let before = authority.load().await.unwrap().unwrap();
     assert!(matches!(

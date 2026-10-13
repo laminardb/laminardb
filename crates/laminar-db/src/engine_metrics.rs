@@ -1,8 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
 use prometheus::{
-    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 
 /// Bounded-cardinality metrics for committed cluster subscriptions.
@@ -167,6 +167,51 @@ impl ClusterSubscriptionMetrics {
                 registry,
                 "cluster_subscription_gateway_manifest_refresh_seconds",
                 "Gateway committed-index refresh duration",
+            ),
+        }
+    }
+}
+
+/// Vnode placement as this process last adopted it.
+#[cfg(feature = "cluster")]
+pub struct PlacementMetrics {
+    /// Vnodes owned per failure domain. Label: `domain`.
+    pub vnodes_per_domain: IntGaugeVec,
+    /// Largest single domain's share of all vnodes (`[0, 1]`) — the blast radius.
+    pub blast_radius_ratio: prometheus::Gauge,
+    /// Vnodes owned by this process.
+    pub owned_vnodes: IntGauge,
+}
+
+#[cfg(feature = "cluster")]
+impl PlacementMetrics {
+    fn new(registry: &Registry) -> Self {
+        let vnodes_per_domain = IntGaugeVec::new(
+            Opts::new(
+                "placement_vnodes_per_domain",
+                "Vnodes owned per failure domain (cluster mode)",
+            ),
+            &["domain"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(vnodes_per_domain.clone()))
+            .unwrap();
+        let blast_radius_ratio = prometheus::Gauge::new(
+            "placement_blast_radius_ratio",
+            "Largest single domain's share of all vnodes (0-1); state affected if it fails",
+        )
+        .unwrap();
+        registry
+            .register(Box::new(blast_radius_ratio.clone()))
+            .unwrap();
+        Self {
+            vnodes_per_domain,
+            blast_radius_ratio,
+            owned_vnodes: register_int_gauge(
+                registry,
+                "placement_owned_vnodes",
+                "Vnodes owned by this process (cluster mode)",
             ),
         }
     }
@@ -339,10 +384,9 @@ pub struct EngineMetrics {
     pub lookup_source_errors: IntCounterVec,
     /// On-demand lookup rows awaiting a source fetch. Label: `table`.
     pub lookup_in_flight_rows: IntGaugeVec,
-    /// Vnodes owned per failure domain (cluster mode). Label: `domain`.
-    pub placement_vnodes_per_domain: IntGaugeVec,
-    /// Largest single domain's share of all vnodes (`[0, 1]`) — the blast radius.
-    pub placement_blast_radius_ratio: Gauge,
+    /// Vnode placement as this process last adopted it.
+    #[cfg(feature = "cluster")]
+    pub placement: PlacementMetrics,
     /// Unexpected compute-thread exits (operator panics) that faulted the pipeline.
     pub pipeline_faults_total: IntCounter,
     /// Fatal cycle errors dropped-and-continued under at-least-once delivery.
@@ -644,19 +688,8 @@ impl EngineMetrics {
                 &["table"],
             )
             .unwrap()),
-            placement_vnodes_per_domain: reg!(IntGaugeVec::new(
-                Opts::new(
-                    "placement_vnodes_per_domain",
-                    "Vnodes owned per failure domain (cluster mode)"
-                ),
-                &["domain"],
-            )
-            .unwrap()),
-            placement_blast_radius_ratio: reg!(Gauge::new(
-                "placement_blast_radius_ratio",
-                "Largest single domain's share of all vnodes (0-1); state affected if it fails"
-            )
-            .unwrap()),
+            #[cfg(feature = "cluster")]
+            placement: PlacementMetrics::new(registry),
             pipeline_faults_total: reg!(IntCounter::new(
                 "pipeline_faults_total",
                 "Compute-thread crashes that faulted the pipeline"

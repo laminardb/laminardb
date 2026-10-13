@@ -216,42 +216,111 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    async fn recover_cluster_checkpoint(
+    async fn recover_cluster_cut(
+        db: &Self,
         coord: &mut crate::checkpoint_coordinator::CheckpointCoordinator,
         runtime_mode: RuntimeMode,
         recover_target: Option<u64>,
     ) -> (
         Result<Option<crate::recovery_manager::RecoveredState>, DbError>,
-        bool,
+        Option<IdleClusterStart>,
     ) {
         if runtime_mode == RuntimeMode::Cluster && recover_target.is_none() {
             match coord.certified_idle_process() {
-                Ok(true) => return (Ok(None), true),
+                Ok(true) => {
+                    return match db.idle_cluster_start(coord).await {
+                        Ok(start) => (Ok(None), Some(start)),
+                        Err(error) => (Err(error), None),
+                    };
+                }
                 Ok(false) => {}
-                Err(error) => return (Err(error), false),
+                Err(error) => return (Err(error), None),
             }
         }
         let recovery = match recover_target {
             Some(target) => coord.recover_to_epoch(target).await,
             None => coord.recover().await,
         };
-        (recovery, false)
+        (recovery, None)
+    }
+
+    /// An ownerless process restores no state. After a committed topology migration it still
+    /// starts sources from the committed cut: a migration-created source's genesis policy (such
+    /// as `latest`) was replaced by the migration's sealed cursor and is not recoverable alone.
+    #[cfg(feature = "cluster")]
+    async fn idle_cluster_start(
+        &self,
+        coord: &crate::checkpoint_coordinator::CheckpointCoordinator,
+    ) -> Result<IdleClusterStart, DbError> {
+        let catalog = self.catalog_manifest_store.lock().clone();
+        let migrated = match catalog {
+            Some(catalog) => matches!(
+                catalog.topology_state().await?,
+                laminar_core::cluster::control::TopologyCatalogState::Versioned {
+                    committed: Some(_),
+                    ..
+                }
+            ),
+            None => false,
+        };
+        let committed_cut = if migrated {
+            coord.committed_source_cut().await?
+        } else {
+            None
+        };
+        Ok(IdleClusterStart { committed_cut })
     }
 
     #[cfg(feature = "cluster")]
     fn report_empty_cluster_recovery(
         &self,
         runtime_mode: RuntimeMode,
-        skipped_idle_recovery: bool,
+        idle_start: Option<IdleClusterStart>,
+        sources: &mut [TrackedSourceRegistration],
     ) -> Result<(), DbError> {
         if runtime_mode == RuntimeMode::Cluster {
             self.validate_fresh_cluster_vnode_start()?;
         }
-        if skipped_idle_recovery {
-            tracing::info!("certified ownerless cluster process skipped checkpoint recovery");
-        } else {
+        let Some(idle_start) = idle_start else {
             tracing::info!("No checkpoint found, starting fresh");
+            return Ok(());
+        };
+        let Some(cut) = idle_start.committed_cut else {
+            tracing::info!("certified ownerless cluster process skipped checkpoint recovery");
+            return Ok(());
+        };
+        let assignment = cut
+            .assignment_fence
+            .as_ref()
+            .and_then(|fence| std::num::NonZeroU64::new(fence.assignment_version));
+        let attempt = laminar_core::checkpoint::CheckpointAttempt::canonical(cut.epoch);
+        for src in sources
+            .iter_mut()
+            .filter(|src| src.contract().supports_replay())
+        {
+            let checkpoint = cut.source_offsets.get(&src.name).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "committed cut {} has no offset for replayable source '{}'",
+                    cut.epoch, src.name
+                ))
+            })?;
+            validate_source_recovery_assignment(
+                &src.name,
+                src.assignment_scoped,
+                Some(checkpoint),
+                assignment,
+            )?;
+            src.position = laminar_connectors::connector::SourcePosition::Resume {
+                attempt,
+                checkpoint: crate::checkpoint_coordinator::connector_to_source_checkpoint(
+                    checkpoint,
+                ),
+            };
         }
+        tracing::info!(
+            epoch = cut.epoch,
+            "certified ownerless cluster process starts sources from the committed cut"
+        );
         Ok(())
     }
 
@@ -332,8 +401,8 @@ impl LaminarDB {
                 #[cfg(feature = "cluster")]
                 let recover_target = self.recover_target_epoch.lock().take();
                 #[cfg(feature = "cluster")]
-                let (recovery, skipped_idle_recovery) =
-                    Self::recover_cluster_checkpoint(coord, runtime_mode, recover_target).await;
+                let (recovery, idle_start) =
+                    Self::recover_cluster_cut(self, coord, runtime_mode, recover_target).await;
                 #[cfg(not(feature = "cluster"))]
                 let recovery = coord.recover().await;
                 // Resolve any interrupted sink epoch before opening its successor.
@@ -467,7 +536,7 @@ impl LaminarDB {
                     }
                     Ok(None) => {
                         #[cfg(feature = "cluster")]
-                        self.report_empty_cluster_recovery(runtime_mode, skipped_idle_recovery)?;
+                        self.report_empty_cluster_recovery(runtime_mode, idle_start, sources)?;
                         #[cfg(not(feature = "cluster"))]
                         tracing::info!("No checkpoint found, starting fresh");
                     }
@@ -494,4 +563,10 @@ impl LaminarDB {
             restored_reference_tables,
         })
     }
+}
+
+/// Start positions for a process that owns no vnodes and therefore restores no state.
+#[cfg(feature = "cluster")]
+struct IdleClusterStart {
+    committed_cut: Option<laminar_core::checkpoint::CommittedCheckpointIndex>,
 }

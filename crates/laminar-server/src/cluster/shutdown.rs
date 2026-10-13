@@ -281,14 +281,25 @@ impl ClusterHandle {
             info!("Received shutdown signal, shutting down cluster node...");
         }
 
+        let mut drain_incomplete = false;
         if !authority_lost {
-            authority_lost = drain_local_vnodes(&mut self, &terminal).await;
+            match drain_local_vnodes(&mut self, &terminal).await {
+                DrainOutcome::Drained => {}
+                DrainOutcome::AuthorityLost => authority_lost = true,
+                DrainOutcome::Incomplete => {
+                    // Still-owned vnodes must not publish from a node that is leaving. Exit
+                    // fenced; the expiring process lease drives failed-owner recovery.
+                    drain_incomplete = true;
+                    self.db.revoke_cluster_authority();
+                }
+            }
         }
         authority_lost |= terminal.is_cancelled();
         self.leader_lease.cancel();
 
         let (shutdown_result, runtime_tasks_clean, mut authority_lost) =
-            teardown_runtime_and_database(&mut self, &terminal, authority_lost).await;
+            teardown_runtime_and_database(&mut self, &terminal, authority_lost || drain_incomplete)
+                .await;
 
         authority_lost |= terminal.is_cancelled();
         authority_lost |= !self.process_lease.disarm_for_shutdown();
@@ -318,6 +329,14 @@ impl ClusterHandle {
             Err(ClusterStartupError::AuthorityLost(
                 "stable node identity lease expired or was superseded".into(),
             ))
+        } else if drain_incomplete {
+            if let Err(error) = &shutdown_result {
+                warn!(%error, "Database shutdown after an incomplete drain failed");
+            }
+            Err(ClusterStartupError::DrainIncomplete(format!(
+                "owned vnodes were not reassigned within {:?}; exited fenced for failed-owner                  recovery",
+                self.drain_timeout
+            )))
         } else {
             shutdown_result
                 .map_err(|error| ClusterStartupError::EngineShutdown(error.to_string()))?;
@@ -332,82 +351,79 @@ impl ClusterHandle {
     }
 }
 
-/// Announce Draining, flip the local drain flag, and block until the leader
-/// has reassigned every vnode we own (bounded so a stuck cluster cannot wedge
-/// shutdown). Returns whether process authority was lost during the drain.
-async fn drain_local_vnodes(
+/// Result of waiting for the leader to move this node's vnodes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DrainOutcome {
+    /// The certified assignment no longer names this node.
+    Drained,
+    /// The allowance expired with vnodes still owned; ownership moves by failed-owner recovery.
+    Incomplete,
+    /// Process authority ended first and takes precedence.
+    AuthorityLost,
+}
+
+/// Announce Draining, flip the local drain flag, and block until the leader has reassigned every
+/// vnode we own, bounded by the configured drain allowance. Leases keep renewing meanwhile.
+pub(super) async fn drain_local_vnodes(
     handle: &mut ClusterHandle,
     terminal: &tokio_util::sync::CancellationToken,
-) -> bool {
-    let mut authority_lost = false;
-    // Graceful drain. Discovery and the rebalance control plane must
-    // stay alive here: peers need to observe our Draining state and
-    // the leader needs to rotate our vnodes away before we tear down.
-    //
-    // 1. Announce Draining so peers stop routing to us and the
-    //    leader's `assignable_instances` drops us from assignment.
-    if !authority_lost {
-        let mut draining = handle.local_node.clone();
-        draining.state = NodeState::Draining;
-        authority_lost = announce_node_state_with_bound(
-            &handle.discovery,
-            draining,
-            terminal,
-            "announce draining state",
-        )
-        .await;
-
-        if !authority_lost {
-            // 2. Flip the local draining flag so that if we are the leader,
-            //    our own rebalance controller excludes us from assignment.
-            let retains_drain_leadership = handle.cluster_controller.begin_drain();
-            // A non-leader yields immediately. The certified current leader must keep
-            // renewing until it checkpoints its own predecessor cut; the target roster
-            // excludes it and transfers candidacy after the committed assignment is adopted.
-            if !retains_drain_leadership {
-                handle.leader_lease.cancel();
+) -> DrainOutcome {
+    // Discovery and the rebalance control plane stay alive: peers must observe Draining and
+    // the leader must checkpoint and rotate our vnodes away before teardown.
+    let mut draining = handle.local_node.clone();
+    draining.state = NodeState::Draining;
+    if announce_node_state_with_bound(
+        &handle.discovery,
+        draining,
+        terminal,
+        "announce draining state",
+    )
+    .await
+    {
+        return DrainOutcome::AuthorityLost;
+    }
+    // A non-leader yields immediately. The certified current leader must keep renewing until
+    // it checkpoints its own predecessor cut; the target roster excludes it and transfers
+    // candidacy after the committed assignment is adopted.
+    if !handle.cluster_controller.begin_drain() {
+        handle.leader_lease.cancel();
+    }
+    let me = laminar_core::state::NodeId(handle.local_node.id.0);
+    let drain = async {
+        match handle.cluster_controller.checkpoint_authority() {
+            Ok(authority) => {
+                laminar_db::rebalance::wait_until_drained(
+                    &handle.snapshot_store,
+                    Some(&authority),
+                    me,
+                    handle.vnode_count,
+                    Duration::from_secs(1),
+                    handle.drain_timeout,
+                )
+                .await
             }
-
-            // 3. Block until the leader has reassigned every vnode we own,
-            //    bounded so a stuck cluster can't wedge shutdown forever.
-            let me = laminar_core::state::NodeId(handle.local_node.id.0);
-            let drain = async {
-                match handle.cluster_controller.checkpoint_authority() {
-                    Ok(authority) => {
-                        laminar_db::rebalance::wait_until_drained(
-                            &handle.snapshot_store,
-                            Some(&authority),
-                            me,
-                            handle.vnode_count,
-                            Duration::from_secs(1),
-                            Duration::from_secs(30),
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        warn!(%error, "Drain cannot certify assignment authority");
-                        false
-                    }
-                }
-            };
-            let drained = tokio::select! {
-                biased;
-                () = terminal.cancelled() => {
-                    authority_lost = true;
-                    false
-                }
-                drained = drain => drained,
-            };
-            if authority_lost {
-                warn!("Process lease lost while draining; switching to terminal shutdown");
-            } else if drained {
-                info!("Drain complete: all owned vnodes reassigned");
-            } else {
-                warn!("Drain timed out after 30s; proceeding with shutdown");
+            Err(error) => {
+                warn!(%error, "Drain cannot certify assignment authority");
+                false
             }
         }
+    };
+    let outcome = tokio::select! {
+        biased;
+        () = terminal.cancelled() => DrainOutcome::AuthorityLost,
+        drained = drain => if drained { DrainOutcome::Drained } else { DrainOutcome::Incomplete },
+    };
+    match outcome {
+        DrainOutcome::Drained => info!("Drain complete: all owned vnodes reassigned"),
+        DrainOutcome::Incomplete => warn!(
+            drain_timeout = ?handle.drain_timeout,
+            "Drain allowance exhausted with vnodes still owned; exiting fenced"
+        ),
+        DrainOutcome::AuthorityLost => {
+            warn!("Process lease lost while draining; switching to terminal shutdown");
+        }
     }
-    authority_lost
+    outcome
 }
 
 /// Tear down advertisement, rebalance, leader lease, and the database in the

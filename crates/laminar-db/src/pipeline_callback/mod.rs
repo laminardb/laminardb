@@ -5891,6 +5891,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.observe_checkpoint_recovery_state(recovering)
     }
 
+    #[cfg(feature = "cluster")]
+    fn periodic_checkpoints_held(&self) -> bool {
+        self.cluster_controller
+            .as_ref()
+            .is_some_and(|controller| controller.periodic_checkpoints_held())
+    }
+
     fn fault_on_cycle_error(&self) -> bool {
         use laminar_connectors::connector::DeliveryGuarantee;
         self.delivery_guarantee != DeliveryGuarantee::BestEffort || self.in_cluster()

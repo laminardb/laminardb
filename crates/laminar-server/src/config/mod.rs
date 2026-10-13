@@ -170,6 +170,10 @@ pub struct ServerSection {
     /// Retained-memory charge limit per local MV; must be nonzero.
     #[serde(default = "default_materialized_view_max_bytes")]
     pub materialized_view_max_bytes: usize,
+    /// Pipeline-wide charged-byte budget for managed operator state (keyed aggregates, windows,
+    /// joins). `None` uses 256 MiB; configured budgets must be greater than zero.
+    #[serde(default)]
+    pub pipeline_max_managed_state_bytes: Option<usize>,
     /// Per-graph-port batch limit. `None` uses 256; zero disables the count limit.
     #[serde(default)]
     pub pipeline_max_input_buf_batches: Option<usize>,
@@ -190,6 +194,10 @@ pub struct ServerSection {
         with = "humantime_serde"
     )]
     pub event_time_max_future_skew: Duration,
+    /// Cluster graceful-shutdown allowance for the leader to checkpoint and reassign this node's
+    /// vnodes. `None` uses `checkpoint.timeout` plus 30 seconds of handoff headroom.
+    #[serde(default, with = "humantime_serde")]
+    pub drain_timeout: Option<Duration>,
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
@@ -255,11 +263,13 @@ impl Default for ServerSection {
             reference_table_max_bytes: default_reference_table_max_bytes(),
             materialized_view_max_rows: default_materialized_view_max_rows(),
             materialized_view_max_bytes: default_materialized_view_max_bytes(),
+            pipeline_max_managed_state_bytes: None,
             pipeline_max_input_buf_batches: None,
             pipeline_max_input_buf_bytes: None,
             temporal_join_idle_history_retention: None,
             source_idle_timeout: None,
             event_time_max_future_skew: default_event_time_max_future_skew(),
+            drain_timeout: None,
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
@@ -288,6 +298,9 @@ impl ServerSection {
             .materialized_view_max_bytes(self.materialized_view_max_bytes)
             .datafusion_memory_limit_bytes(self.datafusion_memory_limit_bytes)
             .source_queue_max_bytes(self.source_queue_max_bytes);
+        if let Some(bytes) = self.pipeline_max_managed_state_bytes {
+            builder = builder.pipeline_max_managed_state_bytes(bytes);
+        }
         if let Some(batches) = self.pipeline_max_input_buf_batches {
             builder = builder.pipeline_max_input_buf_batches(batches);
         }
@@ -306,6 +319,9 @@ impl ServerSection {
             self.reference_table_max_rows,
             self.reference_table_max_bytes,
         )?;
+        if let Some(bytes) = self.pipeline_max_managed_state_bytes {
+            laminar_db::validate_managed_state_max_bytes(bytes)?;
+        }
         if self.pipeline_max_input_buf_bytes == Some(0) {
             return Err("pipeline_max_input_buf_bytes must be greater than zero when configured");
         }
@@ -313,6 +329,14 @@ impl ServerSection {
             return Err("datafusion_memory_limit_bytes must be greater than zero");
         }
         laminar_db::validate_source_queue_max_bytes(self.source_queue_max_bytes)
+    }
+
+    /// Graceful-drain allowance: the configured value, or the checkpoint timeout plus headroom for
+    /// the leader's rebalance debounce, drain acknowledgements and assignment publication.
+    #[must_use]
+    pub(crate) fn effective_drain_timeout(&self, checkpoint_timeout: Duration) -> Duration {
+        self.drain_timeout
+            .unwrap_or_else(|| checkpoint_timeout.saturating_add(DRAIN_HANDOFF_HEADROOM))
     }
 
     /// Configured key-group topology, or the common deployment default.
@@ -853,6 +877,8 @@ pub enum ConfigError {
     #[error("configuration validation errors:\n  - {}", errors.join("\n  - "))]
     ValidationErrors { errors: Vec<String> },
 }
+
+const DRAIN_HANDOFF_HEADROOM: Duration = Duration::from_secs(30);
 
 fn default_bind() -> String {
     "127.0.0.1:8080".to_string()

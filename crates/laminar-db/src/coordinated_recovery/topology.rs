@@ -81,18 +81,7 @@ impl TopologyDriver {
             .map_err(|error| TopologyError::Protocol(error.to_string()))?;
         // Finish this process's prior held boundary even if the leader has admitted the next
         // request after Release/abort. The latest journal entry alone is insufficient here.
-        let installed = db
-            .installed_topology_runtime
-            .lock()
-            .as_ref()
-            .filter(|binding| {
-                binding.released_sequence.is_none()
-                    && binding
-                        .recovery
-                        .as_ref()
-                        .is_none_or(|recovery| !recovery.released)
-            })
-            .map(|binding| binding.input.operation().operation_id);
+        let installed = Self::held_runtime_operation(db);
         let retained = installed
             .or_else(|| {
                 self.image
@@ -125,7 +114,14 @@ impl TopologyDriver {
             .ok_or_else(|| {
                 TopologyError::Conflict("retained topology operation disappeared".into())
             })?;
-        if self.progress.is_none_or(|(operation, sequence, _)| {
+        if status.phase == TopologyAdmissionPhase::Active {
+            // Active is terminal. Its age must not turn later recoveries or fault observations,
+            // which clear `completed`, into requests for yet another recovery round.
+            if self.progress.take().is_some() {
+                tracing::info!(operation = %status.operation_id.get(), phase = ?status.phase,
+                    "observed durable topology progress");
+            }
+        } else if self.progress.is_none_or(|(operation, sequence, _)| {
             operation != status.operation_id || sequence != status.status_sequence
         }) {
             self.progress = Some((
@@ -289,30 +285,7 @@ impl TopologyDriver {
                     db.certify_installed_cluster_topology(operation).await?;
                 }
             }
-            TopologyAdmissionPhase::Active => {
-                let recovered = db
-                    .installed_topology_runtime
-                    .lock()
-                    .clone()
-                    .filter(|binding| {
-                        binding.input.operation().operation_id == operation
-                            && binding.recovery.is_some()
-                    });
-                if let Some(binding) = recovered {
-                    if !db.recovered_topology_runtime_is_active(&binding).await? {
-                        self.request_recovery(db, controller);
-                        return Err(TopologyError::Fenced.into());
-                    }
-                    self.image = None;
-                    self.completed = Some((operation, status.status_sequence));
-                    return Ok(());
-                }
-                // Original Release only authorizes its exact runtime UUID. Never reconstruct a
-                // post-Release failure from the parent root or reuse another runtime's receipt.
-                db.apply_cluster_topology_release(operation).await?;
-                self.image = None;
-                self.completed = Some((operation, status.status_sequence));
-            }
+            TopologyAdmissionPhase::Active => self.advance_active(db, controller, status).await?,
             TopologyAdmissionPhase::Aborted { .. } => {
                 return Err(TopologyError::Conflict(
                     "aborted topology cannot advance a target phase".into(),
@@ -321,6 +294,61 @@ impl TopologyDriver {
             }
         }
         Ok(())
+    }
+
+    async fn advance_active(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        status: &TopologyAdmissionStatus,
+    ) -> Result<(), DbError> {
+        let operation = status.operation_id;
+        if db.live_topology_commit().await?.as_ref() == status.commit.as_ref() {
+            let recovered = db
+                .installed_topology_runtime
+                .lock()
+                .clone()
+                .filter(|binding| {
+                    binding.input.operation().operation_id == operation
+                        && binding.recovery.is_some()
+                });
+            if let Some(binding) = recovered {
+                if !db.recovered_topology_runtime_is_active(&binding).await? {
+                    self.request_recovery(db, controller);
+                    return Err(TopologyError::Fenced.into());
+                }
+            } else {
+                // Original Release only authorizes its exact runtime UUID. Never reconstruct a
+                // post-Release failure from the parent root or reuse another runtime's receipt.
+                db.apply_cluster_topology_release(operation).await?;
+            }
+        } else if Self::held_runtime_operation(db) == Some(operation) {
+            // The target checkpoint settled this operation before the local runtime applied its
+            // Release, which is no longer admissible; reopen intake through ordinary recovery.
+            self.request_recovery(db, controller);
+            return Err(TopologyError::Fenced.into());
+        }
+        // A settled target may restart or reassign through ordinary recovery; no installed
+        // topology runtime remains to audit.
+        self.image = None;
+        self.completed = Some((operation, status.status_sequence));
+        Ok(())
+    }
+
+    /// Operation whose installed runtime still holds intake: never released, or recovered but
+    /// not yet released.
+    fn held_runtime_operation(db: &LaminarDB) -> Option<TopologyOperationId> {
+        db.installed_topology_runtime
+            .lock()
+            .as_ref()
+            .filter(|binding| {
+                binding.released_sequence.is_none()
+                    && binding
+                        .recovery
+                        .as_ref()
+                        .is_none_or(|recovery| !recovery.released)
+            })
+            .map(|binding| binding.input.operation().operation_id)
     }
 }
 

@@ -289,23 +289,47 @@ async fn topology_recovery_round_supersedes_unreleased_installation_in_same_lead
 }
 
 #[tokio::test]
-async fn topology_recovery_round_target_checkpoint_rejects_parent_cut_and_unbound_release() {
+async fn topology_recovery_round_before_target_checkpoint_rejects_unbound_release() {
     let authority = store(30_000);
     let (fixture, input) = active(&authority).await;
-    target_checkpoint(&authority, &fixture, &input, 2).await;
     let round = recovery_round(&authority, &fixture, &input, 1).await;
+    assert!(round.topology_binding().is_some());
     let before = authority.load_record().await.unwrap();
-    assert!(publish(&authority, &fixture, &terminal(&round, 1))
+    let unbound = round.clone().bind_topology(None).unwrap();
+    assert!(publish(&authority, &fixture, &terminal(&unbound, 1))
         .await
         .is_err());
-    let unbound = round.clone().bind_topology(None).unwrap();
-    assert!(publish(&authority, &fixture, &terminal(&unbound, 2))
+    assert_eq!(authority.load_record().await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn topology_recovery_round_after_target_checkpoint_is_ordinary_and_rejects_parent_cut() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let original = input.operation().clone();
+    target_checkpoint(&authority, &fixture, &input, 2).await;
+    let round = recovery_round(&authority, &fixture, &input, 1).await;
+    assert!(round.topology_binding().is_none());
+    let before = authority.load_record().await.unwrap();
+    assert!(publish(&authority, &fixture, &terminal(&round, 1))
         .await
         .is_err());
     assert_eq!(authority.load_record().await.unwrap(), before);
     publish(&authority, &fixture, &terminal(&round, 2))
         .await
         .unwrap();
+    assert_eq!(
+        authority
+            .topology_operation_status(original.operation_id)
+            .await
+            .unwrap(),
+        Some(original)
+    );
+    let snapshot = authority.recovery_admission_snapshot().await.unwrap();
+    assert!(authority
+        .recovery_admission_is_current(&snapshot, &round.leader_proof)
+        .await
+        .unwrap());
     assert_eq!(
         select(&authority, &fixture, input.process())
             .await
@@ -401,7 +425,118 @@ async fn topology_recovery_round_malformed_binding_cannot_stage_a_terminal() {
 }
 
 #[tokio::test]
-async fn topology_recovery_round_preserves_exact_handoff_pin_until_new_target_checkpoint() {
+async fn topology_recovery_round_live_target_rejects_survivor_rescaling() {
+    use crate::cluster::control::{ProcessLeaseFence, ProcessLeaseOutcome, ProcessLeaseStore};
+
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let checkpoint = input.outcome().committed_checkpoint.clone().unwrap();
+    let processes = ProcessLeaseStore::new(authority.store.clone(), NodeId(2), 30_000);
+    let prior = processes.load().await.unwrap().unwrap();
+    let observed = processes.observe_rival(&prior).unwrap();
+    tokio::time::sleep(Duration::from_millis(30_001)).await;
+    let ProcessLeaseOutcome::Acquired(replacement) = processes
+        .try_takeover(Uuid::from_u128(222), &observed, 30_001)
+        .await
+        .unwrap()
+    else {
+        panic!("replacement process");
+    };
+    let before = fixture.assignments.load().await.unwrap().unwrap();
+    let process_fence = ProcessLeaseFence::new(prior, replacement.clone()).unwrap();
+    // Before the target's own checkpoint, only the migration root can restore it.
+    for remove_owner in [true, false] {
+        let mut owners = before.vnodes.clone();
+        for owner in owners.values_mut() {
+            *owner = if remove_owner || owner.0 == 2 {
+                NodeId(1)
+            } else {
+                NodeId(2)
+            };
+        }
+        let mut roster = before.participants.clone();
+        if remove_owner {
+            roster.retain(|participant| participant.node_id != 2);
+        } else {
+            roster[1].boot_incarnation = replacement.owner;
+        }
+        let unsupported = before.next_for_participants(owners, roster).unwrap();
+        assert!(authority
+            .validate_topology_assignment_proposal(&unsupported.assignment_fence().unwrap())
+            .await
+            .is_err());
+        let proposal = fixture
+            .assignments
+            .stage_recovery_proposal(&unsupported)
+            .await
+            .unwrap();
+        let proof = input.current_leader().unwrap();
+        let decision = AssignmentRecoveryDecision::new(
+            before.assignment_fence().unwrap(),
+            unsupported.assignment_fence().unwrap(),
+            proposal,
+            vec![process_fence.clone()],
+            checkpoint.clone(),
+            proof.clone(),
+        )
+        .unwrap();
+        let authority_before = authority.load_record().await.unwrap();
+        assert!(authority
+            .record_assignment_recovery_decision(&proof, decision)
+            .await
+            .is_err());
+        assert_eq!(authority.load_record().await.unwrap(), authority_before);
+        assert_eq!(
+            fixture.assignments.load().await.unwrap(),
+            Some(before.clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn topology_settled_target_admits_graceful_scale_in_drain() {
+    let authority = store(30_000);
+    let (fixture, input) = active(&authority).await;
+    let current = fixture.assignments.load().await.unwrap().unwrap();
+    let proof = input.current_leader().unwrap();
+    let mut owners = current.vnodes.clone();
+    for owner in owners.values_mut() {
+        *owner = NodeId(1);
+    }
+    let survivors = current
+        .participants
+        .iter()
+        .filter(|participant| participant.node_id == 1)
+        .copied()
+        .collect();
+    let drain = current
+        .next_draining(owners, survivors, proof.clone())
+        .unwrap();
+    // The live migration still owns placement: a scale-in drain is rejected before any write.
+    let before = authority.load_record().await.unwrap();
+    assert!(authority
+        .publish_assignment_drain(&proof, &fixture.assignments, &drain)
+        .await
+        .is_err());
+    assert_eq!(authority.load_record().await.unwrap(), before);
+    assert_eq!(
+        fixture.assignments.load().await.unwrap(),
+        Some(current.clone())
+    );
+
+    target_checkpoint(&authority, &fixture, &input, 2).await;
+    authority
+        .publish_assignment_drain(&proof, &fixture.assignments, &drain)
+        .await
+        .unwrap();
+    let head = fixture.assignments.load().await.unwrap().unwrap();
+    assert!(head.draining);
+    assert_eq!(head.version, current.version + 1);
+    assert!(head.vnodes.values().all(|owner| *owner == NodeId(1)));
+}
+
+#[tokio::test]
+async fn topology_recovery_round_settled_target_redistributes_failed_owner_with_handoff_pin() {
     use crate::cluster::control::{ProcessLeaseFence, ProcessLeaseOutcome, ProcessLeaseStore};
 
     let authority = store(30_000);
@@ -422,71 +557,24 @@ async fn topology_recovery_round_preserves_exact_handoff_pin_until_new_target_ch
     };
     let before = fixture.assignments.load().await.unwrap().unwrap();
     let process_fence = ProcessLeaseFence::new(prior, replacement.clone()).unwrap();
-    // A failed owner must be replaced in its original slot. Even with a valid takeover,
-    // admission must not strand the committed topology on a reduced or redistributed map.
-    for remove_owner in [true, false] {
-        let mut owners = before.vnodes.clone();
-        for owner in owners.values_mut() {
-            *owner = if remove_owner || owner.0 == 2 {
-                NodeId(1)
-            } else {
-                NodeId(2)
-            };
-        }
-        let mut roster = before.participants.clone();
-        if remove_owner {
-            roster.retain(|participant| participant.node_id != 2);
-        } else {
-            roster[1].boot_incarnation = replacement.owner;
-        }
-        let unsupported = before.next_for_participants(owners, roster).unwrap();
-        let proposal = fixture
-            .assignments
-            .stage_recovery_proposal(&unsupported)
-            .await
-            .unwrap();
-        let proof = input.current_leader().unwrap();
-        let decision = AssignmentRecoveryDecision::new(
-            before.assignment_fence().unwrap(),
-            unsupported.assignment_fence().unwrap(),
-            proposal,
-            vec![process_fence.clone()],
-            checkpoint.clone(),
-            proof.clone(),
-        )
-        .unwrap();
-        let authority_before = authority.load_record().await.unwrap();
-        assert!(
-            authority
-                .record_assignment_recovery_decision(&proof, decision)
-                .await
-                .is_err(),
-            "committed topology must reject survivor rescaling before authority admission"
-        );
-        assert_eq!(authority.load_record().await.unwrap(), authority_before);
-        assert_eq!(
-            fixture.assignments.load().await.unwrap(),
-            Some(before.clone())
-        );
-        assert!(fixture
-            .assignments
-            .load_version(before.version + 1)
-            .await
-            .unwrap()
-            .is_none());
+    // The target's own checkpoint settled the migration: vnodes may change owners through the
+    // ordinary recovery decision, which pins that exact checkpoint for the handoff.
+    let mut owners = before.vnodes.clone();
+    for owner in owners.values_mut() {
+        *owner = if owner.0 == 2 { NodeId(1) } else { NodeId(2) };
     }
     let mut roster = before.participants.clone();
     roster[1].boot_incarnation = replacement.owner;
-    let assignment = before
-        .next_for_participants(before.vnodes.clone(), roster)
-        .unwrap();
+    let assignment = before.next_for_participants(owners, roster).unwrap();
     let target = assignment.assignment_fence().unwrap();
-    let authority_before = authority.load_record().await.unwrap();
+    assert_ne!(
+        target.assignment_digest,
+        before.assignment_fence().unwrap().assignment_digest
+    );
     authority
         .validate_topology_assignment_proposal(&target)
         .await
         .unwrap();
-    assert_eq!(authority.load_record().await.unwrap(), authority_before);
     let proposal = fixture
         .assignments
         .stage_recovery_proposal(&assignment)
@@ -510,11 +598,27 @@ async fn topology_recovery_round_preserves_exact_handoff_pin_until_new_target_ch
         .materialize_assignment_recovery(target.assignment_version)
         .await
         .unwrap();
-    let input = reconstruct(&authority, &fixture, input.process())
+    authority
+        .record_recovery_fault(owner_recovery_fault_publisher(&fixture.lease.owner), 1)
         .await
         .unwrap();
-    let round = recovery_round(&authority, &fixture, &input, 1).await;
+    let faults = authority.recovery_fault_inventory().await.unwrap();
+    let round = RecoveryRound::new(
+        1,
+        proof.clone(),
+        target.clone(),
+        Vec::new(),
+        faults.revision(),
+        faults.faults().to_vec(),
+    )
+    .unwrap();
     let process_authority = topology_preparation::processes(&authority);
+    let binding = authority
+        .recovery_topology_binding(&round, Some((&fixture.assignments, &process_authority)))
+        .await
+        .unwrap();
+    assert!(binding.is_none());
+    let round = round.bind_topology(binding).unwrap();
     authority
         .audit_recovery_topology(
             &round,
@@ -523,39 +627,9 @@ async fn topology_recovery_round_preserves_exact_handoff_pin_until_new_target_ch
         )
         .await
         .unwrap();
-
-    // A pin protects restore state; it cannot authorize a different assignment or payload.
-    let head = authority.load_record().await.unwrap().unwrap();
-    for case in 0..2 {
-        let mut changed = head.clone();
-        let pin = changed.assignment_handoff_pin.as_mut().unwrap();
-        if case == 0 {
-            pin.target.assignment_version += 1;
-        } else {
-            pin.checkpoint.sha256 = "f".repeat(64);
-        }
-        assert!(authority
-            .audit_recovery_topology_from(
-                &changed,
-                &round,
-                Some(2),
-                Some((&fixture.assignments, &process_authority)),
-            )
-            .await
-            .is_err());
-    }
-    for (index, process) in input.processes().iter().enumerate() {
-        certify_recovered(
-            &authority,
-            &fixture,
-            &round,
-            *process,
-            800 + index as u128,
-            2,
-        )
+    assert!(publish(&authority, &fixture, &terminal(&round, 1))
         .await
-        .unwrap();
-    }
+        .is_err());
     publish(&authority, &fixture, &terminal(&round, 2))
         .await
         .unwrap();

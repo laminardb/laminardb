@@ -164,12 +164,12 @@ pub use checkpoint_coordinator::{
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointStats,
 };
 pub use config::{
-    validate_materialized_view_limits, validate_reference_table_limits,
-    validate_source_queue_max_bytes, BackpressurePolicy, LaminarConfig, RestartPolicy,
-    DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES, DEFAULT_MATERIALIZED_VIEW_MAX_BYTES,
-    DEFAULT_MATERIALIZED_VIEW_MAX_ROWS, DEFAULT_MAX_MANAGED_STATE_BYTES,
-    DEFAULT_REFERENCE_TABLE_MAX_BYTES, DEFAULT_REFERENCE_TABLE_MAX_ROWS,
-    DEFAULT_SOURCE_QUEUE_MAX_BYTES, MAX_SOURCE_QUEUE_BYTES,
+    validate_managed_state_max_bytes, validate_materialized_view_limits,
+    validate_reference_table_limits, validate_source_queue_max_bytes, BackpressurePolicy,
+    LaminarConfig, RestartPolicy, DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES,
+    DEFAULT_MATERIALIZED_VIEW_MAX_BYTES, DEFAULT_MATERIALIZED_VIEW_MAX_ROWS,
+    DEFAULT_MAX_MANAGED_STATE_BYTES, DEFAULT_REFERENCE_TABLE_MAX_BYTES,
+    DEFAULT_REFERENCE_TABLE_MAX_ROWS, DEFAULT_SOURCE_QUEUE_MAX_BYTES, MAX_SOURCE_QUEUE_BYTES,
 };
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;

@@ -13,6 +13,17 @@ use crate::cluster::control::CatalogManifestRef;
 pub const MAX_TOPOLOGY_OPERATIONS: usize = 64;
 pub(crate) const MAX_TOPOLOGY_PLAN_BYTES: usize = 32 * 1024;
 
+/// Occupancy of the bounded topology request journal. Every admitted request, including Active
+/// and Aborted ones, keeps its identity so a retry returns its original outcome. Admission is
+/// rejected once `retained` reaches `capacity`; terminal-prefix compaction is not implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyJournalUsage {
+    /// Request identities currently retained.
+    pub retained: usize,
+    /// Fixed maximum number of retained identities.
+    pub capacity: usize,
+}
+
 /// Exact request and assignment evidence reserved before checkpoint cutover.
 ///
 /// Admission does not certify the candidate's operator/connector compatibility or authorize its

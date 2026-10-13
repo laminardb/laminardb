@@ -314,6 +314,37 @@ impl CatalogManifestStore {
         self.authority.topology_catalog_state().await
     }
 
+    /// Commit of a topology migration that still owns startup and recovery; `None` once settled.
+    ///
+    /// # Errors
+    /// Fails closed when the authority or referenced topology evidence is invalid.
+    pub async fn live_topology_commit(
+        &self,
+    ) -> Result<Option<super::topology::TopologyCommit>, super::topology::TopologyError> {
+        self.authority.live_topology_commit().await
+    }
+
+    /// Retained topology request identities against the fixed journal capacity.
+    ///
+    /// # Errors
+    /// Fails closed when the authority is invalid or the read exceeds its deadline.
+    pub async fn topology_journal_usage(
+        &self,
+    ) -> Result<super::topology::TopologyJournalUsage, super::topology::TopologyError> {
+        self.authority.topology_journal_usage().await
+    }
+
+    /// Subscription certificates preserved by the newest committed migration.
+    ///
+    /// # Errors
+    /// Fails closed when the authority or referenced migration root is invalid.
+    pub async fn committed_topology_subscriptions(
+        &self,
+    ) -> Result<Vec<crate::checkpoint::OutputDistributionCertificate>, super::topology::TopologyError>
+    {
+        self.authority.committed_topology_subscriptions().await
+    }
+
     /// Load the catalog and its topology metadata from one immutable authority snapshot.
     ///
     /// # Errors
