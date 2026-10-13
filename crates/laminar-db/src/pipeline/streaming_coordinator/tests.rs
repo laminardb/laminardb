@@ -836,7 +836,6 @@ struct MockRuntimeState {
     leader: bool,
     recovering: bool,
     assignment_ready: bool,
-    periodic_checkpoints_held: bool,
 }
 
 #[cfg(feature = "cluster")]
@@ -861,6 +860,7 @@ enum MockLateFilter {
 
 #[allow(clippy::struct_excessive_bools)]
 struct MockCallback {
+    periodic_checkpoints_held: bool,
     cycle_count: u32,
     attempt_to_reserve: CheckpointAttempt,
     reserve_error: Option<String>,
@@ -996,8 +996,8 @@ impl MockCallback {
                 leader: true,
                 recovering: false,
                 assignment_ready: true,
-                periodic_checkpoints_held: false,
             },
+            periodic_checkpoints_held: false,
             assignment_fault: None,
             assignment_fence: None,
             assignment_flags: laminar_core::checkpoint::flags::NONE,
@@ -1251,7 +1251,7 @@ impl PipelineCallback for MockCallback {
     }
 
     fn periodic_checkpoints_held(&self) -> bool {
-        self.runtime.periodic_checkpoints_held
+        self.periodic_checkpoints_held
     }
 
     async fn checkpoint_assignment_for_admission(
@@ -3509,7 +3509,7 @@ async fn topology_submission_hold_defers_only_periodic_admission() {
     coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(interval);
     coordinator.last_checkpoint = Instant::now() - interval;
     let mut callback = MockCallback::new();
-    callback.runtime.periodic_checkpoints_held = true;
+    callback.periodic_checkpoints_held = true;
 
     assert!(coordinator
         .checkpoint_admission(&mut callback)
@@ -3524,7 +3524,7 @@ async fn topology_submission_hold_defers_only_periodic_admission() {
         "the hold must not back off the due cut"
     );
 
-    callback.runtime.periodic_checkpoints_held = false;
+    callback.periodic_checkpoints_held = false;
     let periodic = coordinator
         .checkpoint_admission(&mut callback)
         .await
@@ -3536,7 +3536,7 @@ async fn topology_submission_hold_defers_only_periodic_admission() {
     let (reply_tx, _reply_rx) = crossfire::oneshot::oneshot();
     let (request, _reservation_wait) = unreserved_manual_request(reply_tx);
     manual.manual_waiting.push(request);
-    callback.runtime.periodic_checkpoints_held = true;
+    callback.periodic_checkpoints_held = true;
     let admission = manual
         .checkpoint_admission(&mut callback)
         .await

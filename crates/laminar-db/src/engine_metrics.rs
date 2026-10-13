@@ -1,8 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
 use prometheus::{
-    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 
 /// Bounded-cardinality metrics for committed cluster subscriptions.
@@ -178,7 +178,7 @@ pub struct PlacementMetrics {
     /// Vnodes owned per failure domain. Label: `domain`.
     pub vnodes_per_domain: IntGaugeVec,
     /// Largest single domain's share of all vnodes (`[0, 1]`) — the blast radius.
-    pub blast_radius_ratio: Gauge,
+    pub blast_radius_ratio: prometheus::Gauge,
     /// Vnodes owned by this process.
     pub owned_vnodes: IntGauge,
 }
@@ -197,7 +197,7 @@ impl PlacementMetrics {
         registry
             .register(Box::new(vnodes_per_domain.clone()))
             .unwrap();
-        let blast_radius_ratio = Gauge::new(
+        let blast_radius_ratio = prometheus::Gauge::new(
             "placement_blast_radius_ratio",
             "Largest single domain's share of all vnodes (0-1); state affected if it fails",
         )
