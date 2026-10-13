@@ -40,7 +40,9 @@ fn test_schema() -> SchemaRef {
     ]))
 }
 
-const REDPANDA_HOST_PORT: u16 = 19092;
+// Off the shared 19092 broker port: other suites probe 19092 and would otherwise run against
+// this short-lived container concurrently.
+const REDPANDA_HOST_PORT: u16 = 39092;
 const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
@@ -234,6 +236,7 @@ fn make_config(brokers: &str, group_id: &str, topic: &str) -> KafkaSourceConfig 
 /// scenarios sequentially to avoid fixed-port conflicts.
 #[tokio::test]
 async fn kafka_source_integration() {
+    let advertised = format!("PLAINTEXT://127.0.0.1:{REDPANDA_HOST_PORT}");
     let _container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
         .with_exposed_port(9092.into())
         .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
@@ -251,7 +254,7 @@ async fn kafka_source_integration() {
             "--kafka-addr",
             "PLAINTEXT://0.0.0.0:9092",
             "--advertise-kafka-addr",
-            "PLAINTEXT://127.0.0.1:19092",
+            advertised.as_str(),
             "--node-id",
             "0",
         ])
