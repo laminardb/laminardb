@@ -537,6 +537,35 @@ impl CheckpointCoordinator {
             .map(Some)
     }
 
+    /// Source positions and assignment of the authoritative committed cluster cut, without
+    /// loading manifests or state. `None` when no cut has committed.
+    ///
+    /// # Errors
+    /// Rejects unreadable authority or a cut bound to another pipeline or deployment.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn committed_source_cut(
+        &self,
+    ) -> Result<Option<CommittedCheckpointIndex>, DbError> {
+        let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+            DbError::Checkpoint("committed source cut requires cluster checkpoint authority".into())
+        })?;
+        let deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
+        let Some((_, committed)) =
+            select_cluster_recovery_cut_until(controller.as_ref(), deadline).await?
+        else {
+            return Ok(None);
+        };
+        if committed.pipeline_identity != self.expected_pipeline_identity()?
+            || committed.deployment_id != self.expected_deployment_id()?
+            || committed.assignment_fence.is_none()
+        {
+            return Err(DbError::Checkpoint(
+                "committed source cut belongs to another pipeline, deployment or scope".into(),
+            ));
+        }
+        Ok(Some(committed))
+    }
+
     pub async fn recover(&mut self) -> Result<Option<RecoveredState>, DbError> {
         if self.phase != CheckpointPhase::Idle {
             return Err(DbError::Checkpoint(
