@@ -177,6 +177,24 @@ async fn cold_start_settled_target(
     )
     .await
     .unwrap();
+    // Peers fence shuffle by topology generation; ordinary startup must rejoin on the committed one.
+    let catalog = fresh.db.catalog_manifest_store.lock().clone().unwrap();
+    let laminar_core::cluster::control::TopologyCatalogState::Versioned {
+        committed: Some(commit),
+        ..
+    } = catalog.topology_state().await.unwrap()
+    else {
+        panic!("settled target has a committed topology");
+    };
+    let target = laminar_core::shuffle::ShuffleTopologyFence::from_manifest(
+        commit.topology_version,
+        &commit.manifest,
+    )
+    .unwrap();
+    let sender = fresh.db.shuffle_sender.lock().clone().unwrap();
+    let receiver = fresh.db.shuffle_receiver.lock().clone().unwrap();
+    assert_eq!(sender.topology_fence(), Some(target));
+    assert_eq!(receiver.topology_fence(), Some(target));
     (fresh, probe)
 }
 

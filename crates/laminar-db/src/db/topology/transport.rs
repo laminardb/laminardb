@@ -9,6 +9,37 @@ use laminar_core::shuffle::ShuffleTopologyFence;
 use super::{DbError, DbState, LaminarDB, PreparedTopologyRestore};
 
 impl LaminarDB {
+    /// Rejoin peers on the committed topology generation during ordinary startup of a settled
+    /// target. Live migrations install this fence through their own restore path; a process that
+    /// starts after settlement would otherwise offer the legacy fabric and peers refuse its shuffle.
+    /// The caller holds the assignment adoption lock and intake is not yet open.
+    pub(crate) async fn bind_settled_topology_transport(&self) -> Result<(), DbError> {
+        let Some(catalog) = self.catalog_manifest_store.lock().clone() else {
+            return Ok(());
+        };
+        let laminar_core::cluster::control::TopologyCatalogState::Versioned {
+            committed: Some(commit),
+            ..
+        } = catalog.topology_state().await?
+        else {
+            return Ok(());
+        };
+        let target = ShuffleTopologyFence::from_manifest(commit.topology_version, &commit.manifest)
+            .map_err(|error| TopologyError::Invalid(error.to_string()))?;
+        let sender = self.shuffle_sender.lock().clone();
+        let receiver = self.shuffle_receiver.lock().clone();
+        let (Some(sender), Some(receiver)) = (sender, receiver) else {
+            return Ok(());
+        };
+        if sender.topology_fence() == Some(target) && receiver.topology_fence() == Some(target) {
+            return Ok(());
+        }
+        sender
+            .install_topology_fence_pair(&receiver, sender.topology_fence(), target)
+            .map_err(|error| TopologyError::Conflict(error.to_string()))?;
+        Ok(())
+    }
+
     /// Fence this process's transport and private graph to the exact committed target.
     /// Reobserves retirement for a held parent; a Created DB must have no runtime/connector owners.
     /// Current full-roster, process/adoption, assignment, source availability and Commit are audited
