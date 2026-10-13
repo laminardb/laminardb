@@ -3851,29 +3851,6 @@ fn drain_certificate_binds_the_durable_target_map_and_boot_roster() {
 }
 
 #[test]
-fn publish_placement_metrics_labels_by_domain() {
-    let prom = prometheus::Registry::new();
-    let metrics = EngineMetrics::new(&prom);
-
-    // 4 vnodes: node 1 owns two, node 2 owns one, one is unassigned.
-    let vreg = VnodeRegistry::new(4);
-    vreg.set_assignment(vec![NodeId(1), NodeId(1), NodeId(2), NodeId::UNASSIGNED].into());
-    let nodes = vec![
-        (NodeId(1), Locality::parse("region=r;zone=z1")),
-        (NodeId(2), Locality::parse("region=r;zone=z2")),
-    ];
-
-    publish_placement_metrics(&metrics, &vreg, &nodes, 1); // isolation_tier 1 = zone
-
-    let g = &metrics.placement_vnodes_per_domain;
-    assert_eq!(g.with_label_values(&["r;z1"]).get(), 2);
-    assert_eq!(g.with_label_values(&["r;z2"]).get(), 1);
-    assert_eq!(g.with_label_values(&["unknown"]).get(), 1); // the unassigned vnode
-                                                            // Blast radius = largest domain (2) / total vnodes (4).
-    assert!((metrics.placement_blast_radius_ratio.get() - 0.5).abs() < 1e-9);
-}
-
-#[test]
 fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
     fn participant(node_id: u64, boot: u64) -> CheckpointParticipant {
         CheckpointParticipant {

@@ -305,7 +305,8 @@ input is read. **Vnodes** (`server.key_groups`, fixed per deployment) are the un
 routing, checkpoint framing and ownership; changing their count requires a new deployment.
 **Owners** are stable `node_id` processes; the leader assigns vnodes to owners with unweighted
 rendezvous hashing, which suits homogeneous workers. `GET /api/v1/cluster/vnodes` returns the
-current owner of every vnode and `placement_vnodes_per_domain` summarises it by failure domain.
+current owner of every vnode, `placement_vnodes_per_domain` summarises it by failure domain, and
+each process exports its own count as `placement_owned_vnodes`.
 
 Ownership changes reuse one protocol: the leader takes a checkpoint, publishes the next
 assignment, and the new owners range-restore the committed donor frames before intake resumes.
