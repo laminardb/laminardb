@@ -199,7 +199,7 @@ impl LaminarDB {
             // Fresh definition binding would overwrite their public catalog certificates.
             stream_regs.clone_from(image.candidate.connector_manager.lock().streams());
         } else {
-            self.bind_settled_topology_transport().await?;
+            self.bind_replayed_topology_fence()?;
             self.bind_subscription_output_certificates(stream_regs, pipeline_identity)
                 .await?;
         }

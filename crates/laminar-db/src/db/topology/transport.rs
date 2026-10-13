@@ -9,35 +9,58 @@ use laminar_core::shuffle::ShuffleTopologyFence;
 use super::{DbError, DbState, LaminarDB, PreparedTopologyRestore};
 
 impl LaminarDB {
-    /// Rejoin peers on the committed topology generation during ordinary startup of a settled
-    /// target. Live migrations install this fence through their own restore path; a process that
-    /// starts after settlement would otherwise offer the legacy fabric and peers refuse its shuffle.
-    /// The caller holds the assignment adoption lock and intake is not yet open.
-    pub(crate) async fn bind_settled_topology_transport(&self) -> Result<(), DbError> {
-        let Some(catalog) = self.catalog_manifest_store.lock().clone() else {
-            return Ok(());
-        };
-        let laminar_core::cluster::control::TopologyCatalogState::Versioned {
-            committed: Some(commit),
-            ..
-        } = catalog.topology_state().await?
+    /// Activate the shuffle assignment certificate, then keep a fresh process on the committed
+    /// topology generation. Callers hold the assignment adoption and execution fences.
+    pub(crate) fn install_shuffle_assignment_fence(
+        &self,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> Result<(), DbError> {
+        self.install_shuffle_assignment_certificate(fence)?;
+        self.bind_replayed_topology_fence().inspect_err(|_| {
+            self.invalidate_shuffle_assignment_fence();
+        })
+    }
+
+    /// Peers refuse shuffle from another topology generation. A live migration binds its fence
+    /// through the restore path; a process that starts after settlement has none, so bind the
+    /// committed generation it replayed once its assignment is active. Ordinary startup calls
+    /// this before building the graph, and assignment activation calls it again.
+    pub(crate) fn bind_replayed_topology_fence(&self) -> Result<(), DbError> {
+        let Some(target) = self
+            .replayed_topology
+            .lock()
+            .and_then(|replayed| replayed.fence)
         else {
             return Ok(());
         };
-        let target = ShuffleTopologyFence::from_manifest(commit.topology_version, &commit.manifest)
-            .map_err(|error| TopologyError::Invalid(error.to_string()))?;
         let sender = self.shuffle_sender.lock().clone();
         let receiver = self.shuffle_receiver.lock().clone();
         let (Some(sender), Some(receiver)) = (sender, receiver) else {
             return Ok(());
         };
-        if sender.topology_fence() == Some(target) && receiver.topology_fence() == Some(target) {
+        if sender.topology_fence().is_some()
+            || sender.active_assignment_digest().is_none()
+            || receiver.active_assignment_digest().is_none()
+        {
             return Ok(());
         }
         sender
-            .install_topology_fence_pair(&receiver, sender.topology_fence(), target)
+            .install_topology_fence_pair(&receiver, None, target)
             .map_err(|error| TopologyError::Conflict(error.to_string()))?;
         Ok(())
+    }
+
+    /// Topology generation an ordinary graph sends under: the endpoint's, or for a fresh process
+    /// whose assignment is not active yet, the committed generation it replayed.
+    pub(crate) fn shuffle_topology_fence(
+        &self,
+        sender: &laminar_core::shuffle::ShuffleSender,
+    ) -> Option<ShuffleTopologyFence> {
+        sender.topology_fence().or_else(|| {
+            self.replayed_topology
+                .lock()
+                .and_then(|replayed| replayed.fence)
+        })
     }
 
     /// Fence this process's transport and private graph to the exact committed target.

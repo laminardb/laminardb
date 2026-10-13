@@ -460,8 +460,7 @@ pub struct LaminarDB {
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
     /// Version loaded by exact catalog replay; runtime activation requires Running and release.
     #[cfg(feature = "cluster")]
-    pub(crate) replayed_topology_version:
-        parking_lot::Mutex<Option<laminar_core::cluster::control::TopologyVersion>>,
+    pub(crate) replayed_topology: parking_lot::Mutex<Option<crate::db::topology::ReplayedTopology>>,
     /// Pre-built shared checkpoint namespace installed during cluster construction.
     #[cfg(feature = "cluster")]
     cluster_checkpoint_object_store: Option<Arc<dyn object_store::ObjectStore>>,
@@ -1498,7 +1497,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             catalog_manifest_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
-            replayed_topology_version: parking_lot::Mutex::new(None),
+            replayed_topology: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             cluster_checkpoint_object_store: None,
             #[cfg(feature = "cluster")]
@@ -1583,7 +1582,7 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    pub(crate) fn install_shuffle_assignment_fence(
+    pub(crate) fn install_shuffle_assignment_certificate(
         &self,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
     ) -> Result<(), DbError> {
@@ -2362,7 +2361,7 @@ impl LaminarDB {
             )));
         }
         replay_guard.sealed();
-        *self.replayed_topology_version.lock() = topology.committed_version();
+        *self.replayed_topology.lock() = topology::ReplayedTopology::from_catalog(&topology)?;
         Ok(Some(manifest))
     }
 

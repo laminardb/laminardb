@@ -292,7 +292,7 @@ impl LaminarDB {
             if !controller.proof_is_live(&proof) {
                 return Err(TopologyError::Fenced.into());
             }
-            *self.replayed_topology_version.lock() = Some(TopologyVersion::LEGACY_BASELINE);
+            *self.replayed_topology.lock() = Some(super::ReplayedTopology::LEGACY_BASELINE);
             Ok(baseline)
         }).await.map_err(|_| TopologyError::Contended)?
     }

@@ -142,7 +142,7 @@ impl LaminarDB {
                 {
                     let self_id = laminar_core::state::NodeId(controller.instance_id().0);
                     graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
-                        topology: sender.topology_fence(),
+                        topology: self.shuffle_topology_fence(&sender),
                         registry,
                         sender,
                         receiver,
