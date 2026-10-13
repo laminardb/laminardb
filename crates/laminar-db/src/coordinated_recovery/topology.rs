@@ -81,18 +81,7 @@ impl TopologyDriver {
             .map_err(|error| TopologyError::Protocol(error.to_string()))?;
         // Finish this process's prior held boundary even if the leader has admitted the next
         // request after Release/abort. The latest journal entry alone is insufficient here.
-        let installed = db
-            .installed_topology_runtime
-            .lock()
-            .as_ref()
-            .filter(|binding| {
-                binding.released_sequence.is_none()
-                    && binding
-                        .recovery
-                        .as_ref()
-                        .is_none_or(|recovery| !recovery.released)
-            })
-            .map(|binding| binding.input.operation().operation_id);
+        let installed = Self::held_runtime_operation(db);
         let retained = installed
             .or_else(|| {
                 self.image
@@ -333,12 +322,33 @@ impl TopologyDriver {
                 // post-Release failure from the parent root or reuse another runtime's receipt.
                 db.apply_cluster_topology_release(operation).await?;
             }
+        } else if Self::held_runtime_operation(db) == Some(operation) {
+            // The target checkpoint settled this operation before the local runtime applied its
+            // Release, which is no longer admissible; reopen intake through ordinary recovery.
+            self.request_recovery(db, controller);
+            return Err(TopologyError::Fenced.into());
         }
         // A settled target may restart or reassign through ordinary recovery; no installed
         // topology runtime remains to audit.
         self.image = None;
         self.completed = Some((operation, status.status_sequence));
         Ok(())
+    }
+
+    /// Operation whose installed runtime still holds intake: never released, or recovered but
+    /// not yet released.
+    fn held_runtime_operation(db: &LaminarDB) -> Option<TopologyOperationId> {
+        db.installed_topology_runtime
+            .lock()
+            .as_ref()
+            .filter(|binding| {
+                binding.released_sequence.is_none()
+                    && binding
+                        .recovery
+                        .as_ref()
+                        .is_none_or(|recovery| !recovery.released)
+            })
+            .map(|binding| binding.input.operation().operation_id)
     }
 }
 

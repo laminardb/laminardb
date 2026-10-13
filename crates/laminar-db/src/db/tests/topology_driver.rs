@@ -358,6 +358,43 @@ async fn topology_driver_active_target_never_counts_as_stalled() {
 }
 
 #[tokio::test]
+async fn topology_driver_recovers_a_runtime_still_held_when_its_target_settles() {
+    let (fixture, committed, _probe) = activation::installed().await;
+    fixture
+        .authority
+        .controller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            fixture.process_lease.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .db
+        .release_installed_cluster_topology(committed.operation_id)
+        .await
+        .unwrap();
+    fixture.db.checkpoint().await.unwrap();
+    // A slow process can join the settling checkpoint before applying its own Release, which
+    // settlement then makes inadmissible.
+    fixture
+        .db
+        .installed_topology_runtime
+        .lock()
+        .as_mut()
+        .unwrap()
+        .released_sequence = None;
+    let mut driver = TopologyDriver::default();
+    assert!(driver
+        .poll(&fixture.db, &fixture.authority.controller)
+        .await
+        .is_err());
+    assert_ne!(fixture.db.pending_recovery_fault.load(Ordering::Acquire), 0);
+    fixture.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn topology_driver_active_release_never_reconstructs_a_missing_runtime_from_parent() {
     let (fixture, committed, probe) = activation::installed().await;
     fixture
