@@ -836,6 +836,7 @@ struct MockRuntimeState {
     leader: bool,
     recovering: bool,
     assignment_ready: bool,
+    periodic_checkpoints_held: bool,
 }
 
 #[cfg(feature = "cluster")]
@@ -995,6 +996,7 @@ impl MockCallback {
                 leader: true,
                 recovering: false,
                 assignment_ready: true,
+                periodic_checkpoints_held: false,
             },
             assignment_fault: None,
             assignment_fence: None,
@@ -1246,6 +1248,10 @@ impl PipelineCallback for MockCallback {
 
     fn is_recovering(&mut self) -> bool {
         self.runtime.recovering
+    }
+
+    fn periodic_checkpoints_held(&self) -> bool {
+        self.runtime.periodic_checkpoints_held
     }
 
     async fn checkpoint_assignment_for_admission(
@@ -3494,6 +3500,48 @@ async fn intake_reopen_restarts_periodic_cadence_without_delaying_manual_handoff
         .expect("manual HANDOFF must remain immediately eligible after intake reopens");
     assert!(handoff.manual);
     assert_ne!(handoff.flags & laminar_core::checkpoint::flags::HANDOFF, 0);
+}
+
+#[tokio::test]
+async fn topology_submission_hold_defers_only_periodic_admission() {
+    let interval = Duration::from_millis(250);
+    let mut coordinator = admission_coordinator(Vec::new());
+    coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(interval);
+    coordinator.last_checkpoint = Instant::now() - interval;
+    let mut callback = MockCallback::new();
+    callback.runtime.periodic_checkpoints_held = true;
+
+    assert!(coordinator
+        .checkpoint_admission(&mut callback)
+        .await
+        .is_none());
+    assert_eq!(
+        callback.checkpoint_assignment_calls, 0,
+        "a held periodic cut must not audit or reserve anything"
+    );
+    assert!(
+        coordinator.checkpoint_retry_not_before.is_none(),
+        "the hold must not back off the due cut"
+    );
+
+    callback.runtime.periodic_checkpoints_held = false;
+    let periodic = coordinator
+        .checkpoint_admission(&mut callback)
+        .await
+        .expect("the due periodic cut must resume as soon as the hold drops");
+    assert!(!periodic.manual);
+
+    let mut manual = admission_coordinator(Vec::new());
+    manual.config.checkpoint_schedule = CheckpointSchedule::Periodic(interval);
+    let (reply_tx, _reply_rx) = crossfire::oneshot::oneshot();
+    let (request, _reservation_wait) = unreserved_manual_request(reply_tx);
+    manual.manual_waiting.push(request);
+    callback.runtime.periodic_checkpoints_held = true;
+    let admission = manual
+        .checkpoint_admission(&mut callback)
+        .await
+        .expect("manual checkpoints must ignore the topology submission hold");
+    assert!(admission.manual);
 }
 
 #[tokio::test]

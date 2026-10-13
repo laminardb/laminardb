@@ -858,6 +858,10 @@ pub struct ClusterController {
     /// owns the pipeline fence. Without this lock, a recovering process could replace a stale cut
     /// while an in-flight normal publication concurrently reinstalls it.
     committed_watermark_publication: parking_lot::Mutex<()>,
+    /// Local topology submissions waiting for a gap between checkpoint artifact reservations.
+    /// Periodic checkpoint admission yields while any is pending.
+    #[cfg(feature = "cluster")]
+    topology_admission_waiters: std::sync::atomic::AtomicUsize,
     /// While draining, the node excludes itself from [`Self::assignable_instances`] so the
     /// next rotation sheds its vnodes before it exits.
     draining: Arc<AtomicBool>,
@@ -918,6 +922,8 @@ mod recovery_identity;
 mod recovery_protocol;
 #[cfg(feature = "cluster")]
 mod topology;
+#[cfg(feature = "cluster")]
+pub use topology::PeriodicCheckpointHold;
 mod wire;
 
 use wire::{

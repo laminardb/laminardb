@@ -1231,6 +1231,19 @@ fn process_lease_fence_withdraws_checkpoint_authority() {
     assert_eq!(controller.checkpoint_drain_transition(), None);
 }
 
+#[cfg(feature = "cluster")]
+#[test]
+fn periodic_checkpoint_hold_lasts_until_every_guard_drops() {
+    let controller = ctl(1, Vec::new());
+    assert!(!controller.periodic_checkpoints_held());
+    let first = controller.hold_periodic_checkpoints();
+    let second = controller.hold_periodic_checkpoints();
+    drop(first);
+    assert!(controller.periodic_checkpoints_held());
+    drop(second);
+    assert!(!controller.periodic_checkpoints_held());
+}
+
 #[test]
 fn checkpoint_drain_transition_compare_and_clear_preserves_a_nonmatch() {
     let controller = ctl(1, Vec::new());

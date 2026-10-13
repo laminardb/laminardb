@@ -21,7 +21,7 @@ pub use barrier::{
     InMemoryKv, Phase, QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 #[cfg(feature = "cluster")]
-pub use controller::CheckpointPrepareObservation;
+pub use controller::{CheckpointPrepareObservation, PeriodicCheckpointHold};
 pub use controller::{
     ClusterController, LocalProcessAuthorityEvidence, LocalProcessAuthorityEvidenceError,
     LocalProcessAuthorityIdentity, RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement,

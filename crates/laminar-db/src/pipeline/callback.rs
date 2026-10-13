@@ -622,6 +622,12 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// `true` while a local topology submission waits for a gap between checkpoint artifact
+    /// reservations; periodic admission yields and manual requests proceed. Default `false`.
+    fn periodic_checkpoints_held(&self) -> bool {
+        false
+    }
+
     /// `true` if a fatal cycle error should fault for recovery rather than drop-and-continue
     /// (exactly-once, or coordinated recovery). Default `false` (at-least-once drops).
     fn fault_on_cycle_error(&self) -> bool {
