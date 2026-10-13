@@ -4029,6 +4029,54 @@ async fn wait_until_drained_honors_an_allowance_beyond_thirty_seconds() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn wait_until_drained_never_certifies_an_unfinished_handoff() {
+    let me = NodeId(1);
+    let survivor = CheckpointParticipant {
+        node_id: 2,
+        boot_incarnation: uuid::Uuid::from_u128(2),
+    };
+    let committed = snapshot(BTreeMap::from([(0, me), (1, NodeId(2))]));
+    // The target already excludes this node, but its leader departed before the handoff cut.
+    let draining = draining_snapshot(
+        &committed,
+        BTreeMap::from([(0, NodeId(2)), (1, NodeId(2))]),
+        vec![survivor],
+    );
+    let store = Arc::new(store());
+    store.save_if_absent(&committed).await.unwrap();
+    assert!(matches!(
+        store
+            .save_if_version(&draining, committed.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let settle = {
+        let store = Arc::clone(&store);
+        let draining = draining.clone();
+        let aborted = draining.aborted_target(&committed).unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            store.finalize_drain(&draining, &aborted).await.unwrap()
+        })
+    };
+    let drained = wait_until_drained(
+        &store,
+        None,
+        me,
+        2,
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .await;
+    assert!(
+        !drained,
+        "neither the unfinished target nor the successor's abort releases this node's vnodes"
+    );
+    assert!(matches!(settle.await.unwrap(), RotateOutcome::Rotated));
+}
+
 #[tokio::test]
 async fn wait_until_drained_fails_closed_when_no_snapshot() {
     let s = store();
