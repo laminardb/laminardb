@@ -1,10 +1,11 @@
 //! FIX TagValue source built on the QuickFIX C++ session engine.
 //!
-//! One source owns one initiator session. Inbound application messages are journaled durably
-//! inside the engine callback before the engine may advance its inbound sequence number, then
-//! projected from the journal into Arrow rows with deterministic `(session, journal index, row)`
-//! positions. Restart replays the journal from the committed checkpoint cursor; the session
-//! resumes from the engine store and the counterparty retransmits anything not yet journaled.
+//! One source owns one initiator session. Inbound application messages are journaled inside the
+//! engine callback, and the session's store never persists an inbound sequence number past a
+//! record that is not yet durable; records are then projected from the journal into Arrow rows
+//! with deterministic `(session, journal index, row)` positions. Restart replays the journal from
+//! the committed checkpoint cursor; the session resumes from its store and the counterparty
+//! retransmits anything a crash lost.
 //!
 //! Supported: FIX.4.2/FIX.4.4 initiator over loopback TCP or verified TLS, at-least-once with
 //! checkpointing, embedded and single-node deployments. Not supported (rejected before I/O):
@@ -22,6 +23,7 @@ mod engine;
 mod journal;
 mod metrics;
 mod projection;
+mod session_store;
 mod source;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

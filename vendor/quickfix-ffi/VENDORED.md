@@ -35,8 +35,10 @@ upstream repository published no security advisories as of 2026-10-14.
 - `quickfix-bind/include/laminar_bridge.h` and `quickfix-bind/src/laminar_bridge.cpp` (new):
   length-aware field read/write and serialization, uniform field-map and group access,
   dictionary introspection, session state (store creation time and sequence numbers), sender
-  sequence setter for test counterparties, and `stop(force)` for initiators and acceptors. Every
-  function catches all C++ exceptions, including non-`std::exception` ones.
+  sequence setter for test counterparties, `stop(force)` for initiators and acceptors, and a
+  `MessageStoreFactory` whose stores persist every sequence-number change and reset through
+  caller callbacks before caching it (outbound messages are never stored). Every function
+  catches all C++ exceptions, including non-`std::exception` ones.
 - `quickfix-bind/CMakeLists.txt` compiles the bridge into `quickfixbind`.
 - `build.rs` compiles both libraries with `/EHsc` on MSVC. `cmake-rs` replaces CMake's default
   MSVC flags, so the published crate builds without unwind semantics (warning C4530): an engine
@@ -69,7 +71,13 @@ Verified against `libquickfix/src/C++/Session.cpp` and the qualification tests i
 - `generateReject` and `generateBusinessReject` advance the target sequence number before the
   outbound reject reaches `toAdmin`; dictionary validation runs before sequencing, so a message
   that arrives ahead of the expected number is rejected without consuming it.
-- `FileStore` uses `fflush` without `fsync`.
+- `FileStore` uses `fflush` without `fsync`; the LaminarDB source replaces it with its own store.
+- Every store call runs under the session-state mutex. An `IOException` from a store makes
+  `Session::next` disconnect and `Session::sendRaw` return without sending; with
+  `PersistMessages=N`, `nextResendRequest` answers with a gap fill without reading the store.
+- The engine resets its store (`SessionState::reset`) for an accepted Logon with
+  ResetSeqNumFlag=Y, `ResetOnLogon`/`ResetOnLogout`/`ResetOnDisconnect`, and when the store's
+  creation time falls outside the current schedule period.
 - The SSL initiator sets SNI but performs no hostname verification and skips peer verification
   when no CA is configured; the LaminarDB source does not use it.
 - The single-threaded `SocketInitiator` never reconnects after a session-initiated disconnect

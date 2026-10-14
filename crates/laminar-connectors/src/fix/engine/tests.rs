@@ -34,10 +34,9 @@ pub(crate) fn acceptor_key(name: &str) -> SessionKey {
     }
 }
 
-fn common(store: &std::path::Path) -> Vec<(&'static str, String)> {
+fn common() -> Vec<(&'static str, String)> {
     // Client-side engine defaults; the venue is configured by `FixTestVenue`.
     vec![
-        ("FileStorePath", store.display().to_string()),
         ("UseDataDictionary", "Y".into()),
         ("DataDictionary", DICTIONARY.into()),
         ("StartTime", "00:00:00".into()),
@@ -122,6 +121,70 @@ pub(crate) fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     while !condition() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Client session store in memory, recording every persisted change.
+struct MemoryStore {
+    values: Mutex<StoreValues>,
+    /// Fails the target update to this value once.
+    fail_target: Mutex<Option<u64>>,
+    targets: Mutex<Vec<u64>>,
+    senders: Mutex<Vec<u64>>,
+    resets: Mutex<Vec<(i64, i64)>>,
+}
+
+impl MemoryStore {
+    fn new(fail_target: Option<u64>) -> Arc<Self> {
+        Arc::new(Self {
+            values: Mutex::new(StoreValues {
+                creation_unix_micros: 1_000_000,
+                next_sender: 1,
+                next_target: 1,
+            }),
+            fail_target: Mutex::new(fail_target),
+            targets: Mutex::new(Vec::new()),
+            senders: Mutex::new(Vec::new()),
+            resets: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl StoreBackend for MemoryStore {
+    fn values(&self) -> StoreValues {
+        *self.values.lock()
+    }
+
+    fn set_next_sender(&self, next: u64) -> Result<(), ConnectorError> {
+        self.senders.lock().push(next);
+        self.values.lock().next_sender = next;
+        Ok(())
+    }
+
+    fn set_next_target(&self, next: u64) -> Result<(), ConnectorError> {
+        if self
+            .fail_target
+            .lock()
+            .take_if(|fail| *fail == next)
+            .is_some()
+        {
+            return Err(ConnectorError::WriteError("injected store failure".into()));
+        }
+        self.targets.lock().push(next);
+        self.values.lock().next_target = next;
+        Ok(())
+    }
+
+    fn reset(&self, now_unix_micros: i64) -> Result<i64, ConnectorError> {
+        let mut values = self.values.lock();
+        let creation = now_unix_micros.max(values.creation_unix_micros + 1);
+        self.resets.lock().push((now_unix_micros, creation));
+        *values = StoreValues {
+            creation_unix_micros: creation,
+            next_sender: 1,
+            next_target: 1,
+        };
+        Ok(creation)
     }
 }
 
@@ -226,8 +289,8 @@ struct Client {
 }
 
 impl Client {
-    fn start(dir: &std::path::Path, port: u16, callbacks: Arc<ClientCallbacks>) -> Self {
-        let mut defaults = common(&dir.join("client-store"));
+    fn start(port: u16, callbacks: Arc<ClientCallbacks>, store: Arc<MemoryStore>) -> Self {
+        let mut defaults = common();
         defaults.push(("ConnectionType", "initiator".into()));
         defaults.push(("SocketConnectHost", "127.0.0.1".into()));
         defaults.push(("SocketConnectPort", port.to_string()));
@@ -235,7 +298,8 @@ impl Client {
         defaults.push(("PersistMessages", "N".into()));
         let settings = Settings::single_session(&defaults, &callbacks.key, &[]).expect("settings");
         let application = Application::new(callbacks).expect("application");
-        let initiator = Initiator::new(settings, application).expect("initiator");
+        let store = StoreFactory::owned(store).expect("store");
+        let initiator = Initiator::new(settings, application, store).expect("initiator");
         initiator.start().expect("start");
         Self { initiator }
     }
@@ -254,6 +318,70 @@ fn accepted_sequence(deliveries: &[Delivery]) -> Vec<u64> {
         .collect()
 }
 
+/// The engine persists every sequence change through the owned store before using it. A failed
+/// target update disconnects without advancing the cached target, so the counterparty resends
+/// the message; outbound numbers are persisted one by one before each send.
+#[test]
+fn store_changes_precede_use_and_a_failed_update_does_not_advance_the_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let venue = Venue::start(dir.path(), "store");
+    let callbacks = ClientCallbacks::new("store", Fault::None);
+    // Venue seq 1 is Logon; application messages are 2, 3, 4. Accepting 3 tries target 4.
+    let store = MemoryStore::new(Some(4));
+    let client = Client::start(venue.port(), callbacks.clone(), store.clone());
+    venue.wait_logged_on();
+    for exec in ["E1", "E2", "E3"] {
+        venue.send_execution_report(Some(exec), 1);
+    }
+    wait_until("all messages accepted", || {
+        accepted_sequence(&callbacks.deliveries.lock()).contains(&4)
+    });
+    client.stop();
+
+    let deliveries = callbacks.deliveries.lock().clone();
+    let seq3: Vec<bool> = deliveries
+        .iter()
+        .filter(|delivery| delivery.seq == 3)
+        .map(|delivery| delivery.poss_dup)
+        .collect();
+    assert_eq!(
+        seq3,
+        vec![false, true],
+        "redelivered after the failed update"
+    );
+    let targets = store.targets.lock().clone();
+    assert!(
+        targets.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{targets:?}"
+    );
+    assert_eq!(targets.iter().filter(|target| **target == 4).count(), 1);
+    let senders = store.senders.lock().clone();
+    assert!(!senders.is_empty());
+    assert!(
+        senders.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "{senders:?}"
+    );
+}
+
+/// An engine reset goes through the owned store, and the engine adopts the creation time the
+/// store reports.
+#[test]
+fn engine_reset_persists_through_the_store_and_adopts_its_creation_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let venue = Venue::start(dir.path(), "store_reset");
+    let callbacks = ClientCallbacks::new("store_reset", Fault::None);
+    let store = MemoryStore::new(None);
+    let client = Client::start(venue.port(), callbacks.clone(), store.clone());
+    venue.wait_logged_on();
+    reset_session(&callbacks.key).expect("reset");
+    wait_until("reset persisted", || !store.resets.lock().is_empty());
+    let (now, created) = store.resets.lock()[0];
+    assert!(created >= now);
+    let engine = session_state(&callbacks.key).expect("state");
+    assert_eq!(engine.creation_unix_seconds, created / 1_000_000);
+    client.stop();
+}
+
 /// The inbound target sequence advances only after `from_app` returns `Accept`; `Disconnect`
 /// leaves it unchanged and the counterparty retransmits the same sequence number with
 /// PossDupFlag=Y after the engine reconnects.
@@ -263,7 +391,7 @@ fn disconnect_outcome_does_not_advance_target_and_message_is_retransmitted() {
     let test_thread = std::thread::current().id();
     let venue = Venue::start(dir.path(), "disconnect");
     let callbacks = ClientCallbacks::new("disconnect", Fault::DisconnectOnce(3));
-    let client = Client::start(dir.path(), venue.port(), callbacks.clone());
+    let client = Client::start(venue.port(), callbacks.clone(), MemoryStore::new(None));
     venue.wait_logged_on();
     for exec in ["E1", "E2", "E3"] {
         venue.send_execution_report(Some(exec), 1);
@@ -307,7 +435,7 @@ fn panic_in_callback_is_contained_and_not_reported_as_success() {
     let dir = tempfile::tempdir().expect("tempdir");
     let venue = Venue::start(dir.path(), "panic");
     let callbacks = ClientCallbacks::new("panic", Fault::PanicOnce(2));
-    let client = Client::start(dir.path(), venue.port(), callbacks.clone());
+    let client = Client::start(venue.port(), callbacks.clone(), MemoryStore::new(None));
     venue.wait_logged_on();
     venue.send_execution_report(Some("E1"), 0);
     venue.send_execution_report(Some("E2"), 0);
@@ -326,7 +454,7 @@ fn validation_reject_advances_target_without_application_callback() {
     let dir = tempfile::tempdir().expect("tempdir");
     let venue = Venue::start(dir.path(), "reject");
     let callbacks = ClientCallbacks::new("reject", Fault::None);
-    let client = Client::start(dir.path(), venue.port(), callbacks.clone());
+    let client = Client::start(venue.port(), callbacks.clone(), MemoryStore::new(None));
     venue.wait_logged_on();
     venue.send_execution_report(None, 0);
     venue.send_execution_report(Some("E2"), 0);

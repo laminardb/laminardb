@@ -1,17 +1,28 @@
 //! Node-local durable journal of accepted inbound FIX records.
 //!
 //! The journal is the only path from the session to the projection. Session callbacks append
-//! records and return to the engine only after the record reached the configured durability
-//! boundary, so the engine's inbound sequence number can never be ahead of the journal.
-//! `poll_batch` reads records only up to that boundary, so a LaminarDB checkpoint never names a
-//! journal position that a crash inside the declared failure model can lose. Segments wholly
-//! before the latest committed source cursor are deleted.
+//! records before they return to the engine. Under `SyncPolicy::Fsync` appends are group
+//! committed: an append only buffers its frame, and the sync path writes everything buffered so
+//! far and makes it durable with one `fdatasync`, so the engine thread never waits on storage (a
+//! flush also blocks concurrent writes to the same file on Windows). While a record is not yet
+//! durable the journal holds the session store's persisted inbound sequence number at or below
+//! the record's sequence number (`DurabilityFloor`), so a crash inside the failure model makes
+//! the counterparty retransmit every record it lost. Records that start or reset a sequence
+//! series are synced before the append returns.
+//!
+//! Readers see records only up to the durable end, so a LaminarDB checkpoint never names a
+//! journal position that a crash inside the failure model can lose. Segments wholly before the
+//! latest committed source cursor are deleted.
 //!
 //! Any failed write or sync poisons the writer: the callback disconnects without advancing the
-//! session, no later record is appended, and the next start reconciles the file by truncating a
-//! torn tail. A failed `fsync` is never retried because its outcome is ambiguous.
+//! session, no later record is appended or synced, and the next start reconciles the file by
+//! truncating a torn tail. A failed `fsync` is never retried because its outcome is ambiguous.
+//!
+//! Lock order: `sync_serial`, then `state`, then the floor's own lock. The floor is called only
+//! under `state` so that floor changes apply in the order the journal decided them.
 
 mod record;
+mod recovery;
 mod segment;
 
 pub(crate) use record::{ApplicationRecord, Record, SessionSnapshot};
@@ -21,28 +32,61 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
 
-use laminar_core::durable_fs::{durable_rename, ensure_durable_directory, DurableRenameMode};
-use parking_lot::Mutex;
+use laminar_core::durable_fs::ensure_durable_directory;
+use parking_lot::{Condvar, Mutex};
 use tokio::sync::Notify;
 
 use crate::error::ConnectorError;
 use record::corrupt;
+use recovery::{load_or_create_meta, parse_journal_id, recover};
 use segment::{FrameRead, FrameReader, FRAME_OVERHEAD, HEADER_LEN};
 
 const META_FILE: &str = "journal.json";
 const META_FORMAT: u32 = 1;
 const LOCK_FILE: &str = ".laminardb-fix.lock";
+/// Unsynced bytes above which an append syncs inline, bounding how far durability and reader
+/// visibility can trail the session when storage stalls.
+const MAX_UNSYNCED_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Durability boundary a record reaches before the session acknowledges it to the engine.
+/// Failure model of the journal and the session store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncPolicy {
-    /// `fdatasync` per record: survives process, operating-system, and power failure of the
-    /// host, given storage that honours flushes.
+    /// Group-committed `fdatasync`: survives process, operating-system, and power failure of
+    /// the host, given storage that honours flushes.
     Fsync,
     /// Written to the operating system: survives process failure only.
     OperatingSystem,
+}
+
+/// Receives the lowest inbound sequence number whose journal record is written but not yet
+/// durable; `None` when every record is durable. The session store never persists an inbound
+/// sequence number above it.
+pub(crate) trait DurabilityFloor: Send + Sync {
+    fn set(&self, floor: Option<u64>);
+}
+
+/// How an appended record constrains the session store until it is durable.
+enum Durability {
+    /// Neither the engine's sequence progress nor the series depends on it.
+    Plain,
+    /// The engine may advance past this inbound sequence number once the append returns.
+    Hold(u64),
+    /// Starts or resets a sequence series: durable before the append returns.
+    Barrier,
+}
+
+impl Durability {
+    fn of(record: &Record) -> Self {
+        match record {
+            Record::Application(application) => Self::Hold(application.seq),
+            Record::GapFill { from_seq, .. } => Self::Hold(*from_seq),
+            Record::SeriesStarted { .. } | Record::SequenceReset { .. } => Self::Barrier,
+            Record::SessionSnapshot(_) | Record::Rejected { .. } => Self::Plain,
+        }
+    }
 }
 
 /// Journal sizing and durability options.
@@ -87,11 +131,47 @@ pub(crate) struct DurableEnd {
 struct Writer {
     file: File,
     segment_first: RecordIndex,
+    /// Length of the current segment including `pending`.
     segment_bytes: u64,
     next_index: RecordIndex,
     poisoned: Option<String>,
     payload: Vec<u8>,
     frame: Vec<u8>,
+    /// Frames buffered under `SyncPolicy::Fsync` that the sync path has not written yet.
+    pending: Vec<u8>,
+}
+
+impl Writer {
+    fn new(
+        file: File,
+        segment_first: RecordIndex,
+        segment_bytes: u64,
+        next_index: RecordIndex,
+        payload: Vec<u8>,
+        frame: Vec<u8>,
+    ) -> Self {
+        Self {
+            file,
+            segment_first,
+            segment_bytes,
+            next_index,
+            poisoned: None,
+            payload,
+            frame,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Write the buffered frames to the end of the current segment.
+    fn write_pending(&mut self) -> Result<(), ConnectorError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let written = self.segment_bytes - self.pending.len() as u64;
+        write_at_end(&mut self.file, written, &self.pending)?;
+        self.pending.clear();
+        Ok(())
+    }
 }
 
 struct State {
@@ -102,6 +182,51 @@ struct State {
     /// `(seq, content_digest)` of current-series application records awaiting possible
     /// retransmission after a restart; consumed by `take_redelivery_window`.
     redelivery: Vec<(u64, u64)>,
+    /// Records before this index are durable.
+    synced: RecordIndex,
+    unsynced_bytes: u64,
+    /// Lowest held sequence number among records the running sync covers.
+    hold_syncing: Option<u64>,
+    /// Lowest held sequence number among records no sync covers yet.
+    hold_unsynced: Option<u64>,
+    stopping: bool,
+}
+
+impl State {
+    /// State of a reopened journal: everything recovered is durable.
+    fn new(
+        writer: Writer,
+        progress: SessionSnapshot,
+        segments: VecDeque<SegmentInfo>,
+        redelivery: Vec<(u64, u64)>,
+    ) -> Self {
+        let synced = writer.next_index;
+        let retained_bytes = segments.iter().map(|segment| segment.bytes).sum();
+        Self {
+            writer,
+            progress,
+            segments,
+            retained_bytes,
+            redelivery,
+            synced,
+            unsynced_bytes: 0,
+            hold_syncing: None,
+            hold_unsynced: None,
+            stopping: false,
+        }
+    }
+
+    fn floor(&self) -> Option<u64> {
+        self.hold_syncing.or(self.hold_unsynced)
+    }
+
+    fn writer_end(&self) -> DurableEnd {
+        DurableEnd {
+            next_index: self.writer.next_index,
+            segment_first: self.writer.segment_first,
+            segment_bytes: self.writer.segment_bytes,
+        }
+    }
 }
 
 /// An open journal. Holds an exclusive OS lock on its directory while alive.
@@ -114,7 +239,30 @@ pub(crate) struct Journal {
     end: Mutex<DurableEnd>,
     over_capacity: AtomicBool,
     data_ready: Arc<Notify>,
+    /// Serializes syncs so that each completion covers a prefix of the next one.
+    sync_serial: Mutex<()>,
+    sync_wanted: Condvar,
+    floor: OnceLock<Arc<dyn DurabilityFloor>>,
     _lock: File,
+}
+
+/// The group-commit thread of a journal under `SyncPolicy::Fsync`. Dropping it syncs what was
+/// appended and joins the thread.
+pub(crate) struct GroupCommit {
+    journal: Arc<Journal>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for GroupCommit {
+    fn drop(&mut self) {
+        self.journal.state.lock().stopping = true;
+        self.journal.sync_wanted.notify_all();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!("FIX journal sync thread panicked");
+            }
+        }
+    }
 }
 
 impl Journal {
@@ -148,11 +296,16 @@ impl Journal {
         let segments_dir = root.join("segments");
         ensure_durable_directory(&segments_dir)?;
         let recovered = recover(&segments_dir, &journal_id, options)?;
-        let end = DurableEnd {
-            next_index: recovered.writer.next_index,
-            segment_first: recovered.writer.segment_first,
-            segment_bytes: recovered.writer.segment_bytes,
-        };
+        if options.sync == SyncPolicy::Fsync {
+            // Recovered bytes may be writes of a crashed process that never reached storage.
+            for segment in &recovered.segments {
+                OpenOptions::new()
+                    .write(true)
+                    .open(segment::segment_path(&segments_dir, segment.first_index))?
+                    .sync_data()?;
+            }
+        }
+        let end = recovered.writer_end();
         let journal = Self {
             segments_dir,
             id: journal_id,
@@ -162,6 +315,9 @@ impl Journal {
             state: Mutex::new(recovered),
             end: Mutex::new(end),
             data_ready,
+            sync_serial: Mutex::new(()),
+            sync_wanted: Condvar::new(),
+            floor: OnceLock::new(),
             _lock: lock,
         };
         journal.refresh_capacity(&journal.state.lock());
@@ -170,6 +326,56 @@ impl Journal {
 
     pub(crate) fn meta(&self) -> &JournalMeta {
         &self.meta
+    }
+
+    /// Bind the session store that must not persist inbound progress past durable records.
+    /// Called once, before the session starts.
+    pub(crate) fn attach_floor(
+        &self,
+        floor: Arc<dyn DurabilityFloor>,
+    ) -> Result<(), ConnectorError> {
+        self.floor.set(floor).map_err(|_| {
+            ConnectorError::Internal("FIX journal durability floor is already attached".into())
+        })
+    }
+
+    /// Start the group-commit thread; `None` under `SyncPolicy::OperatingSystem`.
+    pub(crate) fn start_group_commit(
+        self: &Arc<Self>,
+    ) -> Result<Option<GroupCommit>, ConnectorError> {
+        if self.options.sync != SyncPolicy::Fsync {
+            return Ok(None);
+        }
+        let journal = self.clone();
+        let thread = std::thread::Builder::new()
+            .name("laminardb-fix-journal-sync".into())
+            .spawn(move || journal.run_group_commit())?;
+        Ok(Some(GroupCommit {
+            journal: self.clone(),
+            thread: Some(thread),
+        }))
+    }
+
+    fn run_group_commit(&self) {
+        loop {
+            {
+                let mut state = self.state.lock();
+                while state.synced == state.writer.next_index
+                    && !state.stopping
+                    && state.writer.poisoned.is_none()
+                {
+                    self.sync_wanted.wait(&mut state);
+                }
+                let drained = state.synced == state.writer.next_index;
+                if state.writer.poisoned.is_some() || (state.stopping && drained) {
+                    return;
+                }
+            }
+            if let Err(error) = self.sync() {
+                tracing::error!(error = %error, "FIX journal sync failed; capture stops");
+                return;
+            }
+        }
     }
 
     pub(crate) fn sync_policy(&self) -> SyncPolicy {
@@ -216,24 +422,111 @@ impl Journal {
         window
     }
 
-    /// Durably append one record and publish it to readers.
+    /// Append one record. Under `SyncPolicy::OperatingSystem` it is durable and readable on
+    /// return; under `SyncPolicy::Fsync` it becomes readable when a sync covers it, and until
+    /// then holds the durability floor at its sequence number.
     ///
     /// # Errors
     /// Returns the poisoning cause; after the first failure every append fails.
     pub(crate) fn append(&self, record: &Record) -> Result<RecordIndex, ConnectorError> {
+        let durability = Durability::of(record);
         let mut state = self.state.lock();
         let index = self.append_locked(&mut state, record)?;
         apply_progress(&mut state.progress, record);
-        let end = DurableEnd {
-            next_index: state.writer.next_index,
-            segment_first: state.writer.segment_first,
-            segment_bytes: state.writer.segment_bytes,
-        };
         self.refresh_capacity(&state);
+        if self.options.sync == SyncPolicy::OperatingSystem {
+            state.synced = state.writer.next_index;
+            state.unsynced_bytes = 0;
+            let end = state.writer_end();
+            drop(state);
+            self.publish(end);
+            return Ok(index);
+        }
+        if let (Durability::Hold(seq), None) = (&durability, state.hold_unsynced) {
+            let before = state.floor();
+            state.hold_unsynced = Some(*seq);
+            if before.is_none() {
+                self.set_floor(state.floor());
+            }
+        }
+        let sync_now =
+            matches!(durability, Durability::Barrier) || state.unsynced_bytes > MAX_UNSYNCED_BYTES;
         drop(state);
+        if sync_now {
+            self.sync()?;
+        } else {
+            self.sync_wanted.notify_one();
+        }
+        Ok(index)
+    }
+
+    /// Make every appended record durable and readable.
+    ///
+    /// # Errors
+    /// Fails when the writer is poisoned; a failed sync poisons it.
+    pub(crate) fn sync(&self) -> Result<(), ConnectorError> {
+        let _serial = self.sync_serial.lock();
+        let (file, end, bytes) = {
+            let mut state = self.state.lock();
+            if let Some(cause) = &state.writer.poisoned {
+                return Err(ConnectorError::WriteError(format!(
+                    "FIX journal stopped after an earlier failure: {cause}"
+                )));
+            }
+            if state.synced == state.writer.next_index {
+                return Ok(());
+            }
+            if let Err(error) = state.writer.write_pending() {
+                return Err(self.poison_sync(state, &error));
+            }
+            let file = match state.writer.file.try_clone() {
+                Ok(file) => file,
+                Err(error) => return Err(self.poison_sync(state, &error)),
+            };
+            state.hold_syncing = state.hold_unsynced.take();
+            (file, state.writer_end(), state.unsynced_bytes)
+        };
+        let result = sync_file(&file);
+        let mut state = self.state.lock();
+        if let Err(error) = result {
+            return Err(self.poison_sync(state, &error));
+        }
+        state.synced = end.next_index;
+        state.unsynced_bytes = state.unsynced_bytes.saturating_sub(bytes);
+        let before = state.floor();
+        state.hold_syncing = None;
+        if state.floor() != before {
+            self.set_floor(state.floor());
+        }
+        drop(state);
+        self.publish(end);
+        Ok(())
+    }
+
+    fn poison_sync(
+        &self,
+        mut state: parking_lot::MutexGuard<'_, State>,
+        error: &dyn std::fmt::Display,
+    ) -> ConnectorError {
+        let cause = error.to_string();
+        state.writer.poisoned = Some(cause.clone());
+        drop(state);
+        self.sync_wanted.notify_all();
+        ConnectorError::outcome_unknown(
+            format!("FIX journal sync failed; the session stops: {cause}"),
+            false,
+        )
+    }
+
+    fn set_floor(&self, floor: Option<u64>) {
+        if let Some(sink) = self.floor.get() {
+            sink.set(floor);
+        }
+    }
+
+    fn publish(&self, end: DurableEnd) {
         *self.end.lock() = end;
         self.data_ready.notify_one();
-        Ok(index)
     }
 
     fn append_locked(
@@ -263,7 +556,7 @@ impl Journal {
         } else {
             Ok(())
         }
-        .and_then(|()| write_frame(&mut state.writer, &payload, self.options.sync));
+        .and_then(|()| self.write_frame(&mut state.writer, &payload));
         state.writer.payload = payload;
         if let Err(error) = result {
             let cause = error.to_string();
@@ -279,11 +572,18 @@ impl Journal {
             last.bytes = state.writer.segment_bytes;
         }
         state.retained_bytes += frame_bytes;
+        state.unsynced_bytes += frame_bytes;
         Ok(index)
     }
 
-    /// Start a new segment whose first record snapshots the current session progress.
+    /// Start a new segment whose first record snapshots the current session progress. The
+    /// outgoing segment is synced first, so a durable end in the new segment implies every
+    /// earlier record is durable.
     fn rotate(&self, state: &mut State) -> Result<(), ConnectorError> {
+        if self.options.sync == SyncPolicy::Fsync {
+            state.writer.write_pending()?;
+            sync_file(&state.writer.file)?;
+        }
         let first_index = state.writer.next_index;
         let snapshot = Record::SessionSnapshot(state.progress);
         snapshot.encode_into(&mut state.writer.payload)?;
@@ -327,6 +627,18 @@ impl Journal {
             state.retained_bytes = state.retained_bytes.saturating_sub(oldest.bytes);
         }
         self.refresh_capacity(&state);
+        Ok(())
+    }
+
+    fn write_frame(&self, writer: &mut Writer, payload: &[u8]) -> Result<(), ConnectorError> {
+        segment::encode_frame(payload, &mut writer.frame)?;
+        match self.options.sync {
+            SyncPolicy::Fsync => writer.pending.extend_from_slice(&writer.frame),
+            SyncPolicy::OperatingSystem => {
+                write_at_end(&mut writer.file, writer.segment_bytes, &writer.frame)?;
+            }
+        }
+        writer.segment_bytes += writer.frame.len() as u64;
         Ok(())
     }
 
@@ -461,36 +773,33 @@ impl JournalReader {
     }
 }
 
-fn write_frame(
-    writer: &mut Writer,
-    payload: &[u8],
-    sync: SyncPolicy,
-) -> Result<(), ConnectorError> {
-    segment::encode_frame(payload, &mut writer.frame)?;
+/// Write `bytes` at the end of a segment of `written` bytes.
+fn write_at_end(file: &mut File, written: u64, bytes: &[u8]) -> Result<(), ConnectorError> {
     #[cfg(test)]
     let write = if tests::take_injected_write_failure() {
-        let half = writer.frame.len() / 2;
-        writer
-            .file
-            .write_all(&writer.frame[..half])
+        file.write_all(&bytes[..bytes.len() / 2])
             .and_then(|()| Err(std::io::Error::other("injected short write")))
     } else {
-        writer.file.write_all(&writer.frame)
+        file.write_all(bytes)
     };
     #[cfg(not(test))]
-    let write = writer.file.write_all(&writer.frame);
+    let write = file.write_all(bytes);
     if let Err(error) = write {
         // Remove a partial frame so the segment stays valid for recovery; the writer is
         // poisoned either way.
-        let _ = writer.file.set_len(writer.segment_bytes);
-        let _ = writer.file.seek(SeekFrom::Start(writer.segment_bytes));
+        let _ = file.set_len(written);
+        let _ = file.seek(SeekFrom::Start(written));
         return Err(error.into());
     }
-    if sync == SyncPolicy::Fsync {
-        writer.file.sync_data()?;
-    }
-    writer.segment_bytes += writer.frame.len() as u64;
     Ok(())
+}
+
+fn sync_file(file: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::take_injected_sync_failure() {
+        return Err(std::io::Error::other("injected sync failure"));
+    }
+    file.sync_data()
 }
 
 fn apply_progress(progress: &mut SessionSnapshot, record: &Record) {
@@ -498,11 +807,11 @@ fn apply_progress(progress: &mut SessionSnapshot, record: &Record) {
         Record::SessionSnapshot(snapshot) => *progress = *snapshot,
         Record::SeriesStarted {
             series,
-            store_created_unix_seconds,
+            store_created_unix_micros,
         } => {
             *progress = SessionSnapshot {
                 series: *series,
-                store_created_unix_seconds: *store_created_unix_seconds,
+                store_created_unix_micros: *store_created_unix_micros,
                 high_water: 0,
             };
         }
@@ -513,184 +822,6 @@ fn apply_progress(progress: &mut SessionSnapshot, record: &Record) {
         // The engine also rejects messages that arrived ahead of the expected sequence number
         // without consuming it, so a reject is evidence only, never sequence progress.
         Record::Rejected { .. } => {}
-    }
-}
-
-fn load_or_create_meta(
-    root: &Path,
-    session: &str,
-    capture_contract: &str,
-) -> Result<JournalMeta, ConnectorError> {
-    let path = root.join(META_FILE);
-    if path.exists() {
-        let bytes = std::fs::read(&path)?;
-        let meta: JournalMeta = serde_json::from_slice(&bytes)
-            .map_err(|error| corrupt(&format!("journal metadata: {error}")))?;
-        if meta.format != META_FORMAT {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "FIX journal format {} is not supported by this build",
-                meta.format
-            )));
-        }
-        if meta.session != session || meta.capture_contract != capture_contract {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "FIX journal '{}' belongs to session '{}' with a different capture contract; \
-                 an incompatible profile change needs a new journal path (DROP and CREATE the \
-                 source)",
-                root.display(),
-                meta.session
-            )));
-        }
-        return Ok(meta);
-    }
-    let meta = JournalMeta {
-        format: META_FORMAT,
-        journal_id: uuid::Uuid::new_v4().simple().to_string(),
-        session: session.to_string(),
-        capture_contract: capture_contract.to_string(),
-    };
-    let bytes = serde_json::to_vec_pretty(&meta)
-        .map_err(|error| ConnectorError::Internal(error.to_string()))?;
-    let temp = root.join(format!("{META_FILE}.tmp"));
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    durable_rename(&temp, &path, DurableRenameMode::NoReplace)?;
-    Ok(meta)
-}
-
-fn parse_journal_id(text: &str) -> Result<[u8; 16], ConnectorError> {
-    uuid::Uuid::parse_str(text)
-        .map(|id| *id.as_bytes())
-        .map_err(|_| corrupt("journal id is not a UUID"))
-}
-
-/// Rebuild writer state, progress, and the redelivery window; truncate a torn tail.
-fn recover(
-    dir: &Path,
-    journal_id: &[u8; 16],
-    options: JournalOptions,
-) -> Result<State, ConnectorError> {
-    let indices = segment::list_segments(dir)?;
-    if indices.is_empty() {
-        let mut payload = Vec::new();
-        let mut frame = Vec::new();
-        Record::SessionSnapshot(SessionSnapshot::default()).encode_into(&mut payload)?;
-        segment::encode_frame(&payload, &mut frame)?;
-        let file = segment::create_segment(dir, 0, journal_id, &frame)?;
-        let bytes = HEADER_LEN + frame.len() as u64;
-        return Ok(State {
-            writer: Writer {
-                file,
-                segment_first: 0,
-                segment_bytes: bytes,
-                next_index: 1,
-                poisoned: None,
-                payload,
-                frame,
-            },
-            progress: SessionSnapshot::default(),
-            segments: VecDeque::from([SegmentInfo {
-                first_index: 0,
-                bytes,
-            }]),
-            retained_bytes: bytes,
-            redelivery: Vec::new(),
-        });
-    }
-
-    let mut progress = SessionSnapshot::default();
-    let mut redelivery = Vec::new();
-    let mut segments = VecDeque::new();
-    let mut payload = Vec::new();
-    let mut next_index = indices[0];
-    for (position, first_index) in indices.iter().copied().enumerate() {
-        if first_index != next_index {
-            return Err(corrupt(&format!(
-                "segment {first_index} does not continue at record {next_index}"
-            )));
-        }
-        let last = position + 1 == indices.len();
-        let path = segment::segment_path(dir, first_index);
-        let mut file = File::open(&path)?;
-        segment::check_header(&mut file, first_index, journal_id)?;
-        let length = file.metadata()?.len();
-        let mut frames = FrameReader::new(file, HEADER_LEN, options.max_record_bytes)?;
-        loop {
-            match frames.next(length, &mut payload)? {
-                FrameRead::Frame => {
-                    let record = Record::decode(&payload)?;
-                    track_redelivery(&mut redelivery, &progress, &record);
-                    apply_progress(&mut progress, &record);
-                    next_index += 1;
-                }
-                FrameRead::End => break,
-                FrameRead::Torn if last => {
-                    let valid = frames.offset();
-                    tracing::warn!(
-                        segment = first_index,
-                        valid_bytes = valid,
-                        torn_bytes = length - valid,
-                        "truncating torn FIX journal tail left by an interrupted append"
-                    );
-                    let file = OpenOptions::new().write(true).open(&path)?;
-                    file.set_len(valid)?;
-                    file.sync_all()?;
-                    break;
-                }
-                FrameRead::Torn | FrameRead::Corrupt => {
-                    return Err(corrupt(&format!(
-                        "segment {first_index} is damaged at byte {}",
-                        frames.offset()
-                    )));
-                }
-            }
-        }
-        segments.push_back(SegmentInfo {
-            first_index,
-            bytes: frames.offset(),
-        });
-    }
-    let active = segments
-        .back()
-        .copied()
-        .ok_or_else(|| corrupt("journal has no segments"))?;
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(segment::segment_path(dir, active.first_index))?;
-    file.seek(SeekFrom::End(0))?;
-    let retained_bytes = segments.iter().map(|segment| segment.bytes).sum();
-    Ok(State {
-        writer: Writer {
-            file,
-            segment_first: active.first_index,
-            segment_bytes: active.bytes,
-            next_index,
-            poisoned: None,
-            payload,
-            frame: Vec::new(),
-        },
-        progress,
-        segments,
-        retained_bytes,
-        redelivery,
-    })
-}
-
-fn track_redelivery(window: &mut Vec<(u64, u64)>, progress: &SessionSnapshot, record: &Record) {
-    match record {
-        Record::SeriesStarted { .. } => window.clear(),
-        Record::Application(record) if record.series == progress.series => {
-            window.push((record.seq, record.content_digest));
-        }
-        _ => {}
     }
 }
 

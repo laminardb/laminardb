@@ -7,6 +7,7 @@
 
 mod application;
 mod socket;
+mod store;
 
 #[cfg(test)]
 mod tests;
@@ -15,6 +16,7 @@ pub(crate) use application::{Application, CallbackOutcome, OutboundMessage, Sess
 #[cfg(any(test, feature = "testing"))]
 pub(crate) use socket::Acceptor;
 pub(crate) use socket::Initiator;
+pub(crate) use store::{StoreBackend, StoreFactory, StoreValues};
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::marker::PhantomData;
@@ -697,6 +699,7 @@ impl<'a> FieldMapRef<'a> {
 }
 
 /// Persisted engine-store identity and in-memory sequence state of a live session.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionState {
     /// Store creation time in whole seconds; it changes exactly when the store is reset.
@@ -707,11 +710,13 @@ pub(crate) struct SessionState {
 
 /// Read the state of a registered session. Valid from any thread while the engine object that
 /// owns the session is alive.
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn session_state(session: &SessionKey) -> Result<SessionState, EngineError> {
     let id = session.to_engine()?;
     session_state_raw(id.0)
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn session_state_raw(id: ffi::FixSessionID_t) -> Result<SessionState, EngineError> {
     let mut state = SessionState {
         creation_unix_seconds: 0,

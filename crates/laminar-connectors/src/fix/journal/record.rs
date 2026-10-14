@@ -21,8 +21,8 @@ const FLAG_POSS_RESEND: u8 = 2;
 pub(crate) struct SessionSnapshot {
     /// Current sequence series ordinal; 0 before the first logon.
     pub(crate) series: u32,
-    /// Engine store creation time (whole seconds) that identifies `series`.
-    pub(crate) store_created_unix_seconds: i64,
+    /// Engine store creation time that identifies `series`.
+    pub(crate) store_created_unix_micros: i64,
     /// Highest inbound sequence number journaled in `series`; 0 when none.
     pub(crate) high_water: u64,
 }
@@ -49,10 +49,10 @@ pub(crate) struct ApplicationRecord {
 pub(crate) enum Record {
     /// First record of every segment.
     SessionSnapshot(SessionSnapshot),
-    /// The engine store was reset; inbound numbering restarts in a new series.
+    /// The session store was reset; inbound numbering restarts in a new series.
     SeriesStarted {
         series: u32,
-        store_created_unix_seconds: i64,
+        store_created_unix_micros: i64,
     },
     Application(ApplicationRecord),
     /// SequenceReset-GapFill accepted: `from_seq..new_seq` carry no resent application data.
@@ -83,16 +83,16 @@ impl Record {
             Self::SessionSnapshot(snapshot) => {
                 output.push(KIND_SESSION_SNAPSHOT);
                 output.extend_from_slice(&snapshot.series.to_le_bytes());
-                output.extend_from_slice(&snapshot.store_created_unix_seconds.to_le_bytes());
+                output.extend_from_slice(&snapshot.store_created_unix_micros.to_le_bytes());
                 output.extend_from_slice(&snapshot.high_water.to_le_bytes());
             }
             Self::SeriesStarted {
                 series,
-                store_created_unix_seconds,
+                store_created_unix_micros,
             } => {
                 output.push(KIND_SERIES_STARTED);
                 output.extend_from_slice(&series.to_le_bytes());
-                output.extend_from_slice(&store_created_unix_seconds.to_le_bytes());
+                output.extend_from_slice(&store_created_unix_micros.to_le_bytes());
             }
             Self::Application(record) => {
                 output.push(KIND_APPLICATION);
@@ -139,12 +139,12 @@ impl Record {
         let record = match reader.u8()? {
             KIND_SESSION_SNAPSHOT => Self::SessionSnapshot(SessionSnapshot {
                 series: reader.u32()?,
-                store_created_unix_seconds: reader.i64()?,
+                store_created_unix_micros: reader.i64()?,
                 high_water: reader.u64()?,
             }),
             KIND_SERIES_STARTED => Self::SeriesStarted {
                 series: reader.u32()?,
-                store_created_unix_seconds: reader.i64()?,
+                store_created_unix_micros: reader.i64()?,
             },
             KIND_APPLICATION => {
                 let series = reader.u32()?;
@@ -268,12 +268,12 @@ mod tests {
         let records = [
             Record::SessionSnapshot(SessionSnapshot {
                 series: 3,
-                store_created_unix_seconds: 1_760_000_000,
+                store_created_unix_micros: 1_760_000_000,
                 high_water: 42,
             }),
             Record::SeriesStarted {
                 series: 4,
-                store_created_unix_seconds: -1,
+                store_created_unix_micros: -1,
             },
             Record::Application(ApplicationRecord {
                 series: 4,

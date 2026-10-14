@@ -478,6 +478,25 @@ pub struct LmFixFieldMap_t(NonNull<ffi::c_void>);
 /// Receives one serialized message; `ptr` is valid only for the duration of the call.
 pub type LmFixBytesSink = extern "C" fn(ctx: *mut ffi::c_void, ptr: *const ffi::c_char, len: usize);
 
+/// Persistence callbacks of an externally owned session store; each returns 0 once the change
+/// is persisted.
+#[repr(C)]
+pub struct LmFixStoreCallbacks {
+    pub set_next_sender: extern "C" fn(ctx: *mut ffi::c_void, next_sender: u64) -> i8,
+    pub set_next_target: extern "C" fn(ctx: *mut ffi::c_void, next_target: u64) -> i8,
+    pub reset: extern "C" fn(
+        ctx: *mut ffi::c_void,
+        now_unix_micros: i64,
+        creation_unix_micros: *mut i64,
+    ) -> i8,
+    pub load: extern "C" fn(
+        ctx: *mut ffi::c_void,
+        creation_unix_micros: *mut i64,
+        next_sender: *mut u64,
+        next_target: *mut u64,
+    ) -> i8,
+}
+
 #[link(name = "quickfixbind")]
 extern "C" {
     pub fn LmFix_messageBody(msg: FixMessage_t) -> Option<LmFixFieldMap_t>;
@@ -559,6 +578,14 @@ extern "C" {
 
     #[must_use]
     pub fn LmFix_sessionSetNextSender(session_id: FixSessionID_t, next_sender: u64) -> i8;
+
+    pub fn LmFix_callbackStoreFactoryNew(
+        callbacks: *const LmFixStoreCallbacks,
+        ctx: *mut ffi::c_void,
+        creation_unix_micros: i64,
+        next_sender: u64,
+        next_target: u64,
+    ) -> Option<FixMessageStoreFactory_t>;
 
     #[must_use]
     pub fn LmFix_initiatorStop(initiator: FixInitiator_t, force: i8) -> i8;

@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use parking_lot::Mutex;
 use quickfix_ffi as ffi;
 
+use super::store::StoreFactory;
 use super::{bridge_error, engine_error, Application, EngineError, Settings};
 
 /// Sessions registered with the engine in this process. The engine's session registry is
@@ -41,24 +42,6 @@ impl Drop for SessionClaim {
     }
 }
 
-struct StoreFactory(ffi::FixMessageStoreFactory_t);
-
-impl StoreFactory {
-    fn file(settings: &Settings) -> Result<Self, EngineError> {
-        // SAFETY: `settings` is live; the factory copies what it needs (FileStorePath).
-        let raw = unsafe { ffi::FixFileMessageStoreFactory_new(settings.raw) }
-            .ok_or_else(|| engine_error("file store factory"))?;
-        Ok(Self(raw))
-    }
-}
-
-impl Drop for StoreFactory {
-    fn drop(&mut self) {
-        // SAFETY: created by `FixFileMessageStoreFactory_new`, deleted after the socket.
-        unsafe { ffi::FixMessageStoreFactory_delete(self.0) };
-    }
-}
-
 /// A `ThreadedSocketInitiator` for one session.
 pub(crate) struct Initiator {
     raw: ffi::FixInitiator_t,
@@ -77,15 +60,18 @@ unsafe impl Sync for Initiator {}
 
 impl Initiator {
     /// Create the initiator and its session. No socket is opened until `start`.
-    pub(crate) fn new(settings: Settings, application: Application) -> Result<Self, EngineError> {
+    pub(crate) fn new(
+        settings: Settings,
+        application: Application,
+        store: StoreFactory,
+    ) -> Result<Self, EngineError> {
         let claim = SessionClaim::acquire(&settings.session)?;
-        let store = StoreFactory::file(&settings)?;
         // SAFETY: all referenced objects are live and owned by the returned value, which keeps
         // them alive until after the initiator is deleted.
         let raw = unsafe {
             ffi::FixInitiator_new(
                 application.raw,
-                store.0,
+                store.raw,
                 settings.raw,
                 application.log,
                 1,
@@ -167,7 +153,7 @@ impl Acceptor {
         let raw = unsafe {
             ffi::FixAcceptor_new(
                 application.raw,
-                store.0,
+                store.raw,
                 settings.raw,
                 application.log,
                 1,

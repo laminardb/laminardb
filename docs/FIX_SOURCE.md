@@ -14,7 +14,7 @@ with CMake and a C++17 compiler. Builds without the feature do not compile or li
 | Role | Initiator, one session per source | Acceptor |
 | Versions | FIX.4.4 (qualified with local tests), FIX.4.2 (same engine path, not separately exercised) | FIXT.1.1 / FIX 5.x, FIXP, FAST, SBE |
 | Transport | TLS with chain and hostname verification, optional mutual TLS; plaintext TCP to loopback, or to a remote host only with `tcp.allow.remote` | Engine-native SSL |
-| Deployment | Embedded, single-node server | Cluster (the journal and engine store are node-local) |
+| Deployment | Embedded, single-node server | Cluster (the journal and session state are node-local) |
 | Delivery | At-least-once with checkpointing | Best-effort, exactly-once |
 | Outbound traffic | Session messages only (Logon, Heartbeat, ResendRequest, Logout, Reject) | Application messages, subscription requests |
 | Host failure | `journal.sync = fsync` survives process, OS, and power failure of the host | Loss of the node or its disk |
@@ -27,17 +27,23 @@ certification. Qualify every venue with its own dictionary, schedule, and confor
 
 1. The engine validates each inbound message against the dictionary and checks CompIDs,
    SendingTime, and sequence number.
-2. For a selected message type, the source writes the engine's serialization of the message to
-   the journal inside the engine callback and returns only once the record is durable. Until
-   then the engine cannot advance its inbound sequence number. If the write cannot complete, the
-   session logs out without advancing, and the counterparty retransmits after reconnecting.
-3. The source reads durable journal records, parses them with the pinned dictionary, and emits
+2. For a selected message type, the source appends the engine's serialization of the message to
+   the journal inside the engine callback. If the append fails, the session logs out without
+   advancing its inbound sequence number, and the counterparty retransmits after reconnecting.
+3. The session's sequence numbers live in a store the source owns (`session.identity` and
+   `session.inbound` under `journal.path`). The persisted inbound sequence number never passes a
+   journal record that is not yet durable. With `journal.sync = fsync` a background thread makes
+   everything appended so far durable with one flush (group commit); records that start or reset
+   a sequence series are flushed before the callback returns. The outbound sequence number is
+   flushed before each message is sent, and a store reset first flushes the journal.
+4. The source reads durable journal records, parses them with the pinned dictionary, and emits
    rows. Each row is positioned by `(session, journal index, row ordinal)`. A checkpoint stores
    the journal index; committed checkpoints release whole journal segments.
-4. On restart the source replays the journal from the committed index without contacting the
-   counterparty, and the session resumes from the engine store. Retransmissions of already
-   journaled sequence numbers are dropped after a content comparison that ignores
-   retransmission headers; a retransmission with different content stops the source.
+5. On restart the source replays the journal from the committed index without contacting the
+   counterparty, and the session resumes from its persisted sequence numbers; the counterparty
+   retransmits anything after them. Retransmissions of already journaled sequence numbers are
+   dropped after a content comparison that ignores retransmission headers; a retransmission with
+   different content stops the source.
 
 The journal holds the engine's re-serialization (`Message::toString`), which recomputes
 BodyLength and CheckSum. It is not guaranteed to equal the bytes on the wire.
@@ -97,8 +103,8 @@ inbound application messages only.
 | `username`, `password` | none | Logon Username (553) / Password (554) |
 | `dictionary.path` | required | Dictionary XML, at most 16 MiB; pinned by SHA-256 at CREATE SOURCE |
 | `messages` | required | Comma-separated application MsgTypes to capture |
-| `journal.path` | required | Journal, engine store, and pinned dictionary directory; exclusively locked |
-| `journal.sync` | `fsync` | `fsync` (host failure) or `os` (process failure only) |
+| `journal.path` | required | Journal, session state, and pinned dictionary directory; exclusively locked |
+| `journal.sync` | `fsync` | `fsync` (host failure; group-committed flushes) or `os` (process failure only) |
 | `journal.max.bytes` | 1 GiB | Retained bytes above which intake pauses |
 | `journal.segment.bytes` | 64 MiB | Segment size; retention deletes whole segments |
 | `max.message.bytes` | 1 MiB | Largest captured message; larger ones stop the source |
@@ -221,11 +227,13 @@ mode. Rows may repeat after recovery when a sink is not checkpoint-committable.
 
 | Failure | Outcome |
 |---|---|
-| Process killed at any point | No accepted message lost; the session resumes from the engine store and the counterparty retransmits anything not journaled; retransmissions are deduplicated |
-| Host or power failure, `journal.sync = fsync` | As above for inbound data. The outbound sequence number may regress (the engine store does not fsync); the next logon may then be rejected as "MsgSeqNum too low" and needs operator reconciliation |
+| Process killed at any point | No accepted message lost; the session resumes from its persisted sequence numbers and the counterparty retransmits anything after them; retransmissions are deduplicated |
+| Host or power failure, `journal.sync = fsync` | As above. Records not yet flushed are lost from the journal but the persisted inbound sequence number never passed them, so they are retransmitted; an outbound sequence number is never reused |
 | Host or power failure, `journal.sync = os` | Not covered: journal records may be lost; a restore past the journal end fails |
-| Node or disk loss | Not covered: the journal and engine store are on that node |
-| Journal write or fsync failure | The writer stops (no retry after an ambiguous fsync); the session logs out without advancing; the source fails; restart truncates a torn tail |
+| Node or disk loss | Not covered: the journal and session state are on that node |
+| Journal write or flush failure | The writer stops (no retry after an ambiguous flush); the session logs out without advancing; the source fails; restart truncates a torn tail |
+| Session state write failure | The session stops: inbound processing disconnects, outbound messages are not sent, and the source fails |
+| Damaged session state | `session.identity` with no valid copy fails the start (the outbound sequence number is unknown); a damaged `session.inbound` requests retransmission from 1 |
 | Journal full | Intake pauses (session logs out and refuses logon) until committed checkpoints release segments |
 | Corrupt record before the durable end | The source fails; no fallback |
 | Restore point older than the retained journal | The source fails with "restore point expired" |
@@ -243,7 +251,7 @@ source starts from the oldest retained journal record, and the session continues
 - SequenceReset-Reset that skips numbers is unrecoverable history. With `on.sequence.reset = fail`
   the source stops at that journal record; reconcile with the venue, then set `continue` to emit
   rows after it with `gap_before = true`. `fix_source_feed_incomplete` stays 1 for the run.
-- A series starts when an accepted Logon carries ResetSeqNumFlag=Y or the engine store was reset
+- A series starts when an accepted Logon carries ResetSeqNumFlag=Y or the session store was reset
   (configured reset or a new schedule period).
 - A counterparty that renumbers without ResetSeqNumFlag violates the protocol; the engine logs
   out with "MsgSeqNum too low", and the source does not reset automatically.
@@ -271,27 +279,29 @@ are internal to the engine and do not fault it.
 
 ## Performance
 
-Measured 2026-10-14 on one Windows 11 laptop (consumer NVMe, `--release`), local QuickFIX acceptor
-on loopback, ExecutionReports of about 200 bytes, one session. Latency is from the scheduled send
-time (open loop) to the row returned by the source, so queueing delay is included. These are
-local numbers, not a target: rerun on production hardware before sizing.
+Measured 2026-10-14 in `--release` on one laptop: Windows 11 on its consumer NVMe, and Ubuntu
+under WSL2 on the same machine (ext4 on a virtual disk). Local QuickFIX acceptor on loopback,
+ExecutionReports of about 200 bytes, one session. Latency is from the scheduled send time (open
+loop) to the row returned by the source, so queueing delay is included. These are local numbers,
+not a target: rerun on production hardware before sizing.
 
-| Measurement | `journal.sync = os` | `journal.sync = fsync` |
-|---|---|---|
-| Journal append (300-byte record) p50 / p99 / p99.9 | 4.5 µs / 16.8 µs / 43 µs | 6.3 ms / 15.5 ms / 28.8 ms |
-| Receive-to-Arrow at 500 msg/s p50 / p99 / p99.9 | 130 µs / 254 µs / 3.7 ms | saturated (see below) |
-| Receive-to-Arrow at 2000 msg/s p50 / p99 / p99.9 | 115 µs / 596 µs / 16.6 ms | saturated |
-| Sustained capture rate | above 14,000 msg/s (5,000-message burst in 340 ms) | 462 msg/s |
+| Measurement | Windows `os` | Windows `fsync` | Linux `os` | Linux `fsync` |
+|---|---|---|---|---|
+| Engine-thread journal append, p50 / p99 | 4.5 µs / 18.9 µs | 0.1 µs / 1.1 µs | 0.7 µs / 3.0 µs | 0.07 µs / 1.4 µs |
+| Receive-to-Arrow at 500 msg/s, p50 / p99 | 162 µs / 260 µs | 3.4 ms / 5.2 ms | 116 µs / 190 µs | 24 ms / 72 ms |
+| Receive-to-Arrow at 2000 msg/s, p50 / p99 | 156 µs / 249 µs | 3.4 ms / 8.3 ms | 115 µs / 202 µs | 25 ms / 312 ms |
+| 5,000-message burst, all rows | 14,600 msg/s | 14,100 msg/s | 53,000 msg/s | 27,200 msg/s |
+
+With `fsync`, an append only buffers the record; rows become readable after the next group
+flush, so receive-to-Arrow latency is about one flush on the storage (a few milliseconds on the
+NVMe, about 20 ms on the WSL2 virtual disk) and throughput no longer depends on flush latency.
+Receive-to-query and receive-to-committed-sink latency add the pipeline cycle and the checkpoint
+interval respectively and were not measured separately.
 
 Projection costs 12 µs per message without groups and 21 µs / 43 µs with 3 / 10 expanded entries
 (about 85,000 / 140,000 / 233,000 rows per second on one core).
 
-`fsync` throughput is one `FlushFileBuffers` per message on this machine, because each message is
-made durable before the engine may advance its sequence number. Server SSDs and `fdatasync` on
-Linux are typically one to two orders of magnitude faster; measure before relying on `fsync` for
-bursts. Receive-to-query and receive-to-committed-sink latency add the pipeline cycle and the
-checkpoint interval respectively and were not measured separately.
-
+## Operations
 
 - **Reconnect.** The engine reconnects every `reconnect.interval.seconds` (fixed interval) inside
   the schedule. Nothing else retries.
@@ -307,7 +317,8 @@ checkpoint interval respectively and were not measured separately.
   (`laminar_connectors::fix`).
 - **Unresolved gaps / sequence reset.** Never reset sequence numbers to get connected. Agree a reset
   with the venue, then either set `reset.on.logon = true` for the next logon or stop the source and
-  remove `journal.path/engine` (this starts a new series). Both are explicit operator actions.
+  remove `journal.path/session.identity` and `journal.path/session.inbound` (this starts a new
+  series at sequence number 1). Both are explicit operator actions.
 - **Replay.** Restart from the last checkpoint replays the retained journal. To reprocess with a new
   mapping, drop and recreate the source with the same `journal.path`.
 - **Failover.** Not automatic. To move a source to another host, stop the pipeline, copy the whole

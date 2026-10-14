@@ -9,10 +9,11 @@ use tokio::sync::Notify;
 
 use super::capture::{Capture, SessionStatus};
 use super::config::{FixSourceConfig, SequenceResetPolicy, Transport};
-use super::engine::{Application, Initiator, Settings};
-use super::journal::{Journal, JournalReader, Record};
+use super::engine::{Application, Initiator, Settings, StoreFactory};
+use super::journal::{GroupCommit, Journal, JournalReader, Record};
 use super::metrics::{saturating, FixMetrics};
 use super::projection::{compile, Projection};
+use super::session_store::SessionStore;
 use super::tls::TlsBridge;
 use super::{dictionary, NATIVE_FORMAT};
 use crate::checkpoint::SourceCheckpoint;
@@ -112,6 +113,8 @@ impl Drop for Engine {
 
 struct Running {
     journal: Arc<Journal>,
+    store: Arc<SessionStore>,
+    _group_commit: Option<GroupCommit>,
     /// Cursor metadata and input-channel inventory shared by every checkpoint of this run.
     cursor: SourceCheckpoint,
     reader: JournalReader,
@@ -206,6 +209,32 @@ fn committed_dictionary(binding: Option<&SchemaBinding>) -> Option<String> {
     native.identity.get("dictionary_sha256").cloned()
 }
 
+/// Open the journal and the session store whose persisted inbound progress it bounds.
+fn open_durable_state(
+    parsed: &FixSourceConfig,
+    dictionary_sha256: &str,
+    data_ready: Arc<Notify>,
+) -> Result<(Arc<Journal>, Arc<SessionStore>), ConnectorError> {
+    let journal = Arc::new(Journal::open(
+        &parsed.journal_path,
+        &parsed.session.display(),
+        &parsed.capture_contract(dictionary_sha256),
+        parsed.journal,
+        data_ready,
+    )?);
+    let barrier_journal = Arc::downgrade(&journal);
+    let store = Arc::new(SessionStore::open(
+        &parsed.journal_path,
+        parsed.journal.sync,
+        Box::new(move || match barrier_journal.upgrade() {
+            Some(journal) => journal.sync(),
+            None => Err(terminal("FIX journal closed".into())),
+        }),
+    )?);
+    journal.attach_floor(store.clone())?;
+    Ok((journal, store))
+}
+
 fn terminal(reason: String) -> ConnectorError {
     ConnectorError::InvalidState {
         expected: "FIX capture running".into(),
@@ -292,13 +321,7 @@ impl SourceConnector for FixSource {
             Arc::new(super::engine::DataDictionary::from_path(&pinned_text)?);
         let plan = compile(&config, &schema, &projection_dictionary, &parsed.messages)?;
         let session = parsed.session.display();
-        let journal = Arc::new(Journal::open(
-            &parsed.journal_path,
-            &session,
-            &parsed.capture_contract(&sha256),
-            parsed.journal,
-            self.data_ready.clone(),
-        )?);
+        let (journal, store) = open_durable_state(&parsed, &sha256, self.data_ready.clone())?;
         let start_index = match &position {
             SourcePosition::Initial => journal.first_retained_index(),
             SourcePosition::Resume { checkpoint, .. } => {
@@ -334,12 +357,11 @@ impl SourceConnector for FixSource {
             Some(bridge) => ("127.0.0.1".to_string(), bridge.local_port),
             None => (parsed.host.clone(), parsed.port),
         };
-        let store_dir = parsed.journal_path.join("engine");
-        laminar_core::durable_fs::ensure_durable_directory(&store_dir)?;
-        let defaults = parsed.engine_defaults(&pinned, &store_dir, (&connect.0, connect.1));
+        let defaults = parsed.engine_defaults(&pinned, (&connect.0, connect.1));
         let settings = Settings::single_session(&defaults, &parsed.session, &[])?;
         let capture = Arc::new(Capture::new(
             journal.clone(),
+            store.clone(),
             parsed.session.clone(),
             parsed.messages.iter().cloned().collect(),
             parsed.credentials.clone(),
@@ -348,7 +370,12 @@ impl SourceConnector for FixSource {
             metrics.clone(),
         ));
         let guard = self.guard()?;
-        let initiator = Initiator::new(settings, Application::new(capture)?)?;
+        let group_commit = journal.start_group_commit()?;
+        let initiator = Initiator::new(
+            settings,
+            Application::new(capture)?,
+            StoreFactory::owned(store.clone())?,
+        )?;
         initiator.start()?;
         let engine = Engine {
             initiator: Some(initiator),
@@ -370,6 +397,8 @@ impl SourceConnector for FixSource {
                 parsed.max_rows_per_message,
             ),
             journal,
+            store,
+            _group_commit: group_commit,
             cursor,
             reader,
             status,
@@ -388,7 +417,12 @@ impl SourceConnector for FixSource {
     ) -> Result<Option<SourceBatch>, ConnectorError> {
         let data_ready = self.data_ready.clone();
         let running = self.running()?;
-        if let Some(reason) = running.status.fatal() {
+        let stopped = running
+            .status
+            .fatal()
+            .or_else(|| running.journal.poisoned())
+            .or_else(|| running.store.poisoned());
+        if let Some(reason) = stopped {
             return Err(terminal(reason));
         }
         let end = running.journal.durable_end();
@@ -469,6 +503,10 @@ impl SourceConnector for FixSource {
         if let Some(mut running) = self.running.take() {
             if let Some(engine) = running.engine.take() {
                 engine.stop().await;
+            }
+            // Lets the session store persist inbound progress up to the last record.
+            if let Err(error) = running.journal.sync() {
+                tracing::warn!(error = %error, "FIX journal sync on close failed");
             }
             tracing::info!(
                 session = %running.journal.meta().session,

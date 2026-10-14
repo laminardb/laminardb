@@ -10,6 +10,9 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use laminar_core::checkpoint::CheckpointAttempt;
 
+use super::engine::StoreBackend;
+use super::journal::SyncPolicy;
+use super::session_store::SessionStore;
 use super::testing::{FixTestVenue, TestMessage};
 use super::FixSource;
 use crate::checkpoint::SourceCheckpoint;
@@ -222,13 +225,11 @@ fn seqs(batches: &[RecordBatch]) -> Vec<u64> {
         .collect()
 }
 
-fn store_file(journal: &Path, suffix: &str) -> PathBuf {
-    std::fs::read_dir(journal.join("engine"))
-        .expect("store")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.to_string_lossy().ends_with(suffix))
-        .expect("store file")
+/// Model a crash after journal appends but before the session store persisted the inbound
+/// sequence number: rewind it to the first application message.
+fn rewind_inbound(journal: &Path) {
+    let store = SessionStore::open(journal, SyncPolicy::Fsync, Box::new(|| Ok(()))).expect("store");
+    store.set_next_target(2).expect("rewind");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -277,12 +278,7 @@ async fn a_regressed_engine_store_is_reconciled_by_retransmission_without_duplic
     let (_, checkpoint) = collect(&mut source, 3).await;
     source.close().await.expect("close");
 
-    // Model a crash after the journal append but before the engine persisted its target:
-    // rewind the stored inbound sequence number.
-    let seqnums = store_file(&harness.journal(), ".seqnums");
-    let text = std::fs::read_to_string(&seqnums).expect("seqnums");
-    let (sender, _) = text.split_once(':').expect("format");
-    std::fs::write(&seqnums, format!("{} : {:0>20}", sender.trim(), 2)).expect("rewind");
+    rewind_inbound(&harness.journal());
 
     let mut source = harness.start(resume(checkpoint), &[]).await;
     harness.send("E4");
@@ -321,10 +317,7 @@ async fn a_conflicting_retransmission_fails_closed() {
         .replace("37=E1", "37=X1")
         .into_bytes();
     std::fs::write(&body, tampered).expect("tamper");
-    let seqnums = store_file(&harness.journal(), ".seqnums");
-    let text = std::fs::read_to_string(&seqnums).expect("seqnums");
-    let (sender, _) = text.split_once(':').expect("format");
-    std::fs::write(&seqnums, format!("{} : {:0>20}", sender.trim(), 2)).expect("rewind");
+    rewind_inbound(&harness.journal());
 
     // The tampered stored copy no longer matches its checksum; let the venue resend it anyway.
     let venue = FixTestVenue::start_with_settings(
@@ -484,15 +477,23 @@ async fn a_full_journal_pauses_intake_until_a_commit_releases_space() {
         !harness.venue().logged_on(),
         "a full journal pauses the session"
     );
-    assert!(harness.journal_bytes() > 1_048_576);
 
     // Project and commit everything journaled so far; retention frees space and the session
-    // logs on again, receiving the refused messages by retransmission.
+    // logs on again, receiving the refused messages by retransmission. Group commit publishes
+    // the last records shortly after the pause.
     let mut checkpoint = source.checkpoint();
-    while let Some(batch) = source.poll_batch(1024).await.expect("poll") {
-        assert!(batch.num_rows() > 0);
-        checkpoint = source.checkpoint();
+    let mut idle_since = Instant::now();
+    while idle_since.elapsed() < Duration::from_millis(300) {
+        match source.poll_batch(1024).await.expect("poll") {
+            Some(batch) => {
+                assert!(batch.num_rows() > 0);
+                checkpoint = source.checkpoint();
+                idle_since = Instant::now();
+            }
+            None => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
     }
+    assert!(harness.journal_bytes() > 1_048_576);
     source
         .notify_epoch_committed(1, &checkpoint)
         .await

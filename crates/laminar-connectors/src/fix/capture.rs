@@ -1,16 +1,17 @@
 //! Session callbacks that durably capture inbound application messages.
 //!
-//! Ordering invariant: `from_app` returns `Accept` only after the message's journal record
-//! reached the configured durability boundary. The engine advances its inbound sequence number
-//! after `Accept`, so persisted session progress never passes unjournaled application data. Any
-//! condition that prevents durable capture returns `Disconnect`, which leaves the sequence number
-//! unchanged and makes the counterparty retransmit after the engine reconnects.
+//! Ordering invariant: `from_app` returns `Accept` only after the message's journal record was
+//! appended. The engine advances its inbound sequence number after `Accept`, and the session
+//! store persists it only up to the journal's durability floor, so persisted session progress
+//! never passes application data a crash can lose. Any condition that prevents capture returns
+//! `Disconnect`, which leaves the sequence number unchanged and makes the counterparty
+//! retransmit after the engine reconnects.
 //!
 //! Sequence series: the engine resets its store, restarting both sequence numbers at 1, for an
 //! accepted Logon with ResetSeqNumFlag=Y, for a configured reset, and at a new schedule period.
 //! Every reset is followed by a Logon before application messages, so the Logon callback starts a
-//! new journal series when the Logon carries ResetSeqNumFlag=Y or the store's creation time (whole
-//! seconds) changed.
+//! new journal series when the Logon carries ResetSeqNumFlag=Y or the store's creation time
+//! changed.
 //!
 //! Retransmissions: after a restart the engine's persisted target may trail the journal. A
 //! message at or below the journal's high-water mark is a retransmission of an already captured
@@ -25,10 +26,11 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use super::config::Credentials;
 use super::engine::{
-    session_state, CallbackOutcome, MessageRef, OutboundMessage, SessionCallbacks, SessionKey,
+    CallbackOutcome, MessageRef, OutboundMessage, SessionCallbacks, SessionKey, StoreBackend,
 };
 use super::journal::{ApplicationRecord, Journal, Record};
 use super::metrics::{saturating, FixMetrics};
+use super::session_store::SessionStore;
 
 /// Header fields a retransmission may legitimately change: BodyLength, PossDupFlag,
 /// SendingTime, PossResend, OrigSendingTime, LastMsgSeqNumProcessed.
@@ -65,6 +67,7 @@ struct CaptureState {
 /// Session callbacks bound to one journal.
 pub(crate) struct Capture {
     journal: Arc<Journal>,
+    store: Arc<SessionStore>,
     session: SessionKey,
     messages: Vec<String>,
     credentials: Option<Credentials>,
@@ -75,8 +78,10 @@ pub(crate) struct Capture {
 }
 
 impl Capture {
+    #[allow(clippy::too_many_arguments)] // INVARIANT: every field is fixed for the session's life.
     pub(crate) fn new(
         journal: Arc<Journal>,
+        store: Arc<SessionStore>,
         session: SessionKey,
         messages: Vec<String>,
         credentials: Option<Credentials>,
@@ -86,6 +91,7 @@ impl Capture {
     ) -> Self {
         Self {
             journal,
+            store,
             session,
             messages,
             credentials,
@@ -106,6 +112,9 @@ impl Capture {
             return Some(fatal);
         }
         if let Some(poisoned) = self.journal.poisoned() {
+            return Some(poisoned);
+        }
+        if let Some(poisoned) = self.store.poisoned() {
             return Some(poisoned);
         }
         if self.journal.over_capacity() {
@@ -140,20 +149,13 @@ impl Capture {
             .body()
             .and_then(|body| body.field(141))
             .is_ok_and(|value| value == Some(b"Y".as_slice()));
-        let engine = match session_state(&self.session) {
-            Ok(engine) => engine,
-            Err(error) => {
-                self.status
-                    .fail(format!("FIX engine session state unavailable: {error}"));
-                return CallbackOutcome::Disconnect;
-            }
-        };
+        let engine = self.store.values();
         let progress = self.journal.progress();
         let window = self.journal.take_redelivery_window(engine.next_target);
         let mut state = self.state.lock();
         if reset_flag
             || progress.series == 0
-            || progress.store_created_unix_seconds != engine.creation_unix_seconds
+            || progress.store_created_unix_micros != engine.creation_unix_micros
         {
             state.redelivery = Some(Vec::new());
             drop(state);
@@ -166,11 +168,11 @@ impl Capture {
                 session = %self.session.display(),
                 series,
                 previous = progress.series,
-                "FIX engine store reset; starting a new inbound sequence series"
+                "FIX session store reset; starting a new inbound sequence series"
             );
             return self.append(&Record::SeriesStarted {
                 series,
-                store_created_unix_seconds: engine.creation_unix_seconds,
+                store_created_unix_micros: engine.creation_unix_micros,
             });
         }
         if state.redelivery.is_none() {
@@ -207,14 +209,7 @@ impl Capture {
                 new_seq,
             });
         }
-        let expected = match session_state(&self.session) {
-            Ok(engine) => engine.next_target,
-            Err(error) => {
-                self.status
-                    .fail(format!("FIX engine session state unavailable: {error}"));
-                return CallbackOutcome::Disconnect;
-            }
-        };
+        let expected = self.store.values().next_target;
         if new_seq <= expected {
             return CallbackOutcome::Accept;
         }
@@ -250,10 +245,10 @@ impl Capture {
             header.field(43).map_err(|error| error.to_string())? == Some(b"Y".as_slice());
         let poss_resend =
             header.field(97).map_err(|error| error.to_string())? == Some(b"Y".as_slice());
-        let engine = session_state(&self.session).map_err(|error| error.to_string())?;
+        let engine = self.store.values();
         let progress = self.journal.progress();
-        if engine.creation_unix_seconds != progress.store_created_unix_seconds {
-            return Err("engine store identity changed without a logon; refusing to attribute the message to a series".into());
+        if engine.creation_unix_micros != progress.store_created_unix_micros {
+            return Err("session store identity changed without a logon; refusing to attribute the message to a series".into());
         }
         let mut state = self.state.lock();
         let state = &mut *state;

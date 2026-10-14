@@ -167,7 +167,7 @@ const KEYS: &[Key] = &[
     ),
     required(
         "journal.path",
-        "Directory of the durable receive journal and engine store",
+        "Directory of the durable receive journal and session state",
     ),
     optional(
         "journal.sync",
@@ -543,7 +543,6 @@ impl FixSourceConfig {
     pub(crate) fn engine_defaults(
         &self,
         pinned_dictionary: &std::path::Path,
-        store_dir: &std::path::Path,
         connect: (&str, u16),
     ) -> Vec<(&'static str, String)> {
         let mut settings: Vec<(&'static str, String)> = self
@@ -555,11 +554,11 @@ impl FixSourceConfig {
             ("ConnectionType", "initiator".to_string()),
             ("SocketConnectHost", connect.0.to_string()),
             ("SocketConnectPort", connect.1.to_string()),
-            ("FileStorePath", store_dir.display().to_string()),
             ("UseDataDictionary", "Y".to_string()),
             ("DataDictionary", pinned_dictionary.display().to_string()),
             // Outbound messages are not stored, so no logon secret is written at rest; resend
-            // requests from the counterparty are answered with gap fills.
+            // requests from the counterparty are answered with gap fills. The session store
+            // rejects message persistence.
             ("PersistMessages", "N".to_string()),
             ("ValidateLengthAndChecksum", "Y".to_string()),
             ("CheckCompID", "Y".to_string()),
@@ -715,11 +714,7 @@ mod tests {
     #[test]
     fn defaults_keep_validation_on_and_resets_off() {
         let parsed = FixSourceConfig::parse(&base()).expect("parse");
-        let defaults = parsed.engine_defaults(
-            std::path::Path::new("d.xml"),
-            std::path::Path::new("store"),
-            ("127.0.0.1", 9878),
-        );
+        let defaults = parsed.engine_defaults(std::path::Path::new("d.xml"), ("127.0.0.1", 9878));
         let get = |key: &str| {
             defaults
                 .iter()

@@ -9,6 +9,7 @@
 #include <quickfix/FieldMap.h>
 #include <quickfix/Initiator.h>
 #include <quickfix/Message.h>
+#include <quickfix/MessageStore.h>
 #include <quickfix/Session.h>
 #include <quickfix/SessionID.h>
 
@@ -17,6 +18,111 @@ namespace {
 thread_local std::string lastError;
 
 void setError(const char *what) { lastError.assign(what ? what : "unknown C++ exception"); }
+
+constexpr int64_t MICROS_PER_SECOND = 1000000;
+
+int64_t toUnixMicros(const FIX::UtcTimeStamp &time) {
+  return static_cast<int64_t>(time.getTimeT()) * MICROS_PER_SECOND + time.getMicrosecond();
+}
+
+FIX::UtcTimeStamp fromUnixMicros(int64_t micros) {
+  return FIX::UtcTimeStamp(static_cast<time_t>(micros / MICROS_PER_SECOND),
+                           static_cast<int>(micros % MICROS_PER_SECOND), 6);
+}
+
+// Sequence numbers and creation time cached for the engine; every change is persisted through
+// the callbacks first and cached only after they succeed.
+class CallbackStore : public FIX::MessageStore {
+public:
+  CallbackStore(const FIX::LmFixStoreCallbacks &callbacks, void *ctx, int64_t creationUnixMicros, FIX::SEQNUM nextSender,
+                FIX::SEQNUM nextTarget)
+      : m_callbacks(callbacks),
+        m_ctx(ctx),
+        m_creation(fromUnixMicros(creationUnixMicros)),
+        m_nextSender(nextSender),
+        m_nextTarget(nextTarget) {}
+
+  bool set(FIX::SEQNUM, const std::string &) EXCEPT(FIX::IOException) override {
+    throw FIX::IOException("LaminarDB FIX sessions do not store outbound messages");
+  }
+
+  void get(FIX::SEQNUM, FIX::SEQNUM, std::vector<std::string> &) const EXCEPT(FIX::IOException) override {}
+
+  FIX::SEQNUM getNextSenderMsgSeqNum() const EXCEPT(FIX::IOException) override { return m_nextSender; }
+
+  FIX::SEQNUM getNextTargetMsgSeqNum() const EXCEPT(FIX::IOException) override { return m_nextTarget; }
+
+  void setNextSenderMsgSeqNum(FIX::SEQNUM next) EXCEPT(FIX::IOException) override {
+    check(m_callbacks.setNextSender(m_ctx, next), "sender sequence update");
+    m_nextSender = next;
+  }
+
+  void setNextTargetMsgSeqNum(FIX::SEQNUM next) EXCEPT(FIX::IOException) override {
+    check(m_callbacks.setNextTarget(m_ctx, next), "target sequence update");
+    m_nextTarget = next;
+  }
+
+  void incrNextSenderMsgSeqNum() EXCEPT(FIX::IOException) override { setNextSenderMsgSeqNum(m_nextSender + 1); }
+
+  void incrNextTargetMsgSeqNum() EXCEPT(FIX::IOException) override { setNextTargetMsgSeqNum(m_nextTarget + 1); }
+
+  FIX::UtcTimeStamp getCreationTime() const EXCEPT(FIX::IOException) override { return m_creation; }
+
+  void reset(const FIX::UtcTimeStamp &now) EXCEPT(FIX::IOException) override {
+    int64_t creation = 0;
+    check(m_callbacks.reset(m_ctx, toUnixMicros(now), &creation), "reset");
+    m_creation = fromUnixMicros(creation);
+    m_nextSender = 1;
+    m_nextTarget = 1;
+  }
+
+  void refresh() EXCEPT(FIX::IOException) override {
+    int64_t creation = 0;
+    uint64_t sender = 0;
+    uint64_t target = 0;
+    check(m_callbacks.load(m_ctx, &creation, &sender, &target), "refresh");
+    m_creation = fromUnixMicros(creation);
+    m_nextSender = sender;
+    m_nextTarget = target;
+  }
+
+private:
+  static void check(int8_t result, const char *operation) {
+    if (result != 0) {
+      throw FIX::IOException(std::string("LaminarDB session store ") + operation + " failed");
+    }
+  }
+
+  FIX::LmFixStoreCallbacks m_callbacks;
+  void *m_ctx;
+  FIX::UtcTimeStamp m_creation;
+  FIX::SEQNUM m_nextSender;
+  FIX::SEQNUM m_nextTarget;
+};
+
+class CallbackStoreFactory : public FIX::MessageStoreFactory {
+public:
+  CallbackStoreFactory(const FIX::LmFixStoreCallbacks &callbacks, void *ctx, int64_t creationUnixMicros,
+                       FIX::SEQNUM nextSender, FIX::SEQNUM nextTarget)
+      : m_callbacks(callbacks),
+        m_ctx(ctx),
+        m_creationUnixMicros(creationUnixMicros),
+        m_nextSender(nextSender),
+        m_nextTarget(nextTarget) {}
+
+  FIX::MessageStore *create(const FIX::UtcTimeStamp &, const FIX::SessionID &) override {
+    return new CallbackStore(m_callbacks, m_ctx, m_creationUnixMicros, m_nextSender, m_nextTarget);
+  }
+
+  void destroy(FIX::MessageStore *store) override { delete store; }
+
+private:
+  FIX::LmFixStoreCallbacks m_callbacks;
+  void *m_ctx;
+  int64_t m_creationUnixMicros;
+  FIX::SEQNUM m_nextSender;
+  FIX::SEQNUM m_nextTarget;
+};
 
 } // namespace
 
@@ -255,6 +361,19 @@ int8_t LmFix_sessionSetNextSender(const SessionID *sessionId, uint64_t nextSende
     }
     session->setNextSenderMsgSeqNum(static_cast<SEQNUM>(nextSender));
     return 0;
+  })
+}
+
+MessageStoreFactory *LmFix_callbackStoreFactoryNew(const LmFixStoreCallbacks *callbacks, void *ctx,
+                                                   int64_t creationUnixMicros, uint64_t nextSender,
+                                                   uint64_t nextTarget) {
+  if (!callbacks || !callbacks->setNextSender || !callbacks->setNextTarget || !callbacks->reset || !callbacks->load) {
+    setError("null argument");
+    return nullptr;
+  }
+  LMFIX_GUARD(nullptr, {
+    return new CallbackStoreFactory(*callbacks, ctx, creationUnixMicros, static_cast<SEQNUM>(nextSender),
+                                    static_cast<SEQNUM>(nextTarget));
   })
 }
 

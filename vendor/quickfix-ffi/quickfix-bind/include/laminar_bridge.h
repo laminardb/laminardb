@@ -71,6 +71,24 @@ int8_t LmFix_sessionState(const FixSessionID_t *sessionId, int64_t *creationUnix
 // `Session::setNextSenderMsgSeqNum` on a live session. 0 on success.
 int8_t LmFix_sessionSetNextSender(const FixSessionID_t *sessionId, uint64_t nextSender);
 
+// Persistence of an externally owned session store. Each callback returns 0 once the change is
+// persisted; any other value makes the engine see an IOException and leaves the store unchanged.
+typedef struct LmFixStoreCallbacks {
+  int8_t (*setNextSender)(void *ctx, uint64_t nextSender);
+  int8_t (*setNextTarget)(void *ctx, uint64_t nextTarget);
+  // Resets both sequence numbers to 1 and reports the new store creation time, which may differ
+  // from `nowUnixMicros`.
+  int8_t (*reset)(void *ctx, int64_t nowUnixMicros, int64_t *creationUnixMicros);
+  int8_t (*load)(void *ctx, int64_t *creationUnixMicros, uint64_t *nextSender, uint64_t *nextTarget);
+} LmFixStoreCallbacks;
+
+// Store factory for one session whose state starts at the given values and changes only through
+// `callbacks`. Stores never keep outbound messages, so sessions must use PersistMessages=N.
+// `ctx` must outlive the factory. NULL on error.
+FixMessageStoreFactory_t *LmFix_callbackStoreFactoryNew(const LmFixStoreCallbacks *callbacks, void *ctx,
+                                                        int64_t creationUnixMicros, uint64_t nextSender,
+                                                        uint64_t nextTarget);
+
 // `Initiator::stop(force)`. 0 on success.
 int8_t LmFix_initiatorStop(FixInitiator_t *initiator, int8_t force);
 
