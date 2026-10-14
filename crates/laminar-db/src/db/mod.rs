@@ -3977,6 +3977,10 @@ impl LaminarDB {
             laminar_connectors::nats::register_nats_source(registry)?;
             laminar_connectors::nats::register_nats_sink(registry)?;
         }
+        #[cfg(feature = "fix")]
+        {
+            laminar_connectors::fix::register_fix_source(registry)?;
+        }
         Ok(())
     }
 

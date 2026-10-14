@@ -134,6 +134,7 @@ impl Drop for OwnedSessionId {
 /// Engine session settings: one `[DEFAULT]` dictionary and one session dictionary.
 pub(crate) struct Settings {
     raw: ffi::FixSessionSettings_t,
+    session: String,
 }
 
 // SAFETY: `SessionSettings` is a plain value object; after construction it is only read by the
@@ -150,7 +151,10 @@ impl Settings {
         // SAFETY: plain constructor; the returned pointer is owned by `Settings`.
         let raw =
             unsafe { ffi::FixSessionSettings_new() }.ok_or_else(|| engine_error("settings"))?;
-        let settings = Self { raw };
+        let settings = Self {
+            raw,
+            session: session.display(),
+        };
         let defaults_dictionary = Dictionary::new("DEFAULT", defaults)?;
         // SAFETY: both pointers are live; the engine copies the dictionary.
         if unsafe { ffi::FixSessionSettings_setGlobal(settings.raw, defaults_dictionary.raw) } != 0

@@ -326,3 +326,37 @@ mod tests {
         assert!(Record::decode(&[]).is_err());
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn application_records_round_trip(
+            series in any::<u32>(),
+            seq in any::<u64>(),
+            received in any::<i64>(),
+            poss_dup in any::<bool>(),
+            poss_resend in any::<bool>(),
+            msg_type in "[0-9A-Za-z]{1,3}",
+            digest in any::<u64>(),
+            message in proptest::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let record = Record::Application(ApplicationRecord {
+                series, seq, received_at_nanos: received, poss_dup, poss_resend,
+                msg_type, content_digest: digest, message,
+            });
+            let mut buffer = Vec::new();
+            record.encode_into(&mut buffer).expect("encode");
+            prop_assert_eq!(Record::decode(&buffer).expect("decode"), record);
+        }
+
+        #[test]
+        fn arbitrary_payloads_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = Record::decode(&bytes);
+        }
+    }
+}

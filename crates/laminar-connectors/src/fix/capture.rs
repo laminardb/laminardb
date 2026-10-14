@@ -28,7 +28,7 @@ use super::engine::{
     session_state, CallbackOutcome, MessageRef, OutboundMessage, SessionCallbacks, SessionKey,
 };
 use super::journal::{ApplicationRecord, Journal, Record};
-use super::metrics::FixMetrics;
+use super::metrics::{saturating, FixMetrics};
 
 /// Header fields a retransmission may legitimately change: BodyLength, PossDupFlag,
 /// SendingTime, PossResend, OrigSendingTime, LastMsgSeqNumProcessed.
@@ -124,7 +124,7 @@ impl Capture {
             Ok(_) => {
                 self.metrics
                     .journal_retained_bytes
-                    .set(gauge(self.journal.retained_bytes()));
+                    .set(saturating(self.journal.retained_bytes()));
                 CallbackOutcome::Accept
             }
             Err(error) => {
@@ -200,7 +200,7 @@ impl Capture {
             }
             self.metrics
                 .gap_fill_seqs
-                .inc_by(new_seq - seq.max(progress.high_water + 1));
+                .inc_by(new_seq - seq.max(progress.high_water.saturating_add(1)));
             return self.append(&Record::GapFill {
                 series: progress.series,
                 from_seq: seq,
@@ -290,7 +290,7 @@ impl Capture {
         }
         if outcome == CallbackOutcome::Accept {
             self.metrics.messages_captured.inc();
-            self.metrics.next_target_seq.set(gauge(seq + 1));
+            self.metrics.next_target_seq.set(saturating(seq + 1));
         }
         Ok(outcome)
     }
@@ -343,18 +343,27 @@ impl SessionCallbacks for Capture {
         let msg_type = msg_type(message.view());
         match msg_type.as_deref() {
             Some(b"A") => {
-                let Some(credentials) = &self.credentials else {
-                    return;
-                };
-                let username = credentials.username.as_deref().map(|value| (553, value));
-                let password = credentials
-                    .password
+                // The engine buffers a whole message before any limit applies, so ask the
+                // counterparty for the bound (MaxMessageSize, 383).
+                let max_size = self.max_message_bytes.to_string();
+                let username = self
+                    .credentials
                     .as_ref()
+                    .and_then(|credentials| credentials.username.as_deref())
+                    .map(|value| (553, value));
+                let password = self
+                    .credentials
+                    .as_ref()
+                    .and_then(|credentials| credentials.password.as_ref())
                     .map(|value| (554, value.expose()));
-                for (tag, value) in username.into_iter().chain(password) {
+                let fields = [(383, max_size.as_str())]
+                    .into_iter()
+                    .chain(username)
+                    .chain(password);
+                for (tag, value) in fields {
                     if let Err(error) = message.set_body(tag, value.as_bytes()) {
                         self.status
-                            .fail(format!("cannot set logon credential field {tag}: {error}"));
+                            .fail(format!("cannot set logon field {tag}: {error}"));
                     }
                 }
             }
@@ -445,8 +454,4 @@ fn now_nanos() -> i64 {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
         .unwrap_or(0)
-}
-
-fn gauge(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
 }

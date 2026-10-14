@@ -258,3 +258,57 @@ fn redelivery_window_holds_current_series_records_at_or_after_the_engine_target(
         "handed out once"
     );
 }
+
+/// Receive-to-durable component: per-append latency of a 300-byte application record.
+#[test]
+#[ignore = "performance profile; run in release with --ignored"]
+fn profile_append_latency() {
+    for sync in [SyncPolicy::OperatingSystem, SyncPolicy::Fsync] {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut opts = options(64 << 20);
+        opts.sync = sync;
+        let journal = Journal::open(
+            dir.path(),
+            "FIX.4.4:A->B",
+            "contract",
+            opts,
+            Arc::new(Notify::new()),
+        )
+        .expect("open");
+        let message = vec![b'x'; 300];
+        let mut latencies = Vec::with_capacity(5000);
+        for seq in 1..=5000_u64 {
+            let record = Record::Application(ApplicationRecord {
+                series: 1,
+                seq,
+                received_at_nanos: 0,
+                poss_dup: false,
+                poss_resend: false,
+                msg_type: "8".into(),
+                content_digest: seq,
+                message: message.clone(),
+            });
+            let begin = std::time::Instant::now();
+            journal.append(&record).expect("append");
+            latencies.push(begin.elapsed());
+        }
+        latencies.sort_unstable();
+        let at = |quantile: f64| {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let index = ((latencies.len() as f64 - 1.0) * quantile).round() as usize;
+            latencies[index]
+        };
+        eprintln!(
+            "append sync={sync:?} p50={:?} p95={:?} p99={:?} p99.9={:?} max={:?}",
+            at(0.5),
+            at(0.95),
+            at(0.99),
+            at(0.999),
+            latencies.last().copied().unwrap_or_default()
+        );
+    }
+}

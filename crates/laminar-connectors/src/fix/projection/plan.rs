@@ -95,9 +95,10 @@ pub(crate) enum Conversion {
         timezone: Option<Arc<str>>,
     },
     Date32,
+    /// `List` of a struct (`fields`) or of one scalar or nested-list member (`None`).
     List {
         item: FieldRef,
-        fields: Fields,
+        fields: Option<Fields>,
     },
 }
 
@@ -127,6 +128,18 @@ fn error(message: impl Into<String>) -> ConnectorError {
     ConnectorError::ConfigurationError(message.into())
 }
 
+fn tags(text: &str) -> Result<Vec<i32>, ConnectorError> {
+    text.split('.').map(tag).collect()
+}
+
+/// A list column over one group: struct item fields, or the member path of a scalar item.
+struct ListSpec<'s> {
+    count_tag: i32,
+    item: &'s FieldRef,
+    fields: Option<&'s Fields>,
+    members: &'s [i32],
+}
+
 fn tag(text: &str) -> Result<i32, ConnectorError> {
     text.parse::<i32>()
         .ok()
@@ -152,17 +165,12 @@ fn conversion(field: &Field) -> Result<Conversion, ConnectorError> {
             timezone: timezone.clone(),
         },
         DataType::Date32 => Conversion::Date32,
-        DataType::List(item) => match item.data_type() {
-            DataType::Struct(fields) => Conversion::List {
-                item: item.clone(),
-                fields: fields.clone(),
+        DataType::List(item) => Conversion::List {
+            item: item.clone(),
+            fields: match item.data_type() {
+                DataType::Struct(fields) => Some(fields.clone()),
+                _ => None,
             },
-            _ => {
-                return Err(error(format!(
-                    "FIX list column '{}' must be LIST<STRUCT<...>>",
-                    field.name()
-                )))
-            }
         },
         other => {
             return Err(error(format!(
@@ -372,23 +380,35 @@ impl<'a> Compiler<'a> {
             } else {
                 (Section::Body, Scope::Body, path.as_str())
             };
-            let tag = tag(text)?;
-            if let Conversion::List { fields, .. } = &conversion {
-                if section != Section::Body {
+            let tags = tags(text)?;
+            match (&conversion, tags.as_slice()) {
+                (Conversion::List { .. }, _) if section != Section::Body => {
                     return Err(error(format!(
                         "column '{}': only body groups map to lists",
                         field.name()
                     )));
                 }
-                let groups = self.top_level_groups(tag)?;
-                Source::Group {
-                    scope,
-                    count_tag: tag,
-                    children: self.children(&key, fields, &groups)?,
+                (Conversion::List { item, fields }, [group, members @ ..]) => {
+                    let groups = self.top_level_groups(*group)?;
+                    let list = ListSpec {
+                        count_tag: *group,
+                        item,
+                        fields: fields.as_ref(),
+                        members,
+                    };
+                    self.list(&key, field, scope, &groups, &list)?
                 }
-            } else {
-                self.check_field(None, section, tag, field, &conversion)?;
-                Source::Field { scope, tag }
+                (_, [tag]) => {
+                    self.check_field(None, section, *tag, field, &conversion)?;
+                    Source::Field { scope, tag: *tag }
+                }
+                _ => {
+                    return Err(error(format!(
+                        "column '{}': path '{path}' does not match its type {}",
+                        field.name(),
+                        field.data_type()
+                    )))
+                }
             }
         };
         Ok(ColumnPlan {
@@ -399,6 +419,7 @@ impl<'a> Compiler<'a> {
         })
     }
 
+    /// A field or nested group of a group entry: `TAG`, or `NESTED[.MEMBER...]` for a list.
     fn member(
         &mut self,
         key: &str,
@@ -408,17 +429,77 @@ impl<'a> Compiler<'a> {
         groups: &Groups<'a>,
         text: &str,
     ) -> Result<Source, ConnectorError> {
-        let tag = tag(text)?;
-        if let Conversion::List { fields, .. } = conversion {
-            let nested = self.nested_groups(groups, tag)?;
-            return Ok(Source::Group {
-                scope,
-                count_tag: tag,
-                children: self.children(key, fields, &nested)?,
-            });
+        let tags = tags(text)?;
+        match (conversion, tags.as_slice()) {
+            (Conversion::List { item, fields }, [nested, members @ ..]) => {
+                let nested_groups = self.nested_groups(groups, *nested)?;
+                let list = ListSpec {
+                    count_tag: *nested,
+                    item,
+                    fields: fields.as_ref(),
+                    members,
+                };
+                self.list(key, field, scope, &nested_groups, &list)
+            }
+            (_, [tag]) => {
+                self.check_field(Some(groups), Section::Body, *tag, field, conversion)?;
+                Ok(Source::Field { scope, tag: *tag })
+            }
+            _ => Err(error(format!(
+                "column '{}': path '{text}' does not match its type {}",
+                field.name(),
+                field.data_type()
+            ))),
         }
-        self.check_field(Some(groups), Section::Body, tag, field, conversion)?;
-        Ok(Source::Field { scope, tag })
+    }
+
+    /// A list over the entries of one group: struct entries mapped by child keys, or one member
+    /// per entry (`[TAG]`, or `[NESTED, ...]` for a nested list).
+    fn list(
+        &mut self,
+        key: &str,
+        field: &Field,
+        scope: Scope,
+        groups: &Groups<'a>,
+        list: &ListSpec<'_>,
+    ) -> Result<Source, ConnectorError> {
+        let children = match (list.fields, list.members) {
+            (Some(fields), []) => self.children(key, fields, groups)?,
+            (None, [_, ..]) => {
+                let item_conversion = conversion(list.item)?;
+                let text = list
+                    .members
+                    .iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let source = self.member(
+                    key,
+                    list.item,
+                    &item_conversion,
+                    Scope::Entry,
+                    groups,
+                    &text,
+                )?;
+                vec![ColumnPlan {
+                    name: list.item.name().clone(),
+                    source,
+                    conversion: item_conversion,
+                    nullable: list.item.is_nullable(),
+                }]
+            }
+            _ => {
+                return Err(error(format!(
+                    "column '{}': a struct list maps a group tag; a scalar list maps GROUP.MEMBER",
+                    field.name()
+                )))
+            }
+        };
+        Ok(Source::Group {
+            scope,
+            count_tag: list.count_tag,
+            children,
+        })
     }
 
     fn children(

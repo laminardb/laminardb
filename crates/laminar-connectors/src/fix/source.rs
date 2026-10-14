@@ -11,7 +11,7 @@ use super::capture::{Capture, SessionStatus};
 use super::config::{FixSourceConfig, SequenceResetPolicy, Transport};
 use super::engine::{Application, Initiator, Settings};
 use super::journal::{Journal, JournalReader, Record};
-use super::metrics::FixMetrics;
+use super::metrics::{saturating, FixMetrics};
 use super::projection::{compile, Projection};
 use super::tls::TlsBridge;
 use super::{dictionary, NATIVE_FORMAT};
@@ -112,11 +112,15 @@ impl Drop for Engine {
 
 struct Running {
     journal: Arc<Journal>,
+    /// Cursor metadata and input-channel inventory shared by every checkpoint of this run.
+    cursor: SourceCheckpoint,
     reader: JournalReader,
     projection: Projection,
     status: Arc<SessionStatus>,
     metrics: Arc<FixMetrics>,
     on_sequence_reset: SequenceResetPolicy,
+    /// Journal index of the latest committed checkpoint.
+    committed: u64,
     engine: Option<Engine>,
 }
 
@@ -141,13 +145,20 @@ impl FixSource {
             .ok_or_else(|| ConnectorError::Internal("FIX source generation is retired".into()))
     }
 
-    fn checkpoint_for(journal: &Journal, next: u64) -> SourceCheckpoint {
+    /// The session is the source's one input channel, matching the row-position partition.
+    fn cursor_template(journal: &Journal) -> Result<SourceCheckpoint, ConnectorError> {
         let mut checkpoint = SourceCheckpoint::new();
-        checkpoint.set_offset(OFFSET_NEXT, next.to_string());
         checkpoint.set_metadata("connector", CHECKPOINT_CONNECTOR);
         checkpoint.set_metadata("checkpoint.version", CHECKPOINT_VERSION);
         checkpoint.set_metadata("journal.id", journal.meta().journal_id.clone());
         checkpoint.set_metadata("capture.contract", journal.meta().capture_contract.clone());
+        checkpoint.set_input_channels(vec![journal.meta().session.as_bytes().to_vec()])?;
+        Ok(checkpoint)
+    }
+
+    fn checkpoint_for(template: &SourceCheckpoint, next: u64) -> SourceCheckpoint {
+        let mut checkpoint = template.clone();
+        checkpoint.set_offset(OFFSET_NEXT, next.to_string());
         checkpoint
     }
 
@@ -300,6 +311,8 @@ impl SourceConnector for FixSource {
             }
         };
         let reader = journal.reader(start_index)?;
+        let replay = journal.durable_end().next_index.saturating_sub(start_index);
+        let cursor = Self::cursor_template(&journal)?;
         let source_name = config.get("laminar.source.name").unwrap_or("fix");
         let metrics = Arc::new(match &self.registry {
             Some(registry) => FixMetrics::registered(source_name, registry)?,
@@ -307,7 +320,8 @@ impl SourceConnector for FixSource {
         });
         metrics
             .journal_retained_bytes
-            .set(i64::try_from(journal.retained_bytes()).unwrap_or(i64::MAX));
+            .set(saturating(journal.retained_bytes()));
+        metrics.startup_replay_records.set(saturating(replay));
         let status = Arc::new(SessionStatus::default());
 
         let tls = match &parsed.transport {
@@ -333,12 +347,13 @@ impl SourceConnector for FixSource {
             status.clone(),
             metrics.clone(),
         ));
+        let guard = self.guard()?;
         let initiator = Initiator::new(settings, Application::new(capture)?)?;
         initiator.start()?;
         let engine = Engine {
             initiator: Some(initiator),
             tls,
-            guard: Some(self.guard()?),
+            guard: Some(guard),
         };
         tracing::info!(
             session = %session,
@@ -355,10 +370,12 @@ impl SourceConnector for FixSource {
                 parsed.max_rows_per_message,
             ),
             journal,
+            cursor,
             reader,
             status,
             metrics,
             on_sequence_reset: parsed.on_sequence_reset,
+            committed: start_index,
             engine: Some(engine),
         });
         self.data_ready.notify_one();
@@ -414,8 +431,12 @@ impl SourceConnector for FixSource {
         let unread = end.next_index.saturating_sub(running.reader.next_index());
         running
             .metrics
+            .checkpoint_lag_records
+            .set(saturating(end.next_index.saturating_sub(running.committed)));
+        running
+            .metrics
             .journal_unread_records
-            .set(i64::try_from(unread).unwrap_or(i64::MAX));
+            .set(saturating(unread));
         if unread > 0 {
             data_ready.notify_one();
         }
@@ -427,7 +448,7 @@ impl SourceConnector for FixSource {
             .metrics
             .rows_emitted
             .inc_by(records.num_rows() as u64);
-        let checkpoint = Self::checkpoint_for(&running.journal, running.reader.next_index());
+        let checkpoint = Self::checkpoint_for(&running.cursor, running.reader.next_index());
         Ok(Some(
             SourceBatch::positioned(records, positions)?.with_checkpoint(checkpoint),
         ))
@@ -439,7 +460,7 @@ impl SourceConnector for FixSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         match &self.running {
-            Some(running) => Self::checkpoint_for(&running.journal, running.reader.next_index()),
+            Some(running) => Self::checkpoint_for(&running.cursor, running.reader.next_index()),
             None => SourceCheckpoint::new(),
         }
     }
@@ -473,10 +494,11 @@ impl SourceConnector for FixSource {
         let running = self.running()?;
         let committed = Self::checkpoint_index(&running.journal, checkpoint)?;
         running.journal.release_before(committed)?;
+        running.committed = running.committed.max(committed);
         running
             .metrics
             .journal_retained_bytes
-            .set(i64::try_from(running.journal.retained_bytes()).unwrap_or(i64::MAX));
+            .set(saturating(running.journal.retained_bytes()));
         Ok(())
     }
 }

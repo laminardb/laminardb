@@ -310,3 +310,38 @@ mod tests {
         assert!(!dir.path().join(format!("{:020}{TEMP_SUFFIX}", 9)).exists());
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Arbitrary bytes after a valid header never panic the reader, never yield a frame past
+        /// the bound, and always stop.
+        #[test]
+        fn arbitrary_segment_tails_are_classified(tail in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let dir = tempfile::tempdir().expect("dir");
+            let mut frame = Vec::new();
+            encode_frame(b"first", &mut frame).expect("frame");
+            let mut file = create_segment(dir.path(), 0, &[1; 16], &frame).expect("segment");
+            file.write_all(&tail).expect("tail");
+            drop(file);
+            let path = segment_path(dir.path(), 0);
+            let length = std::fs::metadata(&path).expect("metadata").len();
+            let mut reader = File::open(&path).expect("open");
+            check_header(&mut reader, 0, &[1; 16]).expect("header");
+            let mut frames = FrameReader::new(reader, HEADER_LEN, 1024).expect("reader");
+            let mut payload = Vec::new();
+            for _ in 0..4096 {
+                match frames.next(length, &mut payload).expect("read") {
+                    FrameRead::Frame => prop_assert!(frames.offset() <= length),
+                    FrameRead::End | FrameRead::Torn | FrameRead::Corrupt => break,
+                }
+            }
+        }
+    }
+}

@@ -5261,6 +5261,7 @@ dependencies = [
  "pgpq",
  "postgres-types",
  "prometheus",
+ "proptest",
  "quick_cache",
  "rand 0.10.3",
  "rcgen",

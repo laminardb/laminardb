@@ -377,6 +377,56 @@ fn projection_with(schema: &SchemaRef, mappings: &[(&str, &str)]) -> Projection 
 }
 
 #[test]
+fn group_members_project_as_aligned_scalar_lists() {
+    let list = |item: DataType| DataType::List(Arc::new(Field::new("item", item, true)));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("party_ids", list(DataType::Utf8), true),
+        Field::new("party_roles", list(DataType::Int64), true),
+        Field::new("sub_ids", list(list(DataType::Utf8)), true),
+    ]));
+    let mut projection = projection(
+        schema,
+        &[
+            ("column.party_ids", "453.448"),
+            ("column.party_roles", "453.452"),
+            ("column.sub_ids", "453.802.523"),
+        ],
+        &["8"],
+    );
+    let parties = [
+        Party {
+            id: "A",
+            role: "1",
+            subs: &["S1", "S2"],
+        },
+        Party {
+            id: "B",
+            role: "3",
+            subs: &[],
+        },
+    ];
+    projection
+        .push(1, &record(2, "8", execution_report(2, "O", &parties, None)))
+        .expect("push");
+    let (batch, _) = projection.finish().expect("finish");
+    let ids = batch.column(0).as_list::<i32>().value(0);
+    let ids = ids.as_string::<i32>();
+    assert_eq!((ids.value(0), ids.value(1)), ("A", "B"));
+    let roles = batch.column(1).as_list::<i32>().value(0);
+    assert_eq!(
+        roles.as_primitive::<Int64Type>().values().to_vec(),
+        vec![1, 3]
+    );
+    let subs = batch.column(2).as_list::<i32>().value(0);
+    let subs = subs.as_list::<i32>();
+    assert_eq!(
+        (subs.value_length(0), subs.value_length(1)),
+        (2, 0),
+        "entry boundaries kept"
+    );
+}
+
+#[test]
 fn mixed_message_types_share_one_nullable_schema() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("order_id", DataType::Utf8, true),
@@ -476,4 +526,61 @@ fn mappings_are_validated_against_schema_and_dictionary_before_activation() {
         &messages(&["ZZ"])
     )
     .is_err());
+}
+
+/// Projection CPU cost per journaled message (engine parse plus Arrow building).
+#[test]
+#[ignore = "performance profile; run in release with --ignored"]
+fn profile_projection_throughput() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("order_id", DataType::Utf8, false),
+        Field::new("last_px", DataType::Decimal128(18, 4), true),
+        Field::new(
+            "transact_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("venue_seq", DataType::Int64, true),
+        Field::new("party_id", DataType::Utf8, true),
+        Field::new("_fix_seq_num", DataType::UInt64, false),
+    ]));
+    let mappings = [
+        ("expand", "453"),
+        ("column.order_id", "37"),
+        ("column.last_px", "31"),
+        ("column.transact_time", "60"),
+        ("column.venue_seq", "5001"),
+        ("column.party_id", "453[].448"),
+    ];
+    for entries in [0_usize, 3, 10] {
+        let ids: Vec<String> = (0..entries).map(|index| format!("P{index}")).collect();
+        let parties: Vec<Party<'_>> = ids
+            .iter()
+            .map(|id| Party {
+                id,
+                role: "1",
+                subs: &[],
+            })
+            .collect();
+        let message = record(2, "8", execution_report(2, "ORD", &parties, None));
+        let mut projection = projection(schema.clone(), &mappings, &["8"]);
+        let messages = 20_000_u64;
+        let begin = std::time::Instant::now();
+        let mut rows = 0;
+        for index in 0..messages {
+            rows += projection.push(index, &message).expect("push");
+            if projection.rows() >= 1024 {
+                projection.finish().expect("finish");
+            }
+        }
+        projection.finish().expect("finish");
+        let elapsed = begin.elapsed();
+        eprintln!(
+            "projection entries={entries:>2} bytes={} messages/s={:.0} rows/s={:.0} per-message={:?}",
+            message.message.len(),
+            messages as f64 / elapsed.as_secs_f64(),
+            rows as f64 / elapsed.as_secs_f64(),
+            elapsed / u32::try_from(messages).expect("count")
+        );
+    }
 }

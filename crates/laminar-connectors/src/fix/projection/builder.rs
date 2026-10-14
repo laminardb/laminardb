@@ -22,7 +22,8 @@ pub(super) struct ListState {
     nulls: NullBufferBuilder,
     pub(super) children: Vec<ColumnBuilder>,
     item: FieldRef,
-    fields: Fields,
+    /// Struct item fields; `None` when the single child holds the item values.
+    fields: Option<Fields>,
 }
 
 impl ListState {
@@ -251,8 +252,15 @@ impl ColumnBuilder {
                     .iter_mut()
                     .map(Self::finish)
                     .collect::<Result<Vec<_>, _>>()?;
-                let entries = StructArray::try_new(list.fields.clone(), children, None)
-                    .map_err(schema_error)?;
+                let entries: ArrayRef = match &list.fields {
+                    Some(fields) => Arc::new(
+                        StructArray::try_new(fields.clone(), children, None)
+                            .map_err(schema_error)?,
+                    ),
+                    None => children.into_iter().next().ok_or_else(|| {
+                        ConnectorError::Internal("scalar list has no item builder".into())
+                    })?,
+                };
                 let boundaries = std::mem::replace(&mut list.offsets, vec![0]);
                 let mut offsets = OffsetBufferBuilder::<i32>::new(boundaries.len());
                 for pair in boundaries.windows(2) {
@@ -261,13 +269,8 @@ impl ColumnBuilder {
                 }
                 let offsets = offsets.finish();
                 Arc::new(
-                    ListArray::try_new(
-                        list.item.clone(),
-                        offsets,
-                        Arc::new(entries),
-                        list.nulls.finish(),
-                    )
-                    .map_err(schema_error)?,
+                    ListArray::try_new(list.item.clone(), offsets, entries, list.nulls.finish())
+                        .map_err(schema_error)?,
                 )
             }
         };

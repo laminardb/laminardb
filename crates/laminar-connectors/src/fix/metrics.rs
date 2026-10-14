@@ -5,12 +5,19 @@ use prometheus::{IntCounter, IntGauge, Opts, Registry};
 
 use crate::error::ConnectorError;
 
+/// A counter or size as a gauge value, saturating at `i64::MAX`.
+pub(crate) fn saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Per-source FIX metrics. Labels are bounded: one `source` label, no message identifiers.
 pub(crate) struct FixMetrics {
     pub(crate) logged_on: IntGauge,
     pub(crate) next_target_seq: IntGauge,
     pub(crate) journal_retained_bytes: IntGauge,
     pub(crate) journal_unread_records: IntGauge,
+    pub(crate) checkpoint_lag_records: IntGauge,
+    pub(crate) startup_replay_records: IntGauge,
     pub(crate) journal_paused: IntGauge,
     pub(crate) feed_incomplete: IntGauge,
     pub(crate) messages_captured: IntCounter,
@@ -52,6 +59,14 @@ impl FixMetrics {
                 journal_unread_records: gauge(
                     "fix_source_journal_unread_records",
                     "Durable journal records not yet projected",
+                )?,
+                checkpoint_lag_records: gauge(
+                    "fix_source_checkpoint_lag_records",
+                    "Durable journal records after the last committed checkpoint",
+                )?,
+                startup_replay_records: gauge(
+                    "fix_source_startup_replay_records",
+                    "Journal records replayed from the restore point at the last start",
                 )?,
                 journal_paused: gauge(
                     "fix_source_journal_paused",
@@ -113,6 +128,8 @@ impl FixMetrics {
             Box::new(self.next_target_seq.clone()),
             Box::new(self.journal_retained_bytes.clone()),
             Box::new(self.journal_unread_records.clone()),
+            Box::new(self.checkpoint_lag_records.clone()),
+            Box::new(self.startup_replay_records.clone()),
             Box::new(self.journal_paused.clone()),
             Box::new(self.feed_incomplete.clone()),
             Box::new(self.messages_captured.clone()),

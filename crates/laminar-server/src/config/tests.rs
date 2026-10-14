@@ -47,6 +47,10 @@ fn shipped_server_configs_deserialize() {
             "server-demo",
             include_str!("../../../../examples/server-demo/laminardb.toml"),
         ),
+        (
+            "fix-drop-copy",
+            include_str!("../../../../examples/fix-drop-copy.toml"),
+        ),
     ] {
         toml::from_str::<ServerConfig>(input)
             .unwrap_or_else(|error| panic!("{name} config does not deserialize: {error}"));

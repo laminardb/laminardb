@@ -1025,6 +1025,45 @@ fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
     }
 }
 
+#[cfg(feature = "fix")]
+#[test]
+fn fix_source_is_admitted_only_locally_at_least_once_with_checkpoints() {
+    use super::admit_source_recovery_contract;
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::fix::register_fix_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("fix");
+    for (key, value) in [
+        ("host", "127.0.0.1"),
+        ("port", "9878"),
+        ("transport", "tcp"),
+        ("sender.comp.id", "LAMINAR"),
+        ("target.comp.id", "VENUE"),
+        ("dictionary.path", "FIX44.xml"),
+        ("messages", "8"),
+        ("journal.path", "journal"),
+    ] {
+        config.set(key, value);
+    }
+    let source = registry.create_source(&config, None).unwrap();
+    let contract = source.contract(&config).unwrap();
+    let admit = |delivery, checkpointing, runtime| {
+        admit_source_recovery_contract(contract, delivery, checkpointing, runtime)
+    };
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Local),
+        Ok(())
+    );
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster),
+        Err("cluster singleton sources require fenced singleton placement, which is not implemented"),
+        "the journal and engine store are node-local"
+    );
+    assert!(admit(DeliveryGuarantee::ExactlyOnce, true, RuntimeMode::Local).is_err());
+    assert!(admit(DeliveryGuarantee::AtLeastOnce, false, RuntimeMode::Local).is_err());
+    assert!(admit(DeliveryGuarantee::BestEffort, false, RuntimeMode::Local).is_err());
+}
+
 #[cfg(feature = "delta-lake")]
 #[test]
 fn delta_change_feed_is_a_local_replayable_changelog_route_source() {

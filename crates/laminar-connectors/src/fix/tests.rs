@@ -533,3 +533,241 @@ impl Harness {
             .unwrap_or(0)
     }
 }
+
+mod tls {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::TlsAcceptor;
+
+    use super::*;
+
+    struct Authority {
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    }
+
+    fn authority() -> Authority {
+        let key = rcgen::KeyPair::generate().expect("ca key");
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).expect("ca");
+        Authority { cert, key }
+    }
+
+    /// A TLS terminator for `localhost` in front of the plaintext venue.
+    async fn terminator(authority: &Authority, venue_port: u16) -> u16 {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().expect("server key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("server params")
+            .signed_by(&key, &authority.cert, &authority.key)
+            .expect("server cert");
+        let chain = vec![CertificateDer::from(cert.der().to_vec())];
+        let key = PrivateKeyDer::from_pem_slice(key.serialize_pem().as_bytes()).expect("key pem");
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let Ok(mut venue) = TcpStream::connect(("127.0.0.1", venue_port)).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut tls, &mut venue).await;
+                });
+            }
+        });
+        port
+    }
+
+    async fn start_tls(harness: &Harness, port: u16, ca: &Path, server_name: &str) -> FixSource {
+        let ca = ca.display().to_string();
+        let port = port.to_string();
+        let mut config = harness.config(&[
+            ("transport", "tls"),
+            ("tls.ca.file", ca.as_str()),
+            ("tls.server.name", server_name),
+        ]);
+        config.set("port", port);
+        let mut source = FixSource::new(None);
+        let binding = source
+            .resolve_schema(&config, Some(schema()))
+            .await
+            .expect("resolve");
+        config.set_schema_binding(binding).expect("binding");
+        source
+            .start(
+                SourceStart::new(
+                    config,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .expect("request"),
+            )
+            .await
+            .expect("start");
+        source
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verified_tls_carries_the_session_and_untrusted_peers_are_refused() {
+        let harness = Harness::new("tls");
+        let trusted = authority();
+        let port = terminator(&trusted, harness.venue().port()).await;
+        let ca = harness.dir.path().join("ca.pem");
+        std::fs::write(&ca, trusted.cert.pem()).expect("ca file");
+
+        let untrusted = harness.dir.path().join("other-ca.pem");
+        std::fs::write(&untrusted, authority().cert.pem()).expect("other ca");
+        for (ca_file, name) in [(&untrusted, "localhost"), (&ca, "fix.example.com")] {
+            let mut source = start_tls(&harness, port, ca_file, name).await;
+            assert!(
+                !harness.venue().wait_logged_on(Duration::from_secs(3)),
+                "TLS must fail for CA {} and name {name}",
+                ca_file.display()
+            );
+            assert!(source.poll_batch(16).await.expect("not fatal").is_none());
+            source.close().await.expect("close");
+        }
+
+        let mut source = start_tls(&harness, port, &ca, "localhost").await;
+        assert!(
+            harness.venue().wait_logged_on(Duration::from_secs(20)),
+            "verified TLS logon"
+        );
+        harness.send("T1");
+        let (batches, _) = collect(&mut source, 1).await;
+        assert_eq!(column(&batches, "exec_id"), vec!["T1"]);
+        source.close().await.expect("close");
+    }
+}
+
+/// Latency profile: receive-to-Arrow from a scheduled send time (open loop, so queueing delay is
+/// included), per durability policy, plus burst catch-up. Run with
+/// `cargo test --release -p laminar-connectors --features fix --lib fix::tests::profile -- --ignored --nocapture`.
+mod profile {
+    use super::*;
+
+    fn percentile(sorted: &[Duration], quantile: f64) -> Duration {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let index = ((sorted.len() as f64 - 1.0) * quantile).round() as usize;
+        sorted[index]
+    }
+
+    async fn run(name: &str, sync: &str, rate: u64, seconds: u64) {
+        let harness = Harness::new(name);
+        let mut source = harness
+            .start(
+                SourcePosition::Initial,
+                &[
+                    ("journal.sync", sync),
+                    ("journal.segment.bytes", "67108864"),
+                ],
+            )
+            .await;
+        let total = usize::try_from(rate * seconds).expect("count");
+        let interval = Duration::from_nanos(1_000_000_000 / rate);
+        let start = Instant::now() + Duration::from_millis(100);
+        let venue = harness.venue();
+        let mut latencies = Vec::with_capacity(total);
+        let mut received = 0_usize;
+        let mut sent = 0_usize;
+        while received < total {
+            while sent < total
+                && Instant::now() >= start + interval * u32::try_from(sent).expect("index")
+            {
+                venue
+                    .send(&execution_report(
+                        &format!("O{sent}"),
+                        Some(&format!("{sent}")),
+                    ))
+                    .expect("send");
+                sent += 1;
+            }
+            if let Some(batch) = source.poll_batch(1024).await.expect("poll") {
+                let now = Instant::now();
+                for id in column(&[batch.records], "exec_id") {
+                    let index: u32 = id.parse().expect("id");
+                    latencies.push(now - (start + interval * index));
+                    received += 1;
+                }
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+        let elapsed = Instant::now() - start;
+        source.close().await.expect("close");
+        latencies.sort_unstable();
+        eprintln!(
+            "{name:>8} sync={sync:<5} rate={rate}/s n={total} p50={:?} p95={:?} p99={:?} p99.9={:?} max={:?} throughput={:.0}/s",
+            percentile(&latencies, 0.50),
+            percentile(&latencies, 0.95),
+            percentile(&latencies, 0.99),
+            percentile(&latencies, 0.999),
+            latencies.last().copied().unwrap_or_default(),
+            total as f64 / elapsed.as_secs_f64(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "performance profile; run in release with --ignored"]
+    async fn profile_receive_to_arrow_latency() {
+        for (sync, rate) in [("os", 500), ("os", 2000), ("fsync", 500), ("fsync", 2000)] {
+            run(&format!("p{sync}{rate}"), sync, rate, 5).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "performance profile; run in release with --ignored"]
+    async fn profile_burst_catch_up() {
+        for sync in ["os", "fsync"] {
+            let harness = Harness::new(&format!("burst{sync}"));
+            let mut source = harness
+                .start(
+                    SourcePosition::Initial,
+                    &[
+                        ("journal.sync", sync),
+                        ("journal.segment.bytes", "67108864"),
+                    ],
+                )
+                .await;
+            let burst = 5000;
+            let begin = Instant::now();
+            for index in 0..burst {
+                harness
+                    .venue()
+                    .send(&execution_report(
+                        &format!("O{index}"),
+                        Some(&format!("{index}")),
+                    ))
+                    .expect("send");
+            }
+            let queued = Instant::now() - begin;
+            let (batches, _) = collect(&mut source, burst).await;
+            let caught_up = Instant::now() - begin;
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            eprintln!(
+                "burst sync={sync:<5} messages={burst} venue_send={queued:?} all_rows={caught_up:?} rate={:.0}/s",
+                rows as f64 / caught_up.as_secs_f64()
+            );
+            source.close().await.expect("close");
+        }
+    }
+}

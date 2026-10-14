@@ -414,3 +414,71 @@ fn data_fields_and_groups_round_trip_through_engine_serialization() {
         .expect("serialize");
     assert_eq!(reparsed, serialized, "engine serialization is stable");
 }
+
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn valid_message() -> Vec<u8> {
+        let mut message = OwnedMessage::new().expect("message");
+        for (tag, value) in [
+            (8, "FIX.4.4"),
+            (35, "8"),
+            (49, "A"),
+            (56, "B"),
+            (34, "2"),
+            (52, "20261014-12:00:00"),
+        ] {
+            message
+                .set_field(Section::Header, tag, value.as_bytes())
+                .expect("header");
+        }
+        for (tag, value) in [
+            (37, "O"),
+            (17, "E"),
+            (150, "F"),
+            (39, "1"),
+            (55, "X"),
+            (54, "1"),
+            (151, "0"),
+            (14, "1"),
+            (6, "1"),
+        ] {
+            message
+                .set_field(Section::Body, tag, value.as_bytes())
+                .expect("body");
+        }
+        let mut bytes = Vec::new();
+        message
+            .view()
+            .serialize_into(&mut bytes)
+            .expect("serialize");
+        bytes
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Untrusted bytes, and corrupted valid messages, either parse or fail with an error;
+        /// no input crashes the engine boundary.
+        #[test]
+        fn parsing_untrusted_bytes_is_contained(
+            noise in proptest::collection::vec(any::<u8>(), 0..512),
+            flips in proptest::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..8),
+        ) {
+            let dictionary = DataDictionary::from_path(DICTIONARY).expect("dictionary");
+            let _ = dictionary.parse(&noise);
+            let mut corrupted = valid_message();
+            for (index, byte) in flips {
+                let position = index.index(corrupted.len());
+                corrupted[position] = byte;
+            }
+            if let Ok(parsed) = dictionary.parse(&corrupted) {
+                let body = parsed.view().body().expect("body");
+                let _ = body.field(37);
+                let _ = body.group_count(453);
+            }
+        }
+    }
+}

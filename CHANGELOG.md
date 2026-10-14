@@ -4,6 +4,13 @@
 
 ### Added
 
+- FIX TagValue source (`fix` feature, off by default) on the QuickFIX C++ engine: one initiator
+  session per source over verified TLS or loopback TCP, a durable receive journal written inside
+  the engine callback before the inbound sequence number advances, dictionary-validated column
+  mappings for header, body, group, and metadata fields, deterministic replay, and at-least-once
+  delivery in embedded and single-node deployments. Cluster placement and exactly-once delivery
+  are rejected. See `docs/FIX_SOURCE.md`.
+
 - Kafka exactly-once output in embedded and single-node deployments: each checkpoint's records are
   published by one fenced transactional committer together with a cursor marker in a compacted
   `commit.topic`, so `read_committed` readers see every committed record once across crashes.

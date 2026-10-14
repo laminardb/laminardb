@@ -204,3 +204,32 @@ mod tests {
         assert!(boolean(b"y").is_err());
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    proptest! {
+        #[test]
+        fn formatted_decimals_parse_back_exactly(unscaled in any::<i64>(), scale in 0_i8..12) {
+            let magnitude = unscaled.unsigned_abs().to_string();
+            let digits = usize::try_from(scale).expect("scale");
+            let padded = format!("{magnitude:0>width$}", width = digits + 1);
+            let (whole, fraction) = padded.split_at(padded.len() - digits);
+            let sign = if unscaled < 0 { "-" } else { "" };
+            let text = if digits == 0 { format!("{sign}{whole}") } else { format!("{sign}{whole}.{fraction}") };
+            prop_assert_eq!(decimal(text.as_bytes(), 38, scale), Ok(i128::from(unscaled)));
+        }
+
+        #[test]
+        fn arbitrary_text_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
+            let _ = decimal(&bytes, 18, 4);
+            let _ = integer(&bytes);
+            let _ = utc_timestamp(&bytes, TimeUnit::Nanosecond);
+            let _ = date(&bytes);
+            let _ = boolean(&bytes);
+        }
+    }
+}

@@ -9,9 +9,37 @@
 //! `SocketMonitor::drop` removes the socket before `ConnectorWrapper::onError` calls `drop`
 //! again, so `onDisconnect` never fires and the initiator never reconnects.
 
+use std::collections::BTreeSet;
+
+use parking_lot::Mutex;
 use quickfix_ffi as ffi;
 
 use super::{bridge_error, engine_error, Application, EngineError, Settings};
+
+/// Sessions registered with the engine in this process. The engine's session registry is
+/// process-global, so a second socket for an active session would share or corrupt its state.
+static ACTIVE_SESSIONS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Exclusive claim on one session identity; released after the engine object is deleted.
+struct SessionClaim(String);
+
+impl SessionClaim {
+    fn acquire(session: &str) -> Result<Self, EngineError> {
+        if !ACTIVE_SESSIONS.lock().insert(session.to_string()) {
+            return Err(EngineError::Call {
+                operation: "session registration",
+                message: format!("FIX session {session} is already active in this process"),
+            });
+        }
+        Ok(Self(session.to_string()))
+    }
+}
+
+impl Drop for SessionClaim {
+    fn drop(&mut self) {
+        ACTIVE_SESSIONS.lock().remove(&self.0);
+    }
+}
 
 struct StoreFactory(ffi::FixMessageStoreFactory_t);
 
@@ -38,6 +66,7 @@ pub(crate) struct Initiator {
     _store: StoreFactory,
     _application: Application,
     _settings: Settings,
+    _claim: SessionClaim,
 }
 
 // SAFETY: `start` and `stop` are the engine's cross-thread control API, and the owned engine
@@ -49,6 +78,7 @@ unsafe impl Sync for Initiator {}
 impl Initiator {
     /// Create the initiator and its session. No socket is opened until `start`.
     pub(crate) fn new(settings: Settings, application: Application) -> Result<Self, EngineError> {
+        let claim = SessionClaim::acquire(&settings.session)?;
         let store = StoreFactory::file(&settings)?;
         // SAFETY: all referenced objects are live and owned by the returned value, which keeps
         // them alive until after the initiator is deleted.
@@ -68,6 +98,7 @@ impl Initiator {
             _store: store,
             _application: application,
             _settings: settings,
+            _claim: claim,
         })
     }
 
@@ -100,9 +131,13 @@ impl Initiator {
 
 impl Drop for Initiator {
     fn drop(&mut self) {
-        // SAFETY: the last reference is gone; deleting a running initiator stops and joins its
-        // engine threads first.
-        unsafe { ffi::FixInitiator_delete(self.raw) };
+        // `~Initiator` deletes sessions without stopping engine threads, so stop and join them
+        // first; stopping an already stopped initiator returns immediately.
+        // SAFETY: the initiator is live and owned; no other reference remains.
+        unsafe {
+            let _ = ffi::LmFix_initiatorStop(self.raw, 1);
+            ffi::FixInitiator_delete(self.raw);
+        }
     }
 }
 
@@ -113,6 +148,7 @@ pub(crate) struct Acceptor {
     _store: StoreFactory,
     _application: Application,
     _settings: Settings,
+    _claim: SessionClaim,
 }
 
 // SAFETY: as for `Initiator`; the acceptor runs on engine-owned threads after `start`.
@@ -125,6 +161,7 @@ unsafe impl Sync for Acceptor {}
 #[cfg(any(test, feature = "testing"))]
 impl Acceptor {
     pub(crate) fn new(settings: Settings, application: Application) -> Result<Self, EngineError> {
+        let claim = SessionClaim::acquire(&settings.session)?;
         let store = StoreFactory::file(&settings)?;
         // SAFETY: as for `Initiator::new`.
         let raw = unsafe {
@@ -143,6 +180,7 @@ impl Acceptor {
             _store: store,
             _application: application,
             _settings: settings,
+            _claim: claim,
         })
     }
 
@@ -168,7 +206,11 @@ impl Acceptor {
 #[cfg(any(test, feature = "testing"))]
 impl Drop for Acceptor {
     fn drop(&mut self) {
-        // SAFETY: owned and no longer referenced; deleting also stops engine threads.
-        unsafe { ffi::FixAcceptor_delete(self.raw) };
+        // As for `Initiator`: `~Acceptor` does not stop engine threads.
+        // SAFETY: the acceptor is live and owned; no other reference remains.
+        unsafe {
+            let _ = ffi::LmFix_acceptorStop(self.raw, 1);
+            ffi::FixAcceptor_delete(self.raw);
+        }
     }
 }

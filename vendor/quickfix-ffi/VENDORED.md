@@ -64,6 +64,11 @@ Verified against `libquickfix/src/C++/Session.cpp` and the qualification tests i
 - The single-threaded `SocketInitiator` never reconnects after a session-initiated disconnect
   (`SocketMonitor::drop` removes the socket before `ConnectorWrapper::onError` calls it again),
   so the source uses `ThreadedSocketInitiator`.
+- `~Initiator` and `~Acceptor` delete their sessions without stopping engine threads; the Rust
+  owners call `stop(force)` before deleting.
+- The session registry is process-global: `Session::Session` ignores a failed `addSession` for a
+  duplicate ID, and `~Session` erases the registry entry by ID, so two live sessions with one ID
+  corrupt each other. The Rust sockets claim each session ID process-wide.
 
 ## Licences
 

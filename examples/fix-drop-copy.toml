@@ -1,0 +1,68 @@
+# Single-node FIX drop-copy profile. SYNTHETIC: the CompIDs, endpoint, and dictionary are
+# placeholders; qualify a real venue with its own dictionary, schedule, and conformance tests.
+#
+# Build the server with the FIX source: cargo build -p laminar-server --features fix
+# Secrets come from the environment: FIX_PASSWORD.
+
+[server]
+mode = "single"
+bind = "127.0.0.1:8080"
+
+[checkpoint]
+url = "file:///var/lib/laminardb/checkpoints"
+interval = "5s"
+
+[pipeline]
+delivery = "at_least_once"
+
+[[source]]
+name = "fills"
+connector = "fix"
+[source.properties]
+host = "fix-uat.venue.example"
+port = "9443"
+"tls.ca.file" = "/etc/laminardb/fix/venue-ca.pem"
+"sender.comp.id" = "LAMINAR"
+"target.comp.id" = "VENUE"
+username = "laminar"
+password = "$${FIX_PASSWORD}"
+"dictionary.path" = "/etc/laminardb/fix/venue-FIX44.xml"
+messages = "8"
+"journal.path" = "/var/lib/laminardb/fix/venue"
+"schedule.start.time" = "06:00:00"
+"schedule.end.time" = "22:00:00"
+"column.exec_id" = "17"
+"column.order_id" = "37"
+"column.symbol" = "55"
+"column.last_qty" = "32"
+"column.last_px" = "31"
+"column.transact_time" = "60"
+[[source.schema]]
+name = "exec_id"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "order_id"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "last_qty"
+type = "DECIMAL(18, 4)"
+[[source.schema]]
+name = "last_px"
+type = "DECIMAL(18, 8)"
+[[source.schema]]
+name = "transact_time"
+type = "TIMESTAMP"
+nullable = false
+[[source.schema]]
+name = "_fix_seq_num"
+type = "BIGINT"
+nullable = false
+[source.watermark]
+column = "transact_time"
+max_out_of_orderness = "2s"
