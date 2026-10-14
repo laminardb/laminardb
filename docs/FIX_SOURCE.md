@@ -368,8 +368,8 @@ journal end) rather than duplicating rows.
 Process kills are tested (repeated hard kills of a running pipeline lose no message). The host
 and power failure rows follow from the flush ordering above; no power-loss test has been run.
 
-Changing the session identity, dictionary content, message selection, or validation flags
-changes the journal's capture contract; a journal with a different contract is rejected. Change
+Changing the session identity, dictionary content, message selection, validation flags, or
+`venue` changes the journal's capture contract; a journal with a different contract is rejected. Change
 the column mapping by dropping and recreating the source: the pipeline identity changes, the new
 source starts from the oldest retained journal record, and the session continues.
 

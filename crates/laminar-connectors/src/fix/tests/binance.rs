@@ -19,7 +19,7 @@ use base64::Engine as _;
 
 use super::super::testing::{FixTestVenue, TestGroupEntry, TestMessage};
 use super::super::FixSource;
-use super::collect;
+use super::{collect, resume};
 use crate::config::{encode_arrow_schema_ipc, ConnectorConfig};
 use crate::connector::{DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart};
 
@@ -111,7 +111,11 @@ fn config(journal: &Path, extra: &[(&str, &str)]) -> ConnectorConfig {
     config
 }
 
-async fn start(config: ConnectorConfig, registry: Option<Arc<prometheus::Registry>>) -> FixSource {
+async fn start(
+    config: ConnectorConfig,
+    position: SourcePosition,
+    registry: Option<Arc<prometheus::Registry>>,
+) -> FixSource {
     let mut source = FixSource::new(registry);
     let binding = source
         .resolve_schema(&config, Some(schema()))
@@ -120,17 +124,18 @@ async fn start(config: ConnectorConfig, registry: Option<Arc<prometheus::Registr
     let mut config = config;
     config.set_schema_binding(binding).expect("binding");
     source
-        .start(
-            SourceStart::new(
-                config,
-                SourcePosition::Initial,
-                DeliveryGuarantee::AtLeastOnce,
-            )
-            .expect("request"),
-        )
+        .start(SourceStart::new(config, position, DeliveryGuarantee::AtLeastOnce).expect("request"))
         .await
         .expect("start");
     source
+}
+
+async fn wait_logons(venue: &FixTestVenue, logons: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while venue.logons() < logons || !venue.logged_on() {
+        assert!(Instant::now() < deadline, "logon {logons}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// An ExecutionReport with the fields and formats of Binance's documented sample.
@@ -251,7 +256,7 @@ fn series_and_gaps(batches: &[RecordBatch]) -> Vec<(u32, bool)> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn signed_logon_resets_every_session_and_flags_the_reconnect_gap() {
+async fn signed_logon_resets_every_session_and_flags_reconnect_and_restart_gaps() {
     let dir = tempfile::tempdir().expect("dir");
     let venue = FixTestVenue::start_with_settings(
         &dir.path().join("venue"),
@@ -270,11 +275,9 @@ async fn signed_logon_resets_every_session_and_flags_the_reconnect_gap() {
         ("transport", "tcp"),
         ("logon.key.file", key.as_str()),
     ];
-    let mut source = start(config(&dir.path().join("journal"), &extra), None).await;
-    assert!(
-        venue.wait_logged_on(Duration::from_secs(20)),
-        "signed logon"
-    );
+    let config = || config(&dir.path().join("journal"), &extra);
+    let mut source = start(config(), SourcePosition::Initial, None).await;
+    wait_logons(&venue, 1).await;
     assert_signed_logon(&venue.logon_requests()[0], &public_key);
 
     venue.send(&execution_report(144)).expect("send");
@@ -292,17 +295,23 @@ async fn signed_logon_resets_every_session_and_flags_the_reconnect_gap() {
     // Binance answers no ResendRequest, so whatever it sent while the session was down is
     // gone: the next series starts with a flagged row.
     venue.reset_session().expect("disconnect");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while venue.logons() < 2 || !venue.logged_on() {
-        assert!(Instant::now() < deadline, "second logon");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_logons(&venue, 2).await;
     assert_signed_logon(&venue.logon_requests()[1], &public_key);
     venue.send(&execution_report(146)).expect("send");
     venue.send(&execution_report(147)).expect("send");
-    let (second, _) = collect(&mut source, 2).await;
+    let (second, checkpoint) = collect(&mut source, 2).await;
     assert_eq!(int64(&second, "exec_id"), vec![146, 147]);
     assert_eq!(series_and_gaps(&second), vec![(2, true), (2, false)]);
+
+    // A clean restart is a gap too: the session was down between the runs.
+    source.close().await.expect("close");
+    let mut source = start(config(), resume(checkpoint), None).await;
+    wait_logons(&venue, 3).await;
+    assert_signed_logon(&venue.logon_requests()[2], &public_key);
+    venue.send(&execution_report(148)).expect("send");
+    let (third, _) = collect(&mut source, 1).await;
+    assert_eq!(int64(&third, "exec_id"), vec![148]);
+    assert_eq!(series_and_gaps(&third), vec![(3, true)]);
     source.close().await.expect("close");
     venue.stop().expect("stop venue");
 }
@@ -374,7 +383,12 @@ async fn binance_testnet_drop_copy_logs_on() {
         ("logon.key.file", key_file.as_str()),
     ];
     let registry = Arc::new(prometheus::Registry::new());
-    let mut source = start(config(&journal, &extra), Some(registry.clone())).await;
+    let mut source = start(
+        config(&journal, &extra),
+        SourcePosition::Initial,
+        Some(registry.clone()),
+    )
+    .await;
     let deadline = Instant::now() + Duration::from_secs(30);
     while !logged_on(&registry) {
         assert!(Instant::now() < deadline, "testnet logon");
