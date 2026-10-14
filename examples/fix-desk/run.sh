@@ -10,7 +10,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 DATA=${DESK_DATA_DIR:-$HERE/data}
-PYTHON=${PYTHON:-python3}
+# Probe by running: on Windows `python3` may be a Store alias that only opens the Store.
+PYTHON=${PYTHON:-$(for p in python3 python; do "$p" -c '' 2>/dev/null && echo "$p" && break; done)}
 # The standard FIX 4.4 dictionary from the QuickFIX commit the engine is built from.
 QUICKFIX_COMMIT=386ce46e917ae494ab6e90b1be90fd421cdbe3f9
 FIX44_SHA256=a82655b54363aa9c6d1b2f21f294f1198c0d7125d7b44c26d93d3179f3358425

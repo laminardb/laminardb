@@ -1,7 +1,6 @@
 [server]
 mode = "single"
 bind = "127.0.0.1:8080"
-pgwire_bind = "127.0.0.1:5432"
 delivery = "exactly_once"
 
 [checkpoint]
