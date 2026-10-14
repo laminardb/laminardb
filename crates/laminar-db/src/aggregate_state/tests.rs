@@ -2294,3 +2294,122 @@ fn binary_scalar_roundtrips_exactly() {
     let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
     assert_eq!(round_trip(&sv), sv);
 }
+
+/// Registers `fills (symbol, kind, qty DECIMAL(18, 8), px DOUBLE)` and returns three rows:
+/// a fill of 1.5 at 2.5, a non-fill of 2 at 3.0, and a fill of 0.5 at 1.0.
+pub(crate) fn mixed_type_fills(ctx: &SessionContext) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("qty", DataType::Decimal128(18, 8), false),
+        Field::new("px", DataType::Float64, false),
+    ]));
+    let qty = arrow::array::Decimal128Array::from(vec![150_000_000_i128, 200_000_000, 50_000_000])
+        .with_precision_and_scale(18, 8)
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["A", "A", "A"])),
+            Arc::new(arrow::array::StringArray::from(vec!["F", "N", "F"])),
+            Arc::new(qty),
+            Arc::new(arrow::array::Float64Array::from(vec![2.5, 3.0, 1.0])),
+        ],
+    )
+    .unwrap();
+    let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+    ctx.register_table("fills", Arc::new(table)).unwrap();
+    batch
+}
+
+#[tokio::test]
+async fn compiled_pre_aggregation_coerces_mixed_operand_types() {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Decimal128Type, Float64Type, Int64Type};
+
+    let ctx = laminar_sql::create_session_context();
+    let input = mixed_type_fills(&ctx);
+    let sql = "SELECT symbol, SUM(CASE WHEN kind = 'F' THEN qty ELSE 0 END) AS volume, \
+               MAX(px * 1000) AS px_milli FROM fills WHERE qty >= 1 GROUP BY symbol";
+    let declared = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .logical_plan()
+        .schema()
+        .as_arrow()
+        .clone();
+    let mut state = try_from_sql_local(&ctx, sql, false)
+        .await
+        .unwrap()
+        .expect("aggregate state");
+    let projection = state
+        .compiled_projection()
+        .expect("compiled pre-aggregation");
+    let pre_aggregated =
+        crate::operator_graph::try_evaluate_compiled(projection, &[input.clone()]).unwrap();
+    for batch in &pre_aggregated {
+        state.process_batch(batch, i64::MIN).unwrap();
+    }
+    let emitted = state.emit().unwrap();
+    assert_eq!(emitted[0].schema().as_ref(), &declared);
+    // The 0.5 fill fails WHERE; the non-fill contributes the ELSE branch.
+    assert_eq!(
+        emitted[0]
+            .column(1)
+            .as_primitive::<Decimal128Type>()
+            .value(0),
+        150_000_000
+    );
+    assert_eq!(
+        emitted[0].column(2).as_primitive::<Float64Type>().value(0),
+        3000.0
+    );
+
+    let keyed = "SELECT CASE WHEN kind = 'F' THEN qty ELSE 0 END AS bucket, COUNT(*) AS n \
+                 FROM fills GROUP BY CASE WHEN kind = 'F' THEN qty ELSE 0 END";
+    let mut state = try_from_sql_local(&ctx, keyed, false)
+        .await
+        .unwrap()
+        .expect("aggregate state");
+    let projection = state
+        .compiled_projection()
+        .expect("compiled pre-aggregation");
+    for batch in crate::operator_graph::try_evaluate_compiled(projection, &[input]).unwrap() {
+        state.process_batch(&batch, i64::MIN).unwrap();
+    }
+    let emitted = state.emit().unwrap();
+    let mut buckets: Vec<(i128, i64)> = emitted
+        .iter()
+        .flat_map(|batch| {
+            let bucket = batch.column(0).as_primitive::<Decimal128Type>();
+            let count = batch.column(1).as_primitive::<Int64Type>();
+            (0..batch.num_rows())
+                .map(|row| (bucket.value(row), count.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    buckets.sort_unstable();
+    assert_eq!(buckets, vec![(0, 1), (50_000_000, 1), (150_000_000, 1)]);
+}
+
+#[tokio::test]
+async fn compiled_pre_aggregation_rejects_case_branches_it_would_truncate() {
+    let ctx = laminar_sql::create_session_context();
+    mixed_type_fills(&ctx);
+    // An unanalyzed CASE is typed by its first branch; a DOUBLE column, or a literal that does
+    // not convert exactly, cannot be narrowed to it.
+    for sql in [
+        "SELECT symbol, SUM(CASE WHEN kind = 'F' THEN qty ELSE px END) AS v FROM fills GROUP BY symbol",
+        "SELECT symbol, SUM(CASE WHEN kind = 'F' THEN 1 ELSE 0.5 END) AS v FROM fills GROUP BY symbol",
+    ] {
+        let error = match try_from_sql_local(&ctx, sql, false).await {
+            Err(error) => error,
+            Ok(_) => panic!("a lossy CASE was admitted: {sql}"),
+        };
+        assert!(
+            error.to_string().contains("CAST the CASE branches"),
+            "{sql}: {error}"
+        );
+    }
+}

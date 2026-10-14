@@ -6,8 +6,9 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
-use datafusion_common::tree_node::TreeNode;
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{DFSchema, ScalarValue};
+use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::{ExprSchemable, LogicalPlan};
 use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
@@ -25,9 +26,94 @@ pub(crate) struct AggregateInfo {
     pub(crate) where_predicate: Option<datafusion_expr::Expr>,
 }
 
-/// Supplied by the caller so the builder needn't name `DFSchema`/`ExecutionProps`.
+/// Supplied by the caller so the builder needn't name `DFSchema`/`ExecutionProps`. `Ok(None)`
+/// means the expression cannot be compiled and the query falls back to its cached plan.
 pub(crate) type ExprCompiler<'a> =
-    dyn Fn(&datafusion_expr::Expr) -> Option<Arc<dyn PhysicalExpr>> + 'a;
+    dyn Fn(&datafusion_expr::Expr) -> Result<Option<Arc<dyn PhysicalExpr>>, DbError> + 'a;
+
+/// Compiles an expression of the unanalyzed logical plan that managed aggregates are built from.
+///
+/// The plan's types are the stream ABI, but its expressions never went through DataFusion's type
+/// coercion, so operands are coerced here. An unanalyzed CASE is typed by its first non-null
+/// THEN branch; literal branches that convert exactly to that type (`ELSE 0` beside a DECIMAL)
+/// are narrowed to it first. Any other mismatch is rejected instead of cast, so no value is
+/// silently truncated.
+///
+/// # Errors
+/// Returns [`DbError::Unsupported`] when the coerced expression's type differs from the type
+/// the plan declares.
+pub(crate) fn compile_plan_expr(
+    expr: &datafusion_expr::Expr,
+    schema: &DFSchema,
+    props: &ExecutionProps,
+) -> Result<Option<Arc<dyn PhysicalExpr>>, DbError> {
+    let Ok(declared) = expr.get_type(schema) else {
+        return Ok(None);
+    };
+    let Ok(coerced) = narrow_case_literals(expr.clone(), schema)
+        .and_then(|narrowed| narrowed.rewrite(&mut TypeCoercionRewriter::new(schema)))
+    else {
+        return Ok(None);
+    };
+    match coerced.data.get_type(schema) {
+        Ok(actual) if actual == declared => {
+            Ok(create_physical_expr(&coerced.data, schema, props).ok())
+        }
+        Ok(actual) => Err(DbError::Unsupported(format!(
+            "[{}] '{expr}' is typed {declared} but its operands need {actual}; CAST the CASE \
+             branches to one type",
+            laminar_core::error_codes::SQL_UNSUPPORTED
+        ))),
+        Err(_) => Ok(None),
+    }
+}
+
+fn narrow_case_literals(
+    expr: datafusion_expr::Expr,
+    schema: &DFSchema,
+) -> datafusion_common::Result<datafusion_expr::Expr> {
+    expr.transform_up(|expr| {
+        let datafusion_expr::Expr::Case(mut case) = expr else {
+            return Ok(Transformed::no(expr));
+        };
+        let mut declared = None;
+        for (_, then) in &case.when_then_expr {
+            let data_type = then.get_type(schema)?;
+            if !data_type.is_null() {
+                declared = Some(data_type);
+                break;
+            }
+        }
+        let Some(declared) = declared else {
+            return Ok(Transformed::no(datafusion_expr::Expr::Case(case)));
+        };
+        let branches = case
+            .when_then_expr
+            .iter_mut()
+            .map(|(_, then)| then)
+            .chain(case.else_expr.as_mut());
+        for branch in branches {
+            if let datafusion_expr::Expr::Literal(value, metadata) = branch.as_ref() {
+                if let Some(exact) = exact_cast(value, &declared) {
+                    **branch = datafusion_expr::Expr::Literal(exact, metadata.clone());
+                }
+            }
+        }
+        Ok(Transformed::yes(datafusion_expr::Expr::Case(case)))
+    })
+    .map(|transformed| transformed.data)
+}
+
+fn exact_cast(value: &ScalarValue, to: &DataType) -> Option<ScalarValue> {
+    if value.data_type() == *to {
+        return None;
+    }
+    let cast = value.cast_to(to).ok()?;
+    if value.is_null() {
+        return Some(cast);
+    }
+    (cast.cast_to(&value.data_type()).ok()? == *value).then_some(cast)
+}
 
 /// Builds a query's pre-aggregate projection; shared by the plain, windowed, and
 /// EOWC aggregate-state builders.
@@ -70,11 +156,11 @@ impl<'a> PreAggBuilder<'a> {
         fallback: DataType,
         from_phys: bool,
         compile: &ExprCompiler<'_>,
-    ) {
+    ) -> Result<(), DbError> {
         if !self.compile_ok {
-            return;
+            return Ok(());
         }
-        match compile(expr) {
+        match compile(expr)? {
             Some(phys) => {
                 let dt = if from_phys {
                     phys.data_type(self.input_schema).unwrap_or(fallback)
@@ -86,6 +172,7 @@ impl<'a> PreAggBuilder<'a> {
             }
             None => self.compile_ok = false,
         }
+        Ok(())
     }
 
     pub(crate) fn push_group_expr(
@@ -93,7 +180,7 @@ impl<'a> PreAggBuilder<'a> {
         i: usize,
         group_expr: &datafusion_expr::Expr,
         compile: &ExprCompiler<'_>,
-    ) {
+    ) -> Result<(), DbError> {
         let name = if let datafusion_expr::Expr::Column(col) = group_expr {
             self.pre_agg_select_items.push(format!("\"{}\"", col.name));
             col.name.clone()
@@ -103,7 +190,7 @@ impl<'a> PreAggBuilder<'a> {
                 .push(format!("{group_sql} AS \"__group_{i}\""));
             format!("__group_{i}")
         };
-        self.push_compiled_column(&name, group_expr, DataType::Utf8, true, compile);
+        self.push_compiled_column(&name, group_expr, DataType::Utf8, true, compile)
     }
 
     /// `Ok(false)` if `expr` is not an aggregate function.
@@ -152,7 +239,7 @@ impl<'a> PreAggBuilder<'a> {
                 DataType::Boolean,
                 false,
                 compile,
-            );
+            )?;
         } else {
             let raw_types: Vec<DataType> = agg_func
                 .params
@@ -215,7 +302,7 @@ impl<'a> PreAggBuilder<'a> {
                     dt.clone(),
                     false,
                     compile,
-                );
+                )?;
 
                 input_col_indices.push(col_idx);
                 input_types.push(dt);
@@ -226,7 +313,8 @@ impl<'a> PreAggBuilder<'a> {
             .params
             .filter
             .as_ref()
-            .map(|filter_expr| self.push_filter_column(filter_expr, compile));
+            .map(|filter_expr| self.push_filter_column(filter_expr, compile))
+            .transpose()?;
 
         let return_type = udf.return_type(&input_types).map_err(|error| {
             DbError::Unsupported(format!(
@@ -252,7 +340,7 @@ impl<'a> PreAggBuilder<'a> {
         &mut self,
         filter_expr: &datafusion_expr::Expr,
         compile: &ExprCompiler<'_>,
-    ) -> usize {
+    ) -> Result<usize, DbError> {
         let col_idx = self.next_col_idx;
         self.next_col_idx += 1;
         let filter_sql = expr_to_sql(filter_expr);
@@ -273,8 +361,8 @@ impl<'a> PreAggBuilder<'a> {
             DataType::Boolean,
             false,
             compile,
-        );
-        col_idx
+        )?;
+        Ok(col_idx)
     }
 }
 
