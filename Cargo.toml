@@ -12,6 +12,7 @@ exclude = [
     "vendor/pgwire",
     "vendor/pgwire-replication",
     "vendor/quick-xml",
+    "vendor/quickfix-ffi",
     "vendor/rdkafka-sys",
 ]
 resolver = "2"

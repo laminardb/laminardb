@@ -5618,7 +5618,8 @@ async fn test_connector_registry_accessor() {
         + usize::from(cfg!(feature = "mongodb-cdc"))
         + usize::from(cfg!(feature = "files"))
         + usize::from(cfg!(feature = "otel"))
-        + usize::from(cfg!(feature = "nats"));
+        + usize::from(cfg!(feature = "nats"))
+        + usize::from(cfg!(feature = "fix"));
     let expected_sinks = usize::from(cfg!(feature = "kafka"))
         + usize::from(cfg!(feature = "postgres-sink"))
         + usize::from(cfg!(feature = "delta-lake"))

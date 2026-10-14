@@ -24,6 +24,10 @@ jobs:
       id-token: write
     env:
       CARGO_INCREMENTAL: 0
+      # Source-based coverage reads the instrumentation maps, not DWARF; debuginfo in every
+      # all-features test binary filled the runner disk.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
       # Coverage instrumentation grows the same large async recovery test frames exercised by CI.
       RUST_MIN_STACK: 4194304
     steps:

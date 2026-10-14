@@ -112,7 +112,8 @@ jobs:
 
           # Keep the publishable maintained forks on the release version.
           perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
-            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml
+            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml \
+            vendor/quickfix-ffi/Cargo.toml
 
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
@@ -326,7 +327,8 @@ jobs:
 
           # Keep the publishable maintained forks on the release version.
           perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
-            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml
+            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml \
+            vendor/quickfix-ffi/Cargo.toml
 
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
@@ -353,6 +355,10 @@ jobs:
 
       - name: Publish laminardb-pgwire-replication
         run: cargo publish --manifest-path vendor/pgwire-replication/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-quickfix-ffi
+        run: cargo publish --manifest-path vendor/quickfix-ffi/Cargo.toml --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for fork index entries

@@ -56,6 +56,28 @@ epoch microsecond literal for a `TIMESTAMP` column. For example,
 after the epoch. String timestamp literals are not accepted by this insertion
 path.
 
+A FIX session source (`fix` feature) declares every column and maps it to a tag path; see
+[FIX source](FIX_SOURCE.md) for options, the mapping grammar, and the recovery contract:
+
+```sql
+CREATE SOURCE fills (
+    exec_id       VARCHAR NOT NULL,
+    last_px       DECIMAL(18, 8),
+    transact_time TIMESTAMP NOT NULL,
+    party_ids     ARRAY<VARCHAR>,
+    _fix_seq_num  BIGINT NOT NULL,
+    WATERMARK FOR transact_time AS transact_time - INTERVAL '2' SECOND
+) FROM FIX (
+    host = 'fix.venue.example', port = '9443',
+    'sender.comp.id' = 'LAMINAR', 'target.comp.id' = 'VENUE',
+    password = '${FIX_PASSWORD}',
+    'dictionary.path' = '/etc/laminardb/fix/venue-FIX44.xml',
+    messages = '8', 'journal.path' = '/var/lib/laminardb/fix/venue',
+    'column.exec_id' = '17', 'column.last_px' = '31',
+    'column.transact_time' = '60', 'column.party_ids' = '453.448'
+)
+```
+
 **Rust side:**
 ```rust
 #[derive(Record)]

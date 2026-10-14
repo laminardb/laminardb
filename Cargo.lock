@@ -5250,6 +5250,7 @@ dependencies = [
  "jiff",
  "laminar-core",
  "laminardb-pgwire-replication",
+ "laminardb-quickfix-ffi",
  "libc",
  "mongodb",
  "notify",
@@ -5260,8 +5261,10 @@ dependencies = [
  "pgpq",
  "postgres-types",
  "prometheus",
+ "proptest",
  "quick_cache",
  "rand 0.10.3",
+ "rcgen",
  "rdkafka",
  "reqwest 0.12.28",
  "reqwest 0.13.5",
@@ -5289,6 +5292,7 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.9",
  "wiremock",
+ "xxhash-rust",
  "zstd",
 ]
 
@@ -5557,6 +5561,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "laminardb-quickfix-ffi"
+version = "0.32.0"
+dependencies = [
+ "cmake",
+ "fs_extra",
 ]
 
 [[package]]
@@ -8437,9 +8449,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

@@ -110,6 +110,10 @@ pub mod otel;
 #[cfg(feature = "nats")]
 pub mod nats;
 
+/// FIX TagValue session source connector.
+#[cfg(feature = "fix")]
+pub mod fix;
+
 /// AutoLoader-style file source and sink connectors.
 #[cfg(feature = "files")]
 #[allow(

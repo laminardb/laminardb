@@ -1,0 +1,8 @@
+#ifndef CONFIG_H_IN
+#define CONFIG_H_IN
+
+#cmakedefine HAVE_MYSQL
+#cmakedefine HAVE_POSTGRESQL
+#cmakedefine HAVE_SSL 1
+
+#endif

@@ -946,7 +946,7 @@ fn source_contract_admission_matrix_is_fail_closed() {
                                 }
                                 SourceConsistency::Replayable => true,
                                 SourceConsistency::CommitCoupled => {
-                                    delivery == DeliveryGuarantee::AtLeastOnce
+                                    delivery != DeliveryGuarantee::BestEffort
                                         && checkpointing_enabled
                                 }
                             };
@@ -1025,6 +1025,50 @@ fn postgres_cdc_is_admitted_only_locally_at_least_once_with_checkpoints() {
     }
 }
 
+#[cfg(feature = "fix")]
+#[test]
+fn fix_source_is_admitted_only_locally_with_checkpoints() {
+    use super::admit_source_recovery_contract;
+
+    let registry = laminar_connectors::registry::ConnectorRegistry::new();
+    laminar_connectors::fix::register_fix_source(&registry).unwrap();
+    let mut config = ConnectorConfig::new("fix");
+    for (key, value) in [
+        ("host", "127.0.0.1"),
+        ("port", "9878"),
+        ("transport", "tcp"),
+        ("sender.comp.id", "LAMINAR"),
+        ("target.comp.id", "VENUE"),
+        ("dictionary.path", "FIX44.xml"),
+        ("messages", "8"),
+        ("journal.path", "journal"),
+    ] {
+        config.set(key, value);
+    }
+    let source = registry.create_source(&config, None).unwrap();
+    let contract = source.contract(&config).unwrap();
+    let admit = |delivery, checkpointing, runtime| {
+        admit_source_recovery_contract(contract, delivery, checkpointing, runtime)
+    };
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Local),
+        Ok(())
+    );
+    assert_eq!(
+        admit(DeliveryGuarantee::AtLeastOnce, true, RuntimeMode::Cluster),
+        Err("cluster singleton sources require fenced singleton placement, which is not implemented"),
+        "the journal and engine store are node-local"
+    );
+    assert_eq!(
+        admit(DeliveryGuarantee::ExactlyOnce, true, RuntimeMode::Local),
+        Ok(())
+    );
+    assert!(admit(DeliveryGuarantee::ExactlyOnce, true, RuntimeMode::Cluster).is_err());
+    assert!(admit(DeliveryGuarantee::ExactlyOnce, false, RuntimeMode::Local).is_err());
+    assert!(admit(DeliveryGuarantee::AtLeastOnce, false, RuntimeMode::Local).is_err());
+    assert!(admit(DeliveryGuarantee::BestEffort, true, RuntimeMode::Local).is_err());
+}
+
 #[cfg(feature = "delta-lake")]
 #[test]
 fn delta_change_feed_is_a_local_replayable_changelog_route_source() {
@@ -1077,21 +1121,28 @@ fn cluster_best_effort_is_rejected_before_source_topology() {
 
 #[test]
 fn commit_coupled_exactly_once_requires_a_certified_barrier_cut() {
-    let mut contract = laminar_connectors::generator::GeneratorSource::default()
+    let mut certified = laminar_connectors::generator::GeneratorSource::default()
         .contract(&ConnectorConfig::new("generator"))
         .expect("static generator contract");
-    contract.consistency = SourceConsistency::CommitCoupled;
-    let error = admit_source_contract(
-        contract,
-        false,
-        false,
-        DeliveryGuarantee::ExactlyOnce,
-        true,
-        RuntimeMode::Local,
-    )
-    .unwrap_err();
+    certified.consistency = SourceConsistency::CommitCoupled;
+    let admit = |contract| {
+        admit_source_contract(
+            contract,
+            false,
+            false,
+            DeliveryGuarantee::ExactlyOnce,
+            true,
+            RuntimeMode::Local,
+        )
+    };
+    assert_eq!(admit(certified), Ok(()));
 
-    assert!(error.contains("certified in-flight transaction/barrier checkpoint cut"));
+    let uncertified = SourceContract::new(
+        SourceConsistency::CommitCoupled,
+        SourceTopology::Singleton,
+        SourceInputMode::AppendOnly,
+    );
+    assert!(admit(uncertified).unwrap_err().contains("LDB-5037"));
 }
 
 #[test]

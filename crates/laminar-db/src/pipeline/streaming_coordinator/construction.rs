@@ -325,7 +325,7 @@ impl StreamingCoordinator {
             for src in sources {
                 if src.contract().consistency == SourceConsistency::CommitCoupled {
                     return Err(DbError::Config(format!(
-                        "source '{}' is commit-coupled; commit-coupled sources currently support only at-least-once delivery",
+                        "source '{}' is commit-coupled; commit-coupled sources support only at-least-once and certified exactly-once delivery",
                         src.name
                     )));
                 }
