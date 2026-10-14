@@ -16,7 +16,7 @@ use arrow_schema::{DataType, Field, FieldRef, Fields, SchemaRef, TimeUnit};
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::fix::config::COLUMN_PREFIX;
-use crate::fix::engine::{DataDictionary, FieldType, GroupDictionary, Section};
+use crate::fix::engine::{FieldType, GroupDictionary, Section, SessionDictionaries};
 
 /// Connector metadata available to columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +227,7 @@ struct Groups<'a> {
 
 struct Compiler<'a> {
     config: &'a ConnectorConfig,
-    dictionary: &'a DataDictionary,
+    dictionary: &'a SessionDictionaries,
     messages: &'a BTreeSet<String>,
     expand: Option<(i32, Groups<'a>)>,
     truncate_timestamps: bool,
@@ -524,7 +524,7 @@ impl<'a> Compiler<'a> {
 pub(crate) fn compile(
     config: &ConnectorConfig,
     schema: &SchemaRef,
-    dictionary: &DataDictionary,
+    dictionary: &SessionDictionaries,
     messages: &BTreeSet<String>,
 ) -> Result<ProjectionPlan, ConnectorError> {
     for message in messages {

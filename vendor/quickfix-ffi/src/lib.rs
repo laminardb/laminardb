@@ -541,10 +541,17 @@ extern "C" {
         sink: LmFixBytesSink,
     ) -> i8;
 
+    pub fn LmFix_dictionaryVersion(
+        dictionary: FixDataDictionary_t,
+        ctx: *mut ffi::c_void,
+        sink: LmFixBytesSink,
+    ) -> i8;
+
     pub fn LmFix_messageParse(
         ptr: *const ffi::c_char,
         len: usize,
-        dictionary: FixDataDictionary_t,
+        session_dictionary: FixDataDictionary_t,
+        application_dictionary: FixDataDictionary_t,
     ) -> Option<FixMessage_t>;
 
     pub fn LmFix_dictionaryFieldType(dictionary: FixDataDictionary_t, tag: i32) -> i32;

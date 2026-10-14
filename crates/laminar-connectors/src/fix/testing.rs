@@ -30,6 +30,8 @@ pub struct TestGroupEntry {
 pub struct TestMessage {
     /// MsgType (35).
     pub msg_type: String,
+    /// Header fields beyond those the engine fills, such as ApplVerID (1128).
+    pub header_fields: Vec<(i32, String)>,
     /// Body fields.
     pub fields: Vec<(i32, String)>,
     /// Body groups as `(count tag, entries)`.
@@ -200,6 +202,11 @@ impl FixTestVenue {
         outbound
             .set_field(Section::Header, 35, message.msg_type.as_bytes())
             .map_err(engine_error)?;
+        for (tag, value) in &message.header_fields {
+            outbound
+                .set_field(Section::Header, *tag, value.as_bytes())
+                .map_err(engine_error)?;
+        }
         for (tag, value) in &message.fields {
             outbound
                 .set_field(Section::Body, *tag, value.as_bytes())

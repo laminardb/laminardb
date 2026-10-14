@@ -23,6 +23,14 @@ const DICTIONARY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/fix/FIX44-synthetic.xml"
 );
+const TRANSPORT_DICTIONARY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/fix/FIXT11-synthetic.xml"
+);
+const APPLICATION_DICTIONARY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/fix/FIX50SP2-synthetic.xml"
+);
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -40,6 +48,7 @@ struct Harness {
     dir: tempfile::TempDir,
     name: String,
     venue: Option<FixTestVenue>,
+    fixt: bool,
 }
 
 impl Harness {
@@ -57,6 +66,32 @@ impl Harness {
             dir,
             name: name.to_string(),
             venue: Some(venue),
+            fixt: false,
+        }
+    }
+
+    /// A FIXT.1.1 venue whose DefaultApplVerID is `venue_version`; the source captures
+    /// FIX.5.0SP2.
+    fn fixt(name: &str, venue_version: &str) -> Self {
+        let dir = tempfile::tempdir().expect("dir");
+        let venue = FixTestVenue::start_with_settings(
+            &dir.path().join("venue"),
+            Path::new(APPLICATION_DICTIONARY),
+            "FIXT.1.1",
+            &format!("V_{name}"),
+            &format!("L_{name}"),
+            &[
+                ("TransportDataDictionary", TRANSPORT_DICTIONARY.to_string()),
+                ("AppDataDictionary", APPLICATION_DICTIONARY.to_string()),
+                ("DefaultApplVerID", venue_version.to_string()),
+            ],
+        )
+        .expect("venue");
+        Self {
+            dir,
+            name: name.to_string(),
+            venue: Some(venue),
+            fixt: true,
         }
     }
 
@@ -97,6 +132,16 @@ impl Harness {
         ] {
             config.set(key, value);
         }
+        if self.fixt {
+            for (key, value) in [
+                ("begin.string", "FIXT.1.1"),
+                ("dictionary.path", APPLICATION_DICTIONARY),
+                ("transport.dictionary.path", TRANSPORT_DICTIONARY),
+                ("appl.ver.id", "FIX.5.0SP2"),
+            ] {
+                config.set(key, value);
+            }
+        }
         for (key, value) in extra {
             config.set(*key, *value);
         }
@@ -105,6 +150,16 @@ impl Harness {
     }
 
     async fn start(&self, position: SourcePosition, extra: &[(&str, &str)]) -> FixSource {
+        let source = self.start_source(position, extra).await;
+        assert!(
+            self.venue().wait_logged_on(Duration::from_secs(20)),
+            "client logon"
+        );
+        source
+    }
+
+    /// Start the source without waiting for the session to log on.
+    async fn start_source(&self, position: SourcePosition, extra: &[(&str, &str)]) -> FixSource {
         let mut source = FixSource::new(None);
         let config = self.config(extra);
         let binding = source
@@ -120,10 +175,6 @@ impl Harness {
             )
             .await
             .expect("start");
-        assert!(
-            self.venue().wait_logged_on(Duration::from_secs(20)),
-            "client logon"
-        );
         source
     }
 
@@ -152,6 +203,7 @@ fn execution_report(order_id: &str, exec_id: Option<&str>) -> TestMessage {
     }
     TestMessage {
         msg_type: "8".into(),
+        header_fields: Vec::new(),
         fields,
         groups: Vec::new(),
     }
@@ -265,6 +317,54 @@ async fn live_messages_become_rows_and_restart_replays_from_the_journal() {
         .expect("dup")
         .as_boolean();
     assert!(!dup.value(0), "replay preserves the original receive flags");
+    source.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixt_sessions_capture_one_application_version_and_replay_it_after_restart() {
+    let harness = Harness::fixt("fixt", "FIX.5.0SP2");
+    let mut source = harness.start(SourcePosition::Initial, &[]).await;
+    harness.send("E1");
+    let mut explicit = execution_report("E2", Some("E2"));
+    explicit.header_fields.push((1128, "9".into()));
+    harness.venue().send(&explicit).expect("send");
+    let (batches, first) = collect(&mut source, 2).await;
+    assert_eq!(column(&batches, "exec_id"), vec!["E1", "E2"]);
+    source.close().await.expect("close");
+
+    let mut early = first.clone();
+    let next: u64 = first
+        .get_offset("journal.next")
+        .expect("next")
+        .parse()
+        .expect("index");
+    early.set_offset("journal.next", (next - 2).to_string());
+    let mut source = harness.start(resume(early), &[]).await;
+    harness.send("E3");
+    let (batches, _) = collect(&mut source, 3).await;
+    assert_eq!(
+        column(&batches, "exec_id"),
+        vec!["E1", "E2", "E3"],
+        "replayed with both pinned dictionaries, then live"
+    );
+    source.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_counterparty_on_another_application_version_stops_the_source() {
+    let harness = Harness::fixt("fixtv", "FIX.5.0SP1");
+    let mut source = harness.start_source(SourcePosition::Initial, &[]).await;
+    let error = poll_error(&mut source).await;
+    assert!(error.contains("DefaultApplVerID '8'"), "{error}");
+    source.close().await.expect("close");
+
+    let harness = Harness::fixt("fixtm", "FIX.5.0SP2");
+    let mut source = harness.start(SourcePosition::Initial, &[]).await;
+    let mut foreign = execution_report("E1", Some("E1"));
+    foreign.header_fields.push((1128, "8".into()));
+    harness.venue().send(&foreign).expect("send");
+    let error = poll_error(&mut source).await;
+    assert!(error.contains("ApplVerID '8'"), "{error}");
     source.close().await.expect("close");
 }
 

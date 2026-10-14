@@ -37,7 +37,8 @@ upstream repository published no security advisories as of 2026-10-14.
 - `quickfix-bind/include/laminar_bridge.h` and `quickfix-bind/src/laminar_bridge.cpp` (new):
   length-aware field read/write and serialization, uniform field-map and group access,
   dictionary introspection, session state (store creation time and sequence numbers), sender
-  sequence setter for test counterparties, `stop(force)` for initiators and acceptors, and a
+  sequence setter for test counterparties, `stop(force)` for initiators and acceptors, dictionary
+  version, parsing with separate session and application dictionaries, and a
   `MessageStoreFactory` whose stores persist every sequence-number change and reset through
   caller callbacks before caching it (outbound messages are never stored). Every function
   catches all C++ exceptions, including non-`std::exception` ones.
@@ -77,6 +78,13 @@ Verified against `libquickfix/src/C++/Session.cpp` and the qualification tests i
 - Every store call runs under the session-state mutex. An `IOException` from a store makes
   `Session::next` disconnect and `Session::sendRaw` return without sending; with
   `PersistMessages=N`, `nextResendRequest` answers with a gap fill without reading the store.
+- Under FIXT.1.1 the engine parses inbound messages with the application dictionary of its own
+  DefaultApplVerID but validates each one against the dictionary of the message's ApplVerID
+  (1128) or the counterparty's DefaultApplVerID (1137); an ApplVerID without a configured
+  dictionary gets an empty dictionary, which validates nothing. `AppDataDictionary` is
+  registered under the configured DefaultApplVerID, not under the dictionary's own version.
+- A dictionary's version is `type.major.minor` of its root element; the service pack attribute
+  is ignored.
 - The engine resets its store (`SessionState::reset`) for an accepted Logon with
   ResetSeqNumFlag=Y, `ResetOnLogon`/`ResetOnLogout`/`ResetOnDisconnect`, and when the store's
   creation time falls outside the current schedule period.

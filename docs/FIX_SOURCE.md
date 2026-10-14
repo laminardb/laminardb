@@ -12,7 +12,7 @@ with CMake and a C++17 compiler. Builds without the feature do not compile or li
 | Area | Supported | Not supported (rejected before I/O) |
 |---|---|---|
 | Role | Initiator, one session per source | Acceptor |
-| Versions | FIX.4.4 (qualified with local tests), FIX.4.2 (same engine path, not separately exercised) | FIXT.1.1 / FIX 5.x, FIXP, FAST, SBE |
+| Versions | FIX.4.4 and FIXT.1.1 with one FIX 5.0 application version (FIX.5.0, SP1, or SP2) per source, qualified with local tests; FIX.4.2 (same engine path, not separately exercised) | Several application versions in one session, FIX.4.x application versions over FIXT, FIXP, FAST, SBE |
 | Transport | TLS with chain and hostname verification, optional mutual TLS; plaintext TCP to loopback, or to a remote host only with `tcp.allow.remote` | Engine-native SSL |
 | Deployment | Embedded, single-node server | Cluster (the journal and session state are node-local) |
 | Delivery | At-least-once with checkpointing | Best-effort, exactly-once |
@@ -97,11 +97,13 @@ inbound application messages only.
 | `tls.server.name` | `host` | Name verified against the server certificate |
 | `tls.client.cert.file`, `tls.client.key.file` | none | PEM client identity for mutual TLS |
 | `tcp.allow.remote` | `false` | Permit plaintext to a non-loopback host |
-| `begin.string` | `FIX.4.4` | `FIX.4.4` or `FIX.4.2` |
+| `begin.string` | `FIX.4.4` | `FIX.4.4`, `FIX.4.2`, or `FIXT.1.1` |
 | `sender.comp.id`, `target.comp.id` | required | Session CompIDs |
 | `session.qualifier` | none | Engine session qualifier |
 | `username`, `password` | none | Logon Username (553) / Password (554) |
-| `dictionary.path` | required | Dictionary XML, at most 16 MiB; pinned by SHA-256 at CREATE SOURCE |
+| `dictionary.path` | required | Dictionary XML (the application dictionary under FIXT.1.1), at most 16 MiB; pinned by SHA-256 at CREATE SOURCE |
+| `transport.dictionary.path` | required for FIXT.1.1 | FIXT.1.1 transport dictionary XML; pinned like `dictionary.path`; rejected for FIX.4.x |
+| `appl.ver.id` | required for FIXT.1.1 | `FIX.5.0`, `FIX.5.0SP1`, or `FIX.5.0SP2`; sent as DefaultApplVerID (1137); rejected for FIX.4.x |
 | `messages` | required | Comma-separated application MsgTypes to capture |
 | `journal.path` | required | Journal, session state, and pinned dictionary directory; exclusively locked |
 | `journal.sync` | `fsync` | `fsync` (host failure; group-committed flushes) or `os` (process failure only) |
@@ -130,6 +132,30 @@ inbound application messages only.
 Unknown options are rejected, as are engine settings outside this list. The source's Logon
 carries MaxMessageSize (383) = `max.message.bytes`, because the engine buffers a whole message
 before any local limit applies.
+
+### FIXT.1.1 and FIX 5.0
+
+A FIXT.1.1 source names a transport dictionary (header, trailer, session messages) and one
+application dictionary, and captures exactly one application version:
+
+```sql
+    'begin.string' = 'FIXT.1.1',
+    'transport.dictionary.path' = '/etc/laminardb/fix/venue-FIXT11.xml',
+    'dictionary.path' = '/etc/laminardb/fix/venue-FIX50SP2.xml',
+    'appl.ver.id' = 'FIX.5.0SP2',
+```
+
+- The engine validates each application message against the dictionary of its ApplVerID (1128),
+  or of the counterparty's DefaultApplVerID (1137) when the header has none, and an unconfigured
+  version gets an empty dictionary that validates nothing. The source therefore stops when the
+  counterparty's Logon carries another DefaultApplVerID or a message carries another ApplVerID.
+- At start the transport dictionary must describe `FIXT.1.1` and the application dictionary
+  `FIX.5.0`. The engine reads only the `type`, `major`, and `minor` attributes, so the service pack
+  of the application dictionary is not checked; `appl.ver.id` must match the venue's
+  specification.
+- `header.TAG` paths resolve against the transport dictionary and body paths against the
+  application dictionary. Both files are pinned and bound into the journal's capture contract,
+  as is `appl.ver.id`.
 
 ## Column mapping
 

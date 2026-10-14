@@ -13,6 +13,12 @@
 //! new journal series when the Logon carries ResetSeqNumFlag=Y or the store's creation time
 //! changed.
 //!
+//! Application version (FIXT.1.1): the engine parses inbound messages with the configured
+//! application dictionary but validates each one against the dictionary of its own version, and
+//! an unconfigured version gets an empty dictionary that validates nothing. A counterparty
+//! DefaultApplVerID (1137) or message ApplVerID (1128) other than the configured one therefore
+//! stops the source.
+//!
 //! Retransmissions: after a restart the engine's persisted target may trail the journal. A
 //! message at or below the journal's high-water mark is a retransmission of an already captured
 //! sequence number; it is compared with the original by content digest, ignoring header fields
@@ -24,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::config::Credentials;
+use super::config::{ApplVerId, Credentials, FixSourceConfig};
 use super::engine::{
     CallbackOutcome, MessageRef, OutboundMessage, SessionCallbacks, SessionKey, StoreBackend,
 };
@@ -72,30 +78,28 @@ pub(crate) struct Capture {
     messages: Vec<String>,
     credentials: Option<Credentials>,
     max_message_bytes: usize,
+    appl_ver_id: Option<ApplVerId>,
     status: Arc<SessionStatus>,
     metrics: Arc<FixMetrics>,
     state: Mutex<CaptureState>,
 }
 
 impl Capture {
-    #[allow(clippy::too_many_arguments)] // INVARIANT: every field is fixed for the session's life.
     pub(crate) fn new(
         journal: Arc<Journal>,
         store: Arc<SessionStore>,
-        session: SessionKey,
-        messages: Vec<String>,
-        credentials: Option<Credentials>,
-        max_message_bytes: usize,
+        config: &FixSourceConfig,
         status: Arc<SessionStatus>,
         metrics: Arc<FixMetrics>,
     ) -> Self {
         Self {
             journal,
             store,
-            session,
-            messages,
-            credentials,
-            max_message_bytes,
+            session: config.session.clone(),
+            messages: config.messages.iter().cloned().collect(),
+            credentials: config.credentials.clone(),
+            max_message_bytes: config.max_message_bytes,
+            appl_ver_id: config.fixt.as_ref().map(|fixt| fixt.appl_ver_id),
             status,
             metrics,
             state: Mutex::new(CaptureState {
@@ -144,7 +148,28 @@ impl Capture {
         }
     }
 
+    /// Why a FIXT.1.1 application version `value` of `field` is not the configured one.
+    fn foreign_version(&self, field: &str, value: &[u8]) -> Option<String> {
+        let expected = self.appl_ver_id?;
+        if value == expected.code().as_bytes() {
+            return None;
+        }
+        Some(format!(
+            "counterparty {field} '{}' differs from 'appl.ver.id' {} ({}); a source captures one \
+             application version",
+            String::from_utf8_lossy(value),
+            expected.name(),
+            expected.code()
+        ))
+    }
+
     fn logon(&self, message: MessageRef<'_>) -> CallbackOutcome {
+        let default_version = message.body().and_then(|body| body.field(1137));
+        let default_version = default_version.ok().flatten().unwrap_or_default();
+        if let Some(reason) = self.foreign_version("DefaultApplVerID", default_version) {
+            self.status.fail(reason);
+            return CallbackOutcome::Disconnect;
+        }
         let reset_flag = message
             .body()
             .and_then(|body| body.field(141))
@@ -235,6 +260,10 @@ impl Capture {
             .and_then(|value| std::str::from_utf8(value).ok())
             .ok_or("message has no MsgType")?
             .to_string();
+        let version = header.field(1128).map_err(|error| error.to_string())?;
+        if let Some(reason) = version.and_then(|value| self.foreign_version("ApplVerID", value)) {
+            return Err(reason);
+        }
         if !self.messages.contains(&msg_type) {
             self.metrics.messages_excluded.inc();
             return Ok(CallbackOutcome::Accept);

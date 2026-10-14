@@ -146,6 +146,7 @@ fn fill(index: usize) -> TestMessage {
     }
     TestMessage {
         msg_type: "8".into(),
+        header_fields: Vec::new(),
         fields,
         groups: Vec::new(),
     }

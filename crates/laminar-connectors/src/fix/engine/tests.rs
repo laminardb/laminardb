@@ -14,6 +14,30 @@ pub(crate) const DICTIONARY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/fix/FIX44-synthetic.xml"
 );
+pub(crate) const TRANSPORT_DICTIONARY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/fix/FIXT11-synthetic.xml"
+);
+pub(crate) const APPLICATION_DICTIONARY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/fix/FIX50SP2-synthetic.xml"
+);
+
+/// Engine settings of a FIXT.1.1 session capturing FIX.5.0SP2.
+pub(crate) fn fixt_dictionaries() -> Vec<(&'static str, String)> {
+    vec![
+        ("TransportDataDictionary", TRANSPORT_DICTIONARY.into()),
+        ("AppDataDictionary", APPLICATION_DICTIONARY.into()),
+        ("DefaultApplVerID", "FIX.5.0SP2".into()),
+    ]
+}
+
+fn fixt_key(key: SessionKey) -> SessionKey {
+    SessionKey {
+        begin_string: "FIXT.1.1".into(),
+        ..key
+    }
+}
 
 /// Engine sessions are process-global, so concurrently running tests use distinct CompIDs.
 pub(crate) fn initiator_key(name: &str) -> SessionKey {
@@ -38,7 +62,6 @@ fn common() -> Vec<(&'static str, String)> {
     // Client-side engine defaults; the venue is configured by `FixTestVenue`.
     vec![
         ("UseDataDictionary", "Y".into()),
-        ("DataDictionary", DICTIONARY.into()),
         ("StartTime", "00:00:00".into()),
         ("EndTime", "00:00:00".into()),
         ("HeartBtInt", "30".into()),
@@ -62,6 +85,21 @@ impl Venue {
         )
     }
 
+    fn start_fixt(dir: &std::path::Path, name: &str) -> Self {
+        let key = fixt_key(acceptor_key(name));
+        Self(
+            crate::fix::testing::FixTestVenue::start_with_settings(
+                &dir.join("venue-store"),
+                std::path::Path::new(APPLICATION_DICTIONARY),
+                &key.begin_string,
+                &key.sender_comp_id,
+                &key.target_comp_id,
+                &fixt_dictionaries(),
+            )
+            .expect("venue"),
+        )
+    }
+
     fn port(&self) -> u16 {
         self.0.port()
     }
@@ -75,6 +113,15 @@ impl Venue {
 
     /// Send an ExecutionReport; `exec_id = None` omits a required field.
     fn send_execution_report(&self, exec_id: Option<&str>, fee_count: usize) {
+        self.send_report(exec_id, fee_count, Vec::new());
+    }
+
+    fn send_report(
+        &self,
+        exec_id: Option<&str>,
+        fee_count: usize,
+        header_fields: Vec<(i32, String)>,
+    ) {
         let mut fields: Vec<(i32, String)> = vec![(37, "ORD-1".into())];
         if let Some(exec_id) = exec_id {
             fields.push((17, exec_id.into()));
@@ -99,6 +146,7 @@ impl Venue {
         self.0
             .send(&crate::fix::testing::TestMessage {
                 msg_type: "8".into(),
+                header_fields,
                 fields,
                 groups: vec![(136, fees)],
             })
@@ -214,8 +262,12 @@ struct ClientCallbacks {
 
 impl ClientCallbacks {
     fn new(name: &str, fault: Fault) -> Arc<Self> {
+        Self::with_key(initiator_key(name), fault)
+    }
+
+    fn with_key(key: SessionKey, fault: Fault) -> Arc<Self> {
         Arc::new(Self {
-            key: initiator_key(name),
+            key,
             fault: Mutex::new(fault),
             deliveries: Mutex::new(Vec::new()),
             outbound_rejects: Mutex::new(Vec::new()),
@@ -290,7 +342,22 @@ struct Client {
 
 impl Client {
     fn start(port: u16, callbacks: Arc<ClientCallbacks>, store: Arc<MemoryStore>) -> Self {
+        Self::start_with(
+            port,
+            callbacks,
+            store,
+            vec![("DataDictionary", DICTIONARY.into())],
+        )
+    }
+
+    fn start_with(
+        port: u16,
+        callbacks: Arc<ClientCallbacks>,
+        store: Arc<MemoryStore>,
+        dictionaries: Vec<(&'static str, String)>,
+    ) -> Self {
         let mut defaults = common();
+        defaults.extend(dictionaries);
         defaults.push(("ConnectionType", "initiator".into()));
         defaults.push(("SocketConnectHost", "127.0.0.1".into()));
         defaults.push(("SocketConnectPort", port.to_string()));
@@ -469,11 +536,47 @@ fn validation_reject_advances_target_without_application_callback() {
     assert_eq!(venue.rejects().len(), 1);
 }
 
+/// Under FIXT.1.1 the engine validates an application message against the dictionary of its
+/// ApplVerID (1128), and an ApplVerID without a configured dictionary gets an empty one: a
+/// message missing a required field then reaches `from_app` unvalidated. The source therefore
+/// captures one application version and stops on any other.
+#[test]
+fn fixt_messages_of_an_unconfigured_application_version_are_not_validated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let venue = Venue::start_fixt(dir.path(), "fixt");
+    let callbacks = ClientCallbacks::with_key(fixt_key(initiator_key("fixt")), Fault::None);
+    let client = Client::start_with(
+        venue.port(),
+        callbacks.clone(),
+        MemoryStore::new(None),
+        fixt_dictionaries(),
+    );
+    venue.wait_logged_on();
+    venue.send_report(None, 0, Vec::new());
+    venue.send_report(None, 0, vec![(1128, "8".into())]);
+    venue.send_report(Some("E3"), 2, vec![(1128, "9".into())]);
+    wait_until("two messages accepted", || {
+        accepted_sequence(&callbacks.deliveries.lock()).len() == 2
+    });
+    client.stop();
+    assert_eq!(
+        *callbacks.outbound_rejects.lock(),
+        vec![2],
+        "the configured version is validated"
+    );
+    assert_eq!(
+        accepted_sequence(&callbacks.deliveries.lock()),
+        vec![3, 4],
+        "a message of another version is not"
+    );
+}
+
 /// Length-aware access preserves SOH and NUL bytes in data fields through engine
 /// serialization and dictionary parsing; repeating groups keep their entry boundaries.
 #[test]
 fn data_fields_and_groups_round_trip_through_engine_serialization() {
-    let dictionary = DataDictionary::from_path(DICTIONARY).expect("dictionary");
+    let dictionary =
+        SessionDictionaries::single(DataDictionary::from_path(DICTIONARY).expect("dictionary"));
     let mut message = OwnedMessage::new().expect("message");
     let header = [(8, "FIX.4.4"), (35, "8"), (49, "VENUE"), (56, "LAMINAR")];
     for (tag, value) in header {
@@ -595,7 +698,8 @@ mod properties {
             noise in proptest::collection::vec(any::<u8>(), 0..512),
             flips in proptest::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..8),
         ) {
-            let dictionary = DataDictionary::from_path(DICTIONARY).expect("dictionary");
+            let dictionary =
+        SessionDictionaries::single(DataDictionary::from_path(DICTIONARY).expect("dictionary"));
             let _ = dictionary.parse(&noise);
             let mut corrupted = valid_message();
             for (index, byte) in flips {

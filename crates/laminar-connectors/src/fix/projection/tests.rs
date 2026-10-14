@@ -8,15 +8,17 @@ use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 
 use super::*;
 use crate::config::ConnectorConfig;
-use crate::fix::engine::{GroupEntry, OwnedMessage, Section};
+use crate::fix::engine::{DataDictionary, GroupEntry, OwnedMessage, Section};
 
 pub(crate) const DICTIONARY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/fix/FIX44-synthetic.xml"
 );
 
-fn dictionary() -> Arc<DataDictionary> {
-    Arc::new(DataDictionary::from_path(DICTIONARY).expect("dictionary"))
+fn dictionary() -> Arc<SessionDictionaries> {
+    Arc::new(SessionDictionaries::single(
+        DataDictionary::from_path(DICTIONARY).expect("dictionary"),
+    ))
 }
 
 struct Party<'a> {
@@ -31,16 +33,28 @@ fn execution_report(
     parties: &[Party<'_>],
     encoded: Option<&[u8]>,
 ) -> Vec<u8> {
+    execution_report_as(&[(8, "FIX.4.4")], seq, order_id, parties, encoded)
+}
+
+/// An ExecutionReport whose header starts with `version` (BeginString and, under FIXT,
+/// ApplVerID).
+fn execution_report_as(
+    version: &[(i32, &str)],
+    seq: u64,
+    order_id: &str,
+    parties: &[Party<'_>],
+    encoded: Option<&[u8]>,
+) -> Vec<u8> {
     let mut message = OwnedMessage::new().expect("message");
     let seq = seq.to_string();
-    for (tag, value) in [
-        (8, "FIX.4.4"),
+    let header = [
         (35, "8"),
         (49, "VENUE"),
         (56, "LAMINAR"),
         (34, seq.as_str()),
         (52, "20261014-12:00:00.123456789"),
-    ] {
+    ];
+    for (tag, value) in version.iter().copied().chain(header) {
         message
             .set_field(Section::Header, tag, value.as_bytes())
             .expect("header");
@@ -585,6 +599,72 @@ fn profile_projection_throughput() {
             messages as f64 / elapsed.as_secs_f64(),
             rows as f64 / elapsed.as_secs_f64(),
             elapsed / u32::try_from(messages).expect("count")
+        );
+    }
+}
+
+#[test]
+fn fixt_messages_read_the_header_from_the_transport_and_the_body_from_the_application() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fix/");
+    let dictionaries = Arc::new(SessionDictionaries::fixt(
+        DataDictionary::from_path(&format!("{root}FIXT11-synthetic.xml")).expect("transport"),
+        DataDictionary::from_path(&format!("{root}FIX50SP2-synthetic.xml")).expect("application"),
+    ));
+    let list = |item: DataType| DataType::List(Arc::new(Field::new("item", item, true)));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("appl_ver_id", DataType::Utf8, true),
+        Field::new("order_id", DataType::Utf8, false),
+        Field::new("sub_ids", list(list(DataType::Utf8)), true),
+    ]));
+    let mappings = [
+        ("column.appl_ver_id", "header.1128"),
+        ("column.order_id", "37"),
+        ("column.sub_ids", "453.802.523"),
+    ];
+    let plan = compile(
+        &config(&mappings),
+        &schema,
+        &dictionaries,
+        &messages(&["8"]),
+    )
+    .expect("plan");
+    let mut projection = Projection::new(
+        plan,
+        dictionaries.clone(),
+        Arc::from("FIXT.1.1:LAMINAR->VENUE"),
+        100,
+    );
+    let parties = [Party {
+        id: "A",
+        role: "1",
+        subs: &["S1", "S2"],
+    }];
+    let message = execution_report_as(
+        &[(8, "FIXT.1.1"), (1128, "9")],
+        2,
+        "O",
+        &parties,
+        Some(b"x\x01y"),
+    );
+    projection.push(1, &record(2, "8", message)).expect("push");
+    let (batch, _) = projection.finish().expect("finish");
+    assert_eq!(batch.column(0).as_string::<i32>().value(0), "9");
+    assert_eq!(batch.column(1).as_string::<i32>().value(0), "O");
+    let subs = batch.column(2).as_list::<i32>().value(0);
+    assert_eq!(
+        subs.as_list::<i32>().value_length(0),
+        2,
+        "nested groups parsed"
+    );
+
+    for (column, path) in [("order_id", "header.37"), ("appl_ver_id", "1128")] {
+        let key = format!("column.{column}");
+        let mut wrong = mappings.to_vec();
+        wrong.retain(|(name, _)| *name != key);
+        wrong.push((key.as_str(), path));
+        assert!(
+            compile(&config(&wrong), &schema, &dictionaries, &messages(&["8"])).is_err(),
+            "{path} is not where {column} lives"
         );
     }
 }

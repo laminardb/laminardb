@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYNTHETIC test dictionary. Not a venue dictionary and not venue-certified.
+
+  A FIX 5.0 SP2 application subset for FIXT.1.1 sessions (transport: FIXT11-synthetic.xml): the
+  same ExecutionReport, custom fields, and custom message type as FIX44-synthetic.xml. As in
+  FIX 5.0 application dictionaries, the header and trailer are empty.
+-->
+<fix type="FIX" major="5" minor="0" servicepack="2">
+  <header/>
+  <messages>
+    <message name="BusinessMessageReject" msgtype="j" msgcat="app">
+      <field name="RefSeqNum" required="N"/>
+      <field name="RefMsgType" required="Y"/>
+      <field name="BusinessRejectRefID" required="N"/>
+      <field name="BusinessRejectReason" required="Y"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="ExecutionReport" msgtype="8" msgcat="app">
+      <field name="OrderID" required="Y"/>
+      <field name="ClOrdID" required="N"/>
+      <field name="ExecID" required="Y"/>
+      <field name="ExecType" required="Y"/>
+      <field name="OrdStatus" required="Y"/>
+      <group name="NoPartyIDs" required="N">
+        <field name="PartyID" required="N"/>
+        <field name="PartyIDSource" required="N"/>
+        <field name="PartyRole" required="N"/>
+        <group name="NoPartySubIDs" required="N">
+          <field name="PartySubID" required="N"/>
+          <field name="PartySubIDType" required="N"/>
+        </group>
+      </group>
+      <field name="Symbol" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="LastQty" required="N"/>
+      <field name="LastPx" required="N"/>
+      <field name="LeavesQty" required="Y"/>
+      <field name="CumQty" required="Y"/>
+      <field name="AvgPx" required="Y"/>
+      <field name="TransactTime" required="N"/>
+      <field name="Text" required="N"/>
+      <field name="EncodedTextLen" required="N"/>
+      <field name="EncodedText" required="N"/>
+      <group name="NoMiscFees" required="N">
+        <field name="MiscFeeAmt" required="N"/>
+        <field name="MiscFeeCurr" required="N"/>
+        <field name="MiscFeeType" required="N"/>
+      </group>
+      <field name="VenueSeq" required="N"/>
+      <field name="VenueTag" required="N"/>
+    </message>
+    <message name="VenueStatus" msgtype="U1" msgcat="app">
+      <field name="VenueStatusCode" required="Y"/>
+      <field name="TransactTime" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+  </messages>
+  <trailer/>
+  <components/>
+  <fields>
+    <field number="6" name="AvgPx" type="PRICE"/>
+    <field number="11" name="ClOrdID" type="STRING"/>
+    <field number="14" name="CumQty" type="QTY"/>
+    <field number="17" name="ExecID" type="STRING"/>
+    <field number="31" name="LastPx" type="PRICE"/>
+    <field number="32" name="LastQty" type="QTY"/>
+    <field number="37" name="OrderID" type="STRING"/>
+    <field number="39" name="OrdStatus" type="CHAR"/>
+    <field number="45" name="RefSeqNum" type="SEQNUM"/>
+    <field number="54" name="Side" type="CHAR"/>
+    <field number="55" name="Symbol" type="STRING"/>
+    <field number="58" name="Text" type="STRING"/>
+    <field number="60" name="TransactTime" type="UTCTIMESTAMP"/>
+    <field number="136" name="NoMiscFees" type="NUMINGROUP"/>
+    <field number="137" name="MiscFeeAmt" type="AMT"/>
+    <field number="138" name="MiscFeeCurr" type="CURRENCY"/>
+    <field number="139" name="MiscFeeType" type="CHAR"/>
+    <field number="150" name="ExecType" type="CHAR"/>
+    <field number="151" name="LeavesQty" type="QTY"/>
+    <field number="354" name="EncodedTextLen" type="LENGTH"/>
+    <field number="355" name="EncodedText" type="DATA"/>
+    <field number="372" name="RefMsgType" type="STRING"/>
+    <field number="379" name="BusinessRejectRefID" type="STRING"/>
+    <field number="380" name="BusinessRejectReason" type="INT"/>
+    <field number="447" name="PartyIDSource" type="CHAR"/>
+    <field number="448" name="PartyID" type="STRING"/>
+    <field number="452" name="PartyRole" type="INT"/>
+    <field number="453" name="NoPartyIDs" type="NUMINGROUP"/>
+    <field number="523" name="PartySubID" type="STRING"/>
+    <field number="802" name="NoPartySubIDs" type="NUMINGROUP"/>
+    <field number="803" name="PartySubIDType" type="INT"/>
+    <field number="5001" name="VenueSeq" type="INT"/>
+    <field number="5002" name="VenueTag" type="STRING"/>
+    <field number="5003" name="VenueStatusCode" type="INT"/>
+  </fields>
+</fix>

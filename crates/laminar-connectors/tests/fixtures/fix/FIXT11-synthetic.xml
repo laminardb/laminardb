@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYNTHETIC test dictionary. Not a venue dictionary and not venue-certified.
+
+  A FIXT.1.1 transport subset: the standard header (with ApplVerID), trailer, and session
+  messages, whose Logon carries DefaultApplVerID. Application messages are described by
+  FIX50SP2-synthetic.xml.
+-->
+<fix type="FIXT" major="1" minor="1" servicepack="0">
+  <header>
+    <field name="BeginString" required="Y"/>
+    <field name="BodyLength" required="Y"/>
+    <field name="MsgType" required="Y"/>
+    <field name="ApplVerID" required="N"/>
+    <field name="SenderCompID" required="Y"/>
+    <field name="TargetCompID" required="Y"/>
+    <field name="MsgSeqNum" required="Y"/>
+    <field name="PossDupFlag" required="N"/>
+    <field name="PossResend" required="N"/>
+    <field name="SendingTime" required="Y"/>
+    <field name="OrigSendingTime" required="N"/>
+    <field name="LastMsgSeqNumProcessed" required="N"/>
+  </header>
+  <messages>
+    <message name="Heartbeat" msgtype="0" msgcat="admin">
+      <field name="TestReqID" required="N"/>
+    </message>
+    <message name="TestRequest" msgtype="1" msgcat="admin">
+      <field name="TestReqID" required="Y"/>
+    </message>
+    <message name="ResendRequest" msgtype="2" msgcat="admin">
+      <field name="BeginSeqNo" required="Y"/>
+      <field name="EndSeqNo" required="Y"/>
+    </message>
+    <message name="Reject" msgtype="3" msgcat="admin">
+      <field name="RefSeqNum" required="Y"/>
+      <field name="RefTagID" required="N"/>
+      <field name="RefMsgType" required="N"/>
+      <field name="SessionRejectReason" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="SequenceReset" msgtype="4" msgcat="admin">
+      <field name="GapFillFlag" required="N"/>
+      <field name="NewSeqNo" required="Y"/>
+    </message>
+    <message name="Logout" msgtype="5" msgcat="admin">
+      <field name="Text" required="N"/>
+    </message>
+    <message name="Logon" msgtype="A" msgcat="admin">
+      <field name="EncryptMethod" required="Y"/>
+      <field name="HeartBtInt" required="Y"/>
+      <field name="RawDataLength" required="N"/>
+      <field name="RawData" required="N"/>
+      <field name="ResetSeqNumFlag" required="N"/>
+      <field name="NextExpectedMsgSeqNum" required="N"/>
+      <field name="MaxMessageSize" required="N"/>
+      <field name="Username" required="N"/>
+      <field name="Password" required="N"/>
+      <field name="DefaultApplVerID" required="Y"/>
+    </message>
+  </messages>
+  <trailer>
+    <field name="SignatureLength" required="N"/>
+    <field name="Signature" required="N"/>
+    <field name="CheckSum" required="Y"/>
+  </trailer>
+  <components/>
+  <fields>
+    <field number="7" name="BeginSeqNo" type="SEQNUM"/>
+    <field number="8" name="BeginString" type="STRING"/>
+    <field number="9" name="BodyLength" type="LENGTH"/>
+    <field number="10" name="CheckSum" type="STRING"/>
+    <field number="16" name="EndSeqNo" type="SEQNUM"/>
+    <field number="34" name="MsgSeqNum" type="SEQNUM"/>
+    <field number="35" name="MsgType" type="STRING">
+      <value enum="0" description="HEARTBEAT"/>
+      <value enum="1" description="TEST_REQUEST"/>
+      <value enum="2" description="RESEND_REQUEST"/>
+      <value enum="3" description="REJECT"/>
+      <value enum="4" description="SEQUENCE_RESET"/>
+      <value enum="5" description="LOGOUT"/>
+      <value enum="8" description="EXECUTION_REPORT"/>
+      <value enum="A" description="LOGON"/>
+      <value enum="j" description="BUSINESS_MESSAGE_REJECT"/>
+      <value enum="U1" description="VENUE_STATUS"/>
+    </field>
+    <field number="36" name="NewSeqNo" type="SEQNUM"/>
+    <field number="43" name="PossDupFlag" type="BOOLEAN"/>
+    <field number="45" name="RefSeqNum" type="SEQNUM"/>
+    <field number="49" name="SenderCompID" type="STRING"/>
+    <field number="52" name="SendingTime" type="UTCTIMESTAMP"/>
+    <field number="56" name="TargetCompID" type="STRING"/>
+    <field number="58" name="Text" type="STRING"/>
+    <field number="89" name="Signature" type="DATA"/>
+    <field number="93" name="SignatureLength" type="LENGTH"/>
+    <field number="95" name="RawDataLength" type="LENGTH"/>
+    <field number="96" name="RawData" type="DATA"/>
+    <field number="97" name="PossResend" type="BOOLEAN"/>
+    <field number="98" name="EncryptMethod" type="INT"/>
+    <field number="108" name="HeartBtInt" type="INT"/>
+    <field number="112" name="TestReqID" type="STRING"/>
+    <field number="122" name="OrigSendingTime" type="UTCTIMESTAMP"/>
+    <field number="123" name="GapFillFlag" type="BOOLEAN"/>
+    <field number="141" name="ResetSeqNumFlag" type="BOOLEAN"/>
+    <field number="369" name="LastMsgSeqNumProcessed" type="SEQNUM"/>
+    <field number="371" name="RefTagID" type="INT"/>
+    <field number="372" name="RefMsgType" type="STRING"/>
+    <field number="373" name="SessionRejectReason" type="INT"/>
+    <field number="383" name="MaxMessageSize" type="LENGTH"/>
+    <field number="553" name="Username" type="STRING"/>
+    <field number="554" name="Password" type="STRING"/>
+    <field number="789" name="NextExpectedMsgSeqNum" type="SEQNUM"/>
+    <field number="1128" name="ApplVerID" type="STRING">
+      <value enum="7" description="FIX50"/>
+      <value enum="8" description="FIX50SP1"/>
+      <value enum="9" description="FIX50SP2"/>
+    </field>
+    <field number="1137" name="DefaultApplVerID" type="STRING">
+      <value enum="7" description="FIX50"/>
+      <value enum="8" description="FIX50SP1"/>
+      <value enum="9" description="FIX50SP2"/>
+    </field>
+  </fields>
+</fix>

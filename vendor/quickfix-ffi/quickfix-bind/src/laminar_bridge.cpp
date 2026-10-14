@@ -256,12 +256,27 @@ int8_t LmFix_messageSerializeWithoutHeaderTags(const Message *msg, const int32_t
   })
 }
 
-Message *LmFix_messageParse(const char *ptr, size_t len, const DataDictionary *dictionary) {
-  if (!ptr || !dictionary) {
+Message *LmFix_messageParse(const char *ptr, size_t len, const DataDictionary *sessionDictionary,
+                            const DataDictionary *applicationDictionary) {
+  if (!ptr || !sessionDictionary || !applicationDictionary) {
     setError("null argument");
     return nullptr;
   }
-  LMFIX_GUARD(nullptr, { return new Message(std::string(ptr, len), *dictionary, true); })
+  LMFIX_GUARD(nullptr, {
+    return new Message(std::string(ptr, len), *sessionDictionary, *applicationDictionary, true);
+  })
+}
+
+int8_t LmFix_dictionaryVersion(const DataDictionary *dictionary, void *ctx, LmFixBytesSink sink) {
+  if (!dictionary || !sink) {
+    setError("null argument");
+    return ERRNO_INVAL;
+  }
+  LMFIX_GUARD(ERRNO_EXCEPTION, {
+    const std::string version = dictionary->getVersion();
+    sink(ctx, version.data(), version.size());
+    return 0;
+  })
 }
 
 int32_t LmFix_dictionaryFieldType(const DataDictionary *dictionary, int32_t tag) {

@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 
 use super::capture::{Capture, SessionStatus};
 use super::config::{FixSourceConfig, SequenceResetPolicy, Transport};
+use super::dictionary::DictionaryDigests;
 use super::engine::{Application, Initiator, Settings, StoreFactory};
 use super::journal::{GroupCommit, Journal, JournalReader, Record};
 use super::metrics::{saturating, FixMetrics};
@@ -201,24 +202,27 @@ impl FixSource {
     }
 }
 
-fn committed_dictionary(binding: Option<&SchemaBinding>) -> Option<String> {
+fn committed_digests(binding: Option<&SchemaBinding>) -> Option<DictionaryDigests> {
     let native = binding?.value.as_ref()?;
     if native.format != NATIVE_FORMAT {
         return None;
     }
-    native.identity.get("dictionary_sha256").cloned()
+    Some(DictionaryDigests {
+        application: native.identity.get("dictionary_sha256")?.clone(),
+        transport: native.identity.get("transport_dictionary_sha256").cloned(),
+    })
 }
 
 /// Open the journal and the session store whose persisted inbound progress it bounds.
 fn open_durable_state(
     parsed: &FixSourceConfig,
-    dictionary_sha256: &str,
+    digests: &DictionaryDigests,
     data_ready: Arc<Notify>,
 ) -> Result<(Arc<Journal>, Arc<SessionStore>), ConnectorError> {
     let journal = Arc::new(Journal::open(
         &parsed.journal_path,
         &parsed.session.display(),
-        &parsed.capture_contract(dictionary_sha256),
+        &parsed.capture_contract(digests),
         parsed.journal,
         data_ready,
     )?);
@@ -279,10 +283,10 @@ impl SourceConnector for FixSource {
             )
         })?;
         let parsed = FixSourceConfig::parse(config)?;
-        let (_, sha256) = dictionary::read(&parsed.dictionary_path)?;
-        let path = parsed.dictionary_path.display().to_string();
-        let dictionary = super::engine::DataDictionary::from_path(&path)?;
-        let plan = compile(config, &schema, &dictionary, &parsed.messages)?;
+        let files = parsed.dictionary_files();
+        let digests = dictionary::digests(&files)?;
+        let dictionaries = dictionary::load(&parsed, &files)?;
+        let plan = compile(config, &schema, &dictionaries, &parsed.messages)?;
         let mut binding = logical_binding(
             config,
             SchemaDirection::Source,
@@ -290,12 +294,16 @@ impl SourceConnector for FixSource {
             &schema,
         )?;
         bind_external(&mut binding, &schema)?;
+        let mut identity = std::collections::BTreeMap::from([
+            ("dictionary_sha256".into(), digests.application),
+            ("session".into(), parsed.session.display()),
+        ]);
+        if let Some(transport) = digests.transport {
+            identity.insert("transport_dictionary_sha256".into(), transport);
+        }
         binding.value = Some(NativeSchema {
             format: NATIVE_FORMAT.into(),
-            identity: std::collections::BTreeMap::from([
-                ("dictionary_sha256".into(), sha256),
-                ("session".into(), parsed.session.display()),
-            ]),
+            identity,
             definition: plan.canonical(),
             references: Vec::new(),
         });
@@ -311,17 +319,16 @@ impl SourceConnector for FixSource {
                 "FIX source started without its declared schema".into(),
             )
         })?;
-        let sha256 = match committed_dictionary(config.schema_binding()) {
-            Some(sha256) => sha256,
-            None => dictionary::read(&parsed.dictionary_path)?.1,
+        let files = parsed.dictionary_files();
+        let digests = match committed_digests(config.schema_binding()) {
+            Some(digests) => digests,
+            None => dictionary::digests(&files)?,
         };
-        let pinned = dictionary::pin(&parsed.journal_path, &sha256, &parsed.dictionary_path)?;
-        let pinned_text = pinned.display().to_string();
-        let projection_dictionary =
-            Arc::new(super::engine::DataDictionary::from_path(&pinned_text)?);
-        let plan = compile(&config, &schema, &projection_dictionary, &parsed.messages)?;
+        let pinned = dictionary::pin_all(&parsed.journal_path, &digests, &files)?;
+        let dictionaries = Arc::new(dictionary::load(&parsed, &pinned)?);
+        let plan = compile(&config, &schema, &dictionaries, &parsed.messages)?;
         let session = parsed.session.display();
-        let (journal, store) = open_durable_state(&parsed, &sha256, self.data_ready.clone())?;
+        let (journal, store) = open_durable_state(&parsed, &digests, self.data_ready.clone())?;
         let start_index = match &position {
             SourcePosition::Initial => journal.first_retained_index(),
             SourcePosition::Resume { checkpoint, .. } => {
@@ -362,10 +369,7 @@ impl SourceConnector for FixSource {
         let capture = Arc::new(Capture::new(
             journal.clone(),
             store.clone(),
-            parsed.session.clone(),
-            parsed.messages.iter().cloned().collect(),
-            parsed.credentials.clone(),
-            parsed.max_message_bytes,
+            &parsed,
             status.clone(),
             metrics.clone(),
         ));
@@ -392,7 +396,7 @@ impl SourceConnector for FixSource {
         self.running = Some(Running {
             projection: Projection::new(
                 plan,
-                projection_dictionary,
+                dictionaries,
                 Arc::from(session),
                 parsed.max_rows_per_message,
             ),

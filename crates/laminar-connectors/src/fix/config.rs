@@ -9,13 +9,15 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+use super::dictionary::{DictionaryDigests, DictionaryFiles};
 use super::engine::SessionKey;
 use super::journal::{JournalOptions, SyncPolicy};
 use crate::config::{ConfigKeySpec, ConnectorConfig};
 use crate::error::ConnectorError;
 
 /// FIX versions whose session behaviour this connector has qualified.
-const SUPPORTED_BEGIN_STRINGS: &[&str] = &["FIX.4.2", "FIX.4.4"];
+const SUPPORTED_BEGIN_STRINGS: &[&str] = &["FIX.4.2", "FIX.4.4", FIXT_BEGIN_STRING];
+pub(crate) const FIXT_BEGIN_STRING: &str = "FIXT.1.1";
 /// Upper bound on a dictionary file read before handing it to the engine.
 pub(crate) const MAX_DICTIONARY_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -70,6 +72,43 @@ pub(crate) enum SequenceResetPolicy {
     Continue,
 }
 
+/// FIX 5.0 application version of a FIXT.1.1 session (ApplVerID, 1128).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplVerId {
+    Fix50,
+    Fix50Sp1,
+    Fix50Sp2,
+}
+
+impl ApplVerId {
+    const ALL: [Self; 3] = [Self::Fix50, Self::Fix50Sp1, Self::Fix50Sp2];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Fix50 => "FIX.5.0",
+            Self::Fix50Sp1 => "FIX.5.0SP1",
+            Self::Fix50Sp2 => "FIX.5.0SP2",
+        }
+    }
+
+    /// The enumerated value carried in ApplVerID (1128) and DefaultApplVerID (1137).
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Fix50 => "7",
+            Self::Fix50Sp1 => "8",
+            Self::Fix50Sp2 => "9",
+        }
+    }
+}
+
+/// FIXT.1.1 transport settings. One application version is captured per source: the engine
+/// validates a message of any other version against an empty dictionary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fixt {
+    pub(crate) transport_dictionary_path: PathBuf,
+    pub(crate) appl_ver_id: ApplVerId,
+}
+
 /// Fully parsed FIX source configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct FixSourceConfig {
@@ -79,6 +118,7 @@ pub(crate) struct FixSourceConfig {
     pub(crate) transport: Transport,
     pub(crate) credentials: Option<Credentials>,
     pub(crate) dictionary_path: PathBuf,
+    pub(crate) fixt: Option<Fixt>,
     pub(crate) messages: BTreeSet<String>,
     pub(crate) journal_path: PathBuf,
     pub(crate) journal: JournalOptions,
@@ -145,7 +185,7 @@ const KEYS: &[Key] = &[
     ),
     optional(
         "begin.string",
-        "FIX version (FIX.4.4 or FIX.4.2)",
+        "FIX version (FIX.4.4, FIX.4.2, or FIXT.1.1)",
         "FIX.4.4",
     ),
     required("sender.comp.id", "SenderCompID (49) sent by this source"),
@@ -159,7 +199,18 @@ const KEYS: &[Key] = &[
     ),
     required(
         "dictionary.path",
-        "FIX data dictionary XML (pinned by content at activation)",
+        "FIX data dictionary XML, the application dictionary under FIXT.1.1 (pinned by content at \
+         activation)",
+    ),
+    optional(
+        "transport.dictionary.path",
+        "FIXT.1.1 transport dictionary XML (FIXT.1.1 only; pinned by content at activation)",
+        "",
+    ),
+    optional(
+        "appl.ver.id",
+        "FIXT.1.1 application version: FIX.5.0, FIX.5.0SP1, or FIX.5.0SP2 (FIXT.1.1 only)",
+        "",
     ),
     required(
         "messages",
@@ -467,6 +518,7 @@ impl FixSourceConfig {
                 SUPPORTED_BEGIN_STRINGS.join(", ")
             )));
         }
+        let fixt = fixt(config, &begin_string)?;
         let session = SessionKey {
             begin_string,
             sender_comp_id: required_value(config, "sender.comp.id")?.to_string(),
@@ -522,6 +574,7 @@ impl FixSourceConfig {
             transport,
             credentials,
             dictionary_path: PathBuf::from(required_value(config, "dictionary.path")?),
+            fixt,
             messages: messages(config)?,
             journal_path: PathBuf::from(required_value(config, "journal.path")?),
             journal,
@@ -539,10 +592,21 @@ impl FixSourceConfig {
         })
     }
 
+    /// The configured dictionary files.
+    pub(crate) fn dictionary_files(&self) -> DictionaryFiles {
+        DictionaryFiles {
+            application: self.dictionary_path.clone(),
+            transport: self
+                .fixt
+                .as_ref()
+                .map(|fixt| fixt.transport_dictionary_path.clone()),
+        }
+    }
+
     /// Engine `[DEFAULT]` settings for this session.
     pub(crate) fn engine_defaults(
         &self,
-        pinned_dictionary: &std::path::Path,
+        pinned: &DictionaryFiles,
         connect: (&str, u16),
     ) -> Vec<(&'static str, String)> {
         let mut settings: Vec<(&'static str, String)> = self
@@ -555,7 +619,6 @@ impl FixSourceConfig {
             ("SocketConnectHost", connect.0.to_string()),
             ("SocketConnectPort", connect.1.to_string()),
             ("UseDataDictionary", "Y".to_string()),
-            ("DataDictionary", pinned_dictionary.display().to_string()),
             // Outbound messages are not stored, so no logon secret is written at rest; resend
             // requests from the counterparty are answered with gap fills. The session store
             // rejects message persistence.
@@ -565,16 +628,25 @@ impl FixSourceConfig {
             ("RefreshOnLogon", "N".to_string()),
             ("SendRedundantResendRequests", "N".to_string()),
         ]);
+        let application = pinned.application.display().to_string();
+        match (&self.fixt, &pinned.transport) {
+            (Some(fixt), Some(transport)) => settings.extend([
+                ("TransportDataDictionary", transport.display().to_string()),
+                ("AppDataDictionary", application),
+                ("DefaultApplVerID", fixt.appl_ver_id.name().to_string()),
+            ]),
+            _ => settings.push(("DataDictionary", application)),
+        }
         settings
     }
 
     /// SHA-256 of everything needed to interpret journaled messages. Column mappings are
     /// excluded: they belong to the pipeline identity, so a new mapping can replay the journal.
-    pub(crate) fn capture_contract(&self, dictionary_sha256: &str) -> String {
-        let contract = serde_json::json!({
+    pub(crate) fn capture_contract(&self, digests: &DictionaryDigests) -> String {
+        let mut contract = serde_json::json!({
             "version": 1,
             "session": self.session.display(),
-            "dictionary_sha256": dictionary_sha256,
+            "dictionary_sha256": digests.application,
             "messages": self.messages,
             "validation": {
                 "user_defined_fields": self.engine.get("ValidateUserDefinedFields"),
@@ -583,6 +655,13 @@ impl FixSourceConfig {
                 "allow_unknown_message_fields": self.engine.get("AllowUnknownMsgFields"),
             },
         });
+        if let (Some(fixt), Some(object)) = (&self.fixt, contract.as_object_mut()) {
+            object.insert(
+                "transport_dictionary_sha256".into(),
+                digests.transport.clone().into(),
+            );
+            object.insert("appl_ver_id".into(), fixt.appl_ver_id.code().into());
+        }
         hex(&Sha256::digest(contract.to_string().as_bytes()))
     }
 
@@ -609,8 +688,44 @@ impl FixSourceConfig {
         if let Some(qualifier) = &self.session.qualifier {
             identity.insert("session.qualifier".to_string(), qualifier.clone());
         }
+        if let Some(fixt) = &self.fixt {
+            identity.insert(
+                "appl.ver.id".to_string(),
+                fixt.appl_ver_id.name().to_string(),
+            );
+        }
         identity
     }
+}
+
+fn fixt(config: &ConnectorConfig, begin_string: &str) -> Result<Option<Fixt>, ConnectorError> {
+    if begin_string != FIXT_BEGIN_STRING {
+        if let Some(key) = ["transport.dictionary.path", "appl.ver.id"]
+            .into_iter()
+            .find(|key| value(config, key).is_some())
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "'{key}' applies only to 'begin.string' = '{FIXT_BEGIN_STRING}'"
+            )));
+        }
+        return Ok(None);
+    }
+    let text = required_value(config, "appl.ver.id")?;
+    let appl_ver_id = ApplVerId::ALL
+        .into_iter()
+        .find(|version| version.name() == text.trim())
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "'appl.ver.id' must be FIX.5.0, FIX.5.0SP1, or FIX.5.0SP2, got '{text}'"
+            ))
+        })?;
+    Ok(Some(Fixt {
+        transport_dictionary_path: PathBuf::from(required_value(
+            config,
+            "transport.dictionary.path",
+        )?),
+        appl_ver_id,
+    }))
 }
 
 fn engine_settings(
@@ -714,7 +829,7 @@ mod tests {
     #[test]
     fn defaults_keep_validation_on_and_resets_off() {
         let parsed = FixSourceConfig::parse(&base()).expect("parse");
-        let defaults = parsed.engine_defaults(std::path::Path::new("d.xml"), ("127.0.0.1", 9878));
+        let defaults = parsed.engine_defaults(&parsed.dictionary_files(), ("127.0.0.1", 9878));
         let get = |key: &str| {
             defaults
                 .iter()
@@ -770,10 +885,10 @@ mod tests {
         let mut unknown = base();
         unknown.set("SocketConnectHost", "x");
         assert!(FixSourceConfig::parse(&unknown).is_err());
-        let mut fixt = base();
-        fixt.set("begin.string", "FIXT.1.1");
+        let mut fix43 = base();
+        fix43.set("begin.string", "FIX.4.3");
         assert!(matches!(
-            FixSourceConfig::parse(&fixt),
+            FixSourceConfig::parse(&fix43),
             Err(ConnectorError::FeatureUnsupported(_))
         ));
         let mut admin = base();
@@ -799,9 +914,87 @@ mod tests {
         assert!(!format!("{identity:?}").contains("hunter2"));
         assert!(!identity.contains_key("host"));
         assert_ne!(
-            parsed.capture_contract("a"),
-            parsed.capture_contract("b"),
+            parsed.capture_contract(&digests("a", None)),
+            parsed.capture_contract(&digests("b", None)),
             "dictionary content binds the journal"
         );
+    }
+
+    fn digests(application: &str, transport: Option<&str>) -> DictionaryDigests {
+        DictionaryDigests {
+            application: application.into(),
+            transport: transport.map(str::to_string),
+        }
+    }
+
+    fn fixt() -> ConnectorConfig {
+        let mut config = base();
+        config.set("begin.string", "FIXT.1.1");
+        config.set("transport.dictionary.path", "fixt.xml");
+        config.set("appl.ver.id", "FIX.5.0SP2");
+        config
+    }
+
+    #[test]
+    fn fixt_sessions_name_a_transport_dictionary_and_one_application_version() {
+        let parsed = FixSourceConfig::parse(&fixt()).expect("parse");
+        let fixt_settings = parsed.fixt.clone().expect("fixt");
+        assert_eq!(fixt_settings.appl_ver_id, ApplVerId::Fix50Sp2);
+        assert_eq!(fixt_settings.appl_ver_id.code(), "9");
+        let files = parsed.dictionary_files();
+        assert_eq!(
+            files.transport.as_deref(),
+            Some(std::path::Path::new("fixt.xml"))
+        );
+        let defaults = parsed.engine_defaults(&files, ("127.0.0.1", 9878));
+        let get = |key: &str| {
+            defaults
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(get("TransportDataDictionary"), Some("fixt.xml"));
+        assert_eq!(get("AppDataDictionary"), Some("dict.xml"));
+        assert_eq!(get("DefaultApplVerID"), Some("FIX.5.0SP2"));
+        assert_eq!(get("DataDictionary"), None);
+        assert_eq!(
+            parsed
+                .recovery_identity()
+                .get("appl.ver.id")
+                .map(String::as_str),
+            Some("FIX.5.0SP2")
+        );
+        assert_ne!(
+            parsed.capture_contract(&digests("a", Some("t1"))),
+            parsed.capture_contract(&digests("a", Some("t2"))),
+            "transport dictionary content binds the journal"
+        );
+        let mut sp1 = fixt();
+        sp1.set("appl.ver.id", "FIX.5.0SP1");
+        let sp1 = FixSourceConfig::parse(&sp1).expect("parse");
+        assert_ne!(
+            parsed.capture_contract(&digests("a", Some("t"))),
+            sp1.capture_contract(&digests("a", Some("t"))),
+            "the application version binds the journal"
+        );
+    }
+
+    #[test]
+    fn fixt_options_are_required_for_fixt_and_rejected_otherwise() {
+        for key in ["transport.dictionary.path", "appl.ver.id"] {
+            let mut missing = fixt();
+            missing.set(key, "");
+            assert!(FixSourceConfig::parse(&missing).is_err(), "{key} required");
+            let mut stray = base();
+            stray.set(key, "x");
+            let error = FixSourceConfig::parse(&stray).expect_err("rejected below FIXT");
+            assert!(error.to_string().contains("FIXT.1.1"), "{error}");
+        }
+        let mut version = fixt();
+        version.set("appl.ver.id", "FIX.4.4");
+        assert!(FixSourceConfig::parse(&version).is_err());
+        let plain = FixSourceConfig::parse(&base()).expect("parse");
+        assert!(plain.fixt.is_none());
+        assert!(!plain.recovery_identity().contains_key("appl.ver.id"));
     }
 }

@@ -18,7 +18,7 @@ use self::builder::ColumnBuilder;
 use self::plan::{ColumnPlan, Conversion, Meta, Scope, Source};
 use crate::connector::SourceRowPositions;
 use crate::error::ConnectorError;
-use crate::fix::engine::{DataDictionary, FieldMapRef, MessageRef};
+use crate::fix::engine::{FieldMapRef, MessageRef, SessionDictionaries};
 use crate::fix::journal::ApplicationRecord;
 
 /// A message that cannot be projected under the configured contract.
@@ -73,7 +73,7 @@ impl<'a> RowContext<'a> {
 /// Reusable projection state for one source.
 pub(crate) struct Projection {
     plan: ProjectionPlan,
-    dictionary: Arc<DataDictionary>,
+    dictionary: Arc<SessionDictionaries>,
     session: Arc<str>,
     max_rows_per_message: usize,
     builders: Vec<ColumnBuilder>,
@@ -85,7 +85,7 @@ pub(crate) struct Projection {
 impl Projection {
     pub(crate) fn new(
         plan: ProjectionPlan,
-        dictionary: Arc<DataDictionary>,
+        dictionary: Arc<SessionDictionaries>,
         session: Arc<str>,
         max_rows_per_message: usize,
     ) -> Self {

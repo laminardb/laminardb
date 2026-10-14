@@ -50,6 +50,7 @@ fn fill(exec_id: &str, symbol: &str, qty: &str, venue_seq: &str, parties: &[&str
         .collect();
     TestMessage {
         msg_type: "8".into(),
+        header_fields: Vec::new(),
         fields,
         groups: vec![(453, parties)],
     }

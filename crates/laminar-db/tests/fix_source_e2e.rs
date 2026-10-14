@@ -17,6 +17,14 @@ const DICTIONARY: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../laminar-connectors/tests/fixtures/fix/FIX44-synthetic.xml"
 );
+const TRANSPORT_DICTIONARY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../laminar-connectors/tests/fixtures/fix/FIXT11-synthetic.xml"
+);
+const APPLICATION_DICTIONARY: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../laminar-connectors/tests/fixtures/fix/FIX50SP2-synthetic.xml"
+);
 const CONVERGE: Duration = Duration::from_secs(30);
 
 fn sql_path(path: &Path) -> String {
@@ -150,6 +158,7 @@ fn fill(exec_id: &str, symbol: &str, qty: &str, transact_time: &str) -> TestMess
     }
     TestMessage {
         msg_type: "8".into(),
+        header_fields: Vec::new(),
         fields,
         groups: Vec::new(),
     }
@@ -344,6 +353,61 @@ async fn fix_source_feeds_sql_aggregates_windows_and_a_sink_across_restart() {
             "{expected} missing from sink output {ids:?}"
         );
     }
+    venue.stop().expect("stop venue");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixt_source_feeds_a_sql_aggregate() {
+    let dir = tempfile::tempdir().expect("dir");
+    let venue = FixTestVenue::start_with_settings(
+        &dir.path().join("venue"),
+        Path::new(APPLICATION_DICTIONARY),
+        "FIXT.1.1",
+        "VENUE_FIXT",
+        "LAMINAR_FIXT",
+        &[
+            ("TransportDataDictionary", TRANSPORT_DICTIONARY.to_string()),
+            ("AppDataDictionary", APPLICATION_DICTIONARY.to_string()),
+            ("DefaultApplVerID", "FIX.5.0SP2".to_string()),
+        ],
+    )
+    .expect("venue");
+    let ddl = [
+        format!(
+            "CREATE SOURCE fills (symbol VARCHAR NOT NULL) FROM FIX (
+                host = '127.0.0.1',
+                port = '{port}',
+                transport = 'tcp',
+                'begin.string' = 'FIXT.1.1',
+                'appl.ver.id' = 'FIX.5.0SP2',
+                'sender.comp.id' = 'LAMINAR_FIXT',
+                'target.comp.id' = 'VENUE_FIXT',
+                'dictionary.path' = '{application}',
+                'transport.dictionary.path' = '{transport}',
+                messages = '8',
+                'journal.path' = '{journal}',
+                'reconnect.interval.seconds' = '1',
+                'column.symbol' = '55'
+             )",
+            port = venue.port(),
+            application = APPLICATION_DICTIONARY.replace('\\', "/"),
+            transport = TRANSPORT_DICTIONARY.replace('\\', "/"),
+            journal = sql_path(&dir.path().join("journal")),
+        ),
+        "CREATE MATERIALIZED VIEW totals AS \
+         SELECT symbol, COUNT(*) AS fills FROM fills GROUP BY symbol"
+            .to_string(),
+    ];
+    let db = reopen(&dir.path().join("storage"), &ddl).await;
+    db.start().await.expect("start");
+    assert!(venue.wait_logged_on(CONVERGE), "FIXT logon");
+    for (exec, symbol) in [("F1", "AAA"), ("F2", "BBB"), ("F3", "AAA")] {
+        venue
+            .send(&fill(exec, symbol, "10", "20261014-12:00:00"))
+            .expect("send");
+    }
+    wait_totals(&db, &BTreeMap::from([("AAA".into(), 2), ("BBB".into(), 1)])).await;
+    db.shutdown().await.expect("shutdown");
     venue.stop().expect("stop venue");
 }
 

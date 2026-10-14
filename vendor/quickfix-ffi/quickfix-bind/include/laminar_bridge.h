@@ -41,11 +41,17 @@ int8_t LmFix_messageSerialize(const FixMessage_t *msg, void *ctx, LmFixBytesSink
 int8_t LmFix_messageSerializeWithoutHeaderTags(const FixMessage_t *msg, const int32_t *tags, size_t count,
                                                void *ctx, LmFixBytesSink sink);
 
-// Length-aware parse using one dictionary for header, body, and group structure. Checks body
-// length and checksum. NULL on error.
-FixMessage_t *LmFix_messageParse(const char *ptr, size_t len, const FixDataDictionary_t *dictionary);
+// Length-aware parse with a session dictionary for header and trailer and an application
+// dictionary for body and group structure (the same dictionary below FIXT). Checks body length
+// and checksum. NULL on error.
+FixMessage_t *LmFix_messageParse(const char *ptr, size_t len, const FixDataDictionary_t *sessionDictionary,
+                                 const FixDataDictionary_t *applicationDictionary);
 
 // Dictionary introspection for validating column mappings before activation.
+
+// The dictionary's version, `type.major.minor` of its root element (the service pack is not part
+// of it). 0 on success.
+int8_t LmFix_dictionaryVersion(const FixDataDictionary_t *dictionary, void *ctx, LmFixBytesSink sink);
 
 // FIX::TYPE::Type of a defined field, or -1 when the dictionary does not define it.
 int32_t LmFix_dictionaryFieldType(const FixDataDictionary_t *dictionary, int32_t tag);
