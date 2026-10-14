@@ -19,6 +19,10 @@
 - FIX source `venue = 'binance'` profile for Binance Spot drop copy: an Ed25519-signed Logon, a
   sequence reset at every logon, and `gap_before` on the first row of every later series,
   because Binance does not retransmit.
+- `examples/fix-desk`: a trading desk over a FIX drop copy in SQL only (positions, per-minute
+  flow, rejects, large fills, order bursts, drop-copy delay, feed health, and an exactly-once
+  Delta Lake audit trail reconciled in DuckDB), with one connection file per counterparty and a
+  local broker simulator (`laminar-connectors` example `fix_venue`).
 
 - Kafka exactly-once output in embedded and single-node deployments: each checkpoint's records are
   published by one fenced transactional committer together with a cursor marker in a compacted
