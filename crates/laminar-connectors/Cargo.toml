@@ -111,6 +111,10 @@ opentelemetry-proto = { version = "0.31", default-features = false, features = [
 tonic = { version = "0.14", optional = true }
 base64 = { workspace = true, optional = true }
 
+# FIX source: QuickFIX C++ session engine (vendored binding with a length-aware bridge)
+quickfix-ffi = { package = "laminardb-quickfix-ffi", path = "../../vendor/quickfix-ffi", version = "=0.32.0", optional = true }
+xxhash-rust = { workspace = true, optional = true }
+
 # File source/sink
 globset = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
@@ -178,11 +182,14 @@ websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util"]
 files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream"]
 # OpenTelemetry OTLP/gRPC source
 otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:base64"]
+# FIX TagValue source over a QuickFIX initiator session. Builds C++ with CMake.
+fix = ["dep:quickfix-ffi", "dep:xxhash-rust", "dep:tokio-rustls", "dep:webpki-roots"]
 # NATS core + JetStream source and sink
 nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
 [dev-dependencies]
 apache-avro = { workspace = true }
+rcgen = "0.13"
 criterion = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

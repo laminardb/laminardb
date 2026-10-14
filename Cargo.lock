@@ -5250,6 +5250,7 @@ dependencies = [
  "jiff",
  "laminar-core",
  "laminardb-pgwire-replication",
+ "laminardb-quickfix-ffi",
  "libc",
  "mongodb",
  "notify",
@@ -5262,6 +5263,7 @@ dependencies = [
  "prometheus",
  "quick_cache",
  "rand 0.10.3",
+ "rcgen",
  "rdkafka",
  "reqwest 0.12.28",
  "reqwest 0.13.5",
@@ -5289,6 +5291,7 @@ dependencies = [
  "uuid",
  "webpki-roots 1.0.9",
  "wiremock",
+ "xxhash-rust",
  "zstd",
 ]
 
@@ -5557,6 +5560,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "laminardb-quickfix-ffi"
+version = "0.32.0"
+dependencies = [
+ "cmake",
+ "fs_extra",
 ]
 
 [[package]]

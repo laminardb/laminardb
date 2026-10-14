@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYNTHETIC test dictionary. Not a venue dictionary and not venue-certified.
+
+  A FIX 4.4 subset with the standard session messages, an ExecutionReport with nested and
+  sibling repeating groups and a length-prefixed data field, and venue-defined custom fields
+  (5001-5003) and a custom message type (U1). It demonstrates that a dialect is configured
+  through its dictionary and column mapping, not through connector code.
+-->
+<fix type="FIX" major="4" minor="4" servicepack="0">
+  <header>
+    <field name="BeginString" required="Y"/>
+    <field name="BodyLength" required="Y"/>
+    <field name="MsgType" required="Y"/>
+    <field name="SenderCompID" required="Y"/>
+    <field name="TargetCompID" required="Y"/>
+    <field name="MsgSeqNum" required="Y"/>
+    <field name="PossDupFlag" required="N"/>
+    <field name="PossResend" required="N"/>
+    <field name="SendingTime" required="Y"/>
+    <field name="OrigSendingTime" required="N"/>
+    <field name="LastMsgSeqNumProcessed" required="N"/>
+  </header>
+  <messages>
+    <message name="Heartbeat" msgtype="0" msgcat="admin">
+      <field name="TestReqID" required="N"/>
+    </message>
+    <message name="TestRequest" msgtype="1" msgcat="admin">
+      <field name="TestReqID" required="Y"/>
+    </message>
+    <message name="ResendRequest" msgtype="2" msgcat="admin">
+      <field name="BeginSeqNo" required="Y"/>
+      <field name="EndSeqNo" required="Y"/>
+    </message>
+    <message name="Reject" msgtype="3" msgcat="admin">
+      <field name="RefSeqNum" required="Y"/>
+      <field name="RefTagID" required="N"/>
+      <field name="RefMsgType" required="N"/>
+      <field name="SessionRejectReason" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="SequenceReset" msgtype="4" msgcat="admin">
+      <field name="GapFillFlag" required="N"/>
+      <field name="NewSeqNo" required="Y"/>
+    </message>
+    <message name="Logout" msgtype="5" msgcat="admin">
+      <field name="Text" required="N"/>
+    </message>
+    <message name="Logon" msgtype="A" msgcat="admin">
+      <field name="EncryptMethod" required="Y"/>
+      <field name="HeartBtInt" required="Y"/>
+      <field name="RawDataLength" required="N"/>
+      <field name="RawData" required="N"/>
+      <field name="ResetSeqNumFlag" required="N"/>
+      <field name="NextExpectedMsgSeqNum" required="N"/>
+      <field name="MaxMessageSize" required="N"/>
+      <field name="Username" required="N"/>
+      <field name="Password" required="N"/>
+    </message>
+    <message name="BusinessMessageReject" msgtype="j" msgcat="app">
+      <field name="RefSeqNum" required="N"/>
+      <field name="RefMsgType" required="Y"/>
+      <field name="BusinessRejectRefID" required="N"/>
+      <field name="BusinessRejectReason" required="Y"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="ExecutionReport" msgtype="8" msgcat="app">
+      <field name="OrderID" required="Y"/>
+      <field name="ClOrdID" required="N"/>
+      <field name="ExecID" required="Y"/>
+      <field name="ExecType" required="Y"/>
+      <field name="OrdStatus" required="Y"/>
+      <group name="NoPartyIDs" required="N">
+        <field name="PartyID" required="N"/>
+        <field name="PartyIDSource" required="N"/>
+        <field name="PartyRole" required="N"/>
+        <group name="NoPartySubIDs" required="N">
+          <field name="PartySubID" required="N"/>
+          <field name="PartySubIDType" required="N"/>
+        </group>
+      </group>
+      <field name="Symbol" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="LastQty" required="N"/>
+      <field name="LastPx" required="N"/>
+      <field name="LeavesQty" required="Y"/>
+      <field name="CumQty" required="Y"/>
+      <field name="AvgPx" required="Y"/>
+      <field name="TransactTime" required="N"/>
+      <field name="Text" required="N"/>
+      <field name="EncodedTextLen" required="N"/>
+      <field name="EncodedText" required="N"/>
+      <group name="NoMiscFees" required="N">
+        <field name="MiscFeeAmt" required="N"/>
+        <field name="MiscFeeCurr" required="N"/>
+        <field name="MiscFeeType" required="N"/>
+      </group>
+      <field name="VenueSeq" required="N"/>
+      <field name="VenueTag" required="N"/>
+    </message>
+    <message name="VenueStatus" msgtype="U1" msgcat="app">
+      <field name="VenueStatusCode" required="Y"/>
+      <field name="TransactTime" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+  </messages>
+  <trailer>
+    <field name="SignatureLength" required="N"/>
+    <field name="Signature" required="N"/>
+    <field name="CheckSum" required="Y"/>
+  </trailer>
+  <components/>
+  <fields>
+    <field number="6" name="AvgPx" type="PRICE"/>
+    <field number="7" name="BeginSeqNo" type="SEQNUM"/>
+    <field number="8" name="BeginString" type="STRING"/>
+    <field number="9" name="BodyLength" type="LENGTH"/>
+    <field number="10" name="CheckSum" type="STRING"/>
+    <field number="11" name="ClOrdID" type="STRING"/>
+    <field number="14" name="CumQty" type="QTY"/>
+    <field number="16" name="EndSeqNo" type="SEQNUM"/>
+    <field number="17" name="ExecID" type="STRING"/>
+    <field number="31" name="LastPx" type="PRICE"/>
+    <field number="32" name="LastQty" type="QTY"/>
+    <field number="34" name="MsgSeqNum" type="SEQNUM"/>
+    <field number="35" name="MsgType" type="STRING">
+      <value enum="0" description="HEARTBEAT"/>
+      <value enum="1" description="TEST_REQUEST"/>
+      <value enum="2" description="RESEND_REQUEST"/>
+      <value enum="3" description="REJECT"/>
+      <value enum="4" description="SEQUENCE_RESET"/>
+      <value enum="5" description="LOGOUT"/>
+      <value enum="8" description="EXECUTION_REPORT"/>
+      <value enum="A" description="LOGON"/>
+      <value enum="j" description="BUSINESS_MESSAGE_REJECT"/>
+      <value enum="U1" description="VENUE_STATUS"/>
+    </field>
+    <field number="36" name="NewSeqNo" type="SEQNUM"/>
+    <field number="37" name="OrderID" type="STRING"/>
+    <field number="39" name="OrdStatus" type="CHAR"/>
+    <field number="43" name="PossDupFlag" type="BOOLEAN"/>
+    <field number="45" name="RefSeqNum" type="SEQNUM"/>
+    <field number="49" name="SenderCompID" type="STRING"/>
+    <field number="52" name="SendingTime" type="UTCTIMESTAMP"/>
+    <field number="54" name="Side" type="CHAR"/>
+    <field number="55" name="Symbol" type="STRING"/>
+    <field number="56" name="TargetCompID" type="STRING"/>
+    <field number="58" name="Text" type="STRING"/>
+    <field number="60" name="TransactTime" type="UTCTIMESTAMP"/>
+    <field number="89" name="Signature" type="DATA"/>
+    <field number="93" name="SignatureLength" type="LENGTH"/>
+    <field number="95" name="RawDataLength" type="LENGTH"/>
+    <field number="96" name="RawData" type="DATA"/>
+    <field number="97" name="PossResend" type="BOOLEAN"/>
+    <field number="98" name="EncryptMethod" type="INT"/>
+    <field number="108" name="HeartBtInt" type="INT"/>
+    <field number="112" name="TestReqID" type="STRING"/>
+    <field number="122" name="OrigSendingTime" type="UTCTIMESTAMP"/>
+    <field number="123" name="GapFillFlag" type="BOOLEAN"/>
+    <field number="136" name="NoMiscFees" type="NUMINGROUP"/>
+    <field number="137" name="MiscFeeAmt" type="AMT"/>
+    <field number="138" name="MiscFeeCurr" type="CURRENCY"/>
+    <field number="139" name="MiscFeeType" type="CHAR"/>
+    <field number="141" name="ResetSeqNumFlag" type="BOOLEAN"/>
+    <field number="150" name="ExecType" type="CHAR"/>
+    <field number="151" name="LeavesQty" type="QTY"/>
+    <field number="354" name="EncodedTextLen" type="LENGTH"/>
+    <field number="355" name="EncodedText" type="DATA"/>
+    <field number="369" name="LastMsgSeqNumProcessed" type="SEQNUM"/>
+    <field number="371" name="RefTagID" type="INT"/>
+    <field number="372" name="RefMsgType" type="STRING"/>
+    <field number="373" name="SessionRejectReason" type="INT"/>
+    <field number="379" name="BusinessRejectRefID" type="STRING"/>
+    <field number="380" name="BusinessRejectReason" type="INT"/>
+    <field number="383" name="MaxMessageSize" type="LENGTH"/>
+    <field number="447" name="PartyIDSource" type="CHAR"/>
+    <field number="448" name="PartyID" type="STRING"/>
+    <field number="452" name="PartyRole" type="INT"/>
+    <field number="453" name="NoPartyIDs" type="NUMINGROUP"/>
+    <field number="523" name="PartySubID" type="STRING"/>
+    <field number="553" name="Username" type="STRING"/>
+    <field number="554" name="Password" type="STRING"/>
+    <field number="789" name="NextExpectedMsgSeqNum" type="SEQNUM"/>
+    <field number="802" name="NoPartySubIDs" type="NUMINGROUP"/>
+    <field number="803" name="PartySubIDType" type="INT"/>
+    <field number="5001" name="VenueSeq" type="INT"/>
+    <field number="5002" name="VenueTag" type="STRING"/>
+    <field number="5003" name="VenueStatusCode" type="INT"/>
+  </fields>
+</fix>

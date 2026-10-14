@@ -1,0 +1,59 @@
+//! FIX TagValue source built on the QuickFIX C++ session engine.
+//!
+//! One source owns one initiator session. Inbound application messages are journaled durably
+//! inside the engine callback before the engine may advance its inbound sequence number, then
+//! projected from the journal into Arrow rows with deterministic `(session, journal index, row)`
+//! positions. Restart replays the journal from the committed checkpoint cursor; the session
+//! resumes from the engine store and the counterparty retransmits anything not yet journaled.
+//!
+//! Supported: FIX.4.2/FIX.4.4 initiator over loopback TCP or verified TLS, at-least-once with
+//! checkpointing, embedded and single-node deployments. Not supported (rejected before I/O):
+//! acceptor sessions, FIXT/FIX 5, cluster placement, exactly-once, and outbound application
+//! messages.
+
+mod capture;
+mod config;
+mod dictionary;
+mod engine;
+mod journal;
+mod metrics;
+mod projection;
+mod source;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+#[cfg(test)]
+mod tests;
+mod tls;
+
+pub use source::FixSource;
+
+use std::sync::Arc;
+
+use crate::config::ConnectorInfo;
+use crate::error::ConnectorError;
+use crate::registry::ConnectorRegistry;
+use crate::schema::resolution::SchemaCapabilities;
+
+/// Native schema format recorded in FIX schema bindings.
+const NATIVE_FORMAT: &str = "fix-tagvalue";
+
+/// Register the `fix` source connector.
+///
+/// # Errors
+/// Returns an error if the source is already registered or the registry is frozen.
+pub fn register_fix_source(registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
+    let info = ConnectorInfo {
+        schema_capabilities: SchemaCapabilities::declared(false),
+        name: "fix".to_string(),
+        display_name: "FIX Session Source".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        is_source: true,
+        is_sink: false,
+        config_keys: config::config_keys(),
+    };
+    registry.register_source(
+        "fix",
+        info,
+        Arc::new(|registry| Ok(Box::new(FixSource::new(registry.cloned())))),
+    )
+}
