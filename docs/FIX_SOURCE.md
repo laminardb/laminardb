@@ -15,7 +15,7 @@ with CMake and a C++17 compiler. Builds without the feature do not compile or li
 | Versions | FIX.4.4 and FIXT.1.1 with one FIX 5.0 application version (FIX.5.0, SP1, or SP2) per source, qualified with local tests; FIX.4.2 (same engine path, not separately exercised) | Several application versions in one session, FIX.4.x application versions over FIXT, FIXP, FAST, SBE |
 | Transport | TLS with chain and hostname verification, optional mutual TLS; plaintext TCP to loopback, or to a remote host only with `tcp.allow.remote` | Engine-native SSL |
 | Deployment | Embedded, single-node server | Cluster (the journal and session state are node-local) |
-| Delivery | At-least-once with checkpointing | Best-effort, exactly-once |
+| Delivery | At-least-once and exactly-once, with checkpointing | Best-effort; exactly-once in cluster mode |
 | Outbound traffic | Session messages only (Logon, Heartbeat, ResendRequest, Logout, Reject) | Application messages, subscription requests |
 | Host failure | `journal.sync = fsync` survives process, OS, and power failure of the host | Loss of the node or its disk |
 
@@ -248,8 +248,18 @@ whole on every row of the message as two aligned arrays.
 ## Delivery and recovery contract
 
 The source declares a commit-coupled, singleton, append-only contract with deterministic row
-positions, so it is admitted only with `AtLeastOnce` delivery and checkpointing, outside cluster
-mode. Rows may repeat after recovery when a sink is not checkpoint-committable.
+positions, certified for exactly-once delivery. It is admitted with `AtLeastOnce` or
+`ExactlyOnce` delivery and checkpointing, outside cluster mode. Under at-least-once, rows may
+repeat after recovery when a sink is not checkpoint-committable.
+
+Exactly-once holds because the source's checkpoint cut is exact: a cursor is a journal index,
+every emitted record is durable in the journal, and one FIX message is one atomic record, so no
+upstream transaction spans the cut. After a crash the pipeline restores the committed cursor and
+replays the journal from it, and a checkpoint-committable sink discards the uncommitted epoch.
+The repeated-kill test runs into a local Delta Lake append sink; other checkpoint-committable
+sinks are admitted but not exercised with this source. Exactly-once holds within the journal's failure model:
+with `journal.sync = os` a host failure fails the restart (the committed cursor lies beyond the
+journal end) rather than duplicating rows.
 
 | Failure | Outcome |
 |---|---|

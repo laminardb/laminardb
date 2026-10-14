@@ -9,9 +9,10 @@
   verified TLS or loopback TCP, a group-committed receive journal written inside the engine
   callback, a source-owned session store that never persists the inbound sequence number past a
   record that is not yet durable, dictionary-validated column mappings for header, body, group,
-  and metadata fields, deterministic replay, and at-least-once delivery in embedded and
-  single-node deployments. Cluster placement and exactly-once delivery are rejected. See
-  `docs/FIX_SOURCE.md`.
+  and metadata fields, deterministic replay, and at-least-once or exactly-once delivery in
+  embedded and single-node deployments. Cluster placement is rejected. See `docs/FIX_SOURCE.md`.
+- Certified commit-coupled sources are admitted for exactly-once delivery; uncertified ones are
+  still rejected.
 
 - Kafka exactly-once output in embedded and single-node deployments: each checkpoint's records are
   published by one fenced transactional committer together with a cursor marker in a compacted

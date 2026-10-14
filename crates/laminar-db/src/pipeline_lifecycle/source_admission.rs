@@ -38,15 +38,14 @@ pub(super) fn admit_source_recovery_contract(
              connector contract",
         );
     }
+    // Certification of a commit-coupled source asserts that its barrier cut is exact: no
+    // upstream transaction spans the cut, so committed output never holds part of one.
     if contract.consistency == SourceConsistency::CommitCoupled {
-        if delivery == DeliveryGuarantee::ExactlyOnce {
+        if delivery == DeliveryGuarantee::BestEffort {
             return Err(
-                "exactly-once commit-coupled sources require a certified in-flight \
-                 transaction/barrier checkpoint cut, which is not implemented",
+                "commit-coupled sources support only at-least-once and certified exactly-once \
+                 delivery",
             );
-        }
-        if delivery != DeliveryGuarantee::AtLeastOnce {
-            return Err("commit-coupled sources currently support only at-least-once delivery");
         }
         if !checkpointing_enabled {
             return Err(

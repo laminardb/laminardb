@@ -279,6 +279,8 @@ jobs:
         run: cargo test -p laminar-connectors --no-default-features --features fix --lib -- 'fix::'
       - name: SQL end-to-end and process-kill recovery
         run: cargo test -p laminar-db --no-default-features --features "fix files" --test fix_source_e2e --test fix_source_crash
+      - name: Exactly-once into Delta Lake across process kills
+        run: cargo test -p laminar-db --no-default-features --features "fix delta-lake" --test fix_source_exactly_once
       - name: Server build and example profile
         run: cargo test -p laminar-server --no-default-features --features fix --bin laminardb shipped_server_configs_deserialize
 
