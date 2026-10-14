@@ -270,12 +270,12 @@ journal end) rather than duplicating rows.
 | Journal write or flush failure | The writer stops (no retry after an ambiguous flush); the session logs out without advancing; the source fails; restart truncates a torn tail |
 | Session state write failure | The session stops: inbound processing disconnects, outbound messages are not sent, and the source fails |
 | Damaged session state | `session.identity` with no valid copy fails the start (the outbound sequence number is unknown); a damaged `session.inbound` requests retransmission from 1 |
-
-Process kills are tested (repeated hard kills of a running pipeline lose no message). The host
-and power failure rows follow from the flush ordering above; no power-loss test has been run.
 | Journal full | Intake pauses (session logs out and refuses logon) until committed checkpoints release segments |
 | Corrupt record before the durable end | The source fails; no fallback |
 | Restore point older than the retained journal | The source fails with "restore point expired" |
+
+Process kills are tested (repeated hard kills of a running pipeline lose no message). The host
+and power failure rows follow from the flush ordering above; no power-loss test has been run.
 
 Changing the session identity, dictionary content, message selection, or validation flags
 changes the journal's capture contract; a journal with a different contract is rejected. Change
