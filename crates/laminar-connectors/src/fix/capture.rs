@@ -30,13 +30,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::config::{ApplVerId, Credentials, FixSourceConfig};
+use super::config::{ApplVerId, FixSourceConfig};
 use super::engine::{
     CallbackOutcome, MessageRef, OutboundMessage, SessionCallbacks, SessionKey, StoreBackend,
 };
 use super::journal::{ApplicationRecord, Journal, Record};
 use super::metrics::{saturating, FixMetrics};
 use super::session_store::SessionStore;
+use super::venue::Logon;
 
 /// Header fields a retransmission may legitimately change: BodyLength, PossDupFlag,
 /// SendingTime, PossResend, OrigSendingTime, LastMsgSeqNumProcessed.
@@ -76,7 +77,7 @@ pub(crate) struct Capture {
     store: Arc<SessionStore>,
     session: SessionKey,
     messages: Vec<String>,
-    credentials: Option<Credentials>,
+    logon: Logon,
     max_message_bytes: usize,
     appl_ver_id: Option<ApplVerId>,
     status: Arc<SessionStatus>,
@@ -89,6 +90,7 @@ impl Capture {
         journal: Arc<Journal>,
         store: Arc<SessionStore>,
         config: &FixSourceConfig,
+        logon: Logon,
         status: Arc<SessionStatus>,
         metrics: Arc<FixMetrics>,
     ) -> Self {
@@ -97,7 +99,7 @@ impl Capture {
             store,
             session: config.session.clone(),
             messages: config.messages.iter().cloned().collect(),
-            credentials: config.credentials.clone(),
+            logon,
             max_message_bytes: config.max_message_bytes,
             appl_ver_id: config.fixt.as_ref().map(|fixt| fixt.appl_ver_id),
             status,
@@ -367,28 +369,8 @@ impl SessionCallbacks for Capture {
         let msg_type = msg_type(message.view());
         match msg_type.as_deref() {
             Some(b"A") => {
-                // The engine buffers a whole message before any limit applies, so ask the
-                // counterparty for the bound (MaxMessageSize, 383).
-                let max_size = self.max_message_bytes.to_string();
-                let username = self
-                    .credentials
-                    .as_ref()
-                    .and_then(|credentials| credentials.username.as_deref())
-                    .map(|value| (553, value));
-                let password = self
-                    .credentials
-                    .as_ref()
-                    .and_then(|credentials| credentials.password.as_ref())
-                    .map(|value| (554, value.expose()));
-                let fields = [(383, max_size.as_str())]
-                    .into_iter()
-                    .chain(username)
-                    .chain(password);
-                for (tag, value) in fields {
-                    if let Err(error) = message.set_body(tag, value.as_bytes()) {
-                        self.status
-                            .fail(format!("cannot set logon field {tag}: {error}"));
-                    }
+                if let Err(error) = self.logon.apply(message) {
+                    self.status.fail(error);
                 }
             }
             Some(b"3") => self.rejected(message.view()),

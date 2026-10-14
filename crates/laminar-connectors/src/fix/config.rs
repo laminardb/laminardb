@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use super::dictionary::{DictionaryDigests, DictionaryFiles};
 use super::engine::SessionKey;
 use super::journal::{JournalOptions, SyncPolicy};
+use super::venue::Venue;
 use crate::config::{ConfigKeySpec, ConnectorConfig};
 use crate::error::ConnectorError;
 
@@ -125,6 +126,7 @@ pub(crate) struct FixSourceConfig {
     pub(crate) max_message_bytes: usize,
     pub(crate) max_rows_per_message: usize,
     pub(crate) on_sequence_reset: SequenceResetPolicy,
+    pub(crate) venue: Venue,
     engine: BTreeMap<&'static str, String>,
 }
 
@@ -191,6 +193,16 @@ const KEYS: &[Key] = &[
     required("sender.comp.id", "SenderCompID (49) sent by this source"),
     required("target.comp.id", "TargetCompID (56) of the counterparty"),
     optional("session.qualifier", "Engine session qualifier", ""),
+    optional(
+        "venue",
+        "'binance' for a Binance Spot FIX drop-copy session; empty for standard FIX",
+        "",
+    ),
+    optional(
+        "logon.key.file",
+        "PEM PKCS#8 private key that signs the Logon (venue 'binance': Ed25519)",
+        "",
+    ),
     optional("username", "Logon Username (553)", ""),
     optional(
         "password",
@@ -566,7 +578,9 @@ impl FixSourceConfig {
                 )))
             }
         };
-        let engine = engine_settings(config)?;
+        let venue = Venue::parse(config, &session)?;
+        let mut engine = engine_settings(config)?;
+        venue.constrain_engine(config, &mut engine)?;
         Ok(Self {
             session,
             host,
@@ -588,6 +602,7 @@ impl FixSourceConfig {
             )?)
             .map_err(|_| ConnectorError::ConfigurationError("max.rows.per.message".into()))?,
             on_sequence_reset,
+            venue,
             engine,
         })
     }
@@ -662,6 +677,9 @@ impl FixSourceConfig {
             );
             object.insert("appl_ver_id".into(), fixt.appl_ver_id.code().into());
         }
+        if let (Some(venue), Some(object)) = (self.venue.name(), contract.as_object_mut()) {
+            object.insert("venue".into(), venue.into());
+        }
         hex(&Sha256::digest(contract.to_string().as_bytes()))
     }
 
@@ -693,6 +711,9 @@ impl FixSourceConfig {
                 "appl.ver.id".to_string(),
                 fixt.appl_ver_id.name().to_string(),
             );
+        }
+        if let Some(venue) = self.venue.name() {
+            identity.insert("venue".to_string(), venue.to_string());
         }
         identity
     }

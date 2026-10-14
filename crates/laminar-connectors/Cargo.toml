@@ -114,6 +114,8 @@ base64 = { workspace = true, optional = true }
 # FIX source: QuickFIX C++ session engine (vendored binding with a length-aware bridge)
 quickfix-ffi = { package = "laminardb-quickfix-ffi", path = "../../vendor/quickfix-ffi", version = "=0.32.0", optional = true }
 xxhash-rust = { workspace = true, optional = true }
+# Ed25519 Logon signatures for the Binance profile; already built for the FIX TLS bridge.
+aws-lc-rs = { version = "1.18", optional = true, default-features = false, features = ["aws-lc-sys"] }
 
 # File source/sink
 globset = { workspace = true, optional = true }
@@ -183,7 +185,7 @@ files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:li
 # OpenTelemetry OTLP/gRPC source
 otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:base64"]
 # FIX TagValue source over a QuickFIX initiator session. Builds C++ with CMake.
-fix = ["dep:quickfix-ffi", "dep:xxhash-rust", "dep:tokio-rustls", "dep:webpki-roots"]
+fix = ["dep:quickfix-ffi", "dep:xxhash-rust", "dep:tokio-rustls", "dep:webpki-roots", "dep:aws-lc-rs", "dep:base64"]
 # NATS core + JetStream source and sink
 nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
