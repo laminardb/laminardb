@@ -36,6 +36,9 @@ fn get_compiler_launcher() -> Option<&'static str> {
 fn main() {
     let out_dir = env::var("OUT_DIR").expect("Missing OUT_DIR");
     let target_os = TargetOs::from_env();
+    // cmake-rs replaces CMake's default MSVC flags, which carry /EHsc. Without it exceptions
+    // unwind without running destructors, so an engine exception leaves its mutexes locked.
+    let msvc = env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
 
     // Make sure sub-repositories are correctly init
     update_sub_repositories();
@@ -67,6 +70,9 @@ fn main() {
         // Always compile libquickfix in release mode.
         // We are not here to debug this library.
         .profile("RelWithDebInfo");
+    if msvc {
+        quickfix_cmake_config.cxxflag("/EHsc");
+    }
 
     if let Some(compiler_launcher) = get_compiler_launcher() {
         quickfix_cmake_config
@@ -89,6 +95,9 @@ fn main() {
         .define("HAVE_SSL", read_cmake_opt("build-with-ssl"))
         .define("HAVE_MYSQL", read_cmake_opt("build-with-mysql"))
         .define("HAVE_POSTGRESQL", read_cmake_opt("build-with-postgres"));
+    if msvc {
+        quickfix_bind_cmake_config.cxxflag("/EHsc");
+    }
 
     if let Some(compiler_launcher) = get_compiler_launcher() {
         quickfix_bind_cmake_config

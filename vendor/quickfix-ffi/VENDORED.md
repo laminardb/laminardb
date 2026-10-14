@@ -38,6 +38,10 @@ upstream repository published no security advisories as of 2026-10-14.
   sequence setter for test counterparties, and `stop(force)` for initiators and acceptors. Every
   function catches all C++ exceptions, including non-`std::exception` ones.
 - `quickfix-bind/CMakeLists.txt` compiles the bridge into `quickfixbind`.
+- `build.rs` compiles both libraries with `/EHsc` on MSVC. `cmake-rs` replaces CMake's default
+  MSVC flags, so the published crate builds without unwind semantics (warning C4530): an engine
+  exception then skips destructors, and an `IOException` from a store left the session-state
+  mutex locked, deadlocking the reconnect thread.
 - `src/lib.rs` declares the bridge functions.
 - `Cargo.toml` is renamed to `laminardb-quickfix-ffi` 0.32.0, declares `links = "quickfixbind"`
   so Cargo rejects a second copy of the native library in one build, and packages this file;
