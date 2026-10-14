@@ -336,7 +336,7 @@ pub(crate) struct GroupDictionary<'a> {
 }
 
 impl<'a> GroupDictionary<'a> {
-    pub(crate) fn has_field(&self, tag: i32) -> Result<bool, EngineError> {
+    pub(crate) fn has_field(self, tag: i32) -> Result<bool, EngineError> {
         // SAFETY: the group dictionary is live for `'a` and only read.
         match unsafe { ffi::LmFix_dictionaryGroupHasField(self.raw, tag) } {
             0 => Ok(false),
@@ -347,7 +347,7 @@ impl<'a> GroupDictionary<'a> {
 
     /// Nested group `count_tag` inside this group.
     pub(crate) fn group(
-        &self,
+        self,
         msg_type: &str,
         count_tag: i32,
     ) -> Result<Option<GroupDictionary<'a>>, EngineError> {
@@ -562,21 +562,21 @@ impl<'a> MessageRef<'a> {
         }
     }
 
-    pub(crate) fn header(&self) -> Result<FieldMapRef<'a>, EngineError> {
+    pub(crate) fn header(self) -> Result<FieldMapRef<'a>, EngineError> {
         // SAFETY: `raw` is live for `'a`; the header is owned by the message.
         let map = unsafe { ffi::LmFix_messageHeader(self.raw) }
             .ok_or_else(|| bridge_error("message header"))?;
         Ok(FieldMapRef::new(map))
     }
 
-    pub(crate) fn body(&self) -> Result<FieldMapRef<'a>, EngineError> {
+    pub(crate) fn body(self) -> Result<FieldMapRef<'a>, EngineError> {
         // SAFETY: `raw` is live for `'a`; the body is the message itself.
         let map = unsafe { ffi::LmFix_messageBody(self.raw) }
             .ok_or_else(|| bridge_error("message body"))?;
         Ok(FieldMapRef::new(map))
     }
 
-    pub(crate) fn trailer(&self) -> Result<FieldMapRef<'a>, EngineError> {
+    pub(crate) fn trailer(self) -> Result<FieldMapRef<'a>, EngineError> {
         // SAFETY: `raw` is live for `'a`; the trailer is owned by the message.
         let map = unsafe { ffi::LmFix_messageTrailer(self.raw) }
             .ok_or_else(|| bridge_error("message trailer"))?;
@@ -653,7 +653,7 @@ impl<'a> FieldMapRef<'a> {
     }
 
     /// Field value bytes, including embedded NUL bytes, or `None` when absent.
-    pub(crate) fn field(&self, tag: i32) -> Result<Option<&'a [u8]>, EngineError> {
+    pub(crate) fn field(self, tag: i32) -> Result<Option<&'a [u8]>, EngineError> {
         let mut ptr: *const c_char = std::ptr::null();
         let mut len = 0_usize;
         // SAFETY: the map is live for `'a`; outputs are valid writable locations.
@@ -673,7 +673,7 @@ impl<'a> FieldMapRef<'a> {
     }
 
     /// Number of entries in a repeating group (0 when the group is absent).
-    pub(crate) fn group_count(&self, count_tag: i32) -> Result<usize, EngineError> {
+    pub(crate) fn group_count(self, count_tag: i32) -> Result<usize, EngineError> {
         // SAFETY: the map is live for `'a`.
         let count = unsafe { ffi::LmFix_groupCount(self.raw, count_tag) };
         usize::try_from(count).map_err(|_| bridge_error("group count"))
@@ -681,7 +681,7 @@ impl<'a> FieldMapRef<'a> {
 
     /// One-based group entry.
     pub(crate) fn group_entry(
-        &self,
+        self,
         count_tag: i32,
         index: usize,
     ) -> Result<FieldMapRef<'a>, EngineError> {

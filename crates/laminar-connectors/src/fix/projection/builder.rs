@@ -119,8 +119,8 @@ impl ColumnBuilder {
             Self::Timestamp { values, .. } => values.push(None),
             Self::Date32(builder) => builder.append_null(),
             Self::List(list) => {
-                let last = list.offsets.last().copied().unwrap_or(0);
-                list.offsets.push(last);
+                let end = list.offsets.last().copied().unwrap_or(0);
+                list.offsets.push(end);
                 list.nulls.append_null();
             }
         }
@@ -282,6 +282,7 @@ fn narrow<T: TryFrom<i128>>(value: i128) -> Result<T, ValueError> {
     T::try_from(value).map_err(|_| "integer does not fit the column type")
 }
 
+#[allow(clippy::needless_pass_by_value)] // Adapter for owned Result::map_err errors.
 fn schema_error(error: arrow_schema::ArrowError) -> ConnectorError {
     ConnectorError::SchemaMismatch(error.to_string())
 }

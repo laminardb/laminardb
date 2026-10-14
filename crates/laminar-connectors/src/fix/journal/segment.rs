@@ -16,8 +16,10 @@ use super::record::corrupt;
 use crate::error::ConnectorError;
 
 const MAGIC: &[u8; 8] = b"LDBFIXJ1";
-pub(super) const HEADER_LEN: u64 = 32;
-pub(super) const FRAME_OVERHEAD: u64 = 12;
+const HEADER_SIZE: usize = 32;
+const FRAME_HEADER_SIZE: usize = 12;
+pub(super) const HEADER_LEN: u64 = HEADER_SIZE as u64;
+pub(super) const FRAME_OVERHEAD: u64 = FRAME_HEADER_SIZE as u64;
 const SUFFIX: &str = ".seg";
 const TEMP_SUFFIX: &str = ".seg.tmp";
 
@@ -51,8 +53,8 @@ pub(super) fn list_segments(dir: &Path) -> Result<Vec<u64>, ConnectorError> {
     Ok(segments)
 }
 
-fn header_bytes(first_index: u64, journal_id: &[u8; 16]) -> [u8; HEADER_LEN as usize] {
-    let mut header = [0_u8; HEADER_LEN as usize];
+fn header_bytes(first_index: u64, journal_id: &[u8; 16]) -> [u8; HEADER_SIZE] {
+    let mut header = [0_u8; HEADER_SIZE];
     header[..8].copy_from_slice(MAGIC);
     header[8..16].copy_from_slice(&first_index.to_le_bytes());
     header[16..].copy_from_slice(journal_id);
@@ -89,7 +91,7 @@ pub(super) fn check_header(
     first_index: u64,
     journal_id: &[u8; 16],
 ) -> Result<(), ConnectorError> {
-    let mut header = [0_u8; HEADER_LEN as usize];
+    let mut header = [0_u8; HEADER_SIZE];
     file.read_exact(&mut header)
         .map_err(|_| corrupt(&format!("segment {first_index} has a truncated header")))?;
     if header != header_bytes(first_index, journal_id) {
@@ -164,7 +166,7 @@ impl FrameReader {
         if remaining < FRAME_OVERHEAD {
             return Ok(FrameRead::Torn);
         }
-        let mut header = [0_u8; FRAME_OVERHEAD as usize];
+        let mut header = [0_u8; FRAME_HEADER_SIZE];
         self.file.read_exact(&mut header)?;
         let len = u64::from(u32::from_le_bytes([
             header[0], header[1], header[2], header[3],

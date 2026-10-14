@@ -1,7 +1,7 @@
 //! Engine qualification: proves the callback, sequencing, and ownership properties the durable
 //! handoff relies on, against a real local QuickFIX acceptor.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -179,10 +179,10 @@ impl SessionCallbacks for ClientCallbacks {
                 .push(decimal(body.field(45).expect("ref")));
         }
     }
-    fn from_admin(&self, _message: MessageRef<'_>) -> CallbackOutcome {
+    fn inbound_admin(&self, _message: MessageRef<'_>) -> CallbackOutcome {
         CallbackOutcome::Accept
     }
-    fn from_app(&self, message: MessageRef<'_>) -> CallbackOutcome {
+    fn inbound_app(&self, message: MessageRef<'_>) -> CallbackOutcome {
         let header = message.header().expect("header");
         let seq = decimal(header.field(34).expect("seq"));
         let poss_dup = header.field(43).expect("dup") == Some(b"Y".as_slice());

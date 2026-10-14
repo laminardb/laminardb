@@ -151,6 +151,7 @@ fn messages(types: &[&str]) -> BTreeSet<String> {
     types.iter().map(|value| (*value).to_string()).collect()
 }
 
+#[allow(clippy::needless_pass_by_value)] // Call sites build the schema inline.
 fn projection(schema: SchemaRef, mappings: &[(&str, &str)], types: &[&str]) -> Projection {
     let dictionary = dictionary();
     let plan = compile(&config(mappings), &schema, &dictionary, &messages(types)).expect("plan");
@@ -482,12 +483,15 @@ fn missing_required_values_fail_with_the_message_identity() {
     );
 }
 
+/// A schema, its mapping options, and the expected error text.
+type MappingCase<'a> = (SchemaRef, &'a [(&'a str, &'a str)], &'a str);
+
 #[test]
 fn mappings_are_validated_against_schema_and_dictionary_before_activation() {
     let dictionary = dictionary();
     let types = messages(&["8"]);
     let utf8 = |name: &str| Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)]));
-    let cases: &[(SchemaRef, &[(&str, &str)], &str)] = &[
+    let cases: &[MappingCase<'_>] = &[
         (utf8("a"), &[], "no 'column.a' mapping"),
         (utf8("a"), &[("column.a", "9999")], "not in the dictionary"),
         (utf8("a"), &[("column.a", "5003")], "not a Body field"),

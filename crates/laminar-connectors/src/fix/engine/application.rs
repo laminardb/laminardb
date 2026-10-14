@@ -44,9 +44,9 @@ pub(crate) trait SessionCallbacks: Send + Sync + 'static {
     /// An outbound administrative message is about to be serialized and sent.
     fn to_admin(&self, _message: &mut OutboundMessage<'_>) {}
     /// An inbound administrative message passed session validation.
-    fn from_admin(&self, message: MessageRef<'_>) -> CallbackOutcome;
+    fn inbound_admin(&self, message: MessageRef<'_>) -> CallbackOutcome;
     /// An inbound application message passed validation and sequencing.
-    fn from_app(&self, message: MessageRef<'_>) -> CallbackOutcome;
+    fn inbound_app(&self, message: MessageRef<'_>) -> CallbackOutcome;
     /// An engine event line. Never contains message bodies.
     fn on_event(&self, _text: &str) {}
     /// A callback panicked. Inbound callbacks report `Disconnect` after this returns.
@@ -74,7 +74,7 @@ impl OutboundMessage<'_> {
 
 /// Owns the engine `Application` and `LogFactory` that call into `SessionCallbacks`.
 pub(crate) struct Application {
-    pub(super) application: ffi::FixApplication_t,
+    pub(super) raw: ffi::FixApplication_t,
     pub(super) log: ffi::FixLogFactory_t,
     // Boxed so the address handed to the engine stays fixed; dropped after the engine objects.
     _host: Box<CallbackHost>,
@@ -106,7 +106,7 @@ impl Application {
             return Err(engine_error("log factory"));
         };
         Ok(Self {
-            application,
+            raw: application,
             log,
             _host: host,
         })
@@ -119,7 +119,7 @@ impl Drop for Application {
         // before this value drops, so no callback can still reference them.
         unsafe {
             ffi::FixLogFactory_delete(self.log);
-            ffi::FixApplication_delete(self.application);
+            ffi::FixApplication_delete(self.raw);
         }
     }
 }
@@ -155,13 +155,10 @@ fn guarded<T>(
 ) -> T {
     // SAFETY: the engine passes back the pointer registered in `Application::new`.
     let host = unsafe { host(data) };
-    match catch_unwind(AssertUnwindSafe(|| body(host))) {
-        Ok(value) => value,
-        Err(_) => {
-            let _ = catch_unwind(AssertUnwindSafe(|| host.callbacks.on_panic(callback)));
-            on_panic
-        }
-    }
+    catch_unwind(AssertUnwindSafe(|| body(host))).unwrap_or_else(|_| {
+        let _ = catch_unwind(AssertUnwindSafe(|| host.callbacks.on_panic(callback)));
+        on_panic
+    })
 }
 
 extern "C" fn on_create(_data: *const c_void, _session: ffi::FixSessionID_t) {}
@@ -204,7 +201,7 @@ extern "C" fn from_admin(
     guarded(data, "from_admin", CallbackOutcome::Disconnect, |host| {
         // SAFETY: the engine keeps `message` alive and unmodified for the callback.
         host.callbacks
-            .from_admin(unsafe { MessageRef::from_raw(message) })
+            .inbound_admin(unsafe { MessageRef::from_raw(message) })
     })
     .code()
 }
@@ -217,7 +214,7 @@ extern "C" fn from_app(
     guarded(data, "from_app", CallbackOutcome::Disconnect, |host| {
         // SAFETY: the engine keeps `message` alive and unmodified for the callback.
         host.callbacks
-            .from_app(unsafe { MessageRef::from_raw(message) })
+            .inbound_app(unsafe { MessageRef::from_raw(message) })
     })
     .code()
 }

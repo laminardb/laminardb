@@ -252,11 +252,7 @@ impl<'a> Compiler<'a> {
         Ok(Groups { by_message })
     }
 
-    fn nested_groups(
-        &self,
-        parent: &Groups<'a>,
-        count_tag: i32,
-    ) -> Result<Groups<'a>, ConnectorError> {
+    fn nested_groups(parent: &Groups<'a>, count_tag: i32) -> Result<Groups<'a>, ConnectorError> {
         let mut by_message = Vec::new();
         for (message, group) in &parent.by_message {
             if let Some(nested) = group.group(message, count_tag)? {
@@ -432,7 +428,7 @@ impl<'a> Compiler<'a> {
         let tags = tags(text)?;
         match (conversion, tags.as_slice()) {
             (Conversion::List { item, fields }, [nested, members @ ..]) => {
-                let nested_groups = self.nested_groups(groups, *nested)?;
+                let nested_groups = Self::nested_groups(groups, *nested)?;
                 let list = ListSpec {
                     count_tag: *nested,
                     item,

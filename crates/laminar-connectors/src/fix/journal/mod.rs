@@ -107,7 +107,7 @@ struct State {
 /// An open journal. Holds an exclusive OS lock on its directory while alive.
 pub(crate) struct Journal {
     segments_dir: PathBuf,
-    journal_id: [u8; 16],
+    id: [u8; 16],
     meta: JournalMeta,
     options: JournalOptions,
     state: Mutex<State>,
@@ -155,7 +155,7 @@ impl Journal {
         };
         let journal = Self {
             segments_dir,
-            journal_id,
+            id: journal_id,
             meta,
             options,
             over_capacity: AtomicBool::new(false),
@@ -291,7 +291,7 @@ impl Journal {
         let file = segment::create_segment(
             &self.segments_dir,
             first_index,
-            &self.journal_id,
+            &self.id,
             &state.writer.frame,
         )?;
         let bytes = HEADER_LEN + state.writer.frame.len() as u64;
@@ -372,7 +372,7 @@ impl Journal {
             .ok_or_else(|| corrupt("no segment covers the requested record"))?;
         let mut reader = JournalReader {
             segments_dir: self.segments_dir.clone(),
-            journal_id: self.journal_id,
+            journal_id: self.id,
             max_frame: self.options.max_record_bytes,
             segment_first,
             sealed_len: None,

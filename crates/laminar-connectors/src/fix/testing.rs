@@ -54,7 +54,7 @@ impl SessionCallbacks for VenueCallbacks {
         self.logged_on.store(false, Ordering::SeqCst);
     }
 
-    fn from_admin(&self, message: MessageRef<'_>) -> CallbackOutcome {
+    fn inbound_admin(&self, message: MessageRef<'_>) -> CallbackOutcome {
         let is_reject = message
             .header()
             .and_then(|header| header.field(35))
@@ -68,7 +68,7 @@ impl SessionCallbacks for VenueCallbacks {
         CallbackOutcome::Accept
     }
 
-    fn from_app(&self, message: MessageRef<'_>) -> CallbackOutcome {
+    fn inbound_app(&self, message: MessageRef<'_>) -> CallbackOutcome {
         let mut bytes = Vec::new();
         if message.serialize_into(&mut bytes).is_ok() {
             self.application.lock().push(bytes);

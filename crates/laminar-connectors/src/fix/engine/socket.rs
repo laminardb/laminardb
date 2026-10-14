@@ -84,7 +84,7 @@ impl Initiator {
         // them alive until after the initiator is deleted.
         let raw = unsafe {
             ffi::FixInitiator_new(
-                application.application,
+                application.raw,
                 store.0,
                 settings.raw,
                 application.log,
@@ -166,7 +166,7 @@ impl Acceptor {
         // SAFETY: as for `Initiator::new`.
         let raw = unsafe {
             ffi::FixAcceptor_new(
-                application.application,
+                application.raw,
                 store.0,
                 settings.raw,
                 application.log,

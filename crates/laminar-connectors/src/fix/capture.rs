@@ -372,7 +372,7 @@ impl SessionCallbacks for Capture {
         }
     }
 
-    fn from_admin(&self, message: MessageRef<'_>) -> CallbackOutcome {
+    fn inbound_admin(&self, message: MessageRef<'_>) -> CallbackOutcome {
         if let Some(reason) = self.refusal() {
             tracing::warn!(session = %self.session.display(), reason = %reason, "refusing FIX session input");
             return CallbackOutcome::Disconnect;
@@ -384,7 +384,7 @@ impl SessionCallbacks for Capture {
         }
     }
 
-    fn from_app(&self, message: MessageRef<'_>) -> CallbackOutcome {
+    fn inbound_app(&self, message: MessageRef<'_>) -> CallbackOutcome {
         if let Some(reason) = self.refusal() {
             tracing::warn!(session = %self.session.display(), reason = %reason, "refusing FIX application message");
             return CallbackOutcome::Disconnect;

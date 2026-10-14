@@ -11,6 +11,10 @@
 //! acceptor sessions, FIXT/FIX 5, cluster placement, exactly-once, and outbound application
 //! messages.
 
+// FIX field and message names (MsgSeqNum, BodyLength, ExecutionReport) are protocol
+// vocabulary in prose, not code identifiers.
+#![allow(clippy::doc_markdown)]
+
 mod capture;
 mod config;
 mod dictionary;

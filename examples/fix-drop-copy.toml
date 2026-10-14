@@ -7,13 +7,11 @@
 [server]
 mode = "single"
 bind = "127.0.0.1:8080"
+delivery = "at_least_once"
 
 [checkpoint]
 url = "file:///var/lib/laminardb/checkpoints"
 interval = "5s"
-
-[pipeline]
-delivery = "at_least_once"
 
 [[source]]
 name = "fills"

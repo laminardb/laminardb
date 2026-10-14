@@ -193,7 +193,7 @@ async fn poll_error(source: &mut FixSource) -> String {
     }
 }
 
-fn column<'a>(batches: &'a [RecordBatch], name: &str) -> Vec<String> {
+fn column(batches: &[RecordBatch], name: &str) -> Vec<String> {
     batches
         .iter()
         .flat_map(|batch| {
@@ -241,10 +241,7 @@ async fn live_messages_become_rows_and_restart_replays_from_the_journal() {
     let (batches, _) = collect(&mut source, 3).await;
     assert_eq!(column(&batches, "exec_id"), vec!["E1", "E2", "E3"]);
     assert_eq!(seqs(&batches), vec![2, 3, 4], "venue seq 1 is Logon");
-    let after_first = {
-        let journal_rows = source.checkpoint();
-        journal_rows
-    };
+    let after_first = source.checkpoint();
     source.close().await.expect("close");
 
     // A checkpoint taken before the last two rows: restart replays them from the journal
@@ -522,15 +519,13 @@ async fn a_full_journal_pauses_intake_until_a_commit_releases_space() {
 
 impl Harness {
     fn journal_bytes(&self) -> u64 {
-        std::fs::read_dir(self.journal().join("segments"))
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| entry.metadata().ok())
-                    .map(|metadata| metadata.len())
-                    .sum()
-            })
-            .unwrap_or(0)
+        std::fs::read_dir(self.journal().join("segments")).map_or(0, |entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.metadata().ok())
+                .map(|metadata| metadata.len())
+                .sum()
+        })
     }
 }
 
@@ -712,7 +707,7 @@ mod profile {
                 tokio::task::yield_now().await;
             }
         }
-        let elapsed = Instant::now() - start;
+        let elapsed = start.elapsed();
         source.close().await.expect("close");
         latencies.sort_unstable();
         eprintln!(
@@ -759,9 +754,9 @@ mod profile {
                     ))
                     .expect("send");
             }
-            let queued = Instant::now() - begin;
+            let queued = begin.elapsed();
             let (batches, _) = collect(&mut source, burst).await;
-            let caught_up = Instant::now() - begin;
+            let caught_up = begin.elapsed();
             let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             eprintln!(
                 "burst sync={sync:<5} messages={burst} venue_send={queued:?} all_rows={caught_up:?} rate={:.0}/s",
