@@ -262,6 +262,11 @@ const KEYS: &[Key] = &[
         "fail",
     ),
     optional(
+        "timestamp.precision",
+        "'exact' (sub-unit digits fail) or 'truncate' (sub-unit digits are dropped)",
+        "exact",
+    ),
+    optional(
         "expand",
         "Repeating-group count tag whose entries become rows",
         "",

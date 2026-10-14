@@ -57,6 +57,7 @@ pub(super) enum ColumnBuilder {
         values: Vec<Option<i64>>,
         unit: TimeUnit,
         timezone: Option<Arc<str>>,
+        truncate: bool,
     },
     Date32(Date32Builder),
     List(ListState),
@@ -77,10 +78,15 @@ impl ColumnBuilder {
                 precision: *precision,
                 scale: *scale,
             },
-            Conversion::Timestamp { unit, timezone } => Self::Timestamp {
+            Conversion::Timestamp {
+                unit,
+                timezone,
+                truncate,
+            } => Self::Timestamp {
                 values: Vec::new(),
                 unit: *unit,
                 timezone: timezone.clone(),
+                truncate: *truncate,
             },
             Conversion::Date32 => Self::Date32(Date32Builder::new()),
             Conversion::List { item, fields } => {
@@ -144,8 +150,11 @@ impl ColumnBuilder {
                 scale,
             } => builder.append_value(values::decimal(bytes, *precision, *scale)?),
             Self::Timestamp {
-                values: out, unit, ..
-            } => out.push(Some(values::utc_timestamp(bytes, *unit)?)),
+                values: out,
+                unit,
+                truncate,
+                ..
+            } => out.push(Some(values::utc_timestamp(bytes, *unit, *truncate)?)),
             Self::Date32(builder) => builder.append_value(values::date(bytes)?),
             Self::List(_) => return Err("a list column cannot hold a scalar field"),
         }
@@ -223,6 +232,7 @@ impl ColumnBuilder {
                 values,
                 unit,
                 timezone,
+                ..
             } => {
                 let values = std::mem::take(values);
                 let timezone = timezone.clone();

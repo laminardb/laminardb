@@ -93,6 +93,8 @@ pub(crate) enum Conversion {
     Timestamp {
         unit: TimeUnit,
         timezone: Option<Arc<str>>,
+        /// Drop sub-unit digits instead of failing (`timestamp.precision = truncate`).
+        truncate: bool,
     },
     Date32,
     /// `List` of a struct (`fields`) or of one scalar or nested-list member (`None`).
@@ -147,7 +149,7 @@ fn tag(text: &str) -> Result<i32, ConnectorError> {
         .ok_or_else(|| error(format!("'{text}' is not a FIX tag number")))
 }
 
-fn conversion(field: &Field) -> Result<Conversion, ConnectorError> {
+fn conversion(field: &Field, truncate: bool) -> Result<Conversion, ConnectorError> {
     Ok(match field.data_type() {
         DataType::Utf8 => Conversion::Utf8,
         DataType::Binary => Conversion::Binary,
@@ -163,6 +165,7 @@ fn conversion(field: &Field) -> Result<Conversion, ConnectorError> {
         DataType::Timestamp(unit, timezone) => Conversion::Timestamp {
             unit: *unit,
             timezone: timezone.clone(),
+            truncate,
         },
         DataType::Date32 => Conversion::Date32,
         DataType::List(item) => Conversion::List {
@@ -227,6 +230,7 @@ struct Compiler<'a> {
     dictionary: &'a DataDictionary,
     messages: &'a BTreeSet<String>,
     expand: Option<(i32, Groups<'a>)>,
+    truncate_timestamps: bool,
     used_keys: BTreeSet<String>,
 }
 
@@ -317,7 +321,7 @@ impl<'a> Compiler<'a> {
         field: &Field,
         entry: Option<&Groups<'a>>,
     ) -> Result<ColumnPlan, ConnectorError> {
-        let conversion = conversion(field)?;
+        let conversion = conversion(field, self.truncate_timestamps)?;
         let key = format!("{key_prefix}{}", field.name());
         let path = match self.mapping(&key) {
             Some(path) => path.to_string(),
@@ -462,7 +466,7 @@ impl<'a> Compiler<'a> {
         let children = match (list.fields, list.members) {
             (Some(fields), []) => self.children(key, fields, groups)?,
             (None, [_, ..]) => {
-                let item_conversion = conversion(list.item)?;
+                let item_conversion = conversion(list.item, self.truncate_timestamps)?;
                 let text = list
                     .members
                     .iter()
@@ -535,6 +539,15 @@ pub(crate) fn compile(
         dictionary,
         messages,
         expand: None,
+        truncate_timestamps: match config.get("timestamp.precision").map(str::trim) {
+            Some("exact") | None => false,
+            Some("truncate") => true,
+            Some(other) => {
+                return Err(error(format!(
+                    "'timestamp.precision' must be 'exact' or 'truncate', got '{other}'"
+                )))
+            }
+        },
         used_keys: BTreeSet::new(),
     };
     let expand = match config
@@ -610,6 +623,13 @@ impl ProjectionPlan {
             "columns",
             serde_json::json!(self.columns.iter().map(column).collect::<Vec<_>>()),
         );
+        let truncate = self.columns.iter().any(|column| {
+            matches!(
+                column.conversion,
+                Conversion::Timestamp { truncate: true, .. }
+            )
+        });
+        canonical.insert("timestamp_truncate", serde_json::json!(truncate));
         canonical.insert(
             "expand",
             serde_json::json!(self.expand.map(|expand| serde_json::json!({

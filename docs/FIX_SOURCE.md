@@ -116,11 +116,14 @@ inbound application messages only.
 | `allow.unknown.message.fields` | `false` | Accept fields the dictionary does not define for a message |
 | `check.latency`, `max.latency.seconds` | `true`, 120 | SendingTime accuracy check |
 | `on.sequence.reset` | `fail` | `fail` or `continue` after an unrecoverable SequenceReset-Reset |
+| `timestamp.precision` | `exact` | `exact` fails on digits finer than the column unit; `truncate` drops them |
 | `expand` | none | Group count tag whose entries become rows |
 | `expand.empty` | `row` | `row` (one row with null entry values) or `skip` |
 | `column.<name>` | required per column | Field path; see below |
 
-Unknown options are rejected, as are engine settings outside this list.
+Unknown options are rejected, as are engine settings outside this list. The source's Logon
+carries MaxMessageSize (383) = `max.message.bytes`, because the engine buffers a whole message
+before any local limit applies.
 
 ## Column mapping
 
@@ -145,9 +148,13 @@ tags, fields that no selected message defines, wrong sections, and incompatible 
 | `BYTEA` | all | Exact bytes; DATA fields keep embedded SOH and NUL |
 | `BIGINT`, `INT`, unsigned | INT, SEQNUM, LENGTH, NUMINGROUP, ... | Exact integer; out of range fails |
 | `DECIMAL(p, s)` | PRICE, QTY, AMT, FLOAT, INT, ... | Exact; more fractional digits than `s` or more than `p` digits fails |
-| `TIMESTAMP` (any unit) | UTCTIMESTAMP | Exact; sub-unit precision fails |
+| `TIMESTAMP` (any unit) | UTCTIMESTAMP | Exact; sub-unit digits fail unless `timestamp.precision = truncate` |
 | `DATE` | LOCALMKTDATE, UTCDATEONLY | Days since epoch |
 | `BOOLEAN` | BOOLEAN | `Y` / `N` |
+
+SQL `TIMESTAMP` columns are microseconds. A venue that sends nanosecond TransactTime needs
+`timestamp.precision = 'truncate'` (or a VARCHAR column); with `exact` the first such value stops
+the source.
 
 A missing field is NULL; a missing field in a `NOT NULL` column, or an invalid value, stops the
 source at that journal record with the session, series, sequence number, and column. Values are
@@ -250,6 +257,8 @@ All metrics carry only the `source` label.
 | `fix_source_logged_on` | 1 while logged on |
 | `fix_source_next_target_seq` | Next expected inbound sequence number after the last captured message |
 | `fix_source_journal_retained_bytes`, `fix_source_journal_unread_records` | Journal size and projection lag |
+| `fix_source_checkpoint_lag_records` | Durable journal records after the last committed checkpoint |
+| `fix_source_startup_replay_records` | Records replayed from the restore point at the last start |
 | `fix_source_journal_paused` | 1 while intake pauses on a full journal |
 | `fix_source_feed_incomplete` | 1 after an unrecoverable reset in this run |
 | `fix_source_messages_captured_total`, `fix_source_messages_excluded_total` | Journaled and unselected application messages |
@@ -260,7 +269,29 @@ All metrics carry only the `source` label.
 Pipeline health follows the usual rules: a terminal source error faults the pipeline; reconnects
 are internal to the engine and do not fault it.
 
-## Operations
+## Performance
+
+Measured 2026-10-14 on one Windows 11 laptop (consumer NVMe, `--release`), local QuickFIX acceptor
+on loopback, ExecutionReports of about 200 bytes, one session. Latency is from the scheduled send
+time (open loop) to the row returned by the source, so queueing delay is included. These are
+local numbers, not a target: rerun on production hardware before sizing.
+
+| Measurement | `journal.sync = os` | `journal.sync = fsync` |
+|---|---|---|
+| Journal append (300-byte record) p50 / p99 / p99.9 | 4.5 µs / 16.8 µs / 43 µs | 6.3 ms / 15.5 ms / 28.8 ms |
+| Receive-to-Arrow at 500 msg/s p50 / p99 / p99.9 | 130 µs / 254 µs / 3.7 ms | saturated (see below) |
+| Receive-to-Arrow at 2000 msg/s p50 / p99 / p99.9 | 115 µs / 596 µs / 16.6 ms | saturated |
+| Sustained capture rate | above 14,000 msg/s (5,000-message burst in 340 ms) | 462 msg/s |
+
+Projection costs 12 µs per message without groups and 21 µs / 43 µs with 3 / 10 expanded entries
+(about 85,000 / 140,000 / 233,000 rows per second on one core).
+
+`fsync` throughput is one `FlushFileBuffers` per message on this machine, because each message is
+made durable before the engine may advance its sequence number. Server SSDs and `fdatasync` on
+Linux are typically one to two orders of magnitude faster; measure before relying on `fsync` for
+bursts. Receive-to-query and receive-to-committed-sink latency add the pipeline cycle and the
+checkpoint interval respectively and were not measured separately.
+
 
 - **Reconnect.** The engine reconnects every `reconnect.interval.seconds` (fixed interval) inside
   the schedule. Nothing else retries.
@@ -268,7 +299,9 @@ are internal to the engine and do not fault it.
   are read at start.
 - **Disk pressure.** Watch `fix_source_journal_retained_bytes` against `journal.max.bytes` and the
   filesystem. A full journal pauses intake; it never drops records. Retention needs successful
-  checkpoints.
+  checkpoints. While paused, the source logs out every inbound message and logon attempt, so the
+  engine logs repeated Logout/reconnect cycles at `reconnect.interval.seconds`; that is the pause,
+  not a fault.
 - **Stale data.** `fix_source_logged_on = 0` with growing `fix_source_messages_captured_total`
   stalled means the session is down; check engine events at debug level
   (`laminar_connectors::fix`).

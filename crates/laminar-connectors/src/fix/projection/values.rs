@@ -81,8 +81,12 @@ pub(crate) fn boolean(bytes: &[u8]) -> Result<bool, ValueError> {
 }
 
 /// FIX `UTCTimestamp` (`YYYYMMDD-HH:MM:SS[.f{1,9}]`) in `unit` since the Unix epoch. A value
-/// more precise than `unit` is an error.
-pub(crate) fn utc_timestamp(bytes: &[u8], unit: TimeUnit) -> Result<i64, ValueError> {
+/// more precise than `unit` is an error unless `truncate` drops the extra digits.
+pub(crate) fn utc_timestamp(
+    bytes: &[u8],
+    unit: TimeUnit,
+    truncate: bool,
+) -> Result<i64, ValueError> {
     let text = ascii(bytes)?;
     let (seconds_part, fraction) = text.split_once('.').unwrap_or((text, ""));
     if fraction.len() > 9 || (text.contains('.') && !digits(fraction)) {
@@ -104,8 +108,8 @@ pub(crate) fn utc_timestamp(bytes: &[u8], unit: TimeUnit) -> Result<i64, ValueEr
         TimeUnit::Microsecond => (1_000_000, 1_000),
         TimeUnit::Nanosecond => (1_000_000_000, 1),
     };
-    if nanos % divisor != 0 {
-        return Err("timestamp is more precise than the column unit");
+    if nanos % divisor != 0 && !truncate {
+        return Err("timestamp is more precise than the column unit; see 'timestamp.precision'");
     }
     seconds
         .checked_mul(per_second)
@@ -170,25 +174,37 @@ mod tests {
     fn timestamps_keep_their_precision_or_fail() {
         let base = 1_760_443_200; // 2025-10-14T12:00:00Z
         assert_eq!(
-            utc_timestamp(b"20251014-12:00:00", TimeUnit::Second),
+            utc_timestamp(b"20251014-12:00:00", TimeUnit::Second, false),
             Ok(base)
         );
         assert_eq!(
-            utc_timestamp(b"20251014-12:00:00.123", TimeUnit::Millisecond),
+            utc_timestamp(b"20251014-12:00:00.123", TimeUnit::Millisecond, false),
             Ok(base * 1_000 + 123)
         );
         assert_eq!(
-            utc_timestamp(b"20251014-12:00:00.123456789", TimeUnit::Nanosecond),
+            utc_timestamp(b"20251014-12:00:00.123456789", TimeUnit::Nanosecond, false),
             Ok(base * 1_000_000_000 + 123_456_789)
         );
         assert_eq!(
-            utc_timestamp(b"20251014-12:00:00.120", TimeUnit::Millisecond),
+            utc_timestamp(b"20251014-12:00:00.120", TimeUnit::Millisecond, false),
             Ok(base * 1_000 + 120)
         );
-        assert!(utc_timestamp(b"20251014-12:00:00.1234", TimeUnit::Millisecond).is_err());
-        assert!(utc_timestamp(b"20251014-12:00:00.", TimeUnit::Millisecond).is_err());
-        assert!(utc_timestamp(b"2025-10-14T12:00:00", TimeUnit::Second).is_err());
-        assert!(utc_timestamp(b"20251314-12:00:00", TimeUnit::Second).is_err());
+        assert!(utc_timestamp(b"20251014-12:00:00.1234", TimeUnit::Millisecond, false).is_err());
+        assert!(utc_timestamp(b"20251014-12:00:00.", TimeUnit::Millisecond, false).is_err());
+        assert!(utc_timestamp(b"2025-10-14T12:00:00", TimeUnit::Second, false).is_err());
+        assert!(utc_timestamp(b"20251314-12:00:00", TimeUnit::Second, false).is_err());
+    }
+
+    #[test]
+    fn truncation_is_explicit_and_drops_digits() {
+        let base = 1_760_443_200; // 2025-10-14T12:00:00Z
+        assert_eq!(
+            utc_timestamp(b"20251014-12:00:00.123456789", TimeUnit::Microsecond, true),
+            Ok(base * 1_000_000 + 123_456)
+        );
+        assert!(
+            utc_timestamp(b"20251014-12:00:00.123456789", TimeUnit::Microsecond, false).is_err()
+        );
     }
 
     #[test]
@@ -227,7 +243,7 @@ mod properties {
         fn arbitrary_text_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
             let _ = decimal(&bytes, 18, 4);
             let _ = integer(&bytes);
-            let _ = utc_timestamp(&bytes, TimeUnit::Nanosecond);
+            let _ = utc_timestamp(&bytes, TimeUnit::Nanosecond, false);
             let _ = date(&bytes);
             let _ = boolean(&bytes);
         }
