@@ -16,7 +16,9 @@ name = "laminardb-quickfix-ffi"
 version = "0.32.0"
 authors = ["Arthur LE MOIGNE"]
 build = "build.rs"
+links = "quickfixbind"
 include = [
+    "/VENDORED.md",
     "/libquickfix/cmake/",
     "/libquickfix/src/C++",
     "/libquickfix/src/CMakeLists.txt",

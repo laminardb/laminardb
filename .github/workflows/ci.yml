@@ -425,12 +425,14 @@ jobs:
         run: |
           cargo package --manifest-path vendor/pgwire/Cargo.toml --no-verify
           cargo package --manifest-path vendor/pgwire-replication/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/quickfix-ffi/Cargo.toml --no-verify
       - name: Verify workspace packages can be assembled
         run: |
-          # The release publishes both maintained forks before the Laminar crates.
+          # The release publishes the maintained forks before the Laminar crates.
           cargo package --workspace --locked --no-verify \
             --config 'patch.crates-io.laminardb-pgwire.path="vendor/pgwire"' \
-            --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"'
+            --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"' \
+            --config 'patch.crates-io.laminardb-quickfix-ffi.path="vendor/quickfix-ffi"'
 
   # ============================================
   # MSRV Check

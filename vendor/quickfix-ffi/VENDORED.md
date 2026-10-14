@@ -39,8 +39,15 @@ upstream repository published no security advisories as of 2026-10-14.
   function catches all C++ exceptions, including non-`std::exception` ones.
 - `quickfix-bind/CMakeLists.txt` compiles the bridge into `quickfixbind`.
 - `src/lib.rs` declares the bridge functions.
-- `Cargo.toml` is renamed to `laminardb-quickfix-ffi` 0.32.0; `.cargo-ok`, `.cargo_vcs_info.json`,
-  `Cargo.toml.orig`, and `Cargo.lock` from the crate archive are omitted.
+- `Cargo.toml` is renamed to `laminardb-quickfix-ffi` 0.32.0, declares `links = "quickfixbind"`
+  so Cargo rejects a second copy of the native library in one build, and packages this file;
+  `.cargo-ok`, `.cargo_vcs_info.json`, `Cargo.toml.orig`, and `Cargo.lock` from the crate archive
+  are omitted.
+
+## Publication
+
+The release workflow publishes this crate with the other maintained forks, before
+`laminar-connectors`, on the release version; CI checks that it packages.
 
 No engine source under `libquickfix/` is modified.
 
