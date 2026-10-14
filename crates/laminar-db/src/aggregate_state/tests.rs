@@ -2347,7 +2347,8 @@ async fn compiled_pre_aggregation_coerces_mixed_operand_types() {
         .compiled_projection()
         .expect("compiled pre-aggregation");
     let pre_aggregated =
-        crate::operator_graph::try_evaluate_compiled(projection, &[input.clone()]).unwrap();
+        crate::operator_graph::try_evaluate_compiled(projection, std::slice::from_ref(&input))
+            .unwrap();
     for batch in &pre_aggregated {
         state.process_batch(batch, i64::MIN).unwrap();
     }

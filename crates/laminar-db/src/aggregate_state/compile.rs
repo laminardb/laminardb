@@ -33,8 +33,8 @@ pub(crate) type ExprCompiler<'a> =
 
 /// Compiles an expression of the unanalyzed logical plan that managed aggregates are built from.
 ///
-/// The plan's types are the stream ABI, but its expressions never went through DataFusion's type
-/// coercion, so operands are coerced here. An unanalyzed CASE is typed by its first non-null
+/// The plan's types are the stream ABI, but its expressions skipped the analyzer's type coercion,
+/// so operands are coerced here. An unanalyzed CASE is typed by its first non-null
 /// THEN branch; literal branches that convert exactly to that type (`ELSE 0` beside a DECIMAL)
 /// are narrowed to it first. Any other mismatch is rejected instead of cast, so no value is
 /// silently truncated.
@@ -309,12 +309,10 @@ impl<'a> PreAggBuilder<'a> {
             }
         }
 
-        let filter_col_index = agg_func
-            .params
-            .filter
-            .as_ref()
-            .map(|filter_expr| self.push_filter_column(filter_expr, compile))
-            .transpose()?;
+        let filter_col_index = match &agg_func.params.filter {
+            Some(filter_expr) => Some(self.push_filter_column(filter_expr, compile)?),
+            None => None,
+        };
 
         let return_type = udf.return_type(&input_types).map_err(|error| {
             DbError::Unsupported(format!(
