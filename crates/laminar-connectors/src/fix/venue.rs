@@ -1,5 +1,5 @@
-//! Counterparty profiles: what a venue requires beyond standard FIX at logon, and whether it
-//! retransmits.
+//! Counterparty behaviour beyond standard FIX: extra Logon fields, venue profiles, and whether
+//! the counterparty retransmits.
 //!
 //! Binance Spot drop copy authenticates the Logon with an Ed25519 signature over MsgType,
 //! SenderCompID, TargetCompID, MsgSeqNum, and SendingTime joined by SOH. The engine fills the
@@ -26,6 +26,16 @@ use crate::error::ConnectorError;
 
 const BINANCE_TARGET_COMP_ID: &str = "SPOT";
 const SOH: u8 = 1;
+/// Option prefix of static Logon body fields: `logon.field.<tag>`.
+pub(crate) const LOGON_FIELD_PREFIX: &str = "logon.field.";
+/// Standard header and trailer tags, and Logon fields the engine or another option sets.
+const RESERVED_LOGON_TAGS: &[i32] = &[
+    8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142,
+    143, 144, 145, 212, 213, 347, 369, 370, 627, 628, 629, 630, 1128, 1129,
+    1156, // header, trailer
+    95, 96, 98, 108, 141, 383, 553, 554, 789,
+    1137, // Logon fields owned by the engine or options
+];
 
 /// Session behaviour a counterparty requires beyond standard FIX.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,10 +95,12 @@ impl Venue {
         }
     }
 
-    /// Whether the counterparty retransmits after a reconnect. Without retransmission every
-    /// sequence series after the first may follow lost messages.
-    pub(crate) fn retransmits(&self) -> bool {
-        matches!(self, Self::Standard)
+    /// Logon body tags the profile sets.
+    fn logon_tags(&self) -> &'static [i32] {
+        match self {
+            Self::Standard => &[],
+            Self::Binance { .. } => &[25035, 9406],
+        }
     }
 
     /// Engine settings the venue fixes, and validation defaults for fields it adds without a
@@ -138,6 +150,66 @@ impl Venue {
     }
 }
 
+/// Whether the counterparty answers ResendRequest with the original messages
+/// (`counterparty.resends`). Binance never does.
+///
+/// # Errors
+/// Returns a configuration error for a value other than `true` or `false`, or `true` for Binance.
+pub(crate) fn resends(config: &ConnectorConfig, venue: &Venue) -> Result<bool, ConnectorError> {
+    let configured = match option(config, "counterparty.resends") {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => {
+            return Err(invalid(format!(
+                "FIX source 'counterparty.resends' must be 'true' or 'false', got '{other}'"
+            )))
+        }
+    };
+    match (venue, configured) {
+        (Venue::Standard, configured) => Ok(configured.unwrap_or(true)),
+        (Venue::Binance { .. }, Some(true)) => Err(invalid(
+            "Binance answers no ResendRequest; remove 'counterparty.resends' = 'true'".into(),
+        )),
+        (Venue::Binance { .. }, _) => Ok(false),
+    }
+}
+
+/// Static Logon body fields from `logon.field.<tag>` options.
+///
+/// # Errors
+/// Returns a configuration error for a tag that is not a positive integer, a tag the engine, a
+/// header, or another option owns, or a value that is empty or holds control characters.
+pub(crate) fn logon_fields(
+    config: &ConnectorConfig,
+    venue: &Venue,
+) -> Result<BTreeMap<i32, String>, ConnectorError> {
+    let mut fields = BTreeMap::new();
+    for (key, value) in config.properties() {
+        let Some(tag) = key.strip_prefix(LOGON_FIELD_PREFIX) else {
+            continue;
+        };
+        let tag: i32 = tag
+            .parse()
+            .ok()
+            .filter(|tag| *tag > 0)
+            .ok_or_else(|| invalid(format!("'{key}' must name a positive FIX tag number")))?;
+        if RESERVED_LOGON_TAGS.contains(&tag) || venue.logon_tags().contains(&tag) {
+            return Err(invalid(format!(
+                "'{key}': tag {tag} is a header or trailer field, or set by the engine or another \
+                 option"
+            )));
+        }
+        if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(invalid(format!(
+                "'{key}' needs a value without control characters"
+            )));
+        }
+        fields.insert(tag, value.clone());
+    }
+    Ok(fields)
+}
+
 fn binance_session(config: &ConnectorConfig, session: &SessionKey) -> Result<(), ConnectorError> {
     if session.begin_string != "FIX.4.4" {
         return Err(invalid(
@@ -177,6 +249,7 @@ fn binance_session(config: &ConnectorConfig, session: &SessionKey) -> Result<(),
 /// Fields this source adds to its Logon, with any signing key loaded at start.
 pub(crate) struct Logon {
     credentials: Option<Credentials>,
+    fields: Vec<(i32, String)>,
     /// MaxMessageSize (383), which Binance's Logon does not define.
     max_message_bytes: Option<String>,
     binance: Option<Ed25519KeyPair>,
@@ -189,9 +262,15 @@ impl Logon {
     /// Fails when the signing key cannot be read or is not an Ed25519 PKCS#8 key.
     pub(crate) fn load(config: &FixSourceConfig) -> Result<Self, ConnectorError> {
         let credentials = config.credentials.clone();
+        let fields = config
+            .logon_fields
+            .iter()
+            .map(|(tag, value)| (*tag, value.clone()))
+            .collect();
         match &config.venue {
             Venue::Standard => Ok(Self {
                 credentials,
+                fields,
                 // The engine buffers a whole message before any local limit applies, so ask the
                 // counterparty for the bound.
                 max_message_bytes: Some(config.max_message_bytes.to_string()),
@@ -207,6 +286,7 @@ impl Logon {
                     .map_err(|_| unusable("is not an Ed25519 private key"))?;
                 Ok(Self {
                     credentials,
+                    fields,
                     max_message_bytes: None,
                     binance: Some(key),
                 })
@@ -242,6 +322,7 @@ impl Logon {
             .chain(username)
             .chain(password)
             .chain(signature)
+            .chain(self.fields.iter().cloned())
         {
             message
                 .set_body(tag, value.as_bytes())
@@ -381,7 +462,56 @@ mod tests {
         assert!(engine(&no_reset).is_err());
         let mut slow = BTreeMap::from([("HeartBtInt", "120".to_string())]);
         assert!(venue.constrain_engine(&binance(), &mut slow).is_err());
-        assert!(!venue.retransmits());
-        assert!(Venue::Standard.retransmits());
+    }
+
+    #[test]
+    fn resends_default_on_and_binance_never_resends() {
+        let binance_venue = Venue::Binance {
+            key_file: "k".into(),
+        };
+        let mut config = ConnectorConfig::new("fix");
+        assert!(resends(&config, &Venue::Standard).expect("default"));
+        assert!(!resends(&config, &binance_venue).expect("binance"));
+        config.set("counterparty.resends", "false");
+        assert!(!resends(&config, &Venue::Standard).expect("configured"));
+        config.set("counterparty.resends", "true");
+        assert!(resends(&config, &binance_venue).is_err());
+        config.set("counterparty.resends", "yes");
+        assert!(resends(&config, &Venue::Standard).is_err());
+    }
+
+    #[test]
+    fn logon_fields_skip_owned_tags_and_unsafe_values() {
+        let mut config = ConnectorConfig::new("fix");
+        config.set("logon.field.9406", "Y");
+        config.set("logon.field.1603", "LaminarDB");
+        assert_eq!(
+            logon_fields(&config, &Venue::Standard).expect("fields"),
+            BTreeMap::from([(1603, "LaminarDB".to_string()), (9406, "Y".to_string())])
+        );
+        let binance_venue = Venue::Binance {
+            key_file: "k".into(),
+        };
+        assert!(
+            logon_fields(&config, &binance_venue).is_err(),
+            "the Binance profile sets 9406"
+        );
+        for (key, value) in [
+            ("logon.field.553", "user"),
+            ("logon.field.141", "Y"),
+            ("logon.field.49", "SENDER"),
+            ("logon.field.10", "000"),
+            ("logon.field.x", "1"),
+            ("logon.field.0", "1"),
+            ("logon.field.5000", ""),
+            ("logon.field.5000", "a\u{1}b"),
+        ] {
+            let mut config = ConnectorConfig::new("fix");
+            config.set(key, value);
+            assert!(
+                logon_fields(&config, &Venue::Standard).is_err(),
+                "{key} = {value:?}"
+            );
+        }
     }
 }

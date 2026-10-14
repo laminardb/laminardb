@@ -124,8 +124,8 @@ struct Running {
     status: Arc<SessionStatus>,
     metrics: Arc<FixMetrics>,
     on_sequence_reset: SequenceResetPolicy,
-    /// Whether the counterparty retransmits what it sent while the session was down.
-    retransmits: bool,
+    /// Whether the counterparty answers ResendRequest with the original messages.
+    resends: bool,
     /// Journal index of the latest committed checkpoint.
     committed: u64,
     engine: Option<Engine>,
@@ -416,7 +416,7 @@ impl SourceConnector for FixSource {
             status,
             metrics,
             on_sequence_reset: parsed.on_sequence_reset,
-            retransmits: parsed.venue.retransmits(),
+            resends: parsed.resends,
             committed: start_index,
             engine: Some(engine),
         });
@@ -469,7 +469,10 @@ impl SourceConnector for FixSource {
                         SequenceResetPolicy::Continue => running.projection.mark_gap(),
                     }
                 }
-                Record::SeriesStarted { series, .. } if !running.retransmits && series > 1 => {
+                // Without resends, a new series or a gap fill may stand in for lost messages.
+                Record::SeriesStarted { series: 2.., .. } | Record::GapFill { .. }
+                    if !running.resends =>
+                {
                     running.metrics.feed_incomplete.set(1);
                     running.projection.mark_gap();
                 }

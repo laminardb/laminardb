@@ -16,7 +16,7 @@ with CMake and a C++17 compiler. Builds without the feature do not compile or li
 | Transport | TLS with chain and hostname verification, optional mutual TLS; plaintext TCP to loopback, or to a remote host only with `tcp.allow.remote` | Engine-native SSL |
 | Deployment | Embedded, single-node server | Cluster (the journal and session state are node-local) |
 | Delivery | At-least-once and exactly-once, with checkpointing | Best-effort; exactly-once in cluster mode |
-| Logon | Username (553) / Password (554); Binance Spot drop copy with an Ed25519-signed Logon (`venue = 'binance'`) | Other signed or venue-specific Logon fields; Binance order-entry, market-data, and FIX SBE sessions |
+| Logon | Username (553) / Password (554); static fields (`logon.field.<tag>`); Binance Spot drop copy with an Ed25519-signed Logon (`venue = 'binance'`) | Other signed or computed Logon fields; Binance order-entry, market-data, and FIX SBE sessions |
 | Outbound traffic | Session messages only (Logon, Heartbeat, ResendRequest, Logout, Reject) | Application messages, subscription requests |
 | Host failure | `journal.sync = fsync` survives process, OS, and power failure of the host | Loss of the node or its disk |
 
@@ -104,6 +104,8 @@ inbound application messages only.
 | `username`, `password` | none | Logon Username (553) / Password (554) |
 | `venue` | none | `binance` for a Binance Spot drop-copy session; see [Binance Spot drop copy](#binance-spot-drop-copy) |
 | `logon.key.file` | none | PEM PKCS#8 private key that signs the Logon (`venue = 'binance'`: Ed25519); read at start |
+| `logon.field.<tag>` | none | Static Logon body field; see [Venue-specific Logon fields](#venue-specific-logon-fields-and-counterparties-without-resends) |
+| `counterparty.resends` | `true` | `false` when the counterparty does not answer ResendRequest with the original messages |
 | `dictionary.path` | required | Dictionary XML (the application dictionary under FIXT.1.1), at most 16 MiB; pinned by SHA-256 at CREATE SOURCE |
 | `transport.dictionary.path` | required for FIXT.1.1 | FIXT.1.1 transport dictionary XML; pinned like `dictionary.path`; rejected for FIX.4.x |
 | `appl.ver.id` | required for FIXT.1.1 | `FIX.5.0`, `FIX.5.0SP1`, or `FIX.5.0SP2`; sent as DefaultApplVerID (1137); rejected for FIX.4.x |
@@ -159,6 +161,31 @@ application dictionary, and captures exactly one application version:
 - `header.TAG` paths resolve against the transport dictionary and body paths against the
   application dictionary. Both files are pinned and bound into the journal's capture contract,
   as is `appl.ver.id`.
+
+### Venue-specific Logon fields and counterparties without resends
+
+Two options adapt the source to a counterparty without a venue profile:
+
+```sql
+    'logon.field.9406' = 'Y',        -- e.g. a drop-copy flag the venue requires
+    'logon.field.1603' = 'LaminarDB',
+    'counterparty.resends' = 'false',
+    'reset.on.logon' = 'true',
+```
+
+- `logon.field.<tag>` adds a static body field to every Logon. Header and trailer tags and Logon
+  fields that the engine or another option owns (EncryptMethod, HeartBtInt, ResetSeqNumFlag,
+  RawData, MaxMessageSize, Username, Password, NextExpectedMsgSeqNum, DefaultApplVerID) are
+  rejected, as are empty values and control characters. Values are stored with the source
+  definition, so they are not for secrets; a computed or secret field needs a venue profile.
+  Logon fields are not part of the capture contract.
+- `counterparty.resends = 'false'` declares that the counterparty does not answer ResendRequest
+  with the original messages. The source then flags the first row after every gap fill and after
+  every sequence series but the journal's first with `gap_before = true`, and sets
+  `fix_source_feed_incomplete`, because either may stand in for messages that are never
+  delivered. The setting is bound into the capture contract. A counterparty that ignores
+  ResendRequest entirely must reset sequence numbers at logon (`reset.on.logon = 'true'`), or a
+  gap stalls the session.
 
 ### Binance Spot drop copy
 
@@ -223,8 +250,9 @@ The profile:
 Completeness is weaker than with a counterparty that retransmits. Binance answers no
 ResendRequest and resets sequence numbers at every logon, so reports it sends while no session
 is logged on, or that are in flight when the session or the host fails, are never delivered.
-Every journaled message is still delivered under the pipeline's guarantee. The first row of
-every sequence series after the journal's first has `gap_before = true`, and
+Every journaled message is still delivered under the pipeline's guarantee. The profile implies
+`counterparty.resends = 'false'` (setting it to `true` is rejected): the first row of every
+sequence series after the journal's first has `gap_before = true`, and
 `fix_source_feed_incomplete` is set; reconcile those intervals through Binance's account APIs.
 
 Operational notes from Binance's documentation:
@@ -295,7 +323,7 @@ describes entry `i`. Expanding one group never forms a product with other groups
 | `journal_index` | BIGINT / unsigned | Journal record index |
 | `session` | VARCHAR | `BeginString:Sender->Target` |
 | `message` | BYTEA | Engine serialization of the message (not wire-exact) |
-| `gap_before` | BOOLEAN | First row after an unrecoverable SequenceReset-Reset, or after a new series from a counterparty that cannot retransmit (`venue = 'binance'`) |
+| `gap_before` | BOOLEAN | First row after an unrecoverable SequenceReset-Reset, or, with `counterparty.resends = 'false'`, after a gap fill or a new sequence series |
 
 Event identity is `(session, series, seq_num, row)`. A reconnect or restart never changes it.
 Mixed message types share one schema: select several MsgTypes and declare columns that some types
@@ -354,7 +382,7 @@ journal end) rather than duplicating rows.
 | Failure | Outcome |
 |---|---|
 | Process killed at any point | No accepted message lost; the session resumes from its persisted sequence numbers and the counterparty retransmits anything after them; retransmissions are deduplicated |
-| Any failure or disconnect, `venue = 'binance'` | Journaled messages are delivered as above; messages not yet journaled are lost because Binance does not retransmit, and the next series is flagged `gap_before` |
+| Any failure or disconnect, `counterparty.resends = 'false'` (implied by `venue = 'binance'`) | Journaled messages are delivered as above; messages not yet journaled are lost because the counterparty does not retransmit, and the next gap fill or series is flagged `gap_before` |
 | Host or power failure, `journal.sync = fsync` | As above. Records not yet flushed are lost from the journal but the persisted inbound sequence number never passed them, so they are retransmitted; an outbound sequence number is never reused |
 | Host or power failure, `journal.sync = os` | Not covered: journal records may be lost; a restore past the journal end fails |
 | Node or disk loss | Not covered: the journal and session state are on that node |
@@ -377,7 +405,9 @@ source starts from the oldest retained journal record, and the session continues
 
 - The engine requests resends for gaps. SequenceReset-GapFill moves past administrative or
   intentionally skipped numbers and is not loss; missing numbers in the emitted rows are expected
-  because administrative and unselected messages share the sequence space.
+  because administrative and unselected messages share the sequence space. With
+  `counterparty.resends = 'false'` a gap fill or a new series is flagged as possible loss
+  instead.
 - SequenceReset-Reset that skips numbers is unrecoverable history. With `on.sequence.reset = fail`
   the source stops at that journal record; reconcile with the venue, then set `continue` to emit
   rows after it with `gap_before = true`. `fix_source_feed_incomplete` stays 1 for the run.
@@ -398,7 +428,7 @@ All metrics carry only the `source` label.
 | `fix_source_checkpoint_lag_records` | Durable journal records after the last committed checkpoint |
 | `fix_source_startup_replay_records` | Records replayed from the restore point at the last start |
 | `fix_source_journal_paused` | 1 while intake pauses on a full journal |
-| `fix_source_feed_incomplete` | 1 after an unrecoverable reset in this run, or after a new series from a counterparty that cannot retransmit |
+| `fix_source_feed_incomplete` | 1 after an unrecoverable reset in this run, or, with `counterparty.resends = 'false'`, after a gap fill or a new series |
 | `fix_source_messages_captured_total`, `fix_source_messages_excluded_total` | Journaled and unselected application messages |
 | `fix_source_duplicates_total`, `fix_source_duplicates_unverified_total`, `fix_source_duplicate_conflicts_total` | Retransmission handling |
 | `fix_source_rejects_sent_total`, `fix_source_gap_fill_seqs_total`, `fix_source_sequence_resets_total` | Session recovery evidence |

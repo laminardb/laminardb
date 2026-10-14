@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use super::dictionary::{DictionaryDigests, DictionaryFiles};
 use super::engine::SessionKey;
 use super::journal::{JournalOptions, SyncPolicy};
-use super::venue::Venue;
+use super::venue::{self, Venue, LOGON_FIELD_PREFIX};
 use crate::config::{ConfigKeySpec, ConnectorConfig};
 use crate::error::ConnectorError;
 
@@ -127,6 +127,9 @@ pub(crate) struct FixSourceConfig {
     pub(crate) max_rows_per_message: usize,
     pub(crate) on_sequence_reset: SequenceResetPolicy,
     pub(crate) venue: Venue,
+    /// Whether the counterparty answers ResendRequest with the original messages.
+    pub(crate) resends: bool,
+    pub(crate) logon_fields: BTreeMap<i32, String>,
     engine: BTreeMap<&'static str, String>,
 }
 
@@ -197,6 +200,11 @@ const KEYS: &[Key] = &[
         "venue",
         "'binance' for a Binance Spot FIX drop-copy session; empty for standard FIX",
         "",
+    ),
+    optional(
+        "counterparty.resends",
+        "'false' when the counterparty answers no ResendRequest with the original messages",
+        "true",
     ),
     optional(
         "logon.key.file",
@@ -364,6 +372,11 @@ pub(crate) fn config_keys() -> Vec<ConfigKeySpec> {
         "Field path for a declared column: TAG, header.TAG, trailer.TAG, GROUP[].TAG, GROUP, or @metadata",
         "",
     ));
+    keys.push(ConfigKeySpec::optional(
+        "logon.field.<tag>",
+        "Static Logon body field (not for secrets)",
+        "",
+    ));
     keys
 }
 
@@ -428,7 +441,8 @@ fn reject_unknown(config: &ConnectorConfig) -> Result<(), ConnectorError> {
     for key in config.properties().keys() {
         let known = KEYS.iter().any(|spec| spec.name == key)
             || RUNTIME_KEYS.contains(&key.as_str())
-            || key.starts_with(COLUMN_PREFIX);
+            || key.starts_with(COLUMN_PREFIX)
+            || key.starts_with(LOGON_FIELD_PREFIX);
         if !known {
             return Err(ConnectorError::ConfigurationError(format!(
                 "unknown FIX source option '{key}'"
@@ -579,6 +593,8 @@ impl FixSourceConfig {
             }
         };
         let venue = Venue::parse(config, &session)?;
+        let resends = venue::resends(config, &venue)?;
+        let logon_fields = venue::logon_fields(config, &venue)?;
         let mut engine = engine_settings(config)?;
         venue.constrain_engine(config, &mut engine)?;
         Ok(Self {
@@ -603,6 +619,8 @@ impl FixSourceConfig {
             .map_err(|_| ConnectorError::ConfigurationError("max.rows.per.message".into()))?,
             on_sequence_reset,
             venue,
+            resends,
+            logon_fields,
             engine,
         })
     }
@@ -677,8 +695,13 @@ impl FixSourceConfig {
             );
             object.insert("appl_ver_id".into(), fixt.appl_ver_id.code().into());
         }
-        if let (Some(venue), Some(object)) = (self.venue.name(), contract.as_object_mut()) {
-            object.insert("venue".into(), venue.into());
+        if let Some(object) = contract.as_object_mut() {
+            if let Some(venue) = self.venue.name() {
+                object.insert("venue".into(), venue.into());
+            }
+            if !self.resends {
+                object.insert("resends".into(), false.into());
+            }
         }
         hex(&Sha256::digest(contract.to_string().as_bytes()))
     }

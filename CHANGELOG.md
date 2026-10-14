@@ -13,6 +13,9 @@
   embedded and single-node deployments. Cluster placement is rejected. See `docs/FIX_SOURCE.md`.
 - Certified commit-coupled sources are admitted for exactly-once delivery; uncertified ones are
   still rejected.
+- FIX source `logon.field.<tag>` for static venue-specific Logon fields, and
+  `counterparty.resends = 'false'` for counterparties that do not retransmit: gap fills and
+  new sequence series then flag the next row `gap_before`.
 - FIX source `venue = 'binance'` profile for Binance Spot drop copy: an Ed25519-signed Logon, a
   sequence reset at every logon, and `gap_before` on the first row of every later series,
   because Binance does not retransmit.

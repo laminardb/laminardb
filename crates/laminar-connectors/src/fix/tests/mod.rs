@@ -265,6 +265,21 @@ fn column(batches: &[RecordBatch], name: &str) -> Vec<String> {
         .collect()
 }
 
+fn gaps(batches: &[RecordBatch]) -> Vec<bool> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let flags = batch
+                .column_by_name("_fix_gap_before")
+                .expect("gap")
+                .as_boolean();
+            (0..flags.len())
+                .map(|row| flags.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn seqs(batches: &[RecordBatch]) -> Vec<u64> {
     batches
         .iter()
@@ -469,20 +484,9 @@ async fn gap_fills_and_session_rejects_do_not_create_rows_or_incompleteness() {
     let (batches, _) = collect(&mut source, 3).await;
     assert_eq!(column(&batches, "exec_id"), vec!["E1", "E2", "E3"]);
     assert_eq!(seqs(&batches), vec![2, 6, 8]);
-    let gap = batches
-        .iter()
-        .flat_map(|batch| {
-            let flags = batch
-                .column_by_name("_fix_gap_before")
-                .expect("gap")
-                .as_boolean();
-            (0..flags.len())
-                .map(|row| flags.value(row))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        gap.iter().all(|flag| !flag),
+    assert_eq!(
+        gaps(&batches),
+        vec![false, false, false],
         "a gap fill is not an unrecoverable gap"
     );
     // The engine validates before sequencing, so the invalid message is rejected on arrival
@@ -490,6 +494,48 @@ async fn gap_fills_and_session_rejects_do_not_create_rows_or_incompleteness() {
     assert!(
         !harness.venue().rejects().is_empty(),
         "the invalid message was rejected"
+    );
+    source.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_resends_gap_fills_and_new_series_flag_possible_loss() {
+    let harness = Harness::new("noresend");
+    let options = [
+        ("counterparty.resends", "false"),
+        ("reset.on.logon", "true"),
+        ("logon.field.5002", "drop-copy"),
+    ];
+    let mut source = harness.start(SourcePosition::Initial, &options).await;
+    let logon = &harness.venue().logon_requests()[0];
+    let field = b"\x015002=drop-copy\x01";
+    assert!(
+        logon.windows(field.len()).any(|window| window == field),
+        "static Logon field sent"
+    );
+    harness.send("E1");
+    harness.venue().skip_sequence_numbers(3).expect("skip");
+    harness.send("E2");
+    let (batches, _) = collect(&mut source, 2).await;
+    assert_eq!(
+        gaps(&batches),
+        vec![false, true],
+        "a gap fill may stand in for messages that are never resent"
+    );
+
+    harness.venue().reset_session().expect("disconnect");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while harness.venue().logons() < 2 || !harness.venue().logged_on() {
+        assert!(Instant::now() < deadline, "second logon");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    harness.send("E3");
+    let (batches, _) = collect(&mut source, 1).await;
+    assert_eq!(column(&batches, "exec_id"), vec!["E3"]);
+    assert_eq!(
+        gaps(&batches),
+        vec![true],
+        "a new series may follow lost messages"
     );
     source.close().await.expect("close");
 }
