@@ -251,6 +251,38 @@ jobs:
           docker compose -f tests/docker/iceberg-compose.yml logs --tail=200
 
   # ============================================
+  # FIX source (QuickFIX C++ engine, local acceptor)
+  # ============================================
+  fix-source:
+    name: FIX source (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fix-source
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ pkg-config mold protobuf-compiler
+      - name: Default builds exclude the native engine
+        run: |
+          if cargo tree -p laminar-server -e normal | grep -q laminardb-quickfix-ffi; then
+            echo "the default laminar-server graph links the QuickFIX engine" >&2
+            exit 1
+          fi
+      - name: Clippy
+        run: cargo clippy -p laminar-connectors --no-default-features --features "fix testing" --all-targets -- -D warnings
+      - name: Engine qualification, journal, projection, and session scenarios
+        run: cargo test -p laminar-connectors --no-default-features --features fix --lib -- 'fix::'
+      - name: SQL end-to-end and process-kill recovery
+        run: cargo test -p laminar-db --no-default-features --features "fix files" --test fix_source_e2e --test fix_source_crash
+      - name: Server build and example profile
+        run: cargo test -p laminar-server --no-default-features --features fix --bin laminardb shipped_server_configs_deserialize
+
+  # ============================================
   # Release Build (main/develop only)
   # ============================================
   release-build:
