@@ -234,6 +234,9 @@ mode. Rows may repeat after recovery when a sink is not checkpoint-committable.
 | Journal write or flush failure | The writer stops (no retry after an ambiguous flush); the session logs out without advancing; the source fails; restart truncates a torn tail |
 | Session state write failure | The session stops: inbound processing disconnects, outbound messages are not sent, and the source fails |
 | Damaged session state | `session.identity` with no valid copy fails the start (the outbound sequence number is unknown); a damaged `session.inbound` requests retransmission from 1 |
+
+Process kills are tested (repeated hard kills of a running pipeline lose no message). The host
+and power failure rows follow from the flush ordering above; no power-loss test has been run.
 | Journal full | Intake pauses (session logs out and refuses logon) until committed checkpoints release segments |
 | Corrupt record before the durable end | The source fails; no fallback |
 | Restore point older than the retained journal | The source fails with "restore point expired" |
@@ -295,6 +298,9 @@ not a target: rerun on production hardware before sizing.
 With `fsync`, an append only buffers the record; rows become readable after the next group
 flush, so receive-to-Arrow latency is about one flush on the storage (a few milliseconds on the
 NVMe, about 20 ms on the WSL2 virtual disk) and throughput no longer depends on flush latency.
+Every outbound session message (Heartbeat, ResendRequest, Reject, Logout) still costs one flush of
+`session.identity` on the engine thread, so a counterparty that provokes many rejects slows
+inbound processing to about one message per flush.
 Receive-to-query and receive-to-committed-sink latency add the pipeline cycle and the checkpoint
 interval respectively and were not measured separately.
 

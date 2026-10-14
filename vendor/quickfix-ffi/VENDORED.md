@@ -1,7 +1,9 @@
 # Vendored quickfix-ffi with a LaminarDB bridge
 
 Status: adopted 2026-10-14 for the optional `fix` source feature. Remove the bridge file once an
-upstream binding exposes length-aware field access, dictionary introspection, and forced stop.
+upstream binding exposes length-aware field access, dictionary introspection, forced stop, and
+externally owned stores, and drop the `build.rs` change once upstream compiles with `/EHsc` on
+MSVC.
 
 ## Why
 
