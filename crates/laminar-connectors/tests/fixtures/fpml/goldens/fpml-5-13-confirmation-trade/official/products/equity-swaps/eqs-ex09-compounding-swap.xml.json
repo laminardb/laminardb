@@ -1,0 +1,56 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "a241ec30c4b56387f019d43cd9f227061213588d3cf8ee7b1d840bc261a4c5bc",
+    "documentation": {
+      "master_confirmation_date": "2002-06-20",
+      "master_confirmation_type": "EquityAmericas"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "BankB",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "BankB"
+          }
+        ]
+      },
+      {
+        "id": "BankA",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "BankA"
+          }
+        ]
+      }
+    ],
+    "product_type": "equitySwapTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "BankB",
+          "party_ids": [
+            {
+              "scheme": "DTCC",
+              "value": "BankB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "TradeRefNbr",
+              "value": "TRADEABC"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2008-01-01"
+    },
+    "trade_ordinal": 0
+  }
+]

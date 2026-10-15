@@ -1,0 +1,377 @@
+[
+  {
+    "correlation_id": "LCH00000000001",
+    "creation_timestamp": {
+      "local": "2020-12-17T09:10:11.257918600"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "85e5ac8289067241475e446668f9a1e0cc3f3d8d54fca02b3db8329dcddcc85b",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "LCH00000000001",
+    "message_id_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-portfolio-id",
+            "value": "XXX_H_XXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-counterparty-id",
+            "value": "LCHLGB2L"
+          }
+        ]
+      },
+      {
+        "id": "clearingDCO",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "LCHLGB2L"
+          }
+        ]
+      },
+      {
+        "id": "clearingBroker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "XXX"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "COMPRESSION"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "LCHLGB2L",
+    "sequence_number": 1,
+    "swap": {
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "InterestRate"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "InterestRate:IRSwap:FixedFloat"
+          }
+        ]
+      },
+      "streams": [
+        {
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "T",
+              "period_multiplier": 1,
+              "roll_convention": "NONE"
+            },
+            "effective_date": {
+              "adjusted_date": "2008-09-18",
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2008-09-18"
+            },
+            "id": "fixedCalcPeriodDates1",
+            "termination_date": {
+              "adjusted_date": "2025-06-16",
+              "date_adjustments": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2025-06-15"
+            }
+          },
+          "id": "fixedLeg1",
+          "known_amount_schedule": {
+            "currency": "EUR",
+            "initial_value": "7000000.000000000000000000"
+          },
+          "payer_party_href": "party2",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedCalcPeriodDates1",
+            "id": "paymentDates1",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "party1"
+        },
+        {
+          "calculation": {
+            "compounding_method": "Flat",
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "EUR-EURIBOR-Reuters",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 3
+              }
+            },
+            "notional_schedule": {
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "6000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 3,
+              "roll_convention": "15"
+            },
+            "effective_date": {
+              "adjusted_date": "2008-09-18",
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2008-09-18"
+            },
+            "first_regular_period_start_date": "2008-12-15",
+            "id": "floatingCalcPeriodDates2",
+            "stub_period_type": "ShortInitial",
+            "termination_date": {
+              "adjusted_date": "2025-06-16",
+              "date_adjustments": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2025-06-15"
+            }
+          },
+          "id": "floatingLeg2",
+          "payer_party_href": "party1",
+          "payment_dates": {
+            "calculation_period_dates_href": "floatingCalcPeriodDates2",
+            "id": "paymentDates2",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "party2",
+          "reset_dates": {
+            "calculation_period_dates_href": "floatingCalcPeriodDates2",
+            "fixing_dates": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "resetDates2",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "resetDates2",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          },
+          "stub_calculation_period_amount": {
+            "calculation_period_dates_href": "floatingCalcPeriodDates2",
+            "initial_stub": {
+              "floating_rates": [
+                {
+                  "floating_rate_index": "EUR-EURIBOR-Reuters",
+                  "index_tenor": {
+                    "period": "M",
+                    "period_multiplier": 2
+                  }
+                },
+                {
+                  "floating_rate_index": "EUR-EURIBOR-Reuters",
+                  "index_tenor": {
+                    "period": "M",
+                    "period_multiplier": 3
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "tradeSource",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "COMPRESSION"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "1-2"
+            },
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/alpha-trade-id",
+              "value": "11111111"
+            }
+          ]
+        },
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-portfolio-id",
+              "value": "XXX_H_XXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "abc123"
+            }
+          ]
+        },
+        {
+          "party_href": "clearingBroker1",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "XXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "def456"
+            }
+          ]
+        },
+        {
+          "party_href": "clearingDCO",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "LCHLGB2L"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "LCH00000000001"
+            },
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-classification",
+              "value": "STM"
+            }
+          ]
+        },
+        {
+          "issuer": {
+            "scheme": "USINamespace",
+            "value": "1010000051"
+          },
+          "trade_ids": [
+            {
+              "scheme": "USI",
+              "value": "XX111111111XXX111111111111111111"
+            }
+          ]
+        },
+        {
+          "issuer": {
+            "scheme": "http://www.fpml.org/coding-scheme/external/issuer-identifier",
+            "value": "1010000051"
+          },
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/unique-transaction-identifier",
+              "value": "XX111111111XXX111111111111111111"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2013-07-31T09:10:11",
+            "offset_minutes": 0,
+            "utc": "2013-07-31T09:10:11Z"
+          },
+          "execution_venue_type": "OffFacility",
+          "party_href": "party1"
+        },
+        {
+          "clearing_status": "Received",
+          "party_href": "clearingDCO"
+        },
+        {
+          "party_href": "tradeSource"
+        }
+      ],
+      "trade_date": "2014-11-17"
+    },
+    "trade_ordinal": 0
+  }
+]

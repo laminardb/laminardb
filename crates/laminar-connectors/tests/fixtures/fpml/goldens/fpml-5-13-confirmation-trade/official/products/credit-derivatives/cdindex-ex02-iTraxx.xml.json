@@ -1,0 +1,73 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "aecc290fcf629bf504212e4b687aeb9219265c2e5427e0d0d37d39a8d58e8de2",
+    "documentation": {
+      "master_confirmation_date": "2004-10-11",
+      "master_confirmation_type": "DJ.iTraxx.Europe"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-person-id",
+            "value": "549300X5I608U02HAI25"
+          }
+        ],
+        "party_name": "New Bank, New York"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-person-id",
+            "value": "VMPORTIB1LEXNX832U55"
+          }
+        ],
+        "party_name": "Massive Bank, New York"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-person-id",
+              "value": "549300X5I608U02HAI25"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.newbank.com/trade-id",
+              "value": "ITRAXX1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-person-id",
+              "value": "VMPORTIB1LEXNX832U55"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.massivebank.com/trade-id",
+              "value": "1234B6"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2004-11-03"
+    },
+    "trade_ordinal": 0
+  }
+]

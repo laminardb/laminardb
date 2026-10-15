@@ -1,0 +1,1087 @@
+# FpML coverage manifest. The oracle is the pinned closure: every member of the `product`
+# substitution group, every loan facility and loan event representation, and every global
+# element derived from `Document`. CI fails when an oracle member is missing here, and when a
+# `typed` entry lacks its profile column or golden evidence. `outstanding` entries are counted
+# and fail the release gate (FPML_RELEASE_GATE=1). Levels: 1 = validated ingestion with
+# recoverable preservation, 2 = typed projection of the economic structure, 3 = additional
+# business-rule or lifecycle interpretation (not implemented for any entry).
+
+[closure]
+artifact = "fpml-5-13-8-rec-2/confirmation"
+
+[[product]]
+element = "bondOption"
+type = "BondOption"
+asset_class = "interest-rate"
+status = "outstanding"
+
+[[product]]
+element = "brokerEquityOption"
+type = "BrokerEquityOption"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "bulletPayment"
+type = "BulletPayment"
+asset_class = "interest-rate"
+status = "outstanding"
+
+[[product]]
+element = "capFloor"
+type = "CapFloor"
+asset_class = "interest-rate"
+status = "outstanding"
+
+[[product]]
+element = "commodityBasketOption"
+type = "CommodityBasketOption"
+asset_class = "commodity"
+status = "outstanding"
+
+[[product]]
+element = "commodityDigitalOption"
+type = "CommodityDigitalOption"
+asset_class = "commodity"
+status = "outstanding"
+
+[[product]]
+element = "commodityForward"
+type = "CommodityForward"
+asset_class = "commodity"
+status = "outstanding"
+
+[[product]]
+element = "commodityOption"
+type = "CommodityOption"
+asset_class = "commodity"
+status = "outstanding"
+
+[[product]]
+element = "commodityPerformanceSwap"
+type = "CommodityPerformanceSwap"
+asset_class = "commodity"
+status = "outstanding"
+
+[[product]]
+element = "commoditySwap"
+type = "CommoditySwap"
+asset_class = "commodity"
+status = "outstanding"
+
+[[product]]
+element = "commoditySwaption"
+type = "CommoditySwaption"
+asset_class = "commodity"
+status = "outstanding"
+
+[[product]]
+element = "correlationSwap"
+type = "CorrelationSwap"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "creditDefaultSwap"
+type = "CreditDefaultSwap"
+asset_class = "credit"
+status = "outstanding"
+
+[[product]]
+element = "creditDefaultSwapOption"
+type = "CreditDefaultSwapOption"
+asset_class = "credit"
+status = "outstanding"
+
+[[product]]
+element = "dividendSwapOptionTransactionSupplement"
+type = "DividendSwapOptionTransactionSupplement"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "dividendSwapTransactionSupplement"
+type = "DividendSwapTransactionSupplement"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "equityAccumulator"
+type = "EquityAccumulator"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "equityForward"
+type = "EquityForward"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "equityOption"
+type = "EquityOption"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "equityOptionTransactionSupplement"
+type = "EquityOptionTransactionSupplement"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "equitySwapTransactionSupplement"
+type = "EquitySwapTransactionSupplement"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "fra"
+type = "Fra"
+asset_class = "interest-rate"
+status = "outstanding"
+
+[[product]]
+element = "fxAccrualDigitalOption"
+type = "FxAccrualDigitalOption"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxAccrualForward"
+type = "FxAccrualForward"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxAccrualOption"
+type = "FxAccrualOption"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxDigitalOption"
+type = "FxDigitalOption"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxFlexibleForward"
+type = "FxFlexibleForward"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxForwardVolatilityAgreement"
+type = "FxForwardVolatilityAgreement"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxOption"
+type = "FxOption"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxRangeAccrual"
+type = "FxRangeAccrual"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxSingleLeg"
+type = "FxSingleLeg"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxSwap"
+type = "FxSwap"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxTargetKnockoutForward"
+type = "FxTargetKnockoutForward"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxVarianceSwap"
+type = "FxPerformanceSwap"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "fxVolatilitySwap"
+type = "FxPerformanceSwap"
+asset_class = "foreign-exchange"
+status = "outstanding"
+
+[[product]]
+element = "genericProduct"
+type = "GenericProduct"
+asset_class = "cross-asset"
+status = "outstanding"
+
+[[product]]
+element = "instrumentTradeDetails"
+type = "InstrumentTradeDetails"
+asset_class = "securities"
+status = "outstanding"
+
+[[product]]
+element = "repo"
+type = "Repo"
+asset_class = "securities-financing"
+status = "outstanding"
+
+[[product]]
+element = "returnSwap"
+type = "ReturnSwap"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "securityLending"
+type = "SecurityLending"
+asset_class = "securities-financing"
+status = "outstanding"
+
+[[product]]
+element = "standardProduct"
+type = "StandardProduct"
+asset_class = "cross-asset"
+status = "outstanding"
+
+[[product]]
+element = "strategy"
+type = "Strategy"
+asset_class = "cross-asset"
+status = "outstanding"
+
+[[product]]
+element = "swap"
+type = "Swap"
+asset_class = "interest-rate"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "swap"
+notes = "Legs, notional and FX-linked schedules, fixed/floating/inflation rates, stubs, principal exchanges, early termination; cashflows are not generated"
+
+[[product]]
+element = "swaption"
+type = "Swaption"
+asset_class = "interest-rate"
+status = "outstanding"
+
+[[product]]
+element = "termDeposit"
+type = "TermDeposit"
+asset_class = "loans-and-deposits"
+status = "outstanding"
+
+[[product]]
+element = "varianceOptionTransactionSupplement"
+type = "VarianceOptionTransactionSupplement"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "varianceSwap"
+type = "VarianceSwap"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "varianceSwapTransactionSupplement"
+type = "VarianceSwapTransactionSupplement"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "volatilitySwap"
+type = "VolatilitySwap"
+asset_class = "equity"
+status = "outstanding"
+
+[[product]]
+element = "volatilitySwapTransactionSupplement"
+type = "VolatilitySwapTransactionSupplement"
+asset_class = "equity"
+status = "outstanding"
+
+[[loan]]
+element = "delayedDraw"
+group = "facilityGroup"
+type = "DelayedDraw"
+status = "outstanding"
+
+[[loan]]
+element = "letterOfCreditFacility"
+group = "facilityGroup"
+type = "LetterOfCreditFacility"
+status = "outstanding"
+
+[[loan]]
+element = "revolver"
+group = "facilityGroup"
+type = "Revolver"
+status = "outstanding"
+
+[[loan]]
+element = "termLoan"
+group = "facilityGroup"
+type = "TermLoan"
+status = "outstanding"
+
+[[loan]]
+element = "accrualOptionChange"
+group = "facilityEventGroup"
+type = "AccrualOptionChange"
+status = "outstanding"
+
+[[loan]]
+element = "accruingFeeChange"
+group = "facilityEventGroup"
+type = "AccruingFeeChange"
+status = "outstanding"
+
+[[loan]]
+element = "accruingFeeExpiry"
+group = "facilityEventGroup"
+type = "AccruingFeeExpiry"
+status = "outstanding"
+
+[[loan]]
+element = "accruingFeePayment"
+group = "facilityEventGroup"
+type = "AccruingFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "accruingPikPayment"
+group = "facilityEventGroup"
+type = "AccruingPikPayment"
+status = "outstanding"
+
+[[loan]]
+element = "amendmentFeePayment"
+group = "facilityEventGroup"
+type = "AmendmentFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "commitmentAdjustment"
+group = "facilityEventGroup"
+type = "CommitmentAdjustment"
+status = "outstanding"
+
+[[loan]]
+element = "defaultRateChange"
+group = "facilityEventGroup"
+type = "DefaultRateChange"
+status = "outstanding"
+
+[[loan]]
+element = "defaultRateExpiry"
+group = "facilityEventGroup"
+type = "DefaultRateExpiry"
+status = "outstanding"
+
+[[loan]]
+element = "facilityExtensionFeePayment"
+group = "facilityEventGroup"
+type = "FacilityExtensionFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "facilityPrepayment"
+group = "facilityEventGroup"
+type = "FacilityPrepayment"
+status = "outstanding"
+
+[[loan]]
+element = "facilityPrepaymentFeePayment"
+group = "facilityEventGroup"
+type = "FacilityPrepaymentFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "facilityTermination"
+group = "facilityEventGroup"
+type = "FacilityTermination"
+status = "outstanding"
+
+[[loan]]
+element = "fundingFeePayment"
+group = "facilityEventGroup"
+type = "FundingFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "mandatoryCostRateChange"
+group = "facilityEventGroup"
+type = "MandatoryCostRateChange"
+status = "outstanding"
+
+[[loan]]
+element = "mandatoryCostRateExpiry"
+group = "facilityEventGroup"
+type = "MandatoryCostRateExpiry"
+status = "outstanding"
+
+[[loan]]
+element = "miscFeePayment"
+group = "facilityEventGroup"
+type = "MiscFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "penaltyRateChange"
+group = "facilityEventGroup"
+type = "PenaltyRateChange"
+status = "outstanding"
+
+[[loan]]
+element = "penaltyRateExpiry"
+group = "facilityEventGroup"
+type = "PenaltyRateExpiry"
+status = "outstanding"
+
+[[loan]]
+element = "upfrontFeePayment"
+group = "facilityEventGroup"
+type = "UpfrontFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "waiverFeePayment"
+group = "facilityEventGroup"
+type = "WaiverFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "baseRateSet"
+group = "loanContractEventGroup"
+type = "LoanContractBaseRateSet"
+status = "outstanding"
+
+[[loan]]
+element = "borrowing"
+group = "loanContractEventGroup"
+type = "Borrowing"
+status = "outstanding"
+
+[[loan]]
+element = "breakageFeePayment"
+group = "loanContractEventGroup"
+type = "BreakageFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "interestCapitalization"
+group = "loanContractEventGroup"
+type = "InterestCapitalization"
+status = "outstanding"
+
+[[loan]]
+element = "interestPayment"
+group = "loanContractEventGroup"
+type = "LoanInterestPayment"
+status = "outstanding"
+
+[[loan]]
+element = "legacyInterestCapitalization"
+group = "loanContractEventGroup"
+type = "LegacyInterestCapitalization"
+status = "outstanding"
+
+[[loan]]
+element = "legacyInterestPayment"
+group = "loanContractEventGroup"
+type = "LegacyLoanInterestPayment"
+status = "outstanding"
+
+[[loan]]
+element = "loanContractAdjustment"
+group = "loanContractEventGroup"
+type = "LoanContractAdjustment"
+status = "outstanding"
+
+[[loan]]
+element = "maturityChange"
+group = "loanContractEventGroup"
+type = "LoanContractMaturityChange"
+status = "outstanding"
+
+[[loan]]
+element = "repayment"
+group = "loanContractEventGroup"
+type = "Repayment"
+status = "outstanding"
+
+[[loan]]
+element = "rollover"
+group = "loanContractEventGroup"
+type = "Rollover"
+status = "outstanding"
+
+[[loan]]
+element = "lcAdjustment"
+group = "lcEventGroup"
+type = "LcAdjustment"
+status = "outstanding"
+
+[[loan]]
+element = "lcFxRevaluation"
+group = "lcEventGroup"
+type = "LcFxRevaluation"
+status = "outstanding"
+
+[[loan]]
+element = "lcIssuance"
+group = "lcEventGroup"
+type = "LcIssuance"
+status = "outstanding"
+
+[[loan]]
+element = "lcIssuanceFeePayment"
+group = "lcEventGroup"
+type = "LcIssuanceFeePayment"
+status = "outstanding"
+
+[[loan]]
+element = "lcRateChange"
+group = "lcEventGroup"
+type = "LcRateChange"
+status = "outstanding"
+
+[[loan]]
+element = "lcRenewal"
+group = "lcEventGroup"
+type = "LcRenewal"
+status = "outstanding"
+
+[[loan]]
+element = "lcTermination"
+group = "lcEventGroup"
+type = "LcTermination"
+status = "outstanding"
+
+[[loan]]
+element = "loanAllocation"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationEvent"
+status = "outstanding"
+
+[[loan]]
+element = "loanAllocationConfirmation"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationEvent"
+status = "outstanding"
+
+[[loan]]
+element = "loanAllocationFeeDue"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationTransferFeeDue"
+status = "outstanding"
+
+[[loan]]
+element = "loanAllocationFeeOwed"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationTransferFeeOwed"
+status = "outstanding"
+
+[[loan]]
+element = "loanAllocationSettlement"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationSettlement"
+status = "outstanding"
+
+[[loan]]
+element = "loanAllocationSettlementDateAvailability"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationSettlementDateAvailability"
+status = "outstanding"
+
+[[loan]]
+element = "loanAllocationSettlementDateFinalization"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationSettlementDateFinalization"
+status = "outstanding"
+
+[[loan]]
+element = "loanTrade"
+group = "loanTradeEventGroup"
+type = "LoanTradeEvent"
+status = "outstanding"
+
+[[loan]]
+element = "loanTradeConfirmation"
+group = "loanTradeEventGroup"
+type = "LoanTradeEvent"
+status = "outstanding"
+
+[[loan]]
+element = "loanTradeFeeDue"
+group = "loanTradeEventGroup"
+type = "LoanTradeTransferFeeDue"
+status = "outstanding"
+
+[[loan]]
+element = "loanTradeFeeOwed"
+group = "loanTradeEventGroup"
+type = "LoanTradeTransferFeeOwed"
+status = "outstanding"
+
+[[document]]
+element = "allocationAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "allocationApproved"
+type = "AllocationApproved"
+status = "outstanding"
+
+[[document]]
+element = "allocationException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "allocationRefused"
+type = "AllocationRefused"
+status = "outstanding"
+
+[[document]]
+element = "approvalStatusNotification"
+type = "ApprovalStatusNotification"
+status = "outstanding"
+
+[[document]]
+element = "clearingAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "clearingConfirmed"
+type = "ClearingConfirmed"
+status = "outstanding"
+
+[[document]]
+element = "clearingEligibility"
+type = "ClearingEligibility"
+status = "outstanding"
+
+[[document]]
+element = "clearingEligibilityAcknowledgement"
+type = "Acknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "clearingEligibilityException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "clearingException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "clearingRefused"
+type = "ClearingRefused"
+status = "outstanding"
+
+[[document]]
+element = "clearingStatus"
+type = "ClearingStatus"
+status = "outstanding"
+
+[[document]]
+element = "collateralAllocationAccepted"
+type = "CollateralAllocationAccepted"
+status = "outstanding"
+
+[[document]]
+element = "collateralAllocationAcknowledgement"
+type = "Acknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "collateralAllocationRejected"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "confirmationAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "confirmationAgreed"
+type = "ConfirmationAgreed"
+status = "outstanding"
+
+[[document]]
+element = "confirmationDisputed"
+type = "ConfirmationDisputed"
+status = "outstanding"
+
+[[document]]
+element = "confirmationException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "confirmationStatus"
+type = "ConfirmationStatus"
+status = "outstanding"
+
+[[document]]
+element = "consentAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "consentException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "consentGranted"
+type = "ConsentGranted"
+status = "outstanding"
+
+[[document]]
+element = "consentRefused"
+type = "ConsentRefused"
+status = "outstanding"
+
+[[document]]
+element = "creditEventAcknowledgement"
+type = "Acknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "creditEventException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "creditEventNotification"
+type = "CreditEventNotification"
+status = "outstanding"
+
+[[document]]
+element = "creditEventNotificationRetracted"
+type = "CreditEventNotificationRetracted"
+status = "outstanding"
+
+[[document]]
+element = "dataDocument"
+type = "DataDocument"
+status = "outstanding"
+
+[[document]]
+element = "dealStatement"
+type = "DealStatement"
+status = "outstanding"
+
+[[document]]
+element = "eventStatusException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "eventStatusResponse"
+type = "EventStatusResponse"
+status = "outstanding"
+
+[[document]]
+element = "executionAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "executionAdvice"
+type = "ExecutionAdvice"
+status = "outstanding"
+
+[[document]]
+element = "executionAdviceAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "executionAdviceException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "executionAdviceRetracted"
+type = "ExecutionAdviceRetracted"
+status = "outstanding"
+
+[[document]]
+element = "executionException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "executionNotification"
+type = "ExecutionNotification"
+status = "outstanding"
+
+[[document]]
+element = "executionRetracted"
+type = "ExecutionRetracted"
+status = "outstanding"
+
+[[document]]
+element = "facilityNotification"
+type = "FacilityNotification"
+status = "outstanding"
+
+[[document]]
+element = "facilityPositionStatement"
+type = "FacilityPositionStatement"
+status = "outstanding"
+
+[[document]]
+element = "facilityStatement"
+type = "FacilityStatement"
+status = "outstanding"
+
+[[document]]
+element = "lcNotification"
+type = "LcNotification"
+status = "outstanding"
+
+[[document]]
+element = "loanAllocationNotification"
+type = "LoanAllocationNotification"
+status = "outstanding"
+
+[[document]]
+element = "loanBulkServicingNotification"
+type = "LoanBulkServicingNotification"
+status = "outstanding"
+
+[[document]]
+element = "loanContractNotification"
+type = "LoanContractNotification"
+status = "outstanding"
+
+[[document]]
+element = "loanCovenantObligationNotification"
+type = "LoanCovenantObligationNotification"
+status = "outstanding"
+
+[[document]]
+element = "loanLegalActionNotification"
+type = "LoanLegalActionNotification"
+status = "outstanding"
+
+[[document]]
+element = "loanLegalActionStatement"
+type = "LoanLegalActionStatement"
+status = "outstanding"
+
+[[document]]
+element = "loanNotificationAcknowledgement"
+type = "LoanNotificationAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "loanNotificationException"
+type = "LoanNotificationException"
+status = "outstanding"
+
+[[document]]
+element = "loanNotificationRetracted"
+type = "LoanNotificationRetracted"
+status = "outstanding"
+
+[[document]]
+element = "loanPartyProfileStatement"
+type = "LoanPartyProfileStatement"
+status = "outstanding"
+
+[[document]]
+element = "loanTradeNotification"
+type = "LoanTradeNotification"
+status = "outstanding"
+
+[[document]]
+element = "maturityAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "maturityException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "maturityNotification"
+type = "MaturityNotification"
+status = "outstanding"
+
+[[document]]
+element = "messageRejected"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "optionExpirationNotification"
+type = "ExecutionNotification"
+status = "outstanding"
+
+[[document]]
+element = "outstandingContractsStatement"
+type = "OutstandingContractsStatement"
+status = "outstanding"
+
+[[document]]
+element = "requestAllocation"
+type = "RequestAllocation"
+status = "outstanding"
+
+[[document]]
+element = "requestAllocationRetracted"
+type = "RequestAllocationRetracted"
+status = "outstanding"
+
+[[document]]
+element = "requestClearing"
+type = "RequestClearing"
+status = "outstanding"
+
+[[document]]
+element = "requestClearingEligibility"
+type = "RequestClearingEligibility"
+status = "outstanding"
+
+[[document]]
+element = "requestClearingRetracted"
+type = "RequestClearingRetracted"
+status = "outstanding"
+
+[[document]]
+element = "requestCollateralAllocation"
+type = "RequestCollateralAllocation"
+status = "outstanding"
+
+[[document]]
+element = "requestConfirmation"
+type = "RequestConfirmation"
+status = "outstanding"
+
+[[document]]
+element = "requestConfirmationRetracted"
+type = "ConfirmationRetracted"
+status = "outstanding"
+
+[[document]]
+element = "requestConsent"
+type = "RequestConsent"
+status = "outstanding"
+
+[[document]]
+element = "requestConsentRetracted"
+type = "RequestConsentRetracted"
+status = "outstanding"
+
+[[document]]
+element = "requestEventStatus"
+type = "RequestEventStatus"
+status = "outstanding"
+
+[[document]]
+element = "requestExecution"
+type = "RequestExecution"
+status = "outstanding"
+
+[[document]]
+element = "requestExecutionRetracted"
+type = "RequestExecutionRetracted"
+status = "outstanding"
+
+[[document]]
+element = "requestRetransmission"
+type = "RequestRetransmission"
+status = "outstanding"
+
+[[document]]
+element = "requestTradeReferenceInformationUpdate"
+type = "RequestTradeReferenceInformationUpdate"
+status = "outstanding"
+
+[[document]]
+element = "requestTradeReferenceInformationUpdateRetracted"
+type = "RequestTradeReferenceInformationUpdateRetracted"
+status = "outstanding"
+
+[[document]]
+element = "serviceNotification"
+type = "ServiceNotification"
+status = "outstanding"
+
+[[document]]
+element = "serviceNotificationException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "tradeChangeAdvice"
+type = "TradeChangeAdvice"
+status = "outstanding"
+
+[[document]]
+element = "tradeChangeAdviceAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "tradeChangeAdviceException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "tradeChangeAdviceRetracted"
+type = "TradeChangeAdviceRetracted"
+status = "outstanding"
+
+[[document]]
+element = "tradeReferenceInformationUpdateAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "tradeReferenceInformationUpdateException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "valuationDocument"
+type = "ValuationDocument"
+status = "outstanding"
+
+[[document]]
+element = "verificationStatusAcknowledgement"
+type = "Acknowledgement"
+status = "outstanding"
+
+[[document]]
+element = "verificationStatusException"
+type = "Exception"
+status = "outstanding"
+
+[[document]]
+element = "verificationStatusNotification"
+type = "VerificationStatusNotification"
+status = "outstanding"

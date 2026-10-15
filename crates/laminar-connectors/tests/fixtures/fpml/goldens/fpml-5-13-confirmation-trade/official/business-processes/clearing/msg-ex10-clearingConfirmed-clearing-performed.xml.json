@@ -1,0 +1,350 @@
+[
+  {
+    "correlation_id": "TRD0001",
+    "creation_timestamp": {
+      "local": "2010-01-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2010-01-04T08:57:00Z"
+    },
+    "document_root": "clearingConfirmed",
+    "document_sha256": "6565fa1dfef098d60a56beef19ee59a6b317d8c0f7a8d1e08e218feeeca6a5ed",
+    "fpml_version": "5-13",
+    "message_id": "R00ABC1",
+    "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "sef",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SEFCO"
+          }
+        ]
+      },
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "RBSLGB1LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "JPMCGB2L"
+          }
+        ]
+      },
+      {
+        "id": "broker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XYZ_BANK"
+          }
+        ]
+      },
+      {
+        "id": "broker2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "QLM_BANK"
+          }
+        ]
+      },
+      {
+        "id": "DCO1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "DCO Corp"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/clearingConfirmed/clearing/submitted/trade",
+    "sent_by": "LCHLGB2LXXX",
+    "trade_context": "submitted",
+    "trade_count": 3,
+    "trade_header": {
+      "cleared_date": "2010-01-04",
+      "party_trade_identifiers": [
+        {
+          "party_href": "sef",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "SEFCO"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.sef.com/coding-scheme/clearing-id",
+              "value": "SEF01"
+            }
+          ]
+        },
+        {
+          "party_href": "clearer",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+              "value": "LCHLGB2LXXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://lch.com/trade_id",
+              "value": "LCH01"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "party_href": "party1"
+        },
+        {
+          "party_href": "party2"
+        }
+      ],
+      "trade_date": "2010-01-04"
+    },
+    "trade_ordinal": 0
+  },
+  {
+    "correlation_id": "TRD0001",
+    "creation_timestamp": {
+      "local": "2010-01-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2010-01-04T08:57:00Z"
+    },
+    "document_root": "clearingConfirmed",
+    "document_sha256": "6565fa1dfef098d60a56beef19ee59a6b317d8c0f7a8d1e08e218feeeca6a5ed",
+    "fpml_version": "5-13",
+    "message_id": "R00ABC1",
+    "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "sef",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SEFCO"
+          }
+        ]
+      },
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "RBSLGB1LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "JPMCGB2L"
+          }
+        ]
+      },
+      {
+        "id": "broker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XYZ_BANK"
+          }
+        ]
+      },
+      {
+        "id": "broker2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "QLM_BANK"
+          }
+        ]
+      },
+      {
+        "id": "DCO1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "DCO Corp"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/clearingConfirmed/clearing/cleared/trade",
+    "sent_by": "LCHLGB2LXXX",
+    "trade_context": "cleared",
+    "trade_count": 3,
+    "trade_header": {
+      "cleared_date": "2010-01-04",
+      "party_trade_identifiers": [
+        {
+          "party_href": "clearer",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+              "value": "LCHLGB2LXXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://lch.com/trade_id",
+              "value": "LCH02"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "party_href": "clearer"
+        }
+      ],
+      "trade_date": "2010-01-04"
+    },
+    "trade_ordinal": 1
+  },
+  {
+    "correlation_id": "TRD0001",
+    "creation_timestamp": {
+      "local": "2010-01-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2010-01-04T08:57:00Z"
+    },
+    "document_root": "clearingConfirmed",
+    "document_sha256": "6565fa1dfef098d60a56beef19ee59a6b317d8c0f7a8d1e08e218feeeca6a5ed",
+    "fpml_version": "5-13",
+    "message_id": "R00ABC1",
+    "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "sef",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SEFCO"
+          }
+        ]
+      },
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "RBSLGB1LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "JPMCGB2L"
+          }
+        ]
+      },
+      {
+        "id": "broker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XYZ_BANK"
+          }
+        ]
+      },
+      {
+        "id": "broker2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "QLM_BANK"
+          }
+        ]
+      },
+      {
+        "id": "DCO1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "DCO Corp"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/clearingConfirmed/clearing/cleared[2]/trade",
+    "sent_by": "LCHLGB2LXXX",
+    "trade_context": "cleared",
+    "trade_count": 3,
+    "trade_header": {
+      "cleared_date": "2010-01-04",
+      "party_trade_identifiers": [
+        {
+          "party_href": "clearer",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+              "value": "LCHLGB2LXXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://lch.com/trade_id",
+              "value": "LCH03"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "party_href": "clearer"
+        }
+      ],
+      "trade_date": "2010-01-04"
+    },
+    "trade_ordinal": 2
+  }
+]

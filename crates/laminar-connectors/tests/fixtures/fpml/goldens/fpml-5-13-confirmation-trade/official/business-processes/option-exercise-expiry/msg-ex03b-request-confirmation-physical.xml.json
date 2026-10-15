@@ -1,0 +1,75 @@
+[
+  {
+    "correlation_id": "CORR019",
+    "creation_timestamp": {
+      "local": "2010-09-10T10:00:00",
+      "offset_minutes": 0,
+      "utc": "2010-09-10T10:00:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "70e3f0367d2fc7b73a8c6e80ef9534a8d8bea7bc9123095dfae03d9e56c4f5a4",
+    "documentation": {
+      "master_confirmation_date": "2003-06-20",
+      "master_confirmation_type": "ISDA2003CreditNorthAmerican"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "0485674",
+    "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "AMAG",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500T86SHG919ON888"
+          }
+        ],
+        "party_name": "International Bank Asset Management"
+      },
+      {
+        "id": "SKY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300HTD3SZJWA5TS80"
+          }
+        ],
+        "party_name": "Sky Limited"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "AMAGGB22XXX",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "linked_trade_ids": [
+            {
+              "scheme": "ExerciseTransactionRefNbr",
+              "value": "CDSwaption1"
+            }
+          ],
+          "party_href": "SKY",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300HTD3SZJWA5TS80"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "TradeRefNbr",
+              "value": "CDS1"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2007-10-31"
+    },
+    "trade_ordinal": 0
+  }
+]

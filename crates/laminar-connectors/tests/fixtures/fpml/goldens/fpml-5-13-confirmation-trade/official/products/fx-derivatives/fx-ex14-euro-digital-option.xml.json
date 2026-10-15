@@ -1,0 +1,78 @@
+[
+  {
+    "correlation_id": "FX01234",
+    "creation_timestamp": {
+      "local": "2001-11-12T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-11-12T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "fd1fb6523d7149594ccaea48c078507e910bf68a698e6cc57cbb9c67ced27f36",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX109876",
+    "message_id_scheme": "http://www.citi.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000SCC07UI6DB380"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFM8T61CT2L1QCEMIK50"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxDigitalOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "CITIUS33",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000SCC07UI6DB380"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.citi.com/fx/trade-id",
+              "value": "CITI10014"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFM8T61CT2L1QCEMIK50"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.ubsw.com/fx/trade-id",
+              "value": "UBSW20014"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-11-12"
+    },
+    "trade_ordinal": 0
+  }
+]

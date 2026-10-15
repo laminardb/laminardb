@@ -1,0 +1,66 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "creation_timestamp": {
+      "local": "2011-03-24T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2011-03-24T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "ca04a335507657470781c0222405e023d7c4e7b80fafc102f5f291fa592e7385",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxAccrualForward",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300SRLRVTR996F086"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "#partyA",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2011-03-26"
+    },
+    "trade_ordinal": 0
+  }
+]

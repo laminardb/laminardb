@@ -1,0 +1,297 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "value": "1234"
+          }
+        ],
+        "account_name": "SkyAccount",
+        "beneficiary_href": "SKY",
+        "id": "INTAC1"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "47896325"
+          }
+        ],
+        "account_name": "Sky General Account",
+        "beneficiary_href": "SKY",
+        "id": "GEN478"
+      }
+    ],
+    "correlation_id": "CORR002",
+    "creation_timestamp": {
+      "local": "2007-07-27T11:02:00",
+      "offset_minutes": 0,
+      "utc": "2007-07-27T11:02:00Z"
+    },
+    "document_root": "executionAdvice",
+    "document_sha256": "d757f1f5850e65460b846f7b8b9c8de17785c404960ac416932dbd597f109564",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": true,
+    "message_id": "0483608",
+    "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "AMAG",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500T86SHG919ON888"
+          }
+        ],
+        "party_name": "International Bank Asset Management"
+      },
+      {
+        "id": "SKY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ],
+        "party_name": "Sky Limited"
+      },
+      {
+        "id": "CST",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FL0LHI0TEZ8V48"
+          }
+        ],
+        "party_name": "Standards Slav. Int'l"
+      },
+      {
+        "id": "FIRST",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E0S1LZYZ9QNX81"
+          }
+        ],
+        "party_name": "First International Bank, MozartStrasse, Frankfurt"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionAdvice/trade",
+    "sent_by": "AMAGGB22XXX",
+    "sequence_number": 2,
+    "swap": {
+      "product": {},
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "fixed_rate_schedule": {
+              "initial_value": "0.098700000000000000"
+            },
+            "notional_schedule": {
+              "currency": "JPY",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "12300000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "GBLO",
+                "JPTO"
+              ],
+              "business_centers_href": "BCT1",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "30"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY",
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_centers_href": "BCT1",
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2007-07-30"
+            },
+            "id": "CALC1",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY",
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2037-07-30"
+            }
+          },
+          "payer_party_href": "SKY",
+          "payment_dates": {
+            "calculation_period_dates_href": "CALC1",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "GBLO",
+                "JPTO"
+              ],
+              "business_centers_href": "BCT1",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "receiver_party_href": "FIRST"
+        },
+        {
+          "calculation": {
+            "compounding_method": "Flat",
+            "day_count_fraction": "ACT/365.FIXED",
+            "floating_rate_calculation": {
+              "floating_rate_index": "JPY-BBSF-Bloomberg-15:00",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 3
+              }
+            },
+            "notional_schedule": {
+              "currency": "JPY",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "12300000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "GBLO",
+                "JPTO"
+              ],
+              "business_centers_href": "BCT1",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 3,
+              "roll_convention": "30"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY",
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_centers_href": "BCT1",
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2007-07-30"
+            },
+            "id": "CALC2",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY",
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_centers_href": "BCT1",
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2037-07-30"
+            }
+          },
+          "payer_party_href": "FIRST",
+          "payment_dates": {
+            "calculation_period_dates_href": "CALC2",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "GBLO",
+                "JPTO"
+              ],
+              "business_centers_href": "BCT1",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "Y",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "SKY",
+          "reset_dates": {
+            "calculation_period_dates_href": "CALC2",
+            "fixing_dates": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "RES2",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "RES2",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "GBLO",
+                "JPTO"
+              ],
+              "business_centers_href": "BCT1",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            }
+          }
+        }
+      ]
+    },
+    "trade_context": "executionAdvice",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "SKY",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300XQFX97CITUR430"
+            }
+          ],
+          "version_ids": [
+            {
+              "scheme": "http://www.swift.com/coding-scheme/contract-id",
+              "value": "IRS2"
+            }
+          ],
+          "versions": [
+            2
+          ]
+        }
+      ],
+      "trade_date": "2007-07-27"
+    },
+    "trade_ordinal": 0
+  }
+]

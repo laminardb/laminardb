@@ -1,0 +1,91 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CS/2021/08/18/32-09",
+    "creation_timestamp": {
+      "local": "2021-08-18T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2021-08-18T16:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "d8b1b91cc115e17cf9b7c4aa23cb15641c0f4569bb5b3b2996569d6949e27ac7",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "MS/2021/08/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "6234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "6569"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2021-08-18"
+    },
+    "trade_ordinal": 0
+  }
+]

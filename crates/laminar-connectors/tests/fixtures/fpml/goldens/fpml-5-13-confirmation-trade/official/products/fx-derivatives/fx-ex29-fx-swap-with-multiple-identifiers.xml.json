@@ -1,0 +1,96 @@
+[
+  {
+    "correlation_id": "CORRELATIONID",
+    "creation_timestamp": {
+      "local": "2013-01-01T00:00:00",
+      "offset_minutes": 0,
+      "utc": "2013-01-01T00:00:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "f39da4f861d2c90405155436c02b692fb2332224524b283642f054b39aebf98b",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "MESSAGEID",
+    "message_id_scheme": "MarkitSERV",
+    "parties": [
+      {
+        "id": "ExecutingParty",
+        "party_ids": [
+          {
+            "scheme": "MarkitSERV",
+            "value": "PartyA"
+          }
+        ]
+      },
+      {
+        "id": "Counterparty",
+        "party_ids": [
+          {
+            "scheme": "MarkitSERV",
+            "value": "PartyB"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSwap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "MARKITSERV",
+    "sequence_number": 1,
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "issuer": {
+            "scheme": "http://www.fpml.org/coding-scheme/external/cftc/issuer-identifier",
+            "value": "USIPREFIX"
+          },
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/unique-transaction-identifier",
+              "value": "USITRADEID"
+            }
+          ]
+        },
+        {
+          "issuer": {
+            "scheme": "http://www.fpml.org/coding-scheme/external/issuer-identifier",
+            "value": "UTIPREFIX"
+          },
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/unique-transaction-identifier",
+              "value": "UTITRADEID"
+            }
+          ]
+        },
+        {
+          "issuer": {
+            "scheme": "http://www.fpml.org/coding-scheme/external/cftc/issuer-identifier",
+            "value": "USIPREFIX"
+          },
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/unique-transaction-identifier",
+              "value": "USITRADEID"
+            }
+          ]
+        },
+        {
+          "issuer": {
+            "scheme": "http://www.fpml.org/coding-scheme/external/cftc/issuer-identifier",
+            "value": "UTIPREFIX"
+          },
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/unique-transaction-identifier",
+              "value": "UTITRADEID"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-01-01"
+    },
+    "trade_ordinal": 0
+  }
+]

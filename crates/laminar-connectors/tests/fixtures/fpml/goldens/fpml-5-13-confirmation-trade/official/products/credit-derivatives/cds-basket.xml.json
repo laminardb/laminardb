@@ -1,0 +1,76 @@
+[
+  {
+    "correlation_id": "CORR/2005/01/24/0EB30A0q",
+    "creation_timestamp": {
+      "local": "2005-01-24T04:36:35",
+      "offset_minutes": -480,
+      "utc": "2005-01-24T12:36:35Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "bc711672034f26d3464b7e2c41d148501ba21bdc5cb8f65efbbdb4c9345c0ac5",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2003Credit"
+      ]
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:0EB40A0q",
+    "message_id_scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/messageID",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "I7331LVCZKQKX5T7XV54"
+          }
+        ],
+        "party_name": "Morgan Stanley Capital Services"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800H14XVWOV87OI72"
+          }
+        ],
+        "party_name": "Barclays Global Investors"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "BGIAGB2L",
+    "sequence_number": 1,
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "linked_trade_ids": [
+            {
+              "scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/linkID",
+              "value": "USDINDEX"
+            }
+          ],
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "213800H14XVWOV87OI72"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/tradeID",
+              "value": "DJITRAXXUSDMS5Y"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2004-01-24"
+    },
+    "trade_ordinal": 0
+  }
+]

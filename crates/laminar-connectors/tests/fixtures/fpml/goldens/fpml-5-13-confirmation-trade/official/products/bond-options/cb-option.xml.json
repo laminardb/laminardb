@@ -1,0 +1,68 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "Party1"
+      ]
+    },
+    "correlation_id": "CRR/2007/01/04/2342342",
+    "creation_timestamp": {
+      "local": "2007-01-05T15:38:00",
+      "offset_minutes": -300,
+      "utc": "2007-01-05T20:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "8e1eda64c81846b6c61bf0b1948596bf774631db8f98d7ca764531c6a5261ebc",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "2342342",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "bondOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABIC1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/coding-scheme/trade-id",
+              "value": "Trade234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-01-16"
+    },
+    "trade_ordinal": 0
+  }
+]

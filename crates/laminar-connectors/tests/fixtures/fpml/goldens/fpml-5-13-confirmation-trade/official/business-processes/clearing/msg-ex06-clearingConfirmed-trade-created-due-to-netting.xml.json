@@ -1,0 +1,65 @@
+[
+  {
+    "correlation_id": "TRD0001",
+    "creation_timestamp": {
+      "local": "2010-01-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2010-01-04T08:57:00Z"
+    },
+    "document_root": "clearingConfirmed",
+    "document_sha256": "8c55e07e4ea08b04be0077dd0c44ba318ce2fcf4936ba7140a35b795b823355e",
+    "documentation": {
+      "master_confirmation_date": "2001-01-04",
+      "master_confirmation_type": "ISDA1999Credit"
+    },
+    "fpml_version": "5-13",
+    "message_id": "R00ABC1",
+    "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "RBSLGB1LXXX"
+          }
+        ]
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/clearingConfirmed/trade",
+    "sent_by": "LCHLGB2LXXX",
+    "trade_context": "clearingConfirmed",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "clearer",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+              "value": "LCHLGB2LXXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lch.com/coding-scheme/clearing-id",
+              "value": "CL000003"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2010-01-04"
+    },
+    "trade_ordinal": 0
+  }
+]

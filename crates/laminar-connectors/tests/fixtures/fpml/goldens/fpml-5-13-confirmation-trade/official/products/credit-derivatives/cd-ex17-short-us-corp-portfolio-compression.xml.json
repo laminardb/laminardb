@@ -1,0 +1,76 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "832c6a6ec5fff897b9182f62f6e65e1339957060a6c5a751bf0df366f965bf59",
+    "documentation": {
+      "contractual_matrix": [
+        "CreditDerivativesPhysicalSettlementMatrix"
+      ],
+      "master_agreement_date": "2004-07-28",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900BIAQJIUV6DLE92"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.xyzbank.com/cd-trade-id",
+              "value": "xyz1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abcbank.com/cd-trade-id",
+              "value": "abc1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-12-03"
+    },
+    "trade_ordinal": 0
+  }
+]

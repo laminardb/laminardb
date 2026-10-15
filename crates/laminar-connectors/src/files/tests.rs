@@ -158,6 +158,43 @@ mod fpml {
         source.close().await.unwrap();
     }
 
+    /// A restarted source registers its metrics again at once: the closed decoder unregisters
+    /// them on drop, even while its worker is still finishing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_count_documents_and_survive_a_fast_restart() {
+        let registry = prometheus::Registry::new();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("swap.xml"),
+            example("products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml"),
+        )
+        .unwrap();
+        let mut named = config(directory.path());
+        named.set("laminar.source.name", "trades");
+        for round in 0..3 {
+            let mut source = FileSource::with_registry(Some(&registry));
+            source
+                .start(
+                    SourceStart::new(
+                        named.clone(),
+                        SourcePosition::Initial,
+                        DeliveryGuarantee::AtLeastOnce,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("restart {round}: {error}"));
+            poll_rows(&mut source, 10, 1).await.unwrap();
+            let accepted = registry
+                .gather()
+                .into_iter()
+                .find(|family| family.name() == "fpml_documents_accepted_total")
+                .map(|family| family.get_metric()[0].get_counter().value());
+            assert_eq!(accepted, Some(1.0));
+            source.close().await.unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_resumed_document_skips_its_committed_rows() {
         let directory = tempfile::tempdir().unwrap();

@@ -7,12 +7,28 @@ use prometheus::{Histogram, HistogramOpts, IntCounter, IntCounterVec, Opts, Regi
 use super::error::Stage;
 use crate::error::ConnectorError;
 
-pub(crate) struct FpmlMetrics {
+/// Metric handles the validator worker updates. Clones share their values.
+#[derive(Clone)]
+pub(crate) struct FpmlCounters {
     pub(crate) documents_accepted: IntCounter,
     pub(crate) documents_rejected: IntCounterVec,
     pub(crate) rows: IntCounter,
     pub(crate) document_bytes: IntCounter,
     pub(crate) decode_seconds: Histogram,
+}
+
+impl FpmlCounters {
+    pub(crate) fn rejected(&self, stage: Stage) {
+        self.documents_rejected
+            .with_label_values(&[stage.label()])
+            .inc();
+    }
+}
+
+/// Registered metric families, owned by the decoder: dropping it unregisters them at once,
+/// even while the worker finishes its last document, so a restarted source can register again.
+pub(crate) struct FpmlMetrics {
+    pub(crate) counters: FpmlCounters,
     registration: Option<Registry>,
 }
 
@@ -22,7 +38,7 @@ impl FpmlMetrics {
             IntCounter::with_opts(Opts::new(name, help).const_label("source", source))
         };
         let build = || -> Result<Self, prometheus::Error> {
-            Ok(Self {
+            let counters = FpmlCounters {
                 documents_accepted: counter(
                     "fpml_documents_accepted_total",
                     "FpML documents validated and projected",
@@ -51,6 +67,9 @@ impl FpmlMetrics {
                         0.25, 0.5, 1.0, 2.5,
                     ]),
                 )?,
+            };
+            Ok(Self {
+                counters,
                 registration: None,
             })
         };
@@ -59,12 +78,13 @@ impl FpmlMetrics {
     }
 
     fn collectors(&self) -> Vec<Box<dyn Collector>> {
+        let counters = &self.counters;
         vec![
-            Box::new(self.documents_accepted.clone()),
-            Box::new(self.documents_rejected.clone()),
-            Box::new(self.rows.clone()),
-            Box::new(self.document_bytes.clone()),
-            Box::new(self.decode_seconds.clone()),
+            Box::new(counters.documents_accepted.clone()),
+            Box::new(counters.documents_rejected.clone()),
+            Box::new(counters.rows.clone()),
+            Box::new(counters.document_bytes.clone()),
+            Box::new(counters.decode_seconds.clone()),
         ]
     }
 
@@ -83,12 +103,6 @@ impl FpmlMetrics {
         }
         metrics.registration = Some(registry.clone());
         Ok(metrics)
-    }
-
-    pub(crate) fn rejected(&self, stage: Stage) {
-        self.documents_rejected
-            .with_label_values(&[stage.label()])
-            .inc();
     }
 }
 

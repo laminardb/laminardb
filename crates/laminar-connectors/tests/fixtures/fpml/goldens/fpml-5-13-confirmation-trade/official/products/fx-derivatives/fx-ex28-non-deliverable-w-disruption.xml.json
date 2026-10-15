@@ -1,0 +1,78 @@
+[
+  {
+    "correlation_id": "FX987",
+    "creation_timestamp": {
+      "local": "2013-04-16T22:00:00",
+      "offset_minutes": 0,
+      "utc": "2013-04-16T22:00:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "372508fdea67a9235cc8d7d16f4949c8b51ff78c9eec0b13d9596a836eec9fa3",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.matchingservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "HSBCGB01"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "BNPPGB01"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABN",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "HSBCGB01"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "urn:hsbc:trade-id",
+              "value": "12345678"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "BNPPGB01"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "run:bnpp/trade-id",
+              "value": "AZ5678901"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-04-01"
+    },
+    "trade_ordinal": 0
+  }
+]

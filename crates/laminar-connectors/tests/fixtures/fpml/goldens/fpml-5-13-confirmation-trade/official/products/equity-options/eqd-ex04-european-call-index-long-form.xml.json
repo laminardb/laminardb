@@ -1,0 +1,75 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party2"
+      ]
+    },
+    "correlation_id": "CS/2000/08/01/EquityIndexOption369",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "b7374dee9a9b2bab07aa0262571747b8e828baad57c949f800f6c4705ebb91d4",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "EquityIndexOption456a789b",
+    "message_id_scheme": "http://www.msdw.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "msdw",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/eqd-trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-09-04"
+    },
+    "trade_ordinal": 0
+  }
+]

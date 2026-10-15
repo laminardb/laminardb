@@ -1,0 +1,262 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "43b186bf29d7a1375521004def8c1495f74b02f7c3d0d23246444785d9ceea1a",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "swap": {
+      "additional_payments": [
+        {
+          "payer_party_href": "partyB",
+          "payment_amount": {
+            "amount": "70102311.000000000000000000",
+            "currency": "JPY",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "USNY",
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2022-03-22"
+          },
+          "payment_type": "UnclassifiedFee",
+          "receiver_party_href": "partyA"
+        },
+        {
+          "payer_party_href": "partyA",
+          "payment_amount": {
+            "amount": "594995.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "USNY",
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2022-03-22"
+          },
+          "payment_type": "UpfrontFee",
+          "receiver_party_href": "partyB"
+        }
+      ],
+      "product": {},
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "fixed_rate_schedule": {
+              "initial_value": "0.000000000000000000"
+            },
+            "notional_schedule": {
+              "currency": "JPY",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "589100000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "13"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2022-03-22"
+            },
+            "first_regular_period_start_date": "2022-09-13",
+            "id": "fixedLegCalcPeriodDates",
+            "stub_period_type": "ShortInitial",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY",
+                  "JPTO"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2031-09-13"
+            }
+          },
+          "id": "fixedLeg",
+          "payer_party_href": "partyA",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedLegCalcPeriodDates",
+            "first_payment_date": "2022-09-13",
+            "id": "fixedLegShort",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "principal_exchanges": {
+            "final_exchange": true,
+            "initial_exchange": true,
+            "intermediate_exchange": false
+          },
+          "receiver_party_href": "partyB"
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "fixed_rate_schedule": {
+              "initial_value": "0.025640000000000000"
+            },
+            "notional_schedule": {
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "5000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "13"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2022-03-22"
+            },
+            "first_regular_period_start_date": "2022-09-13",
+            "id": "fixedLeg2CalcPeriodDates",
+            "stub_period_type": "ShortInitial",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY",
+                  "JPTO"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2031-09-13"
+            }
+          },
+          "id": "fixedLeg2",
+          "payer_party_href": "partyB",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedLeg2CalcPeriodDates",
+            "first_payment_date": "2022-09-13",
+            "id": "fixedLeg2Short",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "USNY",
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "principal_exchanges": {
+            "final_exchange": true,
+            "initial_exchange": true,
+            "intermediate_exchange": false
+          },
+          "receiver_party_href": "partyA"
+        }
+      ]
+    },
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "00000"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "00000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2022-03-14"
+    },
+    "trade_ordinal": 0
+  }
+]

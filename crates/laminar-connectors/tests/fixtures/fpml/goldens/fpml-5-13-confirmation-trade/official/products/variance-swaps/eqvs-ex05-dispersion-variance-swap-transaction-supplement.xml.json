@@ -1,0 +1,67 @@
+[
+  {
+    "correlation_id": "234239",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "bb13450f6116fb71b677c7a5baaa6502e0a13d0f6a9b9734f38b1c7bda77910c",
+    "documentation": {
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "283920",
+    "message_id_scheme": "http://www.abc.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "BAQ892"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "COP902"
+          }
+        ]
+      }
+    ],
+    "product_type": "varianceSwapTransactionSupplement",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABC290",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "BAQ892"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.xyz.com/coding-scheme/trade-id",
+              "value": "280234089"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2000-06-28"
+    },
+    "trade_ordinal": 0
+  }
+]

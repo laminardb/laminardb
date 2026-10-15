@@ -1,0 +1,80 @@
+[
+  {
+    "correlation_id": "FX65431",
+    "creation_timestamp": {
+      "local": "2001-12-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-12-04T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "8a6002a6015d6698328004b3ba5fea604762660aaf94117f117b17de0469f3d0",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX87653",
+    "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "TR24TWEY5RVRQV65HD49"
+          }
+        ],
+        "party_name": "MIDLAND"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ],
+        "party_name": "ABN AMRO"
+      }
+    ],
+    "product_type": "termDeposit",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABNANL2A",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "TR24TWEY5RVRQV65HD49"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.midlandnb.com/swaps/trade-id",
+              "value": "MB87623"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abn.com/swaps/trade-id",
+              "value": "AA9876"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-02-14"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,76 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "d9ad57580086981c8312c458ffac7ecf46debdad815548faaaf1628843dc28e6",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021"
+      ],
+      "master_confirmation_date": "2022-07-21",
+      "master_confirmation_type": "iBoxx"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "HPFHU0OQ28E4N0NFVK49"
+          }
+        ],
+        "party_name": "New Bank, New York"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900O1WT2BXINL9612"
+          }
+        ],
+        "party_name": "Massive Bank, New York"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "HPFHU0OQ28E4N0NFVK49"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.newbank.com/trade-id",
+              "value": "CDX1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900O1WT2BXINL9612"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.massivebank.com/trade-id",
+              "value": "1234A6"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2021-08-18"
+    },
+    "trade_ordinal": 0
+  }
+]

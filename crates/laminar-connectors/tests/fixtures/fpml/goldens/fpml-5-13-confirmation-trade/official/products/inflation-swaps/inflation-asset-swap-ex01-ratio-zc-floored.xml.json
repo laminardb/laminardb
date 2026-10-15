@@ -1,0 +1,267 @@
+[
+  {
+    "creation_timestamp": {
+      "local": "2018-09-17T06:55:42",
+      "offset_minutes": 300,
+      "utc": "2018-09-17T01:55:42Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "cbe10bcc315c9a5b2bb96c97a8fb0d1805afaa43c839fa74987a4d2d721bff85",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:2W81Q117",
+    "message_id_scheme": "XXX",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.party1.com/swaps/party-id",
+            "value": "12345"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.party1.com/swaps/party-id",
+            "value": "67890"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "XXXXXXXX",
+    "swap": {
+      "additional_terms": [
+        "GB00BYZW3J87"
+      ],
+      "product": {},
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/ACT.ISMA",
+            "inflation_rate_calculation": {
+              "calculation_method": "Ratio",
+              "calculation_style": "ZeroCoupon",
+              "fallback_bond_applicable": true,
+              "floating_rate_index": "UK-RPI",
+              "floating_rate_multiplier_schedule": {
+                "initial_value": "0.001250000000000000"
+              },
+              "index_source": "UKRPI",
+              "inflation_lag": {
+                "period": "M",
+                "period_multiplier": 3
+              },
+              "initial_index_level": "260.019350000000000000",
+              "interpolation_method": "LinearZeroYield"
+            },
+            "notional_schedule": {
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "id": "leg_1_notionalSchedule",
+              "initial_value": "100000000.000000000000000000"
+            },
+            "rate_calculation_type": "inflationRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "22"
+            },
+            "effective_date": {
+              "adjusted_date": "2018-09-17",
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2018-09-17"
+            },
+            "first_period_start_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2018-05-22"
+            },
+            "first_regular_period_start_date": "2018-11-22",
+            "id": "leg_1_calculationPeriodDates",
+            "termination_date": {
+              "adjusted_date": "2036-11-22",
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2036-11-22"
+            }
+          },
+          "id": "inflation_linked_bond",
+          "payer_party_href": "Party1",
+          "payment_dates": {
+            "calculation_period_dates_href": "leg_1_calculationPeriodDates",
+            "id": "leg_1_paymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "principal_exchanges": {
+            "final_exchange": true,
+            "initial_exchange": false,
+            "intermediate_exchange": false
+          },
+          "receiver_party_href": "Party2"
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "floating_rate_calculation": {
+              "floating_rate_index": "GBP-WMBA-SONIA-COMPOUND",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "spread_schedules": [
+                {
+                  "initial_value": "0.005077080000000000"
+                }
+              ]
+            },
+            "notional_schedule": {
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "id": "leg_2_notionalSchedule",
+              "initial_value": "100000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 12,
+              "roll_convention": "22"
+            },
+            "effective_date": {
+              "adjusted_date": "2018-09-17",
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2018-09-17"
+            },
+            "id": "leg_2_calculationPeriodDates",
+            "termination_date": {
+              "adjusted_date": "2036-11-24",
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2036-11-22"
+            }
+          },
+          "payer_party_href": "Party2",
+          "payment_dates": {
+            "calculation_period_dates_href": "leg_2_calculationPeriodDates",
+            "first_payment_date": "2019-05-22",
+            "id": "leg_2_paymentDates",
+            "last_regular_payment_date": "2036-05-22",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 12
+            }
+          },
+          "principal_exchanges": {
+            "final_exchange": true,
+            "initial_exchange": false,
+            "intermediate_exchange": false
+          },
+          "receiver_party_href": "Party1",
+          "reset_dates": {
+            "calculation_period_dates_href": "leg_2_calculationPeriodDates",
+            "fixing_dates": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "PRECEDING",
+              "date_relative_to_href": "leg_2_calculationPeriodDates",
+              "period": "D",
+              "period_multiplier": 0
+            },
+            "id": "leg_2_resetDates",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "PRECEDING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 12
+            },
+            "reset_relative_to": "CalculationPeriodEndDate"
+          }
+        }
+      ]
+    },
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/party-id",
+              "value": "12345"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "E2000098N10184"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/party-id",
+              "value": "67890"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2018-09-17"
+    },
+    "trade_ordinal": 0
+  }
+]

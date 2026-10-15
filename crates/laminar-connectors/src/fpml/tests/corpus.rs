@@ -1,29 +1,13 @@
-//! Whole-pipeline tests over the official corpus.
+//! Reference integrity and hand-checked economics over the official corpus.
 
-use super::document::Interner;
-use super::limits::Limits;
-use super::references::{ReferencePolicy, ReferenceRules};
-use super::schema_model::SchemaModel;
-use super::xsd::{TreeNames, Validator};
-use super::Artifact;
-
-#[derive(serde::Deserialize)]
-struct Corpus {
-    example: Vec<CorpusEntry>,
-}
-
-#[derive(serde::Deserialize)]
-struct CorpusEntry {
-    path: String,
-    status: String,
-    errata: Option<String>,
-}
-
-const NEWLINE: &str = "\n";
-
-fn corpus_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fpml/fpml-5-13-8-rec-2")
-}
+use super::{corpus, corpus_root, decoder_for, example, valid_examples};
+use crate::fpml::document::Interner;
+use crate::fpml::golden;
+use crate::fpml::limits::Limits;
+use crate::fpml::references::{ReferencePolicy, ReferenceRules};
+use crate::fpml::schema_model::SchemaModel;
+use crate::fpml::xsd::{TreeNames, Validator};
+use crate::fpml::Artifact;
 
 #[test]
 fn reference_policies_over_the_official_corpus() {
@@ -33,9 +17,6 @@ fn reference_policies_over_the_official_corpus() {
     let names = TreeNames::new(&mut interner, &artifact.reference_namespaces);
     let rules = ReferenceRules::new(&model, &mut interner);
     let mut validator = Validator::compile(&artifact.files).unwrap();
-    let corpus: Corpus =
-        toml::from_str(&std::fs::read_to_string(corpus_root().join("corpus.toml")).unwrap())
-            .unwrap();
     let expected: Vec<String> =
         std::fs::read_to_string(corpus_root().join("reference-annotation-violations.txt"))
             .unwrap()
@@ -45,14 +26,18 @@ fn reference_policies_over_the_official_corpus() {
             .collect();
     let mut flagged = Vec::new();
     let mut errata = Vec::new();
-    for entry in corpus
+    for entry in corpus()
         .example
         .iter()
         .filter(|entry| entry.status == "xsd-valid")
     {
-        let bytes = std::fs::read(corpus_root().join("confirmation").join(&entry.path)).unwrap();
         let (document, _) = validator
-            .validate(&bytes, &Limits::default(), &mut interner, &names)
+            .validate(
+                &example(&entry.path),
+                &Limits::default(),
+                &mut interner,
+                &names,
+            )
             .unwrap();
         rules
             .check(&document, &interner, names.href, ReferencePolicy::Resolve)
@@ -75,27 +60,7 @@ fn reference_policies_over_the_official_corpus() {
     );
 }
 
-fn decoder_for(profile: &str) -> super::FpmlDecoder {
-    let config = super::FpmlConfig {
-        profile: super::ProfileSource::Bundled(profile.into()),
-        schema_path: None,
-        references: ReferencePolicy::Resolve,
-        limits: Limits::default(),
-    };
-    let (artifact, profile) = config.resolve().unwrap();
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(super::FpmlDecoder::start(
-            artifact, &profile, &config, "test", None, None,
-        ))
-        .unwrap()
-}
-
-fn example(path: &str) -> Vec<u8> {
-    std::fs::read(corpus_root().join("confirmation").join(path)).unwrap()
-}
-
+/// Values read by hand from the example, not from a golden.
 #[test]
 fn vanilla_swap_projects_identifiers_parties_and_legs() {
     let decoder = decoder_for("fpml-5-13-confirmation-trade");
@@ -105,7 +70,7 @@ fn vanilla_swap_projects_identifiers_parties_and_legs() {
         ))
         .unwrap();
     assert_eq!(batch.num_rows(), 1);
-    let json = super::golden::rows(&batch);
+    let json = golden::rows(&batch);
     let row = &json[0];
     assert_eq!(row["document_root"], "dataDocument");
     assert_eq!(row["product_type"], "swap");
@@ -164,27 +129,20 @@ fn vanilla_swap_projects_identifiers_parties_and_legs() {
     assert_eq!(row["parties"][0]["party_name"], "Party A");
 }
 
-/// Every schema-valid official example decodes through the trade profile, producing one row per
-/// confirmation-view trade and none for documents without trades.
+/// Every schema-valid official example decodes through the trade profile: one row per
+/// confirmation-view trade, none for documents without trades.
 #[test]
-fn trade_profile_decodes_the_whole_official_corpus() {
+fn trade_profile_rows_match_an_independent_count() {
     let decoder = decoder_for("fpml-5-13-confirmation-trade");
-    let corpus: Corpus =
-        toml::from_str(&std::fs::read_to_string(corpus_root().join("corpus.toml")).unwrap())
-            .unwrap();
-    let mut rows = 0;
-    let mut failures = Vec::new();
-    for entry in corpus
-        .example
+    let rows: usize = valid_examples()
         .iter()
-        .filter(|entry| entry.status == "xsd-valid")
-    {
-        match decoder.decode(&example(&entry.path)) {
-            Ok(batch) => rows += batch.num_rows(),
-            Err(error) => failures.push(format!("{}: {error}", entry.path)),
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join(NEWLINE));
-    // Counted independently with Python ElementTree: trade elements that have a tradeHeader.
+        .map(|path| {
+            decoder
+                .decode(&example(path))
+                .unwrap_or_else(|error| panic!("{path}: {error}"))
+                .num_rows()
+        })
+        .sum();
+    // Counted with Python ElementTree: trade elements that have a tradeHeader child.
     assert_eq!(rows, 366);
 }

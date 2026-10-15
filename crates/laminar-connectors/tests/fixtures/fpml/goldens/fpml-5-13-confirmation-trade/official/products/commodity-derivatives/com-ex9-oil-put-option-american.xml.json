@@ -1,0 +1,78 @@
+[
+  {
+    "calculation_agent": {
+      "calculation_agent_party": "AsSpecifiedInMasterAgreement"
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "986535faacf185733c2bc902b140654982cdc8eb9048303dc7cdd4488ab395be",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC6"
+          }
+        ],
+        "party_name": "Rusty"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC1"
+          }
+        ],
+        "party_name": "SwapsWire Ltd (LE)"
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "ABC6"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "ABC1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2008-10-27"
+    },
+    "trade_ordinal": 0
+  }
+]

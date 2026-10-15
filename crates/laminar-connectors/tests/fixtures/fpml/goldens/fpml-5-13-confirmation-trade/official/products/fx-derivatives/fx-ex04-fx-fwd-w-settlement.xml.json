@@ -1,0 +1,78 @@
+[
+  {
+    "correlation_id": "FX987",
+    "creation_timestamp": {
+      "local": "2001-10-12T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-10-12T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "1d019328d2ce3c1e62b48f51884a66f715cfa8faa7ac590f86911a479ffbb3ba",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.matchingservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000SCC07UI6DB380"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFM8T61CT2L1QCEMIK50"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "MATCHSRV",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000SCC07UI6DB380"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.citi.com/fx/trade-id",
+              "value": "FWD123"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFM8T61CT2L1QCEMIK50"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.ubsw.com/fx/trade-id",
+              "value": "FXD2002987"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-11-12"
+    },
+    "trade_ordinal": 0
+  }
+]

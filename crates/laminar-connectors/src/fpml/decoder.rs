@@ -18,7 +18,7 @@ use super::artifacts::{hex, Artifact};
 use super::document::Interner;
 use super::error::{Rejection, Stage};
 use super::limits::Limits;
-use super::metrics::FpmlMetrics;
+use super::metrics::{FpmlCounters, FpmlMetrics};
 use super::prescan::prescan;
 use super::profile::{Profile, ProfileSource};
 use super::projection::{project, DocumentInfo};
@@ -104,6 +104,7 @@ struct Job {
 pub struct FpmlDecoder {
     schema: SchemaRef,
     jobs: mpsc::SyncSender<Job>,
+    _metrics: FpmlMetrics,
 }
 
 impl std::fmt::Debug for FpmlDecoder {
@@ -142,7 +143,7 @@ impl FpmlDecoder {
             plan: Arc::clone(&profile.plan),
             references: config.references,
             limits: config.limits,
-            metrics,
+            metrics: metrics.counters.clone(),
         };
         std::thread::Builder::new()
             .name("fpml-validator".into())
@@ -159,6 +160,7 @@ impl FpmlDecoder {
         Ok(Self {
             schema: profile.schema(),
             jobs,
+            _metrics: metrics,
         })
     }
 
@@ -212,7 +214,7 @@ struct Worker {
     plan: Arc<super::profile::Plan>,
     references: ReferencePolicy,
     limits: Limits,
-    metrics: FpmlMetrics,
+    metrics: FpmlCounters,
 }
 
 struct Prepared {
@@ -287,8 +289,7 @@ impl Worker {
             return Err(Rejection::new(
                 Stage::Root,
                 format!(
-                    "document root namespace '{}' is not the pinned view namespace '{}'",
-                    truncate(&scan.root_namespace, 128),
+                    "the document root is not in the pinned view namespace '{}'",
                     self.artifact.namespace
                 ),
             ));
@@ -331,12 +332,4 @@ impl Worker {
             },
         )
     }
-}
-
-fn truncate(text: &str, limit: usize) -> &str {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }

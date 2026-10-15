@@ -1,0 +1,67 @@
+[
+  {
+    "correlation_id": "CW/2009/02/24/123466",
+    "creation_timestamp": {
+      "local": "2002-09-24T18:08:40.335",
+      "offset_minutes": -300,
+      "utc": "2002-09-24T23:08:40.335Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "767ab01d59e524ecb2e781aad3560b32d3085ccb5be6b7065368cbf647630e45",
+    "documentation": {
+      "master_confirmation_date": "2002-06-20",
+      "master_confirmation_type": "ISDA2004EquityAmericasInterdealer"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "123466-002700000000022",
+    "message_id_scheme": "perFpMLReqmt",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "DTCC00006441"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "DTCC00006440"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOptionTransactionSupplement",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "DTCC00006441",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "DTCC",
+              "value": "DTCC00006441"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "TradeRefNbr",
+              "value": "TW9236"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-10-31"
+    },
+    "trade_ordinal": 0
+  }
+]

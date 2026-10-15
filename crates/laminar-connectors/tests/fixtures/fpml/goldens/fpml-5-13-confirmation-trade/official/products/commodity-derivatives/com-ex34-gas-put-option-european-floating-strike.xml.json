@@ -1,0 +1,80 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyB"
+      ]
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "1a634c5f73f244be8784b9693c63e533f403fa5a1509eb532d9dd1acd63f2f5f",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300U2FJ850G1P3962"
+          }
+        ],
+        "party_name": "Company A Inc."
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300B23HNTO1OHFU87"
+          }
+        ],
+        "party_name": "Company B Inc."
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300U2FJ850G1P3962"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyA.com/spec/2001/trade-id-1-0",
+              "value": "COA1234567"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300B23HNTO1OHFU87"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyB.com/spec/2001/trade-id-1-0",
+              "value": "COB7654321"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-04-10"
+    },
+    "trade_ordinal": 0
+  }
+]

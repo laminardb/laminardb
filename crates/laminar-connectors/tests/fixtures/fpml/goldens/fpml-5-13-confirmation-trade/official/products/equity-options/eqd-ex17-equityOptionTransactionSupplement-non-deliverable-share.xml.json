@@ -1,0 +1,71 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "c3e6daa6bc40bd903da5d6bfbbbc3f3004d6c9b279581ce7212ec7f2dbb60591",
+    "documentation": {
+      "master_confirmation_date": "2006-01-20",
+      "master_confirmation_type": "ISDA2005EquityAsiaExcludingJapanInterdealer"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOptionTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/trade-id-1-0",
+              "value": "1"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/trade-id-1-0",
+              "value": "1"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-09-18"
+    },
+    "trade_ordinal": 0
+  }
+]

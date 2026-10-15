@@ -1,0 +1,91 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CS/2006/07/02/32-09",
+    "creation_timestamp": {
+      "local": "2006-07-02T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-07-02T16:38:00Z"
+    },
+    "document_root": "confirmationAgreed",
+    "document_sha256": "0984285785c77f12a8aab27c96a0f1ab9196cd710b9389c3797e59d48a52aa69",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "in_reply_to": "MS/2006/07/03/15-92",
+    "message_id": "MS/2006/04/07/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "row_locator": "/confirmationAgreed/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 8,
+    "trade_context": "confirmationAgreed",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "5678"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-10-17"
+    },
+    "trade_ordinal": 0
+  }
+]

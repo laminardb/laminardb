@@ -1,0 +1,243 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "value": "PRIM_450"
+          }
+        ],
+        "account_name": "PRIMARY_ACCOUNT",
+        "beneficiary_href": "party1",
+        "id": "primaryAct1"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "CROSS_560"
+          }
+        ],
+        "account_name": "CROSS_ACCOUNT",
+        "beneficiary_href": "party2",
+        "id": "crossAct1"
+      }
+    ],
+    "correlation_id": "1234556",
+    "creation_timestamp": {
+      "local": "2004-06-23T06:55:42",
+      "offset_minutes": 300,
+      "utc": "2004-06-23T01:55:42Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "f09d7cf3feffd0cf8f10ad9b4d7b5925a86176a8b4bb20d9417fc82b6f4bdee1",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:2W81Q117",
+    "message_id_scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/messageID",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "12345"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "67890"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "BGIAGB2L",
+    "sequence_number": 1,
+    "swap": {
+      "product": {},
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "1/1",
+            "fixed_rate_schedule": {
+              "initial_value": "0.010000000000000000"
+            },
+            "notional_schedule": {
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "1000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "Y",
+              "period_multiplier": 1,
+              "roll_convention": "22"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2005-02-22"
+            },
+            "first_period_start_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2005-02-20"
+            },
+            "id": "N10434",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2035-02-22"
+            }
+          },
+          "payer_party_href": "party1",
+          "payment_dates": {
+            "calculation_period_dates_href": "N10434",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "Y",
+              "period_multiplier": 30
+            }
+          },
+          "receiver_party_href": "party2"
+        },
+        {
+          "calculation": {
+            "compounding_method": "None",
+            "day_count_fraction": "1/1",
+            "inflation_rate_calculation": {
+              "fallback_bond_applicable": true,
+              "floating_rate_index": "UK-RPI",
+              "index_source": "UKRPI",
+              "inflation_lag": {
+                "period": "M",
+                "period_multiplier": 2
+              },
+              "interpolation_method": "LinearZeroYield",
+              "main_publication": "ONS"
+            },
+            "notional_schedule": {
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "1000000.000000000000000000"
+            },
+            "rate_calculation_type": "inflationRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "calculation_period_frequency": {
+              "period": "Y",
+              "period_multiplier": 30,
+              "roll_convention": "NONE"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2005-02-22"
+            },
+            "id": "N10277",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2035-02-22"
+            }
+          },
+          "payer_party_href": "party2",
+          "payment_dates": {
+            "calculation_period_dates_href": "N10277",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "Y",
+              "period_multiplier": 30
+            }
+          },
+          "receiver_party_href": "party1"
+        }
+      ]
+    },
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "12345"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "E2000098N10184"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "67890"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclays.com/swaps/trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-02-20"
+    },
+    "trade_ordinal": 0
+  }
+]

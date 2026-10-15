@@ -1,0 +1,79 @@
+[
+  {
+    "creation_timestamp": {
+      "local": "2011-02-04T16:42:16.100",
+      "offset_minutes": 0,
+      "utc": "2011-02-04T16:42:16.100Z"
+    },
+    "document_root": "executionAdvice",
+    "document_sha256": "9c25c5b10642a17bd9eb7c5c55d663901db522a799d67f693009fd826ff94588",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "1234",
+    "message_id_scheme": "http://www.abcbank.com/coding-scheme/abcbank/message-id",
+    "parties": [
+      {
+        "id": "ABC",
+        "party_ids": [
+          {
+            "scheme": "http://www.abcbank.com/coding-scheme/abcbank/party-id",
+            "value": "ID-86278"
+          }
+        ]
+      },
+      {
+        "id": "COUNTERPARTY",
+        "party_ids": [
+          {
+            "scheme": "http://www.abcbank.com/coding-scheme/abcbank/party-id",
+            "value": "ID-6320357"
+          }
+        ]
+      }
+    ],
+    "product_type": "instrumentTradeDetails",
+    "row_locator": "/executionAdvice/trade",
+    "sent_by": "FRONTSYSTEM",
+    "trade_context": "executionAdvice",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "ABC",
+          "party_ids": [
+            {
+              "scheme": "http://www.abcbank.com/coding-scheme/abcbank/party-id",
+              "value": "ID-86278"
+            }
+          ],
+          "version_ids": [
+            {
+              "scheme": "http://www.abcbank.com/coding-scheme/front-office/trade-id",
+              "value": "1234512345"
+            },
+            {
+              "scheme": "http://www.abcbank.com/coding-scheme/back-office/trade-id",
+              "value": "4853560"
+            }
+          ],
+          "versions": [
+            1,
+            1
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2016-08-25T13:00:00.100",
+            "offset_minutes": 0,
+            "utc": "2016-08-25T13:00:00.100Z"
+          },
+          "party_href": "ABC"
+        }
+      ],
+      "trade_date": "2016-08-25"
+    },
+    "trade_ordinal": 0
+  }
+]

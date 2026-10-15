@@ -1,0 +1,80 @@
+[
+  {
+    "correlation_id": "FX01234",
+    "creation_timestamp": {
+      "local": "2001-01-15T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-01-15T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "b40667c87ce4f4acda912bde7f32e6fe6bd22edc276439573c52fecb9b297045",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX109876",
+    "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "PARTYA"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ],
+        "party_name": "ABN Amro"
+      }
+    ],
+    "product_type": "fxOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABNANL2A",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-2-0",
+              "value": "IBFXO-0123456789"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-2-0",
+              "value": "IBFXO-0123456789"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-01-15"
+    },
+    "trade_ordinal": 0
+  }
+]

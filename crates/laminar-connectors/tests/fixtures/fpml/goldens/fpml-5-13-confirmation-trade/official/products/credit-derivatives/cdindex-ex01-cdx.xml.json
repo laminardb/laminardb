@@ -1,0 +1,73 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "e4c438e3d12f7967a63c39be28ec8520cc1110d1653aa3c6020f9bb3c03b0d86",
+    "documentation": {
+      "master_confirmation_date": "2004-10-18",
+      "master_confirmation_type": "DJ.CDX.NA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "HPFHU0OQ28E4N0NFVK49"
+          }
+        ],
+        "party_name": "New Bank, New York"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900O1WT2BXINL9612"
+          }
+        ],
+        "party_name": "Massive Bank, New York"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "HPFHU0OQ28E4N0NFVK49"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.newbank.com/trade-id",
+              "value": "CDX1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900O1WT2BXINL9612"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.massivebank.com/trade-id",
+              "value": "1234A6"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-01-24"
+    },
+    "trade_ordinal": 0
+  }
+]

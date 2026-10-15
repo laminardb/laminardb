@@ -1,0 +1,293 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "1fdd931b83375246afbd8b56e6e4e8b8e0bd712abbe10e2ac3a857b8b0d16f48",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "AAA International"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "AAA Capital Services Inc."
+      },
+      {
+        "id": "partyC",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900AYEI57S5UCED35"
+          }
+        ],
+        "party_name": "SWAPSWIRE"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "swap": {
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "InterestRateSwap"
+          }
+        ]
+      },
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "BUS/252",
+            "inflation_rate_calculation": {
+              "fallback_bond_applicable": false,
+              "floating_rate_index": "BRL-IPCA",
+              "index_source": "BZSXPRTA",
+              "inflation_lag": {
+                "period": "M",
+                "period_multiplier": -1
+              },
+              "interpolation_method": "None",
+              "spread_schedules": [
+                {
+                  "initial_value": "0.012900000000000000"
+                }
+              ]
+            },
+            "notional_schedule": {
+              "currency": "BRL",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "474045351.350000000000000000"
+            },
+            "rate_calculation_type": "inflationRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "calculation_period_frequency": {
+              "period": "T",
+              "period_multiplier": 1,
+              "roll_convention": "NONE"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2022-06-13"
+            },
+            "id": "floatingLegCalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "id": "floatingLegTerminationDate",
+              "unadjusted_date": "2025-07-01"
+            }
+          },
+          "id": "floatingLeg",
+          "non_deliverable_settlement": {
+            "reference_currency": "BRL",
+            "settlement_rate_option": "BRL.PTAX/BRL09"
+          },
+          "payer_party_href": "partyB",
+          "payment_dates": {
+            "calculation_period_dates_href": "floatingLegCalcPeriodDates",
+            "id": "floatingLegPaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "BRBD",
+                "USNY"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "payment_days_offset": {
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 1
+            },
+            "payment_frequency": {
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "partyA",
+          "reset_dates": {
+            "calculation_period_dates_href": "floatingLegCalcPeriodDates",
+            "fixing_dates": {
+              "business_centers": [
+                "BRBD"
+              ],
+              "business_day_convention": "PRECEDING",
+              "date_relative_to_href": "floatingLegResetDates",
+              "period": "D",
+              "period_multiplier": 0
+            },
+            "id": "floatingLegResetDates",
+            "reset_dates_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "reset_frequency": {
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "settlement_currency": "USD"
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "BUS/252",
+            "floating_rate_calculation": {
+              "floating_rate_index": "BRL-CDI",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index"
+            },
+            "notional_schedule": {
+              "currency": "BRL",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "474045351.350000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "calculation_period_frequency": {
+              "period": "T",
+              "period_multiplier": 1,
+              "roll_convention": "NONE"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2022-06-13"
+            },
+            "id": "floatingLeg2CalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "id": "floatingLeg2TerminationDate",
+              "unadjusted_date": "2025-07-01"
+            }
+          },
+          "id": "floatingLeg2",
+          "non_deliverable_settlement": {
+            "reference_currency": "BRL",
+            "settlement_rate_option": "BRL.PTAX/BRL09"
+          },
+          "payer_party_href": "partyA",
+          "payment_dates": {
+            "calculation_period_dates_href": "floatingLeg2CalcPeriodDates",
+            "id": "floatingLeg2PaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "BRBD",
+                "USNY"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "payment_days_offset": {
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 1
+            },
+            "payment_frequency": {
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "partyB",
+          "reset_dates": {
+            "calculation_period_dates_href": "floatingLeg2CalcPeriodDates",
+            "fixing_dates": {
+              "business_centers": [
+                "BRBD"
+              ],
+              "business_day_convention": "PRECEDING",
+              "date_relative_to_href": "floatingLeg2ResetDates",
+              "period": "D",
+              "period_multiplier": 0
+            },
+            "id": "floatingLeg2ResetDates",
+            "reset_dates_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "reset_frequency": {
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "settlement_currency": "USD"
+        }
+      ]
+    },
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party-a.com/swaps/trade-id",
+              "value": "43660124A"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900CPTY57S5UCBB52"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party-b.com/swaps/trade-id",
+              "value": "43660133A"
+            }
+          ]
+        },
+        {
+          "party_href": "partyC",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900AYEI57S5UCED35"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "187355008-2"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2022-06-13"
+    },
+    "trade_ordinal": 0
+  }
+]

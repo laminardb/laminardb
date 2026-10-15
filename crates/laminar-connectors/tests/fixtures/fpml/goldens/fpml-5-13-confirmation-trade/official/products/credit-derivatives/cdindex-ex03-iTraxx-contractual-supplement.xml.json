@@ -1,0 +1,93 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.partyA/accountId",
+            "value": "12345PartyA"
+          }
+        ],
+        "id": "accountParty1"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://partyB/accountId",
+            "value": "67899PartyB"
+          }
+        ],
+        "id": "accountParty2"
+      }
+    ],
+    "document_root": "dataDocument",
+    "document_sha256": "4a5be14496651d0a8b0a57af5eef3e1787dfaf6f3c1694e02062a11a0a98b9e2",
+    "documentation": {
+      "master_agreement_date": "2000-01-01",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900O1WT2BXINL9612"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300P7IVTDP12DEA19"
+          }
+        ],
+        "party_name": "Party B"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300P7IVTDP12DEA19"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/trade-id",
+              "value": "ITRAXX1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900O1WT2BXINL9612"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/trade-id",
+              "value": "1234B6"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-11-03"
+    },
+    "trade_ordinal": 0
+  }
+]
