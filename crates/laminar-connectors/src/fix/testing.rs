@@ -133,6 +133,30 @@ impl FixTestVenue {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())
             .map(|address| address.port())?;
+        Self::listen(
+            port,
+            store,
+            dictionary,
+            begin_string,
+            venue_comp_id,
+            client_comp_id,
+            settings,
+        )
+    }
+
+    /// As [`Self::start_with_settings`], listening on `port`.
+    ///
+    /// # Errors
+    /// Fails when the engine rejects the settings or cannot listen.
+    pub fn listen(
+        port: u16,
+        store: &Path,
+        dictionary: &Path,
+        begin_string: &str,
+        venue_comp_id: &str,
+        client_comp_id: &str,
+        settings: &[(&'static str, String)],
+    ) -> Result<Self, ConnectorError> {
         let mut defaults = vec![
             ("ConnectionType", "acceptor".to_string()),
             ("SocketAcceptPort", port.to_string()),

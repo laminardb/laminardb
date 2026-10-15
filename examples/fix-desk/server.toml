@@ -1,0 +1,8 @@
+[server]
+mode = "single"
+bind = "127.0.0.1:8080"
+delivery = "exactly_once"
+
+[checkpoint]
+url = "${DESK_CHECKPOINT_URL}"
+interval = "2s"
