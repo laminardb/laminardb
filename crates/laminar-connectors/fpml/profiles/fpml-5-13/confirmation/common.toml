@@ -161,6 +161,14 @@ fields = [
   { name = "business_centers_href", type = "utf8", path = "businessCentersReference/@href" },
 ]
 
+[structs.adjustable_date2]
+fields = [
+  { name = "unadjusted_date", type = "date32", path = "unadjustedDate" },
+  { name = "date_adjustments", type = "struct<business_day_adjustments>", path = "dateAdjustments" },
+  { name = "date_adjustments_href", type = "utf8", path = "dateAdjustmentsReference/@href" },
+  { name = "adjusted_date", type = "date32", path = "adjustedDate" },
+]
+
 [structs.adjustable_date]
 description = "Unadjusted date as supplied, its adjustments, and any supplied adjusted date"
 fields = [
@@ -209,6 +217,25 @@ fields = [
   { name = "rate_source_page", type = "utf8", path = "primaryRateSource/rateSourcePage" },
   { name = "secondary_rate_source", type = "utf8", path = "secondaryRateSource/rateSource" },
   { name = "fixing_time", type = "struct<business_center_time>", path = "fixingTime" },
+]
+
+[structs.basic_quotation]
+description = "A quoted value with its measure, units, side, and source (BasicQuotation)"
+fields = [
+  { name = "value", type = "decimal", path = "value" },
+  { name = "measure_type", type = "utf8", path = "measureType" },
+  { name = "quote_units", type = "utf8", path = "quoteUnits" },
+  { name = "side", type = "utf8", path = "side" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "currency_type", type = "utf8", path = "currencyType" },
+  { name = "timing", type = "utf8", path = "timing" },
+  { name = "business_center", type = "utf8", path = "businessCenter" },
+  { name = "exchange_id", type = "utf8", path = "exchangeId" },
+  { name = "pricing_model", type = "utf8", path = "pricingModel" },
+  { name = "time", type = "datetime", path = "time" },
+  { name = "valuation_date", type = "date32", path = "valuationDate" },
+  { name = "expiry_time", type = "datetime", path = "expiryTime" },
+  { name = "cashflow_type", type = "utf8", path = "cashflowType" },
 ]
 
 [structs.payment]

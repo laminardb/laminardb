@@ -1,0 +1,123 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "091fffd5a3c0976f166cae497eda0001ae90d757497b1849608b27391cecd7db",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 1"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 2"
+          }
+        ]
+      }
+    ],
+    "product_type": "repo",
+    "repo": {
+      "collateral_assets": [
+        {
+          "asset_type": "bond",
+          "id": "XSJKL",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN-1-0",
+              "value": "JKL Corp Bond"
+            }
+          ]
+        }
+      ],
+      "day_count_fraction": "ACT/ACT.ICMA",
+      "initial_margin_type": "Cash",
+      "near_leg": {
+        "buyer_party_href": "Party1",
+        "collateral": [
+          {
+            "accruals": "9.250000000000000000",
+            "asset_href": "XSJKL",
+            "clean_price": "97.856943700000000000",
+            "dirty_price": "107.106943700000000000",
+            "nominal_amount": {
+              "amount": "1000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "seller_party_href": "Party2",
+        "settlement_amount": {
+          "amount": "782855.550000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2014-11-03"
+          }
+        }
+      },
+      "open_term": {
+        "calling_party": "AsDefinedInMasterAgreement"
+      },
+      "product": {},
+      "rate": {
+        "fixed_rate_schedule": {
+          "initial_value": "0.850000000000000000"
+        }
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "Party19235"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 2"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "Party22000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-11-19"
+    },
+    "trade_ordinal": 0
+  }
+]

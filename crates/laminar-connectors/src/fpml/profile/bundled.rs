@@ -34,6 +34,14 @@ pub const BUNDLED_PROFILES: &[(&str, &str)] = &[
         "fpml-5-13-confirmation-equity-volatility",
         "fpml-5-13/confirmation/trade-equity-volatility.toml",
     ),
+    (
+        "fpml-5-13-confirmation-securities",
+        "fpml-5-13/confirmation/trade-securities.toml",
+    ),
+    (
+        "fpml-5-13-confirmation-cross-asset",
+        "fpml-5-13/confirmation/trade-cross-asset.toml",
+    ),
 ];
 
 macro_rules! profile_files {
@@ -49,17 +57,21 @@ const FILES: &[(&str, &str)] = profile_files!(
     "fpml-5-13/confirmation/options.toml",
     "fpml-5-13/confirmation/products/commodity.toml",
     "fpml-5-13/confirmation/products/credit.toml",
+    "fpml-5-13/confirmation/products/cross-asset.toml",
     "fpml-5-13/confirmation/products/equity.toml",
     "fpml-5-13/confirmation/products/fx.toml",
     "fpml-5-13/confirmation/products/rates.toml",
+    "fpml-5-13/confirmation/products/securities.toml",
     "fpml-5-13/confirmation/trade-columns.toml",
     "fpml-5-13/confirmation/trade-commodity.toml",
     "fpml-5-13/confirmation/trade-credit.toml",
+    "fpml-5-13/confirmation/trade-cross-asset.toml",
     "fpml-5-13/confirmation/trade-equity-options.toml",
     "fpml-5-13/confirmation/trade-equity-swaps.toml",
     "fpml-5-13/confirmation/trade-equity-volatility.toml",
     "fpml-5-13/confirmation/trade-fx.toml",
     "fpml-5-13/confirmation/trade-rates.toml",
+    "fpml-5-13/confirmation/trade-securities.toml",
     "fpml-5-13/confirmation/trade.toml",
 );
 

@@ -329,19 +329,29 @@ notes = "Same FxPerformanceSwap mapping as fxVarianceSwap"
 element = "genericProduct"
 type = "GenericProduct"
 asset_class = "cross-asset"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-cross-asset"
+column = "generic_product"
+synthetic = ["generic-product.xml"]
+notes = "Multi-leg flag, buyer/seller or counterparties, premium, effective/expiration/termination dates, underlyers (rate, exchange rate, asset, reference entity, index, energy product, with parties and day count), notionals, commodity, equity and option attributes, payment and reset frequencies by underlyer, settlement currency and type, additional payments"
 
 [[product]]
 element = "instrumentTradeDetails"
 type = "InstrumentTradeDetails"
 asset_class = "securities"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-securities"
+column = "instrument_trade_details"
+notes = "Buyer/seller, underlying asset (any underlyingAsset member), quantity or nominal, quotes, coupon start and ex-dividend dates, traded flat, net and gross principal; instances inside business-event payloads are outside trade rows"
 
 [[product]]
 element = "repo"
 type = "Repo"
 asset_class = "securities-financing"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-securities"
+column = "repo"
+notes = "Fixed or floating rate and day count, term or open duration with extension and call terms, initial margin, near and far legs (buyer/seller, settlement date and amount, FX rate, delivery, collateral valuations, repo interest), payment frequency, collateral bonds, convertibles or equities, generic security or tri-party, collateral arrangement"
 
 [[product]]
 element = "returnSwap"
@@ -356,19 +366,29 @@ notes = "Buyer/seller, leg types, return legs (parties, dates, underlyer, settle
 element = "securityLending"
 type = "SecurityLending"
 asset_class = "securities-financing"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-securities"
+column = "security_lending"
+notes = "Lender/borrower, principal security valuation, initiation and termination settlement, duration with extension and call terms, fee or rebate rate and minimum fee, day count, dividend rate, minimum billing, collateral type or tri-party, margin ratio or haircut, collateral currency and FX rate, arrangements"
 
 [[product]]
 element = "standardProduct"
 type = "StandardProduct"
 asset_class = "cross-asset"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-cross-asset"
+column = "standard_product"
+synthetic = ["standard-product.xml"]
+notes = "Product ids and types, notional, quotes (value, measure, side, currency, time, valuation date)"
 
 [[product]]
 element = "strategy"
 type = "Strategy"
 asset_class = "cross-asset"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-cross-asset"
+column = "strategy"
+notes = "Strategy product model, component identifiers (trade identifier and component hrefs), premium product href, and each component's product type, id, product model and parties; component economics are typed by the component's asset-class profile when traded alone, not within the strategy row"
 
 [[product]]
 element = "swap"

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a fixed-float swap reported as a
+     genericProduct with two underlyers, a notional, and frequencies, written because the FpML
+     5.13 corpus has no genericProduct example. -->
+<requestConfirmation xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-GEN-0001</messageId>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sentBy>
+    <creationTimestamp>2026-05-11T14:00:00Z</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">SYN-GEN</correlationId>
+  <sequenceNumber>1</sequenceNumber>
+  <trade>
+    <tradeHeader>
+      <partyTradeIdentifier>
+        <partyReference href="party1" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">GEN-3001</tradeId>
+      </partyTradeIdentifier>
+      <partyTradeIdentifier>
+        <partyReference href="party2" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">GEN-3001</tradeId>
+      </partyTradeIdentifier>
+      <tradeDate>2026-05-11</tradeDate>
+    </tradeHeader>
+    <genericProduct>
+      <primaryAssetClass>InterestRate</primaryAssetClass>
+      <productType>InterestRate:IRSwap:FixedFloat</productType>
+      <multiLeg>true</multiLeg>
+      <counterpartyReference href="party1" />
+      <counterpartyReference href="party2" />
+      <effectiveDate>
+        <unadjustedDate>2026-05-13</unadjustedDate>
+        <dateAdjustments>
+          <businessDayConvention>MODFOLLOWING</businessDayConvention>
+          <businessCenters>
+            <businessCenter>USNY</businessCenter>
+          </businessCenters>
+        </dateAdjustments>
+      </effectiveDate>
+      <terminationDate>
+        <unadjustedDate>2031-05-13</unadjustedDate>
+        <dateAdjustments>
+          <businessDayConvention>MODFOLLOWING</businessDayConvention>
+          <businessCenters>
+            <businessCenter>USNY</businessCenter>
+          </businessCenters>
+        </dateAdjustments>
+      </terminationDate>
+      <underlyer id="fixedUnderlyer">
+        <fixedRate>
+          <initialValue>0.0365</initialValue>
+        </fixedRate>
+        <payerPartyReference href="party1" />
+        <receiverPartyReference href="party2" />
+        <dayCountFraction>30/360</dayCountFraction>
+      </underlyer>
+      <underlyer id="floatingUnderlyer">
+        <floatingRate>
+          <floatingRateIndex>USD-SOFR-OIS Compound</floatingRateIndex>
+        </floatingRate>
+        <payerPartyReference href="party2" />
+        <receiverPartyReference href="party1" />
+        <dayCountFraction>ACT/360</dayCountFraction>
+      </underlyer>
+      <notional>
+        <currency>USD</currency>
+        <amount>50000000</amount>
+      </notional>
+      <paymentFrequency>
+        <periodMultiplier>1</periodMultiplier>
+        <period>Y</period>
+        <underlyerReference href="fixedUnderlyer" />
+      </paymentFrequency>
+      <paymentFrequency>
+        <periodMultiplier>1</periodMultiplier>
+        <period>Y</period>
+        <underlyerReference href="floatingUnderlyer" />
+      </paymentFrequency>
+      <resetFrequency>
+        <periodMultiplier>1</periodMultiplier>
+        <period>D</period>
+        <underlyerReference href="floatingUnderlyer" />
+      </resetFrequency>
+      <settlementCurrency>USD</settlementCurrency>
+      <settlementType>Cash</settlementType>
+    </genericProduct>
+  </trade>
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+  </party>
+</requestConfirmation>

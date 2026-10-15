@@ -1,0 +1,164 @@
+[
+  {
+    "correlation_id": "SYN-GEN",
+    "creation_timestamp": {
+      "local": "2026-05-11T14:00:00",
+      "offset_minutes": 0,
+      "utc": "2026-05-11T14:00:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "e2847474333a66ee12acc94271125c60b218a66ef6064ff9671f6099a60f2463",
+    "fpml_version": "5-13",
+    "generic_product": {
+      "counterparty_hrefs": [
+        "party1",
+        "party2"
+      ],
+      "effective_date": {
+        "date_adjustments": {
+          "business_centers": [
+            "USNY"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "unadjusted_date": "2026-05-13"
+      },
+      "multi_leg": true,
+      "notionals": [
+        {
+          "amount": "50000000.000000000000000000",
+          "currency": "USD"
+        }
+      ],
+      "payment_frequencies": [
+        {
+          "period": "Y",
+          "period_multiplier": 1,
+          "underlyer_href": "fixedUnderlyer"
+        },
+        {
+          "period": "Y",
+          "period_multiplier": 1,
+          "underlyer_href": "floatingUnderlyer"
+        }
+      ],
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "InterestRate"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "InterestRate:IRSwap:FixedFloat"
+          }
+        ]
+      },
+      "reset_frequencies": [
+        {
+          "period": "D",
+          "period_multiplier": 1,
+          "underlyer_href": "floatingUnderlyer"
+        }
+      ],
+      "settlement_currencies": [
+        "USD"
+      ],
+      "settlement_type": "Cash",
+      "termination_date": {
+        "date_adjustments": {
+          "business_centers": [
+            "USNY"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "unadjusted_date": "2031-05-13"
+      },
+      "underlyers": [
+        {
+          "day_count_fraction": "30/360",
+          "fixed_rate": {
+            "initial_value": "0.036500000000000000"
+          },
+          "id": "fixedUnderlyer",
+          "payer_party_href": "party1",
+          "receiver_party_href": "party2",
+          "underlyer_type": "fixedRate"
+        },
+        {
+          "day_count_fraction": "ACT/360",
+          "floating_rate_index": "USD-SOFR-OIS Compound",
+          "id": "floatingUnderlyer",
+          "payer_party_href": "party2",
+          "receiver_party_href": "party1",
+          "underlyer_type": "floatingRate"
+        }
+      ]
+    },
+    "is_correction": false,
+    "message_id": "SYN-GEN-0001",
+    "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "product_type": "genericProduct",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYA",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYA"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "GEN-3001"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "GEN-3001"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2026-05-11"
+    },
+    "trade_ordinal": 0
+  }
+]

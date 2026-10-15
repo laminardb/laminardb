@@ -1,0 +1,176 @@
+# Securities and securities financing: repo (near and far legs, collateral, rate, call and
+# extension terms, tri-party), securityLending (principal, fee or rebate, collateral provisions),
+# and instrumentTradeDetails (a cash trade in any underlying asset with quantity, quotes, and
+# principal).
+include = ["../common.toml", "../assets.toml", "rates.toml"]
+
+[structs.security]
+description = "A security identified by instrument ids (GenericSecurity)"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "instrument_ids", type = "list<struct<instrument_id>>", path = "instrumentId" },
+  { name = "instrument_types", type = "list<utf8>", path = "instrumentType" },
+  { name = "description", type = "utf8", path = "description" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "issuer_party_href", type = "utf8", path = "issuerPartyReference/@href" },
+  { name = "credit_qualities", type = "list<utf8>", path = "creditQuality" },
+  { name = "maturity", type = "date32", path = "maturity" },
+]
+
+[structs.security_valuation]
+fields = [
+  { name = "security", type = "struct<security>", path = "security" },
+  { name = "nominal_amount", type = "struct<money>", path = "nominalAmount" },
+  { name = "quantity", type = "decimal", path = "quantity" },
+  { name = "clean_price", type = "decimal", path = "cleanPrice" },
+  { name = "accruals", type = "decimal", path = "accruals" },
+  { name = "dirty_price", type = "decimal", path = "dirtyPrice" },
+  { name = "yield_to_maturity", type = "decimal", path = "yieldToMaturity" },
+  { name = "all_in_price", type = "decimal", path = "allInPrice" },
+  { name = "unit_price", type = "struct<money>", path = "unitPrice" },
+  { name = "quote_units", type = "utf8", path = "quoteUnits" },
+  { name = "valuation_amount", type = "struct<money>", path = "valuationAmount" },
+]
+
+[structs.collateral_valuation]
+fields = [
+  { name = "asset_href", type = "utf8", path = "assetReference/@href" },
+  { name = "nominal_amount", type = "struct<money>", path = "nominalAmount" },
+  { name = "quantity", type = "decimal", path = "quantity" },
+  { name = "clean_price", type = "decimal", path = "cleanPrice" },
+  { name = "accruals", type = "decimal", path = "accruals" },
+  { name = "dirty_price", type = "decimal", path = "dirtyPrice" },
+  { name = "yield_to_maturity", type = "decimal", path = "yieldToMaturity" },
+  { name = "all_in_price", type = "decimal", path = "allInPrice" },
+  { name = "accruals_amount", type = "struct<money>", path = "accrualsAmount" },
+  { name = "number_of_units", type = "decimal", path = "numberOfUnits" },
+  { name = "unit_price", type = "struct<money>", path = "unitPrice" },
+]
+
+[structs.fx_conversion_rate]
+fields = [
+  { name = "currency1", type = "utf8", path = "quotedCurrencyPair/currency1" },
+  { name = "currency2", type = "utf8", path = "quotedCurrencyPair/currency2" },
+  { name = "quote_basis", type = "utf8", path = "quotedCurrencyPair/quoteBasis" },
+  { name = "rate", type = "decimal", path = "rate" },
+]
+
+[structs.repo_leg]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "settlement_date", type = "struct<adjustable_or_relative_date>", path = "settlementDate" },
+  { name = "settlement_amount", type = "struct<money>", path = "settlementAmount" },
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "fx_rate", type = "struct<fx_conversion_rate>", path = "fxRate" },
+  { name = "delivery_method", type = "utf8", path = "deliveryMethod" },
+  { name = "delivery_date", type = "struct<adjustable_or_relative_date>", path = "deliveryDate" },
+  { name = "collateral", type = "list<struct<collateral_valuation>>", path = "collateral" },
+  { name = "repo_interest", type = "decimal", path = "repoInterest" },
+]
+
+[structs.rate_calculation]
+description = "Fixed rate schedule or floating rate calculation, with reset frequency"
+fields = [
+  { name = "fixed_rate_schedule", type = "struct<schedule>", path = "fixedRateSchedule" },
+  { name = "floating_rate_calculation", type = "struct<floating_rate_calculation>", path = "floatingRateCalculation" },
+  { name = "reset_frequency", type = "struct<frequency>", path = "resetFrequency" },
+]
+
+[structs.party_notice_period]
+fields = [
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "notice_period", type = "struct<relative_date_offset>", path = "noticePeriod" },
+]
+
+[structs.open_term]
+description = "Extension or call terms of an open-ended financing (ExtensionPeriod and call terms)"
+fields = [
+  { name = "extension_style", type = "utf8", path = "extensionStyle" },
+  { name = "extension_period", type = "struct<relative_date_offset>", path = "extensionPeriod" },
+  { name = "calling_party", type = "utf8", path = "callingParty" },
+  { name = "call_date", type = "struct<adjustable_or_relative_date>", path = "callDate" },
+  { name = "notice_period", type = "struct<relative_date_offset>", path = "noticePeriod" },
+  { name = "party_notice_periods", type = "list<struct<party_notice_period>>", path = "partyNoticePeriod" },
+]
+
+[structs.tri_party]
+fields = [
+  { name = "agent_party_href", type = "utf8", path = "triPartyAgent/@href" },
+  { name = "collateral_profile", type = "utf8", path = "collateralProfile" },
+  { name = "collateral_type", type = "utf8", path = "collateralType" },
+  { name = "delivery_by_value", type = "bool", path = "deliveryByValue" },
+]
+
+# ── Products ─────────────────────────────────────────────────────────────────
+
+[structs.repo]
+description = "Repurchase agreement: rate, term, legs, collateral"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "rate", type = "struct<rate_calculation>", path = "." },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "duration", type = "utf8", path = "duration" },
+  { name = "open_term", type = "struct<open_term>", path = "." },
+  { name = "earliest_call_date", type = "struct<adjustable_date>", path = "earliestCallDate" },
+  { name = "initial_margin_type", type = "utf8", path = "initialMargin/marginType" },
+  { name = "initial_margin_threshold", type = "struct<money>", path = "initialMargin/marginThreshold" },
+  { name = "initial_margin_minimum_transfer", type = "struct<money>", path = "initialMargin/minimumTransferAmount" },
+  { name = "near_leg", type = "struct<repo_leg>", path = "nearLeg" },
+  { name = "far_leg", type = "struct<repo_leg>", path = "farLeg" },
+  { name = "payment_frequency", type = "struct<frequency>", path = "paymentFrequency" },
+  { name = "collateral_assets", type = "list<struct<bond_asset>>", path = "bond | convertibleBond | equity" },
+  { name = "security", type = "struct<security>", path = "security" },
+  { name = "tri_party", type = "struct<tri_party>", path = "triParty" },
+  { name = "general_collateral", type = "bool", path = "generalCollateral" },
+  { name = "collateral_arrangement", type = "utf8", path = "collateralArrangement" },
+  { name = "eligible_for_rehypothecation", type = "bool", path = "eligibleForRehypothecation" },
+]
+
+[structs.security_lending]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "lender_party_href", type = "utf8", path = "lenderPartyReference/@href" },
+  { name = "borrower_party_href", type = "utf8", path = "borrowerPartyReference/@href" },
+  { name = "principal", type = "struct<security_valuation>", path = "principal" },
+  { name = "initiation_settlement_date", type = "date32", path = "initiation/settlementDate" },
+  { name = "initiation_delivery_method", type = "utf8", path = "initiation/deliveryMethod" },
+  { name = "termination_settlement_date", type = "date32", path = "termination/settlementDate" },
+  { name = "termination_delivery_method", type = "utf8", path = "termination/deliveryMethod" },
+  { name = "duration", type = "utf8", path = "duration" },
+  { name = "open_term", type = "struct<open_term>", path = "." },
+  { name = "fee", type = "struct<rate_calculation>", path = "fee" },
+  { name = "minimum_fee", type = "struct<money>", path = "fee/minimumFee" },
+  { name = "rebate", type = "struct<rate_calculation>", path = "rebate" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "dividend_rate", type = "decimal", path = "dividendRate" },
+  { name = "minimum_billing_amount", type = "struct<money>", path = "minimumBillingAmount" },
+  { name = "rebate_payment_frequency", type = "struct<frequency>", path = "rebatePaymentFrequency" },
+  { name = "collateral_type", type = "utf8", path = "collateralProvisions/collateralType" },
+  { name = "collateral_tri_party", type = "struct<tri_party>", path = "collateralProvisions/triParty" },
+  { name = "margin_ratio", type = "decimal", path = "collateralProvisions/marginRatio" },
+  { name = "haircut", type = "decimal", path = "collateralProvisions/haircut" },
+  { name = "collateral_currency", type = "utf8", path = "collateralProvisions/collateralCurrency" },
+  { name = "collateral_fx_rate", type = "struct<fx_conversion_rate>", path = "collateralProvisions/fxRate" },
+  { name = "collateral_arrangement", type = "utf8", path = "collateralProvisions/collateralArrangement" },
+  { name = "exclusive_arrangements", type = "bool", path = "collateralProvisions/exclusiveArrangements" },
+  { name = "eligible_for_rehypothecation", type = "bool", path = "collateralProvisions/eligibleForRehypothecation" },
+]
+
+[structs.instrument_trade_details]
+description = "A cash trade in an underlying asset"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "underlying_asset", type = "struct<asset>", path = "{underlying_asset}" },
+  { name = "quantity", type = "decimal", path = "quantity/number" },
+  { name = "nominal", type = "struct<money>", path = "quantity/nominal" },
+  { name = "quotes", type = "list<struct<basic_quotation>>", path = "pricing/quote" },
+  { name = "coupon_start_date", type = "date32", path = "pricing/couponStartDate" },
+  { name = "ex_dividend_date", type = "date32", path = "pricing/exDividendDate" },
+  { name = "traded_flat_of_accrued", type = "bool", path = "pricing/tradedFlatOfAccrued" },
+  { name = "principal_net", type = "decimal", path = "principal/principalAmount/net" },
+  { name = "principal_gross", type = "decimal", path = "principal/principalAmount/gross" },
+]

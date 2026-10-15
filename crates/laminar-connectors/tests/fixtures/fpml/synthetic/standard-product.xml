@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a standardized index CDS identified by its
+     product id, with a notional and a quoted spread, written because the FpML 5.13 corpus has no
+     standardProduct example (FpML 5.13 deprecates standardProduct but still admits it). -->
+<requestConfirmation xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-STD-0001</messageId>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sentBy>
+    <creationTimestamp>2026-06-22T08:45:30.125-04:00</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">SYN-STD</correlationId>
+  <sequenceNumber>1</sequenceNumber>
+  <trade>
+    <tradeHeader>
+      <partyTradeIdentifier>
+        <partyReference href="party1" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">STD-4001</tradeId>
+      </partyTradeIdentifier>
+      <partyTradeIdentifier>
+        <partyReference href="party2" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">STD-4001</tradeId>
+      </partyTradeIdentifier>
+      <tradeDate>2026-06-22</tradeDate>
+    </tradeHeader>
+    <standardProduct>
+      <primaryAssetClass>Credit</primaryAssetClass>
+      <productType>Credit:Index:CDX</productType>
+      <productId productIdScheme="http://www.example.com/coding-scheme/product-id">CDX.NA.IG.46-5Y</productId>
+      <notional>
+        <currency>USD</currency>
+        <amount>25000000</amount>
+      </notional>
+      <quote>
+        <value>0.0052</value>
+        <measureType>ParSpread</measureType>
+        <side>Mid</side>
+        <currency>USD</currency>
+        <time>2026-06-22T08:45:00-04:00</time>
+        <valuationDate>2026-06-22</valuationDate>
+      </quote>
+    </standardProduct>
+  </trade>
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+  </party>
+</requestConfirmation>

@@ -521,3 +521,5 @@ official/products/repo/sbl-ex02-term-fx-rate-non-cash.xml
 official/products/securities/sec-ex001-trade-execution-future.xml
 official/products/securities/sec-ex002-trade-execution-exchange-traded-option.xml
 synthetic/equity-accumulator.xml
+synthetic/generic-product.xml
+synthetic/standard-product.xml

@@ -1,0 +1,35 @@
+# One row per FpML securities or securities financing trade (repo, securityLending, instrumentTradeDetails) with the shared trade-level columns and the
+# product's typed economics. Exactly one product struct is non-null per row; `product_type` names
+# it. Trades of other asset classes are not rows of this profile; the
+# fpml-5-13-confirmation-trade profile has every trade.
+include = ["trade-columns.toml", "products/securities.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-securities"
+version = 1
+description = "FpML 5.13 confirmation view: one row per securities or securities financing trade with typed economics"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/trade[tradeHeader][{securities_product}]"
+
+[sets]
+securities_product = [
+  "repo",
+  "securityLending",
+  "instrumentTradeDetails",
+]
+
+[[columns]]
+name = "repo"
+type = "struct<repo>"
+path = "repo"
+
+[[columns]]
+name = "security_lending"
+type = "struct<security_lending>"
+path = "securityLending"
+
+[[columns]]
+name = "instrument_trade_details"
+type = "struct<instrument_trade_details>"
+path = "instrumentTradeDetails"

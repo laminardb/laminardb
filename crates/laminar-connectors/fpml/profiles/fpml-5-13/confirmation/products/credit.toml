@@ -16,14 +16,6 @@ fields = [
   { name = "scheme", type = "utf8", path = "@entityIdScheme" },
 ]
 
-[structs.adjustable_date2]
-fields = [
-  { name = "unadjusted_date", type = "date32", path = "unadjustedDate" },
-  { name = "date_adjustments", type = "struct<business_day_adjustments>", path = "dateAdjustments" },
-  { name = "date_adjustments_href", type = "utf8", path = "dateAdjustmentsReference/@href" },
-  { name = "adjusted_date", type = "date32", path = "adjustedDate" },
-]
-
 [structs.reference_obligation]
 fields = [
   { name = "asset", type = "struct<obligation_asset>", path = "bond | convertibleBond | mortgage | loan" },

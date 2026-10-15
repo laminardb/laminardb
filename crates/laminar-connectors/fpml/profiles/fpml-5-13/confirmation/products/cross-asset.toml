@@ -1,0 +1,135 @@
+# Cross-asset products: genericProduct (a product described by its main dates, underlyers,
+# notionals, and option and commodity attributes rather than a full model), standardProduct
+# (a standardized product identified by its product ids, with notional and quotes), and
+# strategy. A strategy row types the strategy itself and identifies each component product by
+# element name, id, product model, and parties; component economics are typed by the component's
+# own asset-class profile when the component is traded on its own.
+include = ["../common.toml", "../assets.toml"]
+
+[sets]
+generic_underlyer = [
+  "floatingRate", "fixedRate", "exchangeRate", "quotedCurrencyPair", "referenceEntity",
+  "indexReferenceInformation", "gas", "oil", "coal", "electricity",
+]
+generic_commodity = ["gas", "oil", "coal", "electricity"]
+
+[structs.cashflow_notional]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "units", type = "utf8", path = "units" },
+  { name = "amount", type = "decimal", path = "amount" },
+]
+
+[structs.generic_underlyer]
+description = "One underlyer: a rate, exchange rate, asset, reference entity, index, or energy product"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "underlyer_type", type = "utf8", path = "{generic_underlyer}/#name | {underlying_asset}/#name" },
+  { name = "floating_rate_index", type = "utf8", path = "floatingRate/floatingRateIndex" },
+  { name = "floating_rate_index_tenor", type = "struct<period>", path = "floatingRate/indexTenor" },
+  { name = "fixed_rate", type = "struct<schedule>", path = "fixedRate" },
+  { name = "exchange_rate_currency1", type = "utf8", path = "exchangeRate/quotedCurrencyPair/currency1" },
+  { name = "exchange_rate_currency2", type = "utf8", path = "exchangeRate/quotedCurrencyPair/currency2" },
+  { name = "currency1", type = "utf8", path = "quotedCurrencyPair/currency1" },
+  { name = "currency2", type = "utf8", path = "quotedCurrencyPair/currency2" },
+  { name = "quote_basis", type = "utf8", path = "quotedCurrencyPair/quoteBasis" },
+  { name = "asset", type = "struct<asset>", path = "{underlying_asset}" },
+  { name = "reference_entity_name", type = "utf8", path = "referenceEntity/entityName" },
+  { name = "reference_entity_ids", type = "list<utf8>", path = "referenceEntity/entityId" },
+  { name = "index_name", type = "utf8", path = "indexReferenceInformation/indexName" },
+  { name = "index_series", type = "int64", path = "indexReferenceInformation/indexSeries" },
+  { name = "commodity_type", type = "utf8", path = "{generic_commodity}/type" },
+  { name = "averaging_method", type = "utf8", path = "averagingMethod" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+]
+
+[structs.generic_frequency]
+description = "Payment or reset frequency of one underlyer"
+fields = [
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "underlyer_href", type = "utf8", path = "underlyerReference/@href" },
+]
+
+[structs.generic_strike]
+fields = [
+  { name = "strike_price", type = "decimal", path = "strikePrice" },
+  { name = "strike_percentage", type = "decimal", path = "strikePercentage" },
+  { name = "currency", type = "utf8", path = "currency" },
+]
+
+[structs.strategy_component]
+fields = [
+  { name = "trade_identifier_hrefs", type = "list<utf8>", path = "tradeIdentifierReference/@href" },
+  { name = "component_href", type = "utf8", path = "componentReference/@href" },
+]
+
+[structs.component_product]
+description = "A strategy component: its element name, id, product model, and parties"
+fields = [
+  { name = "product_type", type = "utf8", path = "#name" },
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+]
+
+# ── Products ─────────────────────────────────────────────────────────────────
+
+[structs.generic_product]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "multi_leg", type = "bool", path = "multiLeg" },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "counterparty_hrefs", type = "list<utf8>", path = "counterpartyReference/@href" },
+  { name = "premium", type = "struct<simple_payment>", path = "premium" },
+  { name = "effective_date", type = "struct<adjustable_date2>", path = "effectiveDate" },
+  { name = "expiration_date", type = "struct<adjustable_date2>", path = "expirationDate" },
+  { name = "termination_date", type = "struct<adjustable_date2>", path = "terminationDate" },
+  { name = "underlyers", type = "list<struct<generic_underlyer>>", path = "underlyer" },
+  { name = "notionals", type = "list<struct<cashflow_notional>>", path = "notional" },
+  { name = "commodity_grades", type = "list<utf8>", path = "grade" },
+  { name = "load_type", type = "utf8", path = "loadType" },
+  { name = "commodity_quantity", type = "decimal", path = "quantity" },
+  { name = "commodity_quantity_frequency", type = "utf8", path = "quantityFrequency" },
+  { name = "commodity_fixed_price", type = "decimal", path = "fixedPrice/price" },
+  { name = "commodity_fixed_price_currency", type = "utf8", path = "fixedPrice/priceCurrency" },
+  { name = "commodity_fixed_price_unit", type = "utf8", path = "fixedPrice/priceUnit" },
+  { name = "interconnection_point", type = "utf8", path = "interconnectionPoint" },
+  { name = "option_entitlement", type = "decimal", path = "optionEntitlement" },
+  { name = "number_of_options", type = "decimal", path = "numberOfOptions" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "commencement_date", type = "struct<adjustable_date2>", path = "commencementDate" },
+  { name = "exercise_style", type = "utf8", path = "exerciseStyle" },
+  { name = "strikes", type = "list<struct<generic_strike>>", path = "strike" },
+  { name = "features", type = "list<utf8>", path = "feature" },
+  { name = "payment_frequencies", type = "list<struct<generic_frequency>>", path = "paymentFrequency" },
+  { name = "reset_frequencies", type = "list<struct<generic_frequency>>", path = "resetFrequency" },
+  { name = "settlement_currencies", type = "list<utf8>", path = "settlementCurrency" },
+  { name = "settlement_type", type = "utf8", path = "settlementType" },
+  { name = "additional_payments", type = "list<struct<payment>>", path = "additionalPayment" },
+]
+
+[structs.standard_product]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "notional", type = "struct<cashflow_notional>", path = "notional" },
+  { name = "quotes", type = "list<struct<basic_quotation>>", path = "quote" },
+]
+
+[structs.strategy]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "component_identifiers", type = "list<struct<strategy_component>>", path = "strategyComponentIdentifier" },
+  { name = "premium_product_href", type = "utf8", path = "premiumProductReference/@href" },
+  { name = "components", type = "list<struct<component_product>>", path = "{product}" },
+]

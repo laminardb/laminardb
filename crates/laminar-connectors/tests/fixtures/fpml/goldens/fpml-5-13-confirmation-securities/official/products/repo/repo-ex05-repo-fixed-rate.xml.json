@@ -1,0 +1,153 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "0a417b7280501f73c4a23818dba0f9983c026d6e08ae677f311c8fefcc797445",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 1"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 2"
+          }
+        ]
+      }
+    ],
+    "product_type": "repo",
+    "repo": {
+      "collateral_assets": [
+        {
+          "asset_type": "bond",
+          "currency": "CHF",
+          "description": "PLC",
+          "id": "XYZ",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN-1-0",
+              "value": "CH"
+            }
+          ],
+          "maturity": "2015-08-05"
+        }
+      ],
+      "day_count_fraction": "ACT/ACT.ICMA",
+      "duration": "Term",
+      "far_leg": {
+        "buyer_party_href": "Party2",
+        "collateral": [
+          {
+            "asset_href": "XYZ",
+            "clean_price": "97.220000000000000000",
+            "nominal_amount": {
+              "amount": "10500000.000000000000000000",
+              "currency": "CHF",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "id": "forwardLeg",
+        "seller_party_href": "Party1",
+        "settlement_amount": {
+          "amount": "445117713.450000000000000000",
+          "currency": "RUB",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2014-11-27"
+          }
+        }
+      },
+      "initial_margin_type": "Cash",
+      "near_leg": {
+        "buyer_party_href": "Party1",
+        "collateral": [
+          {
+            "asset_href": "XYZ",
+            "clean_price": "97.220000000000000000",
+            "nominal_amount": {
+              "amount": "10500000.000000000000000000",
+              "currency": "CHF",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "seller_party_href": "Party2",
+        "settlement_amount": {
+          "amount": "444176424.530000000000000000",
+          "currency": "RUB",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2014-11-20"
+          }
+        }
+      },
+      "open_term": {},
+      "product": {},
+      "rate": {
+        "fixed_rate_schedule": {
+          "initial_value": "0.110500000000000000"
+        }
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "Party19235"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 2"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "Party22000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-11-20"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,158 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "d36b1656ee4a26516cdc1ae7c4550dcbffcd6f57fafcea6a138a361f5c6a4ee9",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 1"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 2"
+          }
+        ]
+      }
+    ],
+    "product_type": "repo",
+    "repo": {
+      "collateral_assets": [
+        {
+          "asset_type": "bond",
+          "currency": "USD",
+          "description": "RUB KLM Corp Bond, ISIN: RU…",
+          "id": "KLM",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN-1-0",
+              "value": "KLM"
+            }
+          ]
+        }
+      ],
+      "day_count_fraction": "ACT/360",
+      "duration": "Term",
+      "far_leg": {
+        "buyer_party_href": "Party2",
+        "collateral": [
+          {
+            "asset_href": "KLM",
+            "dirty_price": "1.008860000000000000",
+            "nominal_amount": {
+              "amount": "150000000.000000000000000000",
+              "currency": "RUB",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "id": "forwardLeg",
+        "seller_party_href": "Party1",
+        "settlement_currency": "USD",
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2013-02-27"
+          }
+        }
+      },
+      "initial_margin_type": "Cash",
+      "near_leg": {
+        "buyer_party_href": "Party1",
+        "collateral": [
+          {
+            "asset_href": "KLM",
+            "dirty_price": "1.008860000000000000",
+            "nominal_amount": {
+              "amount": "150000000.000000000000000000",
+              "currency": "RUB",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "seller_party_href": "Party2",
+        "settlement_amount": {
+          "amount": "4000000.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-11-27"
+          }
+        }
+      },
+      "open_term": {},
+      "product": {},
+      "rate": {
+        "floating_rate_calculation": {
+          "floating_rate_index": "USD-LIBOR-BBA-Bloomberg",
+          "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+          "index_tenor": {
+            "period": "M",
+            "period_multiplier": 1
+          },
+          "spread_schedules": [
+            {
+              "initial_value": "0.005000000000000000"
+            }
+          ]
+        }
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "Party19235"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 2"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "Party22000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-11-19"
+    },
+    "trade_ordinal": 0
+  }
+]

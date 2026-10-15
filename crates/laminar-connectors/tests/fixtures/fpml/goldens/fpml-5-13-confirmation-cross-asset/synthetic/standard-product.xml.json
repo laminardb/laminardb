@@ -1,0 +1,116 @@
+[
+  {
+    "correlation_id": "SYN-STD",
+    "creation_timestamp": {
+      "local": "2026-06-22T08:45:30.125",
+      "offset_minutes": -240,
+      "utc": "2026-06-22T12:45:30.125Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "07e517c5c8a75e2dd22aa8aae9d45315655de21506599bdd013bb66a81b378c8",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SYN-STD-0001",
+    "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "product_type": "standardProduct",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYA",
+    "sequence_number": 1,
+    "standard_product": {
+      "notional": {
+        "amount": "25000000.000000000000000000",
+        "currency": "USD"
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Credit"
+        },
+        "product_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/product-id",
+            "value": "CDX.NA.IG.46-5Y"
+          }
+        ],
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Credit:Index:CDX"
+          }
+        ]
+      },
+      "quotes": [
+        {
+          "currency": "USD",
+          "measure_type": "ParSpread",
+          "side": "Mid",
+          "time": {
+            "local": "2026-06-22T08:45:00",
+            "offset_minutes": -240,
+            "utc": "2026-06-22T12:45:00Z"
+          },
+          "valuation_date": "2026-06-22",
+          "value": "0.005200000000000000"
+        }
+      ]
+    },
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYA"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "STD-4001"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "STD-4001"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2026-06-22"
+    },
+    "trade_ordinal": 0
+  }
+]
