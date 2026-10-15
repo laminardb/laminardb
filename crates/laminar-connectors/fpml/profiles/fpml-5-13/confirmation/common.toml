@@ -203,6 +203,14 @@ fields = [
 
 # ── Payments and settlement ───────────────────────────────────────────────────
 
+[structs.fx_spot_rate_source]
+fields = [
+  { name = "rate_source", type = "utf8", path = "primaryRateSource/rateSource" },
+  { name = "rate_source_page", type = "utf8", path = "primaryRateSource/rateSourcePage" },
+  { name = "secondary_rate_source", type = "utf8", path = "secondaryRateSource/rateSource" },
+  { name = "fixing_time", type = "struct<business_center_time>", path = "fixingTime" },
+]
+
 [structs.payment]
 description = "A payment between two parties (fees, premiums, other payments)"
 fields = [
@@ -212,6 +220,16 @@ fields = [
   { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
   { name = "payment_date", type = "struct<adjustable_date>", path = "paymentDate" },
   { name = "payment_type", type = "utf8", path = "paymentType" },
+]
+
+[structs.simple_payment]
+description = "A payment whose date may be adjustable or relative (SimplePayment)"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<adjustable_or_relative_date>", path = "paymentDate" },
 ]
 
 [structs.premium]

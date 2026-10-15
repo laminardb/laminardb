@@ -1,0 +1,148 @@
+[
+  {
+    "correlation_id": "FX01234",
+    "creation_timestamp": {
+      "local": "2001-12-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-12-04T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "de2abef714e3d44e6e20e125be05269eef06d4d631e2a613bdb2a7e2afd7cedd",
+    "fpml_version": "5-13",
+    "fx_option": {
+      "buyer_party_href": "party1",
+      "call_currency_amount": {
+        "amount": "36900000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "exercise": {
+        "commencement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2001-12-04"
+          }
+        },
+        "cut_name": "NewYork",
+        "expiry_date": "2002-06-04",
+        "expiry_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "14:00:00"
+        },
+        "latest_value_date": "2002-06-06",
+        "style": "americanExercise"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party1",
+          "payment_amount": {
+            "amount": "36900.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2001-12-06"
+            }
+          },
+          "quote_basis": "PercentageOfCallCurrencyAmount",
+          "quote_value": "0.001000000000000000",
+          "receiver_party_href": "party2"
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxOption"
+          }
+        ]
+      },
+      "put_currency_amount": {
+        "amount": "75000000.000000000000000000",
+        "currency": "AUD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "seller_party_href": "party2",
+      "strike": {
+        "rate": "0.492000000000000000",
+        "strike_quote_basis": "CallCurrencyPerPutCurrency"
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX109876",
+    "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "PARTYA"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ],
+        "party_name": "ABN Amro"
+      }
+    ],
+    "product_type": "fxOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABNANL2A",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://partyA.com/trades",
+              "value": "123456789"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://adnamro.com/trade-ids",
+              "value": "ABN1789"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-12-04"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -16,7 +16,7 @@ use super::document::{Document, ElementId, Interner, NameId, NO_ELEMENT};
 use super::error::{Rejection, Stage};
 use super::limits::Limits;
 use super::profile::{
-    Alternative, Column, Conversion, Meta, Plan, Selector, Source, Step, Terminal,
+    Alternative, Column, Conversion, Meta, NameTest, Plan, Selector, Source, Step, Terminal,
 };
 use super::references::ReferenceRules;
 
@@ -318,7 +318,7 @@ impl<'a> Projector<'a> {
                     if test.matches(element.name)
                         && predicates
                             .iter()
-                            .all(|required| self.has_child(child, *required))
+                            .all(|required| self.has_child(child, required))
                     {
                         out.push(child);
                     }
@@ -336,7 +336,7 @@ impl<'a> Projector<'a> {
             Step::Filter(predicates) => {
                 if predicates
                     .iter()
-                    .all(|required| self.has_child(id, *required))
+                    .all(|required| self.has_child(id, required))
                 {
                     out.push(id);
                 }
@@ -374,11 +374,11 @@ impl<'a> Projector<'a> {
         Ok(())
     }
 
-    fn has_child(&self, parent: ElementId, name: NameId) -> bool {
+    fn has_child(&self, parent: ElementId, test: &NameTest) -> bool {
         self.document.children(parent).any(|child| {
             self.document
                 .element(child)
-                .is_some_and(|element| element.name == name)
+                .is_some_and(|element| test.matches(element.name))
         })
     }
 

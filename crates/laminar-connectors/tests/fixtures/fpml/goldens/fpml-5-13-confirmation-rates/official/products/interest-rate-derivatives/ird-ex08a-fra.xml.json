@@ -1,0 +1,114 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "83aede9901095b376289049b2cff24335586c065f6588a6b7bd1f791b08f3919",
+    "fpml_version": "5-13",
+    "fra": {
+      "adjusted_effective_date": "2019-01-14",
+      "adjusted_termination_date": "2019-06-13",
+      "buyer_party_href": "partyB",
+      "calculation_period_number_of_days": 150,
+      "day_count_fraction": "ACT/360",
+      "fixed_rate": "0.005000000000000000",
+      "fixing_date_offset": {
+        "business_centers": [
+          "GBLO"
+        ],
+        "business_day_convention": "NONE",
+        "date_relative_to_href": "resetDate",
+        "day_type": "Business",
+        "period": "D",
+        "period_multiplier": -2
+      },
+      "floating_rate_index": "USD-LIBOR-BBA",
+      "fra_discounting": "ISDA",
+      "index_tenors": [
+        {
+          "period": "M",
+          "period_multiplier": 5
+        }
+      ],
+      "notional": {
+        "amount": "50000000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "payment_date": {
+        "date_adjustments": {
+          "business_centers": [
+            "GBLO",
+            "USNY"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "unadjusted_date": "2019-01-14"
+      },
+      "product": {
+        "product_ids": [
+          {
+            "value": "64209469"
+          }
+        ],
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "InterestRate:FRA"
+          }
+        ]
+      },
+      "seller_party_href": "partyA"
+    },
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "A BANK(\"ABANK\")"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "SELL SECURITIES CO LTD (\"Counterparty\")"
+      }
+    ],
+    "product_type": "fra",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "FpML-test-8"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2019-01-14"
+    },
+    "trade_ordinal": 0
+  }
+]

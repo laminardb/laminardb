@@ -43,13 +43,13 @@ pub(crate) enum Step {
     Root,
     Child {
         test: NameTest,
-        predicates: Vec<NameId>,
+        predicates: Vec<NameTest>,
     },
     Descendants,
     Parent,
     Deref,
-    /// Keep the current elements that have a child with each of these names.
-    Filter(Vec<NameId>),
+    /// Keep the current elements that have a child matching each of these tests.
+    Filter(Vec<NameTest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

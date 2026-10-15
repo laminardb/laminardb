@@ -1,0 +1,163 @@
+[
+  {
+    "bond_option": {
+      "buyer_party_href": "Party2",
+      "entitlement_currency": "CHF",
+      "exercise": {
+        "american": {
+          "commencement_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "CHZU"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2021-08-23"
+            }
+          },
+          "earliest_exercise_time": {
+            "business_center": "GBLO",
+            "hour_minute_time": "09:00:00"
+          },
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "CHZU"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2025-08-18"
+            }
+          },
+          "expiration_time": {
+            "business_center": "GBLO",
+            "hour_minute_time": "16:00:00"
+          },
+          "id": "EXERCISE"
+        },
+        "style": "americanExercise"
+      },
+      "exercise_procedure": {
+        "follow_up_confirmation": true,
+        "limited_right_to_confirm": false,
+        "manual_exercise_present": "manualExercise",
+        "split_ticket": true
+      },
+      "number_of_options": "1.000000000000000000",
+      "option_entitlement": "1100000.000000000000000000",
+      "option_type": "Call",
+      "product": {},
+      "seller_party_href": "Party1",
+      "settlement": {
+        "settlement_date": {
+          "relative_date": {
+            "business_centers": [
+              "GBLO",
+              "CHZU"
+            ],
+            "business_day_convention": "NONE",
+            "date_relative_to_href": "EXERCISE",
+            "day_type": "Business",
+            "period": "D",
+            "period_multiplier": 8
+          }
+        },
+        "settlement_type": "Physical"
+      },
+      "strike_reference_swap_curve": "referenceSwapCurve",
+      "underlying": {
+        "asset_type": "convertibleBond",
+        "clearance_system": "Euroclear",
+        "coupon_rate": "0.000000000000000000",
+        "currency": "CHF",
+        "face_amount": "1100000.000000000000000000",
+        "instrument_ids": [
+          {
+            "scheme": "ISIN",
+            "value": "ExampleISIN1"
+          }
+        ],
+        "issuer_name": "ABC Finance",
+        "maturity": "2024-08-26",
+        "par_value": "1100000.000000000000000000",
+        "payment_frequency": {
+          "period": "M",
+          "period_multiplier": 6
+        }
+      }
+    },
+    "calculation_agent": {
+      "party_hrefs": [
+        "Party1"
+      ]
+    },
+    "correlation_id": "CRR/2007/01/04/2342342",
+    "creation_timestamp": {
+      "local": "2021-08-18T15:38:00",
+      "offset_minutes": -300,
+      "utc": "2021-08-18T20:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "1805ffb6d82494f5bbe28ecd091eb7c159e0d960e489632bd6f9edd23e36d110",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021"
+      ]
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "2342342",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "bondOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABIC1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/coding-scheme/trade-id",
+              "value": "Trade234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2021-08-18"
+    },
+    "trade_ordinal": 0
+  }
+]

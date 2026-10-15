@@ -1,0 +1,146 @@
+# Trade-level columns every confirmation trade profile shares: document and message context,
+# trade identity and header, product type, parties, and documentation. Profiles include this file
+# first and add their product columns after it.
+include = ["common.toml"]
+
+[[columns]]
+name = "document_sha256"
+type = "utf8"
+meta = "document_sha256"
+required = true
+
+[[columns]]
+name = "document_root"
+type = "utf8"
+meta = "root"
+required = true
+
+[[columns]]
+name = "fpml_version"
+type = "utf8"
+meta = "fpml_version"
+required = true
+
+[[columns]]
+name = "trade_ordinal"
+type = "uint32"
+meta = "row"
+required = true
+
+[[columns]]
+name = "trade_count"
+type = "uint32"
+meta = "row_count"
+required = true
+
+[[columns]]
+name = "row_locator"
+type = "utf8"
+meta = "row_locator"
+required = true
+
+[[columns]]
+name = "trade_context"
+type = "utf8"
+path = "../#name"
+description = "Local name of the trade's parent element (the document root or a business event)"
+
+[[columns]]
+name = "message_id"
+type = "utf8"
+path = "/header/messageId"
+
+[[columns]]
+name = "message_id_scheme"
+type = "utf8"
+path = "/header/messageId/@messageIdScheme"
+
+[[columns]]
+name = "in_reply_to"
+type = "utf8"
+path = "/header/inReplyTo"
+
+[[columns]]
+name = "sent_by"
+type = "utf8"
+path = "/header/sentBy"
+
+[[columns]]
+name = "creation_timestamp"
+type = "datetime"
+path = "/header/creationTimestamp"
+
+[[columns]]
+name = "is_correction"
+type = "bool"
+path = "/isCorrection"
+
+[[columns]]
+name = "correlation_id"
+type = "utf8"
+path = "/correlationId"
+
+[[columns]]
+name = "sequence_number"
+type = "int64"
+path = "/sequenceNumber"
+
+[[columns]]
+name = "trade_id"
+type = "utf8"
+path = "@id"
+description = "Document-local id of the trade element, when present"
+
+[[columns]]
+name = "trade_header"
+type = "struct<trade_header>"
+path = "tradeHeader"
+required = true
+
+[[columns]]
+name = "product_type"
+type = "utf8"
+path = "{product}/#name"
+required = true
+description = "Local name of the product element (for example swap, fxOption, creditDefaultSwap)"
+
+[[columns]]
+name = "other_party_payments"
+type = "list<struct<payment>>"
+path = "otherPartyPayment"
+
+[[columns]]
+name = "broker_party_hrefs"
+type = "list<utf8>"
+path = "brokerPartyReference/@href"
+
+[[columns]]
+name = "calculation_agent"
+type = "struct<calculation_agent>"
+path = "calculationAgent"
+
+[[columns]]
+name = "calculation_agent_business_center"
+type = "utf8"
+path = "calculationAgentBusinessCenter"
+
+[[columns]]
+name = "documentation"
+type = "struct<documentation>"
+path = "documentation"
+
+[[columns]]
+name = "governing_law"
+type = "utf8"
+path = "governingLaw"
+
+[[columns]]
+name = "parties"
+type = "list<struct<party>>"
+path = "/party"
+description = "Every party declared in the document"
+
+[[columns]]
+name = "accounts"
+type = "list<struct<account>>"
+path = "/account"

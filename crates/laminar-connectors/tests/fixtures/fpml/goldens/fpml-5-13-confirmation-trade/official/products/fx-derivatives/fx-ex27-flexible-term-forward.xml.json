@@ -3,51 +3,6 @@
     "document_root": "dataDocument",
     "document_sha256": "547ba543336cf721ca2619dc94d46fe20fc74eb5c2c4fd476277f75b33df7b47",
     "fpml_version": "5-13",
-    "fx_flexible_forward": {
-      "additional_payment": {
-        "payer_party_href": "partyB",
-        "payment_amount": {
-          "amount": "123000.000000000000000000",
-          "currency": "EUR",
-          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
-        },
-        "payment_date": {
-          "adjusted_date": "2011-09-30"
-        },
-        "receiver_party_href": "partyA"
-      },
-      "buyer_party_href": "partyB",
-      "call_currency": "EUR",
-      "earliest_execution_time": {
-        "business_center": "GBLO",
-        "hour_minute_time": "09:00:00"
-      },
-      "execution_expiry_date": "2012-12-30",
-      "execution_start_date": "2011-09-30",
-      "forward_rate": {
-        "currency1": "USD",
-        "currency2": "EUR",
-        "quote_basis": "Currency1PerCurrency2",
-        "rate": "1.375000000000000000"
-      },
-      "latest_execution_time": {
-        "business_center": "GBLO",
-        "hour_minute_time": "15:00:00"
-      },
-      "minimum_execution_amount": {
-        "amount": "500000.000000000000000000",
-        "currency": "EUR",
-        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
-      },
-      "notional_amount": {
-        "amount": "10000000.000000000000000000",
-        "currency": "EUR",
-        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
-      },
-      "product": {},
-      "put_currency": "USD",
-      "seller_party_href": "partyA"
-    },
     "parties": [
       {
         "id": "partyA",

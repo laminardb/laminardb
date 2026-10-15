@@ -59,6 +59,18 @@ pub(super) fn synthetic_fixtures() -> Vec<String> {
     found
 }
 
+/// Schema-valid official examples a bundled profile rejects, with the reason. Each is an FpML
+/// example erratum: a reference the profile projects through targets an element of the wrong
+/// type, which the schema annotation forbids and projection never follows.
+const EXPECTED_REJECTIONS: &[(&str, &str, &str)] = &[];
+
+pub(super) fn expected_rejection(profile: &str, path: &str) -> Option<&'static str> {
+    EXPECTED_REJECTIONS
+        .iter()
+        .find(|(rejecting, rejected, _)| *rejecting == profile && *rejected == path)
+        .map(|(_, _, reason)| *reason)
+}
+
 pub(super) fn example(path: &str) -> Vec<u8> {
     std::fs::read(corpus_root().join("confirmation").join(path)).unwrap()
 }

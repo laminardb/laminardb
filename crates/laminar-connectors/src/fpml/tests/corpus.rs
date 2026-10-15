@@ -1,13 +1,17 @@
 //! Reference integrity and hand-checked economics over the official corpus.
 
-use super::{corpus, corpus_root, decoder_for, example, valid_examples};
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{corpus, corpus_root, decoder_for, example, expected_rejection, valid_examples};
 use crate::fpml::document::Interner;
 use crate::fpml::golden;
 use crate::fpml::limits::Limits;
 use crate::fpml::references::{ReferencePolicy, ReferenceRules};
 use crate::fpml::schema_model::SchemaModel;
 use crate::fpml::xsd::{TreeNames, Validator};
-use crate::fpml::Artifact;
+use crate::fpml::{Artifact, BUNDLED_PROFILES};
+
+const TRADE_PROFILE: &str = "fpml-5-13-confirmation-trade";
 
 #[test]
 fn reference_policies_over_the_official_corpus() {
@@ -63,7 +67,7 @@ fn reference_policies_over_the_official_corpus() {
 /// Values read by hand from the example, not from a golden.
 #[test]
 fn vanilla_swap_projects_identifiers_parties_and_legs() {
-    let decoder = decoder_for("fpml-5-13-confirmation-trade");
+    let decoder = decoder_for("fpml-5-13-confirmation-rates");
     let batch = decoder
         .decode(&example(
             "products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml",
@@ -129,20 +133,70 @@ fn vanilla_swap_projects_identifiers_parties_and_legs() {
     assert_eq!(row["parties"][0]["party_name"], "Party A");
 }
 
+/// `(document, row_locator)` to `product_type` for every row a profile yields over the corpus;
+/// documents the profile is expected to reject contribute none.
+fn trades(profile: &str) -> BTreeMap<(String, String), String> {
+    let decoder = decoder_for(profile);
+    let mut trades = BTreeMap::new();
+    for path in valid_examples() {
+        let batch = match (
+            decoder.decode(&example(&path)),
+            expected_rejection(profile, &path),
+        ) {
+            (Ok(batch), None) => batch,
+            (Err(error), Some(reason)) => {
+                assert!(
+                    error.to_string().contains(reason),
+                    "{profile} {path}: rejected for another reason: {error}"
+                );
+                continue;
+            }
+            (Ok(_), Some(reason)) => panic!("{profile} {path}: expected a rejection ({reason})"),
+            (Err(error), None) => panic!("{profile} {path}: {error}"),
+        };
+        for row in golden::rows(&batch) {
+            let locator = row["row_locator"].as_str().unwrap().to_owned();
+            let product = row["product_type"].as_str().unwrap().to_owned();
+            assert!(
+                trades.insert((path.clone(), locator), product).is_none(),
+                "{profile} {path}: duplicate row locator"
+            );
+        }
+    }
+    trades
+}
+
 /// Every schema-valid official example decodes through the trade profile: one row per
 /// confirmation-view trade, none for documents without trades.
 #[test]
 fn trade_profile_rows_match_an_independent_count() {
-    let decoder = decoder_for("fpml-5-13-confirmation-trade");
-    let rows: usize = valid_examples()
-        .iter()
-        .map(|path| {
-            decoder
-                .decode(&example(path))
-                .unwrap_or_else(|error| panic!("{path}: {error}"))
-                .num_rows()
-        })
-        .sum();
     // Counted with Python ElementTree: trade elements that have a tradeHeader child.
-    assert_eq!(rows, 366);
+    assert_eq!(trades(TRADE_PROFILE).len(), 366);
+}
+
+/// Each asset-class profile yields exactly the trades whose product types it covers, and no
+/// trade is a row of two asset-class profiles.
+#[test]
+fn asset_class_profiles_partition_the_trades_they_cover() {
+    let all = trades(TRADE_PROFILE);
+    let mut claimed: BTreeSet<(String, String)> = BTreeSet::new();
+    for (profile, _) in BUNDLED_PROFILES {
+        if *profile == TRADE_PROFILE {
+            continue;
+        }
+        let rows = trades(profile);
+        let products: BTreeSet<&String> = rows.values().collect();
+        let expected: BTreeMap<_, _> = all
+            .iter()
+            .filter(|(key, product)| {
+                products.contains(product) && expected_rejection(profile, &key.0).is_none()
+            })
+            .map(|(key, product)| (key.clone(), product.clone()))
+            .collect();
+        assert!(!rows.is_empty(), "{profile} yields no rows");
+        assert_eq!(rows, expected, "{profile}");
+        for key in rows.into_keys() {
+            assert!(claimed.insert(key.clone()), "{profile} also claims {key:?}");
+        }
+    }
 }

@@ -1,0 +1,109 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "75b37bb1dec7b7ffabe113aaa0351d1273caae94446eae2fc7d2dc866d062499",
+    "fpml_version": "5-13",
+    "fra": {
+      "adjusted_effective_date": "1991-07-17",
+      "adjusted_termination_date": "1992-01-17",
+      "buyer_party_href": "party1",
+      "calculation_period_number_of_days": 184,
+      "day_count_fraction": "ACT/360",
+      "fixed_rate": "0.040000000000000000",
+      "fixing_date_offset": {
+        "business_centers": [
+          "GBLO"
+        ],
+        "business_day_convention": "NONE",
+        "date_relative_to_href": "resetDate",
+        "day_type": "Business",
+        "period": "D",
+        "period_multiplier": -2
+      },
+      "floating_rate_index": "CHF-LIBOR-BBA",
+      "fra_discounting": "ISDA",
+      "index_tenors": [
+        {
+          "period": "M",
+          "period_multiplier": 6
+        }
+      ],
+      "notional": {
+        "amount": "25000000.000000000000000000",
+        "currency": "CHF",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "payment_date": {
+        "date_adjustments": {
+          "business_centers": [
+            "CHZU"
+          ],
+          "business_day_convention": "FOLLOWING"
+        },
+        "unadjusted_date": "1991-07-17"
+      },
+      "product": {},
+      "seller_party_href": "party2"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "TR24TWEY5RVRQV65HD49"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      }
+    ],
+    "product_type": "fra",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "TR24TWEY5RVRQV65HD49"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.hsbc.com/swaps/trade-id",
+              "value": "MB87623"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abnamro.com/swaps/trade-id",
+              "value": "AA9876"
+            }
+          ]
+        }
+      ],
+      "trade_date": "1991-05-14"
+    },
+    "trade_ordinal": 0
+  }
+]

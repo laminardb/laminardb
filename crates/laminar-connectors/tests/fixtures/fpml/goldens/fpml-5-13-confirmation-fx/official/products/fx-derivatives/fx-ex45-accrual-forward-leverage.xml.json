@@ -1,0 +1,167 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "creation_timestamp": {
+      "local": "2014-06-09T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2014-06-09T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "fbf4f29f1e715cb4b1339e6215f137c8456a3b20055ec3c34bd2a5cd22d71a33",
+    "fpml_version": "5-13",
+    "fx_accrual_forward": {
+      "linear_payoff_regions": [
+        {
+          "counter_currency_amount": {
+            "currency": "CAD",
+            "initial_value": "433000.000000000000000000"
+          },
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "partyB",
+            "receiver_party_href": "partyA"
+          },
+          "exchanged_currency2": {
+            "currency": "CAD",
+            "payer_party_href": "partyA",
+            "receiver_party_href": "partyB"
+          },
+          "leverage_condition": "Below",
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "initial_value": "1.082500000000000000"
+          }
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxAccrualForward"
+          }
+        ]
+      },
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "day_type": "Business",
+            "end_date": "2014-10-31",
+            "number_of_fixings": 22,
+            "start_date": "2014-10-01"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "CATO",
+                  "hour_minute_time": "12:00:00"
+                },
+                "rate_source": "Reuters",
+                "rate_source_page": "BOFC"
+              },
+              "quoted_currency_pair": {
+                "currency1": "USD",
+                "currency2": "CAD",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "lower_bound": {
+                "condition": "AtOrAbove"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            },
+            {
+              "accrual_factor": {
+                "initial_value": "2.000000000000000000"
+              },
+              "lower_bound": {
+                "condition": "Above"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            }
+          ]
+        },
+        "expiry_date": {
+          "adjusted_date": "2014-10-31"
+        },
+        "notional_amount": {
+          "currency": "USD",
+          "initial_value": "400000.000000000000000000"
+        },
+        "settlement_date": {
+          "adjusted_date": "2014-11-03",
+          "date_adjustments": {
+            "business_centers": [
+              "USNY",
+              "CATO"
+            ],
+            "business_day_convention": "FOLLOWING"
+          }
+        }
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxAccrualForward",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300SRLRVTR996F086"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "#partyA",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-06-09"
+    },
+    "trade_ordinal": 0
+  }
+]

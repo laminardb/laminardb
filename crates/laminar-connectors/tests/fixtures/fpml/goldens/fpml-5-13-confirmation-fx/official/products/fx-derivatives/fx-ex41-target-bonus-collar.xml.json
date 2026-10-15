@@ -1,0 +1,216 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "ptyA"
+      ]
+    },
+    "creation_timestamp": {
+      "local": "2011-03-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2011-03-01T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "bb6d769a4f3da42c065d192d37bca92542f4fa6208b991e2552a575fe7f4581d",
+    "fpml_version": "5-13",
+    "fx_target_knockout_forward": {
+      "additional_payments": [
+        {
+          "payer_party_href": "ptyA",
+          "payment_amount": {
+            "amount": "91000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2014-06-18"
+            }
+          },
+          "receiver_party_href": "ptyB"
+        }
+      ],
+      "expiry_schedule": {
+        "adjusted_dates": [
+          "2014-06-30",
+          "2014-07-14",
+          "2014-07-28",
+          "2014-08-11",
+          "2014-08-25",
+          "2014-09-08",
+          "2014-09-22"
+        ],
+        "date_adjustments": {
+          "business_centers": [
+            "EUTA"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "end_date": "2014-07-03",
+        "final_expiry_date": "2014-09-22",
+        "observation_frequency": {
+          "period": "W",
+          "period_multiplier": 2
+        },
+        "start_date": "2014-06-30"
+      },
+      "fixing_information_source": {
+        "fixing_time": {
+          "business_center": "DEFR",
+          "hour_minute_time": "14:15:00"
+        },
+        "rate_source": "Reuters",
+        "rate_source_page": "ECB37"
+      },
+      "notional_amount": {
+        "currency": "EUR",
+        "initial_value": "500000.000000000000000000"
+      },
+      "payoff_regions": [
+        {
+          "lower_bound": {
+            "condition": "AtOrAbove",
+            "strike_href": "s2"
+          },
+          "physical_settlement_style": "VariedStrike",
+          "region_type": "constantPayoffRegion",
+          "upper_bound": {
+            "condition": "AtOrBelow",
+            "strike_href": "s1"
+          }
+        },
+        {
+          "counter_currency_amount": {
+            "currency": "USD",
+            "initial_value": "661750.000000000000000000"
+          },
+          "exchanged_currency1": {
+            "currency": "EUR",
+            "payer_party_href": "ptyA",
+            "receiver_party_href": "ptyB"
+          },
+          "exchanged_currency2": {
+            "currency": "USD",
+            "payer_party_href": "ptyB",
+            "receiver_party_href": "ptyA"
+          },
+          "lower_bound": {
+            "condition": "Above",
+            "strike_href": "s1"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "s1",
+            "initial_value": "1.323500000000000000"
+          }
+        },
+        {
+          "exchanged_currency1": {
+            "currency": "EUR",
+            "payer_party_href": "ptyA",
+            "receiver_party_href": "ptyB"
+          },
+          "exchanged_currency2": {
+            "currency": "USD",
+            "payer_party_href": "ptyB",
+            "receiver_party_href": "ptyA"
+          },
+          "leverage_condition": "Below",
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "s2",
+            "initial_value": "1.303500000000000000"
+          },
+          "upper_bound": {
+            "condition": "Below",
+            "strike_href": "s2"
+          }
+        }
+      ],
+      "product": {},
+      "quoted_currency_pair": {
+        "currency1": "EUR",
+        "currency2": "USD",
+        "quote_basis": "Currency2PerCurrency1"
+      },
+      "settlement_schedule": {
+        "adjusted_dates": [
+          "2014-07-02",
+          "2014-07-16",
+          "2014-07-30",
+          "2014-08-13",
+          "2014-08-27",
+          "2014-09-10",
+          "2014-09-24"
+        ],
+        "date_adjustments": {
+          "business_centers": [
+            "EUTA",
+            "USNY"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "final_settlement_date": "2014-09-24"
+      },
+      "targets": [
+        {
+          "knockout_intrinsic_value": "0.100000000000000000",
+          "knockout_settlement_adjustment_style": "VariedNotional",
+          "knockout_target_style": "Exact"
+        }
+      ]
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "ptyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "ptyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxTargetKnockoutForward",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "ptyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/fx/trade-id",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-07-04"
+    },
+    "trade_ordinal": 0
+  }
+]

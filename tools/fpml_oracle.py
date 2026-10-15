@@ -105,7 +105,7 @@ class Profile:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
         if root:
             self.header = data["profile"]
-            self.columns = data.get("columns", [])
+            self.columns = []
             self._set_specs = {}
         self.namespaces.update(data.get("namespaces", {}))
         self._set_specs.update(data.get("sets", {}))
@@ -117,10 +117,18 @@ class Profile:
             else:
                 target = (path.parent / include).resolve()
             self._load(target, bundled, False, seen)
+        # An included file's columns precede the including file's own.
+        self.columns.extend(data.get("columns", []))
 
     def element_name(self, text: str) -> str:
         prefix, _, local = text.rpartition(":")
         return "{%s}%s" % (self.namespaces[prefix], local)
+
+    def name_test(self, text: str):
+        """Predicate `[name]` or `[{set}]` as a test on a child's tag."""
+        if text.startswith("{"):
+            return self.sets[text[1:-1]].__contains__
+        return self.element_name(text).__eq__
 
     def attribute_name(self, text: str) -> str:
         prefix, _, local = text.rpartition(":")
@@ -197,8 +205,8 @@ def evaluate_alternative(profile, document, selector, context) -> list:
         elif token == ".":
             pass
         elif token.startswith(".["):
-            required = [profile.element_name(p) for p in re.findall(r"\[([^\]]+)\]", token)]
-            current = [e for e in current if all(any(c.tag == r for c in e) for r in required)]
+            required = [profile.name_test(p) for p in re.findall(r"\[([^\]]+)\]", token)]
+            current = [e for e in current if all(any(test(c.tag) for c in e) for test in required)]
         elif token == "..":
             current = [document.parent[e] for e in current if e in document.parent]
         elif token == "**":
@@ -236,14 +244,14 @@ def evaluate_alternative(profile, document, selector, context) -> list:
             else:
                 name = profile.element_name(head)
                 test = name.__eq__
-            required = [profile.element_name(p) for p in predicates]
+            required = [profile.name_test(p) for p in predicates]
             current = [
                 child
                 for element in current
                 for child in element
                 if isinstance(child.tag, str)
                 and test(child.tag)
-                and all(any(g.tag == r for g in child) for r in required)
+                and all(any(isinstance(g.tag, str) and has(g.tag) for g in child) for has in required)
             ]
     return current
 
@@ -429,22 +437,44 @@ def main() -> int:
         if header:
             profiles[header["name"]] = path
     fixtures = crate / "tests/fixtures/fpml"
+    listing = (fixtures / "fpml-5-13-8-rec-2/reference-annotation-violations.txt").read_text(encoding="utf-8")
+    violations = {line.strip() for line in listing.splitlines() if line.strip() and not line.startswith("#")}
     checked = rows = 0
     problems: list[str] = []
     for name, root_file in profiles.items():
         profile = Profile(root_file, bundled, closure)
         golden_root = fixtures / "goldens" / name
+        for relative in (golden_root / "zero-rows.txt").read_text(encoding="utf-8").split():
+            kind, _, rest = relative.partition("/")
+            source = fixtures / ("fpml-5-13-8-rec-2/confirmation" if kind == "official" else "synthetic") / rest
+            document = Document(source.read_bytes(), "http://www.fpml.org/FpML-5/confirmation")
+            try:
+                produced = len(project(profile, document))
+            except Mismatch as error:
+                problems.append(f"{name} {relative}: {error}")
+                continue
+            if produced:
+                problems.append(f"{name} {relative}: listed with zero rows, oracle has {produced}")
+            checked += 1
         for golden in sorted(golden_root.rglob("*.json")):
             relative = golden.relative_to(golden_root).as_posix()[: -len(".json")]
             kind, _, rest = relative.partition("/")
             source = fixtures / ("fpml-5-13-8-rec-2/confirmation" if kind == "official" else "synthetic") / rest
+            actual = json.loads(golden.read_text(encoding="utf-8"))
+            if isinstance(actual, dict):
+                # A rejection is accepted only for a document the schema-policy reference check
+                # flags; the decoder's own suites pin the exact reason.
+                reason = actual.get("rejected", "")
+                if kind != "official" or rest not in violations or "rejected at references" not in reason:
+                    problems.append(f"{name} {relative}: unexpected rejection golden {actual!r}")
+                checked += 1
+                continue
             document = Document(source.read_bytes(), "http://www.fpml.org/FpML-5/confirmation")
             try:
                 expected = project(profile, document)
             except Mismatch as error:
                 problems.append(f"{name} {relative}: {error}")
                 continue
-            actual = json.loads(golden.read_text(encoding="utf-8"))
             local: list[str] = []
             if len(expected) != len(actual):
                 local.append(f"oracle has {len(expected)} rows, golden {len(actual)}")

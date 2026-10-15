@@ -1,0 +1,258 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "0f34265006ee32c244bc5ccf7279e0c1f7f228c134c36c1e4fcbd5757bacb6f0",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "0103"
+          }
+        ],
+        "party_name": "MarketProducts"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "0617mpm24"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "swap": {
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "InterestRate:IRSwap:FixedFloat"
+          }
+        ]
+      },
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "30/360",
+            "fixed_rate_schedule": {
+              "initial_value": "0.000300000000000000"
+            },
+            "notional_schedule": {
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "id": "notionalSchedule_0_0",
+              "initial_value": "100000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "2"
+            },
+            "id": "calculationPeriodDates_0_0",
+            "relative_effective_date": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "tradeDate",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 2
+            },
+            "relative_termination_date": {
+              "business_centers": [
+                "GBLO",
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING",
+              "date_relative_to_href": "effectiveDate_0_0",
+              "period": "Y",
+              "period_multiplier": 2
+            }
+          },
+          "cashflows_match_parameters": false,
+          "id": "swapStream_0_0",
+          "payer_party_href": "party1",
+          "payment_dates": {
+            "calculation_period_dates_href": "calculationPeriodDates_0_0",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "principal_exchanges": {
+            "final_exchange": false,
+            "initial_exchange": false,
+            "intermediate_exchange": false
+          },
+          "receiver_party_href": "party2"
+        },
+        {
+          "calculation": {
+            "compounding_method": "Straight",
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 6
+              }
+            },
+            "notional_schedule": {
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "id": "notionalSchedule_0_1",
+              "initial_value": "100000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 3,
+              "roll_convention": "NONE"
+            },
+            "id": "calculationPeriodDates_0_1",
+            "relative_effective_date": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "tradeDate",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 2
+            },
+            "relative_termination_date": {
+              "business_centers": [
+                "GBLO",
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING",
+              "date_relative_to_href": "effectiveDate_0_1",
+              "period": "Y",
+              "period_multiplier": 2
+            }
+          },
+          "cashflows_match_parameters": false,
+          "id": "swapStream_0_1",
+          "payer_party_href": "party2",
+          "payment_dates": {
+            "calculation_period_dates_href": "calculationPeriodDates_0_1",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "principal_exchanges": {
+            "final_exchange": false,
+            "initial_exchange": false,
+            "intermediate_exchange": false
+          },
+          "receiver_party_href": "party1",
+          "reset_dates": {
+            "calculation_period_dates_href": "calculationPeriodDates_0_1",
+            "fixing_dates": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "resetDates_0_1",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "resetDates_0_1",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 1
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          }
+        }
+      ]
+    },
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "0103"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://xml.morganstanley.com/fid/ird/msTradeIdScheme/swapName",
+              "value": "martin"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "0617mpm24"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://xml.morganstanley.com/fid/ird/counterpartyTradeIdScheme",
+              "value": "1234567"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-07-31"
+    },
+    "trade_ordinal": 0
+  }
+]

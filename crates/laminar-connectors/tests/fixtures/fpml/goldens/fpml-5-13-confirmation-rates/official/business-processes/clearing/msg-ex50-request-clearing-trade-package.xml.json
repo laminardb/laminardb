@@ -1,0 +1,644 @@
+[
+  {
+    "correlation_id": "0123456",
+    "creation_timestamp": {
+      "local": "2009-12-25T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2009-12-25T08:57:00Z"
+    },
+    "document_root": "requestClearing",
+    "document_sha256": "49990bf910815bf03629dc7e16ee78202fa07480441381c8321e0fe6fd7deb39",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "M000123",
+    "message_id_scheme": "http://sef1.com/message-id",
+    "parties": [
+      {
+        "id": "counterpartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493007UORKUC7B3R009"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300CG6M7FPQFSZZ36"
+          }
+        ]
+      },
+      {
+        "id": "counterpartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493001GQM0W2RB8NG57"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "F226TOH6YD6XJB17KS62"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF1"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000OYML8W30IO673"
+          }
+        ]
+      },
+      {
+        "id": "executionVenue",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF2"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500W4M6T99LTBH450"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/requestClearing/tradePackage/trade",
+    "sent_by": "SEF1",
+    "sequence_number": 1,
+    "swap": {
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "InterestRate:IRSwap:FixedFloat"
+          }
+        ]
+      },
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "JPY-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 6
+              }
+            },
+            "notional_schedule": {
+              "currency": "JPY",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "3000000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "10"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2011-03-10"
+            },
+            "id": "floatingLegCalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2023-03-10"
+            }
+          },
+          "id": "floatingLeg",
+          "payer_party_href": "counterpartyB",
+          "payment_dates": {
+            "calculation_period_dates_href": "floatingLegCalcPeriodDates",
+            "id": "floatingLegPaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "receiver_party_href": "counterpartyA",
+          "reset_dates": {
+            "calculation_period_dates_href": "floatingLegCalcPeriodDates",
+            "fixing_dates": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "floatingLegResetDates",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "floatingLegResetDates",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          }
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "fixed_rate_schedule": {
+              "initial_value": "0.015437500000000000"
+            },
+            "notional_schedule": {
+              "currency": "JPY",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "3000000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "10"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2011-03-10"
+            },
+            "id": "fixedLegCalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2023-03-10"
+            }
+          },
+          "id": "fixedLeg",
+          "payer_party_href": "counterpartyA",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedLegCalcPeriodDates",
+            "id": "fixedLegPaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "receiver_party_href": "counterpartyB"
+        }
+      ]
+    },
+    "trade_context": "tradePackage",
+    "trade_count": 2,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "tradeSource",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "SEF1"
+            },
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000OYML8W30IO673"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/trade-package-id",
+              "value": "TR1"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyA"
+        },
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyB"
+        }
+      ],
+      "trade_date": "2009-12-25"
+    },
+    "trade_ordinal": 0
+  },
+  {
+    "correlation_id": "0123456",
+    "creation_timestamp": {
+      "local": "2009-12-25T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2009-12-25T08:57:00Z"
+    },
+    "document_root": "requestClearing",
+    "document_sha256": "49990bf910815bf03629dc7e16ee78202fa07480441381c8321e0fe6fd7deb39",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "M000123",
+    "message_id_scheme": "http://sef1.com/message-id",
+    "parties": [
+      {
+        "id": "counterpartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493007UORKUC7B3R009"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300CG6M7FPQFSZZ36"
+          }
+        ]
+      },
+      {
+        "id": "counterpartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493001GQM0W2RB8NG57"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "F226TOH6YD6XJB17KS62"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF1"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000OYML8W30IO673"
+          }
+        ]
+      },
+      {
+        "id": "executionVenue",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF2"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500W4M6T99LTBH450"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/requestClearing/tradePackage/trade[2]",
+    "sent_by": "SEF1",
+    "sequence_number": 1,
+    "swap": {
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "InterestRate:IRSwap:FixedFloat"
+          }
+        ]
+      },
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "JPY-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 6
+              }
+            },
+            "notional_schedule": {
+              "currency": "JPY",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "3000000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "10"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2011-03-10"
+            },
+            "id": "t2floatingLegCalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2023-03-10"
+            }
+          },
+          "id": "t2floatingLeg",
+          "payer_party_href": "counterpartyB",
+          "payment_dates": {
+            "calculation_period_dates_href": "t2floatingLegCalcPeriodDates",
+            "id": "t2floatingLegPaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "receiver_party_href": "counterpartyA",
+          "reset_dates": {
+            "calculation_period_dates_href": "t2floatingLegCalcPeriodDates",
+            "fixing_dates": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "t2floatingLegResetDates",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "t2floatingLegResetDates",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          }
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "fixed_rate_schedule": {
+              "initial_value": "0.015437500000000000"
+            },
+            "notional_schedule": {
+              "currency": "JPY",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "3000000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "10"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2011-03-10"
+            },
+            "id": "t2fixedLegCalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2023-03-10"
+            }
+          },
+          "id": "t2fixedLeg",
+          "payer_party_href": "counterpartyA",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedLegCalcPeriodDates",
+            "id": "t2fixedLegPaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "JPTO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "receiver_party_href": "counterpartyB"
+        }
+      ]
+    },
+    "trade_context": "tradePackage",
+    "trade_count": 2,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "tradeSource",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "SEF1"
+            },
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000OYML8W30IO673"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/trade-package-id",
+              "value": "TR2"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyA"
+        },
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyB"
+        }
+      ],
+      "trade_date": "2009-12-25"
+    },
+    "trade_ordinal": 1
+  }
+]

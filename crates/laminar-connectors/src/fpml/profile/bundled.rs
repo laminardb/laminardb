@@ -1,10 +1,20 @@
 //! Profile files shipped in the binary.
 
 /// Bundled profiles: `(name, root file)`.
-pub const BUNDLED_PROFILES: &[(&str, &str)] = &[(
-    "fpml-5-13-confirmation-trade",
-    "fpml-5-13/confirmation/trade.toml",
-)];
+pub const BUNDLED_PROFILES: &[(&str, &str)] = &[
+    (
+        "fpml-5-13-confirmation-trade",
+        "fpml-5-13/confirmation/trade.toml",
+    ),
+    (
+        "fpml-5-13-confirmation-rates",
+        "fpml-5-13/confirmation/trade-rates.toml",
+    ),
+    (
+        "fpml-5-13-confirmation-fx",
+        "fpml-5-13/confirmation/trade-fx.toml",
+    ),
+];
 
 macro_rules! profile_files {
     ($($path:literal),* $(,)?) => {
@@ -19,6 +29,9 @@ const FILES: &[(&str, &str)] = profile_files!(
     "fpml-5-13/confirmation/options.toml",
     "fpml-5-13/confirmation/products/fx.toml",
     "fpml-5-13/confirmation/products/rates.toml",
+    "fpml-5-13/confirmation/trade-columns.toml",
+    "fpml-5-13/confirmation/trade-fx.toml",
+    "fpml-5-13/confirmation/trade-rates.toml",
     "fpml-5-13/confirmation/trade.toml",
 );
 

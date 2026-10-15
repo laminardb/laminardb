@@ -36,27 +36,6 @@
     "row_locator": "/requestConfirmation/trade",
     "sent_by": "ABNANL2A",
     "sequence_number": 1,
-    "term_deposit": {
-      "day_count_fraction": "ACT/360",
-      "fixed_rate": "0.040000000000000000",
-      "maturity_date": "2002-02-15",
-      "payer_party_href": "party1",
-      "principal": {
-        "amount": "25000000.000000000000000000",
-        "currency": "CHF",
-        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
-      },
-      "product": {
-        "product_types": [
-          {
-            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
-            "value": "TermDeposit"
-          }
-        ]
-      },
-      "receiver_party_href": "party2",
-      "start_date": "2002-02-14"
-    },
     "trade_context": "requestConfirmation",
     "trade_count": 1,
     "trade_header": {

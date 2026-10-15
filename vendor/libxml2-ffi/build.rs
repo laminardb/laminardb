@@ -47,8 +47,8 @@ const ON: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=libxml2");
-    let source = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
-        .join("libxml2");
+    let source =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")).join("libxml2");
 
     let mut config = cmake::Config::new(&source);
     // One optimized C build for every Rust profile keeps the library name and CRT stable.

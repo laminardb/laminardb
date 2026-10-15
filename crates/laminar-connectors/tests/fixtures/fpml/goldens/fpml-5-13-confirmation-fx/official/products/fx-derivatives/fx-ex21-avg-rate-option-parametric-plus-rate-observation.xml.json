@@ -1,0 +1,125 @@
+[
+  {
+    "correlation_id": "CRR/2007/01/04/2342342",
+    "creation_timestamp": {
+      "local": "2010-11-05T12:34:56",
+      "offset_minutes": -300,
+      "utc": "2010-11-05T17:34:56Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "2429848c8784cdf7124ac89dcc438046b545df6c1dd685a87f1d0ae298ed06d0",
+    "fpml_version": "5-13",
+    "fx_option": {
+      "buyer_party_href": "party2",
+      "call_currency_amount": {
+        "amount": "463709.680000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "exercise": {
+        "expiry_date": "2010-11-30",
+        "expiry_time": {
+          "business_center": "MXMC",
+          "hour_minute_time": "12:30:00"
+        },
+        "style": "europeanExercise",
+        "value_date": "2010-12-04"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "1750.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2010-08-18"
+            }
+          },
+          "receiver_party_href": "party1"
+        }
+      ],
+      "product": {},
+      "put_currency_amount": {
+        "amount": "5750000.000000000000000000",
+        "currency": "MXN",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "seller_party_href": "party1",
+      "strike": {
+        "rate": "12.400000000000000000",
+        "strike_quote_basis": "PutCurrencyPerCallCurrency"
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX87654",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "7H6GLXDRUGQFU57RNE97"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800QILIUD4ROSUO03"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYAUS33",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "7H6GLXDRUGQFU57RNE97"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.chase.com/fx/trade-id",
+              "value": "CH-23948"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "213800QILIUD4ROSUO03"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.db.com/fx/trade-id",
+              "value": "DB-89080"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2010-08-16"
+    },
+    "trade_ordinal": 0
+  }
+]

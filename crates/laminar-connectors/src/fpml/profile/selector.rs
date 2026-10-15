@@ -5,7 +5,7 @@
 //! selector  := ['/'] step (('/' | '->') step)*
 //! step      := '.' pred* | '..' | '**' | '*' | name pred* | '{' set '}' pred*
 //!            | '@' name | '#text' | '#name' | '#type' | '#locator'
-//! pred      := '[' name ']'
+//! pred      := '[' name ']' | '[' '{' set '}' ']'
 //! name      := [prefix ':'] local
 //! ```
 //!
@@ -13,7 +13,8 @@
 //! its default namespace); unprefixed attributes have no namespace. A leading `/` starts at the
 //! document root; `|` concatenates the results of alternatives in order (FpML's
 //! value-or-reference choices). `**` is descendant-or-self,
-//! `[name]` keeps elements that have such a child, and `->` follows the current element's `href`
+//! `[name]` keeps elements that have such a child (`[{set}]`: a child in the set), and `->`
+//! follows the current element's `href`
 //! to the element with that `id`. A value step (`@`, `#…`) may only end a selector; a selector
 //! ending in an element yields that element's character data.
 
@@ -31,13 +32,13 @@ pub(crate) enum ParsedStep {
     Root,
     Child {
         test: ParsedTest,
-        predicates: Vec<ParsedName>,
+        predicates: Vec<ParsedTest>,
     },
     Descendants,
     Parent,
     Deref,
     /// `.[name]…`: keep the current elements that have such children.
-    Filter(Vec<ParsedName>),
+    Filter(Vec<ParsedTest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,13 +155,8 @@ fn child(token: &str, namespaces: &BTreeMap<String, String>) -> Result<ParsedSte
     };
     let test = if head == "*" {
         ParsedTest::Any
-    } else if let Some(set) = head.strip_prefix('{').and_then(|set| set.strip_suffix('}')) {
-        if set.is_empty() {
-            return Err("empty set name".into());
-        }
-        ParsedTest::Set(set.to_owned())
     } else {
-        ParsedTest::Name(name(head, namespaces, true)?)
+        name_or_set(head, namespaces)?
     };
     Ok(ParsedStep::Child {
         test,
@@ -168,18 +164,28 @@ fn child(token: &str, namespaces: &BTreeMap<String, String>) -> Result<ParsedSte
     })
 }
 
+fn name_or_set(text: &str, namespaces: &BTreeMap<String, String>) -> Result<ParsedTest, String> {
+    let Some(set) = text.strip_prefix('{').and_then(|set| set.strip_suffix('}')) else {
+        return Ok(ParsedTest::Name(name(text, namespaces, true)?));
+    };
+    if set.is_empty() {
+        return Err("empty set name".into());
+    }
+    Ok(ParsedTest::Set(set.to_owned()))
+}
+
 fn predicates(
     token: &str,
     mut rest: &str,
     namespaces: &BTreeMap<String, String>,
-) -> Result<Vec<ParsedName>, String> {
+) -> Result<Vec<ParsedTest>, String> {
     let mut parsed = Vec::new();
     while !rest.is_empty() {
         let inner = rest
             .strip_prefix('[')
             .and_then(|after| after.split_once(']'))
             .ok_or_else(|| format!("malformed predicate in '{token}'"))?;
-        parsed.push(name(inner.0, namespaces, true)?);
+        parsed.push(name_or_set(inner.0, namespaces)?);
         rest = inner.1;
     }
     Ok(parsed)
@@ -244,7 +250,7 @@ mod tests {
                 ParsedStep::Descendants,
                 ParsedStep::Child {
                     test: ParsedTest::Name(fpml("trade")),
-                    predicates: vec![fpml("tradeHeader")]
+                    predicates: vec![ParsedTest::Name(fpml("tradeHeader"))]
                 },
                 ParsedStep::Child {
                     test: ParsedTest::Set("product".into()),
@@ -273,7 +279,21 @@ mod tests {
         assert_eq!(parse(".", &namespaces()).unwrap().steps, vec![]);
         assert_eq!(
             parse(".[basketConstituent]", &namespaces()).unwrap().steps,
-            vec![ParsedStep::Filter(vec![fpml("basketConstituent")])]
+            vec![ParsedStep::Filter(vec![ParsedTest::Name(fpml(
+                "basketConstituent"
+            ))])]
+        );
+        assert_eq!(
+            parse("trade[tradeHeader][{rates}]", &namespaces())
+                .unwrap()
+                .steps,
+            vec![ParsedStep::Child {
+                test: ParsedTest::Name(fpml("trade")),
+                predicates: vec![
+                    ParsedTest::Name(fpml("tradeHeader")),
+                    ParsedTest::Set("rates".into())
+                ]
+            }]
         );
         assert_eq!(
             parse("{product}/#name", &namespaces()).unwrap().terminal,
@@ -284,7 +304,7 @@ mod tests {
     #[test]
     fn rejects_malformed_selectors() {
         for selector in [
-            "", "a//b", "@x/b", "#name/b", "u:a", "a[b", "{}", "#unknown", "1a",
+            "", "a//b", "@x/b", "#name/b", "u:a", "a[b", "{}", "#unknown", "1a", "a[*]", "a[{}]",
         ] {
             assert!(parse(selector, &namespaces()).is_err(), "{selector}");
         }

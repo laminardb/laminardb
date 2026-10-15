@@ -9,61 +9,6 @@
     "document_root": "requestConfirmation",
     "document_sha256": "12622f8429ed9063c05b2fa5657db46f8d27cc06d9995a15bb7afb98502414da",
     "fpml_version": "5-13",
-    "fx_single_leg": {
-      "details": {
-        "exchange_rate": {
-          "forward_points": "0.050000000000000000",
-          "quoted_currency_pair": {
-            "currency1": "USD",
-            "currency2": "INR",
-            "quote_basis": "Currency2PerCurrency1"
-          },
-          "rate": "43.400000000000000000",
-          "spot_rate": "43.350000000000000000"
-        },
-        "exchanged_currency1": {
-          "payer_party_href": "party2",
-          "payment_amount": {
-            "amount": "10000000.000000000000000000",
-            "currency": "USD",
-            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
-          },
-          "receiver_party_href": "party1"
-        },
-        "exchanged_currency2": {
-          "payer_party_href": "party1",
-          "payment_amount": {
-            "amount": "434000000.000000000000000000",
-            "currency": "INR",
-            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
-          },
-          "receiver_party_href": "party2"
-        },
-        "non_deliverable_settlement": {
-          "fixings": [
-            {
-              "fixing_date": "2002-04-09",
-              "fx_spot_rate_source": {
-                "fixing_time": {
-                  "business_center": "INMU",
-                  "hour_minute_time": "14:30:00"
-                },
-                "rate_source": "Reuters",
-                "rate_source_page": "RBIB"
-              },
-              "quoted_currency_pair": {
-                "currency1": "USD",
-                "currency2": "INR",
-                "quote_basis": "Currency2PerCurrency1"
-              }
-            }
-          ],
-          "settlement_currency": "USD"
-        },
-        "value_date": "2002-04-11"
-      },
-      "product": {}
-    },
     "is_correction": false,
     "message_id": "09876",
     "message_id_scheme": "http://www.partyA.com/coding-scheme/messageId",

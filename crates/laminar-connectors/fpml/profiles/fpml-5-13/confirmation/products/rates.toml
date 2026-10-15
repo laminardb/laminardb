@@ -125,14 +125,6 @@ fields = [
   { name = "value_date", type = "date32", path = "valueDate" },
 ]
 
-[structs.fx_spot_rate_source]
-fields = [
-  { name = "rate_source", type = "utf8", path = "primaryRateSource/rateSource" },
-  { name = "rate_source_page", type = "utf8", path = "primaryRateSource/rateSourcePage" },
-  { name = "secondary_rate_source", type = "utf8", path = "secondaryRateSource/rateSource" },
-  { name = "fixing_time", type = "struct<business_center_time>", path = "fixingTime" },
-]
-
 [structs.floating_rate_calculation]
 fields = [
   { name = "id", type = "utf8", path = "@id" },

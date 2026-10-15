@@ -1,12 +1,16 @@
 //! Golden outputs of every bundled profile over every schema-valid official example and every
-//! synthetic fixture. A document without rows still has a golden (`[]`), so zero-row documents
-//! are covered too. `FPML_GOLDEN_REGEN=1` rewrites them; `tools/fpml/oracle.py` re-derives every
-//! golden from the profile and the XML with an independent parser.
+//! synthetic fixture. A document that yields rows has a JSON golden; the documents that yield none
+//! are listed in the profile's `zero-rows.txt`, so every fixture's outcome is pinned; an expected
+//! rejection's golden records the error. `FPML_GOLDEN_REGEN=1` rewrites them;
+//! `tools/fpml_oracle.py` re-derives every golden from the profile and the XML with an independent
+//! parser.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::{decoder_for, example, fixtures_root, synthetic_fixtures, valid_examples};
+use super::{
+    decoder_for, example, expected_rejection, fixtures_root, synthetic_fixtures, valid_examples,
+};
 use crate::fpml::{golden, BUNDLED_PROFILES};
 
 /// `(golden path relative to the profile directory, document bytes)` for every fixture.
@@ -26,6 +30,8 @@ pub(super) fn golden_root(profile: &str) -> PathBuf {
     fixtures_root().join("goldens").join(profile)
 }
 
+const ZERO_ROWS: &str = "zero-rows.txt";
+
 #[test]
 fn every_profile_matches_its_goldens_over_every_fixture() {
     let regenerate = std::env::var_os("FPML_GOLDEN_REGEN").is_some();
@@ -35,23 +41,41 @@ fn every_profile_matches_its_goldens_over_every_fixture() {
         let decoder = decoder_for(profile);
         let root = golden_root(profile);
         let mut expected = BTreeSet::new();
+        let mut zero_rows = Vec::new();
         for (relative, bytes) in &fixtures {
-            let batch = decoder
-                .decode(bytes)
-                .unwrap_or_else(|error| panic!("{profile} {relative}: {error}"));
-            let mut rendered = serde_json::to_string_pretty(&golden::rows(&batch)).unwrap();
+            let official = relative
+                .strip_prefix("official/")
+                .and_then(|path| path.strip_suffix(".json"));
+            let rejection = official.and_then(|path| expected_rejection(profile, path));
+            let value = match (decoder.decode(bytes), rejection) {
+                (Ok(batch), None) => serde_json::Value::Array(golden::rows(&batch)),
+                (Err(error), Some(reason)) if error.to_string().contains(reason) => {
+                    serde_json::json!({ "rejected": error.to_string() })
+                }
+                (Ok(_), Some(reason)) => panic!("{profile} {relative}: expected {reason}"),
+                (Err(error), _) => panic!("{profile} {relative}: {error}"),
+            };
+            if value.as_array().is_some_and(Vec::is_empty) {
+                zero_rows.push(relative.trim_end_matches(".json").to_owned());
+                continue;
+            }
+            let mut rendered = serde_json::to_string_pretty(&value).unwrap();
             rendered.push('\n');
             let path = relative
                 .split('/')
                 .fold(root.clone(), |path, part| path.join(part));
-            expected.insert(path.clone());
-            if regenerate {
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(&path, rendered).unwrap();
-            } else if std::fs::read_to_string(&path).ok().as_deref() != Some(rendered.as_str()) {
-                mismatches.push(format!("{profile}: {relative}"));
-            }
+            check_golden(&path, &rendered, regenerate, &mut mismatches);
+            expected.insert(path);
         }
+        zero_rows.sort();
+        let listing = zero_rows.iter().fold(String::new(), |mut listing, path| {
+            listing.push_str(path);
+            listing.push('\n');
+            listing
+        });
+        let path = root.join(ZERO_ROWS);
+        check_golden(&path, &listing, regenerate, &mut mismatches);
+        expected.insert(path);
         for stale in walk(&root) {
             if !expected.contains(&stale) {
                 if regenerate {
@@ -70,7 +94,16 @@ fn every_profile_matches_its_goldens_over_every_fixture() {
     );
 }
 
-pub(super) fn walk(root: &std::path::Path) -> Vec<PathBuf> {
+fn check_golden(path: &Path, rendered: &str, regenerate: bool, mismatches: &mut Vec<String>) {
+    if regenerate {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, rendered).unwrap();
+    } else if std::fs::read_to_string(path).ok().as_deref() != Some(rendered) {
+        mismatches.push(path.display().to_string());
+    }
+}
+
+pub(super) fn walk(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {

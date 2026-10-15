@@ -396,7 +396,7 @@ fields = [
   { name = "spot_rate", type = "decimal", path = "spotRate" },
   { name = "linear_payoff_regions", type = "list<struct<fx_payoff_region>>", path = "linearPayoffRegion" },
   { name = "average_rate", type = "struct<fx_rate_observable>", path = "averageRate" },
-  { name = "additional_payments", type = "list<struct<payment>>", path = "additionalPayment" },
+  { name = "additional_payments", type = "list<struct<simple_payment>>", path = "additionalPayment" },
   { name = "cash_settlement", type = "struct<fx_cash_settlement>", path = "cashSettlement" },
 ]
 
@@ -462,7 +462,7 @@ fields = [
   { name = "pivot", type = "struct<schedule>", path = "pivot" },
   { name = "payoff_regions", type = "list<struct<fx_payoff_region>>", path = "constantPayoffRegion | linearPayoffRegion" },
   { name = "barriers", type = "list<struct<fx_barrier>>", path = "barrier" },
-  { name = "additional_payments", type = "list<struct<payment>>", path = "additionalPayment" },
+  { name = "additional_payments", type = "list<struct<simple_payment>>", path = "additionalPayment" },
   { name = "cash_settlement", type = "struct<fx_cash_settlement>", path = "cashSettlement" },
 ]
 

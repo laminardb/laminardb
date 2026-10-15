@@ -3,15 +3,18 @@
 //! A profile is a TOML file with a `[profile]` header, `[[columns]]`, and optional
 //! `[namespaces]`, `[sets]`, and `[structs.<template>]` sections. `include` pulls in other files
 //! (relative to the including file, or `bundled:<path>` for a bundled file) that contribute
-//! namespaces, sets, and struct templates. Profiles are compiled against the pinned schema
-//! closure before activation: unknown element or attribute names, unknown templates, and
-//! incompatible types fail configuration, never ingestion.
+//! namespaces, sets, struct templates, and columns; an included file's columns come before the
+//! including file's own, in include order, and a file included twice contributes once. Profiles
+//! are compiled against the pinned schema closure before activation: unknown element or attribute
+//! names, unknown templates, and incompatible types fail configuration, never ingestion.
 
 mod bundled;
 mod compile;
 mod plan;
 mod selector;
 mod spec;
+#[cfg(test)]
+mod tests;
 mod types;
 
 use std::collections::BTreeSet;
@@ -21,7 +24,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 pub(crate) use plan::{
-    Alternative, Column, Conversion, Meta, Plan, Selector, Source, Step, Terminal,
+    Alternative, Column, Conversion, Meta, NameTest, Plan, Selector, Source, Step, Terminal,
 };
 pub(crate) use types::UTC_ZONE;
 
@@ -195,10 +198,6 @@ impl Loader {
             }
             (false, None) => {}
         }
-        if !root && !file.columns.is_empty() {
-            return Err(located("an included file must not declare columns".into()));
-        }
-        merged.columns.extend(file.columns);
         for (prefix, uri) in file.namespaces {
             if let Some(existing) = merged.namespaces.get(&prefix) {
                 if existing != &uri {
@@ -239,6 +238,7 @@ impl Loader {
             };
             self.load(&next, identity, depth + 1, false, merged)?;
         }
+        merged.columns.extend(file.columns);
         Ok(())
     }
 }

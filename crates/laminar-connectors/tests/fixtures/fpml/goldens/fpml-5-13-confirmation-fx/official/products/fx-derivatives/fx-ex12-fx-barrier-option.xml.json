@@ -1,0 +1,146 @@
+[
+  {
+    "correlation_id": "FX01234",
+    "creation_timestamp": {
+      "local": "2001-08-16T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-08-16T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "853e0f1ea2f3c84499fe46ffbecd7d1363ecfc8d3fe3e232614296917d155bd2",
+    "fpml_version": "5-13",
+    "fx_option": {
+      "barriers": [
+        {
+          "barrier_type": "Knockin",
+          "direction": "Up",
+          "information_sources": [
+            {
+              "rate_source": "Reuters",
+              "rate_source_page": "EUR="
+            }
+          ],
+          "observation_end_date": "2002-02-06",
+          "observation_start_date": "2001-08-16",
+          "quoted_currency_pair": {
+            "currency1": "EUR",
+            "currency2": "USD",
+            "quote_basis": "Currency2PerCurrency1"
+          },
+          "trigger_rate": "0.897500000000000000"
+        }
+      ],
+      "buyer_party_href": "party2",
+      "call_currency_amount": {
+        "amount": "5000000.000000000000000000",
+        "currency": "EUR",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "exercise": {
+        "expiry_date": "2002-02-06",
+        "expiry_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "10:00:00"
+        },
+        "style": "europeanExercise",
+        "value_date": "2002-02-08"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "45000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2001-11-06"
+            }
+          },
+          "receiver_party_href": "party1"
+        }
+      ],
+      "product": {},
+      "put_currency_amount": {
+        "amount": "4500000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "seller_party_href": "party1",
+      "spot_rate": "0.893500000000000000",
+      "strike": {
+        "rate": "0.900000000000000000",
+        "strike_quote_basis": "PutCurrencyPerCallCurrency"
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX109876",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800QILIUD4ROSUO03"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYAUS33",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "PARTYAUS33"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "213800QILIUD4ROSUO03"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.db.com/swaps/trade-id",
+              "value": "DEUTDEFF"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-08-16"
+    },
+    "trade_ordinal": 0
+  }
+]

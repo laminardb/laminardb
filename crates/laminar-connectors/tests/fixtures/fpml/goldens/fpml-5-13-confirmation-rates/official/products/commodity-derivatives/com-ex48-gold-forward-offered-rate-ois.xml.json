@@ -1,0 +1,282 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "77aa0da5d2524e2054f66c7e088ef54c1d2c97a65b0ee8a42f3c82a185487ebd",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021"
+      ]
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank A"
+          }
+        ],
+        "party_name": "Bank a"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank B"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "swap": {
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        },
+        "product_ids": [
+          {
+            "scheme": "http://www.dtcc.com/coding-scheme/external/GTR-Product-Id",
+            "value": "Commodity:Metals:Precious:LoanLease:Cash"
+          }
+        ]
+      },
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-SOFR-OIS Compound",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index"
+            },
+            "notional_schedule": {
+              "currency": "XAU",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "100.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 3,
+              "roll_convention": "1"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2021-08-18"
+            },
+            "id": "gofoperioddates1",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_centers_href": "primaryBusinessCenters",
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2022-08-18"
+            }
+          },
+          "payer_party_href": "party1",
+          "payment_dates": {
+            "calculation_period_dates_href": "gofoperioddates1",
+            "first_payment_date": "2021-11-18",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            }
+          },
+          "receiver_party_href": "party2",
+          "reset_dates": {
+            "calculation_period_dates_href": "gofoperioddates1",
+            "fixing_dates": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "resetDates1",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "resetDates1",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          }
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "floating_rate_calculation": {
+              "floating_rate_index": "GOFO",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/commodity-floating-rate-index",
+              "spread_schedules": [
+                {
+                  "initial_value": "-0.000100000000000000"
+                }
+              ]
+            },
+            "notional_schedule": {
+              "currency": "XAU",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "100.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 3,
+              "roll_convention": "1"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_centers_href": "primaryBusinessCenters",
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2021-08-18"
+            },
+            "id": "gofoperioddates2",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_centers_href": "primaryBusinessCenters",
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2022-08-18"
+            }
+          },
+          "payer_party_href": "party2",
+          "payment_dates": {
+            "calculation_period_dates_href": "gofoperioddates2",
+            "first_payment_date": "2021-11-18",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            }
+          },
+          "receiver_party_href": "party1",
+          "reset_dates": {
+            "calculation_period_dates_href": "gofoperioddates2",
+            "fixing_dates": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "resetDates2",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "resetDates2",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          }
+        }
+      ]
+    },
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Bank A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.bankB.com/swaps/com-trade-id",
+              "value": "BankA1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Bank B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.bankA.com/swaps/com-trade-id",
+              "value": "BankB5678"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2021-08-18"
+    },
+    "trade_ordinal": 0
+  }
+]

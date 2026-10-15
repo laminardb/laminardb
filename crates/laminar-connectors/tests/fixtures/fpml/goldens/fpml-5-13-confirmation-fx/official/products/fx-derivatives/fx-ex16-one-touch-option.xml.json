@@ -1,0 +1,156 @@
+[
+  {
+    "correlation_id": "FX12345",
+    "creation_timestamp": {
+      "local": "2001-11-12T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-11-12T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "d9933fb4ced1641166a2612a053ee0e0fa0e6b6489d52a16ce5a6f32060427aa",
+    "fpml_version": "5-13",
+    "fx_digital_option": {
+      "buyer_party_href": "party2",
+      "exercise": {
+        "commencement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2001-11-12"
+          }
+        },
+        "cut_name": "LondonEveningPgm",
+        "expiry_date": "2001-11-26",
+        "expiry_time": {
+          "business_center": "GBLO",
+          "hour_minute_time": "14:00:00"
+        },
+        "latest_value_date": "2001-11-26",
+        "style": "americanExercise"
+      },
+      "payout": {
+        "amount": "2000000.000000000000000000",
+        "currency": "GBP",
+        "payout_style": "Deferred"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "78000.000000000000000000",
+            "currency": "GBP",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2001-11-14"
+            }
+          },
+          "receiver_party_href": "party1"
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.sample.com/coding-scheme/product-type-simple",
+            "value": "OneTouch"
+          }
+        ]
+      },
+      "seller_party_href": "party1",
+      "touches": [
+        {
+          "direction": "AtOrAbove",
+          "information_sources": [
+            {
+              "rate_source": "Reuters",
+              "rate_source_page": "GBP="
+            }
+          ],
+          "observation_end_date": "2001-11-26",
+          "observation_start_date": "2001-11-12",
+          "quoted_currency_pair": {
+            "currency1": "GBP",
+            "currency2": "USD",
+            "quote_basis": "Currency2PerCurrency1"
+          },
+          "spot_rate": "1.480000000000000000",
+          "touch_condition": "Touch",
+          "trigger_rate": "1.520000000000000000"
+        }
+      ]
+    },
+    "is_correction": false,
+    "message_id": "FX019876",
+    "message_id_scheme": "http://www.citi.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000SCC07UI6DB380"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFM8T61CT2L1QCEMIK50"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxDigitalOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "CITI10015",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000SCC07UI6DB380"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.citi.com/fx/trade-id",
+              "value": "CITI10016"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFM8T61CT2L1QCEMIK50"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.ubsw.com/fx/trade-id",
+              "value": "UBSW20016"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-11-12"
+    },
+    "trade_ordinal": 0
+  }
+]

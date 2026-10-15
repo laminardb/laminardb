@@ -6,7 +6,9 @@
 //! context type is unknown (`**`, `..`, unannotated `->`) fall back to checking that the name
 //! is declared at all. A struct template may be a union over several element types (for example
 //! every underlying asset): a template field that a particular use cannot match compiles to an
-//! always-null value there, and is an error only if no use of the template can match it.
+//! always-null value there, and is an error only if no use of the template can match it. A use
+//! on known types that can match none of the template's child-element fields is an error, since
+//! the struct would be null wherever the element appears.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -56,6 +58,8 @@ struct Compiler<'a> {
     root_types: BTreeSet<QName>,
     interner: Interner,
     templates: Vec<String>,
+    /// Per open template use: its child-element fields, and how many of them this use can match.
+    uses: Vec<(usize, usize)>,
     /// `(template, field)` to whether any use of the template can match the field.
     template_fields: BTreeMap<(String, String), bool>,
 }
@@ -88,6 +92,7 @@ pub(crate) fn compile(
         root_types: BTreeSet::new(),
         interner: Interner::default(),
         templates: Vec::new(),
+        uses: Vec::new(),
         template_fields: BTreeMap::new(),
     };
     for (name, spec) in &merged.sets {
@@ -312,14 +317,10 @@ impl Compiler<'_> {
                 ParsedStep::Descendants => (Step::Descendants, None),
                 ParsedStep::Parent => (Step::Parent, None),
                 ParsedStep::Deref => (Step::Deref, self.dereferenced(&types)),
-                ParsedStep::Filter(predicates) => {
-                    let mut compiled_predicates = Vec::with_capacity(predicates.len());
-                    for predicate in &predicates {
-                        self.child_types(&types, predicate)?;
-                        compiled_predicates.push(self.interner.intern(&predicate.0, &predicate.1));
-                    }
-                    (Step::Filter(compiled_predicates), types.clone())
-                }
+                ParsedStep::Filter(predicates) => (
+                    Step::Filter(self.predicates(&predicates, &types)?),
+                    types.clone(),
+                ),
                 ParsedStep::Child { test, predicates } => {
                     let (test, next) = match test {
                         ParsedTest::Any => (NameTest::Any, None),
@@ -329,18 +330,8 @@ impl Compiler<'_> {
                             (NameTest::Name(self.interner.intern(&name.0, &name.1)), next)
                         }
                     };
-                    let mut compiled_predicates = Vec::with_capacity(predicates.len());
-                    for predicate in &predicates {
-                        self.child_types(&next, predicate)?;
-                        compiled_predicates.push(self.interner.intern(&predicate.0, &predicate.1));
-                    }
-                    (
-                        Step::Child {
-                            test,
-                            predicates: compiled_predicates,
-                        },
-                        next,
-                    )
+                    let predicates = self.predicates(&predicates, &next)?;
+                    (Step::Child { test, predicates }, next)
                 }
             };
             steps.push(compiled);
@@ -357,6 +348,25 @@ impl Compiler<'_> {
             }
         };
         Ok((Alternative { steps, terminal }, types))
+    }
+
+    /// Child tests an element must each satisfy; the element's own types are unchanged.
+    fn predicates(
+        &mut self,
+        predicates: &[ParsedTest],
+        context: &Types,
+    ) -> Result<Vec<NameTest>, String> {
+        predicates
+            .iter()
+            .map(|predicate| match predicate {
+                ParsedTest::Name(name) => {
+                    self.child_types(context, name)?;
+                    Ok(NameTest::Name(self.interner.intern(&name.0, &name.1)))
+                }
+                ParsedTest::Set(set) => Ok(self.set_step(set, context)?.0),
+                ParsedTest::Any => Err("'[*]' is not a predicate".into()),
+            })
+            .collect()
     }
 
     fn set_step(&self, set: &str, context: &Types) -> Result<(NameTest, Types), String> {
@@ -584,17 +594,24 @@ impl Compiler<'_> {
             _ => return self.selector(path, context),
         };
         let key = (template, spec.name.clone());
-        match self.selector(path, context) {
+        let (compiled, matched) = match self.selector(path, context) {
             Ok(compiled) => {
                 self.template_fields.insert(key, true);
-                Ok(compiled)
+                (compiled, true)
             }
             Err(_) if context.is_some() => {
                 self.template_fields.entry(key).or_insert(false);
-                self.selector(path, &None)
+                (self.selector(path, &None)?, false)
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
+        };
+        if starts_at_child(&compiled.0) {
+            if let Some((fields, matches)) = self.uses.last_mut() {
+                *fields += 1;
+                *matches += usize::from(matched);
+            }
         }
+        Ok(compiled)
     }
 
     fn template(&mut self, name: &str, context: &Types) -> Result<(Vec<Column>, Fields), String> {
@@ -614,6 +631,7 @@ impl Compiler<'_> {
             return Err(format!("struct template '{name}' has no fields"));
         }
         self.templates.push(name.to_owned());
+        self.uses.push((0, 0));
         let mut columns = Vec::with_capacity(spec.fields.len());
         let mut fields = Vec::with_capacity(spec.fields.len());
         let mut seen = HashSet::new();
@@ -635,12 +653,27 @@ impl Compiler<'_> {
             }
         }
         self.templates.pop();
+        if let (Some((fields, 0)), Some(types)) = (self.uses.pop(), context) {
+            if fields > 0 {
+                errors.push(format!(
+                    "struct template '{name}' matches none of its element fields in {}",
+                    type_list(types)
+                ));
+            }
+        }
         if errors.is_empty() {
             Ok((columns, Fields::from(fields)))
         } else {
             Err(errors.join("\n"))
         }
     }
+}
+
+fn starts_at_child(selector: &Selector) -> bool {
+    selector
+        .alternatives
+        .iter()
+        .any(|alternative| matches!(alternative.steps.first(), Some(Step::Child { .. })))
 }
 
 fn type_list(types: &BTreeSet<QName>) -> String {
