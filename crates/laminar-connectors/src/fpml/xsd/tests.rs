@@ -24,7 +24,12 @@ fn schema(body: &str) -> String {
 fn validate(validator: &mut Validator, document: &str) -> Result<(Document, Refusals), Rejection> {
     let mut interner = Interner::default();
     let names = TreeNames::new(&mut interner, &[NS.to_owned()]);
-    validator.validate(document.as_bytes(), &Limits::default(), &mut interner, &names)
+    validator.validate(
+        document.as_bytes(),
+        &Limits::default(),
+        &mut interner,
+        &names,
+    )
 }
 
 const SIMPLE: &str = r#"<xsd:element name="r" type="xsd:string"/>"#;
@@ -110,10 +115,7 @@ fn instance_dtds_and_external_entities_are_rejected_without_loading() {
         format!(r#"<!DOCTYPE r [<!ENTITY % p SYSTEM "{secret_url}"> %p;]><r xmlns="{NS}">a</r>"#),
     ] {
         let error = validate(&mut validator, &document).unwrap_err();
-        assert!(
-            matches!(error.stage, Stage::Parse),
-            "{document}: {error}"
-        );
+        assert!(matches!(error.stage, Stage::Parse), "{document}: {error}");
         assert!(!error.detail.contains("TOP-SECRET"), "{error}");
     }
 }
@@ -187,7 +189,12 @@ fn validated_tree_carries_schema_defaults_and_resolved_xsi_types() {
            </p:r>"#
     );
     let (tree, _) = validator
-        .validate(document.as_bytes(), &Limits::default(), &mut interner, &names)
+        .validate(
+            document.as_bytes(),
+            &Limits::default(),
+            &mut interner,
+            &names,
+        )
         .unwrap();
     let values: Vec<_> = tree.children(0).collect();
     assert_eq!(values.len(), 3);
@@ -247,7 +254,10 @@ fn redaction_keeps_component_names_and_drops_values() {
         redact(message),
         "Element '{urn:x}tradeId', attribute 'tradeIdScheme': '…' is not a valid value of the atomic type '{urn:x}NonEmptyURI'."
     );
-    assert_eq!(redact("value 'PARTY-SECRET' and 'unterminated"), "value '…' and '…");
+    assert_eq!(
+        redact("value 'PARTY-SECRET' and 'unterminated"),
+        "value '…' and '…"
+    );
 }
 
 #[derive(serde::Deserialize)]
@@ -281,7 +291,8 @@ fn official_examples_validate_against_the_bundled_closure() {
         let verdict = validator.validate(&bytes, &Limits::default(), &mut interner, &names);
         match entry.status.as_str() {
             "xsd-valid" => {
-                let (_, refusals) = verdict.unwrap_or_else(|error| panic!("{}: {error}", entry.path));
+                let (_, refusals) =
+                    verdict.unwrap_or_else(|error| panic!("{}: {error}", entry.path));
                 assert_eq!(refusals.attempts, 0, "{}", entry.path);
                 valid += 1;
             }

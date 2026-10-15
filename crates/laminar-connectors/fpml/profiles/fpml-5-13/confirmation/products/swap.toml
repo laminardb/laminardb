@@ -1,0 +1,39 @@
+# fpml:swap (Swap): interest rate swaps, including cross-currency, inflation, OIS, zero-coupon,
+# and FX-linked notional legs. Cashflows are not generated; supplied schedules are kept as given.
+include = ["../common.toml", "rates.toml"]
+
+[structs.swap]
+description = "Interest rate swap"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "streams", type = "list<struct<interest_rate_stream>>", path = "swapStream", description = "One entry per swapStream leg, in document order" },
+  { name = "early_termination_provision", type = "struct<early_termination_provision>", path = "earlyTerminationProvision" },
+  { name = "cancelable_provision", type = "struct<cancelable_provision>", path = "cancelableProvision" },
+  { name = "extendible_provision", type = "struct<extendible_provision>", path = "extendibleProvision" },
+  { name = "additional_payments", type = "list<struct<payment>>", path = "additionalPayment" },
+  { name = "additional_terms", type = "list<utf8>", path = "additionalTerms/bondReference/bond/instrumentId" },
+]
+
+[structs.early_termination_provision]
+fields = [
+  { name = "mandatory_early_termination_date", type = "struct<adjustable_date>", path = "mandatoryEarlyTermination/mandatoryEarlyTerminationDate" },
+  { name = "mandatory_early_termination_tenor", type = "struct<period>", path = "mandatoryEarlyTerminationDateTenor" },
+  { name = "optional_early_termination_buyer_href", type = "utf8", path = "optionalEarlyTermination/singlePartyOption/buyerPartyReference/@href" },
+  { name = "optional_early_termination_seller_href", type = "utf8", path = "optionalEarlyTermination/singlePartyOption/sellerPartyReference/@href" },
+  { name = "optional_early_termination_exercise_type", type = "utf8", path = "optionalEarlyTermination/{exercise}/#name" },
+]
+
+[structs.cancelable_provision]
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "exercise_type", type = "utf8", path = "{exercise}/#name" },
+]
+
+[structs.extendible_provision]
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "exercise_type", type = "utf8", path = "{exercise}/#name" },
+  { name = "follow_up_confirmation", type = "bool", path = "followUpConfirmation" },
+]

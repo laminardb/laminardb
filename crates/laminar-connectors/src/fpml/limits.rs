@@ -57,7 +57,11 @@ impl Limits {
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let defaults = Self::default();
         let limits = Self {
-            max_document_bytes: bound(config, "fpml.max.document.bytes", defaults.max_document_bytes)?,
+            max_document_bytes: bound(
+                config,
+                "fpml.max.document.bytes",
+                defaults.max_document_bytes,
+            )?,
             max_depth: bound(config, "fpml.max.depth", defaults.max_depth)?,
             max_elements: bound(config, "fpml.max.elements", defaults.max_elements)?,
             max_attributes_per_element: bound(

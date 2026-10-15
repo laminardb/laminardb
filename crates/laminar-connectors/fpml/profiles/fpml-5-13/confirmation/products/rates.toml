@@ -1,0 +1,238 @@
+# Interest rate leg structures shared by swap, swaption, capFloor, and return-swap interest legs.
+include = ["../common.toml"]
+
+[structs.interest_rate_stream]
+description = "One interest rate leg (InterestRateStream)"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "payer_account_href", type = "utf8", path = "payerAccountReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "receiver_account_href", type = "utf8", path = "receiverAccountReference/@href" },
+  { name = "calculation_period_dates", type = "struct<calculation_period_dates>", path = "calculationPeriodDates" },
+  { name = "payment_dates", type = "struct<payment_dates>", path = "paymentDates" },
+  { name = "reset_dates", type = "struct<reset_dates>", path = "resetDates" },
+  { name = "calculation", type = "struct<calculation>", path = "calculationPeriodAmount/calculation" },
+  { name = "known_amount_schedule", type = "struct<amount_schedule>", path = "calculationPeriodAmount/knownAmountSchedule" },
+  { name = "stub_calculation_period_amount", type = "struct<stub_calculation_period_amount>", path = "stubCalculationPeriodAmount" },
+  { name = "principal_exchanges", type = "struct<principal_exchanges>", path = "principalExchanges" },
+  { name = "cashflows_match_parameters", type = "bool", path = "cashflows/cashflowsMatchParameters" },
+  { name = "settlement_currency", type = "utf8", path = "settlementProvision/settlementCurrency" },
+  { name = "non_deliverable_settlement", type = "struct<non_deliverable_settlement>", path = "settlementProvision/nonDeliverableSettlement" },
+]
+
+[structs.calculation_period_dates]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "effective_date", type = "struct<adjustable_date>", path = "effectiveDate" },
+  { name = "relative_effective_date", type = "struct<relative_date_offset>", path = "relativeEffectiveDate" },
+  { name = "termination_date", type = "struct<adjustable_date>", path = "terminationDate" },
+  { name = "relative_termination_date", type = "struct<relative_date_offset>", path = "relativeTerminationDate" },
+  { name = "calculation_period_dates_adjustments", type = "struct<business_day_adjustments>", path = "calculationPeriodDatesAdjustments" },
+  { name = "first_period_start_date", type = "struct<adjustable_date>", path = "firstPeriodStartDate" },
+  { name = "first_regular_period_start_date", type = "date32", path = "firstRegularPeriodStartDate" },
+  { name = "first_compounding_period_end_date", type = "date32", path = "firstCompoundingPeriodEndDate" },
+  { name = "last_regular_period_end_date", type = "date32", path = "lastRegularPeriodEndDate" },
+  { name = "stub_period_type", type = "utf8", path = "stubPeriodType" },
+  { name = "calculation_period_frequency", type = "struct<frequency>", path = "calculationPeriodFrequency" },
+]
+
+[structs.payment_dates]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "calculation_period_dates_href", type = "utf8", path = "calculationPeriodDatesReference/@href" },
+  { name = "reset_dates_href", type = "utf8", path = "resetDatesReference/@href" },
+  { name = "valuation_dates_href", type = "utf8", path = "valuationDatesReference/@href" },
+  { name = "payment_frequency", type = "struct<frequency>", path = "paymentFrequency" },
+  { name = "first_payment_date", type = "date32", path = "firstPaymentDate" },
+  { name = "last_regular_payment_date", type = "date32", path = "lastRegularPaymentDate" },
+  { name = "pay_relative_to", type = "utf8", path = "payRelativeTo" },
+  { name = "payment_days_offset", type = "struct<offset>", path = "paymentDaysOffset" },
+  { name = "payment_dates_adjustments", type = "struct<business_day_adjustments>", path = "paymentDatesAdjustments" },
+]
+
+[structs.offset]
+fields = [
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+  { name = "day_type", type = "utf8", path = "dayType" },
+]
+
+[structs.reset_dates]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "calculation_period_dates_href", type = "utf8", path = "calculationPeriodDatesReference/@href" },
+  { name = "reset_relative_to", type = "utf8", path = "resetRelativeTo" },
+  { name = "initial_fixing_date", type = "struct<relative_date_offset>", path = "initialFixingDate" },
+  { name = "fixing_dates", type = "struct<relative_date_offset>", path = "fixingDates" },
+  { name = "rate_cut_off_days_offset", type = "struct<offset>", path = "rateCutOffDaysOffset" },
+  { name = "reset_frequency", type = "struct<reset_frequency>", path = "resetFrequency" },
+  { name = "reset_dates_adjustments", type = "struct<business_day_adjustments>", path = "resetDatesAdjustments" },
+]
+
+[structs.reset_frequency]
+fields = [
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+  { name = "weekly_roll_convention", type = "utf8", path = "weeklyRollConvention" },
+]
+
+[structs.calculation]
+description = "Notional, rate, and day count of one leg (Calculation)"
+fields = [
+  { name = "notional_schedule", type = "struct<notional>", path = "notionalSchedule" },
+  { name = "fx_linked_notional_schedule", type = "struct<fx_linked_notional_schedule>", path = "fxLinkedNotionalSchedule" },
+  { name = "fixed_rate_schedule", type = "struct<schedule>", path = "fixedRateSchedule" },
+  { name = "future_value_notional", type = "struct<future_value_notional>", path = "futureValueNotional" },
+  { name = "rate_calculation_type", type = "utf8", path = "floatingRateCalculation/#name | inflationRateCalculation/#name", description = "floatingRateCalculation or inflationRateCalculation when the leg floats" },
+  { name = "floating_rate_calculation", type = "struct<floating_rate_calculation>", path = "floatingRateCalculation" },
+  { name = "inflation_rate_calculation", type = "struct<inflation_rate_calculation>", path = "inflationRateCalculation" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "discounting_type", type = "utf8", path = "discounting/discountingType" },
+  { name = "discount_rate", type = "decimal", path = "discounting/discountRate" },
+  { name = "compounding_method", type = "utf8", path = "compoundingMethod" },
+]
+
+[structs.notional]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "initial_value", type = "decimal", path = "notionalStepSchedule/initialValue" },
+  { name = "currency", type = "utf8", path = "notionalStepSchedule/currency" },
+  { name = "currency_scheme", type = "utf8", path = "notionalStepSchedule/currency/@currencyScheme" },
+  { name = "steps", type = "list<struct<step>>", path = "notionalStepSchedule/step" },
+  { name = "step_frequency", type = "struct<period>", path = "notionalStepParameters/stepFrequency" },
+  { name = "step_notional_amount", type = "decimal", path = "notionalStepParameters/notionalStepAmount" },
+  { name = "step_notional_rate", type = "decimal", path = "notionalStepParameters/notionalStepRate" },
+]
+
+[structs.fx_linked_notional_schedule]
+fields = [
+  { name = "constant_notional_schedule_href", type = "utf8", path = "constantNotionalScheduleReference/@href" },
+  { name = "initial_value", type = "decimal", path = "initialValue" },
+  { name = "varying_notional_currency", type = "utf8", path = "varyingNotionalCurrency" },
+  { name = "varying_notional_fixing_dates", type = "struct<relative_date_offset>", path = "varyingNotionalFixingDates" },
+  { name = "fx_spot_rate_source", type = "struct<fx_spot_rate_source>", path = "fxSpotRateSource" },
+  { name = "varying_notional_interim_exchange_payment_dates", type = "struct<relative_date_offset>", path = "varyingNotionalInterimExchangePaymentDates" },
+]
+
+[structs.future_value_notional]
+fields = [
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "amount", type = "decimal", path = "amount" },
+  { name = "calculation_period_number_of_days", type = "int64", path = "calculationPeriodNumberOfDays" },
+  { name = "value_date", type = "date32", path = "valueDate" },
+]
+
+[structs.fx_spot_rate_source]
+fields = [
+  { name = "rate_source", type = "utf8", path = "primaryRateSource/rateSource" },
+  { name = "rate_source_page", type = "utf8", path = "primaryRateSource/rateSourcePage" },
+  { name = "secondary_rate_source", type = "utf8", path = "secondaryRateSource/rateSource" },
+  { name = "fixing_time", type = "struct<business_center_time>", path = "fixingTime" },
+]
+
+[structs.floating_rate_calculation]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "floating_rate_index", type = "utf8", path = "floatingRateIndex" },
+  { name = "floating_rate_index_scheme", type = "utf8", path = "floatingRateIndex/@floatingRateIndexScheme" },
+  { name = "index_tenor", type = "struct<period>", path = "indexTenor" },
+  { name = "calculation_method", type = "utf8", path = "calculationParameters/calculationMethod" },
+  { name = "lookback_offset_days", type = "int64", path = "calculationParameters/lookback/offsetDays" },
+  { name = "floating_rate_multiplier_schedule", type = "struct<schedule>", path = "floatingRateMultiplierSchedule" },
+  { name = "spread_schedules", type = "list<struct<spread_schedule>>", path = "spreadSchedule" },
+  { name = "rate_treatment", type = "utf8", path = "rateTreatment" },
+  { name = "cap_rate_schedules", type = "list<struct<strike_schedule>>", path = "capRateSchedule" },
+  { name = "floor_rate_schedules", type = "list<struct<strike_schedule>>", path = "floorRateSchedule" },
+  { name = "initial_rate", type = "decimal", path = "initialRate" },
+  { name = "final_rate_rounding", type = "struct<rounding>", path = "finalRateRounding" },
+  { name = "averaging_method", type = "utf8", path = "averagingMethod" },
+  { name = "negative_interest_rate_treatment", type = "utf8", path = "negativeInterestRateTreatment" },
+]
+
+[structs.inflation_rate_calculation]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "floating_rate_index", type = "utf8", path = "floatingRateIndex" },
+  { name = "index_tenor", type = "struct<period>", path = "indexTenor" },
+  { name = "floating_rate_multiplier_schedule", type = "struct<schedule>", path = "floatingRateMultiplierSchedule" },
+  { name = "spread_schedules", type = "list<struct<spread_schedule>>", path = "spreadSchedule" },
+  { name = "cap_rate_schedules", type = "list<struct<strike_schedule>>", path = "capRateSchedule" },
+  { name = "floor_rate_schedules", type = "list<struct<strike_schedule>>", path = "floorRateSchedule" },
+  { name = "initial_rate", type = "decimal", path = "initialRate" },
+  { name = "inflation_lag", type = "struct<offset>", path = "inflationLag" },
+  { name = "index_source", type = "utf8", path = "indexSource" },
+  { name = "main_publication", type = "utf8", path = "mainPublication" },
+  { name = "interpolation_method", type = "utf8", path = "interpolationMethod" },
+  { name = "initial_index_level", type = "decimal", path = "initialIndexLevel" },
+  { name = "fallback_bond_applicable", type = "bool", path = "fallbackBondApplicable" },
+  { name = "calculation_method", type = "utf8", path = "calculationMethod" },
+  { name = "calculation_style", type = "utf8", path = "calculationStyle" },
+]
+
+[structs.spread_schedule]
+fields = [
+  { name = "initial_value", type = "decimal", path = "initialValue" },
+  { name = "steps", type = "list<struct<step>>", path = "step" },
+  { name = "type", type = "utf8", path = "type" },
+]
+
+[structs.strike_schedule]
+fields = [
+  { name = "initial_value", type = "decimal", path = "initialValue" },
+  { name = "steps", type = "list<struct<step>>", path = "step" },
+  { name = "buyer", type = "utf8", path = "buyer" },
+  { name = "seller", type = "utf8", path = "seller" },
+]
+
+[structs.rounding]
+fields = [
+  { name = "rounding_direction", type = "utf8", path = "roundingDirection" },
+  { name = "precision", type = "int64", path = "precision" },
+]
+
+[structs.stub_value]
+fields = [
+  { name = "floating_rates", type = "list<struct<stub_floating_rate>>", path = "floatingRate" },
+  { name = "stub_rate", type = "decimal", path = "stubRate" },
+  { name = "stub_amount", type = "struct<money>", path = "stubAmount" },
+]
+
+[structs.stub_floating_rate]
+fields = [
+  { name = "floating_rate_index", type = "utf8", path = "floatingRateIndex" },
+  { name = "index_tenor", type = "struct<period>", path = "indexTenor" },
+  { name = "spread_schedules", type = "list<struct<spread_schedule>>", path = "spreadSchedule" },
+]
+
+[structs.stub_calculation_period_amount]
+fields = [
+  { name = "calculation_period_dates_href", type = "utf8", path = "calculationPeriodDatesReference/@href" },
+  { name = "initial_stub", type = "struct<stub_value>", path = "initialStub" },
+  { name = "final_stub", type = "struct<stub_value>", path = "finalStub" },
+]
+
+[structs.principal_exchanges]
+fields = [
+  { name = "initial_exchange", type = "bool", path = "initialExchange" },
+  { name = "final_exchange", type = "bool", path = "finalExchange" },
+  { name = "intermediate_exchange", type = "bool", path = "intermediateExchange" },
+]
+
+[structs.non_deliverable_settlement]
+fields = [
+  { name = "reference_currency", type = "utf8", path = "referenceCurrency" },
+  { name = "fx_fixing_date", type = "struct<fx_fixing_date>", path = "fxFixingDate" },
+  { name = "settlement_rate_option", type = "utf8", path = "settlementRateOption" },
+]
+
+[structs.fx_fixing_date]
+fields = [
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+  { name = "day_type", type = "utf8", path = "dayType" },
+  { name = "business_day_convention", type = "utf8", path = "businessDayConvention" },
+  { name = "business_centers", type = "list<utf8>", path = "businessCenters/businessCenter | businessCentersReference->businessCenter" },
+  { name = "date_relative_to_payment_dates_hrefs", type = "list<utf8>", path = "dateRelativeToPaymentDates/paymentDatesReference/@href" },
+  { name = "date_relative_to_calculation_period_dates_hrefs", type = "list<utf8>", path = "dateRelativeToCalculationPeriodDates/calculationPeriodDatesReference/@href" },
+]

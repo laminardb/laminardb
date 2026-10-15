@@ -11,12 +11,13 @@
 //! creates it on the worker thread that uses it. A validation that has started runs to
 //! completion; input bounds, not cancellation, bound its work.
 
-mod tree;
 #[cfg(test)]
 mod tests;
+mod tree;
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::fmt::Write as _;
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::{Arc, Once};
@@ -24,9 +25,9 @@ use std::sync::{Arc, Once};
 use libxml2_ffi as ffi;
 
 use super::document::{Document, Interner};
-pub(crate) use tree::TreeNames;
 use super::error::{Rejection, Stage};
 use super::limits::Limits;
+pub(crate) use tree::TreeNames;
 
 /// Scheme of the synthetic base URL under which closure files are served. Relative
 /// `schemaLocation` values resolve against it; nothing else can be loaded.
@@ -80,10 +81,7 @@ impl ErrorSink {
             .collect::<Vec<_>>()
             .join("; ");
         if self.errors > self.diagnostics.len() {
-            report.push_str(&format!(
-                " (+{} more)",
-                self.errors - self.diagnostics.len()
-            ));
+            let _ = write!(report, " (+{} more)", self.errors - self.diagnostics.len());
         }
         report
     }
@@ -232,7 +230,10 @@ impl Validator {
         // SAFETY: creates a fresh parser context owned by `ParserGuard`.
         let parser = ParserGuard(unsafe { ffi::xmlNewParserCtxt() });
         if parser.0.is_null() {
-            return Err(Rejection::new(Stage::Worker, "libxml2 parser allocation failed"));
+            return Err(Rejection::new(
+                Stage::Worker,
+                "libxml2 parser allocation failed",
+            ));
         }
         // SAFETY: `parser` is live until the guard drops at the end of this function; `loader`
         // and the boxed sink outlive it. `bytes` outlives the read, which copies nothing it
@@ -359,7 +360,12 @@ unsafe extern "C" fn load_from_closure(
     // SAFETY: `requested` and `bytes` are valid for the call; flags 0 makes libxml2 copy the
     // memory, so the input does not borrow `bytes` after this returns.
     let input = unsafe {
-        ffi::xmlNewInputFromMemory(requested.as_ptr(), bytes.as_ptr().cast::<c_void>(), bytes.len(), 0)
+        ffi::xmlNewInputFromMemory(
+            requested.as_ptr(),
+            bytes.as_ptr().cast::<c_void>(),
+            bytes.len(),
+            0,
+        )
     };
     if input.is_null() {
         return ffi::XML_ERR_NO_MEMORY;

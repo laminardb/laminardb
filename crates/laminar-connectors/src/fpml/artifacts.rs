@@ -184,7 +184,10 @@ impl Artifact {
             let path = directory.join(relative);
             let size = std::fs::metadata(&path)
                 .map_err(|error| {
-                    config_error(format!("cannot read schema file '{}': {error}", path.display()))
+                    config_error(format!(
+                        "cannot read schema file '{}': {error}",
+                        path.display()
+                    ))
                 })?
                 .len();
             if size > MAX_SCHEMA_FILE_BYTES {
@@ -193,17 +196,20 @@ impl Artifact {
                 )));
             }
             let bytes = std::fs::read(&path).map_err(|error| {
-                config_error(format!("cannot read schema file '{}': {error}", path.display()))
+                config_error(format!(
+                    "cannot read schema file '{}': {error}",
+                    path.display()
+                ))
             })?;
             files.insert(name.clone(), Arc::<[u8]>::from(bytes));
         }
-        Self::verify(manifest, files, base)
+        Self::verify(manifest, files, base.as_ref())
     }
 
     fn verify(
         manifest: Manifest,
         mut files: BTreeMap<String, Arc<[u8]>>,
-        base: Option<Self>,
+        base: Option<&Self>,
     ) -> Result<Self, ConnectorError> {
         let listed = manifest.files.keys().collect::<Vec<_>>();
         let present = files.keys().collect::<Vec<_>>();
@@ -224,7 +230,7 @@ impl Artifact {
         }
         let mut digest = Sha256::new();
         let mut reference_namespaces = vec![manifest.namespace.clone()];
-        if let Some(base) = &base {
+        if let Some(base) = base {
             digest.update(base.fingerprint.as_bytes());
             for namespace in &base.reference_namespaces {
                 if !reference_namespaces.contains(namespace) {
@@ -263,7 +269,7 @@ impl Artifact {
             digest.update(name.as_bytes());
             digest.update([0]);
             digest.update(sha.to_ascii_lowercase().as_bytes());
-            digest.update([b'\n']);
+            digest.update(b"\n");
         }
         Ok(Self {
             id: manifest.artifact,
@@ -309,7 +315,10 @@ mod tests {
         assert_eq!(artifact.release, "5-13");
         assert_eq!(artifact.files.files.len(), 36);
         assert_eq!(artifact.files.entry, "fpml-main-5-13.xsd");
-        assert_eq!(Artifact::bundled().unwrap().fingerprint, artifact.fingerprint);
+        assert_eq!(
+            Artifact::bundled().unwrap().fingerprint,
+            artifact.fingerprint
+        );
     }
 
     #[test]
@@ -323,7 +332,9 @@ mod tests {
         };
         std::fs::write(
             directory.path().join("closure.toml"),
-            manifest("\"a.xsd\" = \"0000000000000000000000000000000000000000000000000000000000000000\""),
+            manifest(
+                "\"a.xsd\" = \"0000000000000000000000000000000000000000000000000000000000000000\"",
+            ),
         )
         .unwrap();
         let error = Artifact::resolve(Some(directory.path().to_str().unwrap())).unwrap_err();

@@ -1,6 +1,8 @@
 //! Schema evolution, format codecs, and connector schema traits.
 
 pub mod csv;
+#[cfg(any(feature = "fix", feature = "fpml"))]
+pub(crate) mod decimal_text;
 pub mod error;
 pub mod evolution;
 pub mod json;

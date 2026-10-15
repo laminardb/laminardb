@@ -6,6 +6,7 @@
 //! compares integers, never prefixes or strings.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::ops::Range;
 
 /// Index of an interned `(namespace, local name)` pair.
@@ -47,11 +48,8 @@ impl Interner {
         id
     }
 
-    pub(crate) fn lookup(&self, namespace: &str, local: &str) -> Option<NameId> {
-        let namespace = *self.namespace_ids.get(namespace)?;
-        self.name_ids
-            .get(&(namespace, Box::<str>::from(local)))
-            .copied()
+    pub(crate) fn len(&self) -> usize {
+        self.names.len()
     }
 
     pub(crate) fn local(&self, name: NameId) -> &str {
@@ -164,7 +162,7 @@ impl Document {
             path.push('/');
             path.push_str(local);
             if *ordinal > 1 {
-                path.push_str(&format!("[{ordinal}]"));
+                let _ = write!(path, "[{ordinal}]");
             }
         }
         path
