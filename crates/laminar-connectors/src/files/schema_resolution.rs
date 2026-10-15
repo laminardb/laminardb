@@ -57,6 +57,23 @@ fn resolve_files(
     format: FileFormat,
     explicit: Option<SchemaRef>,
 ) -> Result<SchemaBinding, ConnectorError> {
+    #[cfg(feature = "fpml")]
+    if format == FileFormat::Fpml {
+        let fpml = crate::fpml::FpmlConfig::from_connector_config(config)?;
+        let (artifact, profile) = fpml.resolve()?;
+        let mut binding = fixed_binding(
+            config,
+            explicit,
+            &profile.schema(),
+            SchemaOrigin::BuiltIn,
+            parsed.include_metadata,
+        )?;
+        binding.value = Some(profile.native_schema(&artifact));
+        binding
+            .canonical_bytes()
+            .map_err(crate::schema::resolution::binding_error)?;
+        return Ok(binding);
+    }
     if format == FileFormat::Text {
         let native = crate::schema::traits::FormatDecoder::output_schema(
             &super::text_decoder::TextLineDecoder::new(),

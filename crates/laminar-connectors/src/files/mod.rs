@@ -37,7 +37,12 @@ pub fn register_file_source(
     let info = ConnectorInfo {
         schema_capabilities: crate::schema::resolution::SchemaCapabilities {
             bounded_sampling: true,
-            built_in_formats: vec!["text".into(), "txt".into()],
+            built_in_formats: vec![
+                "text".into(),
+                "txt".into(),
+                #[cfg(feature = "fpml")]
+                "fpml".into(),
+            ],
             ..crate::schema::resolution::SchemaCapabilities::metadata(
                 &["parquet", "arrow_ipc", "arrow"],
                 false,
@@ -65,6 +70,30 @@ pub fn register_file_source(
                 "schema.inference",
                 "Opt-in bounded CSV/JSON inference (4 files, 1 MiB, 1000 rows)",
                 "false",
+            ),
+            #[cfg(feature = "fpml")]
+            ConfigKeySpec::optional(
+                "fpml.profile",
+                "Bundled FpML projection profile (format = 'fpml')",
+                crate::fpml::DEFAULT_PROFILE,
+            ),
+            #[cfg(feature = "fpml")]
+            ConfigKeySpec::optional(
+                "fpml.profile.path",
+                "Operator FpML profile file, instead of a bundled profile",
+                "",
+            ),
+            #[cfg(feature = "fpml")]
+            ConfigKeySpec::optional(
+                "fpml.schema.path",
+                "Directory of a digest-pinned schema closure (closure.toml)",
+                "bundled FpML 5.13 REC-2 confirmation view",
+            ),
+            #[cfg(feature = "fpml")]
+            ConfigKeySpec::optional(
+                "fpml.references",
+                "Reference checks: resolve (ids exist) or schema (also annotated target types)",
+                "resolve",
             ),
         ],
     };

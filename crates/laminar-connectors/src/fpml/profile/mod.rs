@@ -30,6 +30,7 @@ use self::spec::ProfileFile;
 use super::artifacts::{hex, Artifact};
 use super::schema_model::SchemaModel;
 use crate::error::ConnectorError;
+use crate::schema::resolution::NativeSchema;
 
 pub use bundled::BUNDLED_PROFILES;
 
@@ -107,6 +108,33 @@ impl Profile {
             fingerprint: hex(&digest.finalize()),
             plan: Arc::new(plan),
         })
+    }
+
+    /// The native schema contract recorded in a source's schema binding: the closure and
+    /// profile identities a restore must find unchanged.
+    #[must_use]
+    pub fn native_schema(&self, artifact: &Artifact) -> NativeSchema {
+        let mut identity = std::collections::BTreeMap::from([
+            ("schema_closure".to_owned(), artifact.id.clone()),
+            (
+                "schema_closure_sha256".to_owned(),
+                artifact.fingerprint.clone(),
+            ),
+            ("fpml_release".to_owned(), artifact.release.clone()),
+            ("fpml_view".to_owned(), artifact.view.clone()),
+            ("profile".to_owned(), self.name.clone()),
+            ("profile_version".to_owned(), self.version.to_string()),
+            ("profile_sha256".to_owned(), self.fingerprint.clone()),
+        ]);
+        if let Some(build) = artifact.build {
+            identity.insert("fpml_build".to_owned(), build.to_string());
+        }
+        NativeSchema {
+            format: "fpml".to_owned(),
+            identity,
+            definition: serde_json::json!({"description": self.description}),
+            references: Vec::new(),
+        }
     }
 
     /// The Arrow schema every batch from this profile has.

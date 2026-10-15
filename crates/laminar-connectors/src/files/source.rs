@@ -110,8 +110,11 @@ pub struct FileSource {
     /// Output Arrow schema (resolved in `start()`).
     schema: SchemaRef,
     schema_contract: Option<String>,
-    /// Format decoder (created in `start()`).
-    decoder: Option<Box<dyn FormatDecoder>>,
+    /// Format decoder (created in `start()`); shared with the blocking decode task.
+    decoder: Option<Arc<dyn FormatDecoder>>,
+    /// Registry for decoder metrics.
+    #[cfg_attr(not(feature = "fpml"), allow(dead_code))]
+    registry: Option<prometheus::Registry>,
     /// File discovery engine (started in `start()` after cursor validation).
     discovery: Option<FileDiscoveryEngine>,
     /// File ingestion manifest (tracks processed files).
@@ -142,7 +145,7 @@ impl FileSource {
 
     /// Creates a new file source with an optional Prometheus registry.
     #[must_use]
-    pub fn with_registry(_registry: Option<&prometheus::Registry>) -> Self {
+    pub fn with_registry(registry: Option<&prometheus::Registry>) -> Self {
         let empty_schema = Arc::new(Schema::empty());
         let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
@@ -150,6 +153,7 @@ impl FileSource {
             schema: empty_schema,
             schema_contract: None,
             decoder: None,
+            registry: registry.cloned(),
             discovery: None,
             manifest: FileIngestionManifest::new(),
             pending_files: VecDeque::new(),
@@ -244,7 +248,8 @@ impl SourceConnector for FileSource {
             _ => None,
         };
         let resumed = !matches!(position, SourcePosition::Initial);
-        let src_config = FileSourceConfig::from_connector_config(&config)?;
+        #[cfg_attr(not(feature = "fpml"), allow(unused_mut))]
+        let mut src_config = FileSourceConfig::from_connector_config(&config)?;
         // Validate cursor evidence before metadata I/O. Never repair corrupt progress by discovery.
         let (manifest, progress) = restore_ingestion_position(position)?;
         self.prepare_reader_contract(&mut config, saved, resumed, &src_config)
@@ -276,7 +281,20 @@ impl SourceConnector for FileSource {
             );
         }
         // Build decoder and resolve schema.
-        let (decoder, schema) = build_decoder_and_schema(format, &src_config, &config)?;
+        let (decoder, schema) = match format {
+            #[cfg(feature = "fpml")]
+            FileFormat::Fpml => {
+                let guard =
+                    self.task_owner
+                        .track()
+                        .ok_or_else(|| ConnectorError::InvalidState {
+                            expected: "live file task owner".into(),
+                            actual: "retired".into(),
+                        })?;
+                start_fpml_decoder(&mut src_config, &config, self.registry.clone(), guard).await?
+            }
+            _ => build_decoder_and_schema(format, &src_config, &config)?,
+        };
 
         let final_schema = match committed {
             Some(schema) => schema,
@@ -575,15 +593,30 @@ impl FileSource {
             0
         };
 
-        let mut records = self
-            .decoder
-            .as_ref()
+        let decoder =
+            Arc::clone(
+                self.decoder
+                    .as_ref()
+                    .ok_or_else(|| ConnectorError::InvalidState {
+                        expected: "prepared file decoder".into(),
+                        actual: "missing".into(),
+                    })?,
+            );
+        let decode_guard = self
+            .task_owner
+            .track()
             .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "prepared file decoder".into(),
-                actual: "missing".into(),
-            })?
-            .decode_batch(&[RawRecord::new(bytes)])
-            .map_err(ConnectorError::from)?;
+                expected: "live file task owner".into(),
+                actual: "retired".into(),
+            })?;
+        // Decoding (XML Schema validation in particular) is CPU-bound; keep it off the runtime.
+        let mut records = tokio::task::spawn_blocking(move || {
+            let _decode_guard = decode_guard;
+            decoder.decode_batch(&[RawRecord::new(bytes)])
+        })
+        .await
+        .map_err(|error| ConnectorError::ReadError(format!("file decode worker failed: {error}")))?
+        .map_err(ConnectorError::from)?;
         if config.include_metadata {
             records = append_metadata_column(
                 &records,
@@ -617,7 +650,7 @@ fn build_decoder_and_schema(
     format: FileFormat,
     src_config: &FileSourceConfig,
     connector_config: &ConnectorConfig,
-) -> Result<(Box<dyn FormatDecoder>, SchemaRef), ConnectorError> {
+) -> Result<(Arc<dyn FormatDecoder>, SchemaRef), ConnectorError> {
     match format {
         FileFormat::Csv => {
             let schema = connector_config.arrow_schema().unwrap_or_else(|| {
@@ -629,7 +662,7 @@ fn build_decoder_and_schema(
                 ..crate::schema::CsvDecoderConfig::default()
             };
             let decoder = crate::schema::CsvDecoder::with_config(schema.clone(), csv_config);
-            Ok((Box::new(decoder), schema))
+            Ok((Arc::new(decoder), schema))
         }
         FileFormat::Json => {
             let schema = connector_config.arrow_schema().unwrap_or_else(|| {
@@ -637,12 +670,12 @@ fn build_decoder_and_schema(
             });
             let json_config = crate::schema::JsonDecoderConfig::default();
             let decoder = crate::schema::JsonDecoder::with_config(schema.clone(), json_config);
-            Ok((Box::new(decoder), schema))
+            Ok((Arc::new(decoder), schema))
         }
         FileFormat::Text => {
             let decoder = TextLineDecoder::new();
             let schema = decoder.output_schema();
-            Ok((Box::new(decoder), schema))
+            Ok((Arc::new(decoder), schema))
         }
         FileFormat::Parquet => {
             // For Parquet, schema comes from the file footer (authoritative).
@@ -651,7 +684,7 @@ fn build_decoder_and_schema(
                 Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
             });
             let decoder = crate::schema::parquet::ParquetDecoder::new(schema.clone());
-            Ok((Box::new(decoder), schema))
+            Ok((Arc::new(decoder), schema))
         }
         FileFormat::ArrowIpc => {
             // Arrow IPC files embed their schema in the header — use it as
@@ -661,9 +694,56 @@ fn build_decoder_and_schema(
                 Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
             });
             let decoder = super::arrow_ipc_codec::ArrowIpcDecoder::new(schema.clone());
-            Ok((Box::new(decoder), schema))
+            Ok((Arc::new(decoder), schema))
+        }
+        #[cfg(feature = "fpml")]
+        FileFormat::Fpml => Err(ConnectorError::Internal(
+            "FpML decoders are started asynchronously".into(),
+        )),
+    }
+}
+
+/// Resolve the closure and profile off the runtime, check them against the committed schema
+/// contract, and start the validator worker. Files larger than one document are rejected before
+/// they are read.
+#[cfg(feature = "fpml")]
+async fn start_fpml_decoder(
+    src_config: &mut FileSourceConfig,
+    config: &ConnectorConfig,
+    registry: Option<prometheus::Registry>,
+    guard: ConnectorTaskGuard,
+) -> Result<(Arc<dyn FormatDecoder>, SchemaRef), ConnectorError> {
+    let fpml = crate::fpml::FpmlConfig::from_connector_config(config)?;
+    src_config.max_file_bytes = src_config
+        .max_file_bytes
+        .min(fpml.limits.max_document_bytes);
+    let resolving = fpml.clone();
+    let (artifact, profile) = tokio::task::spawn_blocking(move || resolving.resolve())
+        .await
+        .map_err(|error| {
+            ConnectorError::Internal(format!("FpML profile loader failed: {error}"))
+        })??;
+    if let Some(committed) = config
+        .schema_binding()
+        .and_then(|binding| binding.value.as_ref())
+    {
+        if committed.identity != profile.native_schema(&artifact).identity {
+            return Err(ConnectorError::SchemaMismatch(
+                "the FpML profile or schema closure differs from the one this source was created with; recreate the source to change it".into(),
+            ));
         }
     }
+    let source = config.get("laminar.source.name").unwrap_or("files");
+    let decoder = crate::fpml::FpmlDecoder::start(
+        artifact,
+        &profile,
+        &fpml,
+        source,
+        registry.as_ref(),
+        Some(guard),
+    )
+    .await?;
+    Ok((Arc::new(decoder), profile.schema()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

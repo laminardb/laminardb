@@ -270,93 +270,22 @@ impl SchemaModel {
         if !matches!(namespace, ResolveResult::Bound(ns) if ns.as_ref() == XSD.as_bytes()) {
             return Ok(Frame::Other);
         }
-        let attribute = |name: &str| -> Result<Option<String>, ConnectorError> {
-            start
-                .try_get_attribute(name)
-                .map_err(|error| schema_error(file, &error.to_string()))?
-                .map(|value| {
-                    value
-                        .normalized_value(XmlVersion::Implicit1_0)
-                        .map(std::borrow::Cow::into_owned)
-                        .map_err(|error| schema_error(file, &error.to_string()))
-                })
-                .transpose()
-        };
-        let qname = |value: &str| -> Result<QName, ConnectorError> {
-            let (resolved, local) = reader
-                .resolver()
-                .resolve(quick_xml::name::QName(value.as_bytes()), true);
-            let namespace = match resolved {
-                ResolveResult::Bound(namespace) => utf8(namespace.as_ref(), file)?,
-                ResolveResult::Unbound => String::new(),
-                ResolveResult::Unknown(_) => {
-                    return Err(schema_error(file, &format!("unbound prefix in '{value}'")))
-                }
-            };
-            Ok((namespace, utf8(local.as_ref(), file)?))
+        let component = Component {
+            reader,
+            start,
+            file,
         };
         let container = scope.container();
-        let frame = match start.local_name().as_ref() {
+        Ok(match start.local_name().as_ref() {
             b"schema" => {
-                scope.target = attribute("targetNamespace")?.unwrap_or_default();
+                scope.target = component.attribute("targetNamespace")?.unwrap_or_default();
                 scope.qualified_elements =
-                    attribute("elementFormDefault")?.as_deref() == Some("qualified");
+                    component.attribute("elementFormDefault")?.as_deref() == Some("qualified");
                 Frame::Schema
             }
-            b"element" => {
-                if let Some(reference) = attribute("ref")? {
-                    if let Some(container) = &container {
-                        self.container(container)
-                            .element_refs
-                            .insert(qname(&reference)?);
-                    }
-                    return Ok(Frame::Other);
-                }
-                let Some(name) = attribute("name")? else {
-                    return Ok(Frame::Other);
-                };
-                let global = matches!(scope.stack.last(), Some(Frame::Schema));
-                let qualified = global
-                    || attribute("form")?
-                        .map_or(scope.qualified_elements, |form| form == "qualified");
-                let element = (
-                    if qualified {
-                        scope.target.clone()
-                    } else {
-                        String::new()
-                    },
-                    name,
-                );
-                let ty = if let Some(ty) = attribute("type")? {
-                    qname(&ty)?
-                } else {
-                    *anonymous += 1;
-                    (scope.target.clone(), format!("#anonymous-{anonymous}"))
-                };
-                if global {
-                    self.globals.insert(element.clone(), Some(ty.clone()));
-                    if let Some(head) = attribute("substitutionGroup")? {
-                        self.substitutions
-                            .entry(qname(&head)?)
-                            .or_default()
-                            .insert(element.clone());
-                    }
-                }
-                self.element_types
-                    .entry(element.clone())
-                    .or_default()
-                    .insert(ty.clone());
-                if let Some(container) = &container {
-                    self.container(container)
-                        .elements
-                        .entry(element)
-                        .or_default()
-                        .insert(ty.clone());
-                }
-                Frame::Element(ty)
-            }
+            b"element" => self.declare_element(&component, scope, container.as_ref(), anonymous)?,
             b"complexType" | b"simpleType" => {
-                let ty = match (attribute("name")?, scope.stack.last()) {
+                let ty = match (component.attribute("name")?, scope.stack.last()) {
                     (Some(name), _) => (scope.target.clone(), name),
                     (None, Some(Frame::Element(ty))) => ty.clone(),
                     (None, _) => return Ok(Frame::Other),
@@ -365,14 +294,16 @@ impl SchemaModel {
                 Frame::Container(ty)
             }
             b"group" | b"attributeGroup" => {
-                if let Some(name) = attribute("name")? {
+                if let Some(name) = component.attribute("name")? {
                     return Ok(Frame::Container((
                         scope.target.clone(),
                         format!("#group-{name}"),
                     )));
                 }
-                if let (Some(reference), Some(container)) = (attribute("ref")?, &container) {
-                    let referenced = qname(&reference)?;
+                if let (Some(reference), Some(container)) =
+                    (component.attribute("ref")?, &container)
+                {
+                    let referenced = component.qname(&reference)?;
                     let group = (referenced.0, format!("#group-{}", referenced.1));
                     let declared = self.container(container);
                     if start.local_name().as_ref() == b"group" {
@@ -384,9 +315,9 @@ impl SchemaModel {
                 Frame::Other
             }
             b"extension" | b"restriction" => {
-                if let (Some(ty), Some(base)) = (&container, attribute("base")?) {
+                if let (Some(ty), Some(base)) = (&container, component.attribute("base")?) {
                     if !ty.1.starts_with("#group-") {
-                        self.bases.insert(ty.clone(), qname(&base)?);
+                        self.bases.insert(ty.clone(), component.qname(&base)?);
                     }
                 }
                 Frame::Other
@@ -398,41 +329,158 @@ impl SchemaModel {
                 Frame::Other
             }
             b"attribute" => {
-                if let Some(name) = attribute("name")? {
-                    let attribute_name = (String::new(), name.clone());
-                    self.attributes.insert(attribute_name.clone());
-                    if let Some(container) = &container {
-                        self.container(container).attributes.insert(attribute_name);
-                    }
-                    let target = start
-                        .attributes()
-                        .flatten()
-                        .find(|attribute| {
-                            matches!(
-                                reader.resolver().resolve_attribute(attribute.key).0,
-                                ResolveResult::Bound(ns) if ns.as_ref() == ECORE.as_bytes()
-                            ) && attribute.key.local_name().as_ref() == b"reference"
-                        })
-                        .map(|attribute| {
-                            attribute
-                                .normalized_value(XmlVersion::Implicit1_0)
-                                .map(std::borrow::Cow::into_owned)
-                                .map_err(|error| schema_error(file, &error.to_string()))
-                        })
-                        .transpose()?;
-                    if let (Some(ty), Some(target), true) = (&container, target, name == "href") {
-                        self.reference_targets.insert(ty.clone(), qname(&target)?);
-                    }
-                }
+                self.declare_attribute(&component, container.as_ref())?;
                 Frame::Other
             }
             _ => Frame::Other,
+        })
+    }
+
+    fn declare_element(
+        &mut self,
+        component: &Component<'_, '_>,
+        scope: &Scope,
+        container: Option<&QName>,
+        anonymous: &mut usize,
+    ) -> Result<Frame, ConnectorError> {
+        if let Some(reference) = component.attribute("ref")? {
+            if let Some(container) = container {
+                let referenced = component.qname(&reference)?;
+                self.container(container).element_refs.insert(referenced);
+            }
+            return Ok(Frame::Other);
+        }
+        let Some(name) = component.attribute("name")? else {
+            return Ok(Frame::Other);
         };
-        Ok(frame)
+        let global = matches!(scope.stack.last(), Some(Frame::Schema));
+        let qualified = global
+            || component
+                .attribute("form")?
+                .map_or(scope.qualified_elements, |form| form == "qualified");
+        let namespace = if qualified {
+            scope.target.clone()
+        } else {
+            String::new()
+        };
+        let element = (namespace, name);
+        let ty = if let Some(ty) = component.attribute("type")? {
+            component.qname(&ty)?
+        } else {
+            *anonymous += 1;
+            (scope.target.clone(), format!("#anonymous-{anonymous}"))
+        };
+        if global {
+            self.globals.insert(element.clone(), Some(ty.clone()));
+            if let Some(head) = component.attribute("substitutionGroup")? {
+                self.substitutions
+                    .entry(component.qname(&head)?)
+                    .or_default()
+                    .insert(element.clone());
+            }
+        }
+        self.element_types
+            .entry(element.clone())
+            .or_default()
+            .insert(ty.clone());
+        if let Some(container) = container {
+            self.container(container)
+                .elements
+                .entry(element)
+                .or_default()
+                .insert(ty.clone());
+        }
+        Ok(Frame::Element(ty))
+    }
+
+    fn declare_attribute(
+        &mut self,
+        component: &Component<'_, '_>,
+        container: Option<&QName>,
+    ) -> Result<(), ConnectorError> {
+        let Some(name) = component.attribute("name")? else {
+            return Ok(());
+        };
+        let attribute = (String::new(), name);
+        self.attributes.insert(attribute.clone());
+        let Some(container) = container else {
+            return Ok(());
+        };
+        self.container(container)
+            .attributes
+            .insert(attribute.clone());
+        if attribute.1 == "href" {
+            if let Some(target) = component.ecore_reference()? {
+                let target = component.qname(&target)?;
+                self.reference_targets.insert(container.clone(), target);
+            }
+        }
+        Ok(())
     }
 
     fn container(&mut self, name: &QName) -> &mut Container {
         self.containers.entry(name.clone()).or_default()
+    }
+}
+
+/// One XSD element being declared, with the in-scope namespace bindings.
+struct Component<'r, 's> {
+    reader: &'r NsReader<&'r [u8]>,
+    start: &'r BytesStart<'s>,
+    file: &'r str,
+}
+
+impl Component<'_, '_> {
+    fn attribute(&self, name: &str) -> Result<Option<String>, ConnectorError> {
+        self.start
+            .try_get_attribute(name)
+            .map_err(|error| schema_error(self.file, &error.to_string()))?
+            .map(|value| {
+                value
+                    .normalized_value(XmlVersion::Implicit1_0)
+                    .map(std::borrow::Cow::into_owned)
+                    .map_err(|error| schema_error(self.file, &error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Resolve a QName-valued attribute against the bindings in scope.
+    fn qname(&self, value: &str) -> Result<QName, ConnectorError> {
+        let (resolved, local) = self
+            .reader
+            .resolver()
+            .resolve(quick_xml::name::QName(value.as_bytes()), true);
+        let namespace = match resolved {
+            ResolveResult::Bound(namespace) => utf8(namespace.as_ref(), self.file)?,
+            ResolveResult::Unbound => String::new(),
+            ResolveResult::Unknown(_) => {
+                return Err(schema_error(
+                    self.file,
+                    &format!("unbound prefix in '{value}'"),
+                ))
+            }
+        };
+        Ok((namespace, utf8(local.as_ref(), self.file)?))
+    }
+
+    /// The `ecore:reference` annotation attribute, when present.
+    fn ecore_reference(&self) -> Result<Option<String>, ConnectorError> {
+        self.start
+            .attributes()
+            .flatten()
+            .find(|attribute| {
+                matches!(
+                    self.reader.resolver().resolve_attribute(attribute.key).0,
+                    ResolveResult::Bound(ns) if ns.as_ref() == ECORE.as_bytes()
+                ) && attribute.key.local_name().as_ref() == b"reference"
+            })
+            .map(|attribute| {
+                attribute
+                    .normalized_value(XmlVersion::Implicit1_0)
+                    .map(std::borrow::Cow::into_owned)
+                    .map_err(|error| schema_error(self.file, &error.to_string()))
+            })
+            .transpose()
     }
 }
 
