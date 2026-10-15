@@ -205,6 +205,9 @@ def evaluate_alternative(profile, document, selector, context) -> list:
             current = [document.root]
         elif token == ".":
             pass
+        elif token.startswith("self::"):
+            has = profile.name_test(token[6:])
+            current = [e for e in current if isinstance(e.tag, str) and has(e.tag)]
         elif token.startswith(".["):
             required = [profile.name_test(p) for p in re.findall(r"\[([^\]]+)\]", token)]
             current = [e for e in current if all(any(test(c.tag) for c in e) for test in required)]

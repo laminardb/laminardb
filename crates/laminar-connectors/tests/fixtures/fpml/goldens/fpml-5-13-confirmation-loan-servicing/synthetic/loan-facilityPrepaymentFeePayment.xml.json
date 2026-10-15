@@ -1,0 +1,96 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2014-12-15T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2014-12-15T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2014-12-15T09:30:47Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "d42935bc40887f8a486ef53e3f6773d69f956874000c56dda48bf8045e16e6a6",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "2500000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "51425.200000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "51425.200000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "comment": "Upfront fee payment per terms of CA.",
+        "event_identifiers": [
+          {
+            "event_id": "15988",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-12-15",
+      "facility_href": "FAC12345"
+    },
+    "event_type": "facilityPrepaymentFeePayment",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "256552",
+    "notice_date": "2014-12-15",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/facilityPrepaymentFeePayment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

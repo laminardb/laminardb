@@ -1,0 +1,83 @@
+[
+  {
+    "context": "lcNotification",
+    "creation_time_utc": "2015-08-09T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2015-08-09T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2015-08-09T09:30:47Z"
+    },
+    "document_root": "lcNotification",
+    "document_sha256": "0f667487f34dc66a5f1505a2e90bc995662275f640598ea1f608d7c3e8a536ce",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "comment": "Letter of Credit 234 renewal, effective 8/12/2015.",
+        "event_identifiers": [
+          {
+            "event_id": "73502",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2015-08-12",
+      "final_expiry_date": "2016-08-12",
+      "letter_of_credit_hrefs": [
+        "LOC234"
+      ]
+    },
+    "event_type": "lcRenewal",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "0022633698",
+    "notice_date": "2015-08-09",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/lcNotification/lcRenewal",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

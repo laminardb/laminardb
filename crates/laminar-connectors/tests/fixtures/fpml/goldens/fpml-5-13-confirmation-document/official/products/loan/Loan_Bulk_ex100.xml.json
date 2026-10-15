@@ -6,6 +6,7 @@
         "contract_ids": [
           "LoanContract1"
         ],
+        "facility_href": "TermLoanB",
         "id": "LoanContract1",
         "party_href": "BANKOFAGENTSNA"
       }

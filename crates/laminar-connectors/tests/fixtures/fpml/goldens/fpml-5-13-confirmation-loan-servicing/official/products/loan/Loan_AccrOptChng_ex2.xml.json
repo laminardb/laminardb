@@ -1,0 +1,89 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2021-12-30T10:37:45Z",
+    "creation_timestamp": {
+      "local": "2021-12-30T10:37:45",
+      "offset_minutes": 0,
+      "utc": "2021-12-30T10:37:45Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "a01d942e375f6e7f957eb8e5d1a5da7e2acfb0da0892fdf5c06c10f8b82a8f81",
+    "event": {
+      "accrual_options": [
+        {
+          "accrual_option_id": "542602",
+          "currency": "USD",
+          "day_count_fraction": "ACT/360",
+          "floating_rate_index": "USD-SOFR",
+          "option_type": "floatingRateOption"
+        }
+      ],
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "comment": "Accrual Option Change",
+        "event_identifiers": [
+          {
+            "event_id": "41934",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2022-01-01",
+      "facility_href": "FAC12345"
+    },
+    "event_type": "accrualOptionChange",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "842302",
+    "notice_date": "2021-12-30",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/accrualOptionChange",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

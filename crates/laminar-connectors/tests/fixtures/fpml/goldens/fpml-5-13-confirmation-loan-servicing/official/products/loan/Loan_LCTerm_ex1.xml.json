@@ -1,0 +1,94 @@
+[
+  {
+    "context": "lcNotification",
+    "creation_time_utc": "2014-01-14T12:13:47Z",
+    "creation_timestamp": {
+      "local": "2014-01-14T12:13:47",
+      "offset_minutes": 0,
+      "utc": "2014-01-14T12:13:47Z"
+    },
+    "document_root": "lcNotification",
+    "document_sha256": "bc8fdd64c99dd6a02b2aa1f1d50a0adbb00d77bb8a9316a83ddf5fcb375695d1",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "comment": "Letter Of Credit termination, per credit agreement.",
+        "event_identifiers": [
+          {
+            "event_id": "1574285",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-01-02",
+      "expiry": true,
+      "letter_of_credit_hrefs": [
+        "LOC234"
+      ]
+    },
+    "event_type": "lcTermination",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "121347",
+    "notice_date": "2014-01-14",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ],
+        "party_name": "EatonVance"
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ],
+        "party_name": "Amazon"
+      },
+      {
+        "id": "ISSUINGBANK",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3I786123"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/lcNotification/lcTermination",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

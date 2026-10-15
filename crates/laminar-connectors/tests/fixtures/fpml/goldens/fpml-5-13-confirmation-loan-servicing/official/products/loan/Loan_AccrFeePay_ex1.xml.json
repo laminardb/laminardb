@@ -1,0 +1,134 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "2079a0853caec5a014d83016907936d864e7702ed75aa25943ed4f252dce7422",
+    "event": {
+      "accrual_schedule": [
+        {
+          "accrual_amount": {
+            "amount": "100000.000000000000000000",
+            "currency": "USD",
+            "share_amount": "20794.520000000000000000"
+          },
+          "end_date": "2014-09-29",
+          "number_of_days": 92,
+          "rate": "0.002750000000000000",
+          "reference_amount": {
+            "amount": "100000000.000000000000000000",
+            "currency": "USD",
+            "share_amount": "30000000.000000000000000000"
+          },
+          "start_date": "2014-06-30"
+        }
+      ],
+      "accrual_type_id": "71625",
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "100000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "20794.520000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "20794.520000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "event_identifiers": [
+          {
+            "event_id": "61027",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-09-30",
+      "end_date": "2014-09-29",
+      "facility_href": "FAC12345",
+      "start_date": "2014-06-30"
+    },
+    "event_type": "accruingFeePayment",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "612983",
+    "notice_date": "2014-09-29",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "GUARANTORPARTNERSLLC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US6G852363"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/accruingFeePayment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

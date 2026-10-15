@@ -1,0 +1,264 @@
+# Syndicated loan servicing, trading, and facilities: the 39 facility, loan contract, and letter
+# of credit servicing events, the 11 loan allocation and loan trade events, and the four facility
+# types. Event rows share one template whose fields are the union of the event types' content;
+# where the same element name has different types in different events (`rate`), `self::` limits a
+# field to the events that declare it with that type.
+include = ["messages.toml", "assets.toml"]
+
+[sets]
+loan_servicing_event = [
+  "accrualOptionChange", "accruingFeeChange", "accruingFeeExpiry", "accruingFeePayment",
+  "accruingPikPayment", "amendmentFeePayment", "commitmentAdjustment", "defaultRateChange",
+  "defaultRateExpiry", "facilityExtensionFeePayment", "facilityPrepayment",
+  "facilityPrepaymentFeePayment", "facilityTermination", "fundingFeePayment",
+  "mandatoryCostRateChange", "mandatoryCostRateExpiry", "miscFeePayment", "penaltyRateChange",
+  "penaltyRateExpiry", "upfrontFeePayment", "waiverFeePayment",
+  "baseRateSet", "borrowing", "breakageFeePayment", "interestCapitalization", "interestPayment",
+  "legacyInterestCapitalization", "legacyInterestPayment", "loanContractAdjustment",
+  "maturityChange", "repayment", "rollover",
+  "lcAdjustment", "lcFxRevaluation", "lcIssuance", "lcIssuanceFeePayment", "lcRateChange",
+  "lcRenewal", "lcTermination",
+]
+loan_trading_event = [
+  "loanAllocation", "loanAllocationConfirmation", "loanAllocationFeeDue", "loanAllocationFeeOwed",
+  "loanAllocationSettlement", "loanAllocationSettlementDateAvailability",
+  "loanAllocationSettlementDateFinalization",
+  "loanTrade", "loanTradeConfirmation", "loanTradeFeeDue", "loanTradeFeeOwed",
+]
+period_rate_event = ["defaultRateChange", "mandatoryCostRateChange", "penaltyRateChange"]
+decimal_rate_event = ["baseRateSet", "lcRateChange"]
+decimal_rate_option = ["fixedRateOption", "accruingPikOption", "lcOption", "accruingFeeOption"]
+
+[structs.money_share]
+description = "An amount, its currency, and the participant's share (MoneyWithParticipantShare)"
+fields = [
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "amount", type = "decimal", path = "amount" },
+  { name = "share_amount", type = "decimal", path = "shareAmount" },
+]
+
+[structs.cash_payable]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "net_amount", type = "struct<money>", path = "netAmount" },
+]
+
+[structs.loan_event_base]
+description = "Identifiers, parties, and cash every loan event carries"
+fields = [
+  { name = "event_identifiers", type = "list<struct<event_identifier>>", path = "eventIdentifier" },
+  { name = "parent_event_ids", type = "list<utf8>", path = "parentEventIdentifier/eventId" },
+  { name = "previous_event_ids", type = "list<utf8>", path = "previousEventIdentifier/eventId" },
+  { name = "corrected_event_ids", type = "list<utf8>", path = "correctedEventIdentifier/eventId" },
+  { name = "lender_party_hrefs", type = "list<utf8>", path = "lenderPartyReference/@href" },
+  { name = "cash_payable", type = "list<struct<cash_payable>>", path = "cashPayable" },
+  { name = "comment", type = "utf8", path = "comment", whitespace = "collapse" },
+]
+
+[structs.period_rate]
+fields = [
+  { name = "start_date", type = "date32", path = "startDate" },
+  { name = "end_date", type = "date32", path = "endDate" },
+  { name = "rate", type = "decimal", path = "rate" },
+]
+
+[structs.accrual_period]
+description = "One accrual period of a fee or interest payment (current or legacy layout)"
+fields = [
+  { name = "start_date", type = "date32", path = "startDate" },
+  { name = "end_date", type = "date32", path = "endDate" },
+  { name = "number_of_days", type = "int64", path = "numberOfDays" },
+  { name = "reference_amount", type = "struct<money_share>", path = "referenceAmount" },
+  { name = "rate", type = "decimal", path = "rate" },
+  { name = "base_rate", type = "decimal", path = "baseRate" },
+  { name = "spread_adjustment", type = "decimal", path = "spreadAdjustment" },
+  { name = "accrual_amount", type = "struct<money_share>", path = "accrualAmount" },
+]
+
+[structs.commitment_change]
+fields = [
+  { name = "date", type = "date32", path = "date" },
+  { name = "adjustment_type", type = "utf8", path = "adjustment/adjustmentType" },
+  { name = "adjustment_amount", type = "struct<money_share>", path = "adjustment/amount" },
+  { name = "remaining", type = "struct<money_share>", path = "remaining" },
+]
+
+[structs.no_settle_period]
+fields = [
+  { name = "start_date", type = "date32", path = "startDate" },
+  { name = "end_date", type = "date32", path = "endDate" },
+  { name = "period_type", type = "utf8", path = "periodType" },
+]
+
+[structs.facility_commitment]
+fields = [
+  { name = "total_commitment_amount", type = "struct<money_share>", path = "totalCommitmentAmount" },
+  { name = "required_funded_amount", type = "struct<money_share>", path = "requiredFundedAmount" },
+  { name = "unfunded_amount", type = "struct<money_share>", path = "unfundedAmount" },
+  { name = "required_unfunded_amount", type = "struct<money_share>", path = "requiredUnfundedAmount" },
+  { name = "funded_amount", type = "struct<money_share>", path = "fundedAmount" },
+  { name = "unavailable_to_utilize_amount", type = "struct<money_share>", path = "unavailableToUtilizeAmount" },
+]
+
+[structs.loan_fx_terms]
+fields = [
+  { name = "currency1", type = "utf8", path = "quotedCurrencyPair/currency1" },
+  { name = "currency2", type = "utf8", path = "quotedCurrencyPair/currency2" },
+  { name = "quote_basis", type = "utf8", path = "quotedCurrencyPair/quoteBasis" },
+  { name = "fixing_date", type = "date32", path = "fixingDate" },
+  { name = "rate", type = "decimal", path = "rate" },
+]
+
+[structs.accrual_option]
+description = "Fixed, floating, accruing fee, PIK, or letter of credit accrual option"
+fields = [
+  { name = "option_type", type = "utf8", path = "#name" },
+  { name = "accrual_option_id", type = "utf8", path = "accrualOptionId" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "payment_frequency", type = "struct<period>", path = "paymentFrequency" },
+  { name = "fixed_rate", type = "decimal", path = "self::{decimal_rate_option}/rate" },
+  { name = "floating_rate_index", type = "utf8", path = "rate/floatingRateIndex" },
+  { name = "legacy_floating_rate_index", type = "utf8", path = "legacyFloatingRateIndex" },
+  { name = "spread", type = "decimal", path = "spread" },
+  { name = "pik_spread", type = "decimal", path = "pikSpread" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "fee_type", type = "utf8", path = "type" },
+  { name = "start_date", type = "date32", path = "startDate" },
+  { name = "end_date", type = "date32", path = "endDate" },
+]
+
+[structs.loan_contract]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "contract_ids", type = "list<utf8>", path = "contractId | versionedContractId/contractId" },
+  { name = "facility_href", type = "utf8", path = "facilityReference/@href" },
+  { name = "effective_date", type = "date32", path = "effectiveDate" },
+  { name = "borrower_party_href", type = "utf8", path = "borrowerPartyReference/@href" },
+  { name = "amount", type = "struct<money_share>", path = "amount" },
+  { name = "repricing_date", type = "date32", path = "repricingDate" },
+  { name = "maturity_date", type = "date32", path = "maturityDate" },
+  { name = "accrual_type", type = "utf8", path = "fixedRateAccrual/#name | floatingRateAccrual/#name | legacyFloatingRateAccrual/#name" },
+]
+
+[structs.loan_servicing_event]
+description = "A facility, loan contract, or letter of credit servicing event"
+fields = [
+  { name = "base", type = "struct<loan_event_base>", path = "." },
+  { name = "agent_party_href", type = "utf8", path = "agentPartyReference/@href" },
+  { name = "borrower_party_href", type = "utf8", path = "borrowerPartyReference/@href" },
+  { name = "effective_date", type = "date32", path = "effectiveDate" },
+  { name = "legal_action_href", type = "utf8", path = "legalActionReference/@href" },
+  { name = "facility_href", type = "utf8", path = "facilityReference/@href" },
+  { name = "loan_contract_hrefs", type = "list<utf8>", path = "loanContractReference/@href" },
+  { name = "letter_of_credit_hrefs", type = "list<utf8>", path = "letterOfCreditReference/@href" },
+  { name = "accrual_type_id", type = "utf8", path = "id" },
+  { name = "fee_type", type = "utf8", path = "type" },
+  { name = "description", type = "utf8", path = "description", whitespace = "collapse" },
+  { name = "start_date", type = "date32", path = "startDate" },
+  { name = "end_date", type = "date32", path = "endDate" },
+  { name = "amount", type = "struct<money_share>", path = "amount" },
+  { name = "accrual_schedule", type = "list<struct<accrual_period>>", path = "accrualSchedule" },
+  { name = "calculation_method", type = "utf8", path = "calculationMethod | lenderShareCalculationMethod" },
+  { name = "accrual_options", type = "list<struct<accrual_option>>", path = "fixedRateOption | floatingRateOption | legacyFloatingRateOption | accruingPikOption | lcOption | accruingFeeOption" },
+  { name = "period_rate", type = "struct<period_rate>", path = "self::{period_rate_event}/rate" },
+  { name = "rate", type = "decimal", path = "self::{decimal_rate_event}/rate" },
+  { name = "fixing_date", type = "date32", path = "fixingDate" },
+  { name = "spread_adjustment", type = "decimal", path = "spreadAdjustment" },
+  { name = "adjustment_type", type = "utf8", path = "adjustment/adjustmentType" },
+  { name = "adjustment_amount", type = "struct<money_share>", path = "adjustment/amount" },
+  { name = "facility_commitment", type = "struct<facility_commitment>", path = "facilityCommitment" },
+  { name = "commitment_schedule", type = "list<struct<commitment_change>>", path = "commitmentSchedule/commitmentChange" },
+  { name = "next_payment_date", type = "date32", path = "projection/nextPaymentDate" },
+  { name = "projected_amount", type = "struct<money_share>", path = "projection/projectedAmount" },
+  { name = "refusal_allowed", type = "bool", path = "refusalAllowed" },
+  { name = "scheduled", type = "bool", path = "scheduled" },
+  { name = "pik", type = "bool", path = "pik" },
+  { name = "conditions_precedent_met", type = "utf8", path = "conditionsPrecedentMet" },
+  { name = "breakage_fee_claim_date", type = "date32", path = "breakageFeeClaimDate" },
+  { name = "breakage_fee_calculated_by", type = "utf8", path = "breakageFeeCalculatedBy" },
+  { name = "current_maturity_date", type = "date32", path = "currentMaturityDate" },
+  { name = "prior_maturity_date", type = "date32", path = "priorMaturityDate" },
+  { name = "price", type = "decimal", path = "price" },
+  { name = "borrower_mandatory", type = "bool", path = "borrowerMandatory" },
+  { name = "scheduled_repayment", type = "bool", path = "scheduledRepayment" },
+  { name = "current_contract_hrefs", type = "list<utf8>", path = "currentContracts/loanContractReference/@href" },
+  { name = "new_contracts", type = "list<struct<loan_contract>>", path = "newContracts/contract" },
+  { name = "related_borrowing", type = "bool", path = "relatedBorrowing" },
+  { name = "lc_fx_rate", type = "struct<loan_fx_terms>", path = "lcFxRate" },
+  { name = "facility_fx_rate", type = "struct<loan_fx_terms>", path = "facilityFxRate" },
+  { name = "final_expiry_date", type = "date32", path = "finalExpiryDate" },
+  { name = "maturity_date", type = "date32", path = "maturityDate" },
+  { name = "expiry", type = "bool", path = "expiry" },
+]
+
+[structs.funding_payment]
+description = "Delayed compensation, cost of carry, or economic benefit settled with an allocation"
+fields = [
+  { name = "amount", type = "struct<money>", path = "amount" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+]
+
+[structs.loan_trading_event]
+description = "A loan allocation or loan trade event"
+fields = [
+  { name = "base", type = "struct<loan_event_base>", path = "." },
+  { name = "allocation_href", type = "utf8", path = "allocationReference/@href" },
+  { name = "loan_trade_href", type = "utf8", path = "loanTradeReference/@href" },
+  { name = "amount", type = "struct<money>", path = "amount" },
+  { name = "due_date", type = "date32", path = "dueDate" },
+  { name = "waived", type = "bool", path = "waivedFlag" },
+  { name = "credit_agreement_amount", type = "struct<money>", path = "creditAgreementAmount" },
+  { name = "agent_amount", type = "struct<money>", path = "agentAmount" },
+  { name = "settlement_date", type = "date32", path = "settlementDate" },
+  { name = "allocation_amount", type = "struct<money>", path = "allocationAmount" },
+  { name = "facility_position_href", type = "utf8", path = "facilityPosition/facilityReference/@href" },
+  { name = "facility_position_commitment", type = "struct<facility_commitment>", path = "facilityPosition/commitment" },
+  { name = "delayed_compensation", type = "struct<funding_payment>", path = "fundingFactors/delayedCompensation" },
+  { name = "cost_of_carry", type = "struct<funding_payment>", path = "fundingFactors/costOfCarry" },
+  { name = "economic_benefits", type = "list<struct<funding_payment>>", path = "fundingFactors/economicBenefit" },
+  { name = "transfer_fee_buyers_amount", type = "struct<money>", path = "fundingFactors/transferFeeAmounts/buyersAmount" },
+  { name = "transfer_fee_sellers_amount", type = "struct<money>", path = "fundingFactors/transferFeeAmounts/sellersAmount" },
+  { name = "specific_dates", type = "list<date32>", path = "specificDates/date" },
+  { name = "start_date", type = "date32", path = "startDate" },
+  { name = "end_date", type = "date32", path = "endDate" },
+  { name = "on_or_after_date", type = "date32", path = "onOrAfterDate" },
+  { name = "lead_days", type = "int64", path = "leadDays" },
+  { name = "cut_off_time", type = "utf8", path = "cutOffTime" },
+  { name = "no_settle_periods", type = "list<struct<no_settle_period>>", path = "noSettlePeriod" },
+]
+
+[structs.facility]
+description = "A term loan, revolver, delayed draw, or letter of credit facility"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "instrument_ids", type = "list<struct<instrument_id>>", path = "instrumentId" },
+  { name = "description", type = "utf8", path = "description", whitespace = "collapse" },
+  { name = "deal_href", type = "utf8", path = "dealReference/@href" },
+  { name = "borrower_party_href", type = "utf8", path = "borrowerPartyReference/@href" },
+  { name = "co_borrower_party_hrefs", type = "list<utf8>", path = "coBorrowerPartyReference/@href" },
+  { name = "agent_party_href", type = "utf8", path = "agentPartyReference/@href" },
+  { name = "lc_issuing_bank_party_hrefs", type = "list<utf8>", path = "lcIssuingBankPartyReference/@href" },
+  { name = "guarantor_party_hrefs", type = "list<utf8>", path = "guarantorPartyReference/@href" },
+  { name = "start_date", type = "date32", path = "startDate" },
+  { name = "expiry_date", type = "date32", path = "expiryDate" },
+  { name = "maturity_date", type = "date32", path = "maturityDate" },
+  { name = "current_commitment", type = "struct<facility_commitment>", path = "currentCommitment" },
+  { name = "original_commitment", type = "struct<money_share>", path = "originalCommitment" },
+  { name = "commitment_schedule", type = "list<struct<commitment_change>>", path = "commitmentSchedule/commitmentChange" },
+  { name = "deal_fx_rate", type = "struct<loan_fx_terms>", path = "dealFxRate" },
+  { name = "governing_law", type = "utf8", path = "governingLaw" },
+  { name = "features", type = "list<utf8>", path = "feature" },
+  { name = "lien", type = "utf8", path = "lien" },
+  { name = "seniority", type = "utf8", path = "seniority" },
+  { name = "accrual_options", type = "list<struct<accrual_option>>", path = "fixedRateOption | floatingRateOption | legacyFloatingRateOption | accruingPikOption | lcOption | accruingFeeOption" },
+  { name = "default_rate", type = "struct<period_rate>", path = "defaultRate" },
+  { name = "mandatory_cost_rate", type = "struct<period_rate>", path = "mandatoryCostRate" },
+  { name = "penalty_rate", type = "struct<period_rate>", path = "penaltyRate" },
+  { name = "draw_currencies", type = "list<utf8>", path = "multiCurrency/drawCurrency" },
+  { name = "delayed_draw", type = "bool", path = "delayedDraw" },
+  { name = "must_draw_by_date", type = "date32", path = "mustDrawByDate" },
+]

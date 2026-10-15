@@ -1,0 +1,343 @@
+[
+  {
+    "context": "loanBulkServicingNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "6f21716de06ac0f3b455f771fa855249ba35a6ff0bc5052ab309fa20ec34adf6",
+    "event": {
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "97600",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "parent_event_ids": [
+          "RolloverGroup9"
+        ]
+      },
+      "current_contract_hrefs": [
+        "CONT12345"
+      ],
+      "effective_date": "2014-09-05",
+      "new_contracts": [
+        {
+          "accrual_type": "legacyFloatingRateAccrual",
+          "amount": {
+            "amount": "4000000.000000000000000000",
+            "currency": "USD",
+            "share_amount": "4000000.000000000000000000"
+          },
+          "borrower_party_href": "BORROWERINC",
+          "contract_ids": [
+            "NC5678"
+          ],
+          "effective_date": "2014-09-05",
+          "facility_href": "FAC12345",
+          "id": "CONT67890",
+          "maturity_date": "2014-09-30",
+          "party_href": "BANKOFAGENTSNA"
+        }
+      ]
+    },
+    "event_type": "rollover",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "485230",
+    "notice_date": "2014-09-04",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 3,
+    "row_locator": "/loanBulkServicingNotification/rollover",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  },
+  {
+    "context": "loanBulkServicingNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "6f21716de06ac0f3b455f771fa855249ba35a6ff0bc5052ab309fa20ec34adf6",
+    "event": {
+      "accrual_schedule": [
+        {
+          "accrual_amount": {
+            "amount": "14972.220000000000000000",
+            "currency": "USD",
+            "share_amount": "14972.220000000000000000"
+          },
+          "end_date": "2014-09-05",
+          "number_of_days": 88,
+          "rate": "0.012250000000000000",
+          "reference_amount": {
+            "amount": "5000000.000000000000000000",
+            "currency": "USD",
+            "share_amount": "5000000.000000000000000000"
+          },
+          "start_date": "2014-06-09"
+        }
+      ],
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "14972.220000000000000000",
+        "currency": "USD",
+        "share_amount": "14972.220000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "14972.220000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "event_identifiers": [
+          {
+            "event_id": "97642",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ],
+        "parent_event_ids": [
+          "RolloverGroup9"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "calculation_method": "ContractPositionThruPeriod",
+      "effective_date": "2014-09-05",
+      "end_date": "2014-09-05",
+      "loan_contract_hrefs": [
+        "CONT12345"
+      ],
+      "start_date": "2014-06-09"
+    },
+    "event_type": "interestPayment",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "485230",
+    "notice_date": "2014-09-04",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 3,
+    "row_locator": "/loanBulkServicingNotification/interestPayment",
+    "row_ordinal": 1,
+    "sent_by": "US2A432121"
+  },
+  {
+    "context": "loanBulkServicingNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "6f21716de06ac0f3b455f771fa855249ba35a6ff0bc5052ab309fa20ec34adf6",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "1000000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "1000000.000000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "1000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "event_identifiers": [
+          {
+            "event_id": "61948",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ],
+        "parent_event_ids": [
+          "RolloverGroup9"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-09-05",
+      "loan_contract_hrefs": [
+        "CONT12345"
+      ],
+      "refusal_allowed": false
+    },
+    "event_type": "repayment",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "485230",
+    "notice_date": "2014-09-04",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 3,
+    "row_locator": "/loanBulkServicingNotification/repayment",
+    "row_ordinal": 2,
+    "sent_by": "US2A432121"
+  }
+]

@@ -1,0 +1,63 @@
+[
+  {
+    "context": "loanTradeNotification",
+    "creation_time_utc": "2018-09-26T14:00:00Z",
+    "creation_timestamp": {
+      "local": "2018-09-26T10:00:00",
+      "offset_minutes": -240,
+      "utc": "2018-09-26T14:00:00Z"
+    },
+    "document_root": "loanTradeNotification",
+    "document_sha256": "fd8d7585c79f8deaf6597731dbbe4ec07a708304af3a0ec8f8e765ba17335abd",
+    "event": {
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "US001",
+            "event_id_scheme": "http://www.barclays.com/coding-scheme/event-id-1-0",
+            "party_href": "BANK67890"
+          }
+        ]
+      },
+      "loan_trade_href": "T1"
+    },
+    "event_type": "loanTrade",
+    "facility_identifiers": [
+      {
+        "id": "FAC12345",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "BANK67890"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "BPLC0000444445555",
+    "notice_date": "2018-09-26",
+    "parties": [
+      {
+        "id": "BANK12345",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "GB1L213246"
+          }
+        ]
+      },
+      {
+        "id": "BANK67890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LFM0001"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanTradeNotification/loanTrade",
+    "row_ordinal": 0,
+    "sent_by": "US1LFM0001"
+  }
+]

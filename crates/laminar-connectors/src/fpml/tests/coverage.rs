@@ -68,7 +68,7 @@ enum Status {
     Outstanding,
 }
 
-/// Which golden field identifies the representation a row belongs to.
+/// Which golden fields identify the representation a row belongs to.
 #[derive(Clone, Copy)]
 enum Section {
     Product,
@@ -77,11 +77,11 @@ enum Section {
 }
 
 impl Section {
-    fn discriminator(self) -> &'static str {
+    fn discriminators(self) -> &'static [&'static str] {
         match self {
-            Self::Product => "product_type",
-            Self::Loan => "event_type",
-            Self::Document => "document_root",
+            Self::Product => &["product_type"],
+            Self::Loan => &["event_type", "facility_type"],
+            Self::Document => &["document_root"],
         }
     }
 }
@@ -250,7 +250,12 @@ fn check_typed(
     let evidence = goldens
         .rows(profile_name)
         .iter()
-        .filter(|row| row[section.discriminator()] == entry.element.as_str())
+        .filter(|row| {
+            section
+                .discriminators()
+                .iter()
+                .any(|field| row[*field] == entry.element.as_str())
+        })
         .filter(|row| !row[column.as_str()].is_null())
         .count();
     if evidence == 0 {

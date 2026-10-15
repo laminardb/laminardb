@@ -1,0 +1,85 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2014-09-18T09:45:07Z",
+    "creation_timestamp": {
+      "local": "2014-09-18T09:45:07",
+      "offset_minutes": 0,
+      "utc": "2014-09-18T09:45:07Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "dca31c3c14a59734c3c3f6d45e9a5893f58fcde066a778e6a1a977900a0b9faa",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "comment": "Penalty rate change per terms of CA.",
+        "event_identifiers": [
+          {
+            "event_id": "32570",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-09-22",
+      "facility_href": "FAC12345",
+      "period_rate": {
+        "end_date": "2014-12-22",
+        "rate": "0.003000000000000000",
+        "start_date": "2014-09-22"
+      }
+    },
+    "event_type": "penaltyRateChange",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "842301",
+    "notice_date": "2014-09-18",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/penaltyRateChange",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

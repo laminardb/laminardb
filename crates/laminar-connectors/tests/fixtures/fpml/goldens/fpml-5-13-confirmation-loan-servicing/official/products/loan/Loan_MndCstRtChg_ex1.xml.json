@@ -1,0 +1,83 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2013-12-17T10:40:57Z",
+    "creation_timestamp": {
+      "local": "2013-12-17T10:40:57",
+      "offset_minutes": 0,
+      "utc": "2013-12-17T10:40:57Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "739f09732e223ddccc2aeaafd426456924a2f137d85205512a4ec905de558687",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "42902",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2013-12-18",
+      "facility_href": "FAC12345",
+      "period_rate": {
+        "rate": "0.002500000000000000",
+        "start_date": "2013-12-18"
+      }
+    },
+    "event_type": "mandatoryCostRateChange",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "836058",
+    "notice_date": "2013-12-17",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/mandatoryCostRateChange",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

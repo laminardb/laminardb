@@ -425,7 +425,7 @@ path = "facilityIdentifier | facilitySummary"
 
 [[columns]]
 name = "contract_identifiers"
-type = "list<struct<loan_identifier>>"
+type = "list<struct<contract_identifier>>"
 path = "contractIdentifier | contractSummary | letterOfCreditIdentifier | letterOfCreditSummary"
 
 [[columns]]

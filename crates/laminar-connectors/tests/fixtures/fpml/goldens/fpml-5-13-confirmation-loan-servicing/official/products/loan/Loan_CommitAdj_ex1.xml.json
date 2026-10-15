@@ -1,0 +1,107 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2013-10-30T11:38:20Z",
+    "creation_timestamp": {
+      "local": "2013-10-30T11:38:20",
+      "offset_minutes": 0,
+      "utc": "2013-10-30T11:38:20Z"
+    },
+    "deal_identifiers": [
+      {
+        "description": "Borrower Inc. Revolver",
+        "id": "DEAL456",
+        "instrument_ids": [
+          "75362ZUU6"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "document_root": "facilityNotification",
+    "document_sha256": "e6a7e69eeb37b7005d8f9d5f779d7e7063a6477bb1558520dc07a03dbfb6c67a",
+    "event": {
+      "adjustment_amount": {
+        "amount": "1929373.180000000000000000",
+        "currency": "USD",
+        "share_amount": "63598.040000000000000000"
+      },
+      "adjustment_type": "Decrease",
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "comment": "Voluntary paydown, commitment decrease",
+        "event_identifiers": [
+          {
+            "event_id": "598423",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2013-10-31",
+      "facility_commitment": {
+        "total_commitment_amount": {
+          "amount": "135089518.690000000000000000",
+          "currency": "USD",
+          "share_amount": "4452963.920000000000000000"
+        }
+      },
+      "facility_href": "FAC12345",
+      "pik": false,
+      "refusal_allowed": false,
+      "scheduled": true
+    },
+    "event_type": "commitmentAdjustment",
+    "facility_identifiers": [
+      {
+        "description": "Tranche B",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "75362ZUT8"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "656114",
+    "notice_date": "2013-10-30",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ],
+        "party_name": ""
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/commitmentAdjustment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

@@ -549,5 +549,12 @@ synthetic/document-verificationStatusAcknowledgement.xml
 synthetic/document-verificationStatusException.xml
 synthetic/document-verificationStatusNotification.xml
 synthetic/generic-product.xml
+synthetic/loan-breakageFeePayment.xml
+synthetic/loan-facilityPrepaymentFeePayment.xml
+synthetic/loan-legacyInterestCapitalization.xml
+synthetic/loan-legacyInterestPayment.xml
+synthetic/loan-letterOfCreditFacility.xml
+synthetic/loan-mandatoryCostRateExpiry.xml
+synthetic/loan-revolver.xml
 synthetic/standard-product.xml
 synthetic/volatility-swap.xml

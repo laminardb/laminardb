@@ -166,13 +166,21 @@ fields = [
 ]
 
 [structs.loan_identifier]
-description = "Deal, facility, or loan contract identifier"
+description = "Deal or facility identifier or summary"
 fields = [
   { name = "id", type = "utf8", path = "@id" },
   { name = "party_href", type = "utf8", path = "partyReference/@href" },
   { name = "instrument_ids", type = "list<utf8>", path = "instrumentId" },
-  { name = "contract_ids", type = "list<utf8>", path = "contractId | versionedContractId/contractId" },
   { name = "description", type = "utf8", path = "description" },
+]
+
+[structs.contract_identifier]
+description = "Loan contract or letter of credit identifier or summary"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "contract_ids", type = "list<utf8>", path = "contractId | versionedContractId/contractId" },
+  { name = "facility_href", type = "utf8", path = "facilityReference/@href" },
 ]
 
 [structs.loan_event_reference]

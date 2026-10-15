@@ -1,0 +1,107 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2013-12-31T07:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-12-31T07:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-12-31T07:30:47Z"
+    },
+    "deal_identifiers": [
+      {
+        "description": "2010 Capital Expenditure Project",
+        "id": "DL345",
+        "instrument_ids": [
+          "851025AG8"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "document_root": "facilityNotification",
+    "document_sha256": "5fed5a915ff3679b5c83b1effde6c81b868fea1be28fcd61c044bbdc6e0f4c87",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "10000000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "33541.670000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "33541.670000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "comment": "On Limit Amount",
+        "event_identifiers": [
+          {
+            "event_id": "8541236",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2013-12-31",
+      "facility_href": "FAC12345",
+      "fee_type": "Facility Fee"
+    },
+    "event_type": "miscFeePayment",
+    "facility_identifiers": [
+      {
+        "description": "Facility",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "851025AH6"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "0010957329",
+    "notice_date": "2013-12-31",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/miscFeePayment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

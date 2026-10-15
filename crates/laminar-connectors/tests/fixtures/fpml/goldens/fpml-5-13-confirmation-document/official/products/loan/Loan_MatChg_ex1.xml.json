@@ -6,6 +6,7 @@
         "contract_ids": [
           "CC1234"
         ],
+        "facility_href": "FAC12345",
         "id": "LCON123",
         "party_href": "BANKOFAGENTSNA"
       }

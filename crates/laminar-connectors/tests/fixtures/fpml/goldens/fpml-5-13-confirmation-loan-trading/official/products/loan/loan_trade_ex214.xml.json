@@ -1,0 +1,100 @@
+[
+  {
+    "context": "loanAllocationNotification",
+    "creation_time_utc": "2018-03-12T21:35:58.568Z",
+    "creation_timestamp": {
+      "local": "2018-03-12T16:35:58.568",
+      "offset_minutes": -300,
+      "utc": "2018-03-12T21:35:58.568Z"
+    },
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "e6dfbe2c1ece6d21966ff7afc0ca50b09d6d9cc258694e47171107cc21cf6df2",
+    "event": {
+      "allocation_amount": {
+        "amount": "5000000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "allocation_href": "A_001",
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "5000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "KY1L151440",
+            "receiver_party_href": "GB1L104502"
+          }
+        ],
+        "event_identifiers": [
+          {
+            "event_id": "GB008",
+            "event_id_scheme": "http://www.barclays.com/fpml/coding-scheme/internal/loan-allocation-settlement-event-id",
+            "party_href": "US1L142580"
+          }
+        ],
+        "lender_party_hrefs": [
+          "KY1L151440"
+        ]
+      },
+      "facility_position_commitment": {
+        "total_commitment_amount": {
+          "amount": "100000000.000000000000000000",
+          "currency": "USD"
+        }
+      },
+      "facility_position_href": "CUSIP1003",
+      "settlement_date": "2018-03-15"
+    },
+    "event_type": "loanAllocationSettlement",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "P00001549667579",
+    "notice_date": "2018-03-15",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "KY1L151440",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY1L151440"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanAllocationNotification/loanAllocationSettlement",
+    "row_ordinal": 0,
+    "sent_by": "GB1L104502"
+  }
+]

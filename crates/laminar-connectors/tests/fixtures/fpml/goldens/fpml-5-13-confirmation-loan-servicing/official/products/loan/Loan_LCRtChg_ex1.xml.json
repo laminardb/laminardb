@@ -1,0 +1,72 @@
+[
+  {
+    "context": "lcNotification",
+    "creation_time_utc": "2014-01-14T12:03:06Z",
+    "creation_timestamp": {
+      "local": "2014-01-14T12:03:06",
+      "offset_minutes": 0,
+      "utc": "2014-01-14T12:03:06Z"
+    },
+    "document_root": "lcNotification",
+    "document_sha256": "4c17213db599d9ed1d11270db592e80a463bc9f4c3fdc1b3954f659c157de713",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "43927",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "effective_date": "2014-01-10",
+      "letter_of_credit_hrefs": [
+        "LOC567"
+      ],
+      "rate": "0.030000000000000000"
+    },
+    "event_type": "lcRateChange",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "587329",
+    "notice_date": "2014-01-09",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/lcNotification/lcRateChange",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

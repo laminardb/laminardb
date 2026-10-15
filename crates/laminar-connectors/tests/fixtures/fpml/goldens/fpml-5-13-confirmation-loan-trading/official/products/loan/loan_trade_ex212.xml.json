@@ -1,0 +1,82 @@
+[
+  {
+    "context": "loanTradeNotification",
+    "creation_time_utc": "2018-03-08T21:35:58.568Z",
+    "creation_timestamp": {
+      "local": "2018-03-08T16:35:58.568",
+      "offset_minutes": -300,
+      "utc": "2018-03-08T21:35:58.568Z"
+    },
+    "document_root": "loanTradeNotification",
+    "document_sha256": "3b4c9cf338d6fd34b59fb69c0082c1d79b5a8b27bcc5a6ea2bbcfd094f4f91a6",
+    "event": {
+      "amount": {
+        "amount": "3500.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "CH003",
+            "event_id_scheme": "http://www.barclays.com/fpml/coding-scheme/internal/loan-transfer-fee-owed-event-id",
+            "party_href": "CH1L122575"
+          }
+        ],
+        "lender_party_hrefs": [
+          "GB1L104502"
+        ]
+      },
+      "due_date": "2018-03-15",
+      "loan_trade_href": "T_AGBTR_T_001"
+    },
+    "event_type": "loanTradeFeeDue",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "BBPLC00001549667579",
+    "notice_date": "2018-03-08",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "CH1L122575",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "CH1L122575"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanTradeNotification/loanTradeFeeDue",
+    "row_ordinal": 0,
+    "sent_by": "CH1L122575"
+  }
+]

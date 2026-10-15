@@ -1,0 +1,93 @@
+[
+  {
+    "context": "loanContractNotification",
+    "creation_time_utc": "2014-12-11T08:15:25Z",
+    "creation_timestamp": {
+      "local": "2014-12-11T08:15:25",
+      "offset_minutes": 0,
+      "utc": "2014-12-11T08:15:25Z"
+    },
+    "document_root": "loanContractNotification",
+    "document_sha256": "136e17d92e4cb0413d270b9207eec77df329fc766c9c0447be1db38dd99affb4",
+    "event": {
+      "adjustment_amount": {
+        "amount": "5000000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "500500.000000000000000000"
+      },
+      "adjustment_type": "Increase",
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "25000000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "5200500.000000000000000000"
+      },
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "59846",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-12-15",
+      "loan_contract_hrefs": [
+        "LC1234"
+      ]
+    },
+    "event_type": "loanContractAdjustment",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "526553",
+    "notice_date": "2014-12-11",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ],
+        "party_name": ""
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanContractNotification/loanContractAdjustment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

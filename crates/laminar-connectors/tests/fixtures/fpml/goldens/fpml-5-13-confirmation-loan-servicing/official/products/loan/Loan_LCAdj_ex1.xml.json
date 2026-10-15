@@ -1,0 +1,95 @@
+[
+  {
+    "context": "lcNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "lcNotification",
+    "document_sha256": "690eab841de8ffb8fddc6b17bba4164caebb3b70f405f015debca8f93ec4be4b",
+    "event": {
+      "adjustment_amount": {
+        "amount": "50000.000000000000000000",
+        "currency": "USD"
+      },
+      "adjustment_type": "Decrease",
+      "amount": {
+        "amount": "50000.000000000000000000",
+        "currency": "USD"
+      },
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "65334",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ]
+      },
+      "effective_date": "2014-11-12",
+      "letter_of_credit_hrefs": [
+        "LOC234"
+      ],
+      "related_borrowing": false
+    },
+    "event_type": "lcAdjustment",
+    "facility_identifiers": [
+      {
+        "description": "Revolver",
+        "id": "FAC67890",
+        "instrument_ids": [
+          "F234564REV"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "724152",
+    "notice_date": "2014-11-12",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "BENEFICIARYBANK",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1B987656"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/lcNotification/lcAdjustment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

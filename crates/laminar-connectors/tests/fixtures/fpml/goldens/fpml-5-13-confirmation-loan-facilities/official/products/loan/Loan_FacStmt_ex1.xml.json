@@ -1,0 +1,193 @@
+[
+  {
+    "context": "facilityStatement",
+    "creation_time_utc": "2015-12-17T08:35:42Z",
+    "creation_timestamp": {
+      "local": "2015-12-17T08:35:42",
+      "offset_minutes": 0,
+      "utc": "2015-12-17T08:35:42Z"
+    },
+    "deal_identifiers": [
+      {
+        "description": "2012 Construction Project",
+        "id": "DL1357",
+        "instrument_ids": [
+          "D13578"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "document_root": "facilityStatement",
+    "document_sha256": "7b9e08491747286842ef07e5c447b311167c2a17c9ee0a4fc853ed75e8c67d38",
+    "facility": {
+      "accrual_options": [
+        {
+          "accrual_option_id": "825610",
+          "currency": "USD",
+          "day_count_fraction": "30/360",
+          "end_date": "2016-06-01",
+          "fixed_rate": "0.009750000000000000",
+          "option_type": "fixedRateOption",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 3
+          },
+          "start_date": "2016-01-01"
+        }
+      ],
+      "agent_party_href": "BANKOFAGENTSNA",
+      "borrower_party_href": "BORROWERINC",
+      "co_borrower_party_hrefs": [
+        "COBORROWERINC"
+      ],
+      "current_commitment": {
+        "total_commitment_amount": {
+          "amount": "50000000.000000000000000000",
+          "currency": "USD",
+          "share_amount": "1500000.000000000000000000"
+        }
+      },
+      "deal_href": "DL1357",
+      "default_rate": {
+        "end_date": "2016-06-01",
+        "rate": "0.011750000000000000",
+        "start_date": "2016-01-01"
+      },
+      "delayed_draw": true,
+      "description": "Delayed Draw Facility",
+      "governing_law": "USNY",
+      "id": "DDFAC13",
+      "instrument_ids": [
+        {
+          "scheme": "http://www.cusip.com/",
+          "value": "DDFAC1357"
+        }
+      ],
+      "maturity_date": "2016-06-01",
+      "must_draw_by_date": "2016-03-01",
+      "party_href": "BANKOFAGENTSNA",
+      "penalty_rate": {
+        "end_date": "2016-06-01",
+        "rate": "0.011750000000000000",
+        "start_date": "2016-01-01"
+      },
+      "start_date": "2016-01-01"
+    },
+    "facility_type": "delayedDraw",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "818902",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      }
+    ],
+    "row_count": 2,
+    "row_locator": "/facilityStatement/delayedDraw",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121",
+    "statement_date": "2015-12-17"
+  },
+  {
+    "context": "delayedDraw",
+    "creation_time_utc": "2015-12-17T08:35:42Z",
+    "creation_timestamp": {
+      "local": "2015-12-17T08:35:42",
+      "offset_minutes": 0,
+      "utc": "2015-12-17T08:35:42Z"
+    },
+    "deal_identifiers": [
+      {
+        "description": "2012 Construction Project",
+        "id": "DL1357",
+        "instrument_ids": [
+          "D13578"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "document_root": "facilityStatement",
+    "document_sha256": "7b9e08491747286842ef07e5c447b311167c2a17c9ee0a4fc853ed75e8c67d38",
+    "facility": {},
+    "facility_type": "delayedDraw",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "818902",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      }
+    ],
+    "row_count": 2,
+    "row_locator": "/facilityStatement/delayedDraw/delayedDraw",
+    "row_ordinal": 1,
+    "sent_by": "US2A432121",
+    "statement_date": "2015-12-17"
+  }
+]

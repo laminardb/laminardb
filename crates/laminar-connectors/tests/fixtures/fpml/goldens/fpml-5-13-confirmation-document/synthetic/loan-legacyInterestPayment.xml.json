@@ -1,0 +1,88 @@
+[
+  {
+    "actual_build": 7,
+    "contract_identifiers": [
+      {
+        "contract_ids": [
+          "CC1234"
+        ],
+        "facility_href": "FAC12345",
+        "id": "LCON123",
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "creation_time_utc": "2014-05-01T09:30:47Z",
+    "document_bytes": 3381,
+    "document_root": "loanContractNotification",
+    "document_sha256": "33d72bbdf069680a1aa00ce97fa210d7d6106681f4144a2770506d3ac8e96126",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2014-05-01T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2014-05-01T09:30:47Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "002652260",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": false,
+    "loan_events": [
+      {
+        "effective_date": "2014-05-05",
+        "event_ids": [
+          "41236"
+        ],
+        "event_type": "legacyInterestPayment",
+        "locator": "/loanContractNotification/legacyInterestPayment"
+      }
+    ],
+    "notice_date": "2014-05-01",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ]
+  }
+]

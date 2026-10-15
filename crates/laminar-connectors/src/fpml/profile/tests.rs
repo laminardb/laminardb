@@ -142,3 +142,30 @@ path = "swap/swapStream/@id"
         .collect();
     assert_eq!(names, ["trade_date", "trade_id", "swap_streams"]);
 }
+
+#[test]
+fn self_tests_narrow_a_union_to_one_element() {
+    let narrowed = r#"
+[sets]
+product = { substitution = "product" }
+
+[structs.swap_only]
+fields = [
+  { name = "streams", type = "list<utf8>", path = "swapStream/@id" },
+]
+
+[[columns]]
+name = "swap"
+type = "struct<swap_only>"
+path = "{product}/self::swap"
+"#;
+    compile(narrowed).unwrap();
+
+    let error = compile(&narrowed.replace("self::swap", "self::fra")).unwrap_err();
+    assert!(
+        error.contains("struct template 'swap_only' matches none of its element fields in Fra"),
+        "{error}"
+    );
+    let error = compile(&narrowed.replace("{product}/self::swap", "self::swap")).unwrap_err();
+    assert!(error.contains("self::swap can never match here"), "{error}");
+}

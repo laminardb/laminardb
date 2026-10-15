@@ -50,6 +50,8 @@ pub(crate) enum Step {
     Deref,
     /// Keep the current elements that have a child matching each of these tests.
     Filter(Vec<NameTest>),
+    /// Keep the current elements whose name matches.
+    SelfTest(NameTest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

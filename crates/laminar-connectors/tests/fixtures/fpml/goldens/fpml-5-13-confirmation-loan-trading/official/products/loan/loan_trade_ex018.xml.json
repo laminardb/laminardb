@@ -1,0 +1,109 @@
+[
+  {
+    "context": "loanAllocationNotification",
+    "creation_time_utc": "2017-09-09T00:41:30.754731200Z",
+    "creation_timestamp": {
+      "local": "2017-09-08T20:41:30.754731200",
+      "offset_minutes": -240,
+      "utc": "2017-09-09T00:41:30.754731200Z"
+    },
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "9cc16a1770fceb7aaa74387e2ed96925ea668096237c4ee05b5593efc6ee0787",
+    "event": {
+      "allocation_amount": {
+        "amount": "10000000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "allocation_href": "AL1",
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "US003",
+            "event_id_scheme": "http://www.barclays.com/coding-scheme/event-id-1-0",
+            "party_href": "BANK67890"
+          }
+        ]
+      },
+      "cost_of_carry": {
+        "amount": {
+          "amount": "35.500000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        }
+      },
+      "delayed_compensation": {
+        "amount": {
+          "amount": "54.310000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        }
+      },
+      "facility_position_commitment": {
+        "required_funded_amount": {
+          "amount": "100000000.000000000000000000",
+          "currency": "USD"
+        },
+        "total_commitment_amount": {
+          "amount": "100000000.000000000000000000",
+          "currency": "USD"
+        },
+        "unavailable_to_utilize_amount": {
+          "amount": "0.000000000000000000",
+          "currency": "USD",
+          "share_amount": "0.000000000000000000"
+        }
+      },
+      "facility_position_href": "FAC12345",
+      "settlement_date": "2017-08-10",
+      "transfer_fee_buyers_amount": {
+        "amount": "1750.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "transfer_fee_sellers_amount": {
+        "amount": "1750.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      }
+    },
+    "event_type": "loanAllocationSettlement",
+    "facility_identifiers": [
+      {
+        "id": "FAC12345",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "BANK67890"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "BPLC0000354959612",
+    "notice_date": "2017-09-08",
+    "parties": [
+      {
+        "id": "BANK12345",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "GB1L213246"
+          }
+        ]
+      },
+      {
+        "id": "BANK67890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LFM0001"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanAllocationNotification/loanAllocationSettlement",
+    "row_ordinal": 0,
+    "sent_by": "US1LFM0001"
+  }
+]

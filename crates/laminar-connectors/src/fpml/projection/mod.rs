@@ -333,6 +333,14 @@ impl<'a> Projector<'a> {
                     stack[start..].reverse();
                 }
             }
+            Step::SelfTest(test) => {
+                if document
+                    .element(id)
+                    .is_some_and(|element| test.matches(element.name))
+                {
+                    out.push(id);
+                }
+            }
             Step::Filter(predicates) => {
                 if predicates
                     .iter()

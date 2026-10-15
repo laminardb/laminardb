@@ -322,6 +322,7 @@ impl Compiler<'_> {
                     Step::Filter(self.predicates(&predicates, &types)?),
                     types.clone(),
                 ),
+                ParsedStep::SelfTest(test) => self.self_test(&test, &types)?,
                 ParsedStep::Child { test, predicates } => {
                     let (test, next) = match test {
                         ParsedTest::Any => (NameTest::Any, None),
@@ -368,6 +369,52 @@ impl Compiler<'_> {
                 ParsedTest::Any => Err("'[*]' is not a predicate".into()),
             })
             .collect()
+    }
+
+    /// Narrow the current elements to those named by `test`, and their types to the types those
+    /// names are declared with among the current ones.
+    fn self_test(&mut self, test: &ParsedTest, context: &Types) -> Result<(Step, Types), String> {
+        let (names, compiled): (Vec<QName>, NameTest) = match test {
+            ParsedTest::Name(name) => {
+                self.declared(name)?;
+                let id = self.interner.intern(&name.0, &name.1);
+                (vec![name.clone()], NameTest::Name(id))
+            }
+            ParsedTest::Set(set) => {
+                let compiled = self
+                    .sets
+                    .get(set)
+                    .ok_or_else(|| format!("unknown set '{set}'"))?;
+                (
+                    compiled.members.iter().cloned().collect(),
+                    NameTest::Set(Arc::clone(&compiled.ids)),
+                )
+            }
+            ParsedTest::Any => return Err("'self::*' selects nothing new; use '.'".into()),
+        };
+        let declared: BTreeSet<QName> = names
+            .iter()
+            .filter_map(|name| self.model.element_types.get(name))
+            .flatten()
+            .cloned()
+            .collect();
+        let Some(context) = context else {
+            return Ok((Step::SelfTest(compiled), Some(declared)));
+        };
+        let admitted: BTreeSet<QName> = context
+            .iter()
+            .flat_map(|ty| self.model.descendants(ty))
+            .collect();
+        let narrowed: BTreeSet<QName> = declared.intersection(&admitted).cloned().collect();
+        if narrowed.is_empty() {
+            let wanted: Vec<&str> = names.iter().map(|name| name.1.as_str()).collect();
+            return Err(format!(
+                "self::{} can never match here: the current element is one of {}",
+                wanted.join("|"),
+                type_list(context)
+            ));
+        }
+        Ok((Step::SelfTest(compiled), Some(narrowed)))
     }
 
     fn set_step(&self, set: &str, context: &Types) -> Result<(NameTest, Types), String> {

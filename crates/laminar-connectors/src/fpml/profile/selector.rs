@@ -4,6 +4,7 @@
 //! path      := selector ('|' selector)*
 //! selector  := ['/'] step (('/' | '->') step)*
 //! step      := '.' pred* | '..' | '**' | '*' | name pred* | '{' set '}' pred*
+//!            | 'self::' (name | '{' set '}')
 //!            | '@' name | '#text' | '#name' | '#type' | '#locator'
 //! pred      := '[' name ']' | '[' '{' set '}' ']'
 //! name      := [prefix ':'] local
@@ -14,7 +15,9 @@
 //! document root; `|` concatenates the results of alternatives in order (FpML's
 //! value-or-reference choices). `**` is descendant-or-self,
 //! `[name]` keeps elements that have such a child (`[{set}]`: a child in the set), and `->`
-//! follows the current element's `href`
+//! follows the current element's `href`. `self::name` keeps the current element only if it has
+//! that name (or, with a set, a name in the set), so a column can type one element of a union
+//! row with that element's own content model.
 //! to the element with that `id`. A value step (`@`, `#…`) may only end a selector; a selector
 //! ending in an element yields that element's character data.
 
@@ -39,6 +42,8 @@ pub(crate) enum ParsedStep {
     Deref,
     /// `.[name]…`: keep the current elements that have such children.
     Filter(Vec<ParsedTest>),
+    /// `self::name`: keep the current elements with this name.
+    SelfTest(ParsedTest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +133,9 @@ pub(crate) fn parse(
             "#type" => terminal = ParsedTerminal::Type,
             "#locator" => terminal = ParsedTerminal::Locator,
             _ if token.starts_with('#') => return Err(format!("unknown value step '{token}'")),
+            _ if token.starts_with("self::") => {
+                steps.push(ParsedStep::SelfTest(name_or_set(&token[6..], namespaces)?));
+            }
             _ if token.starts_with(".[") => steps.push(ParsedStep::Filter(predicates(
                 token,
                 &token[1..],
@@ -284,6 +292,22 @@ mod tests {
             ))])]
         );
         assert_eq!(
+            parse("self::borrowing/amount", &namespaces())
+                .unwrap()
+                .steps,
+            vec![
+                ParsedStep::SelfTest(ParsedTest::Name(fpml("borrowing"))),
+                ParsedStep::Child {
+                    test: ParsedTest::Name(fpml("amount")),
+                    predicates: vec![]
+                }
+            ]
+        );
+        assert_eq!(
+            parse("self::{events}", &namespaces()).unwrap().steps,
+            vec![ParsedStep::SelfTest(ParsedTest::Set("events".into()))]
+        );
+        assert_eq!(
             parse("trade[tradeHeader][{rates}]", &namespaces())
                 .unwrap()
                 .steps,
@@ -305,6 +329,7 @@ mod tests {
     fn rejects_malformed_selectors() {
         for selector in [
             "", "a//b", "@x/b", "#name/b", "u:a", "a[b", "{}", "#unknown", "1a", "a[*]", "a[{}]",
+            "self::", "self::*",
         ] {
             assert!(parse(selector, &namespaces()).is_err(), "{selector}");
         }

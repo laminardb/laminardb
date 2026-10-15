@@ -467,325 +467,494 @@ notes = "Volatility legs as for volatilitySwap plus underlyer provisions"
 element = "delayedDraw"
 group = "facilityGroup"
 type = "DelayedDraw"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency, delayedDraw, mustDrawByDate"
 
 [[loan]]
 element = "letterOfCreditFacility"
 group = "facilityGroup"
 type = "LetterOfCreditFacility"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+synthetic = ["loan-letterOfCreditFacility.xml"]
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency"
 
 [[loan]]
 element = "revolver"
 group = "facilityGroup"
 type = "Revolver"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+synthetic = ["loan-revolver.xml"]
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency"
 
 [[loan]]
 element = "termLoan"
 group = "facilityGroup"
 type = "TermLoan"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency"
 
 [[loan]]
 element = "accrualOptionChange"
 group = "facilityEventGroup"
 type = "AccrualOptionChange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, fixedRateOption, floatingRateOption, legacyFloatingRateOption, loanContractReference, accruingPikOption, lcOption, letterOfCreditReference"
 
 [[loan]]
 element = "accruingFeeChange"
 group = "facilityEventGroup"
 type = "AccruingFeeChange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, accruingFeeOption"
 
 [[loan]]
 element = "accruingFeeExpiry"
 group = "facilityEventGroup"
 type = "AccruingFeeExpiry"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, id, type"
 
 [[loan]]
 element = "accruingFeePayment"
 group = "facilityEventGroup"
 type = "AccruingFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, id, startDate, endDate, amount, accrualSchedule, projection"
 
 [[loan]]
 element = "accruingPikPayment"
 group = "facilityEventGroup"
 type = "AccruingPikPayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, startDate, endDate, amount, accrualSchedule"
 
 [[loan]]
 element = "amendmentFeePayment"
 group = "facilityEventGroup"
 type = "AmendmentFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
 
 [[loan]]
 element = "commitmentAdjustment"
 group = "facilityEventGroup"
 type = "CommitmentAdjustment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, refusalAllowed, scheduled, pik, facilityCommitment, adjustment, commitmentSchedule"
 
 [[loan]]
 element = "defaultRateChange"
 group = "facilityEventGroup"
 type = "DefaultRateChange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference, rate"
 
 [[loan]]
 element = "defaultRateExpiry"
 group = "facilityEventGroup"
 type = "DefaultRateExpiry"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference"
 
 [[loan]]
 element = "facilityExtensionFeePayment"
 group = "facilityEventGroup"
 type = "FacilityExtensionFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
 
 [[loan]]
 element = "facilityPrepayment"
 group = "facilityEventGroup"
 type = "FacilityPrepayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
 
 [[loan]]
 element = "facilityPrepaymentFeePayment"
 group = "facilityEventGroup"
 type = "FacilityPrepaymentFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-facilityPrepaymentFeePayment.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
 
 [[loan]]
 element = "facilityTermination"
 group = "facilityEventGroup"
 type = "FacilityTermination"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference"
 
 [[loan]]
 element = "fundingFeePayment"
 group = "facilityEventGroup"
 type = "FundingFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
 
 [[loan]]
 element = "mandatoryCostRateChange"
 group = "facilityEventGroup"
 type = "MandatoryCostRateChange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference, rate"
 
 [[loan]]
 element = "mandatoryCostRateExpiry"
 group = "facilityEventGroup"
 type = "MandatoryCostRateExpiry"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-mandatoryCostRateExpiry.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference"
 
 [[loan]]
 element = "miscFeePayment"
 group = "facilityEventGroup"
 type = "MiscFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount, type, description"
 
 [[loan]]
 element = "penaltyRateChange"
 group = "facilityEventGroup"
 type = "PenaltyRateChange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference, rate"
 
 [[loan]]
 element = "penaltyRateExpiry"
 group = "facilityEventGroup"
 type = "PenaltyRateExpiry"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference"
 
 [[loan]]
 element = "upfrontFeePayment"
 group = "facilityEventGroup"
 type = "UpfrontFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
 
 [[loan]]
 element = "waiverFeePayment"
 group = "facilityEventGroup"
 type = "WaiverFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
 
 [[loan]]
 element = "baseRateSet"
 group = "loanContractEventGroup"
 type = "LoanContractBaseRateSet"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, fixingDate, rate, spreadAdjustment"
 
 [[loan]]
 element = "borrowing"
 group = "loanContractEventGroup"
 type = "Borrowing"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, amount, conditionsPrecedentMet"
 
 [[loan]]
 element = "breakageFeePayment"
 group = "loanContractEventGroup"
 type = "BreakageFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-breakageFeePayment.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, amount, breakageFeeClaimDate, breakageFeeCalculatedBy"
 
 [[loan]]
 element = "interestCapitalization"
 group = "loanContractEventGroup"
 type = "InterestCapitalization"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, calculationMethod, amount, accrualSchedule, projection"
 
 [[loan]]
 element = "interestPayment"
 group = "loanContractEventGroup"
 type = "LoanInterestPayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, lenderShareCalculationMethod, amount, accrualSchedule, projection"
 
 [[loan]]
 element = "legacyInterestCapitalization"
 group = "loanContractEventGroup"
 type = "LegacyInterestCapitalization"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-legacyInterestCapitalization.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, calculationMethod, amount, accrualSchedule, projection"
 
 [[loan]]
 element = "legacyInterestPayment"
 group = "loanContractEventGroup"
 type = "LegacyLoanInterestPayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-legacyInterestPayment.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, calculationMethod, amount, accrualSchedule, projection"
 
 [[loan]]
 element = "loanContractAdjustment"
 group = "loanContractEventGroup"
 type = "LoanContractAdjustment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, adjustment, amount"
 
 [[loan]]
 element = "maturityChange"
 group = "loanContractEventGroup"
 type = "LoanContractMaturityChange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, currentMaturityDate, priorMaturityDate"
 
 [[loan]]
 element = "repayment"
 group = "loanContractEventGroup"
 type = "Repayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, amount, price, refusalAllowed, borrowerMandatory, scheduledRepayment"
 
 [[loan]]
 element = "rollover"
 group = "loanContractEventGroup"
 type = "Rollover"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; currentContracts, newContracts"
 
 [[loan]]
 element = "lcAdjustment"
 group = "lcEventGroup"
 type = "LcAdjustment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, adjustment, amount, relatedBorrowing"
 
 [[loan]]
 element = "lcFxRevaluation"
 group = "lcEventGroup"
 type = "LcFxRevaluation"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, lcFxRate, facilityFxRate"
 
 [[loan]]
 element = "lcIssuance"
 group = "lcEventGroup"
 type = "LcIssuance"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, amount"
 
 [[loan]]
 element = "lcIssuanceFeePayment"
 group = "lcEventGroup"
 type = "LcIssuanceFeePayment"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, id, startDate, endDate, amount, accrualSchedule"
 
 [[loan]]
 element = "lcRateChange"
 group = "lcEventGroup"
 type = "LcRateChange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, rate"
 
 [[loan]]
 element = "lcRenewal"
 group = "lcEventGroup"
 type = "LcRenewal"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, finalExpiryDate, maturityDate"
 
 [[loan]]
 element = "lcTermination"
 group = "lcEventGroup"
 type = "LcTermination"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, expiry"
 
 [[loan]]
 element = "loanAllocation"
 group = "loanAllocationEventGroup"
 type = "LoanAllocationEvent"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference"
 
 [[loan]]
 element = "loanAllocationConfirmation"
 group = "loanAllocationEventGroup"
 type = "LoanAllocationEvent"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference"
 
 [[loan]]
 element = "loanAllocationFeeDue"
 group = "loanAllocationEventGroup"
 type = "LoanAllocationTransferFeeDue"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, amount, dueDate"
 
 [[loan]]
 element = "loanAllocationFeeOwed"
 group = "loanAllocationEventGroup"
 type = "LoanAllocationTransferFeeOwed"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, waivedFlag, creditAgreementAmount, agentAmount"
 
 [[loan]]
 element = "loanAllocationSettlement"
 group = "loanAllocationEventGroup"
 type = "LoanAllocationSettlement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, settlementDate, allocationAmount, facilityPosition, fundingFactors"
 
 [[loan]]
 element = "loanAllocationSettlementDateAvailability"
 group = "loanAllocationEventGroup"
 type = "LoanAllocationSettlementDateAvailability"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, specificDates, startDate, endDate, onOrAfterDate, leadDays, cutOffTime, noSettlePeriod"
 
 [[loan]]
 element = "loanAllocationSettlementDateFinalization"
 group = "loanAllocationEventGroup"
 type = "LoanAllocationSettlementDateFinalization"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, settlementDate"
 
 [[loan]]
 element = "loanTrade"
 group = "loanTradeEventGroup"
 type = "LoanTradeEvent"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference"
 
 [[loan]]
 element = "loanTradeConfirmation"
 group = "loanTradeEventGroup"
 type = "LoanTradeEvent"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference"
 
 [[loan]]
 element = "loanTradeFeeDue"
 group = "loanTradeEventGroup"
 type = "LoanTradeTransferFeeDue"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference, amount, dueDate"
 
 [[loan]]
 element = "loanTradeFeeOwed"
 group = "loanTradeEventGroup"
 type = "LoanTradeTransferFeeOwed"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference, waivedFlag, creditAgreementAmount, agentAmount"
 
 [[document]]
 element = "allocationAcknowledgement"

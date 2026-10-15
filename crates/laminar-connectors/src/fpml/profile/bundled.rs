@@ -46,6 +46,18 @@ pub const BUNDLED_PROFILES: &[(&str, &str)] = &[
         "fpml-5-13-confirmation-document",
         "fpml-5-13/confirmation/document.toml",
     ),
+    (
+        "fpml-5-13-confirmation-loan-servicing",
+        "fpml-5-13/confirmation/loan-servicing.toml",
+    ),
+    (
+        "fpml-5-13-confirmation-loan-trading",
+        "fpml-5-13/confirmation/loan-trading.toml",
+    ),
+    (
+        "fpml-5-13-confirmation-loan-facilities",
+        "fpml-5-13/confirmation/loan-facilities.toml",
+    ),
 ];
 
 macro_rules! profile_files {
@@ -59,6 +71,11 @@ const FILES: &[(&str, &str)] = profile_files!(
     "fpml-5-13/confirmation/assets.toml",
     "fpml-5-13/confirmation/common.toml",
     "fpml-5-13/confirmation/document.toml",
+    "fpml-5-13/confirmation/loan-columns.toml",
+    "fpml-5-13/confirmation/loan-facilities.toml",
+    "fpml-5-13/confirmation/loan-servicing.toml",
+    "fpml-5-13/confirmation/loan-trading.toml",
+    "fpml-5-13/confirmation/loans.toml",
     "fpml-5-13/confirmation/messages.toml",
     "fpml-5-13/confirmation/options.toml",
     "fpml-5-13/confirmation/products/commodity.toml",

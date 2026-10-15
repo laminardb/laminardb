@@ -1,0 +1,74 @@
+[
+  {
+    "context": "loanAllocationNotification",
+    "creation_time_utc": "2018-03-15T21:35:58.568Z",
+    "creation_timestamp": {
+      "local": "2018-03-15T16:35:58.568",
+      "offset_minutes": -300,
+      "utc": "2018-03-15T21:35:58.568Z"
+    },
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "a33d8d0a6bbcf192d4d225fc942fb80e05e8f6ddddf4379f8aafbc64ecc9855f",
+    "event": {
+      "allocation_href": "A_001",
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "US005",
+            "event_id_scheme": "http://www.barclays.com/fpml/coding-scheme/internal/loan-allocation-settlement-event-id",
+            "party_href": "US1L142580"
+          }
+        ]
+      },
+      "on_or_after_date": "2018-03-15"
+    },
+    "event_type": "loanAllocationSettlementDateAvailability",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "P00001549667579",
+    "notice_date": "2018-03-08",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "KY1L151440",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY1L151440"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanAllocationNotification/loanAllocationSettlementDateAvailability",
+    "row_ordinal": 0,
+    "sent_by": "US1L142580"
+  }
+]

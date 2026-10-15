@@ -6,6 +6,7 @@
         "contract_ids": [
           "CC1234"
         ],
+        "facility_href": "FAC12345",
         "id": "CONT12345",
         "party_href": "BANKOFAGENTSNA"
       },
@@ -13,6 +14,7 @@
         "contract_ids": [
           "CC4321"
         ],
+        "facility_href": "FAC12345",
         "id": "CONT54321",
         "party_href": "BANKOFAGENTSNA"
       }
