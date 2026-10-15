@@ -117,6 +117,11 @@ xxhash-rust = { workspace = true, optional = true }
 # Ed25519 Logon signatures for the Binance profile; already built for the FIX TLS bridge.
 aws-lc-rs = { version = "1.18", optional = true, default-features = false, features = ["aws-lc-sys"] }
 
+# FpML decoder: libxml2 XML Schema validation (static, vendored), quick-xml pre-scan, TOML profiles
+libxml2-ffi = { package = "laminardb-libxml2-ffi", path = "../../vendor/libxml2-ffi", version = "=0.32.0", optional = true }
+quick-xml = { version = "0.41", default-features = false, optional = true }
+toml = { version = "1.1", optional = true }
+
 # File source/sink
 globset = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
@@ -186,8 +191,10 @@ files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:li
 otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:base64"]
 # FIX TagValue source over a QuickFIX initiator session. Builds C++ with CMake.
 fix = ["dep:quickfix-ffi", "dep:xxhash-rust", "dep:tokio-rustls", "dep:webpki-roots", "dep:aws-lc-rs", "dep:base64"]
+# FpML document decoder (XSD-validated, profile-projected). Builds libxml2 with CMake.
+fpml = ["dep:libxml2-ffi", "dep:quick-xml", "dep:toml"]
 # NATS core + JetStream source and sink
-nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
+nats =["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
 [dev-dependencies]
 apache-avro = { workspace = true }
