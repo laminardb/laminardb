@@ -32,7 +32,8 @@ use crate::schema::error::{SchemaError, SchemaResult};
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
-/// Bundled profile used when neither `fpml.profile` nor `fpml.profile.path` is set.
+/// Bundled profile used when neither `fpml.profile` nor `fpml.profile.path` is set: one row per
+/// trade of any asset class, without product economics (the asset-class profiles add those).
 pub const DEFAULT_PROFILE: &str = "fpml-5-13-confirmation-trade";
 /// Names interned beyond the profile's own before the worker resets its interner.
 const MAX_EXTRA_NAMES: usize = 16_384;
@@ -272,7 +273,11 @@ impl Worker {
         })?;
         let model = SchemaModel::for_artifact(&self.artifact)?;
         let mut interner = self.plan.interner.clone();
-        let names = TreeNames::new(&mut interner, &self.artifact.reference_namespaces);
+        let names = TreeNames::new(
+            &mut interner,
+            &self.artifact.reference_namespaces,
+            &model.unvalidated_containers(),
+        );
         let rules = ReferenceRules::new(&model, &mut interner);
         Ok(Prepared {
             validator,

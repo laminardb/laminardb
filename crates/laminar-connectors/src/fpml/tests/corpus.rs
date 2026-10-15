@@ -18,7 +18,11 @@ fn reference_policies_over_the_official_corpus() {
     let artifact = Artifact::bundled().unwrap();
     let model = SchemaModel::for_artifact(&artifact).unwrap();
     let mut interner = Interner::default();
-    let names = TreeNames::new(&mut interner, &artifact.reference_namespaces);
+    let names = TreeNames::new(
+        &mut interner,
+        &artifact.reference_namespaces,
+        &model.unvalidated_containers(),
+    );
     let rules = ReferenceRules::new(&model, &mut interner);
     let mut validator = Validator::compile(&artifact.files).unwrap();
     let expected: Vec<String> =

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::*;
@@ -23,7 +23,7 @@ fn schema(body: &str) -> String {
 
 fn validate(validator: &mut Validator, document: &str) -> Result<(Document, Refusals), Rejection> {
     let mut interner = Interner::default();
-    let names = TreeNames::new(&mut interner, &[NS.to_owned()]);
+    let names = TreeNames::new(&mut interner, &[NS.to_owned()], &BTreeSet::new());
     validator.validate(
         document.as_bytes(),
         &Limits::default(),
@@ -178,7 +178,7 @@ fn validated_tree_carries_schema_defaults_and_resolved_xsi_types() {
       </xsd:sequence><xsd:attribute name="id" type="xsd:ID"/></xsd:complexType></xsd:element>"#;
     let mut validator = Validator::compile(&files(&[("main.xsd", &schema(body))])).unwrap();
     let mut interner = Interner::default();
-    let names = TreeNames::new(&mut interner, &[NS.to_owned()]);
+    let names = TreeNames::new(&mut interner, &[NS.to_owned()], &BTreeSet::new());
     let scheme = interner.intern("", "scheme");
     let derived = interner.intern(NS, "Derived");
     let document = format!(
@@ -239,7 +239,7 @@ fn element_and_attribute_limits_are_enforced() {
         ..Limits::default()
     };
     let mut interner = Interner::default();
-    let names = TreeNames::new(&mut interner, &[NS.to_owned()]);
+    let names = TreeNames::new(&mut interner, &[NS.to_owned()], &BTreeSet::new());
     let document = format!(r#"<r xmlns="{NS}"><v/><v/><v/></r>"#);
     let error = validator
         .validate(document.as_bytes(), &limits, &mut interner, &names)
@@ -280,7 +280,11 @@ fn official_examples_validate_against_the_bundled_closure() {
     let corpus: Corpus =
         toml::from_str(&std::fs::read_to_string(root.join("corpus.toml")).unwrap()).unwrap();
     let mut interner = Interner::default();
-    let names = TreeNames::new(&mut interner, &artifact.reference_namespaces);
+    let names = TreeNames::new(
+        &mut interner,
+        &artifact.reference_namespaces,
+        &BTreeSet::new(),
+    );
     let (mut valid, mut invalid, mut unavailable) = (0, 0, 0);
     for entry in &corpus.example {
         if entry.status == "unavailable" {
@@ -305,4 +309,46 @@ fn official_examples_validate_against_the_bundled_closure() {
         }
     }
     assert_eq!((valid, invalid, unavailable), (535, 1, 22));
+}
+
+/// An acknowledgement may echo the original message; that content is skipped by the validator,
+/// so ids repeated inside it are data, not duplicate FpML ids, and its hrefs are not references.
+#[test]
+fn skipped_wildcard_content_is_not_indexed() {
+    let artifact = crate::fpml::Artifact::bundled().unwrap();
+    let model = crate::fpml::schema_model::SchemaModel::for_artifact(&artifact).unwrap();
+    let unvalidated = model.unvalidated_containers();
+    let fpml = |local: &str| (artifact.namespace.clone(), local.to_owned());
+    assert!(
+        unvalidated.contains(&fpml("originalMessage")),
+        "{unvalidated:?}"
+    );
+    assert!(unvalidated.contains(&fpml("math")), "{unvalidated:?}");
+    let mut validator = Validator::compile(&artifact.files).unwrap();
+    let mut interner = Interner::default();
+    let names = TreeNames::new(&mut interner, &artifact.reference_namespaces, &unvalidated);
+    let document = br#"<?xml version="1.0" encoding="UTF-8"?>
+<clearingAcknowledgement xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="urn:test:message-id">ACK-1</messageId>
+    <inReplyTo messageIdScheme="urn:test:message-id">REQ-1</inReplyTo>
+    <sentBy>CCP</sentBy>
+    <creationTimestamp>2026-01-02T03:04:05Z</creationTimestamp>
+  </header>
+  <correlationId correlationIdScheme="urn:test:correlation-id">C-1</correlationId>
+  <originalMessage>
+    <requestClearing fpmlVersion="5-13">
+      <party id="party1"><partyId>ORIGINAL</partyId></party>
+      <tradeIdentifier><partyReference href="party1"/></tradeIdentifier>
+    </requestClearing>
+  </originalMessage>
+  <party id="party1"><partyId partyIdScheme="urn:test:party-id">CCP</partyId></party>
+</clearingAcknowledgement>"#;
+    let (parsed, _) = validator
+        .validate(document, &Limits::default(), &mut interner, &names)
+        .unwrap();
+    assert_eq!(parsed.ids.len(), 1);
+    let party = parsed.element(parsed.ids["party1"]).unwrap();
+    assert_eq!(party.parent, 0, "the id indexes the document's own party");
+    assert!(parsed.references.is_empty());
 }

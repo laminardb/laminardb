@@ -33,6 +33,7 @@ struct Container {
     attribute_groups: BTreeSet<QName>,
     attributes: BTreeSet<QName>,
     wildcard: bool,
+    skip_wildcard: bool,
 }
 
 /// The children a type admits, after groups, references, substitution groups, and base types.
@@ -43,6 +44,8 @@ pub(crate) struct Content {
     pub(crate) attributes: BTreeSet<QName>,
     /// The content model has a wildcard; child names cannot be checked.
     pub(crate) wildcard: bool,
+    /// A wildcard admits content the validator skips (`processContents="skip"`).
+    pub(crate) skip_wildcard: bool,
 }
 
 /// Declarations of one closure.
@@ -176,6 +179,23 @@ impl SchemaModel {
     }
 
     /// Children and attributes allowed under `ty`, including inherited ones.
+    /// Elements whose every declared type holds only skipped wildcard content (FpML's
+    /// `originalMessage` and MathML `math`): what they contain is unvalidated data, so its `id`
+    /// and `href` attributes are not FpML references.
+    pub(crate) fn unvalidated_containers(&self) -> BTreeSet<QName> {
+        self.element_types
+            .iter()
+            .filter(|(_, types)| {
+                !types.is_empty()
+                    && types.iter().all(|ty| {
+                        let content = self.content(ty);
+                        content.skip_wildcard && content.elements.is_empty()
+                    })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub(crate) fn content(&self, ty: &QName) -> Arc<Content> {
         if let Some(content) = self
             .contents
@@ -205,6 +225,7 @@ impl SchemaModel {
             return;
         };
         out.wildcard |= declared.wildcard;
+        out.skip_wildcard |= declared.skip_wildcard;
         for (name, types) in &declared.elements {
             out.elements
                 .entry(name.clone())
@@ -324,7 +345,10 @@ impl SchemaModel {
             }
             b"any" => {
                 if let Some(container) = &container {
-                    self.container(container).wildcard = true;
+                    let skip = component.attribute("processContents")?.as_deref() == Some("skip");
+                    let declared = self.container(container);
+                    declared.wildcard = true;
+                    declared.skip_wildcard |= skip;
                 }
                 Frame::Other
             }

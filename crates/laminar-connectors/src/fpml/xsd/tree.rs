@@ -1,6 +1,6 @@
 //! Copy a validated libxml2 tree into an owned [`Document`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{c_char, CStr, CString};
 use std::ops::Range;
 use std::ptr;
@@ -12,21 +12,27 @@ use crate::fpml::document::{
 };
 use crate::fpml::error::{Rejection, Stage};
 use crate::fpml::limits::Limits;
+use crate::fpml::schema_model::QName;
 
 const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Names the copy treats specially. `references` lists the namespaces whose elements carry
-/// FpML `id`/`href` semantics; content admitted by skip wildcards elsewhere is copied but not
-/// indexed.
+/// FpML `id`/`href` semantics; elements in other namespaces, and everything inside an
+/// `unvalidated` container (content the validator skipped), are copied but not indexed.
 pub(crate) struct TreeNames {
     pub(crate) id: NameId,
     pub(crate) href: NameId,
     pub(crate) xsi_type: NameId,
     pub(crate) references: Vec<u32>,
+    pub(crate) unvalidated: HashSet<NameId>,
 }
 
 impl TreeNames {
-    pub(crate) fn new(interner: &mut Interner, reference_namespaces: &[String]) -> Self {
+    pub(crate) fn new(
+        interner: &mut Interner,
+        reference_namespaces: &[String],
+        unvalidated: &BTreeSet<QName>,
+    ) -> Self {
         Self {
             id: interner.intern("", "id"),
             href: interner.intern("", "href"),
@@ -34,6 +40,10 @@ impl TreeNames {
             references: reference_namespaces
                 .iter()
                 .map(|namespace| interner.namespace(namespace))
+                .collect(),
+            unvalidated: unvalidated
+                .iter()
+                .map(|(namespace, local)| interner.intern(namespace, local))
                 .collect(),
         }
     }
@@ -79,16 +89,22 @@ pub(super) unsafe fn copy(
         },
         last_child: Vec::new(),
     };
-    let mut stack: Vec<(*mut ffi::xmlNode, ElementId)> = vec![(root, NO_ELEMENT)];
+    // Each entry carries whether the node lies inside skipped (unvalidated) content.
+    let mut stack: Vec<(*mut ffi::xmlNode, ElementId, bool)> = vec![(root, NO_ELEMENT, false)];
     let mut children: Vec<*mut ffi::xmlNode> = Vec::new();
-    while let Some((node, parent)) = stack.pop() {
+    while let Some((node, parent, skipped)) = stack.pop() {
         // SAFETY: every pointer on the stack is the root or an element child of a live node.
         let view = NodeView {
             node,
             raw: unsafe { &*node },
         };
-        let id = copier.element(&view, parent, &mut children)?;
-        stack.extend(children.iter().rev().map(|child| (*child, id)));
+        let (id, children_skipped) = copier.element(&view, parent, skipped, &mut children)?;
+        stack.extend(
+            children
+                .iter()
+                .rev()
+                .map(|child| (*child, id, children_skipped)),
+        );
     }
     Ok(copier.out)
 }
@@ -104,13 +120,15 @@ struct Copier<'a> {
 }
 
 impl Copier<'_> {
-    /// Copy one element and collect its element children (in document order) into `children`.
+    /// Copy one element and collect its element children (in document order) into `children`;
+    /// also returns whether those children lie inside skipped content.
     fn element(
         &mut self,
         view: &NodeView<'_>,
         parent: ElementId,
+        skipped: bool,
         children: &mut Vec<*mut ffi::xmlNode>,
-    ) -> Result<ElementId, Rejection> {
+    ) -> Result<(ElementId, bool), Rejection> {
         if self.out.elements.len() >= self.limits.max_elements {
             return Err(limit("elements", self.limits.max_elements));
         }
@@ -118,10 +136,11 @@ impl Copier<'_> {
             .map_err(|_| limit("elements", self.limits.max_elements))?;
         let namespace = namespace_of(view.raw.ns)?;
         let name = self.interner.intern(namespace, string(view.raw.name)?);
-        let indexed = self
-            .names
-            .references
-            .contains(&self.interner.namespace(namespace));
+        let indexed = !skipped
+            && self
+                .names
+                .references
+                .contains(&self.interner.namespace(namespace));
         let attributes = self.attributes(view.raw.properties)?;
         let xsi_type = self.xsi_type(view.node, &attributes)?;
         if indexed {
@@ -179,7 +198,7 @@ impl Copier<'_> {
             }
             self.last_child[parent as usize] = id;
         }
-        Ok(id)
+        Ok((id, skipped || self.names.unvalidated.contains(&name)))
     }
 
     fn attributes(&mut self, mut attribute: *mut ffi::_xmlAttr) -> Result<Range<u32>, Rejection> {
