@@ -22,8 +22,8 @@ SELECT symbol,
        SUM(CASE WHEN exec_type = 'F' THEN 1 ELSE 0 END) AS fills,
        SUM(CASE WHEN exec_type = '4' THEN 1 ELSE 0 END) AS cancels,
        SUM(CASE WHEN exec_type = '8' THEN 1 ELSE 0 END) AS rejects,
-       SUM(CASE WHEN exec_type = 'F' THEN last_qty END) AS volume,
-       SUM(CASE WHEN exec_type = 'F' THEN last_qty * last_px END) AS notional
+       SUM(CASE WHEN exec_type = 'F' THEN last_qty ELSE 0 END) AS volume,
+       SUM(CASE WHEN exec_type = 'F' THEN last_qty * last_px ELSE 0 END) AS notional
 FROM executions
 GROUP BY symbol, tumble(transact_time, INTERVAL '1' MINUTE)
 EMIT ON WINDOW CLOSE;
@@ -63,9 +63,9 @@ EMIT ON WINDOW CLOSE;
 CREATE MATERIALIZED VIEW latency_1m AS
 SELECT tumble(transact_time, INTERVAL '1' MINUTE) AS minute,
        COUNT(*) AS reports,
-       AVG((date_part('epoch', _fix_received_at) - date_part('epoch', transact_time)) * 1000.0)
+       AVG((date_part('epoch', _fix_received_at) - date_part('epoch', transact_time)) * 1000)
            AS avg_ms,
-       MAX((date_part('epoch', _fix_received_at) - date_part('epoch', transact_time)) * 1000.0)
+       MAX((date_part('epoch', _fix_received_at) - date_part('epoch', transact_time)) * 1000)
            AS max_ms
 FROM executions
 GROUP BY tumble(transact_time, INTERVAL '1' MINUTE)

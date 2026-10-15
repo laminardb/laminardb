@@ -52,7 +52,7 @@ server() {
     [ -f "$HERE/venues/$venue.sql" ] || { echo "no venues/$venue.sql" >&2; exit 1; }
     local binary="$REPO/target/release/laminardb"
     [ -x "$binary" ] || [ -x "$binary.exe" ] || {
-        echo "build the server first: cargo build --release -p laminar-server --features fix" >&2
+        echo "build the server first: cargo build --release -p laminar-server --no-default-features --features fix,delta-lake" >&2
         exit 1
     }
     fetch_dictionary
