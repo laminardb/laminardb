@@ -1,5 +1,7 @@
-# Interest rate leg structures shared by swap, swaption, capFloor, and return-swap interest legs.
-include = ["../common.toml"]
+# Interest rate products: swap (including cross-currency, inflation, OIS, zero-coupon, and
+# FX-linked notional legs), fra, capFloor, swaption, bulletPayment, and bondOption. Cashflows are
+# not generated; supplied schedules are kept as given.
+include = ["../common.toml", "../options.toml", "../assets.toml"]
 
 [structs.interest_rate_stream]
 description = "One interest rate leg (InterestRateStream)"
@@ -235,4 +237,126 @@ fields = [
   { name = "business_centers", type = "list<utf8>", path = "businessCenters/businessCenter | businessCentersReference->businessCenter" },
   { name = "date_relative_to_payment_dates_hrefs", type = "list<utf8>", path = "dateRelativeToPaymentDates/paymentDatesReference/@href" },
   { name = "date_relative_to_calculation_period_dates_hrefs", type = "list<utf8>", path = "dateRelativeToCalculationPeriodDates/calculationPeriodDatesReference/@href" },
+]
+
+# ── Products ─────────────────────────────────────────────────────────────────
+[structs.swap]
+description = "Interest rate swap"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "streams", type = "list<struct<interest_rate_stream>>", path = "swapStream", description = "One entry per swapStream leg, in document order" },
+  { name = "early_termination_provision", type = "struct<early_termination_provision>", path = "earlyTerminationProvision" },
+  { name = "cancelable_provision", type = "struct<cancelable_provision>", path = "cancelableProvision" },
+  { name = "extendible_provision", type = "struct<extendible_provision>", path = "extendibleProvision" },
+  { name = "additional_payments", type = "list<struct<payment>>", path = "additionalPayment" },
+  { name = "additional_terms", type = "list<utf8>", path = "additionalTerms/bondReference/bond/instrumentId" },
+]
+
+[structs.early_termination_provision]
+fields = [
+  { name = "mandatory_early_termination_date", type = "struct<adjustable_date>", path = "mandatoryEarlyTermination/mandatoryEarlyTerminationDate" },
+  { name = "mandatory_early_termination_tenor", type = "struct<period>", path = "mandatoryEarlyTerminationDateTenor" },
+  { name = "optional_early_termination_buyer_href", type = "utf8", path = "optionalEarlyTermination/singlePartyOption/buyerPartyReference/@href" },
+  { name = "optional_early_termination_seller_href", type = "utf8", path = "optionalEarlyTermination/singlePartyOption/sellerPartyReference/@href" },
+  { name = "optional_early_termination_exercise_type", type = "utf8", path = "optionalEarlyTermination/{exercise}/#name" },
+]
+
+[structs.cancelable_provision]
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "exercise_type", type = "utf8", path = "{exercise}/#name" },
+]
+
+[structs.extendible_provision]
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "exercise_type", type = "utf8", path = "{exercise}/#name" },
+  { name = "follow_up_confirmation", type = "bool", path = "followUpConfirmation" },
+]
+
+[structs.fra]
+description = "Forward rate agreement"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "adjusted_effective_date", type = "date32", path = "adjustedEffectiveDate" },
+  { name = "adjusted_termination_date", type = "date32", path = "adjustedTerminationDate" },
+  { name = "payment_date", type = "struct<adjustable_date>", path = "paymentDate" },
+  { name = "fixing_date_offset", type = "struct<relative_date_offset>", path = "fixingDateOffset" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "calculation_period_number_of_days", type = "int64", path = "calculationPeriodNumberOfDays" },
+  { name = "notional", type = "struct<money>", path = "notional" },
+  { name = "fixed_rate", type = "decimal", path = "fixedRate" },
+  { name = "floating_rate_index", type = "utf8", path = "floatingRateIndex" },
+  { name = "index_tenors", type = "list<struct<period>>", path = "indexTenor" },
+  { name = "fra_discounting", type = "utf8", path = "fraDiscounting" },
+  { name = "additional_payments", type = "list<struct<payment>>", path = "additionalPayment" },
+]
+
+[structs.cap_floor]
+description = "Interest rate cap, floor, or collar"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "stream", type = "struct<interest_rate_stream>", path = "capFloorStream" },
+  { name = "premiums", type = "list<struct<payment>>", path = "premium" },
+  { name = "additional_payments", type = "list<struct<payment>>", path = "additionalPayment" },
+  { name = "early_termination_provision", type = "struct<early_termination_provision>", path = "earlyTerminationProvision" },
+]
+
+[structs.bullet_payment]
+description = "A single payment between two parties"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "payment", type = "struct<payment>", path = "payment" },
+]
+
+[structs.swaption]
+description = "Option on an interest rate swap; the underlying swap is mapped in full"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "premiums", type = "list<struct<payment>>", path = "premium" },
+  { name = "exercise", type = "struct<exercise>", path = "." },
+  { name = "exercise_procedure", type = "struct<exercise_procedure>", path = "exerciseProcedure" },
+  { name = "calculation_agent", type = "struct<calculation_agent>", path = "calculationAgent" },
+  { name = "cash_settlement", type = "struct<cash_settlement>", path = "cashSettlement" },
+  { name = "physical_settlement_cleared", type = "bool", path = "physicalSettlement/clearedPhysicalSettlement" },
+  { name = "swaption_straddle", type = "bool", path = "swaptionStraddle" },
+  { name = "early_termination_provision", type = "struct<early_termination_provision>", path = "earlyTerminationProvision" },
+  { name = "underlying_swap", type = "struct<swap>", path = "swap" },
+]
+
+[structs.cash_settlement]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "valuation_time", type = "struct<business_center_time>", path = "cashSettlementValuationTime" },
+  { name = "valuation_date", type = "struct<relative_date_offset>", path = "cashSettlementValuationDate" },
+  { name = "payment_date_adjustable_dates", type = "struct<adjustable_dates>", path = "cashSettlementPaymentDate/adjustableDates" },
+  { name = "payment_date_relative", type = "struct<relative_date_offset>", path = "cashSettlementPaymentDate/relativeDate" },
+  { name = "method", type = "utf8", path = "midMarketValuation/#name | replacementValue/#name | parYieldCurveUnadjustedMethod/#name | collateralizedCashPriceMethod/#name | cashPriceMethod/#name | cashPriceAlternateMethod/#name | parYieldCurveAdjustedMethod/#name | zeroCouponYieldAdjustedMethod/#name | crossCurrencyMethod/#name" },
+]
+
+[structs.bond_option]
+description = "Option on a bond or convertible bond"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "premium", type = "struct<premium>", path = "premium" },
+  { name = "exercise", type = "struct<exercise>", path = "." },
+  { name = "exercise_procedure", type = "struct<exercise_procedure>", path = "exerciseProcedure" },
+  { name = "notional_amount", type = "struct<money>", path = "notionalAmount" },
+  { name = "notional_reference_href", type = "utf8", path = "notionalReference/@href" },
+  { name = "option_entitlement", type = "decimal", path = "optionEntitlement" },
+  { name = "entitlement_currency", type = "utf8", path = "entitlementCurrency" },
+  { name = "number_of_options", type = "decimal", path = "numberOfOptions" },
+  { name = "settlement", type = "struct<option_settlement>", path = "." },
+  { name = "strike", type = "struct<option_numeric_strike>", path = "strike/price" },
+  { name = "strike_reference_swap_curve", type = "utf8", path = "strike/referenceSwapCurve/#name" },
+  { name = "underlying", type = "struct<bond_asset>", path = "bond | convertibleBond" },
 ]

@@ -1,5 +1,152 @@
 [
   {
+    "cap_floor": {
+      "product": {},
+      "stream": {
+        "calculation": {
+          "day_count_fraction": "ACT/360",
+          "floating_rate_calculation": {
+            "cap_rate_schedules": [
+              {
+                "buyer": "Receiver",
+                "initial_value": "0.060000000000000000",
+                "seller": "Payer",
+                "steps": [
+                  {
+                    "step_date": "2002-06-30",
+                    "step_value": "0.062500000000000000"
+                  },
+                  {
+                    "step_date": "2003-06-30",
+                    "step_value": "0.065000000000000000"
+                  },
+                  {
+                    "step_date": "2004-06-30",
+                    "step_value": "0.067500000000000000"
+                  },
+                  {
+                    "step_date": "2005-06-30",
+                    "step_value": "0.070000000000000000"
+                  }
+                ]
+              }
+            ],
+            "floating_rate_index": "EUR-EURIBOR-Telerate",
+            "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+            "floor_rate_schedules": [
+              {
+                "buyer": "Payer",
+                "initial_value": "0.040000000000000000",
+                "seller": "Receiver",
+                "steps": [
+                  {
+                    "step_date": "2002-06-30",
+                    "step_value": "0.042500000000000000"
+                  },
+                  {
+                    "step_date": "2003-06-30",
+                    "step_value": "0.045000000000000000"
+                  },
+                  {
+                    "step_date": "2004-06-30",
+                    "step_value": "0.047500000000000000"
+                  },
+                  {
+                    "step_date": "2005-06-30",
+                    "step_value": "0.050000000000000000"
+                  }
+                ]
+              }
+            ],
+            "index_tenor": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "notional_schedule": {
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+            "initial_value": "100000000.000000000000000000"
+          },
+          "rate_calculation_type": "floatingRateCalculation"
+        },
+        "calculation_period_dates": {
+          "calculation_period_dates_adjustments": {
+            "business_centers": [
+              "GBLO",
+              "EUTA"
+            ],
+            "business_centers_href": "accrualBusinessCenters0",
+            "business_day_convention": "MODFOLLOWING"
+          },
+          "calculation_period_frequency": {
+            "period": "M",
+            "period_multiplier": 6,
+            "roll_convention": "30"
+          },
+          "effective_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2001-06-30"
+          },
+          "id": "CalcPeriodDates0",
+          "termination_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "GBLO",
+                "EUTA"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "unadjusted_date": "2006-06-30"
+          }
+        },
+        "payer_party_href": "party2",
+        "payment_dates": {
+          "calculation_period_dates_href": "CalcPeriodDates0",
+          "pay_relative_to": "CalculationPeriodEndDate",
+          "payment_dates_adjustments": {
+            "business_centers": [
+              "GBLO",
+              "EUTA"
+            ],
+            "business_day_convention": "MODFOLLOWING"
+          },
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 6
+          }
+        },
+        "receiver_party_href": "party1",
+        "reset_dates": {
+          "calculation_period_dates_href": "CalcPeriodDates0",
+          "fixing_dates": {
+            "business_centers": [
+              "EUTA"
+            ],
+            "business_day_convention": "NONE",
+            "date_relative_to_href": "resetDates0",
+            "day_type": "Business",
+            "period": "D",
+            "period_multiplier": -2
+          },
+          "id": "resetDates0",
+          "reset_dates_adjustments": {
+            "business_centers": [
+              "EUTA"
+            ],
+            "business_centers_href": "resetBusinessCenters0",
+            "business_day_convention": "MODFOLLOWING"
+          },
+          "reset_frequency": {
+            "period": "M",
+            "period_multiplier": 6
+          },
+          "reset_relative_to": "CalculationPeriodStartDate"
+        }
+      }
+    },
     "document_root": "dataDocument",
     "document_sha256": "841f366dda5860f6c15dd604518c2b12bbe1a868254fc2f12f9ead1672a5b602",
     "fpml_version": "5-13",

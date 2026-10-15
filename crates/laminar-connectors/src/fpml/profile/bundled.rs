@@ -14,9 +14,10 @@ macro_rules! profile_files {
 
 /// Every bundled profile file, by path relative to `fpml/profiles/`.
 const FILES: &[(&str, &str)] = profile_files!(
+    "fpml-5-13/confirmation/assets.toml",
     "fpml-5-13/confirmation/common.toml",
+    "fpml-5-13/confirmation/options.toml",
     "fpml-5-13/confirmation/products/rates.toml",
-    "fpml-5-13/confirmation/products/swap.toml",
     "fpml-5-13/confirmation/trade.toml",
 );
 

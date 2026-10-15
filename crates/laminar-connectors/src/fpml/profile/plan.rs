@@ -48,6 +48,8 @@ pub(crate) enum Step {
     Descendants,
     Parent,
     Deref,
+    /// Keep the current elements that have a child with each of these names.
+    Filter(Vec<NameId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

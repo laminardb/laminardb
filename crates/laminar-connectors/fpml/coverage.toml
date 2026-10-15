@@ -13,7 +13,10 @@ artifact = "fpml-5-13-8-rec-2/confirmation"
 element = "bondOption"
 type = "BondOption"
 asset_class = "interest-rate"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "bond_option"
+notes = "Buyer/seller, option type, premium, exercise, notional or entitlement, settlement, strike, underlying bond or convertible bond identity and terms"
 
 [[product]]
 element = "brokerEquityOption"
@@ -25,13 +28,19 @@ status = "outstanding"
 element = "bulletPayment"
 type = "BulletPayment"
 asset_class = "interest-rate"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "bullet_payment"
+notes = "The single payment: payer, receiver, amount, adjustable date"
 
 [[product]]
 element = "capFloor"
 type = "CapFloor"
 asset_class = "interest-rate"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "cap_floor"
+notes = "Cap/floor stream (shared InterestRateStream mapping incl. cap and floor rate schedules), premiums, early termination"
 
 [[product]]
 element = "commodityBasketOption"
@@ -139,7 +148,10 @@ status = "outstanding"
 element = "fra"
 type = "Fra"
 asset_class = "interest-rate"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fra"
+notes = "Parties, dates, notional, fixed rate, floating index and tenors, discounting, additional payments"
 
 [[product]]
 element = "fxAccrualDigitalOption"
@@ -274,7 +286,10 @@ notes = "Legs, notional and FX-linked schedules, fixed/floating/inflation rates,
 element = "swaption"
 type = "Swaption"
 asset_class = "interest-rate"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "swaption"
+notes = "Buyer/seller, premiums, exercise style and dates, procedure, settlement, straddle flag, and the underlying swap in full"
 
 [[product]]
 element = "termDeposit"

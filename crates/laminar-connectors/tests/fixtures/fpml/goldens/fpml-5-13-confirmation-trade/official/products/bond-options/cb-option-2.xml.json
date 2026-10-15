@@ -1,5 +1,98 @@
 [
   {
+    "bond_option": {
+      "buyer_party_href": "PartyB",
+      "entitlement_currency": "JPY",
+      "exercise": {
+        "american": {
+          "commencement_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2004-12-29"
+            }
+          },
+          "earliest_exercise_time": {
+            "business_center": "GBLO",
+            "hour_minute_time": "09:00:00"
+          },
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "JPTO"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2009-06-01"
+            }
+          },
+          "expiration_time": {
+            "business_center": "GBLO",
+            "hour_minute_time": "16:00:00"
+          },
+          "id": "EXERCISE",
+          "multiple_exercise": {
+            "integral_multiple_amount": "1.000000000000000000",
+            "maximum_number_of_options": "200.000000000000000000",
+            "minimum_number_of_options": "20.000000000000000000"
+          }
+        },
+        "style": "americanExercise"
+      },
+      "exercise_procedure": {
+        "follow_up_confirmation": true,
+        "limited_right_to_confirm": false,
+        "manual_exercise_present": "manualExercise",
+        "split_ticket": true
+      },
+      "number_of_options": "200.000000000000000000",
+      "option_entitlement": "10000000.000000000000000000",
+      "option_type": "Call",
+      "product": {},
+      "seller_party_href": "PartyA",
+      "settlement": {
+        "settlement_date": {
+          "relative_date": {
+            "business_centers": [
+              "GBLO",
+              "JPTO"
+            ],
+            "business_day_convention": "NONE",
+            "date_relative_to_href": "EXERCISE",
+            "day_type": "Business",
+            "period": "D",
+            "period_multiplier": 8
+          }
+        },
+        "settlement_type": "Physical"
+      },
+      "strike_reference_swap_curve": "referenceSwapCurve",
+      "underlying": {
+        "asset_type": "convertibleBond",
+        "clearance_system": "DTCC",
+        "coupon_rate": "0.000000000000000000",
+        "currency": "JPY",
+        "instrument_ids": [
+          {
+            "scheme": "ISIN",
+            "value": "ExampleISIN2"
+          }
+        ],
+        "issuer_name": "DEF Holdings",
+        "maturity": "2009-06-15",
+        "payment_frequency": {
+          "period": "M",
+          "period_multiplier": 6
+        }
+      }
+    },
     "calculation_agent": {
       "party_hrefs": [
         "PartyA"

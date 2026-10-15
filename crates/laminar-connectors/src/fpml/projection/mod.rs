@@ -316,13 +316,9 @@ impl<'a> Projector<'a> {
                         continue;
                     };
                     if test.matches(element.name)
-                        && predicates.iter().all(|required| {
-                            document.children(child).any(|grandchild| {
-                                document
-                                    .element(grandchild)
-                                    .is_some_and(|element| element.name == *required)
-                            })
-                        })
+                        && predicates
+                            .iter()
+                            .all(|required| self.has_child(child, *required))
                     {
                         out.push(child);
                     }
@@ -335,6 +331,14 @@ impl<'a> Projector<'a> {
                     let start = stack.len();
                     stack.extend(document.children(current));
                     stack[start..].reverse();
+                }
+            }
+            Step::Filter(predicates) => {
+                if predicates
+                    .iter()
+                    .all(|required| self.has_child(id, *required))
+                {
+                    out.push(id);
                 }
             }
             Step::Parent => {
@@ -368,6 +372,14 @@ impl<'a> Projector<'a> {
             }
         }
         Ok(())
+    }
+
+    fn has_child(&self, parent: ElementId, name: NameId) -> bool {
+        self.document.children(parent).any(|child| {
+            self.document
+                .element(child)
+                .is_some_and(|element| element.name == name)
+        })
     }
 
     fn values(&self, selector: &Selector, context: ElementId) -> Result<Vec<Value<'a>>, Rejection> {

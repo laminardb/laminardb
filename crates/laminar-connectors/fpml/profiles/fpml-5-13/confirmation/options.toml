@@ -1,0 +1,120 @@
+# Option terms shared across asset classes: exercise styles, procedures, and premiums.
+include = ["common.toml"]
+
+[sets]
+exercise = { substitution = "exercise" }
+
+[structs.exercise]
+description = "The option's exercise style; apply to the element that contains the exercise"
+fields = [
+  { name = "style", type = "utf8", path = "{exercise}/#name", description = "americanExercise, bermudaExercise, or europeanExercise" },
+  { name = "american", type = "struct<american_exercise>", path = "americanExercise" },
+  { name = "bermuda", type = "struct<bermuda_exercise>", path = "bermudaExercise" },
+  { name = "european", type = "struct<european_exercise>", path = "europeanExercise" },
+]
+
+[structs.american_exercise]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "commencement_date", type = "struct<adjustable_or_relative_date>", path = "commencementDate" },
+  { name = "expiration_date", type = "struct<adjustable_or_relative_date>", path = "expirationDate" },
+  { name = "relevant_underlying_date", type = "struct<adjustable_or_relative_dates>", path = "relevantUnderlyingDate" },
+  { name = "earliest_exercise_time", type = "struct<business_center_time>", path = "earliestExerciseTime" },
+  { name = "latest_exercise_time", type = "struct<business_center_time>", path = "latestExerciseTime" },
+  { name = "expiration_time", type = "struct<business_center_time>", path = "expirationTime" },
+  { name = "multiple_exercise", type = "struct<multiple_exercise>", path = "multipleExercise" },
+  { name = "exercise_fee_schedule", type = "struct<exercise_fee_schedule>", path = "exerciseFeeSchedule" },
+]
+
+[structs.bermuda_exercise]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "bermuda_exercise_dates", type = "struct<adjustable_or_relative_dates>", path = "bermudaExerciseDates" },
+  { name = "relevant_underlying_date", type = "struct<adjustable_or_relative_dates>", path = "relevantUnderlyingDate" },
+  { name = "earliest_exercise_time", type = "struct<business_center_time>", path = "earliestExerciseTime" },
+  { name = "latest_exercise_time", type = "struct<business_center_time>", path = "latestExerciseTime" },
+  { name = "expiration_time", type = "struct<business_center_time>", path = "expirationTime" },
+  { name = "multiple_exercise", type = "struct<multiple_exercise>", path = "multipleExercise" },
+  { name = "exercise_fee_schedule", type = "struct<exercise_fee_schedule>", path = "exerciseFeeSchedule" },
+]
+
+[structs.european_exercise]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "expiration_date", type = "struct<adjustable_or_relative_date>", path = "expirationDate" },
+  { name = "relevant_underlying_date", type = "struct<adjustable_or_relative_dates>", path = "relevantUnderlyingDate" },
+  { name = "earliest_exercise_time", type = "struct<business_center_time>", path = "earliestExerciseTime" },
+  { name = "expiration_time", type = "struct<business_center_time>", path = "expirationTime" },
+  { name = "partial_exercise", type = "struct<partial_exercise>", path = "partialExercise" },
+  { name = "exercise_fee", type = "struct<exercise_fee>", path = "exerciseFee" },
+]
+
+[structs.adjustable_or_relative_dates]
+fields = [
+  { name = "adjustable_dates", type = "struct<adjustable_dates>", path = "adjustableDates" },
+  { name = "relative_dates", type = "struct<relative_date_offset>", path = "relativeDates" },
+]
+
+[structs.multiple_exercise]
+fields = [
+  { name = "notional_reference_hrefs", type = "list<utf8>", path = "notionalReference/@href" },
+  { name = "integral_multiple_amount", type = "decimal", path = "integralMultipleAmount" },
+  { name = "minimum_notional_amount", type = "decimal", path = "minimumNotionalAmount" },
+  { name = "minimum_number_of_options", type = "decimal", path = "minimumNumberOfOptions" },
+  { name = "maximum_notional_amount", type = "decimal", path = "maximumNotionalAmount" },
+  { name = "maximum_number_of_options", type = "decimal", path = "maximumNumberOfOptions" },
+]
+
+[structs.partial_exercise]
+fields = [
+  { name = "notional_reference_hrefs", type = "list<utf8>", path = "notionalReference/@href" },
+  { name = "integral_multiple_amount", type = "decimal", path = "integralMultipleAmount" },
+  { name = "minimum_notional_amount", type = "decimal", path = "minimumNotionalAmount" },
+  { name = "minimum_number_of_options", type = "decimal", path = "minimumNumberOfOptions" },
+]
+
+[structs.exercise_fee]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "notional_reference_href", type = "utf8", path = "notionalReference/@href" },
+  { name = "fee_amount", type = "decimal", path = "feeAmount" },
+  { name = "fee_rate", type = "decimal", path = "feeRate" },
+  { name = "fee_payment_date", type = "struct<relative_date_offset>", path = "feePaymentDate" },
+]
+
+[structs.exercise_fee_schedule]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "notional_reference_href", type = "utf8", path = "notionalReference/@href" },
+  { name = "fee_amount_schedule", type = "struct<schedule>", path = "feeAmountSchedule" },
+  { name = "fee_rate_schedule", type = "struct<schedule>", path = "feeRateSchedule" },
+  { name = "fee_payment_date", type = "struct<relative_date_offset>", path = "feePaymentDate" },
+]
+
+[structs.exercise_procedure]
+fields = [
+  { name = "manual_exercise", type = "bool", path = "manualExercise/fallbackExercise" },
+  { name = "manual_exercise_present", type = "utf8", path = "manualExercise/#name", description = "manualExercise when exercise is manual" },
+  { name = "automatic_exercise_threshold_rate", type = "decimal", path = "automaticExercise/thresholdRate" },
+  { name = "automatic_exercise_present", type = "utf8", path = "automaticExercise/#name", description = "automaticExercise when exercise is automatic" },
+  { name = "follow_up_confirmation", type = "bool", path = "followUpConfirmation" },
+  { name = "limited_right_to_confirm", type = "bool", path = "limitedRightToConfirm" },
+  { name = "split_ticket", type = "bool", path = "splitTicket" },
+]
+
+[structs.option_numeric_strike]
+fields = [
+  { name = "strike_price", type = "decimal", path = "strikePrice" },
+  { name = "strike_percentage", type = "decimal", path = "strikePercentage" },
+]
+
+[structs.option_settlement]
+description = "OptionSettlement.model of an option, applied to the option element"
+fields = [
+  { name = "settlement_type", type = "utf8", path = "settlementType" },
+  { name = "settlement_date", type = "struct<adjustable_or_relative_date>", path = "settlementDate" },
+  { name = "settlement_amount", type = "struct<money>", path = "settlementAmount" },
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+]

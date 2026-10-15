@@ -3,7 +3,7 @@
 //! ```text
 //! path      := selector ('|' selector)*
 //! selector  := ['/'] step (('/' | '->') step)*
-//! step      := '.' | '..' | '**' | '*' | name pred* | '{' set '}' pred*
+//! step      := '.' pred* | '..' | '**' | '*' | name pred* | '{' set '}' pred*
 //!            | '@' name | '#text' | '#name' | '#type' | '#locator'
 //! pred      := '[' name ']'
 //! name      := [prefix ':'] local
@@ -36,6 +36,8 @@ pub(crate) enum ParsedStep {
     Descendants,
     Parent,
     Deref,
+    /// `.[name]…`: keep the current elements that have such children.
+    Filter(Vec<ParsedName>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +127,11 @@ pub(crate) fn parse(
             "#type" => terminal = ParsedTerminal::Type,
             "#locator" => terminal = ParsedTerminal::Locator,
             _ if token.starts_with('#') => return Err(format!("unknown value step '{token}'")),
+            _ if token.starts_with(".[") => steps.push(ParsedStep::Filter(predicates(
+                token,
+                &token[1..],
+                namespaces,
+            )?)),
             _ if token.starts_with('@') => {
                 terminal = ParsedTerminal::Attribute(name(&token[1..], namespaces, false)?);
             }
@@ -155,8 +162,18 @@ fn child(token: &str, namespaces: &BTreeMap<String, String>) -> Result<ParsedSte
     } else {
         ParsedTest::Name(name(head, namespaces, true)?)
     };
+    Ok(ParsedStep::Child {
+        test,
+        predicates: self::predicates(token, predicates, namespaces)?,
+    })
+}
+
+fn predicates(
+    token: &str,
+    mut rest: &str,
+    namespaces: &BTreeMap<String, String>,
+) -> Result<Vec<ParsedName>, String> {
     let mut parsed = Vec::new();
-    let mut rest = predicates;
     while !rest.is_empty() {
         let inner = rest
             .strip_prefix('[')
@@ -165,10 +182,7 @@ fn child(token: &str, namespaces: &BTreeMap<String, String>) -> Result<ParsedSte
         parsed.push(name(inner.0, namespaces, true)?);
         rest = inner.1;
     }
-    Ok(ParsedStep::Child {
-        test,
-        predicates: parsed,
-    })
+    Ok(parsed)
 }
 
 fn name(
@@ -257,6 +271,10 @@ mod tests {
         let reference = parse("partyReference->", &namespaces()).unwrap();
         assert_eq!(reference.steps.last(), Some(&ParsedStep::Deref));
         assert_eq!(parse(".", &namespaces()).unwrap().steps, vec![]);
+        assert_eq!(
+            parse(".[basketConstituent]", &namespaces()).unwrap().steps,
+            vec![ParsedStep::Filter(vec![fpml("basketConstituent")])]
+        );
         assert_eq!(
             parse("{product}/#name", &namespaces()).unwrap().terminal,
             ParsedTerminal::Name

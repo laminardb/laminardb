@@ -4,7 +4,9 @@
 //! element (or attribute) that the schema admits under the types the previous step can have,
 //! including types derived from them (`xsi:type`) and substitution-group members. Steps whose
 //! context type is unknown (`**`, `..`, unannotated `->`) fall back to checking that the name
-//! is declared at all.
+//! is declared at all. A struct template may be a union over several element types (for example
+//! every underlying asset): a template field that a particular use cannot match compiles to an
+//! always-null value there, and is an error only if no use of the template can match it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -54,6 +56,8 @@ struct Compiler<'a> {
     root_types: BTreeSet<QName>,
     interner: Interner,
     templates: Vec<String>,
+    /// `(template, field)` to whether any use of the template can match the field.
+    template_fields: BTreeMap<(String, String), bool>,
 }
 
 pub(crate) fn compile(
@@ -84,6 +88,7 @@ pub(crate) fn compile(
         root_types: BTreeSet::new(),
         interner: Interner::default(),
         templates: Vec::new(),
+        template_fields: BTreeMap::new(),
     };
     for (name, spec) in &merged.sets {
         let set = compiler.set(name, spec)?;
@@ -113,6 +118,13 @@ pub(crate) fn compile(
                 fields.push(field);
             }
             Err(error) => errors.push(error),
+        }
+    }
+    for ((template, field), matched) in &compiler.template_fields {
+        if !matched {
+            errors.push(format!(
+                "struct template '{template}': field '{field}' matches nothing in any use of the template"
+            ));
         }
     }
     if !errors.is_empty() {
@@ -300,6 +312,14 @@ impl Compiler<'_> {
                 ParsedStep::Descendants => (Step::Descendants, None),
                 ParsedStep::Parent => (Step::Parent, None),
                 ParsedStep::Deref => (Step::Deref, self.dereferenced(&types)),
+                ParsedStep::Filter(predicates) => {
+                    let mut compiled_predicates = Vec::with_capacity(predicates.len());
+                    for predicate in &predicates {
+                        self.child_types(&types, predicate)?;
+                        compiled_predicates.push(self.interner.intern(&predicate.0, &predicate.1));
+                    }
+                    (Step::Filter(compiled_predicates), types.clone())
+                }
                 ParsedStep::Child { test, predicates } => {
                     let (test, next) = match test {
                         ParsedTest::Any => (NameTest::Any, None),
@@ -420,7 +440,9 @@ impl Compiler<'_> {
         let parsed = types::parse(&spec.ty).map_err(label)?;
         let (source, selected) = match (&spec.path, &spec.meta) {
             (Some(path), None) => {
-                let (selector, selected) = self.selector(path, context).map_err(label)?;
+                let (selector, selected) = self
+                    .field_selector(spec, path, top, context)
+                    .map_err(label)?;
                 // Keeps per-row work proportional to the row's neighbourhood, not the document.
                 if selector.has_descendants() {
                     return Err(label(
@@ -546,6 +568,33 @@ impl Compiler<'_> {
                 )
             }
         })
+    }
+
+    /// Compile a column's path. Inside a template, a path this use cannot match falls back to a
+    /// name-only check and is recorded, so union templates work while typos still fail.
+    fn field_selector(
+        &mut self,
+        spec: &FieldSpec,
+        path: &str,
+        top: bool,
+        context: &Types,
+    ) -> Result<(Selector, Types), String> {
+        let template = match (top, self.templates.last()) {
+            (false, Some(template)) => template.clone(),
+            _ => return self.selector(path, context),
+        };
+        let key = (template, spec.name.clone());
+        match self.selector(path, context) {
+            Ok(compiled) => {
+                self.template_fields.insert(key, true);
+                Ok(compiled)
+            }
+            Err(_) if context.is_some() => {
+                self.template_fields.entry(key).or_insert(false);
+                self.selector(path, &None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn template(&mut self, name: &str, context: &Types) -> Result<(Vec<Column>, Fields), String> {
