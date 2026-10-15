@@ -42,9 +42,9 @@ pub(crate) use checkpoints::{
 #[cfg(test)]
 pub(crate) use compile::expr_to_sql;
 pub(crate) use compile::{
-    apply_compiled_having, compile_having_filter, extract_clauses, find_aggregate,
-    find_post_aggregate_projection, post_aggregate_projection_is_positional_identity,
-    CompiledProjection, PreAggBuilder,
+    apply_compiled_having, compile_having_filter, compile_plan_expr, extract_clauses,
+    find_aggregate, find_post_aggregate_projection,
+    post_aggregate_projection_is_positional_identity, CompiledProjection, PreAggBuilder,
 };
 pub(crate) use concrete::{ConcreteAggregateState, ConcreteInputMode};
 #[cfg(feature = "cluster")]
@@ -1294,8 +1294,7 @@ impl IncrementalAggState {
         let state = ctx.state();
         let props = state.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
-        let compile =
-            |e: &datafusion_expr::Expr| create_physical_expr(e, input_df_schema, props).ok();
+        let compile = |e: &datafusion_expr::Expr| compile_plan_expr(e, input_df_schema, props);
         let mut builder = PreAggBuilder::new(
             &input_schema,
             input_df_schema,
@@ -1304,7 +1303,7 @@ impl IncrementalAggState {
         );
 
         for (i, group_expr) in group_exprs.iter().enumerate() {
-            builder.push_group_expr(i, group_expr, &compile);
+            builder.push_group_expr(i, group_expr, &compile)?;
         }
 
         for (i, expr) in aggr_exprs.iter().enumerate() {
@@ -1395,15 +1394,13 @@ impl IncrementalAggState {
         let compiled_projection = if !compile_ok {
             None
         } else if weight_col_idx.is_none() {
-            let filter = if let Some(where_pred) = &agg_info.where_predicate {
-                if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, props) {
-                    Some(phys)
-                } else {
-                    compile_ok = false;
-                    None
+            let filter = match &agg_info.where_predicate {
+                Some(where_pred) => {
+                    let compiled = compile_plan_expr(where_pred, input_df_schema, props)?;
+                    compile_ok = compiled.is_some();
+                    compiled
                 }
-            } else {
-                None
+                None => None,
             };
             if compile_ok {
                 Some(CompiledProjection {

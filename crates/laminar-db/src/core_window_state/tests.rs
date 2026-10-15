@@ -1941,3 +1941,79 @@ async fn now_outside_where_is_rejected_at_build() {
         laminar_core::error_codes::SQL_UNSUPPORTED
     );
 }
+
+#[tokio::test]
+async fn compiled_window_pre_aggregation_coerces_mixed_operand_types() {
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Decimal128Type, Float64Type};
+    use std::time::Duration;
+
+    let ctx = laminar_sql::create_session_context();
+    laminar_sql::register_streaming_functions(&ctx);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, false),
+        Field::new("qty", DataType::Decimal128(18, 8), false),
+        Field::new("px", DataType::Float64, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let qty = arrow::array::Decimal128Array::from(vec![150_000_000_i128, 200_000_000, 50_000_000])
+        .with_precision_and_scale(18, 8)
+        .unwrap();
+    let input = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "A"])),
+            Arc::new(StringArray::from(vec!["F", "N", "F"])),
+            Arc::new(qty),
+            Arc::new(arrow::array::Float64Array::from(vec![2.5, 3.0, 1.0])),
+            Arc::new(Int64Array::from(vec![1_000, 2_000, 3_000])),
+        ],
+    )
+    .unwrap();
+    let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+    ctx.register_table("fills", Arc::new(table)).unwrap();
+    let config = WindowOperatorConfig {
+        window_type: WindowType::Tumbling,
+        time_column: "ts".to_string(),
+        size: Duration::from_secs(10),
+        slide: None,
+        gap: None,
+        offset_ms: 0,
+        allowed_lateness: Duration::ZERO,
+        emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+        late_data_side_output: None,
+    };
+    let sql = "SELECT symbol, SUM(CASE WHEN kind = 'F' THEN qty ELSE 0 END) AS volume, \
+               MAX(px * 1000) AS px_milli FROM fills WHERE qty >= 1 GROUP BY symbol";
+    let mut state = CoreWindowState::try_from_sql(
+        &ctx,
+        sql,
+        &config,
+        Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+        key_groups(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let projection = state
+        .compiled_projection()
+        .expect("compiled pre-aggregation");
+    let pre_aggregated =
+        crate::operator_graph::try_evaluate_compiled(projection, &[input]).unwrap();
+    for batch in &pre_aggregated {
+        state.update_batch(batch).unwrap();
+    }
+    let emitted = state.close_windows(11_000).unwrap();
+    assert_eq!(emitted.len(), 1);
+    // The 0.5 fill fails WHERE; the non-fill contributes the ELSE branch.
+    let volume = emitted[0].column_by_name("volume").unwrap();
+    assert_eq!(volume.data_type(), &DataType::Decimal128(28, 8));
+    assert_eq!(
+        volume.as_primitive::<Decimal128Type>().value(0),
+        150_000_000
+    );
+    let px_milli = emitted[0].column_by_name("px_milli").unwrap();
+    assert_eq!(px_milli.as_primitive::<Float64Type>().value(0), 3000.0);
+}

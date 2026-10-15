@@ -43,6 +43,10 @@
 - A sink reading an incremental materialized view directly binds the view's changelog, including
   its weight column, so a keyed Kafka upsert sink over a `GROUP BY` view no longer fails with a
   schema mismatch on its first write.
+- Managed aggregates coerce mixed operand types in group keys, aggregate arguments, and `WHERE`
+  (`SUM(CASE WHEN ... THEN decimal ELSE 0 END)`, `double * 1000`, `decimal >= 1`) instead of
+  failing at runtime with `LDB-8051`. A `CASE` whose branches cannot be narrowed exactly to its
+  first branch's type is rejected at `CREATE` with a request to `CAST` them.
 
 ### Removed
 
