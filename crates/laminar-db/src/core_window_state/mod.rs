@@ -24,9 +24,9 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    apply_compiled_having, compile_having_filter, extract_clauses, find_aggregate,
-    query_fingerprint_with_config, AggFuncSpec, CompiledProjection, GroupCheckpoint, PreAggBuilder,
-    WindowCheckpoint,
+    apply_compiled_having, compile_having_filter, compile_plan_expr, extract_clauses,
+    find_aggregate, query_fingerprint_with_config, AggFuncSpec, CompiledProjection,
+    GroupCheckpoint, PreAggBuilder, WindowCheckpoint,
 };
 use crate::error::DbError;
 
@@ -646,9 +646,8 @@ impl CoreWindowState {
         }
         let num_group_cols = state_group_exprs.len();
 
-        let compile = |e: &datafusion_expr::Expr| {
-            create_physical_expr(e, input_df_schema, compile_props).ok()
-        };
+        let compile =
+            |e: &datafusion_expr::Expr| compile_plan_expr(e, input_df_schema, compile_props);
         let mut builder = PreAggBuilder::new(
             &input_schema,
             input_df_schema,
@@ -657,7 +656,7 @@ impl CoreWindowState {
         );
 
         for (i, group_expr) in state_group_exprs.into_iter().enumerate() {
-            builder.push_group_expr(i, group_expr, &compile);
+            builder.push_group_expr(i, group_expr, &compile)?;
         }
 
         for (i, expr) in aggr_exprs.iter().enumerate() {
@@ -727,12 +726,9 @@ impl CoreWindowState {
             let filter = if where_uses_now {
                 None
             } else if let Some(where_pred) = &agg_info.where_predicate {
-                if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, compile_props) {
-                    Some(phys)
-                } else {
-                    compile_ok = false;
-                    None
-                }
+                let compiled = compile_plan_expr(where_pred, input_df_schema, compile_props)?;
+                compile_ok = compiled.is_some();
+                compiled
             } else {
                 None
             };
