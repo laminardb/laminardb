@@ -43,6 +43,7 @@ struct VenueCallbacks {
     logged_on: AtomicBool,
     logons: AtomicUsize,
     rejects: Mutex<Vec<Vec<u8>>>,
+    logon_requests: Mutex<Vec<Vec<u8>>>,
     application: Mutex<Vec<Vec<u8>>>,
 }
 
@@ -57,15 +58,15 @@ impl SessionCallbacks for VenueCallbacks {
     }
 
     fn inbound_admin(&self, message: MessageRef<'_>) -> CallbackOutcome {
-        let is_reject = message
-            .header()
-            .and_then(|header| header.field(35))
-            .is_ok_and(|value| value == Some(b"3".as_slice()));
-        if is_reject {
-            let mut bytes = Vec::new();
-            if message.serialize_into(&mut bytes).is_ok() {
-                self.rejects.lock().push(bytes);
-            }
+        let msg_type = message.header().and_then(|header| header.field(35));
+        let received = match msg_type {
+            Ok(Some(b"3")) => &self.rejects,
+            Ok(Some(b"A")) => &self.logon_requests,
+            _ => return CallbackOutcome::Accept,
+        };
+        let mut bytes = Vec::new();
+        if message.serialize_into(&mut bytes).is_ok() {
+            received.lock().push(bytes);
         }
         CallbackOutcome::Accept
     }
@@ -271,6 +272,12 @@ impl FixTestVenue {
     #[must_use]
     pub fn rejects(&self) -> Vec<Vec<u8>> {
         self.callbacks.rejects.lock().clone()
+    }
+
+    /// Logon requests received from the client, as engine serializations.
+    #[must_use]
+    pub fn logon_requests(&self) -> Vec<Vec<u8>> {
+        self.callbacks.logon_requests.lock().clone()
     }
 
     /// Application messages received from the client, as engine serializations.

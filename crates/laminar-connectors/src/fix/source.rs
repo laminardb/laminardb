@@ -16,6 +16,7 @@ use super::metrics::{saturating, FixMetrics};
 use super::projection::{compile, Projection};
 use super::session_store::SessionStore;
 use super::tls::TlsBridge;
+use super::venue::Logon;
 use super::{dictionary, NATIVE_FORMAT};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
@@ -123,6 +124,8 @@ struct Running {
     status: Arc<SessionStatus>,
     metrics: Arc<FixMetrics>,
     on_sequence_reset: SequenceResetPolicy,
+    /// Whether the counterparty answers ResendRequest with the original messages.
+    resends: bool,
     /// Journal index of the latest committed checkpoint.
     committed: u64,
     engine: Option<Engine>,
@@ -330,6 +333,7 @@ impl SourceConnector for FixSource {
         let pinned = dictionary::pin_all(&parsed.journal_path, &digests, &files)?;
         let dictionaries = Arc::new(dictionary::load(&parsed, &pinned)?);
         let plan = compile(&config, &schema, &dictionaries, &parsed.messages)?;
+        let logon = Logon::load(&parsed)?;
         let session = parsed.session.display();
         let (journal, store) = open_durable_state(&parsed, &digests, self.data_ready.clone())?;
         let start_index = match &position {
@@ -373,6 +377,7 @@ impl SourceConnector for FixSource {
             journal.clone(),
             store.clone(),
             &parsed,
+            logon,
             status.clone(),
             metrics.clone(),
         ));
@@ -411,6 +416,7 @@ impl SourceConnector for FixSource {
             status,
             metrics,
             on_sequence_reset: parsed.on_sequence_reset,
+            resends: parsed.resends,
             committed: start_index,
             engine: Some(engine),
         });
@@ -462,6 +468,13 @@ impl SourceConnector for FixSource {
                         }
                         SequenceResetPolicy::Continue => running.projection.mark_gap(),
                     }
+                }
+                // Without resends, a new series or a gap fill may stand in for lost messages.
+                Record::SeriesStarted { series: 2.., .. } | Record::GapFill { .. }
+                    if !running.resends =>
+                {
+                    running.metrics.feed_incomplete.set(1);
+                    running.projection.mark_gap();
                 }
                 Record::SessionSnapshot(_)
                 | Record::SeriesStarted { .. }

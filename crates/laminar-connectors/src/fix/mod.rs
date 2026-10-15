@@ -9,7 +9,8 @@
 //!
 //! Supported: FIX.4.2/FIX.4.4 and FIXT.1.1 (one FIX 5.0 application version) initiator over
 //! loopback TCP or verified TLS, at-least-once or exactly-once with checkpointing, embedded and
-//! single-node deployments. Not supported (rejected before I/O): acceptor sessions, several
+//! single-node deployments, and the Binance Spot drop-copy profile (Ed25519-signed Logon, no
+//! retransmission). Not supported (rejected before I/O): acceptor sessions, several
 //! application versions in one session, cluster placement, and outbound application messages.
 
 // FIX field and message names (MsgSeqNum, BodyLength, ExecutionReport) are protocol
@@ -30,6 +31,7 @@ pub mod testing;
 #[cfg(test)]
 mod tests;
 mod tls;
+mod venue;
 
 pub use source::FixSource;
 
