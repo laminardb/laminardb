@@ -1,0 +1,188 @@
+[
+  {
+    "commodity_option": {
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "CommodityOption"
+          }
+        ]
+      },
+      "strike_price_per_unit": {
+        "amount": "88.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "terms": {
+        "buyer_party_href": "partyA",
+        "calculation_periods_schedule": {
+          "balance_of_first_period": false,
+          "id": "CalculationPeriods",
+          "period": "M",
+          "period_multiplier": 1
+        },
+        "commodity": {
+          "delivery_dates": "FirstNearby",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-1-0",
+              "value": "OIL-WTI-NYMEX"
+            }
+          ],
+          "specified_price": "Settlement"
+        },
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2007-06-01"
+          }
+        },
+        "exercise": {
+          "expiration_dates": [
+            {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2007-06-30"
+              }
+            }
+          ],
+          "payment_dates": {
+            "relative": {
+              "calculation_periods_href": "CalculationPeriods",
+              "pay_relative_to": "CalculationPeriodEndDate",
+              "payment_days_offset": {
+                "business_day_convention": "NONE",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 5
+              }
+            }
+          },
+          "settlement_currency": "USD",
+          "style": "europeanExercise"
+        },
+        "market_disruption": {
+          "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+          "market_disruption_events": "AsSpecifiedInMasterAgreement"
+        },
+        "notional": {
+          "notional_quantity": {
+            "quantity": "15000.000000000000000000",
+            "quantity_frequency": "PerCalculationPeriod",
+            "quantity_unit": "BBL"
+          },
+          "total_notional_quantity": "15000.000000000000000000"
+        },
+        "option_type": "Put",
+        "premiums": [
+          {
+            "payer_party_href": "partyA",
+            "payment_amount": {
+              "amount": "32000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2007-04-12"
+              }
+            },
+            "premium_per_unit": {
+              "amount": "2.130000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "receiver_party_href": "partyB"
+          }
+        ],
+        "pricing_dates": {
+          "business_calendar": "NYMEX-OIL",
+          "calculation_periods_href": "CalculationPeriods",
+          "calendar_source": "ListedOption",
+          "day_distribution": "All",
+          "day_type": "CommodityBusiness"
+        },
+        "seller_party_href": "partyB"
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "a5bf95b7d2244a2288622e1e2470cfa66372426583a104f7add4877017b57e46",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2007-04-10"
+    },
+    "trade_ordinal": 0
+  }
+]

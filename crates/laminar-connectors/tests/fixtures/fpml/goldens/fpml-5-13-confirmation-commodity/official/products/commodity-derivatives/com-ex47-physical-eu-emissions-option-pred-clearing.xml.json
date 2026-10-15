@@ -1,0 +1,181 @@
+[
+  {
+    "commodity_swaption": {
+      "buyer_party_href": "partyB",
+      "option_type": "Call",
+      "physical_exercise": {
+        "expiration_dates": [
+          {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "id": "exerciseDate",
+              "unadjusted_date": "2012-12-31"
+            }
+          }
+        ],
+        "expiration_time": {
+          "hour_minute_time": "17:00:00"
+        },
+        "payment_dates": {},
+        "style": "europeanExercise",
+        "written_confirmation": true
+      },
+      "premium": {
+        "payer_party_href": "partyB",
+        "payment_amount": {
+          "amount": "1000.000000000000000000",
+          "currency": "EUR",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "relative_date": {
+            "business_day_convention": "FOLLOWING",
+            "date_relative_to_href": "tradeDate",
+            "period": "D",
+            "period_multiplier": 3
+          }
+        },
+        "receiver_party_href": "partyA"
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        }
+      },
+      "seller_party_href": "partyA",
+      "underlying": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-12-31"
+          }
+        },
+        "legs": [
+          {
+            "calculation_periods": {
+              "calculation_dates": {
+                "date_adjustments": {
+                  "business_day_convention": "NONE"
+                },
+                "unadjusted_dates": [
+                  "2012-12-31"
+                ]
+              }
+            },
+            "fixed_price": {
+              "price": "7.380000000000000000",
+              "price_currency": "EUR",
+              "price_unit": "Allowances"
+            },
+            "leg_type": "fixedLeg",
+            "notional": {
+              "quantity_href": "deliveryQuantity"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {
+              "master_agreement_payment_dates": false
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          },
+          {
+            "calculation_periods": {},
+            "delivery_date": {
+              "relative_date": {
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "exerciseDate",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "leg_type": "environmentalPhysicalLeg",
+            "notional": {},
+            "number_of_allowances": {
+              "quantity": "1000.000000000000000000",
+              "quantity_unit": "Allowances"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {},
+            "physical_commodity": "environmental",
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "settlement_currency": "EUR",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-12-31"
+          }
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "70734e4dcee4ebd157c05c5dcc0ccbc3646026bc0ae5633b837f3787dc4c9670",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "EnergyCoA"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500QCC36R89FI3U25"
+          }
+        ],
+        "party_name": "EnergyCoB"
+      },
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300IB5Q45JGNPND58"
+          }
+        ],
+        "party_name": "ClearItAll Corp"
+      }
+    ],
+    "product_type": "commoditySwaption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5299000NIGT14YW8ZD26"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "123456"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-06-04"
+    },
+    "trade_ordinal": 0
+  }
+]

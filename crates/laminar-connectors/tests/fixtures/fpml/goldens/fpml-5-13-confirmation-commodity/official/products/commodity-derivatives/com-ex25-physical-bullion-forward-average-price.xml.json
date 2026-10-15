@@ -1,0 +1,160 @@
+[
+  {
+    "commodity_forward": {
+      "average_price_leg": {
+        "calculation": {
+          "pricing_dates": {
+            "calculation_periods_href": "calculationPeriodSchedule",
+            "day_distribution": "All",
+            "day_type": "CommodityBusiness"
+          }
+        },
+        "calculation_periods": {
+          "calculation_periods_schedule": {
+            "balance_of_first_period": false,
+            "id": "calculationPeriodSchedule",
+            "period": "M",
+            "period_multiplier": 1
+          }
+        },
+        "commodity": {
+          "instrument_ids": [
+            {
+              "scheme": "http://www.techco.com/coding-scheme/commodity-reference-price-2-0",
+              "value": "PLATINUM-A.M. FIX"
+            }
+          ],
+          "specified_price": "Morning"
+        },
+        "leg_type": "averagePriceLeg",
+        "notional": {
+          "quantity_href": "deliveryQuantity"
+        },
+        "payer_party_href": "partyA",
+        "payment_dates": {
+          "relative_date": {
+            "business_day_convention": "NotApplicable",
+            "date_relative_to_href": "valueDate",
+            "period": "D",
+            "period_multiplier": 0
+          }
+        },
+        "physical_quantity": {},
+        "pricing_start_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2012-04-01"
+        },
+        "receiver_party_href": "partyB"
+      },
+      "physical_leg": {
+        "bullion_type": "Platinum",
+        "calculation_periods": {},
+        "delivery_location": "Zurich",
+        "id": "bullionLeg",
+        "leg_type": "bullionPhysicalLeg",
+        "notional": {},
+        "payer_party_href": "partyB",
+        "payment_dates": {},
+        "physical_quantity": {
+          "physical_quantity": {
+            "quantity": "1000.000000000000000000",
+            "quantity_frequency": "Term",
+            "quantity_unit": "ozt"
+          }
+        },
+        "receiver_party_href": "partyA",
+        "settlement_date": {
+          "relative_date": {
+            "business_day_convention": "NotApplicable",
+            "date_relative_to_href": "valueDate",
+            "period": "D",
+            "period_multiplier": 0
+          }
+        }
+      },
+      "product": {},
+      "settlement_disruption": "Negotiation",
+      "value_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NotApplicable"
+          },
+          "unadjusted_date": "2012-05-03"
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "3566020d4ff5c5ff6c6c884dc3fbaafdc24739f73ee2b0096d7fb5c7555fa88f",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA1997Bullion"
+      ],
+      "master_agreement_type": "LBMA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "Bank A"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300UXZ1R1RBZVU469"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "product_type": "commodityForward",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5299000NIGT14YW8ZD26"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.techco.com/com-trade-id",
+              "value": "TechCo1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300UXZ1R1RBZVU469"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.banka.com/com-trade-id",
+              "value": "BankA5678"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-03-16"
+    },
+    "trade_ordinal": 0
+  }
+]

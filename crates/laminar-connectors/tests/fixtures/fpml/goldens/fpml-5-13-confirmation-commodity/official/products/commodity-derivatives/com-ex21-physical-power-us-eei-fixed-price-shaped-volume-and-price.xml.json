@@ -1,0 +1,129 @@
+[
+  {
+    "commodity_swap": {
+      "details": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2002-05-01"
+          }
+        },
+        "legs": [
+          {
+            "calculation_periods": {},
+            "delivery_periods": {
+              "calculation_periods_href": "calculationPeriods",
+              "id": "deliveryPeriods"
+            },
+            "delivery_quantity": {},
+            "leg_type": "electricityPhysicalLeg",
+            "notional": {},
+            "payer_party_href": "partyA",
+            "payment_dates": {},
+            "physical_commodity": "electricity",
+            "physical_commodity_type": "Electricity",
+            "physical_quantity": {},
+            "receiver_party_href": "partyB"
+          },
+          {
+            "calculation_periods": {
+              "calculation_periods_schedule": {
+                "balance_of_first_period": false,
+                "id": "calculationPeriods",
+                "period": "M",
+                "period_multiplier": 1
+              }
+            },
+            "leg_type": "fixedLeg",
+            "notional": {
+              "quantity_href": "deliveryQuantity"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {
+              "master_agreement_payment_dates": true
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "settlement_currency": "USD",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2002-07-31"
+          }
+        }
+      },
+      "product": {}
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "b0592d32ff6943556840d7be8eee0e2de8e9b4d9c5ae56fe142c38f639700e3a",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commoditySwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-04-22"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,178 @@
+[
+  {
+    "commodity_performance_swap": {
+      "effective_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2014-03-01"
+        }
+      },
+      "legs": [
+        {
+          "calculation_periods": {
+            "calculation_periods_schedule": {
+              "balance_of_first_period": false,
+              "id": "interestLegCalculationPeriodsSchedule",
+              "period": "M",
+              "period_multiplier": 1
+            }
+          },
+          "day_count_fraction": "ACT/365.FIXED",
+          "fixed_rate": "0.032100000000000000",
+          "leg_type": "commodityInterestLeg",
+          "notional_amount_href": "returnLegNotionalAmount",
+          "payer_party_href": "PartyB",
+          "payment_dates": {
+            "relative": {
+              "business_centers": [
+                "USNY"
+              ],
+              "calculation_periods_href": "interestLegCalculationPeriodsSchedule",
+              "pay_relative_to": "CalculationPeriodEndDate",
+              "payment_days_offset": {
+                "business_day_convention": "FOLLOWING",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            }
+          },
+          "receiver_party_href": "PartyA"
+        },
+        {
+          "calculation_periods": {
+            "calculation_periods_href": "interestLegCalculationPeriodsSchedule"
+          },
+          "commodity": {
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+                "value": "S+P GSCI™ Lean Hogs Index Total Return"
+              }
+            ],
+            "specified_price": "Closing"
+          },
+          "leg_type": "commodityReturnLeg",
+          "notional_amount": {
+            "amount": "1000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "notional_reinvestment": true,
+          "payer_party_href": "PartyA",
+          "payment_dates": {
+            "relative": {
+              "business_centers": [
+                "USNY"
+              ],
+              "calculation_periods_href": "interestLegCalculationPeriodsSchedule",
+              "pay_relative_to": "CalculationPeriodEndDate",
+              "payment_days_offset": {
+                "business_day_convention": "FOLLOWING",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            }
+          },
+          "receiver_party_href": "PartyB",
+          "return_formula": "SimpleFormula",
+          "return_pricing_dates": {
+            "calculation_periods_href": "interestLegCalculationPeriodsSchedule",
+            "day_distribution": "All",
+            "day_type": "CommodityBusiness"
+          }
+        }
+      ],
+      "market_disruption": {
+        "disruption_fallbacks": "AsSpecifiedInConfirmation",
+        "events": [
+          "AsSpecifiedInConfirmation"
+        ]
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Commodity:Energy:Index:Swap:Cash"
+          }
+        ]
+      },
+      "settlement_currency": "USD",
+      "termination_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2014-07-31"
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "261e11e60f34bd76cefae2a505d8ee9f832faedaaa10acf2214b18c08fa1ea6a",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006",
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_date": "2011-10-04",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "product_type": "commodityPerformanceSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "95980020140005196564"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "SUSNUMERIS"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-01-15"
+    },
+    "trade_ordinal": 0
+  }
+]

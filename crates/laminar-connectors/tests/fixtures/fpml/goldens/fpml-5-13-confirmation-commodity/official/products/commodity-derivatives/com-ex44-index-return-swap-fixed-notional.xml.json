@@ -1,0 +1,163 @@
+[
+  {
+    "commodity_performance_swap": {
+      "effective_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2014-04-01"
+        }
+      },
+      "legs": [
+        {
+          "calculation_periods": {
+            "calculation_periods_schedule": {
+              "balance_of_first_period": false,
+              "id": "returnLegCalculationPeriodSchedule",
+              "period": "M",
+              "period_multiplier": 1
+            }
+          },
+          "commodity": {
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+                "value": "DJUBS ComTSM"
+              }
+            ],
+            "specified_price": "Settlement"
+          },
+          "leg_type": "commodityReturnLeg",
+          "notional_amount": {
+            "amount": "1000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "notional_reinvestment": false,
+          "payer_party_href": "PartyA",
+          "payment_dates": {
+            "relative": {
+              "calculation_periods_href": "returnLegCalculationPeriodSchedule",
+              "pay_relative_to": "CalculationPeriodEndDate",
+              "payment_days_offset": {
+                "business_day_convention": "NONE",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            }
+          },
+          "receiver_party_href": "PartyB",
+          "return_formula": "SimpleFormula",
+          "return_initial_price": "274.810000000000000000"
+        },
+        {
+          "calculation_periods": {
+            "calculation_periods_href": "returnLegCalculationPeriodSchedule"
+          },
+          "day_count_fraction": "ACT/365.FIXED",
+          "fixed_rate": "0.032100000000000000",
+          "leg_type": "commodityInterestLeg",
+          "notional_amount_href": "returnLegNotionalAmount",
+          "payer_party_href": "PartyB",
+          "payment_dates": {
+            "relative": {
+              "calculation_periods_href": "returnLegCalculationPeriodSchedule",
+              "pay_relative_to": "CalculationPeriodEndDate",
+              "payment_days_offset": {
+                "business_day_convention": "NONE",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            }
+          },
+          "receiver_party_href": "PartyA"
+        }
+      ],
+      "market_disruption": {
+        "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+        "events": [
+          "AsSpecifiedInMasterAgreement"
+        ]
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Commodity:Energy:Index:Swap:Cash"
+          }
+        ]
+      },
+      "termination_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2014-10-31"
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "332f674e25469cc4e861c6873dbaffce122d14584955ea40691237bc677bbb7f",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_date": "2010-03-23",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "product_type": "commodityPerformanceSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "95980020140005196564"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "ACIRST1234567"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-04-08"
+    },
+    "trade_ordinal": 0
+  }
+]

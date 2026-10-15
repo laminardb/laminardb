@@ -49,43 +49,64 @@ notes = "Cap/floor stream (shared InterestRateStream mapping incl. cap and floor
 element = "commodityBasketOption"
 type = "CommodityBasketOption"
 asset_class = "commodity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_basket_option"
+notes = "Buyer/seller, put/call, dates, calculation periods, basket type, underlyings (commodity, pricing dates, quantity or weight), basket notional, strike references and price, exercise, premiums"
 
 [[product]]
 element = "commodityDigitalOption"
 type = "CommodityDigitalOption"
 asset_class = "commodity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_digital_option"
+notes = "Buyer/seller, put/call, commodity, Asian terms, digital trigger and feature payment, notional amount or quantity, exercise and payment dates, premiums"
 
 [[product]]
 element = "commodityForward"
 type = "CommodityForward"
 asset_class = "commodity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_forward"
+notes = "Value date, fixed or average-price leg, bullion or metal physical leg with quantity, delivery location and settlement date"
 
 [[product]]
 element = "commodityOption"
 type = "CommodityOption"
 asset_class = "commodity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_option"
+notes = "Buyer/seller, put/call, commodity, Asian calculation periods and pricing dates, barrier and trigger, notional quantity, American/European exercise and payment dates, fixed, scheduled or floating strike, physical option underlying swap or forward value date with physical exercise, weather notional, premiums"
 
 [[product]]
 element = "commodityPerformanceSwap"
 type = "CommodityPerformanceSwap"
 asset_class = "commodity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_performance_swap"
+notes = "Dates, settlement currency, interest, return and variance legs (parties, calculation and payment dates, commodity or basket underlyings, notional amount or href, return formula and initial price, variance or volatility strike, annualization, fixed rate and day count), market disruption"
 
 [[product]]
 element = "commoditySwap"
 type = "CommoditySwap"
 asset_class = "commodity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_swap"
+notes = "Effective/termination dates, settlement currency, legs by type (fixed price or schedule, floating with commodity reference, pricing dates, averaging, spread; physical gas/oil/electricity/coal/environmental with delivery periods, product type and quantities), calculation and payment dates, notional quantity or quantity href, weather legs, market disruption"
 
 [[product]]
 element = "commoditySwaption"
 type = "CommoditySwaption"
 asset_class = "commodity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_swaption"
+notes = "Buyer/seller, put/call, the underlying commodity swap (dates, legs, physical delivery), physical exercise, premium"
 
 [[product]]
 element = "correlationSwap"

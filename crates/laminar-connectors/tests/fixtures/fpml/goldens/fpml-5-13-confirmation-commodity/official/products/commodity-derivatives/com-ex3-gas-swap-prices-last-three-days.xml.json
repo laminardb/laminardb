@@ -1,0 +1,197 @@
+[
+  {
+    "commodity_swap": {
+      "details": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2009-01-01"
+          }
+        },
+        "legs": [
+          {
+            "calculation_periods": {
+              "calculation_periods_href": "floatingLegCalculationPeriods"
+            },
+            "fixed_price": {
+              "price": "9.640000000000000000",
+              "price_currency": "USD",
+              "price_unit": "MMBTU"
+            },
+            "leg_type": "fixedLeg",
+            "notional": {
+              "notional_quantity": {
+                "quantity": "5000.000000000000000000",
+                "quantity_frequency": "PerCalendarDay",
+                "quantity_unit": "MMBTU"
+              },
+              "total_notional_quantity": "1825000.000000000000000000"
+            },
+            "payer_party_href": "partyA",
+            "payment_dates": {
+              "relative": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "calculation_periods_href": "floatingLegCalculationPeriods",
+                "pay_relative_to": "CalculationPeriodEndDate",
+                "payment_days_offset": {
+                  "business_day_convention": "NONE",
+                  "day_type": "Business",
+                  "period": "D",
+                  "period_multiplier": 5
+                }
+              }
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyB"
+          },
+          {
+            "calculation": {
+              "averaging_method": "Unweighted",
+              "pricing_dates": {
+                "business_calendar": "NYMEX-NATURAL-GAS",
+                "calculation_periods_href": "floatingLegCalculationPeriods",
+                "day_count": 3,
+                "day_distribution": "Last",
+                "day_type": "CommodityBusiness"
+              }
+            },
+            "calculation_periods": {
+              "calculation_periods_schedule": {
+                "balance_of_first_period": false,
+                "id": "floatingLegCalculationPeriods",
+                "period": "M",
+                "period_multiplier": 1
+              }
+            },
+            "commodity": {
+              "delivery_dates": "FirstNearby",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.partyA.com/instrumentId/commodity-reference-price",
+                  "value": "NATURAL GAS-HENRY HUB-NYMEX"
+                }
+              ],
+              "specified_price": "Settlement"
+            },
+            "leg_type": "floatingLeg",
+            "notional": {
+              "notional_quantity": {
+                "quantity": "5000.000000000000000000",
+                "quantity_frequency": "PerCalendarDay",
+                "quantity_unit": "MMBTU"
+              },
+              "total_notional_quantity": "182500.000000000000000000"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {
+              "relative": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "calculation_periods_href": "floatingLegCalculationPeriods",
+                "pay_relative_to": "CalculationPeriodEndDate",
+                "payment_days_offset": {
+                  "business_day_convention": "NONE",
+                  "day_type": "Business",
+                  "period": "D",
+                  "period_multiplier": 5
+                }
+              }
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "market_disruption": {
+          "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+          "market_disruption_events": "AsSpecifiedInMasterAgreement"
+        },
+        "settlement_currency": "USD",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2009-12-31"
+          }
+        }
+      },
+      "product": {}
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "e827c8669aaa5625308351c295a87b10e1076724dae60f218b7263460710acae",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commoditySwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-08-24"
+    },
+    "trade_ordinal": 0
+  }
+]

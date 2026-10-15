@@ -158,6 +158,20 @@ mod fpml {
         source.close().await.unwrap();
     }
 
+    /// Every bundled profile's schema fits the durable schema contract a source records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_bundled_profile_starts_a_source() {
+        for (profile, _) in crate::fpml::BUNDLED_PROFILES {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = config(directory.path());
+            config.set("fpml.profile", *profile);
+            let mut source = start(config, SourcePosition::Initial)
+                .await
+                .unwrap_or_else(|error| panic!("{profile}: {error}"));
+            source.close().await.unwrap();
+        }
+    }
+
     /// A restarted source registers its metrics again at once: the closed decoder unregisters
     /// them on drop, even while its worker is still finishing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

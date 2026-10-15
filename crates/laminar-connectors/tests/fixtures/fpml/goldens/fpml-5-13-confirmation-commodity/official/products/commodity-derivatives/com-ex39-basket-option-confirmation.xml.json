@@ -1,0 +1,246 @@
+[
+  {
+    "commodity_basket_option": {
+      "basket_type": "notionalQuantityBasket",
+      "buyer_party_href": "PartyA",
+      "calculation_periods_schedule": {
+        "balance_of_first_period": false,
+        "id": "CalculationPeriodsSchedule",
+        "period": "M",
+        "period_multiplier": 1
+      },
+      "effective_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2013-10-01"
+        }
+      },
+      "exercise": {
+        "automatic_exercise": true,
+        "expiration_dates": [
+          {
+            "relative_date": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "CalculationPeriodsSchedule",
+              "period": "D",
+              "period_multiplier": 0
+            }
+          }
+        ],
+        "payment_dates": {
+          "relative": {
+            "calculation_periods_href": "CalculationPeriodsSchedule",
+            "pay_relative_to": "TerminationOrExpirationDate",
+            "payment_days_offset": {
+              "business_day_convention": "NONE",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 3
+            }
+          }
+        },
+        "settlement_currency": "EUR",
+        "style": "europeanExercise",
+        "written_confirmation": false
+      },
+      "option_type": "Call",
+      "premiums": [
+        {
+          "payer_party_href": "PartyA",
+          "payment_amount": {
+            "amount": "1000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2013-01-03"
+            }
+          },
+          "premium_per_unit": {
+            "amount": "0.031710000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "PartyB"
+        }
+      ],
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Commodity:Energy:Oil:Option:Cash"
+          }
+        ]
+      },
+      "seller_party_href": "PartyB",
+      "strike_price_basket_href": "Basket",
+      "strike_price_per_unit": {
+        "amount": "0.369300000000000000",
+        "currency": "EUR",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "termination_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2014-03-31"
+        }
+      },
+      "underlyings": [
+        {
+          "averaging_method": "Unweighted",
+          "commodity": {
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+                "value": "GAS OIL-0.2 PERCENT-CIF MED (GENOVA/LAVERA)-PLATTS EUROPEAN"
+              }
+            ],
+            "specified_price": "MeanOfHighAndLow"
+          },
+          "notional": {
+            "notional_quantity": {
+              "quantity": "28.273843090000000000",
+              "quantity_frequency": "PerCalculationPeriod",
+              "quantity_unit": "MB"
+            },
+            "total_notional_quantity": "15174.113285000000000000"
+          },
+          "pricing_dates": {
+            "business_calendar": "PLATTS-OILGRAM",
+            "calculation_periods_href": "CalculationPeriodsSchedule",
+            "day_distribution": "All",
+            "day_type": "CommodityBusiness"
+          }
+        },
+        {
+          "averaging_method": "Unweighted",
+          "commodity": {
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+                "value": "FUEL OIL-1 PERCENT-CIF MED (GENOVA/LAVERA)-PLATTS EUROPEAN"
+              }
+            ],
+            "specified_price": "MeanOfHighAndLow"
+          },
+          "notional": {
+            "notional_quantity": {
+              "quantity": "49.276501200000000000",
+              "quantity_frequency": "PerCalendarDay",
+              "quantity_unit": "MB"
+            },
+            "total_notional_quantity": "9017.599720000000000000"
+          },
+          "pricing_dates": {
+            "business_calendar": "PLATTS-OILGRAM",
+            "calculation_periods_href": "CalculationPeriodsSchedule",
+            "day_distribution": "All",
+            "day_type": "CommodityBusiness"
+          }
+        },
+        {
+          "averaging_method": "Unweighted",
+          "commodity": {
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+                "value": "OIL-BRENT/BFOE (DTD)-PLATTS MARKETWIRE"
+              }
+            ],
+            "specified_price": "MeanOfHighAndLow"
+          },
+          "notional": {
+            "notional_quantity": {
+              "quantity": "10.764582290000000000",
+              "quantity_frequency": "PerCalculationPeriod",
+              "quantity_unit": "MB"
+            },
+            "total_notional_quantity": "1969.918559000000000000"
+          },
+          "pricing_dates": {
+            "business_calendar": "PLATTS-OILGRAM",
+            "calculation_periods_href": "CalculationPeriodsSchedule",
+            "day_distribution": "All",
+            "day_type": "CommodityBusiness"
+          }
+        }
+      ]
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "043b58418943fc32e42c6ffd21e05817cf68e1f66d4539f385ccf5f17887b3b9",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "product_type": "commodityBasketOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "95980020140005196564"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "ABCD1234"
+            }
+          ]
+        },
+        {
+          "party_href": "PartyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300XQFX97CITUR430"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "EFGH2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-04-01"
+    },
+    "trade_ordinal": 0
+  }
+]

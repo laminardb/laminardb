@@ -1,0 +1,180 @@
+[
+  {
+    "calculation_agent": {
+      "calculation_agent_party": "AsSpecifiedInMasterAgreement"
+    },
+    "commodity_option": {
+      "product": {},
+      "strike_price_per_unit": {
+        "amount": "78.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "terms": {
+        "buyer_party_href": "partyA",
+        "commodity": {
+          "commodity_base": "OIL",
+          "commodity_details": "BRENT",
+          "currency": "USD",
+          "delivery_dates": "SecondNearby",
+          "exchange_id": "IFEU",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-1-0",
+              "value": "OIL-BRENT-IPE"
+            }
+          ],
+          "specified_price": "Settlement",
+          "unit": "BBL"
+        },
+        "exercise": {
+          "automatic_exercise": true,
+          "exercise_periods": [
+            {
+              "commencement_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2008-10-27"
+                }
+              },
+              "expiration_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2009-01-12"
+                }
+              }
+            }
+          ],
+          "payment_dates": {
+            "relative_date": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "exerciseDate",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 5
+            }
+          },
+          "settlement_currency": "USD",
+          "style": "americanExercise",
+          "written_confirmation": false
+        },
+        "market_disruption": {
+          "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+          "market_disruption_events": "AsSpecifiedInMasterAgreement"
+        },
+        "notional": {
+          "notional_quantity": {
+            "quantity": "12000.000000000000000000",
+            "quantity_frequency": "PerCalculationPeriod",
+            "quantity_unit": "BBL"
+          },
+          "total_notional_quantity": "12000.000000000000000000"
+        },
+        "option_type": "Put",
+        "premiums": [
+          {
+            "payer_party_href": "partyA",
+            "payment_amount": {
+              "amount": "72000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2008-10-29"
+              }
+            },
+            "premium_per_unit": {
+              "amount": "6.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "receiver_party_href": "partyB"
+          }
+        ],
+        "seller_party_href": "partyB"
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "986535faacf185733c2bc902b140654982cdc8eb9048303dc7cdd4488ab395be",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC6"
+          }
+        ],
+        "party_name": "Rusty"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC1"
+          }
+        ],
+        "party_name": "SwapsWire Ltd (LE)"
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "ABC6"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "ABC1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2008-10-27"
+    },
+    "trade_ordinal": 0
+  }
+]

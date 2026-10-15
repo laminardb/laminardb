@@ -1,0 +1,161 @@
+[
+  {
+    "commodity_swap": {
+      "details": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2009-04-01"
+          }
+        },
+        "legs": [
+          {
+            "calculation_periods": {},
+            "delivery_periods": {
+              "periods_schedule": {
+                "balance_of_first_period": false,
+                "id": "deliveryPeriods",
+                "period": "T",
+                "period_multiplier": 1
+              }
+            },
+            "delivery_quantity": {
+              "physical_quantity": {
+                "quantity": "15000.000000000000000000",
+                "quantity_frequency": "PerCalendarDay",
+                "quantity_unit": "MMBTU"
+              }
+            },
+            "leg_type": "gasPhysicalLeg",
+            "notional": {},
+            "payer_party_href": "partyA",
+            "payment_dates": {},
+            "physical_commodity": "gas",
+            "physical_commodity_type": "NaturalGas",
+            "physical_quantity": {},
+            "receiver_party_href": "partyB"
+          },
+          {
+            "calculation": {
+              "pricing_dates": {
+                "calculation_periods_href": "deliveryPeriods",
+                "day_distribution": "All",
+                "day_type": "GasFlow"
+              },
+              "spread": {
+                "amount": "15.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "calculation_periods": {
+              "calculation_periods_href": "deliveryPeriods"
+            },
+            "commodity": {
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/spec/2008/commodity-reference-price-1-0",
+                  "value": "NATURAL GAS-NYMEX"
+                }
+              ],
+              "specified_price": "Settlement"
+            },
+            "leg_type": "floatingLeg",
+            "notional": {
+              "quantity_href": "deliveryQuantity"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {
+              "master_agreement_payment_dates": true
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "settlement_currency": "USD",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2009-04-04"
+          }
+        }
+      },
+      "product": {}
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "78042e1b807d9e7519d6b1082e7616a744c18cd71c789992b058dcb0a3c9fc83",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commoditySwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-01-28"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,143 @@
+[
+  {
+    "commodity_performance_swap": {
+      "effective_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2014-04-01"
+        }
+      },
+      "legs": [
+        {
+          "annualization_factor": "252.000000000000000000",
+          "calculation_periods": {
+            "calculation_periods_schedule": {
+              "balance_of_first_period": false,
+              "id": "varianceLegCalculationPeriodSchedule",
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "commodity": {
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+                "value": "MOP-CFR BRAZIL-FMB"
+              }
+            ],
+            "specified_price": "Spot"
+          },
+          "leg_type": "commodityVarianceLeg",
+          "n_adjustment": false,
+          "notional_amount": {
+            "amount": "1000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "notional_reinvestment": false,
+          "payer_party_href": "PartyA",
+          "payment_dates": {
+            "adjustable_dates": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_dates": [
+                "2014-11-05"
+              ]
+            }
+          },
+          "receiver_party_href": "PartyB",
+          "variance_strike_price": "0.090000000000000000"
+        }
+      ],
+      "market_disruption": {
+        "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+        "events": [
+          "AsSpecifiedInMasterAgreement"
+        ]
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Commodity:Energy:Index:Swap:Cash"
+          }
+        ]
+      },
+      "termination_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2014-10-31"
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "3e83c189845e4181da831cad22553d2299d0dec8411ffcee5d0adae445d5a570",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006",
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_date": "2010-03-23",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "product_type": "commodityPerformanceSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "95980020140005196564"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "ACAVS1234567"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-04-08"
+    },
+    "trade_ordinal": 0
+  }
+]

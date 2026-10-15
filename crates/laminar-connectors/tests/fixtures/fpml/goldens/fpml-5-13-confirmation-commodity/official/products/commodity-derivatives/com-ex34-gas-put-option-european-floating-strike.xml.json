@@ -1,0 +1,204 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyB"
+      ]
+    },
+    "commodity_option": {
+      "floating_strike_price_per_unit": {
+        "pricing_dates": {
+          "calculation_periods_href": "calculationPeriodsSchedule",
+          "day_distribution": "First",
+          "day_type": "CommodityBusiness"
+        }
+      },
+      "product": {},
+      "terms": {
+        "buyer_party_href": "partyA",
+        "calculation_periods_schedule": {
+          "balance_of_first_period": true,
+          "id": "calculationPeriodsSchedule",
+          "period": "T",
+          "period_multiplier": 1
+        },
+        "commodity": {
+          "commodity_base": "Natural Gas",
+          "commodity_details": "Louisiana (Henry Hub)",
+          "currency": "USD",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.companyA.com/coding-scheme/commodity-reference-price",
+              "value": "NATURAL GAS-LOUISIANA (HENRY HUB)-GAS DAILY"
+            }
+          ],
+          "publication_rate_source": "Gas-Daily",
+          "publication_rate_source_page": "Daily price survey ($/MMBtu: Louisiana-Onshore South",
+          "specified_price": "Midpoint",
+          "unit": "MMBTU"
+        },
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-09-01"
+          }
+        },
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_dates": [
+            {
+              "relative_date": {
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "calculationPeriodsSchedule",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            }
+          ],
+          "payment_dates": {
+            "relative_date": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING",
+              "date_relative_to_href": "exerciseDate",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 5
+            }
+          },
+          "settlement_currency": "USD",
+          "style": "europeanExercise"
+        },
+        "market_disruption": {
+          "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+          "market_disruption_events": "AsSpecifiedInMasterAgreement"
+        },
+        "notional": {
+          "notional_quantity": {
+            "quantity": "10000.000000000000000000",
+            "quantity_frequency": "PerCalendarDay",
+            "quantity_unit": "MMBTU"
+          },
+          "total_notional_quantity": "300000.000000000000000000"
+        },
+        "option_type": "Put",
+        "premiums": [
+          {
+            "payer_party_href": "partyA",
+            "payment_amount": {
+              "amount": "40500.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "USNY"
+                  ],
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2012-04-12"
+              }
+            },
+            "premium_per_unit": {
+              "amount": "0.135000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "receiver_party_href": "partyB"
+          }
+        ],
+        "pricing_dates": {
+          "calculation_periods_href": "calculationPeriodsSchedule",
+          "day_distribution": "All",
+          "day_type": "CommodityBusiness"
+        },
+        "seller_party_href": "partyB",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-09-30"
+          }
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "1a634c5f73f244be8784b9693c63e533f403fa5a1509eb532d9dd1acd63f2f5f",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300U2FJ850G1P3962"
+          }
+        ],
+        "party_name": "Company A Inc."
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300B23HNTO1OHFU87"
+          }
+        ],
+        "party_name": "Company B Inc."
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300U2FJ850G1P3962"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyA.com/spec/2001/trade-id-1-0",
+              "value": "COA1234567"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300B23HNTO1OHFU87"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyB.com/spec/2001/trade-id-1-0",
+              "value": "COB7654321"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-04-10"
+    },
+    "trade_ordinal": 0
+  }
+]

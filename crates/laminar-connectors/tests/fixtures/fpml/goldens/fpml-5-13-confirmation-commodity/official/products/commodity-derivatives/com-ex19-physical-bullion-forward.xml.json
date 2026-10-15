@@ -1,0 +1,138 @@
+[
+  {
+    "commodity_forward": {
+      "fixed_leg": {
+        "calculation_periods": {},
+        "fixed_price": {
+          "price": "987.120000000000000000",
+          "price_currency": "USD",
+          "price_unit": "ozt"
+        },
+        "id": "fixedLeg",
+        "leg_type": "fixedLeg",
+        "notional": {
+          "quantity_href": "deliveryQuantity"
+        },
+        "payer_party_href": "partyA",
+        "payment_dates": {
+          "relative_date": {
+            "business_day_convention": "NotApplicable",
+            "date_relative_to_href": "valueDate",
+            "period": "D",
+            "period_multiplier": 0
+          }
+        },
+        "physical_quantity": {},
+        "receiver_party_href": "partyB"
+      },
+      "physical_leg": {
+        "bullion_type": "Gold",
+        "calculation_periods": {},
+        "delivery_location": "London",
+        "id": "bullionLeg",
+        "leg_type": "bullionPhysicalLeg",
+        "notional": {},
+        "payer_party_href": "partyB",
+        "payment_dates": {},
+        "physical_quantity": {
+          "physical_quantity": {
+            "quantity": "1000.000000000000000000",
+            "quantity_frequency": "Term",
+            "quantity_unit": "ozt"
+          }
+        },
+        "receiver_party_href": "partyA",
+        "settlement_date": {
+          "relative_date": {
+            "business_day_convention": "NotApplicable",
+            "date_relative_to_href": "valueDate",
+            "period": "D",
+            "period_multiplier": 0
+          }
+        }
+      },
+      "product": {},
+      "settlement_disruption": "Negotiation",
+      "value_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NotApplicable"
+          },
+          "unadjusted_date": "2009-05-12"
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "58c8259105eaece173065ed27b3f76e37e19cad911af195e1a254e866b085961",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006",
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank A"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "product_type": "commodityForward",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-01-28"
+    },
+    "trade_ordinal": 0
+  }
+]

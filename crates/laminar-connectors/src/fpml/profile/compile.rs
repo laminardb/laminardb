@@ -6,9 +6,10 @@
 //! context type is unknown (`**`, `..`, unannotated `->`) fall back to checking that the name
 //! is declared at all. A struct template may be a union over several element types (for example
 //! every underlying asset): a template field that a particular use cannot match compiles to an
-//! always-null value there, and is an error only if no use of the template can match it. A use
-//! on known types that can match none of the template's child-element fields is an error, since
-//! the struct would be null wherever the element appears.
+//! always-null value there, and is an error only if no use of the template can match it. A
+//! template describing a child element of known type that can match none of the template's
+//! child-element fields is an error, since the struct would be null wherever the element appears;
+//! a template composed into its parent with `.` is exempt, as it describes the parent itself.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -486,7 +487,10 @@ impl Compiler<'_> {
                 "offset = \"optional\" applies to timestamp(unit, UTC) columns".into(),
             ));
         }
-        let (conversion, data_type) = self.conversion(&parsed, spec, &selected).map_err(label)?;
+        let element_use = matches!(&source, Source::Path(selector) if starts_at_child(selector));
+        let (conversion, data_type) = self
+            .conversion(&parsed, spec, &selected, element_use)
+            .map_err(label)?;
         if let Source::Meta(meta) = source {
             check_meta(meta, &conversion).map_err(label)?;
         }
@@ -520,6 +524,7 @@ impl Compiler<'_> {
         parsed: &ParsedType,
         spec: &FieldSpec,
         selected: &Types,
+        element_use: bool,
     ) -> Result<(Conversion, DataType), String> {
         Ok(match parsed {
             ParsedType::Utf8 => (
@@ -551,7 +556,7 @@ impl Compiler<'_> {
                 DataType::Timestamp(*unit, utc.then(|| Arc::from(UTC_ZONE))),
             ),
             ParsedType::Struct(template) => {
-                let (columns, fields) = self.template(template, selected)?;
+                let (columns, fields) = self.template(template, selected, element_use)?;
                 (Conversion::Struct(columns), DataType::Struct(fields))
             }
             ParsedType::List(item) => {
@@ -565,7 +570,8 @@ impl Compiler<'_> {
                     offset: spec.offset,
                     description: None,
                 };
-                let (conversion, data_type) = self.conversion(item, &item_spec, selected)?;
+                let (conversion, data_type) =
+                    self.conversion(item, &item_spec, selected, element_use)?;
                 let item_column = Column {
                     name: "item".into(),
                     source: Source::Path(self.selector(".", selected)?.0),
@@ -614,7 +620,12 @@ impl Compiler<'_> {
         Ok(compiled)
     }
 
-    fn template(&mut self, name: &str, context: &Types) -> Result<(Vec<Column>, Fields), String> {
+    fn template(
+        &mut self,
+        name: &str,
+        context: &Types,
+        element_use: bool,
+    ) -> Result<(Vec<Column>, Fields), String> {
         if self.templates.iter().any(|open| open == name) {
             return Err(format!("struct template '{name}' contains itself"));
         }
@@ -653,13 +664,15 @@ impl Compiler<'_> {
             }
         }
         self.templates.pop();
-        if let (Some((fields, 0)), Some(types)) = (self.uses.pop(), context) {
-            if fields > 0 {
-                errors.push(format!(
-                    "struct template '{name}' matches none of its element fields in {}",
-                    type_list(types)
-                ));
-            }
+        let unmatched = self
+            .uses
+            .pop()
+            .is_some_and(|(fields, matches)| fields > 0 && matches == 0);
+        if let (true, Some(types)) = (element_use && unmatched, context) {
+            errors.push(format!(
+                "struct template '{name}' matches none of its element fields in {}",
+                type_list(types)
+            ));
         }
         if errors.is_empty() {
             Ok((columns, Fields::from(fields)))

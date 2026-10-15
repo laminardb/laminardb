@@ -1,0 +1,153 @@
+[
+  {
+    "commodity_option": {
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        }
+      },
+      "terms": {
+        "buyer_party_href": "partyB",
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-11-01"
+          }
+        },
+        "exercise": {
+          "expiration_dates": [
+            {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NONE"
+                },
+                "unadjusted_date": "2013-03-31"
+              }
+            }
+          ],
+          "payment_dates": {
+            "relative_date": {
+              "business_centers": [
+                "USNY"
+              ],
+              "business_day_convention": "MODFOLLOWING",
+              "date_relative_to_href": "weatherCalculationPeriods",
+              "period": "D",
+              "period_multiplier": 5
+            }
+          },
+          "settlement_currency": "USD",
+          "style": "europeanExercise"
+        },
+        "market_disruption": {
+          "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+          "market_disruption_events": "AsSpecifiedInMasterAgreement"
+        },
+        "notional": {},
+        "option_type": "Put",
+        "premiums": [
+          {
+            "payer_party_href": "partyB",
+            "payment_amount": {
+              "amount": "5000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "USNY"
+                  ],
+                  "business_day_convention": "MODFOLLOWING"
+                },
+                "unadjusted_date": "2012-11-04"
+              }
+            },
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "seller_party_href": "partyA"
+      },
+      "weather_notional_amount": {
+        "amount": "150000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "5d7c9727be1fd0be7d6d84c68baad05ff69fda7fd60b36446177af76402f2203",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "ART Reinsurance LLC"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500QCC36R89FI3U25"
+          }
+        ],
+        "party_name": "Mountain Ski Resorts Inc."
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5299000NIGT14YW8ZD26"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "969500QCC36R89FI3U25"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-04-04"
+    },
+    "trade_ordinal": 0
+  }
+]
