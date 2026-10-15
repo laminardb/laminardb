@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--View is confirmation-->
+<!--Version is 5-13-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--
+        == Copyright (c) 2022-2026 All rights reserved.
+        == Financial Products Markup Language is subject to the FpML public license.
+        == A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<loanTradeNotification xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" fpmlVersion="5-13" xsi:schemaLocation="http://www.fpml.org/FpML-5/confirmation ../../fpml-main-5-13.xsd http://www.w3.org/2000/09/xmldsig# ../../xmldsig-core-schema.xsd">
+  <header>
+    <messageId messageIdScheme="http://www.barclays.com/fpml/coding-scheme/internal/message-id">BBPLC00001549667579</messageId>
+    <sentBy messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">CH1L122575</sentBy>
+    <sendTo messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">GB1L104502</sendTo>
+    <creationTimestamp>2018-03-08T16:35:58.568-05:00</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <noticeDate>2018-03-08</noticeDate>
+  <partyReference href="CH1L122575" />
+  <role tradingPartyRoleScheme="http://www.fpml.org/coding-scheme/trading-party-role">Agent</role>
+  <loanTradeFeeOwed>
+    <eventIdentifier>
+      <partyReference href="CH1L122575" />
+      <eventId eventIdScheme="http://www.barclays.com/fpml/coding-scheme/internal/loan-transfer-fee-owed-event-id">CH001</eventId>
+    </eventIdentifier>
+    <lenderPartyReference href="GB1L104502" />
+    <loanTradeReference href="T_AGBTR_T_001" />
+    <waivedFlag>false</waivedFlag>
+    <creditAgreementAmount>
+      <currency currencyScheme="http://www.fpml.org/coding-scheme/external/iso4217">USD</currency>
+      <amount>3500.00</amount>
+    </creditAgreementAmount>
+    <agentAmount>
+      <currency currencyScheme="http://www.fpml.org/coding-scheme/external/iso4217">USD</currency>
+      <amount>3500.00</amount>
+    </agentAmount>
+  </loanTradeFeeOwed>
+  <trade id="T_AGBTR_T_001">
+    <partyReference href="GB1L104502" />
+    <tradeId tradeIdScheme="http://www.barclays.com/fpml/coding-scheme/internal/trade-id">BBPLC_T_001</tradeId>
+    <facilityReference href="CUSIP1003" />
+    <amount>
+      <currency currencyScheme="http://www.fpml.org/coding-scheme/external/iso4217">USD</currency>
+      <amount>10000000.00</amount>
+    </amount>
+    <tradeDate>2018-03-01</tradeDate>
+    <buyerPartyReference href="US1L142580" />
+    <sellerPartyReference href="GB1L104502" />
+    <marketType>Secondary</marketType>
+    <whenIssuedFlag>false</whenIssuedFlag>
+    <tradingAssociation>LSTA</tradingAssociation>
+    <formOfPurchase>Assignment</formOfPurchase>
+    <remittedBy>Seller</remittedBy>
+  </trade>
+  <facilityIdentifier id="CUSIP1003">
+    <partyReference href="GB1L104502" />
+    <instrumentId instrumentIdScheme="http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP">CUSIP1003</instrumentId>
+    <description>Term Loan A</description>
+  </facilityIdentifier>
+  <party id="GB1L104502">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">GB1L104502</partyId>
+  </party>
+  <party id="US1L142580">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US1L142580</partyId>
+  </party>
+  <party id="CH1L122575">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">CH1L122575</partyId>
+  </party>
+</loanTradeNotification>
+

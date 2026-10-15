@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--View is confirmation-->
+<!--Version is 5-13-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--View is confirmation-->
+<!--Version is 5-12-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--
+        == Copyright (c) 2022-2026 All rights reserved.
+        == Financial Products Markup Language is subject to the FpML public license.
+        == A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<!--
+This notice communicates the commitment amounts for a single facility at the global and the lender position levels, on a specific date.
+-->
+<facilityPositionStatement xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" fpmlVersion="5-13" xsi:schemaLocation="http://www.fpml.org/FpML-5/confirmation ../../fpml-main-5-13.xsd http://www.w3.org/2000/09/xmldsig# ../../xmldsig-core-schema.xsd">
+  <header>
+    <messageId messageIdScheme="http://www.bankofagentsna.com/messaging/messageids">155677</messageId>
+    <sentBy messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US2A432121</sentBy>
+    <sendTo messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US5L567878</sendTo>
+    <creationTimestamp>2014-12-17T09:30:47Z</creationTimestamp>
+    <implementationSpecification>
+      <name>BKLoanSys</name>
+      <version implementationSpecificationVersionScheme="http://www.bkloansys.com/">1.0</version>
+      <date>2012-12-06</date>
+    </implementationSpecification>
+  </header>
+  <isCorrection>false</isCorrection>
+  <statementDate>2014-12-17</statementDate>
+  <comments>Facility Position Statement effective 12/17/2014.</comments>
+  <facilityPosition>
+    <facilityReference href="FAC1234" />
+    <commitment>
+      <totalCommitmentAmount>
+        <currency>USD</currency>
+        <amount>10000000.00</amount>
+        <shareAmount>2000000.00</shareAmount>
+      </totalCommitmentAmount>
+    </commitment>
+  </facilityPosition>
+  <positionPartyReference href="BANKOFAGENTSNA" />
+  <dealIdentifier id="DL123">
+    <partyReference href="BANKOFAGENTSNA" />
+    <instrumentId instrumentIdScheme="http://www.bankofagentsna.com/messaging/dealids">Deal1234</instrumentId>
+    <description>2012 Construction Deal</description>
+  </dealIdentifier>
+  <facilityIdentifier id="FAC1234">
+    <partyReference href="BANKOFAGENTSNA" />
+    <instrumentId instrumentIdScheme="http://www.cusip.com/">F123452TLA</instrumentId>
+    <description>Term Loan A</description>
+    <dealReference href="DL123" />
+  </facilityIdentifier>
+  <party id="BANKOFAGENTSNA">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US2A432121</partyId>
+  </party>
+  <party id="LENDERCORP">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US5L567878</partyId>
+  </party>
+  <party id="BORROWERINC">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US3B789454</partyId>
+  </party>
+</facilityPositionStatement>
+

@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--View is confirmation-->
+<!--Version is 5-13-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--View is confirmation-->
+<!--Version is 5-12-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--
+        == Copyright (c) 2022-2026 All rights reserved.
+        == Financial Products Markup Language is subject to the FpML public license.
+        == A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<!--
+Loan Bulk Servicing notifications provide a means for agent banks to communicate multiple events for 1 asset, such as floating rate margin resets and/or 
+re-definitions of the way in which outstanding contracts are structured. In this example, a loan contract is rolling over and a base rate is set for the new contract.
+
+This examples represents: 
+          - a single loan contract rolling over
+          - a base rate set for the new contract
+
+-->
+<loanBulkServicingNotification xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" fpmlVersion="5-13" xsi:schemaLocation="http://www.fpml.org/FpML-5/confirmation ../../fpml-main-5-13.xsd http://www.w3.org/2000/09/xmldsig# ../../xmldsig-core-schema.xsd">
+  <header>
+    <messageId messageIdScheme="http://www.company.com/messageIdScheme">SentProfileMessageID1</messageId>
+    <sentBy messageAddressScheme="http://www.company.com/messageAddressScheme">US2A432121</sentBy>
+    <sendTo messageAddressScheme="http://www.company.com/messageAddressScheme">US5L567878</sendTo>
+    <creationTimestamp>2017-09-30T09:30:47Z</creationTimestamp>
+    <implementationSpecification>
+      <name>Loan FpML</name>
+      <version implementationSpecificationVersionScheme="http://www.company.com/implementationSpecificationVersion">v5.11</version>
+      <date>2017-09-10</date>
+    </implementationSpecification>
+  </header>
+  <isCorrection>false</isCorrection>
+  <noticeDate>2017-09-30</noticeDate>
+  <isGlobalOnly>true</isGlobalOnly>
+  <eventPayment>
+    <payerPartyReference href="BANKOFAGENTSNA" />
+    <receiverPartyReference href="LENDERCORP" />
+    <paymentAmount>
+      <currency>USD</currency>
+      <amount>7500.00</amount>
+    </paymentAmount>
+    <paymentDate>
+      <unadjustedDate>2017-09-30</unadjustedDate>
+      <dateAdjustments>
+        <businessDayConvention>FOLLOWING</businessDayConvention>
+        <businessCenters>
+          <businessCenter>USNY</businessCenter>
+        </businessCenters>
+      </dateAdjustments>
+    </paymentDate>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">ACFP1</eventId>
+    </eventIdentifier>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">IP1</eventId>
+    </eventIdentifier>
+  </eventPayment>
+  <facilityPosition>
+    <facilityReference href="TermLoanB" />
+    <commitment>
+      <totalCommitmentAmount>
+        <currency>USD</currency>
+        <amount>1000000000.00</amount>
+        <shareAmount>5000000.00</shareAmount>
+      </totalCommitmentAmount>
+      <requiredFundedAmount>
+        <currency>USD</currency>
+        <amount>1000000000.00</amount>
+        <shareAmount>5000000.00</shareAmount>
+      </requiredFundedAmount>
+      <unavailableToUtilizeAmount>
+        <currency>USD</currency>
+        <amount>1000000000.00</amount>
+        <shareAmount>5000000.00</shareAmount>
+      </unavailableToUtilizeAmount>
+    </commitment>
+    <outstandingsPosition>
+      <loanContractReference href="LoanContract1" />
+      <amount>
+        <currency>USD</currency>
+        <amount>1000000000.00</amount>
+        <shareAmount>5000000.00</shareAmount>
+      </amount>
+    </outstandingsPosition>
+  </facilityPosition>
+  <accruingFeePayment>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">ACFP1</eventId>
+    </eventIdentifier>
+    <lenderPartyReference href="LENDERCORP" />
+    <cashPayable>
+      <payerPartyReference href="BANKOFAGENTSNA" />
+      <receiverPartyReference href="LENDERCORP" />
+      <netAmount>
+        <currency>USD</currency>
+        <amount>100000.00</amount>
+      </netAmount>
+    </cashPayable>
+    <comment>Accruing Fee Payment</comment>
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <borrowerPartyReference href="BORROWERINC" />
+    <effectiveDate>2017-06-30</effectiveDate>
+    <facilityReference href="TermLoanB" />
+    <id accrualTypeIdScheme="http://www.company.com/accrualTypeIdScheme">Utilization</id>
+    <startDate>2017-06-30</startDate>
+    <endDate>2017-09-30</endDate>
+    <amount>
+      <currency>USD</currency>
+      <amount>100000.00</amount>
+      <shareAmount>5000.00</shareAmount>
+    </amount>
+  </accruingFeePayment>
+  <interestPayment>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">IP1</eventId>
+    </eventIdentifier>
+    <lenderPartyReference href="LENDERCORP" />
+    <cashPayable>
+      <payerPartyReference href="BANKOFAGENTSNA" />
+      <receiverPartyReference href="LENDERCORP" />
+      <netAmount>
+        <currency>USD</currency>
+        <amount>2500.00</amount>
+      </netAmount>
+    </cashPayable>
+    <comment>Interest Payment</comment>
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <borrowerPartyReference href="BORROWERINC" />
+    <effectiveDate>2017-09-30</effectiveDate>
+    <loanContractReference href="LoanContract1" />
+    <startDate>2017-06-30</startDate>
+    <endDate>2017-09-30</endDate>
+    <lenderShareCalculationMethod>ContractPositionThruPeriod</lenderShareCalculationMethod>
+    <amount>
+      <currency>USD</currency>
+      <amount>50000.00</amount>
+      <shareAmount>2500.00</shareAmount>
+    </amount>
+  </interestPayment>
+  <facilitySummary id="TermLoanB">
+    <partyReference href="BANKOFAGENTSNA" />
+    <instrumentId instrumentIdScheme="http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP-1-0">123456ABC</instrumentId>
+    <description>USD 1BN Term Loan B</description>
+    <borrowerPartyReference href="BORROWERINC" />
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <startDate>2015-01-01</startDate>
+    <maturityDate>2020-01-01</maturityDate>
+    <currentCommitment>
+      <totalCommitmentAmount>
+        <currency>USD</currency>
+        <amount>1000000000</amount>
+        <shareAmount>5000000</shareAmount>
+      </totalCommitmentAmount>
+    </currentCommitment>
+  </facilitySummary>
+  <contractIdentifier id="LoanContract1">
+    <partyReference href="BANKOFAGENTSNA" />
+    <contractId contractIdScheme="http://www.company.com/LoanContractIdScheme">LoanContract1</contractId>
+    <facilityReference href="TermLoanB" />
+  </contractIdentifier>
+  <party id="LENDERCORP">
+    <partyId partyIdScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">US5L567878</partyId>
+    <country countryScheme="http://www.fpml.org/coding-scheme/external/iso3166">US</country>
+    <contactInfo>
+      <telephone>
+        <type>Work</type>
+        <number>5552222222</number>
+      </telephone>
+      <email>buyer.contact@lendercorp.com</email>
+      <address>
+        <streetAddress>
+          <streetLine>6789 Main Street</streetLine>
+        </streetAddress>
+        <city>New York</city>
+        <state>NY</state>
+        <country>US</country>
+        <postalCode>10001</postalCode>
+      </address>
+    </contactInfo>
+  </party>
+  <party id="BANKOFAGENTSNA">
+    <partyId partyIdScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">US2A432121</partyId>
+    <country countryScheme="http://www.fpml.org/coding-scheme/external/iso3166">US</country>
+    <contactInfo>
+      <telephone>
+        <type>Work</type>
+        <number>5554444444</number>
+      </telephone>
+      <email>agent.contact@bankofagents.com</email>
+      <address>
+        <streetAddress>
+          <streetLine>12345 Main Street</streetLine>
+        </streetAddress>
+        <city>New York</city>
+        <state>NY</state>
+        <country>US</country>
+        <postalCode>10001</postalCode>
+      </address>
+    </contactInfo>
+  </party>
+  <party id="BORROWERINC">
+    <partyId partyIdScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">US3B789454</partyId>
+    <country countryScheme="http://www.fpml.org/coding-scheme/external/iso3166">US</country>
+    <contactInfo>
+      <telephone>
+        <type>Work</type>
+        <number>5553333333</number>
+      </telephone>
+      <email>borrower.contact@borrowerinc.com</email>
+      <address>
+        <streetAddress>
+          <streetLine>1111 Main Street</streetLine>
+        </streetAddress>
+        <city>New York</city>
+        <state>NY</state>
+        <country>US</country>
+        <postalCode>10001</postalCode>
+      </address>
+    </contactInfo>
+  </party>
+</loanBulkServicingNotification>
+

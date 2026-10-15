@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--View is confirmation-->
+<!--Version is 5-13-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--
+        == Copyright (c) 2022-2026 All rights reserved.
+        == Financial Products Markup Language is subject to the FpML public license.
+        == A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<loanAllocationNotification xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" fpmlVersion="5-13" xsi:schemaLocation="http://www.fpml.org/FpML-5/confirmation ../../fpml-main-5-13.xsd http://www.w3.org/2000/09/xmldsig# ../../xmldsig-core-schema.xsd">
+  <header>
+    <messageId messageIdScheme="http://www.barclays.com/coding-scheme/message-id-1-0">BPLC0000354959612</messageId>
+    <sentBy messageAddressScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">US1LFM0001</sentBy>
+    <sendTo messageAddressScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">GB1L213246</sendTo>
+    <creationTimestamp>2017-09-08T20:41:30.7547312-04:00</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <noticeDate>2017-09-08</noticeDate>
+  <partyReference href="BANK67890" />
+  <role tradingPartyRoleScheme="http://www.fpml.org/coding-scheme/trading-party-role-1-0">Seller</role>
+  <payment>
+    <payerPartyReference href="BANK12345" />
+    <receiverPartyReference href="BANK67890" />
+    <paymentAmount>
+      <currency>USD</currency>
+      <amount>10001731.20</amount>
+    </paymentAmount>
+    <paymentDate>
+      <unadjustedDate>2017-08-10</unadjustedDate>
+      <dateAdjustments>
+        <businessDayConvention>FOLLOWING</businessDayConvention>
+        <businessCenters>
+          <businessCenter>USNY</businessCenter>
+        </businessCenters>
+      </dateAdjustments>
+    </paymentDate>
+    <allocationReference href="AL1" />
+  </payment>
+  <loanAllocationSettlement>
+    <eventIdentifier>
+      <partyReference href="BANK67890" />
+      <eventId eventIdScheme="http://www.barclays.com/coding-scheme/event-id-1-0">US003</eventId>
+    </eventIdentifier>
+    <allocationReference href="AL1" />
+    <settlementDate>2017-08-10</settlementDate>
+    <allocationAmount>
+      <currency>USD</currency>
+      <amount>10000000.0</amount>
+    </allocationAmount>
+    <facilityPosition>
+      <facilityReference href="FAC12345" />
+      <commitment>
+        <totalCommitmentAmount>
+          <currency>USD</currency>
+          <amount>100000000.00</amount>
+        </totalCommitmentAmount>
+        <requiredFundedAmount>
+          <currency>USD</currency>
+          <amount>100000000.00</amount>
+        </requiredFundedAmount>
+        <unavailableToUtilizeAmount>
+          <currency>USD</currency>
+          <amount>0.0</amount>
+          <shareAmount>0</shareAmount>
+        </unavailableToUtilizeAmount>
+      </commitment>
+    </facilityPosition>
+    <fundingFactors>
+      <delayedCompensation>
+        <amount>
+          <currency>USD</currency>
+          <amount>54.31</amount>
+        </amount>
+      </delayedCompensation>
+      <costOfCarry>
+        <amount>
+          <currency>USD</currency>
+          <amount>35.50</amount>
+        </amount>
+      </costOfCarry>
+      <transferFeeAmounts>
+        <buyersAmount>
+          <currency>USD</currency>
+          <amount>1750.00</amount>
+        </buyersAmount>
+        <sellersAmount>
+          <currency>USD</currency>
+          <amount>1750.00</amount>
+        </sellersAmount>
+      </transferFeeAmounts>
+    </fundingFactors>
+  </loanAllocationSettlement>
+  <allocationId id="AL1">
+    <issuer issuerIdScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">DM3F10000</issuer>
+    <tradeId tradeIdScheme="http://www.barclays.com/coding-scheme/allocation-id-1-0">ALLOC1</tradeId>
+    <loanTradeReference href="TRDSUM1" />
+  </allocationId>
+  <tradeSummary id="TRDSUM1">
+    <issuer issuerIdScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">US1LFM0001</issuer>
+    <tradeId tradeIdScheme="http://www.barclays.com/coding-scheme/allocation-id-1-0">TN12345</tradeId>
+    <facilityReference href="FAC12345" />
+    <amount>
+      <currency>USD</currency>
+      <amount>10000000.0</amount>
+    </amount>
+  </tradeSummary>
+  <facilityIdentifier id="FAC12345">
+    <partyReference href="BANK67890" />
+    <instrumentId instrumentIdScheme="http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP-1-0">CUSIP0001</instrumentId>
+  </facilityIdentifier>
+  <party id="BANK12345">
+    <partyId partyIdScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">GB1L213246</partyId>
+  </party>
+  <party id="BANK67890">
+    <partyId partyIdScheme="http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0">US1LFM0001</partyId>
+  </party>
+</loanAllocationNotification>
+
