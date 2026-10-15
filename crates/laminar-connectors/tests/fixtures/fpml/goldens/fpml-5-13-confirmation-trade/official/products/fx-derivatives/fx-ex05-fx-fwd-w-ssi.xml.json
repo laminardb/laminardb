@@ -1,6 +1,7 @@
 [
   {
     "correlation_id": "FX987",
+    "creation_time_utc": "2001-11-19T08:57:00Z",
     "creation_timestamp": {
       "local": "2001-11-19T08:57:00",
       "offset_minutes": 0,

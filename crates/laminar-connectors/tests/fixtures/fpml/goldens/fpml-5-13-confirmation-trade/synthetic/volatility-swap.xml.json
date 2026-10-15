@@ -1,6 +1,7 @@
 [
   {
     "correlation_id": "SYN-VOLS",
+    "creation_time_utc": "2026-03-02T08:15:00Z",
     "creation_timestamp": {
       "local": "2026-03-02T09:15:00",
       "offset_minutes": 60,

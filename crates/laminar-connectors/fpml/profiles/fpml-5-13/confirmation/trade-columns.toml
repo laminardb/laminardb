@@ -71,6 +71,13 @@ type = "datetime"
 path = "/header/creationTimestamp"
 
 [[columns]]
+name = "creation_time_utc"
+type = "timestamp(ns, UTC)"
+path = "/header/creationTimestamp"
+offset = "optional"
+description = "Message creation instant; null when the sender wrote no UTC offset (creation_timestamp keeps the written value)"
+
+[[columns]]
 name = "is_correction"
 type = "bool"
 path = "/isCorrection"

@@ -70,7 +70,7 @@
       <paymentFrequency>
         <periodMultiplier>1</periodMultiplier>
         <period>Y</period>
-        <underlyerReference href="fixedUnderlyer" />
+        <payerPartyReference href="party1" />
       </paymentFrequency>
       <paymentFrequency>
         <periodMultiplier>1</periodMultiplier>

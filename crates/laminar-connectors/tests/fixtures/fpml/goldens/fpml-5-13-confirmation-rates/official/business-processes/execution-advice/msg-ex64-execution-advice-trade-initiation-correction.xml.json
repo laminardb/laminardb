@@ -23,6 +23,7 @@
       }
     ],
     "correlation_id": "CORR002",
+    "creation_time_utc": "2007-07-27T11:02:00Z",
     "creation_timestamp": {
       "local": "2007-07-27T11:02:00",
       "offset_minutes": 0,

@@ -303,6 +303,16 @@ def convert(kind, value, field: dict):
         return token[:10]
     if name == "datetime":
         return datetime_struct(token)
+    if name == "timestamp":
+        _, unit, utc = kind
+        parts = datetime_struct(token)
+        if not utc or unit != "ns":
+            raise Mismatch(f"oracle has no conversion for {kind}")
+        if "utc" in parts:
+            return parts["utc"]
+        if field.get("offset") == "optional":
+            return ABSENT
+        raise Mismatch(f"{token} has no UTC offset")
     raise Mismatch(f"oracle has no conversion for {kind}")
 
 

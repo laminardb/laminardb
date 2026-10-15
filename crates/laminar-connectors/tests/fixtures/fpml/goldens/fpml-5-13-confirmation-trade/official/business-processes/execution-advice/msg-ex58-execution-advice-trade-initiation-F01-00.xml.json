@@ -23,6 +23,7 @@
       }
     ],
     "correlation_id": "IM/F001",
+    "creation_time_utc": "2009-09-01T18:03:09Z",
     "creation_timestamp": {
       "local": "2009-09-01T10:03:09",
       "offset_minutes": -480,

@@ -46,6 +46,7 @@
     },
     "calculation_agent_business_center": "USNY",
     "correlation_id": "234231132",
+    "creation_time_utc": "2002-12-03T09:57:00Z",
     "creation_timestamp": {
       "local": "2002-12-03T09:57:00",
       "offset_minutes": 0,

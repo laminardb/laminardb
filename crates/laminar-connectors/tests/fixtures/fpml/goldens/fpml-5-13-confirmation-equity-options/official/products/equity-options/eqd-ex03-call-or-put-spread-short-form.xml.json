@@ -95,6 +95,7 @@
       ]
     },
     "correlation_id": "CS/2000/08/01/OTCCallorPutSpread45678",
+    "creation_time_utc": "2000-08-01T08:57:00Z",
     "creation_timestamp": {
       "local": "2000-08-01T08:57:00",
       "offset_minutes": 0,

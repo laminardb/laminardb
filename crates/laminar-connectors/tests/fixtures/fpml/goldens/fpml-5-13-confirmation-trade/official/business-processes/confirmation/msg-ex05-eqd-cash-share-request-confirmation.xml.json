@@ -6,6 +6,7 @@
       ]
     },
     "correlation_id": "OTCCallorPutSpread45678",
+    "creation_time_utc": "2002-08-01T08:57:00Z",
     "creation_timestamp": {
       "local": "2002-08-01T08:57:00",
       "offset_minutes": 0,

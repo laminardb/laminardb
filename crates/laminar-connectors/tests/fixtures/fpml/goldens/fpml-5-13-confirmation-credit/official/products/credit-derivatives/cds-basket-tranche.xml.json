@@ -1,6 +1,7 @@
 [
   {
     "correlation_id": "CORR/2005/01/24/0EB30A0q",
+    "creation_time_utc": "2005-01-24T12:36:35Z",
     "creation_timestamp": {
       "local": "2005-01-24T04:36:35",
       "offset_minutes": -480,

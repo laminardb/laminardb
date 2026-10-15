@@ -1,6 +1,7 @@
 [
   {
     "correlation_id": "SYN-STD",
+    "creation_time_utc": "2026-06-22T12:45:30.125Z",
     "creation_timestamp": {
       "local": "2026-06-22T08:45:30.125",
       "offset_minutes": -240,

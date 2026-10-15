@@ -35,6 +35,7 @@
       }
     ],
     "correlation_id": "COR-1223121232",
+    "creation_time_utc": "2006-04-02T10:38:00Z",
     "creation_timestamp": {
       "local": "2006-04-02T15:38:00",
       "offset_minutes": 300,

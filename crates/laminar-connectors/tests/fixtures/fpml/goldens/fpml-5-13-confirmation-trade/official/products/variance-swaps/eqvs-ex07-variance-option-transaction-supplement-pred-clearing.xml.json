@@ -1,6 +1,7 @@
 [
   {
     "correlation_id": "CW/2009/01/27/123",
+    "creation_time_utc": "2009-01-27T15:38:00Z",
     "creation_timestamp": {
       "local": "2009-01-27T15:38:00",
       "offset_minutes": 0,

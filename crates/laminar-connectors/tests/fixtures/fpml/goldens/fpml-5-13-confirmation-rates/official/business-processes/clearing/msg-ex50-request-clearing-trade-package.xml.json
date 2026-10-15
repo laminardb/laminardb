@@ -1,6 +1,7 @@
 [
   {
     "correlation_id": "0123456",
+    "creation_time_utc": "2009-12-25T08:57:00Z",
     "creation_timestamp": {
       "local": "2009-12-25T08:57:00",
       "offset_minutes": 0,
@@ -322,6 +323,7 @@
   },
   {
     "correlation_id": "0123456",
+    "creation_time_utc": "2009-12-25T08:57:00Z",
     "creation_timestamp": {
       "local": "2009-12-25T08:57:00",
       "offset_minutes": 0,

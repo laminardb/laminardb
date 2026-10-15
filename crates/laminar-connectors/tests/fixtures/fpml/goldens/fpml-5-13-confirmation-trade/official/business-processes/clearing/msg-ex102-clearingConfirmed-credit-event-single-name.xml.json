@@ -24,6 +24,7 @@
     ],
     "calculation_agent_business_center": "JPTO",
     "correlation_id": "TRD0001",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
     "creation_timestamp": {
       "local": "2010-01-04T08:57:00",
       "offset_minutes": 0,

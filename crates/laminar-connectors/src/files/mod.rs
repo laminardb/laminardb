@@ -74,7 +74,7 @@ pub fn register_file_source(
             #[cfg(feature = "fpml")]
             ConfigKeySpec::optional(
                 "fpml.profile",
-                "Bundled FpML projection profile (format = 'fpml')",
+                "Bundled FpML projection profile (format = 'fpml'); the default has one row per trade without product economics, which the asset-class profiles add",
                 crate::fpml::DEFAULT_PROFILE,
             ),
             #[cfg(feature = "fpml")]

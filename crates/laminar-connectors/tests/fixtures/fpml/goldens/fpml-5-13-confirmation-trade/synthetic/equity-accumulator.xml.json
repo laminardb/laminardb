@@ -1,6 +1,7 @@
 [
   {
     "correlation_id": "SYN-EQAC",
+    "creation_time_utc": "2026-04-01T02:30:00Z",
     "creation_timestamp": {
       "local": "2026-04-01T10:30:00",
       "offset_minutes": 480,
