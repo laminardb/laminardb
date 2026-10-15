@@ -1,0 +1,231 @@
+# Credit products: creditDefaultSwap (single name, index, basket, nth-to-default, tranche, with
+# fixed or floating fee legs) and creditDefaultSwapOption. Credit events, obligations, and
+# deliverable-obligation characteristics are kept as booleans and codes as supplied.
+include = ["../common.toml", "../options.toml", "../assets.toml"]
+
+[structs.legal_entity]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "entity_name", type = "utf8", path = "entityName" },
+  { name = "entity_ids", type = "list<struct<entity_id>>", path = "entityId" },
+]
+
+[structs.entity_id]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@entityIdScheme" },
+]
+
+[structs.adjustable_date2]
+fields = [
+  { name = "unadjusted_date", type = "date32", path = "unadjustedDate" },
+  { name = "date_adjustments", type = "struct<business_day_adjustments>", path = "dateAdjustments" },
+  { name = "date_adjustments_href", type = "utf8", path = "dateAdjustmentsReference/@href" },
+  { name = "adjusted_date", type = "date32", path = "adjustedDate" },
+]
+
+[structs.reference_obligation]
+fields = [
+  { name = "asset", type = "struct<obligation_asset>", path = "bond | convertibleBond | mortgage | loan" },
+  { name = "primary_obligor", type = "struct<legal_entity>", path = "primaryObligor" },
+  { name = "primary_obligor_href", type = "utf8", path = "primaryObligorReference/@href" },
+  { name = "guarantors", type = "list<struct<legal_entity>>", path = "guarantor" },
+  { name = "standard_reference_obligation", type = "bool", path = "standardReferenceObligation" },
+]
+
+[structs.obligation_asset]
+description = "A reference obligation's bond, convertible bond, mortgage, or loan"
+fields = [
+  { name = "asset_type", type = "utf8", path = "#name" },
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "instrument_ids", type = "list<struct<instrument_id>>", path = "instrumentId" },
+  { name = "description", type = "utf8", path = "description" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "clearance_system", type = "utf8", path = "clearanceSystem" },
+  { name = "issuer_name", type = "utf8", path = "issuerName" },
+  { name = "issuer_party_href", type = "utf8", path = "issuerPartyReference/@href" },
+  { name = "seniority", type = "utf8", path = "seniority" },
+  { name = "coupon_type", type = "utf8", path = "couponType" },
+  { name = "coupon_rate", type = "decimal", path = "couponRate" },
+  { name = "maturity", type = "date32", path = "maturity" },
+  { name = "par_value", type = "decimal", path = "parValue" },
+  { name = "face_amount", type = "decimal", path = "faceAmount" },
+  { name = "payment_frequency", type = "struct<frequency>", path = "paymentFrequency" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "lien", type = "utf8", path = "lien" },
+  { name = "facility_type", type = "utf8", path = "facilityType" },
+  { name = "credit_agreement_date", type = "date32", path = "creditAgreementDate" },
+  { name = "tranche", type = "utf8", path = "tranche" },
+]
+
+[structs.tranche]
+fields = [
+  { name = "attachment_point", type = "decimal", path = "attachmentPoint" },
+  { name = "exhaustion_point", type = "decimal", path = "exhaustionPoint" },
+  { name = "incurred_recovery_applicable", type = "bool", path = "incurredRecoveryApplicable" },
+]
+
+[structs.reference_pool_item]
+fields = [
+  { name = "opening_units", type = "decimal", path = "constituentWeight/openUnits" },
+  { name = "basket_percentage", type = "decimal", path = "constituentWeight/basketPercentage" },
+  { name = "basket_amount", type = "struct<money>", path = "constituentWeight/basketAmount" },
+  { name = "reference_entity", type = "struct<legal_entity>", path = "referencePair/referenceEntity" },
+  { name = "reference_obligation", type = "struct<reference_obligation>", path = "referencePair/referenceObligation" },
+  { name = "no_reference_obligation", type = "bool", path = "referencePair/noReferenceObligation" },
+  { name = "entity_type", type = "utf8", path = "referencePair/entityType" },
+]
+
+[structs.general_terms]
+fields = [
+  { name = "effective_date", type = "struct<adjustable_date2>", path = "effectiveDate" },
+  { name = "scheduled_termination_date", type = "struct<adjustable_date2>", path = "scheduledTerminationDate" },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "date_adjustments", type = "struct<business_day_adjustments>", path = "dateAdjustments" },
+  { name = "reference_type", type = "utf8", path = "referenceInformation/#name | indexReferenceInformation/#name | basketReferenceInformation/#name", description = "Which reference choice the swap uses" },
+  { name = "reference_entity", type = "struct<legal_entity>", path = "referenceInformation/referenceEntity" },
+  { name = "reference_obligations", type = "list<struct<reference_obligation>>", path = "referenceInformation/referenceObligation" },
+  { name = "no_reference_obligation", type = "bool", path = "referenceInformation/noReferenceObligation" },
+  { name = "reference_price", type = "decimal", path = "referenceInformation/referencePrice" },
+  { name = "index_name", type = "utf8", path = "indexReferenceInformation/indexName" },
+  { name = "index_ids", type = "list<utf8>", path = "indexReferenceInformation/indexId" },
+  { name = "index_series", type = "int64", path = "indexReferenceInformation/indexSeries" },
+  { name = "index_annex_version", type = "int64", path = "indexReferenceInformation/indexAnnexVersion" },
+  { name = "index_annex_date", type = "date32", path = "indexReferenceInformation/indexAnnexDate" },
+  { name = "index_annex_source", type = "utf8", path = "indexReferenceInformation/indexAnnexSource" },
+  { name = "index_factor", type = "decimal", path = "indexReferenceInformation/indexFactor" },
+  { name = "excluded_reference_entities", type = "list<struct<legal_entity>>", path = "indexReferenceInformation/excludedReferenceEntity" },
+  { name = "tranche", type = "struct<tranche>", path = "indexReferenceInformation/tranche | basketReferenceInformation/tranche" },
+  { name = "basket_name", type = "utf8", path = "basketReferenceInformation/basketName" },
+  { name = "basket_ids", type = "list<utf8>", path = "basketReferenceInformation/basketId" },
+  { name = "reference_pool", type = "list<struct<reference_pool_item>>", path = "basketReferenceInformation/referencePool/referencePoolItem" },
+  { name = "nth_to_default", type = "int64", path = "basketReferenceInformation/nthToDefault" },
+  { name = "mth_to_default", type = "int64", path = "basketReferenceInformation/mthToDefault" },
+  { name = "additional_terms", type = "list<utf8>", path = "additionalTerm" },
+  { name = "substitution", type = "bool", path = "substitution" },
+  { name = "modified_equity_delivery", type = "bool", path = "modifiedEquityDelivery" },
+]
+
+[structs.initial_payment]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "adjustable_payment_date", type = "date32", path = "adjustablePaymentDate" },
+  { name = "adjusted_payment_date", type = "date32", path = "adjustedPaymentDate" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+]
+
+[structs.periodic_payment]
+fields = [
+  { name = "payment_frequency", type = "struct<period>", path = "paymentFrequency" },
+  { name = "first_period_start_date", type = "date32", path = "firstPeriodStartDate" },
+  { name = "first_payment_date", type = "date32", path = "firstPaymentDate" },
+  { name = "last_regular_payment_date", type = "date32", path = "lastRegularPaymentDate" },
+  { name = "roll_convention", type = "utf8", path = "rollConvention" },
+  { name = "fixed_amount", type = "struct<money>", path = "fixedAmount" },
+  { name = "calculation_amount", type = "struct<money>", path = "fixedAmountCalculation/calculationAmount" },
+  { name = "fixed_rate", type = "decimal", path = "fixedAmountCalculation/fixedRate" },
+  { name = "day_count_fraction", type = "utf8", path = "fixedAmountCalculation/dayCountFraction" },
+  { name = "floating_calculation_amount", type = "struct<money>", path = "floatingAmountCalculation/calculationAmount" },
+  { name = "floating_rate_index", type = "utf8", path = "floatingAmountCalculation/floatingRate/floatingRateIndex" },
+  { name = "adjusted_payment_dates", type = "list<date32>", path = "adjustedPaymentDates/adjustedPaymentDate" },
+]
+
+[structs.fee_leg]
+fields = [
+  { name = "initial_payment", type = "struct<initial_payment>", path = "initialPayment" },
+  { name = "single_payments", type = "list<struct<initial_payment>>", path = "singlePayment" },
+  { name = "periodic_payment", type = "struct<periodic_payment>", path = "periodicPayment" },
+  { name = "market_fixed_rate", type = "decimal", path = "marketFixedRate" },
+  { name = "payment_delay", type = "bool", path = "paymentDelay" },
+  { name = "initial_points", type = "decimal", path = "initialPoints" },
+  { name = "market_price", type = "decimal", path = "marketPrice" },
+  { name = "quotation_style", type = "utf8", path = "quotationStyle" },
+]
+
+[structs.credit_events]
+fields = [
+  { name = "bankruptcy", type = "bool", path = "bankruptcy" },
+  { name = "failure_to_pay", type = "bool", path = "failureToPay/applicable" },
+  { name = "failure_to_pay_grace_period_extension", type = "bool", path = "failureToPay/gracePeriodExtension/applicable" },
+  { name = "failure_to_pay_payment_requirement", type = "struct<money>", path = "failureToPay/paymentRequirement" },
+  { name = "obligation_default", type = "bool", path = "obligationDefault" },
+  { name = "obligation_acceleration", type = "bool", path = "obligationAcceleration" },
+  { name = "repudiation_moratorium", type = "bool", path = "repudiationMoratorium" },
+  { name = "restructuring", type = "bool", path = "restructuring/applicable" },
+  { name = "restructuring_type", type = "utf8", path = "restructuring/restructuringType" },
+  { name = "governmental_intervention", type = "bool", path = "governmentalIntervention" },
+  { name = "default_requirement", type = "struct<money>", path = "defaultRequirement" },
+  { name = "credit_event_notice_parties", type = "list<utf8>", path = "creditEventNotice/notifyingParty/buyerPartyReference/@href | creditEventNotice/notifyingParty/sellerPartyReference/@href" },
+]
+
+[structs.protection_terms]
+fields = [
+  { name = "calculation_amount", type = "struct<money>", path = "calculationAmount" },
+  { name = "credit_events", type = "struct<credit_events>", path = "creditEvents" },
+  { name = "obligation_category", type = "utf8", path = "obligations/category" },
+  { name = "obligations_not_subordinated", type = "bool", path = "obligations/notSubordinated" },
+  { name = "obligations_listed", type = "bool", path = "obligations/listed" },
+  { name = "obligations_not_contingent", type = "bool", path = "obligations/notContingent" },
+]
+
+[structs.cash_settlement_terms]
+fields = [
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "valuation_time", type = "struct<business_center_time>", path = "valuationTime" },
+  { name = "quotation_method", type = "utf8", path = "quotationMethod" },
+  { name = "quotation_amount", type = "struct<money>", path = "quotationAmount" },
+  { name = "minimum_quotation_amount", type = "struct<money>", path = "minimumQuotationAmount" },
+  { name = "dealers", type = "list<utf8>", path = "dealer" },
+  { name = "cash_settlement_business_days", type = "int64", path = "cashSettlementBusinessDays" },
+  { name = "cash_settlement_amount", type = "struct<money>", path = "cashSettlementAmount" },
+  { name = "recovery_factor", type = "decimal", path = "recoveryFactor" },
+  { name = "fixed_settlement", type = "bool", path = "fixedSettlement" },
+  { name = "accrued_interest", type = "bool", path = "accruedInterest" },
+  { name = "valuation_method", type = "utf8", path = "valuationMethod" },
+]
+
+[structs.physical_settlement_terms]
+fields = [
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "physical_settlement_period_business_days", type = "int64", path = "physicalSettlementPeriod/businessDays" },
+  { name = "physical_settlement_period_maximum_business_days", type = "int64", path = "physicalSettlementPeriod/maximumBusinessDays" },
+  { name = "deliverable_obligation_category", type = "utf8", path = "deliverableObligations/category" },
+  { name = "deliverable_not_contingent", type = "bool", path = "deliverableObligations/notContingent" },
+  { name = "deliverable_transferable", type = "bool", path = "deliverableObligations/transferable" },
+  { name = "escrow", type = "bool", path = "escrow" },
+  { name = "sixty_business_day_settlement_cap", type = "bool", path = "sixtyBusinessDaySettlementCap" },
+]
+
+# ── Products ─────────────────────────────────────────────────────────────────
+
+[structs.credit_default_swap]
+description = "Credit default swap on a single name, index, basket, or tranche"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "general_terms", type = "struct<general_terms>", path = "generalTerms" },
+  { name = "fee_leg", type = "struct<fee_leg>", path = "feeLeg" },
+  { name = "protection_terms", type = "list<struct<protection_terms>>", path = "protectionTerms" },
+  { name = "cash_settlement_terms", type = "list<struct<cash_settlement_terms>>", path = "cashSettlementTerms" },
+  { name = "physical_settlement_terms", type = "list<struct<physical_settlement_terms>>", path = "physicalSettlementTerms" },
+]
+
+[structs.credit_default_swap_option]
+description = "Option on a credit default swap; the underlying swap is mapped in full"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "premium", type = "struct<premium>", path = "premium" },
+  { name = "exercise", type = "struct<exercise>", path = "." },
+  { name = "exercise_procedure", type = "struct<exercise_procedure>", path = "exerciseProcedure" },
+  { name = "notional_amount", type = "struct<money>", path = "notionalAmount" },
+  { name = "notional_reference_href", type = "utf8", path = "notionalReference/@href" },
+  { name = "settlement", type = "struct<option_settlement>", path = "." },
+  { name = "strike_spread", type = "decimal", path = "strike/spread" },
+  { name = "strike_price", type = "decimal", path = "strike/price" },
+  { name = "strike_reference_href", type = "utf8", path = "strike/strikeReference/@href" },
+  { name = "underlying", type = "struct<credit_default_swap>", path = "creditDefaultSwap" },
+]

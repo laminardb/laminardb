@@ -1,0 +1,134 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.partyA/accountId",
+            "value": "12345PartyA"
+          }
+        ],
+        "id": "accountParty1"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://partyB/accountId",
+            "value": "67899PartyB"
+          }
+        ],
+        "id": "accountParty2"
+      }
+    ],
+    "credit_default_swap": {
+      "fee_leg": {
+        "initial_payment": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "17000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party1"
+        }
+      },
+      "general_terms": {
+        "buyer_party_href": "party2",
+        "excluded_reference_entities": [
+          {
+            "entity_name": "TESCO PLC"
+          }
+        ],
+        "index_annex_date": "2005-11-01",
+        "index_annex_source": "Publisher",
+        "index_annex_version": 1,
+        "index_name": "Dow Jones iTraxx Europe Consumers Series 2 Version 1",
+        "index_series": 2,
+        "reference_type": "indexReferenceInformation",
+        "scheduled_termination_date": {
+          "unadjusted_date": "2010-03-20"
+        },
+        "seller_party_href": "party1"
+      },
+      "product": {},
+      "protection_terms": [
+        {
+          "calculation_amount": {
+            "amount": "25000000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        }
+      ]
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "4a5be14496651d0a8b0a57af5eef3e1787dfaf6f3c1694e02062a11a0a98b9e2",
+    "documentation": {
+      "master_agreement_date": "2000-01-01",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900O1WT2BXINL9612"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300P7IVTDP12DEA19"
+          }
+        ],
+        "party_name": "Party B"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300P7IVTDP12DEA19"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/trade-id",
+              "value": "ITRAXX1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900O1WT2BXINL9612"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/trade-id",
+              "value": "1234B6"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-11-03"
+    },
+    "trade_ordinal": 0
+  }
+]

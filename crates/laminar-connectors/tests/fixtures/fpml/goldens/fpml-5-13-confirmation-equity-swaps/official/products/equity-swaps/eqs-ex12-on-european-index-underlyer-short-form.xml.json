@@ -1,0 +1,215 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "8f331ee2ed70e815d57774697c50ea57104681b5f0414952eed1e6430761e8c6",
+    "documentation": {
+      "master_confirmation_date": "2009-01-01",
+      "master_confirmation_type": "ISDA2007EquityEuropean"
+    },
+    "equity_swap_transaction_supplement": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "EUR-EURIBOR-Reuters",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 1
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "0.000123400000000000"
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency_href": "equityPaymentCurrency",
+              "reference_amount": "StandardISDA"
+            },
+            "interpolation_method": "LinearZeroYield",
+            "leg": {
+              "id": "interestLeg",
+              "payer_party_href": "partyA",
+              "receiver_party_href": "partyB"
+            },
+            "notional": {
+              "relative_notional_amount_href": "equityNotionalAmount"
+            }
+          }
+        ],
+        "leg_types": [
+          "interestLeg",
+          "returnLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency": "EUR",
+              "reference_amount": "StandardISDA"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "DEFR"
+                  ],
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2009-03-19"
+              }
+            },
+            "initial_price": {
+              "net_price": "100.000000000000000000",
+              "net_price_currency": "EUR"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_centers": [
+                      "DEFR"
+                    ],
+                    "business_day_convention": "FOLLOWING"
+                  },
+                  "unadjusted_date": "2009-01-19"
+                }
+              },
+              "id": "returnLeg",
+              "payer_party_href": "partyB",
+              "receiver_party_href": "partyA",
+              "termination_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_centers": [
+                      "DEFR"
+                    ],
+                    "business_day_convention": "FOLLOWING"
+                  },
+                  "unadjusted_date": "2009-03-19"
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "10000000.000000000000000000",
+                "currency": "EUR",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Standard",
+            "notional_reset": true,
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "finalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "payment_dates_interim": {
+              "relative_dates": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "interimValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "index",
+                "description": "GERMAN SE XETRA DAX INDEX",
+                "exchange_id": "XEUR",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.fpml.org/instrument-id",
+                    "value": ".GDAXI"
+                  }
+                ]
+              },
+              "single_open_units": "100000.000000000000000000"
+            }
+          }
+        ]
+      },
+      "optional_early_termination": true,
+      "product": {},
+      "provisions": {}
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PARTY1234"
+          }
+        ],
+        "party_name": "Party 1234 Ltd"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PARTY5678"
+          }
+        ],
+        "party_name": "Party 5678 Ltd"
+      }
+    ],
+    "product_type": "equitySwapTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "PARTY1234"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.tradeIdScheme.com/tradeIdScheme",
+              "value": "1147071"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "PARTY5678"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.tradeIdScheme.com/tradeIdScheme",
+              "value": "1147071"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-01-19"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,184 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "calculation_agent_business_center": "USNY",
+    "correlation_id": "CORR/2000/08/01/456a779b",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "credit_default_swap": {
+      "fee_leg": {
+        "payment_delay": true,
+        "periodic_payment": {
+          "calculation_amount": {
+            "amount": "15000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "first_payment_date": "2006-11-01",
+          "fixed_rate": "0.050000000000000000",
+          "last_regular_payment_date": "2035-06-01",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 1
+          },
+          "roll_convention": "11"
+        }
+      },
+      "general_terms": {
+        "buyer_party_href": "party1",
+        "date_adjustments": {
+          "business_centers": [
+            "GBLO",
+            "USNY"
+          ],
+          "business_day_convention": "FOLLOWING"
+        },
+        "effective_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "GBLO",
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2006-10-11"
+        },
+        "reference_entity": {
+          "entity_name": "New Century Home Equity Loan Trust 2005-4"
+        },
+        "reference_obligations": [
+          {
+            "asset": {
+              "asset_type": "mortgage",
+              "currency": "USD",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP",
+                  "value": "64352VNC1"
+                },
+                {
+                  "scheme": "http://www.fpml.org/spec/2002/instrument-id-Bloomberg-1-0",
+                  "value": "NCHET 2005-4"
+                }
+              ],
+              "maturity": "2035-09-25",
+              "tranche": "M9"
+            }
+          }
+        ],
+        "reference_type": "referenceInformation",
+        "scheduled_termination_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "GBLO",
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2035-09-25"
+        },
+        "seller_party_href": "party2"
+      },
+      "physical_settlement_terms": [
+        {
+          "escrow": true,
+          "physical_settlement_period_business_days": 5
+        }
+      ],
+      "product": {},
+      "protection_terms": [
+        {
+          "calculation_amount": {
+            "amount": "15000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "credit_events": {}
+        }
+      ]
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "b6d0e42845236afe2fc7f33ea0c773b9aa46e1368eac9fea640d99a803775570",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2003Credit"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "456a789b",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/messsage-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "msdw",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900BIAQJIUV6DLE92"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/",
+              "value": "109257"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/",
+              "value": "1234567"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-10-05"
+    },
+    "trade_ordinal": 0
+  }
+]

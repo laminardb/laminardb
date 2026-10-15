@@ -22,7 +22,10 @@ notes = "Buyer/seller, option type, premium, exercise, notional or entitlement, 
 element = "brokerEquityOption"
 type = "BrokerEquityOption"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "broker_equity_option"
+notes = "Equity option terms plus delta crossed, brokerage fee and broker notes"
 
 [[product]]
 element = "bulletPayment"
@@ -88,61 +91,92 @@ status = "outstanding"
 element = "correlationSwap"
 type = "CorrelationSwap"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "correlation_swap"
+notes = "Correlation leg (parties, dates, underlyer basket, settlement, valuation, observation start, dividends, levels, notional amount, correlation strike, number of data series), additional payments"
 
 [[product]]
 element = "creditDefaultSwap"
 type = "CreditDefaultSwap"
 asset_class = "credit"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-credit"
+column = "credit_default_swap"
+notes = "General terms (dates, buyer/seller, single-name reference entity and obligations, index name/series/annex/factor and exclusions, basket reference pool, nth/mth-to-default, tranche), fee leg (initial, single and periodic payments, fixed or floating), protection terms (credit events, obligations), cash and physical settlement terms"
 
 [[product]]
 element = "creditDefaultSwapOption"
 type = "CreditDefaultSwapOption"
 asset_class = "credit"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-credit"
+column = "credit_default_swap_option"
+notes = "Buyer/seller, option type, premium, American/Bermuda/European exercise, procedure, notional or notional reference, settlement, strike spread/price/reference, and the underlying credit default swap mapped in full"
 
 [[product]]
 element = "dividendSwapOptionTransactionSupplement"
 type = "DividendSwapOptionTransactionSupplement"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "dividend_swap_option_transaction_supplement"
+notes = "Option terms as for varianceOptionTransactionSupplement and the underlying dividend swap transaction supplement"
 
 [[product]]
 element = "dividendSwapTransactionSupplement"
 type = "DividendSwapTransactionSupplement"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "dividend_swap_transaction_supplement"
+notes = "Dividend leg (parties, underlyer, settlement, declared cash and cash-equivalent dividend percentages), fixed leg payments, underlyer provisions"
 
 [[product]]
 element = "equityAccumulator"
 type = "EquityAccumulator"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_accumulator"
+synthetic = ["equity-accumulator.xml"]
+notes = "Buyer/seller, notional, underlyer, forward and spot price, shares per day, maximum trading days, gearing, guaranteed period, observation periods, expiration, settlement, knock-out level or target performance"
 
 [[product]]
 element = "equityForward"
 type = "EquityForward"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_forward"
+notes = "Equity derivative terms as for equityOption plus forward price"
 
 [[product]]
 element = "equityOption"
 type = "EquityOption"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_option"
+notes = "Buyer/seller, option type, effective date, underlyer (single asset or basket with constituents), notional, exercise style and dates, valuation, settlement, method of adjustment, strike, spot, number of options, entitlement, premium"
 
 [[product]]
 element = "equityOptionTransactionSupplement"
 type = "EquityOptionTransactionSupplement"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_option_transaction_supplement"
+notes = "Equity option terms plus exchange look-alike, nearest exchange-traded contract, index annex fallbacks and jurisdictions"
 
 [[product]]
 element = "equitySwapTransactionSupplement"
 type = "EquitySwapTransactionSupplement"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "equity_swap_transaction_supplement"
+notes = "Return swap body as for returnSwap plus early termination elections, break fees, underlyer provisions"
 
 [[product]]
 element = "fra"
@@ -292,7 +326,10 @@ status = "outstanding"
 element = "returnSwap"
 type = "ReturnSwap"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "return_swap"
+notes = "Buyer/seller, leg types, return legs (parties, dates, underlyer, settlement, initial/final price, payment dates, notional, amount, return type), interest legs (notional, fixed or floating rate, day count, compounding), principal exchanges, additional payments, early termination parties"
 
 [[product]]
 element = "securityLending"
@@ -343,31 +380,47 @@ notes = "Payer/receiver, start and maturity dates, tenor, principal, fixed rate,
 element = "varianceOptionTransactionSupplement"
 type = "VarianceOptionTransactionSupplement"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "variance_option_transaction_supplement"
+notes = "Buyer/seller, option type, premium, exercise and valuation, look-alike, entitlement or multiplier, and the underlying variance swap transaction supplement"
 
 [[product]]
 element = "varianceSwap"
 type = "VarianceSwap"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "variance_swap"
+notes = "Variance legs (parties, dates, underlyer, settlement, valuation, observation start, dividends, initial/closing/expiring level, expected N, variance amount, variance or volatility strike, caps, vega notional), additional payments"
 
 [[product]]
 element = "varianceSwapTransactionSupplement"
 type = "VarianceSwapTransactionSupplement"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "variance_swap_transaction_supplement"
+notes = "Variance legs as for varianceSwap plus underlyer provisions"
 
 [[product]]
 element = "volatilitySwap"
 type = "VolatilitySwap"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "volatility_swap"
+synthetic = ["volatility-swap.xml"]
+notes = "Volatility legs (parties, dates, underlyer, settlement, valuation, observation start, dividends, levels, expected N, volatility cap, strike, vega notional), additional payments"
 
 [[product]]
 element = "volatilitySwapTransactionSupplement"
 type = "VolatilitySwapTransactionSupplement"
 asset_class = "equity"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "volatility_swap_transaction_supplement"
+notes = "Volatility legs as for volatilitySwap plus underlyer provisions"
 
 [[loan]]
 element = "delayedDraw"

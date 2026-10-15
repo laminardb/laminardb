@@ -435,3 +435,5 @@ official/products/variance-swaps/eqvs-ex06-variance-option-transaction-supplemen
 official/products/variance-swaps/eqvs-ex07-variance-option-transaction-supplement-pred-clearing.xml
 official/products/volatility-swaps/eqvls-ex01-volatility-swap-index-matrix.xml
 official/products/volatility-swaps/eqvls-ex02-volatility-swap-index-mca.xml
+synthetic/equity-accumulator.xml
+synthetic/volatility-swap.xml

@@ -1,0 +1,255 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "234239",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "52ea233b32ad7326c632aa48c25bab5d459ba42b81d0562898051aeac6b9f03f",
+    "documentation": {
+      "master_agreement_date": "2002-03-15",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "283920",
+    "message_id_scheme": "http://www.abc.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "BAQ892"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "COP902"
+          }
+        ]
+      }
+    ],
+    "product_type": "varianceSwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABC290",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "BAQ892"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.xyz.com/coding-scheme/trade-id",
+              "value": "280234089"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2000-06-28"
+    },
+    "trade_ordinal": 0,
+    "variance_swap": {
+      "legs": [
+        {
+          "amount": {
+            "initial_level": "0.800000000000000000",
+            "observation_start_date": {
+              "relative_date": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "MODFOLLOWING",
+                "date_relative_to_href": "td",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            },
+            "variance_amount": {
+              "amount": "1000000.000000000000000000",
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "variance_strike_price": "0.300000000000000000"
+          },
+          "leg": {
+            "effective_date": {
+              "relative_date": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING",
+                "date_relative_to_href": "osd",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            },
+            "leg_identifiers": [
+              {
+                "scheme": "http://www.xyz.com/coding-scheme/leg-id",
+                "value": "234234234",
+                "version": 1
+              }
+            ],
+            "payer_party_href": "party1",
+            "receiver_party_href": "party2",
+            "termination_date": {
+              "relative_date": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING",
+                "date_relative_to_href": "csd",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            }
+          },
+          "leg_type": "varianceLeg",
+          "settlement": {
+            "settlement_currency": "EUR",
+            "settlement_date": {
+              "relative_date": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "MODFOLLOWING",
+                "date_relative_to_href": "vd",
+                "day_type": "Calendar",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "settlement_type": "Cash"
+          },
+          "underlyer": {
+            "single": {
+              "asset_type": "index",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.dowjones.com/coding-scheme/instrument-id",
+                  "value": "STOXX50E"
+                }
+              ]
+            }
+          },
+          "valuation": {
+            "futures_price_valuation": true,
+            "valuation_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "id": "vd",
+              "unadjusted_date": "2008-10-10"
+            },
+            "valuation_time_type": "Close"
+          }
+        },
+        {
+          "amount": {
+            "all_dividends": true,
+            "initial_level": "0.800000000000000000",
+            "variance_amount": {
+              "amount": "1000000.000000000000000000",
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "variance_strike_price": "0.350000000000000000"
+          },
+          "leg": {
+            "leg_identifiers": [
+              {
+                "scheme": "http://www.xyz.com/coding-scheme/leg-id",
+                "value": "93949033",
+                "version": 1
+              }
+            ],
+            "payer_party_href": "party1",
+            "receiver_party_href": "party2"
+          },
+          "leg_type": "varianceLeg",
+          "settlement": {},
+          "underlyer": {
+            "single": {
+              "asset_type": "equity",
+              "currency": "EUR",
+              "description": "Ahold",
+              "exchange_id": "XASE",
+              "instrument_ids": [
+                {
+                  "scheme": "uri:ticker",
+                  "value": "AH.AS"
+                }
+              ]
+            }
+          },
+          "valuation": {}
+        },
+        {
+          "amount": {
+            "all_dividends": true,
+            "initial_level": "0.800000000000000000",
+            "variance_amount": {
+              "amount": "1000000.000000000000000000",
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "variance_strike_price": "0.400000000000000000"
+          },
+          "leg": {
+            "leg_identifiers": [
+              {
+                "scheme": "http://www.xyz.com/coding-scheme/leg-id",
+                "value": "839274939",
+                "version": 1
+              }
+            ],
+            "payer_party_href": "party1",
+            "receiver_party_href": "party2"
+          },
+          "leg_type": "varianceLeg",
+          "settlement": {},
+          "underlyer": {
+            "single": {
+              "asset_type": "equity",
+              "currency": "EUR",
+              "description": "Royal Dutch Shell A",
+              "exchange_id": "XASE",
+              "instrument_ids": [
+                {
+                  "scheme": "uri:ticker",
+                  "value": "RDSA.AS"
+                }
+              ]
+            }
+          },
+          "valuation": {}
+        }
+      ],
+      "product": {}
+    }
+  }
+]

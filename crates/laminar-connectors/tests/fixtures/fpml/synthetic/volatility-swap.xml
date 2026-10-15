@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: an index volatility swap with an
+     additional payment, written because the FpML 5.13 corpus has no volatilitySwap example. -->
+<requestConfirmation xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-VOLS-0001</messageId>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sentBy>
+    <creationTimestamp>2026-03-02T09:15:00+01:00</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">SYN-VOLS</correlationId>
+  <sequenceNumber>1</sequenceNumber>
+  <trade>
+    <tradeHeader>
+      <partyTradeIdentifier>
+        <partyReference href="party1" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">VOLS-1001</tradeId>
+      </partyTradeIdentifier>
+      <partyTradeIdentifier>
+        <partyReference href="party2" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">VOLS-1001</tradeId>
+      </partyTradeIdentifier>
+      <tradeDate>2026-03-02</tradeDate>
+    </tradeHeader>
+    <volatilitySwap>
+      <primaryAssetClass>Equity</primaryAssetClass>
+      <productType>Equity:Swap:VolatilitySwap</productType>
+      <additionalPayment>
+        <payerPartyReference href="party2" />
+        <receiverPartyReference href="party1" />
+        <paymentDate>
+          <adjustableDate>
+            <unadjustedDate>2026-03-04</unadjustedDate>
+            <dateAdjustments>
+              <businessDayConvention>FOLLOWING</businessDayConvention>
+              <businessCenters>
+                <businessCenter>EUTA</businessCenter>
+              </businessCenters>
+            </dateAdjustments>
+          </adjustableDate>
+        </paymentDate>
+        <paymentAmount>
+          <currency>EUR</currency>
+          <amount>12500.00</amount>
+        </paymentAmount>
+        <paymentType>UpfrontFee</paymentType>
+      </additionalPayment>
+      <volatilityLeg>
+        <payerPartyReference href="party1" />
+        <receiverPartyReference href="party2" />
+        <effectiveDate>
+          <adjustableDate>
+            <unadjustedDate>2026-03-02</unadjustedDate>
+            <dateAdjustments>
+              <businessDayConvention>NONE</businessDayConvention>
+            </dateAdjustments>
+          </adjustableDate>
+        </effectiveDate>
+        <underlyer>
+          <singleUnderlyer>
+            <index>
+              <instrumentId instrumentIdScheme="http://www.fpml.org/coding-scheme/external/instrument-id-Reuters-RIC">.STOXX50E</instrumentId>
+              <description>EURO STOXX 50 Index</description>
+              <currency>EUR</currency>
+              <exchangeId exchangeIdScheme="http://www.fpml.org/coding-scheme/external/exchange-id-MIC">XEUR</exchangeId>
+            </index>
+          </singleUnderlyer>
+        </underlyer>
+        <settlementType>Cash</settlementType>
+        <settlementDate>
+          <relativeDate>
+            <periodMultiplier>3</periodMultiplier>
+            <period>D</period>
+            <dayType>CurrencyBusiness</dayType>
+            <businessDayConvention>NONE</businessDayConvention>
+            <dateRelativeTo href="volatilityValuation" />
+          </relativeDate>
+        </settlementDate>
+        <settlementCurrency>EUR</settlementCurrency>
+        <valuation id="volatilityValuation">
+          <valuationDate>
+            <adjustableDate>
+              <unadjustedDate>2026-09-18</unadjustedDate>
+              <dateAdjustments>
+                <businessDayConvention>NotApplicable</businessDayConvention>
+              </dateAdjustments>
+            </adjustableDate>
+          </valuationDate>
+          <valuationTimeType>Close</valuationTimeType>
+        </valuation>
+        <amount>
+          <observationStartDate>
+            <adjustableDate>
+              <unadjustedDate>2026-03-02</unadjustedDate>
+              <dateAdjustments>
+                <businessDayConvention>NotApplicable</businessDayConvention>
+              </dateAdjustments>
+            </adjustableDate>
+          </observationStartDate>
+          <allDividends>false</allDividends>
+          <volatility>
+            <closingLevel>true</closingLevel>
+            <expectedN>140</expectedN>
+            <volatilityCap>
+              <applicable>true</applicable>
+              <volatilityCapFactor>2.5</volatilityCapFactor>
+            </volatilityCap>
+            <volatilityStrikePrice>18.75</volatilityStrikePrice>
+            <vegaNotionalAmount>250000.00</vegaNotionalAmount>
+          </volatility>
+        </amount>
+      </volatilityLeg>
+    </volatilitySwap>
+    <documentation>
+      <masterAgreement>
+        <masterAgreementType>ISDA</masterAgreementType>
+        <masterAgreementDate>2020-01-15</masterAgreementDate>
+      </masterAgreement>
+      <contractualDefinitions>ISDA2011Equity</contractualDefinitions>
+    </documentation>
+  </trade>
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+    <partyName>Synthetic Party A</partyName>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+    <partyName>Synthetic Party B</partyName>
+  </party>
+</requestConfirmation>

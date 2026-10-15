@@ -1,0 +1,156 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CS/2006/04/02/32-12",
+    "creation_timestamp": {
+      "local": "2006-04-02T15:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-04-02T15:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "39609d633b7275420b1ebfdd254d300e65fb03b9c62c30dc2b4c2ba609157624",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "equity_option": {
+      "option": {
+        "option_entitlement": "1.000000000000000000",
+        "premium": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "5000000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2002-03-25"
+          },
+          "percentage_of_notional": "0.050000000000000000",
+          "receiver_party_href": "party1"
+        },
+        "strike": {
+          "strike_price": "900.000000000000000000"
+        }
+      },
+      "product": {},
+      "terms": {
+        "buyer_party_href": "party2",
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2002-06-25"
+            }
+          },
+          "expiration_time_type": "SpecificTime",
+          "settlement_currency": "EUR",
+          "settlement_date": {
+            "relative_date": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "expirationDate",
+              "day_type": "ExchangeBusiness",
+              "period": "D",
+              "period_multiplier": 3
+            }
+          },
+          "settlement_price_source": "OfficialClose",
+          "settlement_type": "Cash",
+          "style": "equityEuropeanExercise",
+          "valuation": {
+            "valuation_time_type": "Close"
+          }
+        },
+        "method_of_adjustment": "CalculationAgent",
+        "notional": {
+          "amount": "1000000.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "option_type": "Call",
+        "seller_party_href": "party1",
+        "underlyer": {
+          "single": {
+            "asset_type": "index",
+            "description": "S and P 500",
+            "exchange_id": "XNYS",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/schemes/4.1/instrumentId",
+                "value": ".SP500"
+              }
+            ],
+            "related_exchange_ids": [
+              "XCBO"
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "MS/2006/04/02/15-12",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/eqd-trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-03-25"
+    },
+    "trade_ordinal": 0
+  }
+]

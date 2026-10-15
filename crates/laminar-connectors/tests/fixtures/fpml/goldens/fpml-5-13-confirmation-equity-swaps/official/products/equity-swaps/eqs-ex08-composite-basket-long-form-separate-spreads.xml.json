@@ -1,0 +1,353 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CS/2006/07/02/32-09",
+    "creation_timestamp": {
+      "local": "2006-07-02T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-07-02T16:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "348c1f9b33e7218ae11179a671e0a9b9b30373eb381d9a4e7793ccf9fdd8a16c",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "MS/2006/04/07/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "return_swap": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "EUR-EURIBOR-Telerate",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 3
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "0.005000000000000000"
+                },
+                {
+                  "initial_value": "0.005000000000000000",
+                  "steps": [
+                    {
+                      "step_date": "2002-03-17",
+                      "step_value": "0.005500000000000000"
+                    }
+                  ]
+                },
+                {
+                  "initial_value": "0.005000000000000000"
+                },
+                {
+                  "initial_value": "0.005000000000000000",
+                  "steps": [
+                    {
+                      "step_date": "2002-04-17",
+                      "step_value": "0.004200000000000000"
+                    }
+                  ]
+                },
+                {
+                  "initial_value": "0.005000000000000000",
+                  "steps": [
+                    {
+                      "step_date": "2002-03-20",
+                      "step_value": "0.006500000000000000"
+                    }
+                  ]
+                },
+                {
+                  "initial_value": "0.005000000000000000",
+                  "steps": [
+                    {
+                      "step_date": "2002-02-22",
+                      "step_value": "0.002200000000000000"
+                    }
+                  ]
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency_href": "ReferenceCurrency",
+              "reference_amount": "Standard ISDA"
+            },
+            "leg": {
+              "payer_party_href": "party2",
+              "receiver_party_href": "party1"
+            },
+            "notional": {
+              "relative_notional_amount_href": "EquityNotionalAmount"
+            }
+          }
+        ],
+        "leg_types": [
+          "returnLeg",
+          "interestLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency_href": "ReferenceCurrency",
+              "reference_amount": "ISDA Standard"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2004-01-17"
+              }
+            },
+            "initial_price": {
+              "net_price": "19785157.160000000000000000",
+              "net_price_currency": "EUR"
+            },
+            "leg": {
+              "effective_date": {
+                "relative_date": {
+                  "business_day_convention": "NotApplicable",
+                  "date_relative_to_href": "TradeDate",
+                  "day_type": "ExchangeBusiness",
+                  "period": "D",
+                  "period_multiplier": 3
+                }
+              },
+              "payer_party_href": "party1",
+              "receiver_party_href": "party2",
+              "termination_date": {
+                "relative_date": {
+                  "business_day_convention": "NotApplicable",
+                  "date_relative_to_href": "FinalEquityPaymentDate",
+                  "period": "D",
+                  "period_multiplier": 0
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "19785157.160000000000000000",
+                "currency": "EUR",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Execution",
+            "notional_reset": true,
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "FinalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 3
+              }
+            },
+            "payment_dates_interim": {
+              "relative_dates": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "InterimValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 3
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "basket": {
+                "constituents": [
+                  {
+                    "asset": {
+                      "asset_type": "equity",
+                      "currency": "EUR",
+                      "description": "Telecom Italia spa",
+                      "exchange_id": "XMIL",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": "TIT.ME"
+                        }
+                      ]
+                    },
+                    "opening_units": "432000.000000000000000000"
+                  },
+                  {
+                    "asset": {
+                      "asset_type": "equity",
+                      "currency": "EUR",
+                      "description": "Nokya Oyj",
+                      "exchange_id": "XHEL",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": "NOK1V.HE"
+                        }
+                      ]
+                    },
+                    "opening_units": "227000.000000000000000000"
+                  },
+                  {
+                    "asset": {
+                      "asset_type": "equity",
+                      "currency": "EUR",
+                      "description": "Telecom Italia Mobile spa",
+                      "exchange_id": "XMIL",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": "TIM.MI"
+                        }
+                      ]
+                    },
+                    "opening_units": "783000.000000000000000000"
+                  },
+                  {
+                    "asset": {
+                      "asset_type": "equity",
+                      "currency": "EUR",
+                      "description": "Telefonica de Espana",
+                      "exchange_id": "XMAD",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": "TEF.MC"
+                        }
+                      ]
+                    },
+                    "opening_units": "344000.000000000000000000"
+                  },
+                  {
+                    "asset": {
+                      "asset_type": "equity",
+                      "currency": "EUR",
+                      "description": "Portugal Telecom SA",
+                      "exchange_id": "XCVM",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": "PTCO.IN"
+                        }
+                      ]
+                    },
+                    "opening_units": "340000.000000000000000000"
+                  },
+                  {
+                    "asset": {
+                      "asset_type": "equity",
+                      "currency": "GBP",
+                      "description": "Vodafone Group",
+                      "exchange_id": "XLON",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": "VOD.L"
+                        }
+                      ]
+                    },
+                    "opening_units": "2486000.000000000000000000"
+                  }
+                ],
+                "open_units": "1.000000000000000000"
+              }
+            }
+          }
+        ]
+      },
+      "early_termination_parties": [
+        "party1",
+        "party2"
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Swap:PriceReturnBasicPerformance:Basket"
+          }
+        ]
+      }
+    },
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "1245"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "4569"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-07-17"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,152 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "jb2890"
+      ]
+    },
+    "correlation_id": "CW/2000/08/13/456a789b",
+    "creation_timestamp": {
+      "local": "2006-08-13T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2006-08-13T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "5759e564c8525824cc3f4d734ad1e446b32ce541b083a80ee12f14149ba4854b",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "equity_option": {
+      "option": {
+        "number_of_options": "150000.000000000000000000",
+        "option_entitlement": "1.000000000000000000",
+        "premium": {
+          "payer_party_href": "PartyB",
+          "payment_amount": {
+            "amount": "405000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2006-08-14"
+          },
+          "price_per_option": {
+            "amount": "2.700000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "jb2890"
+        },
+        "strike": {
+          "strike_price": "32.000000000000000000"
+        }
+      },
+      "product": {},
+      "terms": {
+        "buyer_party_href": "PartyB",
+        "exercise": {
+          "automatic_exercise": true,
+          "commencement_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2006-08-14"
+            }
+          },
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2008-08-14"
+            }
+          },
+          "expiration_time_type": "Close",
+          "settlement_currency": "EUR",
+          "settlement_price_source": "OfficialClose",
+          "settlement_type": "Election",
+          "style": "equityAmericanExercise",
+          "valuation": {
+            "valuation_time_type": "Close"
+          }
+        },
+        "method_of_adjustment": "CalculationAgent",
+        "option_type": "Call",
+        "seller_party_href": "jb2890",
+        "underlyer": {
+          "single": {
+            "asset_type": "equity",
+            "description": "STMicroelectronics N.V. ordinary shares",
+            "exchange_id": "XNSE",
+            "id": "ud892",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/schemes/4.1/instrumentId",
+                "value": "STM-FP"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "EquityShareOption456a789b",
+    "message_id_scheme": "http://www.msdw.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "jb2890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "msdw",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "jb2890",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/eqd-trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-08-14"
+    },
+    "trade_ordinal": 0
+  }
+]

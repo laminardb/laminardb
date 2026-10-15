@@ -1,0 +1,127 @@
+[
+  {
+    "correlation_id": "PA/2000/08/01/234234923420",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "ef5cc641aef74d664d76a2b1191e47a994fdf9537719ac90e1cce54d8a278cbc",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "234234923420",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "varianceSwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "23902",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/coding-scheme/trade-id",
+              "value": "6234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/coding-scheme/trade-id",
+              "value": "6569"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2007-01-05"
+    },
+    "trade_ordinal": 0,
+    "variance_swap": {
+      "legs": [
+        {
+          "amount": {
+            "additional_dividends": false,
+            "closing_level": true,
+            "options_exchange_dividends": true,
+            "variance_amount": {
+              "amount": "1388.889000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "variance_strike_price": "18.135000000000000000",
+            "vega_notional_amount": "50000.000000000000000000"
+          },
+          "leg": {
+            "payer_party_href": "party1",
+            "receiver_party_href": "party2"
+          },
+          "leg_type": "varianceLeg",
+          "settlement": {
+            "settlement_type": "Cash"
+          },
+          "underlyer": {
+            "single": {
+              "asset_type": "equity",
+              "description": "IBM ordinary shares",
+              "exchange_id": "XNYS",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/schemes/4.1/instrumentId",
+                  "value": "IBM"
+                }
+              ]
+            }
+          },
+          "valuation": {
+            "options_price_valuation": true,
+            "valuation_date": {
+              "date_adjustments": {
+                "business_day_convention": "NotApplicable"
+              },
+              "unadjusted_date": "2004-07-21"
+            }
+          }
+        }
+      ],
+      "product": {}
+    }
+  }
+]

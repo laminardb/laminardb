@@ -1,0 +1,195 @@
+[
+  {
+    "correlation_id": "SYN-VOLS",
+    "creation_timestamp": {
+      "local": "2026-03-02T09:15:00",
+      "offset_minutes": 60,
+      "utc": "2026-03-02T08:15:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "b9116269222df88ebd0a5404450c1fb8e53b7044df45ab58bd1157823a28806e",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2011Equity"
+      ],
+      "master_agreement_date": "2020-01-15",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SYN-VOLS-0001",
+    "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ],
+        "party_name": "Synthetic Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ],
+        "party_name": "Synthetic Party B"
+      }
+    ],
+    "product_type": "volatilitySwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYA",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYA"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "VOLS-1001"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "VOLS-1001"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2026-03-02"
+    },
+    "trade_ordinal": 0,
+    "volatility_swap": {
+      "additional_payments": [
+        {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "12500.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2026-03-04"
+            }
+          },
+          "payment_types": [
+            "UpfrontFee"
+          ],
+          "receiver_party_href": "party1"
+        }
+      ],
+      "legs": [
+        {
+          "amount": {
+            "all_dividends": false,
+            "closing_level": true,
+            "expected_n": 140,
+            "observation_start_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2026-03-02"
+              }
+            },
+            "vega_notional_amount": "250000.000000000000000000",
+            "volatility_cap": true,
+            "volatility_strike_price": "18.750000000000000000"
+          },
+          "leg": {
+            "effective_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NONE"
+                },
+                "unadjusted_date": "2026-03-02"
+              }
+            },
+            "payer_party_href": "party1",
+            "receiver_party_href": "party2"
+          },
+          "leg_type": "volatilityLeg",
+          "settlement": {
+            "settlement_currency": "EUR",
+            "settlement_date": {
+              "relative_date": {
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "volatilityValuation",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 3
+              }
+            },
+            "settlement_type": "Cash"
+          },
+          "underlyer": {
+            "single": {
+              "asset_type": "index",
+              "currency": "EUR",
+              "description": "EURO STOXX 50 Index",
+              "exchange_id": "XEUR",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-Reuters-RIC",
+                  "value": ".STOXX50E"
+                }
+              ]
+            }
+          },
+          "valuation": {
+            "valuation_date": {
+              "date_adjustments": {
+                "business_day_convention": "NotApplicable"
+              },
+              "unadjusted_date": "2026-09-18"
+            },
+            "valuation_time_type": "Close"
+          }
+        }
+      ],
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Equity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Swap:VolatilitySwap"
+          }
+        ]
+      }
+    }
+  }
+]

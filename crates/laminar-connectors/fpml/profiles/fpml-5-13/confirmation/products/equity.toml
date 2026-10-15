@@ -1,0 +1,436 @@
+# Equity products: equityOption, equityForward, brokerEquityOption, the option and swap
+# transaction supplements, returnSwap (equity, index, and bond total return swaps), variance,
+# volatility, correlation, and dividend swaps and their transaction supplements and options, and
+# equityAccumulator. Underlyers use the shared asset template (single assets and baskets).
+include = ["../common.toml", "../options.toml", "../assets.toml", "rates.toml"]
+
+[sets]
+return_swap_leg = { substitution = "returnSwapLeg" }
+observed_calculation = ["variance", "volatility", "correlation"]
+
+# ── Shared equity structures ─────────────────────────────────────────────────
+
+[structs.underlyer]
+description = "A single underlying asset or a basket"
+fields = [
+  { name = "single", type = "struct<asset>", path = "singleUnderlyer/{underlying_asset}" },
+  { name = "single_open_units", type = "decimal", path = "singleUnderlyer/openUnits" },
+  { name = "single_depository_receipt", type = "bool", path = "singleUnderlyer/depositoryReceipt" },
+  { name = "basket", type = "struct<basket>", path = "basket" },
+]
+
+[structs.equity_valuation]
+fields = [
+  { name = "valuation_date", type = "struct<adjustable_date>", path = "valuationDate/adjustableDate" },
+  { name = "valuation_dates", type = "struct<adjustable_dates>", path = "valuationDates/adjustableDates" },
+  { name = "valuation_time_type", type = "utf8", path = "valuationTimeType" },
+  { name = "valuation_time", type = "struct<business_center_time>", path = "valuationTime" },
+  { name = "futures_price_valuation", type = "bool", path = "futuresPriceValuation" },
+  { name = "options_price_valuation", type = "bool", path = "optionsPriceValuation" },
+  { name = "number_of_valuation_dates", type = "int64", path = "numberOfValuationDates" },
+]
+
+[structs.equity_exercise]
+description = "Exercise, valuation, and settlement of an equity derivative"
+fields = [
+  { name = "style", type = "utf8", path = "equityEuropeanExercise/#name | equityAmericanExercise/#name | equityBermudaExercise/#name" },
+  { name = "commencement_date", type = "struct<adjustable_or_relative_date>", path = "equityAmericanExercise/commencementDate" },
+  { name = "expiration_date", type = "struct<adjustable_or_relative_date>", path = "equityEuropeanExercise/expirationDate | equityAmericanExercise/expirationDate | equityBermudaExercise/expirationDate" },
+  { name = "bermuda_exercise_dates", type = "list<date32>", path = "equityBermudaExercise/bermudaExerciseDates/date" },
+  { name = "expiration_time_type", type = "utf8", path = "equityEuropeanExercise/equityExpirationTimeType | equityAmericanExercise/equityExpirationTimeType | equityBermudaExercise/equityExpirationTimeType" },
+  { name = "expiration_time", type = "struct<business_center_time>", path = "equityEuropeanExercise/equityExpirationTime | equityAmericanExercise/equityExpirationTime | equityBermudaExercise/equityExpirationTime" },
+  { name = "automatic_exercise", type = "bool", path = "automaticExercise" },
+  { name = "valuation", type = "struct<equity_valuation>", path = "equityValuation" },
+  { name = "settlement_date", type = "struct<adjustable_or_relative_date>", path = "settlementDate" },
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "settlement_price_source", type = "utf8", path = "settlementPriceSource" },
+  { name = "settlement_type", type = "utf8", path = "settlementType" },
+]
+
+[structs.equity_premium]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "premium_type", type = "utf8", path = "premiumType" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<adjustable_date>", path = "paymentDate" },
+  { name = "swap_premium", type = "bool", path = "swapPremium" },
+  { name = "price_per_option", type = "struct<money>", path = "pricePerOption" },
+  { name = "percentage_of_notional", type = "decimal", path = "percentageOfNotional" },
+]
+
+[structs.equity_strike]
+fields = [
+  { name = "strike_price", type = "decimal", path = "strikePrice" },
+  { name = "strike_percentage", type = "decimal", path = "strikePercentage" },
+  { name = "strike_determination_date", type = "struct<adjustable_or_relative_date>", path = "strikeDeterminationDate" },
+  { name = "currency", type = "utf8", path = "currency" },
+]
+
+[structs.equity_derivative]
+description = "EquityDerivativeBase: parties, option type, underlyer, notional, exercise"
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "equity_effective_date", type = "date32", path = "equityEffectiveDate" },
+  { name = "underlyer", type = "struct<underlyer>", path = "underlyer" },
+  { name = "notional", type = "struct<money>", path = "notional" },
+  { name = "exercise", type = "struct<equity_exercise>", path = "equityExercise" },
+  { name = "method_of_adjustment", type = "utf8", path = "methodOfAdjustment" },
+]
+
+[structs.equity_option_terms]
+fields = [
+  { name = "strike", type = "struct<equity_strike>", path = "strike" },
+  { name = "spot_price", type = "decimal", path = "spotPrice" },
+  { name = "number_of_options", type = "decimal", path = "numberOfOptions" },
+  { name = "option_entitlement", type = "decimal", path = "optionEntitlement" },
+  { name = "multiplier", type = "decimal", path = "multiplier" },
+  { name = "premium", type = "struct<equity_premium>", path = "equityPremium" },
+]
+
+[structs.leg_identifier]
+fields = [
+  { name = "value", type = "utf8", path = "legId" },
+  { name = "scheme", type = "utf8", path = "legId/@legIdScheme" },
+  { name = "version", type = "int64", path = "version" },
+]
+
+[structs.directional_leg]
+description = "Parties and dates every return-swap and netted-swap leg carries"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "leg_identifiers", type = "list<struct<leg_identifier>>", path = "legIdentifier" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "effective_date", type = "struct<adjustable_or_relative_date>", path = "effectiveDate" },
+  { name = "termination_date", type = "struct<adjustable_or_relative_date>", path = "terminationDate" },
+]
+
+[structs.return_swap_notional]
+fields = [
+  { name = "notional_amount", type = "struct<money>", path = "notionalAmount" },
+  { name = "relative_notional_amount_href", type = "utf8", path = "relativeNotionalAmount/@href" },
+  { name = "relative_determination_method_href", type = "utf8", path = "relativeDeterminationMethod/@href" },
+  { name = "determination_method", type = "utf8", path = "determinationMethod" },
+]
+
+[structs.leg_amount]
+fields = [
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "currency_href", type = "utf8", path = "currencyReference/@href" },
+  { name = "determination_method", type = "utf8", path = "determinationMethod" },
+  { name = "reference_amount", type = "utf8", path = "referenceAmount" },
+]
+
+[structs.valuation_price]
+fields = [
+  { name = "determination_method", type = "utf8", path = "determinationMethod" },
+  { name = "amount_relative_to_href", type = "utf8", path = "amountRelativeTo/@href" },
+  { name = "gross_price", type = "decimal", path = "grossPrice/amount" },
+  { name = "net_price", type = "decimal", path = "netPrice/amount" },
+  { name = "net_price_currency", type = "utf8", path = "netPrice/currency" },
+  { name = "valuation_date", type = "struct<adjustable_date>", path = "valuationRules/valuationDate/adjustableDate" },
+]
+
+[structs.return_leg]
+fields = [
+  { name = "leg", type = "struct<directional_leg>", path = "." },
+  { name = "strike_date", type = "struct<adjustable_or_relative_date>", path = "strikeDate" },
+  { name = "underlyer", type = "struct<underlyer>", path = "underlyer" },
+  { name = "settlement", type = "struct<option_settlement>", path = "." },
+  { name = "initial_price", type = "struct<valuation_price>", path = "rateOfReturn/initialPrice" },
+  { name = "notional_reset", type = "bool", path = "rateOfReturn/notionalReset" },
+  { name = "final_price", type = "struct<valuation_price>", path = "rateOfReturn/valuationPriceFinal" },
+  { name = "payment_dates_interim", type = "struct<adjustable_or_relative_dates>", path = "rateOfReturn/paymentDates/paymentDatesInterim" },
+  { name = "payment_date_final", type = "struct<adjustable_or_relative_date>", path = "rateOfReturn/paymentDates/paymentDateFinal" },
+  { name = "notional", type = "struct<return_swap_notional>", path = "notional" },
+  { name = "amount", type = "struct<leg_amount>", path = "amount" },
+  { name = "return_type", type = "utf8", path = "return/returnType" },
+  { name = "notional_adjustments", type = "utf8", path = "notionalAdjustments" },
+]
+
+[structs.interest_leg]
+fields = [
+  { name = "leg", type = "struct<directional_leg>", path = "." },
+  { name = "notional", type = "struct<return_swap_notional>", path = "notional" },
+  { name = "interest_amount", type = "struct<leg_amount>", path = "interestAmount" },
+  { name = "fixed_rate", type = "decimal", path = "interestCalculation/fixedRate" },
+  { name = "floating_rate_calculation", type = "struct<floating_rate_calculation>", path = "interestCalculation/floatingRateCalculation" },
+  { name = "day_count_fraction", type = "utf8", path = "interestCalculation/dayCountFraction" },
+  { name = "compounding_method", type = "utf8", path = "interestCalculation/compounding/compoundingMethod" },
+  { name = "interpolation_method", type = "utf8", path = "interestCalculation/interpolationMethod" },
+]
+
+[structs.return_swap_body]
+description = "ReturnSwapBase: legs, principal exchanges, and additional payments"
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "leg_types", type = "list<utf8>", path = "{return_swap_leg}/#name" },
+  { name = "return_legs", type = "list<struct<return_leg>>", path = "returnLeg" },
+  { name = "interest_legs", type = "list<struct<interest_leg>>", path = "interestLeg" },
+  { name = "principal_exchanges", type = "list<struct<principal_exchange_description>>", path = "principalExchangeFeatures/principalExchangeDescriptions" },
+  { name = "additional_payments", type = "list<struct<return_swap_additional_payment>>", path = "additionalPayment" },
+]
+
+[structs.classifiable_payment]
+description = "A payment with an adjustable or relative date and payment types (ClassifiablePayment)"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<adjustable_or_relative_date>", path = "paymentDate" },
+  { name = "payment_types", type = "list<utf8>", path = "paymentType" },
+]
+
+[structs.principal_exchange_description]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "amount", type = "struct<money>", path = "principalExchangeAmount/principalAmount" },
+  { name = "amount_relative_to_href", type = "utf8", path = "principalExchangeAmount/amountRelativeTo/@href" },
+  { name = "determination_method", type = "utf8", path = "principalExchangeAmount/determinationMethod" },
+  { name = "date", type = "struct<adjustable_or_relative_date>", path = "principalExchangeDate" },
+]
+
+[structs.return_swap_additional_payment]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_amount", type = "struct<money>", path = "additionalPaymentAmount/paymentAmount" },
+  { name = "formula_description", type = "utf8", path = "additionalPaymentAmount/formula/formulaDescription", whitespace = "collapse" },
+  { name = "payment_date", type = "struct<adjustable_or_relative_date>", path = "additionalPaymentDate" },
+  { name = "payment_type", type = "utf8", path = "paymentType" },
+]
+
+[structs.calculated_amount]
+description = "Variance, volatility, or correlation amount of a netted swap leg"
+fields = [
+  { name = "observation_start_date", type = "struct<adjustable_or_relative_date>", path = "observationStartDate" },
+  { name = "options_exchange_dividends", type = "bool", path = "optionsExchangeDividends" },
+  { name = "additional_dividends", type = "bool", path = "additionalDividends" },
+  { name = "all_dividends", type = "bool", path = "allDividends" },
+  { name = "initial_level", type = "decimal", path = "{observed_calculation}/initialLevel" },
+  { name = "closing_level", type = "bool", path = "{observed_calculation}/closingLevel" },
+  { name = "expiring_level", type = "bool", path = "{observed_calculation}/expiringLevel" },
+  { name = "expected_n", type = "int64", path = "{observed_calculation}/expectedN" },
+  { name = "variance_amount", type = "struct<money>", path = "variance/varianceAmount" },
+  { name = "variance_strike_price", type = "decimal", path = "variance/varianceStrikePrice" },
+  { name = "volatility_strike_price", type = "decimal", path = "{observed_calculation}/volatilityStrikePrice" },
+  { name = "variance_cap", type = "bool", path = "variance/varianceCap" },
+  { name = "unadjusted_variance_cap", type = "decimal", path = "variance/unadjustedVarianceCap" },
+  { name = "vega_notional_amount", type = "decimal", path = "{observed_calculation}/vegaNotionalAmount" },
+  { name = "volatility_cap", type = "bool", path = "volatility/volatilityCap/applicable" },
+  { name = "correlation_notional_amount", type = "struct<money>", path = "correlation/notionalAmount" },
+  { name = "correlation_strike_price", type = "decimal", path = "correlation/correlationStrikePrice" },
+  { name = "number_of_data_series", type = "int64", path = "correlation/numberOfDataSeries" },
+]
+
+[structs.netted_swap_leg]
+description = "Variance, volatility, or correlation leg"
+fields = [
+  { name = "leg_type", type = "utf8", path = "#name" },
+  { name = "leg", type = "struct<directional_leg>", path = "." },
+  { name = "underlyer", type = "struct<underlyer>", path = "underlyer" },
+  { name = "settlement", type = "struct<option_settlement>", path = "." },
+  { name = "valuation", type = "struct<equity_valuation>", path = "valuation" },
+  { name = "amount", type = "struct<calculated_amount>", path = "amount" },
+]
+
+[structs.dividend_leg]
+fields = [
+  { name = "leg", type = "struct<directional_leg>", path = "." },
+  { name = "underlyer", type = "struct<underlyer>", path = "underlyer" },
+  { name = "settlement", type = "struct<option_settlement>", path = "." },
+  { name = "declared_cash_dividend_percentage", type = "decimal", path = "declaredCashDividendPercentage" },
+  { name = "declared_cash_equivalent_dividend_percentage", type = "decimal", path = "declaredCashEquivalentDividendPercentage" },
+]
+
+[structs.fixed_payment_leg]
+fields = [
+  { name = "leg", type = "struct<directional_leg>", path = "." },
+  { name = "fixed_payments", type = "list<struct<fixed_payment_amount>>", path = "fixedPayment" },
+]
+
+[structs.fixed_payment_amount]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<relative_date_offset>", path = "paymentDate" },
+]
+
+[structs.equity_underlyer_provisions]
+fields = [
+  { name = "multiple_exchange_index_annex_fallback", type = "bool", path = "multipleExchangeIndexAnnexFallback" },
+  { name = "component_security_index_annex_fallback", type = "bool", path = "componentSecurityIndexAnnexFallback" },
+  { name = "local_jurisdiction", type = "utf8", path = "localJurisdiction" },
+  { name = "relevant_jurisdiction", type = "utf8", path = "relevantJurisdiction" },
+]
+
+[structs.equity_option_on_swap]
+description = "Option terms of a variance or dividend swap option transaction supplement"
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "premium", type = "struct<equity_premium>", path = "equityPremium" },
+  { name = "exercise", type = "struct<equity_exercise>", path = "equityExercise" },
+  { name = "exchange_look_alike", type = "bool", path = "exchangeLookAlike" },
+  { name = "method_of_adjustment", type = "utf8", path = "methodOfAdjustment" },
+  { name = "option_entitlement", type = "decimal", path = "optionEntitlement" },
+  { name = "multiplier", type = "decimal", path = "multiplier" },
+]
+
+# ── Products ─────────────────────────────────────────────────────────────────
+
+[structs.equity_option]
+description = "Equity option on a single name, index, or basket"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "terms", type = "struct<equity_derivative>", path = "." },
+  { name = "option", type = "struct<equity_option_terms>", path = "." },
+]
+
+[structs.equity_forward]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "terms", type = "struct<equity_derivative>", path = "." },
+  { name = "forward_price", type = "struct<money>", path = "forwardPrice" },
+]
+
+[structs.broker_equity_option]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "terms", type = "struct<equity_derivative>", path = "." },
+  { name = "option", type = "struct<equity_option_terms>", path = "." },
+  { name = "delta_crossed", type = "bool", path = "deltaCrossed" },
+  { name = "brokerage_fee", type = "struct<money>", path = "brokerageFee" },
+  { name = "broker_notes", type = "utf8", path = "brokerNotes" },
+]
+
+[structs.equity_option_transaction_supplement]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "terms", type = "struct<equity_derivative>", path = "." },
+  { name = "option", type = "struct<equity_option_terms>", path = "." },
+  { name = "exchange_look_alike", type = "bool", path = "exchangeLookAlike" },
+  { name = "exchange_traded_contract_nearest", type = "bool", path = "exchangeTradedContractNearest" },
+  { name = "multiple_exchange_index_annex_fallback", type = "bool", path = "multipleExchangeIndexAnnexFallback" },
+  { name = "component_security_index_annex_fallback", type = "bool", path = "componentSecurityIndexAnnexFallback" },
+  { name = "local_jurisdiction", type = "utf8", path = "localJurisdiction" },
+]
+
+[structs.return_swap]
+description = "Total return swap (equity, index, or bond return legs against interest legs)"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "body", type = "struct<return_swap_body>", path = "." },
+  { name = "early_termination_parties", type = "list<utf8>", path = "earlyTermination/partyReference/@href" },
+]
+
+[structs.equity_swap_transaction_supplement]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "body", type = "struct<return_swap_body>", path = "." },
+  { name = "mutual_early_termination", type = "bool", path = "mutualEarlyTermination" },
+  { name = "optional_early_termination", type = "bool", path = "optionalEarlyTermination" },
+  { name = "break_fee_election", type = "utf8", path = "breakFeeElection" },
+  { name = "break_fee_rate", type = "decimal", path = "breakFeeRate" },
+  { name = "provisions", type = "struct<equity_underlyer_provisions>", path = "." },
+]
+
+[structs.variance_swap]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "legs", type = "list<struct<netted_swap_leg>>", path = "varianceLeg" },
+  { name = "additional_payments", type = "list<struct<classifiable_payment>>", path = "additionalPayment" },
+]
+
+[structs.variance_swap_transaction_supplement]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "legs", type = "list<struct<netted_swap_leg>>", path = "varianceLeg" },
+  { name = "provisions", type = "struct<equity_underlyer_provisions>", path = "." },
+]
+
+[structs.variance_option_transaction_supplement]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "option", type = "struct<equity_option_on_swap>", path = "." },
+  { name = "underlying", type = "struct<variance_swap_transaction_supplement>", path = "varianceSwapTransactionSupplement" },
+]
+
+[structs.volatility_swap]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "legs", type = "list<struct<netted_swap_leg>>", path = "volatilityLeg" },
+  { name = "additional_payments", type = "list<struct<classifiable_payment>>", path = "additionalPayment" },
+]
+
+[structs.volatility_swap_transaction_supplement]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "legs", type = "list<struct<netted_swap_leg>>", path = "volatilityLeg" },
+  { name = "provisions", type = "struct<equity_underlyer_provisions>", path = "." },
+]
+
+[structs.correlation_swap]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "leg", type = "struct<netted_swap_leg>", path = "correlationLeg" },
+  { name = "additional_payments", type = "list<struct<classifiable_payment>>", path = "additionalPayment" },
+]
+
+[structs.dividend_swap_transaction_supplement]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "dividend_leg", type = "struct<dividend_leg>", path = "dividendLeg" },
+  { name = "fixed_leg", type = "struct<fixed_payment_leg>", path = "fixedLeg" },
+  { name = "provisions", type = "struct<equity_underlyer_provisions>", path = "." },
+]
+
+[structs.dividend_swap_option_transaction_supplement]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "option", type = "struct<equity_option_on_swap>", path = "." },
+  { name = "underlying", type = "struct<dividend_swap_transaction_supplement>", path = "dividendSwapTransactionSupplement" },
+]
+
+[structs.observation_period]
+fields = [
+  { name = "start_date", type = "date32", path = "observationPeriodStartDate" },
+  { name = "end_date", type = "date32", path = "observationPeriodEndDate" },
+  { name = "settlement_date", type = "date32", path = "observationPeriodSettlementDate" },
+  { name = "number_of_trading_days", type = "int64", path = "observationPeriodNoOfTradingDays" },
+  { name = "up_front_settlement", type = "bool", path = "upFrontSettlement" },
+  { name = "number_of_scheduled_trading_days", type = "int64", path = "noOfScheduledTradingDays" },
+]
+
+[structs.equity_accumulator]
+description = "Equity accumulator (accumulates shares daily within observation periods until knock-out)"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "notional", type = "struct<money>", path = "notional" },
+  { name = "underlyer", type = "struct<underlyer>", path = "underlyer" },
+  { name = "forward_price", type = "struct<money>", path = "forwardPrice" },
+  { name = "spot_price", type = "struct<money>", path = "spotPrice" },
+  { name = "number_of_shares_per_day", type = "decimal", path = "numberOfSharesPerDay" },
+  { name = "max_number_of_trading_days", type = "int64", path = "maxNoOfTradingDays" },
+  { name = "gearing_factor", type = "decimal", path = "gearing/gearingFactor" },
+  { name = "leverage_trigger_price", type = "decimal", path = "gearing/leverageTriggerPrice" },
+  { name = "guaranteed_period_end_date", type = "date32", path = "guaranteedPeriodEndDate" },
+  { name = "observation_periods", type = "list<struct<observation_period>>", path = "observationPeriod" },
+  { name = "expiration_date", type = "struct<adjustable_or_relative_date>", path = "expiration/expirationDate" },
+  { name = "settlement_type", type = "utf8", path = "settlementType" },
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "settlement_price_source", type = "utf8", path = "settlementPriceSource" },
+  { name = "knock_out_target_performance", type = "decimal", path = "knockOut/targetPerformance" },
+  { name = "knock_out_level", type = "decimal", path = "knockOut/level" },
+  { name = "knock_out_trigger_time_type", type = "utf8", path = "knockOut/triggerTimeType" },
+]

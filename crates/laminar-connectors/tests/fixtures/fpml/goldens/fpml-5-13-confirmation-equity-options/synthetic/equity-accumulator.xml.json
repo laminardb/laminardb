@@ -1,0 +1,157 @@
+[
+  {
+    "correlation_id": "SYN-EQAC",
+    "creation_timestamp": {
+      "local": "2026-04-01T10:30:00",
+      "offset_minutes": 480,
+      "utc": "2026-04-01T02:30:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "febeb5ef4740fb05a5ebfefc1ba0eb6b8a8f70c76ac5ee9c1426ac9e7ea1fbb1",
+    "equity_accumulator": {
+      "buyer_party_href": "party1",
+      "expiration_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "HKHK"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2026-05-29"
+        }
+      },
+      "forward_price": {
+        "amount": "390.000000000000000000",
+        "currency": "HKD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "gearing_factor": "2.000000000000000000",
+      "guaranteed_period_end_date": "2026-04-15",
+      "knock_out_level": "440.000000000000000000",
+      "knock_out_trigger_time_type": "Closing",
+      "leverage_trigger_price": "390.000000000000000000",
+      "max_number_of_trading_days": 50,
+      "notional": {
+        "amount": "7800000.000000000000000000",
+        "currency": "HKD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "number_of_shares_per_day": "400.000000000000000000",
+      "observation_periods": [
+        {
+          "end_date": "2026-04-30",
+          "number_of_trading_days": 19,
+          "settlement_date": "2026-05-05",
+          "start_date": "2026-04-02"
+        },
+        {
+          "end_date": "2026-05-29",
+          "number_of_trading_days": 19,
+          "settlement_date": "2026-06-03",
+          "start_date": "2026-05-01"
+        }
+      ],
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Equity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Forward:Accumulator"
+          }
+        ]
+      },
+      "seller_party_href": "party2",
+      "settlement_currency": "HKD",
+      "settlement_type": "Physical",
+      "spot_price": {
+        "amount": "420.500000000000000000",
+        "currency": "HKD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "underlyer": {
+        "single": {
+          "asset_type": "equity",
+          "currency": "HKD",
+          "description": "Synthetic ordinary shares",
+          "exchange_id": "XHKG",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-Reuters-RIC",
+              "value": "0700.HK"
+            }
+          ]
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SYN-EQAC-0001",
+    "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityAccumulator",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYA",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYA"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "EQAC-2001"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "EQAC-2001"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2026-04-01"
+    },
+    "trade_ordinal": 0
+  }
+]

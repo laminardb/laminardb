@@ -1,0 +1,150 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "c3e6daa6bc40bd903da5d6bfbbbc3f3004d6c9b279581ce7212ec7f2dbb60591",
+    "documentation": {
+      "master_confirmation_date": "2006-01-20",
+      "master_confirmation_type": "ISDA2005EquityAsiaExcludingJapanInterdealer"
+    },
+    "equity_option_transaction_supplement": {
+      "local_jurisdiction": "TW",
+      "option": {
+        "number_of_options": "1000000.000000000000000000",
+        "option_entitlement": "1.000000000000000000",
+        "premium": {
+          "payer_party_href": "party1",
+          "payment_amount": {
+            "amount": "1500000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2006-09-20"
+          },
+          "price_per_option": {
+            "amount": "1.500000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party2"
+        },
+        "strike": {
+          "currency": "TWD",
+          "strike_price": "33.000000000000000000"
+        }
+      },
+      "product": {},
+      "terms": {
+        "buyer_party_href": "party1",
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NotApplicable"
+              },
+              "unadjusted_date": "2006-12-14"
+            }
+          },
+          "expiration_time_type": "AsSpecifiedInMasterConfirmation",
+          "settlement_currency": "USD",
+          "settlement_date": {
+            "relative_date": {
+              "business_day_convention": "NotApplicable",
+              "date_relative_to_href": "valuationDate",
+              "day_type": "CurrencyBusiness",
+              "period": "D",
+              "period_multiplier": 2
+            }
+          },
+          "settlement_type": "Cash",
+          "style": "equityEuropeanExercise",
+          "valuation": {}
+        },
+        "method_of_adjustment": "CalculationAgent",
+        "option_type": "Call",
+        "seller_party_href": "party2",
+        "underlyer": {
+          "single": {
+            "asset_type": "equity",
+            "description": "TAIWAN MOBILE ORD",
+            "exchange_id": "TAI",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-Reuters-RIC",
+                "value": "3045.TW"
+              }
+            ],
+            "related_exchange_ids": [
+              "All Exchanges"
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOptionTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/trade-id-1-0",
+              "value": "1"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/trade-id-1-0",
+              "value": "1"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-09-18"
+    },
+    "trade_ordinal": 0
+  }
+]

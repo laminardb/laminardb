@@ -1,0 +1,206 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CS/2006/07/02/32-09",
+    "creation_timestamp": {
+      "local": "2006-07-02T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-07-02T16:38:00Z"
+    },
+    "document_root": "confirmationAgreed",
+    "document_sha256": "0984285785c77f12a8aab27c96a0f1ab9196cd710b9389c3797e59d48a52aa69",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "in_reply_to": "MS/2006/07/03/15-92",
+    "message_id": "MS/2006/04/07/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "return_swap": {
+      "body": {
+        "leg_types": [
+          "returnLeg"
+        ],
+        "principal_exchanges": [
+          {
+            "amount": {
+              "amount": "55911.600000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "date": {
+              "relative_date": {
+                "business_day_convention": "NotApplicable",
+                "date_relative_to_href": "EffectiveDate",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            },
+            "payer_party_href": "party2",
+            "receiver_party_href": "party1"
+          }
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency_href": "ReferenceCurrency"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2004-10-17"
+              }
+            },
+            "initial_price": {
+              "net_price": "1.803600000000000000",
+              "net_price_currency": "USD"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2002-10-24"
+                }
+              },
+              "payer_party_href": "party1",
+              "receiver_party_href": "party2",
+              "termination_date": {
+                "relative_date": {
+                  "business_day_convention": "NotApplicable",
+                  "date_relative_to_href": "FinalEquityPaymentDate",
+                  "period": "D",
+                  "period_multiplier": 0
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "55911.600000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Standard",
+            "notional_reset": false,
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "FinalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 5
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "equity",
+                "description": "ZEE",
+                "exchange_id": "XNSE",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.abc.com/instrumentId",
+                    "value": "ZEE.NS"
+                  }
+                ]
+              },
+              "single_open_units": "31000.000000000000000000"
+            }
+          }
+        ]
+      },
+      "early_termination_parties": [
+        "party1",
+        "party2"
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Swap:PriceReturnBasicPerformance:SingleName"
+          }
+        ]
+      }
+    },
+    "row_locator": "/confirmationAgreed/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 8,
+    "trade_context": "confirmationAgreed",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "5678"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-10-17"
+    },
+    "trade_ordinal": 0
+  }
+]

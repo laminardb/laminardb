@@ -1,0 +1,78 @@
+[
+  {
+    "correlation_id": "SYN-EQAC",
+    "creation_timestamp": {
+      "local": "2026-04-01T10:30:00",
+      "offset_minutes": 480,
+      "utc": "2026-04-01T02:30:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "febeb5ef4740fb05a5ebfefc1ba0eb6b8a8f70c76ac5ee9c1426ac9e7ea1fbb1",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SYN-EQAC-0001",
+    "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityAccumulator",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYA",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYA"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "EQAC-2001"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "EQAC-2001"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2026-04-01"
+    },
+    "trade_ordinal": 0
+  }
+]

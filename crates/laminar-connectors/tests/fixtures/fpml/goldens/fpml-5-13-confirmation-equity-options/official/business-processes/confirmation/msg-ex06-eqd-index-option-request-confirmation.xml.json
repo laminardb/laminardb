@@ -1,0 +1,159 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "OTCCallorPutSpread45678",
+    "creation_timestamp": {
+      "local": "2002-07-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2002-07-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "40e57998cb7bb81644882e752dbe158f0f75e995b9fe8016a98e359b37044dc1",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2002Equity"
+      ],
+      "master_agreement_date": "2002-08-01",
+      "master_agreement_type": "ISDA"
+    },
+    "equity_option_transaction_supplement": {
+      "exchange_look_alike": true,
+      "exchange_traded_contract_nearest": true,
+      "multiple_exchange_index_annex_fallback": true,
+      "option": {
+        "number_of_options": "2500.000000000000000000",
+        "premium": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "300000.000000000000000000",
+            "currency": "CHF",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2002-09-06"
+          },
+          "receiver_party_href": "party1"
+        },
+        "strike": {
+          "strike_price": "8700.000000000000000000"
+        }
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Option:PriceReturnBasicPerformance:SingleIndex"
+          }
+        ]
+      },
+      "terms": {
+        "buyer_party_href": "party2",
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2004-12-19"
+            }
+          },
+          "expiration_time_type": "OSP",
+          "settlement_currency": "CHF",
+          "settlement_date": {
+            "relative_date": {
+              "business_centers": [
+                "CHZU"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "valuation",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 2
+            }
+          },
+          "settlement_price_source": "OfficialClose",
+          "settlement_type": "Cash",
+          "style": "equityEuropeanExercise",
+          "valuation": {
+            "valuation_time_type": "OSP"
+          }
+        },
+        "option_type": "Call",
+        "seller_party_href": "party1",
+        "underlyer": {
+          "single": {
+            "asset_type": "index",
+            "description": "Swiss Market Index",
+            "exchange_id": "NYSE",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-Reuters-RIC",
+                "value": "SSMI"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "OTCCallorPutSpread456a789b",
+    "message_id_scheme": "http://www.partyA.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOptionTransactionSupplement",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PartyA",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/tradeId/OTC",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-07-13"
+    },
+    "trade_ordinal": 0
+  }
+]

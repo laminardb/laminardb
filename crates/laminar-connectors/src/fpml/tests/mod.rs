@@ -62,7 +62,11 @@ pub(super) fn synthetic_fixtures() -> Vec<String> {
 /// Schema-valid official examples a bundled profile rejects, with the reason. Each is an FpML
 /// example erratum: a reference the profile projects through targets an element of the wrong
 /// type, which the schema annotation forbids and projection never follows.
-const EXPECTED_REJECTIONS: &[(&str, &str, &str)] = &[];
+const EXPECTED_REJECTIONS: &[(&str, &str, &str)] = &[(
+    "fpml-5-13-confirmation-equity-swaps",
+    "products/equity-swaps/trs-ex04-index-ios.xml",
+    "'businessCentersReference' refers to a 'businessCenter' element",
+)];
 
 pub(super) fn expected_rejection(profile: &str, path: &str) -> Option<&'static str> {
     EXPECTED_REJECTIONS

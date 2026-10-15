@@ -1,0 +1,256 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CS/2006/07/02/32-09",
+    "creation_timestamp": {
+      "local": "2006-07-02T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-07-02T16:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "001a19dcccfc8ccef76df76f5da1d8280e4905c41c472852ba1093df9222cb08",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "MS/2006/04/07/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "other_party_payments": [
+      {
+        "payer_party_href": "party1",
+        "payment_amount": {
+          "amount": "1000.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "date_adjustments": {
+            "business_day_convention": "NotApplicable"
+          },
+          "unadjusted_date": "2002-09-30"
+        },
+        "payment_type": "BrokerageFee",
+        "receiver_party_href": "party3"
+      }
+    ],
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party C"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "return_swap": {
+      "body": {
+        "additional_payments": [
+          {
+            "formula_description": "18388000 * Reference Price * [6.5% (the upfront Fee) + 0.63% (taxes)]",
+            "payer_party_href": "party1",
+            "payment_date": {
+              "relative_date": {
+                "business_day_convention": "NotApplicable",
+                "date_relative_to_href": "EffectiveDate",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            },
+            "payment_type": "Upfront fee",
+            "receiver_party_href": "party2"
+          }
+        ],
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 6
+              }
+            },
+            "interest_amount": {
+              "currency_href": "ReferenceCurrency",
+              "reference_amount": "Standard ISDA"
+            },
+            "leg": {
+              "payer_party_href": "party2",
+              "receiver_party_href": "party1"
+            },
+            "notional": {
+              "relative_determination_method_href": "EquityNotionalAmount"
+            }
+          }
+        ],
+        "leg_types": [
+          "returnLeg",
+          "interestLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency_href": "ReferenceCurrency",
+              "reference_amount": "ISDA Standard"
+            },
+            "final_price": {
+              "determination_method": "CalculationAgent",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "USNY",
+                    "TWTA"
+                  ],
+                  "business_centers_href": "PrimaryBusinessCenter",
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2004-03-12"
+              }
+            },
+            "initial_price": {
+              "determination_method": "CalculationAgent"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2002-09-12"
+                }
+              },
+              "payer_party_href": "party1",
+              "receiver_party_href": "party2",
+              "termination_date": {
+                "relative_date": {
+                  "business_day_convention": "NotApplicable",
+                  "date_relative_to_href": "FinalEquityPaymentDate",
+                  "period": "D",
+                  "period_multiplier": 0
+                }
+              }
+            },
+            "notional": {
+              "determination_method": "CalculationAgent"
+            },
+            "notional_adjustments": "Standard",
+            "notional_reset": false,
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "USNY",
+                  "TWTA"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "FinalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "equity",
+                "description": "Fubon Financial Holdings Co., Ltd.",
+                "exchange_id": "XTAI",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.abc.com/instrumentId",
+                    "value": "2881.TW"
+                  }
+                ]
+              },
+              "single_open_units": "18388000.000000000000000000"
+            }
+          }
+        ]
+      },
+      "early_termination_parties": [
+        "party2"
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Swap:PriceReturnBasicPerformance:SingleName"
+          }
+        ]
+      }
+    },
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "1934"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "5978"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-09-10"
+    },
+    "trade_ordinal": 0
+  }
+]

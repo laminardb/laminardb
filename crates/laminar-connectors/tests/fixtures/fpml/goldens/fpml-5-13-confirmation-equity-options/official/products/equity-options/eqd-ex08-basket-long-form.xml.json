@@ -1,0 +1,170 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "BasketOption987",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "30c9b16ea26901f17c5b57932e5cb4d4b951a5c918a2f01e2026f638a3c22dbc",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "equity_option": {
+      "option": {
+        "number_of_options": "79.099093000000000000",
+        "option_entitlement": "1.000000000000000000",
+        "premium": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "213.567551100000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2000-07-03"
+          },
+          "price_per_option": {
+            "amount": "2.700000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party1"
+        }
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Option:PriceReturnBasicPerformance:Basket"
+          }
+        ]
+      },
+      "terms": {
+        "buyer_party_href": "party2",
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2002-07-01"
+            }
+          },
+          "expiration_time_type": "Close",
+          "settlement_currency": "EUR",
+          "settlement_type": "Cash",
+          "style": "equityEuropeanExercise",
+          "valuation": {
+            "valuation_time_type": "Close"
+          }
+        },
+        "method_of_adjustment": "CalculationAgent",
+        "option_type": "Call",
+        "seller_party_href": "party1",
+        "underlyer": {
+          "basket": {
+            "constituents": [
+              {
+                "asset": {
+                  "asset_type": "equity",
+                  "currency": "EUR",
+                  "description": "Ahold",
+                  "exchange_id": "XASE",
+                  "instrument_ids": [
+                    {
+                      "scheme": "http://www.fpml.org/schemes/4.1/instrumentId",
+                      "value": "AHLD.NA"
+                    }
+                  ]
+                },
+                "basket_percentage": "0.400000000000000000"
+              },
+              {
+                "asset": {
+                  "asset_type": "equity",
+                  "currency": "EUR",
+                  "description": "Royal Dutch",
+                  "exchange_id": "XASE",
+                  "instrument_ids": [
+                    {
+                      "scheme": "http://www.fpml.org/schemes/4.1/instrumentId",
+                      "value": "RD.NA"
+                    }
+                  ]
+                },
+                "basket_percentage": "0.600000000000000000"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "BasketOption456a789b",
+    "message_id_scheme": "http://www.abc.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "abc",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/eqd-trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2000-06-28"
+    },
+    "trade_ordinal": 0
+  }
+]

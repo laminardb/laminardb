@@ -1,0 +1,245 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "Party1"
+      ]
+    },
+    "correlation_id": "CORR/2007/01/02/2342322",
+    "creation_timestamp": {
+      "local": "2007-01-05T15:38:00",
+      "offset_minutes": 0,
+      "utc": "2007-01-05T15:38:00Z"
+    },
+    "credit_default_swap_option": {
+      "buyer_party_href": "Party1",
+      "exercise": {
+        "european": {
+          "earliest_exercise_time": {
+            "business_center": "USNY",
+            "hour_minute_time": "09:00:00"
+          },
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO",
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2006-09-20"
+            }
+          },
+          "expiration_time": {
+            "business_center": "USNY",
+            "hour_minute_time": "11:00:00"
+          }
+        },
+        "style": "europeanExercise"
+      },
+      "exercise_procedure": {
+        "follow_up_confirmation": true,
+        "manual_exercise": false,
+        "manual_exercise_present": "manualExercise"
+      },
+      "notional_reference_href": "NOTIONAL",
+      "option_type": "Put",
+      "premium": {
+        "payer_party_href": "Party1",
+        "payment_amount": {
+          "amount": "65000.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "relative_date": {
+            "business_centers": [
+              "USNY",
+              "GBLO"
+            ],
+            "business_day_convention": "NONE",
+            "date_relative_to_href": "TRADEDATE",
+            "day_type": "Business",
+            "period": "D",
+            "period_multiplier": 3
+          }
+        },
+        "receiver_party_href": "Party2"
+      },
+      "product": {},
+      "seller_party_href": "Party2",
+      "settlement": {
+        "settlement_type": "Physical"
+      },
+      "strike_reference_href": "SPREAD",
+      "underlying": {
+        "fee_leg": {
+          "periodic_payment": {
+            "calculation_amount": {
+              "amount": "10000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "day_count_fraction": "ACT/360",
+            "first_payment_date": "2006-12-20",
+            "fixed_rate": "0.085000000000000000",
+            "last_regular_payment_date": "2011-09-20",
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            },
+            "roll_convention": "20"
+          }
+        },
+        "general_terms": {
+          "buyer_party_href": "Party2",
+          "date_adjustments": {
+            "business_centers": [
+              "GBLO",
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "effective_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2006-09-21"
+          },
+          "reference_entity": {
+            "entity_name": "Entity1"
+          },
+          "reference_obligations": [
+            {
+              "asset": {
+                "asset_type": "bond",
+                "coupon_rate": "0.071250000000000000",
+                "instrument_ids": [
+                  {
+                    "scheme": "CUSIP",
+                    "value": "ExampleCUSIP1"
+                  }
+                ],
+                "maturity": "2013-07-15"
+              },
+              "primary_obligor": {
+                "entity_name": "Entity1"
+              }
+            }
+          ],
+          "reference_price": "1.000000000000000000",
+          "reference_type": "referenceInformation",
+          "scheduled_termination_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2011-09-21"
+          },
+          "seller_party_href": "Party1"
+        },
+        "physical_settlement_terms": [
+          {
+            "deliverable_not_contingent": true,
+            "deliverable_obligation_category": "BondOrLoan",
+            "deliverable_transferable": true,
+            "escrow": true,
+            "physical_settlement_period_maximum_business_days": 30
+          }
+        ],
+        "product": {},
+        "protection_terms": [
+          {
+            "calculation_amount": {
+              "amount": "10000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "credit_events": {
+              "bankruptcy": true,
+              "credit_event_notice_parties": [
+                "Party2",
+                "Party1"
+              ],
+              "default_requirement": {
+                "amount": "10000000.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              },
+              "failure_to_pay": true,
+              "failure_to_pay_payment_requirement": {
+                "amount": "1000000.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              },
+              "restructuring": true,
+              "restructuring_type": "ModR"
+            },
+            "obligation_category": "BorrowedMoney"
+          }
+        ]
+      }
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "a5522acbb3faa04401c6b562356b1cb6494071320e4e2010eae0ab776b9aaecb",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2003Credit"
+      ],
+      "master_agreement_date": "1997-11-05",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "2342342",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "creditDefaultSwapOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABIC1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/eqd-trade-id",
+              "value": "Trade234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-06-27"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,147 @@
+[
+  {
+    "correlation_id": "CW/2006/07/02/133",
+    "creation_timestamp": {
+      "local": "2006-07-02T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-07-02T16:38:00Z"
+    },
+    "dividend_swap_transaction_supplement": {
+      "dividend_leg": {
+        "declared_cash_dividend_percentage": "1.000000000000000000",
+        "declared_cash_equivalent_dividend_percentage": "1.000000000000000000",
+        "leg": {
+          "payer_party_href": "kom722",
+          "receiver_party_href": "kow029"
+        },
+        "settlement": {
+          "settlement_currency": "USD",
+          "settlement_type": "Cash"
+        },
+        "underlyer": {
+          "single": {
+            "asset_type": "index",
+            "currency": "EUR",
+            "description": "France CAC 40 Index",
+            "exchange_id": "XPAR",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/schemes/4-1/instrumentId",
+                "value": ".FCHI"
+              }
+            ],
+            "related_exchange_ids": [
+              "XMAT",
+              "XMON"
+            ]
+          },
+          "single_open_units": "1000.000000000000000000"
+        }
+      },
+      "fixed_leg": {
+        "fixed_payments": [
+          {
+            "payment_amount": {
+              "amount": "50000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "p1",
+              "period": "D",
+              "period_multiplier": 0
+            }
+          },
+          {
+            "payment_amount": {
+              "amount": "56000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "p1",
+              "period": "D",
+              "period_multiplier": 0
+            }
+          }
+        ],
+        "leg": {
+          "payer_party_href": "kow029",
+          "receiver_party_href": "kom722"
+        }
+      },
+      "product": {},
+      "provisions": {}
+    },
+    "document_root": "confirmationAgreed",
+    "document_sha256": "7db258a348c5a7a86a735ab693858a590ba7d718bc865bbe5741ce28ce14b2c3",
+    "fpml_version": "5-13",
+    "in_reply_to": "MS/2006/04/07/15-99",
+    "message_id": "MS/2006/07/02/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "kom722",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "kow029",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "dividendSwapTransactionSupplement",
+    "row_locator": "/confirmationAgreed/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 1,
+    "trade_context": "confirmationAgreed",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "kom722",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "1734"
+            }
+          ]
+        },
+        {
+          "party_href": "kow029",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "5648"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-07-19"
+    },
+    "trade_ordinal": 0
+  }
+]
