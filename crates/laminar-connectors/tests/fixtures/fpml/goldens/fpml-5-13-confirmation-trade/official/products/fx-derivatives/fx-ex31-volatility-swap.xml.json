@@ -23,6 +23,65 @@
     "document_root": "executionNotification",
     "document_sha256": "9daad904765b9c5dafef648d1eb1f9e9528a419039f091d28f5b278b45739a93",
     "fpml_version": "5-13",
+    "fx_volatility_swap": {
+      "additional_payments": [
+        {
+          "payer_party_href": "partyA",
+          "payment_amount": {
+            "amount": "5000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjusted_date": "2011-03-03"
+          },
+          "receiver_party_href": "partyB"
+        }
+      ],
+      "annualization_factor": "252.000000000000000000",
+      "cash_settlement": {
+        "settlement_currency": "USD"
+      },
+      "fixed_leg_payer_href": "partyA",
+      "fixed_rate": "0.151000000000000000",
+      "fixing_information_source": {
+        "fixing_time": {
+          "business_center": "GBLO",
+          "hour_minute_time": "16:00:00"
+        },
+        "rate_source": "WM Company",
+        "rate_source_page": "Sponsor Mid Page"
+      },
+      "fixing_schedule": {
+        "day_type": "Business",
+        "end_date": "2011-03-31",
+        "start_date": "2011-03-01"
+      },
+      "floating_leg_payer_href": "partyB",
+      "mean_adjustment": true,
+      "number_of_returns": 22,
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxVolatilitySwap"
+          }
+        ]
+      },
+      "quoted_currency_pair": {
+        "currency1": "EUR",
+        "currency2": "USD",
+        "quote_basis": "Currency2PerCurrency1"
+      },
+      "settlement_date": {
+        "adjusted_date": "2011-04-04"
+      },
+      "vega_notional": {
+        "amount": "100000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      }
+    },
     "is_correction": false,
     "message_id": "FX456a789b",
     "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",

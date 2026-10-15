@@ -38,6 +38,46 @@
     "row_locator": "/requestConfirmation/trade",
     "sent_by": "ABNANL2A",
     "sequence_number": 1,
+    "term_deposit": {
+      "day_count_fraction": "ACT/360",
+      "dual_currency": {
+        "currency": "JPY",
+        "fixing_date": "2008-07-22",
+        "fixing_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "10:00:00"
+        },
+        "interest_at_risk": false,
+        "spot_rate": "107.850000000000000000",
+        "strike": {
+          "rate": "109.480000000000000000",
+          "strike_quote_basis": "AlternateCurrencyPerDepositCurrency"
+        }
+      },
+      "fixed_rate": "0.080000000000000000",
+      "interest": {
+        "amount": "6666.670000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "maturity_date": "2008-07-24",
+      "payer_party_href": "party1",
+      "principal": {
+        "amount": "1000000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.sample.com/coding-scheme/product-type-simple",
+            "value": "DualCurrencyDeposit"
+          }
+        ]
+      },
+      "receiver_party_href": "party2",
+      "start_date": "2008-06-24"
+    },
     "trade_context": "requestConfirmation",
     "trade_count": 1,
     "trade_header": {

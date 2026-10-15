@@ -9,6 +9,53 @@
     "document_root": "requestConfirmation",
     "document_sha256": "9741672560aae2ff957ff7a05a32faccc666f21fd0329fc14158dc5b25a9a00b",
     "fpml_version": "5-13",
+    "fx_option": {
+      "buyer_party_href": "party2",
+      "call_currency_amount": {
+        "amount": "585539.710000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "exercise": {
+        "expiry_date": "2001-11-30",
+        "expiry_time": {
+          "business_center": "MXMC",
+          "hour_minute_time": "12:30:00"
+        },
+        "style": "europeanExercise",
+        "value_date": "2001-12-04"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "1750.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2001-08-18"
+            }
+          },
+          "receiver_party_href": "party1"
+        }
+      ],
+      "product": {},
+      "put_currency_amount": {
+        "amount": "5750000.000000000000000000",
+        "currency": "MXN",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "seller_party_href": "party1",
+      "strike": {
+        "rate": "9.820000000000000000",
+        "strike_quote_basis": "PutCurrencyPerCallCurrency"
+      }
+    },
     "is_correction": false,
     "message_id": "FX87654",
     "message_id_scheme": "http://www.partyA.com/coding-scheme/messageId",

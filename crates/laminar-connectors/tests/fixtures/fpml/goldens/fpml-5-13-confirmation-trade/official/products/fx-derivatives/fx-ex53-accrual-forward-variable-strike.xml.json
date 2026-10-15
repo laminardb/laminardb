@@ -13,6 +13,129 @@
     "document_root": "executionNotification",
     "document_sha256": "d3fb7577779a51bee1f56e9303d41b73eb3234f30f2818bf8847c63863313aaa",
     "fpml_version": "5-13",
+    "fx_accrual_forward": {
+      "linear_payoff_regions": [
+        {
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "partyB",
+            "receiver_party_href": "partyA"
+          },
+          "exchanged_currency2": {
+            "currency": "EUR",
+            "payer_party_href": "partyA",
+            "receiver_party_href": "partyB"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "st1",
+            "initial_value": "1.247000000000000000"
+          },
+          "upper_bound": {
+            "condition": "AtOrBelow"
+          }
+        },
+        {
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "partyB",
+            "receiver_party_href": "partyA"
+          },
+          "exchanged_currency2": {
+            "currency": "EUR",
+            "payer_party_href": "partyA",
+            "receiver_party_href": "partyB"
+          },
+          "lower_bound": {
+            "condition": "Above"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "st2",
+            "initial_value": "1.470000000000000000"
+          }
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxAccrualForward"
+          }
+        ]
+      },
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "day_type": "Business",
+            "end_date": "2012-12-19",
+            "number_of_fixings": 376,
+            "start_date": "2011-07-07"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "DEFR",
+                  "hour_minute_time": "02:15:00"
+                },
+                "rate_source": "Reuters",
+                "rate_source_page": "ECB37"
+              },
+              "quoted_currency_pair": {
+                "currency1": "EUR",
+                "currency2": "USD",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "lower_bound": {
+                "condition": "Above"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "AtOrBelow"
+              }
+            },
+            {
+              "lower_bound": {
+                "condition": "AtOrAbove"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "AtOrBelow"
+              }
+            },
+            {
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            }
+          ]
+        },
+        "expiry_date": {
+          "adjusted_date": "2012-12-19"
+        },
+        "notional_amount": {
+          "currency": "USD",
+          "initial_value": "188000000.000000000000000000"
+        },
+        "settlement_date": {
+          "adjusted_date": "2012-12-21",
+          "date_adjustments": {
+            "business_centers": [
+              "USNY",
+              "EUTA"
+            ],
+            "business_day_convention": "FOLLOWING"
+          }
+        }
+      }
+    },
     "is_correction": false,
     "message_id": "FX456a789b",
     "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",

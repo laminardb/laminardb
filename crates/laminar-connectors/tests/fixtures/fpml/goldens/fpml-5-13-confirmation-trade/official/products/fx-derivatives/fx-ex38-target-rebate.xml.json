@@ -13,6 +13,161 @@
     "document_root": "executionNotification",
     "document_sha256": "13e4e670c940c70b62e82d75dead3dc340594b9a9be542e9298aa7c630c1110c",
     "fpml_version": "5-13",
+    "fx_target_knockout_forward": {
+      "barriers": [
+        {
+          "barrier_type": "Knockout",
+          "condition": "AtOrBelow",
+          "scope": "Global",
+          "style": "European",
+          "trigger_rate": {
+            "initial_value": "5.980000000000000000"
+          }
+        },
+        {
+          "barrier_type": "Knockin",
+          "condition": "Above",
+          "scope": "PerExpiry",
+          "style": "European",
+          "trigger_rate": {
+            "initial_value": "6.240000000000000000"
+          }
+        }
+      ],
+      "expiry_schedule": {
+        "adjusted_dates": [
+          "2014-02-28",
+          "2014-03-31",
+          "2014-04-30",
+          "2014-05-30",
+          "2014-06-30",
+          "2014-07-31",
+          "2014-08-29",
+          "2014-09-30",
+          "2014-10-31",
+          "2014-11-28",
+          "2014-12-31",
+          "2015-01-30",
+          "2015-02-27",
+          "2015-03-31",
+          "2015-04-30",
+          "2015-05-29",
+          "2015-06-30",
+          "2015-07-31",
+          "2015-08-31",
+          "2015-09-30",
+          "2015-10-30",
+          "2015-11-30",
+          "2015-12-31",
+          "2016-01-29"
+        ],
+        "date_adjustments": {
+          "business_centers": [
+            "CNBE",
+            "HKHK",
+            "USNY"
+          ],
+          "business_centers_href": "BC",
+          "business_day_convention": "FOLLOWING"
+        }
+      },
+      "fixing_information_source": {
+        "fixing_time": {
+          "business_center": "JPTO",
+          "hour_minute_time": "15:00:00"
+        },
+        "rate_source": "Bloomberg",
+        "rate_source_page": "BFIX"
+      },
+      "notional_amount": {
+        "currency": "USD",
+        "initial_value": "1000000.000000000000000000"
+      },
+      "payoff_regions": [
+        {
+          "lower_bound": {
+            "condition": "Above",
+            "strike_href": "s1"
+          },
+          "region_type": "constantPayoffRegion",
+          "upper_bound": {
+            "barrier_href": "peb1",
+            "condition": "AtOrBelow"
+          }
+        },
+        {
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "ptyB",
+            "receiver_party_href": "ptyA"
+          },
+          "exchanged_currency2": {
+            "currency": "EUR",
+            "payer_party_href": "ptyA",
+            "receiver_party_href": "ptyB"
+          },
+          "leverage_condition": "Above",
+          "leverage_ratio": {
+            "initial_value": "2.000000000000000000"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "s1",
+            "initial_value": "6.140000000000000000"
+          }
+        }
+      ],
+      "product": {},
+      "quoted_currency_pair": {
+        "currency1": "USD",
+        "currency2": "CNY",
+        "quote_basis": "Currency2PerCurrency1"
+      },
+      "settlement_schedule": {
+        "adjusted_dates": [
+          "2014-03-04",
+          "2014-04-02",
+          "2014-05-07",
+          "2014-06-04",
+          "2014-07-03",
+          "2014-08-04",
+          "2014-09-02",
+          "2014-10-09",
+          "2014-11-04",
+          "2014-12-02",
+          "2015-01-05",
+          "2015-02-03",
+          "2015-03-03",
+          "2015-04-02",
+          "2015-05-05",
+          "2015-06-02",
+          "2015-07-03",
+          "2015-08-04",
+          "2015-09-02",
+          "2015-10-09",
+          "2015-11-03",
+          "2015-12-02",
+          "2016-01-05",
+          "2016-02-02"
+        ],
+        "date_adjustments": {
+          "business_centers": [
+            "CNBE",
+            "HKHK",
+            "USNY"
+          ],
+          "business_day_convention": "FOLLOWING"
+        },
+        "final_settlement_date": "2016-02-02"
+      },
+      "targets": [
+        {
+          "id": "t1",
+          "knockout_settlement_adjustment_style": "VariedStrike",
+          "knockout_target_style": "Exact"
+        }
+      ]
+    },
     "is_correction": false,
     "message_id": "FX456a789b",
     "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",

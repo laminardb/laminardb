@@ -17,6 +17,7 @@ const FILES: &[(&str, &str)] = profile_files!(
     "fpml-5-13/confirmation/assets.toml",
     "fpml-5-13/confirmation/common.toml",
     "fpml-5-13/confirmation/options.toml",
+    "fpml-5-13/confirmation/products/fx.toml",
     "fpml-5-13/confirmation/products/rates.toml",
     "fpml-5-13/confirmation/trade.toml",
 );

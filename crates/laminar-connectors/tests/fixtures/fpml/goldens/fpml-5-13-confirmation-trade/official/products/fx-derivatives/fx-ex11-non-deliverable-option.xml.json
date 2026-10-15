@@ -9,6 +9,81 @@
     "document_root": "requestConfirmation",
     "document_sha256": "b40667c87ce4f4acda912bde7f32e6fe6bd22edc276439573c52fecb9b297045",
     "fpml_version": "5-13",
+    "fx_option": {
+      "buyer_party_href": "party1",
+      "call_currency_amount": {
+        "amount": "15000000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "cash_settlement": {
+        "fixings": [
+          {
+            "fixing_date": "2001-04-09",
+            "fx_spot_rate_source": {
+              "fixing_time": {
+                "business_center": "VECA",
+                "hour_minute_time": "17:00:00"
+              },
+              "rate_source": "Reuters",
+              "rate_source_page": "VEB01"
+            },
+            "quoted_currency_pair": {
+              "currency1": "VEB",
+              "currency2": "USD",
+              "quote_basis": "Currency1PerCurrency2"
+            }
+          }
+        ],
+        "settlement_currency": "USD"
+      },
+      "exercise": {
+        "expiry_date": "2001-04-09",
+        "expiry_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "10:00:00"
+        },
+        "style": "europeanExercise",
+        "value_date": "2001-04-11"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party1",
+          "payment_amount": {
+            "amount": "372750.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2001-01-17"
+            }
+          },
+          "receiver_party_href": "party2"
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "ForeignExchange:NDO"
+          }
+        ]
+      },
+      "put_currency_amount": {
+        "amount": "17250000.000000000000000000",
+        "currency": "VEB",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "seller_party_href": "party2",
+      "strike": {
+        "rate": "1.150000000000000000",
+        "strike_quote_basis": "PutCurrencyPerCallCurrency"
+      }
+    },
     "is_correction": false,
     "message_id": "FX109876",
     "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",

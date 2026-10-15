@@ -157,79 +157,118 @@ notes = "Parties, dates, notional, fixed rate, floating index and tenors, discou
 element = "fxAccrualDigitalOption"
 type = "FxAccrualDigitalOption"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_accrual_digital_option"
+notes = "Buyer/seller, accrual terms, digital trigger, barriers, premiums"
 
 [[product]]
 element = "fxAccrualForward"
 type = "FxAccrualForward"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_accrual_forward"
+notes = "Notional schedule, accrual observables and regions, fixing/expiry/settlement schedules, linear payoff regions (strike, bounds, leverage, caps), average rate, barriers, cash settlement"
 
 [[product]]
 element = "fxAccrualOption"
 type = "FxAccrualOption"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_accrual_option"
+notes = "Buyer/seller, put/call currencies, accrual terms, strike or counter-currency amount or average strike, average rate, barriers, premiums"
 
 [[product]]
 element = "fxDigitalOption"
 type = "FxDigitalOption"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_digital_option"
+notes = "Buyer/seller, exercise, touch and trigger conditions with rates and observation window, payout, premiums"
 
 [[product]]
 element = "fxFlexibleForward"
 type = "FxFlexibleForward"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_flexible_forward"
+notes = "Buyer/seller, put/call currencies, notional and execution limits, execution period and times, settlement date, forward rate, additional payment"
 
 [[product]]
 element = "fxForwardVolatilityAgreement"
 type = "FxForwardVolatilityAgreement"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_forward_volatility_agreement"
+notes = "Buyer/seller, currency pair, fixing date and time, forward volatility strike, straddle type, tenor, exercise, notional"
 
 [[product]]
 element = "fxOption"
 type = "FxOption"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_option"
+notes = "Buyer/seller, exercise (American/European) dates and cut, procedure, put/call amounts, strike and quote basis, spot rate, barrier and Asian features, premiums with quotes, cash settlement"
 
 [[product]]
 element = "fxRangeAccrual"
 type = "FxRangeAccrual"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_range_accrual"
+notes = "Payer/receiver, accrual terms, barriers, premiums"
 
 [[product]]
 element = "fxSingleLeg"
 type = "FxSingleLeg"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_single_leg"
+notes = "Exchanged currencies with payer/receiver and amounts, dealt currency, tenor, value dates, exchange rate with spot/forward points and cross rates, non-deliverable settlement and fixings, disruption provisions (event and fallback types)"
 
 [[product]]
 element = "fxSwap"
 type = "FxSwap"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_swap"
+notes = "Near and far legs with the same FxCoreDetails mapping as fxSingleLeg"
 
 [[product]]
 element = "fxTargetKnockoutForward"
 type = "FxTargetKnockoutForward"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_target_knockout_forward"
+notes = "Currency pair, notional schedule, targets (accumulation multipliers, knockout level or count), expiry/settlement schedules, fixing source, pivot, constant/linear payoff regions, barriers, cash settlement"
 
 [[product]]
 element = "fxVarianceSwap"
 type = "FxPerformanceSwap"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_variance_swap"
+notes = "Currency pair, vega notional, fixed/floating leg parties and fixed rate, fixing source and schedule, valuation/settlement dates, annualization, mean adjustment, returns, cash settlement"
 
 [[product]]
 element = "fxVolatilitySwap"
 type = "FxPerformanceSwap"
 asset_class = "foreign-exchange"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "fx_volatility_swap"
+notes = "Same FxPerformanceSwap mapping as fxVarianceSwap"
 
 [[product]]
 element = "genericProduct"
@@ -295,7 +334,10 @@ notes = "Buyer/seller, premiums, exercise style and dates, procedure, settlement
 element = "termDeposit"
 type = "TermDeposit"
 asset_class = "loans-and-deposits"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-trade"
+column = "term_deposit"
+notes = "Payer/receiver, start and maturity dates, tenor, principal, fixed rate, day count, dual-currency feature, interest, payments"
 
 [[product]]
 element = "varianceOptionTransactionSupplement"

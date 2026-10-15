@@ -13,6 +13,229 @@
     "document_root": "executionNotification",
     "document_sha256": "11790aaed25e4419e7ca650967a59040da7e4bc674c3f8601a9c589a9ee6f717",
     "fpml_version": "5-13",
+    "fx_accrual_forward": {
+      "additional_payments": [
+        {
+          "payer_party_href": "partyB",
+          "payment_amount": {
+            "amount": "10000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {},
+          "receiver_party_href": "partyA"
+        }
+      ],
+      "linear_payoff_regions": [
+        {
+          "counter_currency_amount": {
+            "currency": "JPY",
+            "initial_value": "49280000.000000000000000000",
+            "steps": [
+              {
+                "step_date": "2010-12-16",
+                "step_value": "51520000.000000000000000000"
+              },
+              {
+                "step_date": "2011-01-18",
+                "step_value": "47040000.000000000000000000"
+              }
+            ]
+          },
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "partyB",
+            "receiver_party_href": "partyA"
+          },
+          "exchanged_currency2": {
+            "currency": "JPY",
+            "payer_party_href": "partyA",
+            "receiver_party_href": "partyB"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "initial_value": "112.000000000000000000"
+          }
+        }
+      ],
+      "product": {},
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "day_type": "Business",
+            "end_date": "2011-02-15",
+            "fixing_dates": [
+              "2010-10-15",
+              "2010-10-18",
+              "2010-10-19",
+              "2010-10-20",
+              "2010-10-21",
+              "2010-10-22",
+              "2010-10-25",
+              "2010-10-26",
+              "2010-10-27",
+              "2010-10-28",
+              "2010-10-29",
+              "2010-11-01",
+              "2010-11-02",
+              "2010-11-03",
+              "2010-11-04",
+              "2010-11-05",
+              "2010-11-08",
+              "2010-11-09",
+              "2010-11-10",
+              "2010-11-11",
+              "2010-11-12",
+              "2010-11-15",
+              "2010-11-16",
+              "2010-11-17",
+              "2010-11-18",
+              "2010-11-19",
+              "2010-11-22",
+              "2010-11-23",
+              "2010-11-24",
+              "2010-11-25",
+              "2010-11-26",
+              "2010-11-29",
+              "2010-11-30",
+              "2010-12-01",
+              "2010-12-02",
+              "2010-12-03",
+              "2010-12-06",
+              "2010-12-07",
+              "2010-12-08",
+              "2010-12-09",
+              "2010-12-10",
+              "2010-12-13",
+              "2010-12-14",
+              "2010-12-15",
+              "2010-12-16",
+              "2010-12-17",
+              "2010-12-20",
+              "2010-12-21",
+              "2010-12-22",
+              "2010-12-23",
+              "2010-12-24",
+              "2010-12-27",
+              "2010-12-28",
+              "2010-12-29",
+              "2010-12-30",
+              "2010-12-31",
+              "2011-01-03",
+              "2011-01-04",
+              "2011-01-05",
+              "2011-01-06",
+              "2011-01-07",
+              "2011-01-10",
+              "2011-01-11",
+              "2011-01-12",
+              "2011-01-13",
+              "2011-01-14",
+              "2011-01-17",
+              "2011-01-18",
+              "2011-01-19",
+              "2011-01-20",
+              "2011-01-21",
+              "2011-01-24",
+              "2011-01-25",
+              "2011-01-26",
+              "2011-01-27",
+              "2011-01-28",
+              "2011-01-31",
+              "2011-02-01",
+              "2011-02-02",
+              "2011-02-03",
+              "2011-02-04",
+              "2011-02-07",
+              "2011-02-08",
+              "2011-02-09",
+              "2011-02-10",
+              "2011-02-11",
+              "2011-02-14",
+              "2011-02-15"
+            ],
+            "start_date": "2010-10-15"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "USNY",
+                  "hour_minute_time": "10:00:00"
+                },
+                "rate_source": "WM Company",
+                "rate_source_page": "JPY1"
+              },
+              "quoted_currency_pair": {
+                "currency1": "USD",
+                "currency2": "JPY",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "accrual_factor": {
+                "initial_value": "2.000000000000000000"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            },
+            {
+              "lower_bound": {
+                "condition": "AtOrAbove"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            }
+          ]
+        },
+        "expiry_schedule": {
+          "adjusted_dates": [
+            "2010-11-15",
+            "2010-12-15",
+            "2011-01-17",
+            "2011-02-15"
+          ],
+          "final_expiry_date": "2011-02-15"
+        },
+        "notional_amount": {
+          "currency": "USD",
+          "initial_value": "440000.000000000000000000",
+          "steps": [
+            {
+              "step_date": "2010-12-16",
+              "step_value": "460000.000000000000000000"
+            },
+            {
+              "step_date": "2011-01-18",
+              "step_value": "420000.000000000000000000"
+            }
+          ]
+        },
+        "settlement_schedule": {
+          "adjusted_dates": [
+            "2010-11-17",
+            "2010-12-17",
+            "2011-01-19",
+            "2011-02-17"
+          ],
+          "date_adjustments": {
+            "business_centers": [
+              "USNY",
+              "JPTO"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "final_settlement_date": "2011-02-17"
+        }
+      }
+    },
     "is_correction": false,
     "message_id": "FX456a789b",
     "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",

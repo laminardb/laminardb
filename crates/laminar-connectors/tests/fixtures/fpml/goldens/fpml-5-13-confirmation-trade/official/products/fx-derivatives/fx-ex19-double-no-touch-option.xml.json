@@ -9,6 +9,103 @@
     "document_root": "requestConfirmation",
     "document_sha256": "f993c117f7757ac2391b171b2383e5b69c333de3cafae852fb7c19dc89069fc7",
     "fpml_version": "5-13",
+    "fx_digital_option": {
+      "buyer_party_href": "party2",
+      "exercise": {
+        "commencement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2001-11-12"
+          }
+        },
+        "cut_name": "LondonEveningPgm",
+        "expiry_date": "2001-11-26",
+        "expiry_time": {
+          "business_center": "GBLO",
+          "hour_minute_time": "14:00:00"
+        },
+        "latest_value_date": "2001-11-26",
+        "style": "americanExercise"
+      },
+      "payout": {
+        "amount": "3000000.000000000000000000",
+        "currency": "GBP",
+        "payout_style": "Immediate"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "78000.000000000000000000",
+            "currency": "GBP",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2001-11-14"
+            }
+          },
+          "receiver_party_href": "party1"
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.sample.com/coding-scheme/product-type-simple",
+            "value": "DoubleNoTouch"
+          }
+        ]
+      },
+      "seller_party_href": "party1",
+      "touches": [
+        {
+          "direction": "AtOrAbove",
+          "information_sources": [
+            {
+              "rate_source": "Reuters",
+              "rate_source_page": "GBP="
+            }
+          ],
+          "observation_end_date": "2001-11-26",
+          "observation_start_date": "2001-11-12",
+          "quoted_currency_pair": {
+            "currency1": "GBP",
+            "currency2": "USD",
+            "quote_basis": "Currency2PerCurrency1"
+          },
+          "spot_rate": "1.480000000000000000",
+          "touch_condition": "Notouch",
+          "trigger_rate": "1.520000000000000000"
+        },
+        {
+          "direction": "AtOrBelow",
+          "information_sources": [
+            {
+              "rate_source": "Reuters",
+              "rate_source_page": "GBP="
+            }
+          ],
+          "observation_end_date": "2001-11-26",
+          "observation_start_date": "2001-11-12",
+          "quoted_currency_pair": {
+            "currency1": "GBP",
+            "currency2": "USD",
+            "quote_basis": "Currency2PerCurrency1"
+          },
+          "spot_rate": "1.480000000000000000",
+          "touch_condition": "Notouch",
+          "trigger_rate": "1.450000000000000000"
+        }
+      ]
+    },
     "is_correction": false,
     "message_id": "FX87654",
     "message_id_scheme": "http://www.ubs.com/coding-scheme/messageId",

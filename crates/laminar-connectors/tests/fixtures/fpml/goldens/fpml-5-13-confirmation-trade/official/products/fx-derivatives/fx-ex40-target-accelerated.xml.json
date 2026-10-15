@@ -13,6 +13,85 @@
     "document_root": "executionNotification",
     "document_sha256": "06f1b4e9bdeb6390e204900dc073829c2d3ccf82fcc0b1b116d9f2e810620f63",
     "fpml_version": "5-13",
+    "fx_target_knockout_forward": {
+      "expiry_schedule": {
+        "adjusted_dates": [
+          "2014-12-23",
+          "2015-01-27",
+          "2015-02-25",
+          "2015-03-26"
+        ]
+      },
+      "fixing_information_source": {
+        "fixing_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "10:00:00"
+        },
+        "rate_source": "Reuters",
+        "rate_source_page": "WMRSPOT09"
+      },
+      "notional_amount": {
+        "currency": "USD",
+        "initial_value": "2000000.000000000000000000"
+      },
+      "payoff_regions": [
+        {
+          "counter_currency_amount": {
+            "currency": "CAD",
+            "initial_value": "2090000.000000000000000000"
+          },
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "ptyA",
+            "receiver_party_href": "ptyB"
+          },
+          "exchanged_currency2": {
+            "currency": "CAD",
+            "payer_party_href": "ptyB",
+            "receiver_party_href": "ptyA"
+          },
+          "leverage_condition": "Below",
+          "leverage_ratio": {
+            "initial_value": "2.000000000000000000"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "s1",
+            "initial_value": "1.045000000000000000"
+          }
+        }
+      ],
+      "product": {},
+      "quoted_currency_pair": {
+        "currency1": "USD",
+        "currency2": "CAD",
+        "quote_basis": "Currency2PerCurrency1"
+      },
+      "settlement_schedule": {
+        "adjusted_dates": [
+          "2014-12-24",
+          "2015-01-28",
+          "2015-02-26",
+          "2015-03-27"
+        ],
+        "date_adjustments": {
+          "business_centers": [
+            "CATO",
+            "USNY"
+          ],
+          "business_day_convention": "FOLLOWING"
+        }
+      },
+      "targets": [
+        {
+          "accumulation_region_multipliers": [
+            "2.000000000000000000"
+          ],
+          "knockout_settlement_adjustment_style": "VariedNotional",
+          "knockout_target_style": "Exact"
+        }
+      ]
+    },
     "is_correction": false,
     "message_id": "FX456a789b",
     "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",

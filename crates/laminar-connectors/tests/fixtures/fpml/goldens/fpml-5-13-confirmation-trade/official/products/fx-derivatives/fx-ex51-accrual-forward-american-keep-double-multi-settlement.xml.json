@@ -13,6 +13,166 @@
     "document_root": "executionNotification",
     "document_sha256": "a70a2055fc60501c370e8466ff0e24d8a1fa8f222e80650cd49d22b8055b01c5",
     "fpml_version": "5-13",
+    "fx_accrual_forward": {
+      "additional_payments": [
+        {
+          "payer_party_href": "partyA",
+          "payment_amount": {
+            "amount": "14000.000000000000000000",
+            "currency": "GBP",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {},
+          "receiver_party_href": "partyB"
+        }
+      ],
+      "linear_payoff_regions": [
+        {
+          "counter_currency_amount": {
+            "currency": "GBP",
+            "initial_value": "150000.000000000000000000"
+          },
+          "exchanged_currency1": {
+            "currency": "GBP",
+            "payer_party_href": "partyA",
+            "receiver_party_href": "partyB"
+          },
+          "exchanged_currency2": {
+            "currency": "USD",
+            "payer_party_href": "partyB",
+            "receiver_party_href": "partyA"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "str",
+            "initial_value": "1.687500000000000000"
+          }
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxAccrualForward"
+          }
+        ]
+      },
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "end_date": "2014-12-30",
+            "number_of_fixings": 13,
+            "observation_frequency": {
+              "period": "W",
+              "period_multiplier": 2
+            },
+            "start_date": "2014-07-15"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "DEFR",
+                  "hour_minute_time": "14:15:00"
+                },
+                "rate_source": "Reuters",
+                "rate_source_page": "ECB37"
+              },
+              "quoted_currency_pair": {
+                "currency1": "GBP",
+                "currency2": "USD",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "lower_bound": {
+                "condition": "AtOrAbove"
+              },
+              "observable_href": "ob1"
+            },
+            {
+              "accrual_factor": {
+                "initial_value": "2.000000000000000000"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            }
+          ]
+        },
+        "barriers": [
+          {
+            "accrual_retention": "Keep",
+            "barrier_type": "Knockout",
+            "condition": "AtOrAbove",
+            "quoted_currency_pair": {
+              "currency1": "GBP",
+              "currency2": "USD",
+              "quote_basis": "Currency2PerCurrency1"
+            },
+            "scope": "Global",
+            "style": "American",
+            "trigger_rate": {
+              "initial_value": "1.747000000000000000"
+            }
+          }
+        ],
+        "expiry_schedule": {
+          "adjusted_dates": [
+            "2014-07-15",
+            "2014-07-29",
+            "2014-08-12",
+            "2014-08-26",
+            "2014-09-09",
+            "2014-09-23",
+            "2014-10-07",
+            "2014-10-21",
+            "2014-11-04",
+            "2014-11-18",
+            "2014-12-02",
+            "2014-12-16",
+            "2014-12-30"
+          ],
+          "final_expiry_date": "2014-12-30"
+        },
+        "notional_amount": {
+          "currency": "USD",
+          "initial_value": "253125.000000000000000000"
+        },
+        "settlement_schedule": {
+          "adjusted_dates": [
+            "2014-07-17",
+            "2014-07-31",
+            "2014-08-14",
+            "2014-08-28",
+            "2014-09-11",
+            "2014-09-25",
+            "2014-10-09",
+            "2014-10-23",
+            "2014-11-06",
+            "2014-11-20",
+            "2014-12-04",
+            "2014-12-18",
+            "2015-01-02"
+          ],
+          "date_adjustments": {
+            "business_centers": [
+              "USNY",
+              "GBLO"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "final_settlement_date": "2015-01-02"
+        }
+      }
+    },
     "is_correction": false,
     "message_id": "FX456a789b",
     "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",

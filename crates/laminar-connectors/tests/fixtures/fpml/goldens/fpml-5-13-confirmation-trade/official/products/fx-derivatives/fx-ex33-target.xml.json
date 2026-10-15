@@ -13,6 +13,153 @@
     "document_root": "executionNotification",
     "document_sha256": "d89c33d6651e00b451410c626d947af5141e947e60c197ed8180d7fcd4f26a03",
     "fpml_version": "5-13",
+    "fx_target_knockout_forward": {
+      "additional_payments": [
+        {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "13700.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {},
+          "receiver_party_href": "party1"
+        }
+      ],
+      "expiry_schedule": {
+        "adjusted_dates": [
+          "2011-09-28",
+          "2011-09-29",
+          "2011-09-30",
+          "2011-10-03",
+          "2011-10-04",
+          "2011-10-05",
+          "2011-10-06",
+          "2011-10-07",
+          "2011-10-11",
+          "2011-10-12",
+          "2011-10-13",
+          "2011-10-14",
+          "2011-10-17",
+          "2011-10-18",
+          "2011-10-19",
+          "2011-10-20",
+          "2011-10-21",
+          "2011-10-24",
+          "2011-10-25",
+          "2011-10-26",
+          "2011-10-27",
+          "2011-10-28",
+          "2011-10-31",
+          "2011-11-01",
+          "2011-11-02",
+          "2011-11-03",
+          "2011-11-04",
+          "2011-11-07",
+          "2011-11-08",
+          "2011-11-09",
+          "2011-11-10",
+          "2011-11-14",
+          "2011-11-15",
+          "2011-11-16",
+          "2011-11-17",
+          "2011-11-18"
+        ]
+      },
+      "fixing_information_source": {
+        "fixing_time": {
+          "business_center": "EUTA",
+          "hour_minute_time": "14:15:00"
+        },
+        "rate_source": "Reuters",
+        "rate_source_page": "ECB37"
+      },
+      "notional_amount": {
+        "currency": "EUR",
+        "initial_value": "100000.000000000000000000"
+      },
+      "payoff_regions": [
+        {
+          "counter_currency_amount": {
+            "currency": "USD",
+            "initial_value": "146000.000000000000000000"
+          },
+          "exchanged_currency1": {
+            "currency": "EUR",
+            "payer_party_href": "party2",
+            "receiver_party_href": "party1"
+          },
+          "exchanged_currency2": {
+            "currency": "USD",
+            "payer_party_href": "party1",
+            "receiver_party_href": "party2"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "str1",
+            "initial_value": "1.460000000000000000"
+          }
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxTarget"
+          }
+        ]
+      },
+      "quoted_currency_pair": {
+        "currency1": "EUR",
+        "currency2": "USD",
+        "quote_basis": "Currency2PerCurrency1"
+      },
+      "settlement_schedule": {
+        "adjusted_dates": [
+          "2011-09-30",
+          "2011-10-03",
+          "2011-10-04",
+          "2011-10-05",
+          "2011-10-06",
+          "2011-10-07",
+          "2011-10-11",
+          "2011-10-12",
+          "2011-10-13",
+          "2011-10-14",
+          "2011-10-17",
+          "2011-10-18",
+          "2011-10-19",
+          "2011-10-20",
+          "2011-10-21",
+          "2011-10-24",
+          "2011-10-25",
+          "2011-10-26",
+          "2011-10-27",
+          "2011-10-28",
+          "2011-10-31",
+          "2011-11-01",
+          "2011-11-02",
+          "2011-11-04",
+          "2011-11-07",
+          "2011-11-08",
+          "2011-11-09",
+          "2011-11-10",
+          "2011-11-14",
+          "2011-11-15",
+          "2011-11-16",
+          "2011-11-17",
+          "2011-11-18",
+          "2011-11-21",
+          "2011-11-22"
+        ]
+      },
+      "targets": [
+        {
+          "knockout_settlement_adjustment_style": "VariedNotional",
+          "knockout_target_style": "Exact"
+        }
+      ]
+    },
     "is_correction": false,
     "message_id": "FX456a789b",
     "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
