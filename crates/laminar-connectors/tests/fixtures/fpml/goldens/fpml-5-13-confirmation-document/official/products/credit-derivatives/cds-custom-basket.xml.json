@@ -1,0 +1,64 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR/2005/01/24/0EB30A0q",
+    "correlation_id_scheme": "http://www.example.com/correlationId",
+    "creation_time_utc": "2005-01-24T12:36:35Z",
+    "document_bytes": 10657,
+    "document_root": "executionNotification",
+    "document_sha256": "964fcd15fbbce3951e87b97705205c014e1c09f5661da86aefe104553ed634bb",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2005-01-24T04:36:35",
+        "offset_minutes": -480,
+        "utc": "2005-01-24T12:36:35Z"
+      },
+      "message_id": "GW:0EB40A0q",
+      "message_id_scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/messageID",
+      "send_to": [
+        "WSSOGB2L"
+      ],
+      "sent_by": "BGIAGB2L"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "I7331LVCZKQKX5T7XV54"
+          }
+        ],
+        "party_name": "Morgan Stanley Captial Services"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800H14XVWOV87OI72"
+          }
+        ],
+        "party_name": "Barclays Global Investors"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "DJITRAXXUSDMS5Y"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2004-01-24"
+      }
+    ]
+  }
+]

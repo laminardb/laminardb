@@ -1,0 +1,55 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-tradeChangeAdviceRetracted",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:45:00Z",
+    "document_bytes": 1350,
+    "document_root": "tradeChangeAdviceRetracted",
+    "document_sha256": "f07aa721926d6ea3771482b47816e2460a80a6e2310a70e760bfeb44e27882fb",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:45:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:45:00Z"
+      },
+      "message_id": "SYN-tradeChangeAdviceRetracted",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trade_identifiers": [
+      {
+        "party_href": "party1",
+        "trade_ids": [
+          "TRD-1001"
+        ]
+      }
+    ]
+  }
+]

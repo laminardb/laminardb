@@ -1,0 +1,86 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "clearing_firm_accounts",
+            "value": "pacct1"
+          }
+        ],
+        "id": "account1"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "844409",
+    "correlation_id_scheme": "trade_id",
+    "creation_time_utc": "2014-09-24T09:30:10Z",
+    "document_bytes": 9665,
+    "document_root": "executionNotification",
+    "document_sha256": "c00aa08f0bf5b44ae095687151c1a8f91ccf5eee896bf80cf8a2cd5cc04fe00a",
+    "events": [
+      {
+        "event_type": "optionExercise",
+        "exercise_action": "FullExercise",
+        "exercise_date": "2014-09-24",
+        "locator": "/executionNotification/optionExercise",
+        "trade_identifiers": [
+          {
+            "party_href": "clearing_service",
+            "trade_ids": [
+              "844409",
+              "scenario1",
+              "scenario1"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2014-09-24T09:30:10",
+        "offset_minutes": 0,
+        "utc": "2014-09-24T09:30:10Z"
+      },
+      "message_id": "MSG4529896",
+      "message_id_scheme": "message_id",
+      "send_to": [
+        "TESTBOOKLE"
+      ],
+      "sent_by": "CLEARCO",
+      "sent_by_scheme": "clearingorg_id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "clearing_firm",
+        "party_ids": [
+          {
+            "scheme": "clearing_member_firms",
+            "value": "TESTBOOKLE"
+          }
+        ]
+      },
+      {
+        "id": "clearing_service",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      },
+      {
+        "id": "trade_source",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "TRADE_REPORT"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 2
+  }
+]

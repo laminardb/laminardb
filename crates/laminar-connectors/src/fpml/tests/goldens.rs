@@ -52,8 +52,14 @@ fn every_profile_matches_its_goldens_over_every_fixture() {
                 (Err(error), Some(reason)) if error.to_string().contains(reason) => {
                     serde_json::json!({ "rejected": error.to_string() })
                 }
-                (Ok(_), Some(reason)) => panic!("{profile} {relative}: expected {reason}"),
-                (Err(error), _) => panic!("{profile} {relative}: {error}"),
+                (Ok(_), Some(reason)) => {
+                    mismatches.push(format!("{profile} {relative}: expected {reason}"));
+                    continue;
+                }
+                (Err(error), _) => {
+                    mismatches.push(format!("{profile} {relative}: {error}"));
+                    continue;
+                }
             };
             if value.as_array().is_some_and(Vec::is_empty) {
                 zero_rows.push(relative.trim_end_matches(".json").to_owned());

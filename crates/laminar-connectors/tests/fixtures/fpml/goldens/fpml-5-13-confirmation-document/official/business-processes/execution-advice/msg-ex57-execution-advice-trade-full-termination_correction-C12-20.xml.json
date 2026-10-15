@@ -1,0 +1,130 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.imgr.com/schemes/account-id",
+            "value": "FUND300"
+          }
+        ],
+        "beneficiary_href": "_fund",
+        "id": "_FUNDACCT"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.custodian.com/account-id",
+            "value": "76543"
+          }
+        ],
+        "beneficiary_href": "_cust",
+        "id": "_CUSTACCT"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "IM/C012",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2009-07-24T20:14:14Z",
+    "document_bytes": 5019,
+    "document_root": "executionAdvice",
+    "document_sha256": "84955536cab9564151c0d779b453aad2c1366d857c4119328f924c2e30928122",
+    "events": [
+      {
+        "agreement_date": "2009-07-24",
+        "change_in_notional_amounts": [
+          {
+            "amount": "15000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "effective_date": "2009-07-27",
+        "event_type": "termination",
+        "locator": "/executionAdvice/termination",
+        "outstanding_notional_amounts": [
+          {
+            "amount": "0.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "payments": [
+          {
+            "id": "TERMINATION_FEE",
+            "payer_party_href": "_broker",
+            "payment_amount": {
+              "amount": "37588.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjusted_date": "2009-07-27"
+            },
+            "payment_type": "Termination Fee",
+            "receiver_party_href": "_fund"
+          }
+        ],
+        "trade_identifiers": [
+          {
+            "party_href": "_fund",
+            "trade_ids": [
+              "CONTR2345"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2009-07-24T12:14:14",
+        "offset_minutes": -480,
+        "utc": "2009-07-24T20:14:14Z"
+      },
+      "message_id": "IM/30",
+      "message_id_scheme": "http://www.imgr.com/schemes/message-id",
+      "send_to": [
+        "CUSTUS3T"
+      ],
+      "sent_by": "IMGRUS6S"
+    },
+    "is_correction": true,
+    "parties": [
+      {
+        "id": "_fund",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000TK7OZL3NFEW61"
+          }
+        ],
+        "party_name": "INVEST MANAGER"
+      },
+      {
+        "id": "_broker",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E4CDNNLJRBKF36"
+          }
+        ],
+        "party_name": "BROKER"
+      },
+      {
+        "id": "_cust",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FNRNXH6KYKUK07"
+          }
+        ],
+        "party_name": "Custodian"
+      }
+    ],
+    "payment_reference_hrefs": [
+      "TERMINATION_FEE"
+    ],
+    "sequence_number": 3
+  }
+]

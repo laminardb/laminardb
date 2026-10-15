@@ -1,0 +1,112 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-03-05T21:35:58.568Z",
+    "document_bytes": 4352,
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "23d0b9cd859ff372b74ab8f79c0a0a8facef08624c4e6c3d2448903f383d0dce",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-05T16:35:58.568",
+        "offset_minutes": -300,
+        "utc": "2018-03-05T21:35:58.568Z"
+      },
+      "message_id": "BBPLC00001549667579",
+      "message_id_scheme": "http://www.barclays.com/fpml/coding-scheme/internal/message-id",
+      "send_to": [
+        "US1L142580"
+      ],
+      "sent_by": "GB1L104502",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "loan_contents": [
+      {
+        "element": "allocation",
+        "locator": "/loanAllocationNotification/allocation"
+      },
+      {
+        "element": "allocation",
+        "locator": "/loanAllocationNotification/allocation[2]"
+      }
+    ],
+    "loan_events": [
+      {
+        "event_ids": [
+          "GB004"
+        ],
+        "event_type": "loanAllocationConfirmation",
+        "locator": "/loanAllocationNotification/loanAllocationConfirmation"
+      },
+      {
+        "event_ids": [
+          "GB005"
+        ],
+        "event_type": "loanAllocationConfirmation",
+        "locator": "/loanAllocationNotification/loanAllocationConfirmation[2]"
+      }
+    ],
+    "notice_date": "2018-03-05",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "KY1L151440",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY1L151440"
+          }
+        ]
+      },
+      {
+        "id": "KY0M003Z48",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY0M003Z48"
+          }
+        ]
+      }
+    ],
+    "party_hrefs": [
+      "GB1L104502"
+    ],
+    "role": "Seller",
+    "trade_identifiers": [
+      {
+        "party_href": "GB1L104502",
+        "trade_ids": [
+          "BBPLC_T_001"
+        ]
+      }
+    ]
+  }
+]

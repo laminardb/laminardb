@@ -1,0 +1,96 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.imgr.com/schemes/account-id",
+            "value": "FUND100"
+          }
+        ],
+        "beneficiary_href": "_fund",
+        "id": "_FUNDACCT"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.custodian.com/account-id",
+            "value": "98765"
+          }
+        ],
+        "beneficiary_href": "_cust",
+        "id": "_CUSTACCT"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "IM/C001",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2009-06-08T18:03:09Z",
+    "document_bytes": 5100,
+    "document_root": "executionAdvice",
+    "document_sha256": "4d0257485913d330d160eada7458fda8280ce6115eb8afa754b347d21dedd681",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2009-06-08T10:03:09",
+        "offset_minutes": -480,
+        "utc": "2009-06-08T18:03:09Z"
+      },
+      "message_id": "IM/5",
+      "message_id_scheme": "http://www.imgr.com/schemes/message-id",
+      "send_to": [
+        "CUSTUS3T"
+      ],
+      "sent_by": "IMGRUS6S"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "_fund",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "INVEST MGR"
+      },
+      {
+        "id": "_broker",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E4CDNNLJRBKF36"
+          }
+        ],
+        "party_name": "BROKER 33"
+      },
+      {
+        "id": "_cust",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FNRNXH6KYKUK07"
+          }
+        ],
+        "party_name": "Custodian"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/executionAdvice/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "_fund",
+            "trade_ids": [
+              "CONTR2345"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2009-06-08"
+      }
+    ]
+  }
+]

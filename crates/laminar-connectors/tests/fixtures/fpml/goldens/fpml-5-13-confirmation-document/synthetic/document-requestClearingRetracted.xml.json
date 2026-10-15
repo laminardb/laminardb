@@ -1,0 +1,47 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-requestClearingRetracted",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:37:00Z",
+    "document_bytes": 1168,
+    "document_root": "requestClearingRetracted",
+    "document_sha256": "09985474c046816147d46f071a53af519960e851722d2eae3e2f8d9715374491",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:37:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:37:00Z"
+      },
+      "message_id": "SYN-requestClearingRetracted",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

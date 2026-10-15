@@ -1,0 +1,60 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2011-03-01T08:57:00Z",
+    "document_bytes": 7229,
+    "document_root": "executionNotification",
+    "document_sha256": "70aa5de5a481fe367e1e46e87db0480403c7c507e1e026f3858769cec9a7d59d",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2011-03-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2011-03-01T08:57:00Z"
+      },
+      "message_id": "FX456a789b",
+      "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "EXECSRV",
+      "sent_by_scheme": "http://www.executionnotificationservice.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "ptyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "ptyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "ptyA",
+            "trade_ids": [
+              "12345"
+            ]
+          }
+        ],
+        "product_type": "fxTargetKnockoutForward",
+        "trade_date": "2014-07-25"
+      }
+    ]
+  }
+]

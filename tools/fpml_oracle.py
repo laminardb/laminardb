@@ -8,7 +8,7 @@ values with `decimal` and `datetime`, and compares every golden row field by fie
 code with the decoder.
 
 Attribute defaults are the one place the two can legitimately differ in method: libxml2
-materializes XML Schema attribute defaults into the validated tree, while ElementTree never sees
+materializes XML Schema attribute defaults and fixed values into the validated tree, while ElementTree never sees
 them. For an attribute absent from a document, the oracle accepts a golden value only if the
 schema closure declares it as a default of an attribute with that name.
 
@@ -64,8 +64,9 @@ class Closure:
                         "{%s}%s" % (target, element.get("name"))
                     )
             for attribute in root.iter(XS + "attribute"):
-                if attribute.get("name") and attribute.get("default") is not None:
-                    self.defaults.setdefault(attribute.get("name"), set()).add(attribute.get("default"))
+                value = attribute.get("default", attribute.get("fixed"))
+                if attribute.get("name") and value is not None:
+                    self.defaults.setdefault(attribute.get("name"), set()).add(value)
 
     def members(self, head_local: str) -> set[str]:
         out: set[str] = set()
@@ -405,7 +406,8 @@ def project(profile: Profile, document: Document) -> list[dict]:
 
 def compare(expected, actual, closure: Closure, path: str, problems: list[str]) -> None:
     if isinstance(expected, Defaultable):
-        if actual is not ABSENT and actual not in closure.defaults.get(expected.name, set()):
+        lexical = json.dumps(actual) if isinstance(actual, (bool, int)) else actual
+        if actual is not ABSENT and lexical not in closure.defaults.get(expected.name, set()):
             problems.append(f"{path}: {actual!r} is not a schema default of @{expected.name}")
         return
     if isinstance(expected, dict) and isinstance(actual, dict):

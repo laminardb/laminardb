@@ -1,0 +1,136 @@
+[
+  {
+    "actual_build": 7,
+    "allocation_identifiers": [
+      {
+        "party_href": "EatonVance",
+        "trade_ids": [
+          "ALLOC1"
+        ]
+      },
+      {
+        "party_href": "EatonVance",
+        "trade_ids": [
+          "ALLOC2"
+        ]
+      },
+      {
+        "party_href": "EatonVance",
+        "trade_ids": [
+          "ALLOC3"
+        ]
+      }
+    ],
+    "creation_time_utc": "2017-09-19T09:30:47Z",
+    "document_bytes": 7807,
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "8fcd3f6e755571f106da648024421f3e351e0d4ffaea5dc455ea6a61e2e30c70",
+    "facility_identifiers": [
+      {
+        "description": "USD 1BN Term Loan B",
+        "id": "TermLoanB",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "AgentParty"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-19T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2017-09-19T09:30:47Z"
+      },
+      "implementation_specification_name": "LoanFpML",
+      "implementation_specification_version": "v5.11",
+      "message_id": "SentMessageID8",
+      "message_id_scheme": "http://www.company.com/messageIdScheme",
+      "send_to": [
+        "JPMorganChase"
+      ],
+      "sent_by": "EatonVance",
+      "sent_by_scheme": "http://www.company.com/messageAddressScheme"
+    },
+    "is_correction": false,
+    "loan_events": [
+      {
+        "event_ids": [
+          "EVENT2"
+        ],
+        "event_type": "loanAllocationSettlementDateFinalization",
+        "locator": "/loanAllocationNotification/loanAllocationSettlementDateFinalization"
+      },
+      {
+        "event_ids": [
+          "EVENT3"
+        ],
+        "event_type": "loanAllocationSettlementDateFinalization",
+        "locator": "/loanAllocationNotification/loanAllocationSettlementDateFinalization[2]"
+      },
+      {
+        "event_ids": [
+          "EVENT4"
+        ],
+        "event_type": "loanAllocationSettlementDateFinalization",
+        "locator": "/loanAllocationNotification/loanAllocationSettlementDateFinalization[3]"
+      }
+    ],
+    "loan_trade_identifiers": [
+      {
+        "party_href": "JPMorganChase",
+        "trade_ids": [
+          "TN12345"
+        ]
+      }
+    ],
+    "notice_date": "2017-09-19",
+    "parties": [
+      {
+        "country": "US",
+        "id": "JPMorganChase",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001011"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "EatonVance",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "EV1000001"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "Amazon",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "AMZ1111111"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "AgentParty",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001012"
+          }
+        ],
+        "party_name": "JPMorganChase"
+      }
+    ],
+    "party_hrefs": [
+      "JPMorganChase"
+    ],
+    "role": "Agent"
+  }
+]

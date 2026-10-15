@@ -1,0 +1,47 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-creditEventNotificationRetracted",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:35:00Z",
+    "document_bytes": 1208,
+    "document_root": "creditEventNotificationRetracted",
+    "document_sha256": "b4eb254159d3642e0e4173217f27b33ff9414d6631522ecaa201a7d50d1ac7e2",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:35:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:35:00Z"
+      },
+      "message_id": "SYN-creditEventNotificationRetracted",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

@@ -1,0 +1,163 @@
+[
+  {
+    "actual_build": 7,
+    "contract_identifiers": [
+      {
+        "contract_ids": [
+          "CC1234"
+        ],
+        "id": "CONT12345",
+        "party_href": "BANKOFAGENTSNA"
+      },
+      {
+        "contract_ids": [
+          "CC4321"
+        ],
+        "id": "CONT54321",
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "document_bytes": 13960,
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "ed85f3c9b8b631cfa6095cea8b2c4160cd8d4d66729df01c3113c1fc3e07346d",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2013-10-21T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2013-10-21T09:30:47Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "449988",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": false,
+    "loan_events": [
+      {
+        "effective_date": "2009-07-15",
+        "event_ids": [
+          "67301"
+        ],
+        "event_type": "rollover",
+        "locator": "/loanBulkServicingNotification/rollover"
+      },
+      {
+        "effective_date": "2009-07-15",
+        "event_ids": [
+          "67562"
+        ],
+        "event_type": "interestPayment",
+        "locator": "/loanBulkServicingNotification/interestPayment"
+      },
+      {
+        "effective_date": "2009-07-15",
+        "event_ids": [
+          "65228"
+        ],
+        "event_type": "interestPayment",
+        "locator": "/loanBulkServicingNotification/interestPayment[2]"
+      }
+    ],
+    "loan_payments": [
+      {
+        "event_ids": [
+          "67562"
+        ],
+        "payer_party_href": "BANKOFAGENTSNA",
+        "payment_amount": {
+          "amount": "722.550000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "USNY"
+            ],
+            "business_day_convention": "MODFOLLOWING"
+          },
+          "unadjusted_date": "2009-07-15"
+        },
+        "receiver_party_href": "LENDERCORP"
+      },
+      {
+        "event_ids": [
+          "65228"
+        ],
+        "payer_party_href": "BANKOFAGENTSNA",
+        "payment_amount": {
+          "amount": "65.690000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2009-07-15"
+        },
+        "receiver_party_href": "LENDERCORP"
+      }
+    ],
+    "notice_date": "2009-07-13",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ]
+  }
+]

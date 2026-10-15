@@ -1,0 +1,59 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-tradeReferenceInformationUpdateAcknowledgement",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:23:00Z",
+    "document_bytes": 1972,
+    "document_root": "tradeReferenceInformationUpdateAcknowledgement",
+    "document_sha256": "e38b5885149cbd427d5f5996ed4dfa061cabe223b3004bb11cca18ddd3e15fed",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:23:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:23:00Z"
+      },
+      "in_reply_to": "REQ-tradeReferenceInformationUpdateAcknowledgement",
+      "message_id": "SYN-tradeReferenceInformationUpdateAcknowledgement",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "original_message_root": "requestConfirmation",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trade_reference_information": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "trade_ids": [
+            "TRD-1001"
+          ]
+        }
+      ]
+    }
+  }
+]

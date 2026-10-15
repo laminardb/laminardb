@@ -1,0 +1,49 @@
+[
+  {
+    "actual_build": 7,
+    "approval_type": "Credit",
+    "approving_party_href": "party2",
+    "correlation_id": "CORR-requestConsentRetracted",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:39:00Z",
+    "document_bytes": 1301,
+    "document_root": "requestConsentRetracted",
+    "document_sha256": "5d50b32cc220373197261f28eed98015626cd6b55d1b0a8ae89e8ffe7bbfb978",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:39:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:39:00Z"
+      },
+      "message_id": "SYN-requestConsentRetracted",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

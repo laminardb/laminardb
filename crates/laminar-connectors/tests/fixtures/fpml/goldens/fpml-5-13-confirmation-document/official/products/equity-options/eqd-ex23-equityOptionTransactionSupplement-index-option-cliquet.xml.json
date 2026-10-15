@@ -1,0 +1,62 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CW/2009/02/24/123476",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2002-09-24T23:08:40.335Z",
+    "document_bytes": 7485,
+    "document_root": "requestConfirmation",
+    "document_sha256": "59681a3d472795e2c353032f61856df6a38a39f4b7a1bec2acfa525ff7a3e444",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-09-24T18:08:40.335",
+        "offset_minutes": -300,
+        "utc": "2002-09-24T23:08:40.335Z"
+      },
+      "message_id": "123476-002700000005656",
+      "message_id_scheme": "perFpMLReqmt",
+      "send_to": [
+        "DTCC00006440"
+      ],
+      "sent_by": "DTCC00006441"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "DTCC00006441"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "DTCC00006440"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "Party1",
+            "trade_ids": [
+              "TW9236"
+            ]
+          }
+        ],
+        "product_type": "equityOptionTransactionSupplement",
+        "trade_date": "2002-10-31"
+      }
+    ]
+  }
+]

@@ -1,0 +1,50 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 3953,
+    "document_root": "dataDocument",
+    "document_sha256": "0ad1224f0c69ac9c02b1ee7fe36f7c1d9721aaa3adab83ceb64d18a13eee3655",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 1"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 2"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "Party1",
+            "trade_ids": [
+              "Party19235"
+            ]
+          },
+          {
+            "party_href": "Party2",
+            "trade_ids": [
+              "Party22000"
+            ]
+          }
+        ],
+        "product_type": "repo",
+        "trade_date": "2013-10-29"
+      }
+    ]
+  }
+]

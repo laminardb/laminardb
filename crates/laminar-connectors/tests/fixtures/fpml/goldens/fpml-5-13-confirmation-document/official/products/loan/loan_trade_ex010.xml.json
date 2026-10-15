@@ -1,0 +1,85 @@
+[
+  {
+    "actual_build": 7,
+    "allocation_identifiers": [
+      {
+        "issuer": "GB1L213246",
+        "trade_ids": [
+          "ALLOC1"
+        ]
+      }
+    ],
+    "creation_time_utc": "2017-09-09T00:41:29.913647100Z",
+    "document_bytes": 3276,
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "8f2bb0662baeaa97cfb880f9e9496791423cd106b0cbb37fc8dc199d11864fc4",
+    "facility_identifiers": [
+      {
+        "id": "FAC12345",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "BANK67890"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-08T20:41:29.913647100",
+        "offset_minutes": -240,
+        "utc": "2017-09-09T00:41:29.913647100Z"
+      },
+      "message_id": "BPLC0000256744803",
+      "message_id_scheme": "http://www.barclays.com/coding-scheme/message-id-1-0",
+      "send_to": [
+        "US1LFM0001"
+      ],
+      "sent_by": "GB1L213246",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0"
+    },
+    "is_correction": false,
+    "loan_tasks": [
+      {
+        "comment": "Please provide lender profile details for settlement.",
+        "responsible_party_href": "BANK67890",
+        "status": "Active",
+        "task_ids": [
+          "BTASK1"
+        ]
+      }
+    ],
+    "loan_trade_identifiers": [
+      {
+        "issuer": "US1LFM0001",
+        "trade_ids": [
+          "TN12345"
+        ]
+      }
+    ],
+    "notice_date": "2017-09-08",
+    "parties": [
+      {
+        "id": "BANK12345",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "GB1L213246"
+          }
+        ]
+      },
+      {
+        "id": "BANK67890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LFM0001"
+          }
+        ]
+      }
+    ],
+    "party_hrefs": [
+      "BANK12345"
+    ],
+    "role": "Buyer"
+  }
+]

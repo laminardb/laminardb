@@ -1,0 +1,45 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 5770,
+    "document_root": "dataDocument",
+    "document_sha256": "332f674e25469cc4e861c6873dbaffce122d14584955ea40691237bc677bbb7f",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "PartyA",
+            "trade_ids": [
+              "ACIRST1234567"
+            ]
+          }
+        ],
+        "product_type": "commodityPerformanceSwap",
+        "trade_date": "2014-04-08"
+      }
+    ]
+  }
+]

@@ -1,0 +1,60 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR/2000/08/01/BasketOption987",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2000-08-01T08:57:00Z",
+    "document_bytes": 7913,
+    "document_root": "requestConfirmation",
+    "document_sha256": "b92f589be019741ecdfd98e3bf1b0623d7150979c68771b28612c499a5354070",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2000-08-01T08:57:00Z"
+      },
+      "message_id": "BasketOption456a789b",
+      "message_id_scheme": "http://www.abc.com/messageId/OTC",
+      "sent_by": "abc",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ],
+        "product_type": "equityOption",
+        "trade_date": "2000-06-28"
+      }
+    ]
+  }
+]

@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 4189,
+    "document_root": "dataDocument",
+    "document_sha256": "6c5ee80c4b4afd071e37afe97d2155949bf0b892c147b8b805f4d1cc4fcbdde3",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "BuyerPartyLEI"
+          }
+        ],
+        "party_name": "Bank A"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SellerPartyLEI"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "1234"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "2345"
+            ]
+          }
+        ],
+        "product_type": "commodityForward",
+        "trade_date": "2013-03-05"
+      }
+    ]
+  }
+]

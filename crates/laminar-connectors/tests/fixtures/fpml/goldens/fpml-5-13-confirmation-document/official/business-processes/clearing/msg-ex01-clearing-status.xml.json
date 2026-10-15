@@ -1,0 +1,56 @@
+[
+  {
+    "actual_build": 7,
+    "clearing_status_items": [
+      {
+        "clearing_status": "Pending",
+        "trade_identifiers": [
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "CL000123"
+            ]
+          }
+        ]
+      }
+    ],
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 1627,
+    "document_root": "clearingStatus",
+    "document_sha256": "00fd0c8cd164f97e74a6c4ebebca8e0258989549bc684836f7c3ae0e20240c1c",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "000456",
+      "message_id_scheme": "http://www.lch.com/message-id",
+      "send_to": [
+        "DEUTDEFFXXX"
+      ],
+      "sent_by": "LCHLGB2LXXX"
+    },
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.lch.com/coding-scheme/party",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.db.com/coding-scheme/party",
+            "value": "DEUTDEFFXXX"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,69 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "FX01234",
+    "correlation_id_scheme": "http://www.partyA.com/coding-scheme/correlationId",
+    "creation_time_utc": "2001-08-16T08:57:00Z",
+    "document_bytes": 5558,
+    "document_root": "requestConfirmation",
+    "document_sha256": "853e0f1ea2f3c84499fe46ffbecd7d1363ecfc8d3fe3e232614296917d155bd2",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2001-08-16T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2001-08-16T08:57:00Z"
+      },
+      "message_id": "FX109876",
+      "message_id_scheme": "http://www.partyA.com/coding-scheme/messageId",
+      "send_to": [
+        "DEUTDEFF"
+      ],
+      "sent_by": "PARTYAUS33",
+      "sent_by_scheme": "http://www.partyA.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800QILIUD4ROSUO03"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "PARTYAUS33"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "DEUTDEFF"
+            ]
+          }
+        ],
+        "product_type": "fxOption",
+        "trade_date": "2001-08-16"
+      }
+    ]
+  }
+]

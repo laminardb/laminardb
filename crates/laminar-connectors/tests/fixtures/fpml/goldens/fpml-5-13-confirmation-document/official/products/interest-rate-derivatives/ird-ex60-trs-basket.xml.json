@@ -1,0 +1,65 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-09-17T01:55:42Z",
+    "document_bytes": 17353,
+    "document_root": "executionNotification",
+    "document_sha256": "e7bc643f594cc8b394ff7f8c7ecfda1f7fe28f3da02bd5e1c2b6f78c60788de7",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-09-17T06:55:42",
+        "offset_minutes": 300,
+        "utc": "2018-09-17T01:55:42Z"
+      },
+      "message_id": "GW:2W81Q117",
+      "message_id_scheme": "XXX",
+      "send_to": [
+        "YYYYYYYY"
+      ],
+      "sent_by": "XXXXXXXX"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "Party1",
+            "trade_ids": [
+              "E2000098N10184"
+            ]
+          },
+          {
+            "party_href": "Party2",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2018-09-17"
+      }
+    ]
+  }
+]

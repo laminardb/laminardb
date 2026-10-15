@@ -1,0 +1,106 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "value": "1234"
+          }
+        ],
+        "account_name": "SkyAccount",
+        "beneficiary_href": "SKY",
+        "id": "INTAC1"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "47896325"
+          }
+        ],
+        "account_name": "Sky General Account",
+        "beneficiary_href": "SKY",
+        "id": "GEN478"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "CORR002",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2007-07-27T11:02:00Z",
+    "document_bytes": 9971,
+    "document_root": "executionAdvice",
+    "document_sha256": "d757f1f5850e65460b846f7b8b9c8de17785c404960ac416932dbd597f109564",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2007-07-27T11:02:00",
+        "offset_minutes": 0,
+        "utc": "2007-07-27T11:02:00Z"
+      },
+      "message_id": "0483608",
+      "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+      "send_to": [
+        "CCSTUS6S"
+      ],
+      "sent_by": "AMAGGB22XXX"
+    },
+    "is_correction": true,
+    "parties": [
+      {
+        "id": "AMAG",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500T86SHG919ON888"
+          }
+        ],
+        "party_name": "International Bank Asset Management"
+      },
+      {
+        "id": "SKY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ],
+        "party_name": "Sky Limited"
+      },
+      {
+        "id": "CST",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FL0LHI0TEZ8V48"
+          }
+        ],
+        "party_name": "Standards Slav. Int'l"
+      },
+      {
+        "id": "FIRST",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E0S1LZYZ9QNX81"
+          }
+        ],
+        "party_name": "First International Bank, MozartStrasse, Frankfurt"
+      }
+    ],
+    "sequence_number": 2,
+    "trades": [
+      {
+        "locator": "/executionAdvice/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "SKY",
+            "trade_ids": [
+              "IRS2"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2007-07-27"
+      }
+    ]
+  }
+]

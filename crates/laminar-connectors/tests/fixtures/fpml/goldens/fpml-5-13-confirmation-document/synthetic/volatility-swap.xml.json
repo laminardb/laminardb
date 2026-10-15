@@ -1,0 +1,68 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "SYN-VOLS",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-03-02T08:15:00Z",
+    "document_bytes": 5457,
+    "document_root": "requestConfirmation",
+    "document_sha256": "b9116269222df88ebd0a5404450c1fb8e53b7044df45ab58bd1157823a28806e",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-03-02T09:15:00",
+        "offset_minutes": 60,
+        "utc": "2026-03-02T08:15:00Z"
+      },
+      "message_id": "SYN-VOLS-0001",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "sent_by": "PARTYA",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ],
+        "party_name": "Synthetic Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ],
+        "party_name": "Synthetic Party B"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "VOLS-1001"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "VOLS-1001"
+            ]
+          }
+        ],
+        "product_type": "volatilitySwap",
+        "trade_date": "2026-03-02"
+      }
+    ]
+  }
+]

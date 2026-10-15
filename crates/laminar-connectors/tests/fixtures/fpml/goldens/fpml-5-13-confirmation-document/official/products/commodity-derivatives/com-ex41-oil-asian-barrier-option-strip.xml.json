@@ -1,0 +1,45 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 7341,
+    "document_root": "dataDocument",
+    "document_sha256": "b25be94c845fe4015bf9e9123b82355535fdeb2296660660577ebdc6b837096f",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "PartyA",
+            "trade_ids": [
+              "UVXY54321"
+            ]
+          }
+        ],
+        "product_type": "commodityOption",
+        "trade_date": "2012-11-15"
+      }
+    ]
+  }
+]

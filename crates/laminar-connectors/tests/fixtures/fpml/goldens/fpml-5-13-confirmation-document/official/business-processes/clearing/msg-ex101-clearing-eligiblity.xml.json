@@ -1,0 +1,79 @@
+[
+  {
+    "actual_build": 7,
+    "clearing_requirements": [
+      {
+        "mandatorily_clearable": true,
+        "supervisory_body": "CFTC"
+      },
+      {
+        "mandatorily_clearable": false,
+        "reasons": [
+          {
+            "reason_code": "308"
+          }
+        ],
+        "supervisory_body": "JFSA"
+      }
+    ],
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.sef.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 2231,
+    "document_root": "clearingEligibility",
+    "document_sha256": "d18a7dd543e6a2c47199beee2618ab985492525b78388fb91507d5bc28a790af",
+    "eligible_for_clearing": true,
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "in_reply_to": "R00ABC1",
+      "message_id": "000456",
+      "message_id_scheme": "http://www.lch.com/message-id",
+      "send_to": [
+        "DEUTDEFFXXX"
+      ],
+      "sent_by": "LCHLGB2LXXX"
+    },
+    "parties": [
+      {
+        "id": "sef",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SEFCO"
+          }
+        ]
+      },
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.lch.com/coding-scheme/party",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.db.com/coding-scheme/party",
+            "value": "DEUTDEFFXXX"
+          }
+        ]
+      }
+    ],
+    "trade_identifiers": [
+      {
+        "party_href": "sef",
+        "trade_ids": [
+          "SEF01"
+        ]
+      }
+    ]
+  }
+]

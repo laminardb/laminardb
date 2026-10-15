@@ -1,0 +1,68 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CS/2021/08/18/32-09",
+    "correlation_id_scheme": "http://www.example.com/correlationId",
+    "creation_time_utc": "2021-08-18T16:38:00Z",
+    "document_bytes": 12497,
+    "document_root": "requestConfirmation",
+    "document_sha256": "d8b1b91cc115e17cf9b7c4aa23cb15641c0f4569bb5b3b2996569d6949e27ac7",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2021-08-18T16:38:00",
+        "offset_minutes": 0,
+        "utc": "2021-08-18T16:38:00Z"
+      },
+      "message_id": "MS/2021/08/15-99",
+      "message_id_scheme": "http://www.example.com/messageId",
+      "send_to": [
+        "PARTYBBICXXX"
+      ],
+      "sent_by": "PARTYABICXXX"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "6234"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "6569"
+            ]
+          }
+        ],
+        "product_type": "returnSwap",
+        "trade_date": "2021-08-18"
+      }
+    ]
+  }
+]

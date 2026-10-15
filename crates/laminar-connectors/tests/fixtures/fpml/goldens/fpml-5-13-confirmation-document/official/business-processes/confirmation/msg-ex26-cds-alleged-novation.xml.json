@@ -1,0 +1,61 @@
+[
+  {
+    "actual_build": 7,
+    "alleged_event_types": [
+      "novation"
+    ],
+    "correlation_id": "corr00223242",
+    "correlation_id_scheme": "http://www.xyzbank.com/cd-trade-id/correlationId/OTC",
+    "creation_time_utc": "2006-01-01T04:01:00Z",
+    "document_bytes": 3200,
+    "document_root": "confirmationStatus",
+    "document_sha256": "e7eae9b0b9172f3723d906ee755b50fe23e0f99f0001e1d3c8dace5b1b419091",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-01-01T09:01:00",
+        "offset_minutes": 300,
+        "utc": "2006-01-01T04:01:00Z"
+      },
+      "in_reply_to": "NovationCDS_ABC_XYZ_msg00005",
+      "message_id": "NovationCDS_ABC_XYZ_msg00010",
+      "message_id_scheme": "http://www.xyzbank.com/cd-trade-id/messageId/OTC",
+      "send_to": [
+        "ABC Bank"
+      ],
+      "sent_by": "XYZ Bank",
+      "sent_by_scheme": "http://www.xyzbank.com/cd-trade-id/partyId"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XYZ Bank"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC Bank"
+          }
+        ]
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "RemainingParty Firm"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 5,
+    "status": "Alleged"
+  }
+]

@@ -790,449 +790,767 @@ status = "outstanding"
 [[document]]
 element = "allocationAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "allocationApproved"
 type = "AllocationApproved"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationApproved.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level blockTradeIdentifier, allocations; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "allocationException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "allocationRefused"
 type = "AllocationRefused"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationRefused.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level blockTradeIdentifier, allocations, reason; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "approvalStatusNotification"
 type = "ApprovalStatusNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level trade, tradeIdentifier, approvals; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingConfirmed"
 type = "ClearingConfirmed"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level compressionActivity, portfolioReference, tradePackage, originatingEvent, trade, additionalEvent, terminatingEvent, termination, deClear, clearing, change, quote, creditLimitInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingEligibility"
 type = "ClearingEligibility"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, deClear, partyTradeIdentifier, eligibleForClearing, clearingRequirements; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingEligibilityAcknowledgement"
 type = "Acknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingEligibilityAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingEligibilityException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingEligibilityException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingRefused"
 type = "ClearingRefused"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingRefused.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, quote, reason; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "clearingStatus"
 type = "ClearingStatus"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level clearingStatusItem; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "collateralAllocationAccepted"
 type = "CollateralAllocationAccepted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-collateralAllocationAccepted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "collateralAllocationAcknowledgement"
 type = "Acknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-collateralAllocationAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "collateralAllocationRejected"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-collateralAllocationRejected.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "confirmationAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-confirmationAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "confirmationAgreed"
 type = "ConfirmationAgreed"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "confirmationDisputed"
 type = "ConfirmationDisputed"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-confirmationDisputed.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent, reason; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "confirmationException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-confirmationException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "confirmationStatus"
 type = "ConfirmationStatus"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level status, assertedEvent, proposedMatch, allegedEvent; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "consentAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-consentAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "consentException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-consentException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "consentGranted"
 type = "ConsentGranted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level type, approver, approvingPartyReference, approvalId, portfolioReference, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, tradeReferenceInformation, creditLimitInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "consentRefused"
 type = "ConsentRefused"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level type, approver, approvingPartyReference, portfolioReference, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, tradeReferenceInformation, creditLimitInformation, reason; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "creditEventAcknowledgement"
 type = "Acknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "creditEventException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "creditEventNotification"
 type = "CreditEventNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventNotification.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level creditEventNotice; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "creditEventNotificationRetracted"
 type = "CreditEventNotificationRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventNotificationRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level creditEventNotice; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "dataDocument"
 type = "DataDocument"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originatingEvent, trade, portfolio; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "dealStatement"
 type = "DealStatement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, deal, dealIdentifier, dealSummary, covenantIdentifier, covenantSummary, covenant, facilityIdentifier, facilitySummary; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "eventStatusException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-eventStatusException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "eventStatusResponse"
 type = "EventStatusResponse"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-eventStatusResponse.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statusItem; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-executionAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionAdvice"
 type = "ExecutionAdvice"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level productType, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent, quote, collateralization, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionAdviceAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-executionAdviceAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionAdviceException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-executionAdviceException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionAdviceRetracted"
 type = "ExecutionAdviceRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent, collateralization, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionNotification"
 type = "ExecutionNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, optionExercise, optionExpiry, optionEvent, additionalEvent, quote, collateralization; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "executionRetracted"
 type = "ExecutionRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "facilityNotification"
 type = "FacilityNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, facilityEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "facilityPositionStatement"
 type = "FacilityPositionStatement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, facilityPosition, positionPartyReference, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "facilityStatement"
 type = "FacilityStatement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, facilityGroup, dealIdentifier, dealSummary; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "lcNotification"
 type = "LcNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, lcEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanAllocationNotification"
 type = "LoanAllocationNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, partyReference, role, payment, loanAllocationEventGroup, settlementTask, allocationId, allocationSummary, allocation, tradeIdentifier, tradeSummary, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanBulkServicingNotification"
 type = "LoanBulkServicingNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, facilityEventGroup, lcEventGroup, loanContractEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanContractNotification"
 type = "LoanContractNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, loanContractEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanCovenantObligationNotification"
 type = "LoanCovenantObligationNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, covenantTask, dealIdentifier, dealSummary, covenantIdentifier, covenantSummary, covenant, facilityIdentifier, facilitySummary; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanLegalActionNotification"
 type = "LoanLegalActionNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityEventGroup, lcEventGroup, loanContractEventGroup, legalActionTask, legalActionStatus, legalActionApprovalStatus, legalActionIdentifier, legalActionSummary, legalAction, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanLegalActionStatement"
 type = "LoanLegalActionStatement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, legalAction, dealIdentifier, dealSummary, deal, facilityIdentifier, facilitySummary, facilityGroup, contractIdentifier, contractSummary, contract, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanNotificationAcknowledgement"
 type = "LoanNotificationAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, eventIdentifier, taskIdentifier; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanNotificationException"
 type = "LoanNotificationException"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData, eventIdentifier, taskIdentifier; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanNotificationRetracted"
 type = "LoanNotificationRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level eventIdentifier, taskIdentifier, originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanPartyProfileStatement"
 type = "LoanPartyProfileStatement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level comments, partyProfile; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "loanTradeNotification"
 type = "LoanTradeNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, partyReference, role, payment, loanTradeEventGroup, settlementTask, tradeIdentifier, tradeSummary, trade, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "maturityAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-maturityAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "maturityException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-maturityException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "maturityNotification"
 type = "MaturityNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level optionExpiry, tradeMaturity; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "messageRejected"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-messageRejected.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "optionExpirationNotification"
 type = "ExecutionNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, optionExercise, optionExpiry, optionEvent, additionalEvent, quote, collateralization; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "outstandingContractsStatement"
 type = "OutstandingContractsStatement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, dealIdentifier, dealSummary, facilityIdentifier, loanContract, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestAllocation"
 type = "RequestAllocation"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level relatedParty, blockTradeIdentifier, allocations; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestAllocationRetracted"
 type = "RequestAllocationRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level blockTradeIdentifier, allocations; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestClearing"
 type = "RequestClearing"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level portfolioReference, tradePackage, originatingEvent, trade, additionalEvent, deClear, quote; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestClearingEligibility"
 type = "RequestClearingEligibility"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level requestingPartyReference, tradePackage, originatingEvent, trade, additionalEvent, deClear; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestClearingRetracted"
 type = "RequestClearingRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestClearingRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, deClear; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestCollateralAllocation"
 type = "RequestCollateralAllocation"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestCollateralAllocation.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level serviceName, requestedAction, collateralGiverPartyReference, collateralAllocation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestConfirmation"
 type = "RequestConfirmation"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestConfirmationRetracted"
 type = "ConfirmationRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestConfirmationRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestConsent"
 type = "RequestConsent"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level requestedAction, type, approver, approvingPartyReference, portfolioReference, compressionActivity, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, deClear, quote; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestConsentRetracted"
 type = "RequestConsentRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestConsentRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level type, approver, approvingPartyReference, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, deClear; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestEventStatus"
 type = "RequestEventStatus"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestEventStatus.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level businessProcess, eventIdentifier; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestExecution"
 type = "RequestExecution"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestExecutionRetracted"
 type = "RequestExecutionRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestExecutionRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestRetransmission"
 type = "RequestRetransmission"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestRetransmission.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level portfolioReference, reportIdentification; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestTradeReferenceInformationUpdate"
 type = "RequestTradeReferenceInformationUpdate"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "requestTradeReferenceInformationUpdateRetracted"
 type = "RequestTradeReferenceInformationUpdateRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestTradeReferenceInformationUpdateRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "serviceNotification"
 type = "ServiceNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-serviceNotification.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level serviceName, status, processingStatus, advisory; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "serviceNotificationException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-serviceNotificationException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "tradeChangeAdvice"
 type = "TradeChangeAdvice"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level change, quote, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "tradeChangeAdviceAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeChangeAdviceAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "tradeChangeAdviceException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeChangeAdviceException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "tradeChangeAdviceRetracted"
 type = "TradeChangeAdviceRetracted"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeChangeAdviceRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradeIdentifier, change, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "tradeReferenceInformationUpdateAcknowledgement"
 type = "EventRequestAcknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeReferenceInformationUpdateAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "tradeReferenceInformationUpdateException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeReferenceInformationUpdateException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "valuationDocument"
 type = "ValuationDocument"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-valuationDocument.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originatingEvent, trade, portfolio, market, valuationSet; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "verificationStatusAcknowledgement"
 type = "Acknowledgement"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-verificationStatusAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "verificationStatusException"
 type = "Exception"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-verificationStatusException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
 
 [[document]]
 element = "verificationStatusNotification"
 type = "VerificationStatusNotification"
-status = "outstanding"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-verificationStatusNotification.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level status, reason, partyTradeIdentifier; nested trades and events summarized with locators into the trade and loan profiles"

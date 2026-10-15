@@ -1,0 +1,84 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-03-08T21:35:58.568Z",
+    "document_bytes": 4003,
+    "document_root": "loanTradeNotification",
+    "document_sha256": "3b4c9cf338d6fd34b59fb69c0082c1d79b5a8b27bcc5a6ea2bbcfd094f4f91a6",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-08T16:35:58.568",
+        "offset_minutes": -300,
+        "utc": "2018-03-08T21:35:58.568Z"
+      },
+      "message_id": "BBPLC00001549667579",
+      "message_id_scheme": "http://www.barclays.com/fpml/coding-scheme/internal/message-id",
+      "send_to": [
+        "GB1L104502"
+      ],
+      "sent_by": "CH1L122575",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "loan_events": [
+      {
+        "event_ids": [
+          "CH003"
+        ],
+        "event_type": "loanTradeFeeDue",
+        "locator": "/loanTradeNotification/loanTradeFeeDue"
+      }
+    ],
+    "notice_date": "2018-03-08",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "CH1L122575",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "CH1L122575"
+          }
+        ]
+      }
+    ],
+    "party_hrefs": [
+      "CH1L122575"
+    ],
+    "role": "Agent",
+    "trades": [
+      {
+        "id": "T_AGBTR_T_001",
+        "locator": "/loanTradeNotification/trade"
+      }
+    ]
+  }
+]

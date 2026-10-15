@@ -1,0 +1,58 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2011-02-04T16:42:16.100Z",
+    "document_bytes": 5646,
+    "document_root": "executionAdvice",
+    "document_sha256": "9c25c5b10642a17bd9eb7c5c55d663901db522a799d67f693009fd826ff94588",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2011-02-04T16:42:16.100",
+        "offset_minutes": 0,
+        "utc": "2011-02-04T16:42:16.100Z"
+      },
+      "message_id": "1234",
+      "message_id_scheme": "http://www.abcbank.com/coding-scheme/abcbank/message-id",
+      "sent_by": "FRONTSYSTEM",
+      "sent_by_scheme": "http://www.abcbank.com/coding-scheme/abcbank/business-unit-id-1-0"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "ABC",
+        "party_ids": [
+          {
+            "scheme": "http://www.abcbank.com/coding-scheme/abcbank/party-id",
+            "value": "ID-86278"
+          }
+        ]
+      },
+      {
+        "id": "COUNTERPARTY",
+        "party_ids": [
+          {
+            "scheme": "http://www.abcbank.com/coding-scheme/abcbank/party-id",
+            "value": "ID-6320357"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/executionAdvice/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "ABC",
+            "trade_ids": [
+              "1234512345",
+              "4853560"
+            ]
+          }
+        ],
+        "product_type": "instrumentTradeDetails",
+        "trade_date": "2016-08-25"
+      }
+    ]
+  }
+]

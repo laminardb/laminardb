@@ -1,0 +1,68 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CS/2006/07/02/32-09",
+    "correlation_id_scheme": "http://www.example.com/correlationId",
+    "creation_time_utc": "2006-07-02T16:38:00Z",
+    "document_bytes": 11812,
+    "document_root": "confirmationAgreed",
+    "document_sha256": "8cf924e049c09b5ab28a734cd19e2ee8b00a52a5d8aeaa122bca8217b44e654b",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-07-02T16:38:00",
+        "offset_minutes": 0,
+        "utc": "2006-07-02T16:38:00Z"
+      },
+      "in_reply_to": "MS/2006/04/07/15-99",
+      "message_id": "MS/2006/04/07/15-99",
+      "message_id_scheme": "http://www.example.com/messageId",
+      "send_to": [
+        "PARTYBBICXXX"
+      ],
+      "sent_by": "PARTYABICXXX"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/confirmationAgreed/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1734"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "5648"
+            ]
+          }
+        ],
+        "product_type": "returnSwap",
+        "trade_date": "2002-07-19"
+      }
+    ]
+  }
+]

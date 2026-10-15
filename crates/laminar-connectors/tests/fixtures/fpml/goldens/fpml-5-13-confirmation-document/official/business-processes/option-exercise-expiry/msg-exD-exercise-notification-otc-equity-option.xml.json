@@ -1,0 +1,64 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR019",
+    "correlation_id_scheme": "http://www.PartyA.com/schemes/correlation-id",
+    "creation_time_utc": "2000-08-26T14:57:00Z",
+    "document_bytes": 2835,
+    "document_root": "executionNotification",
+    "document_sha256": "69dc8b35fb50efa43cc840ea0fe6a2e81c48081120a43b2a6d534c0829f85beb",
+    "events": [
+      {
+        "event_type": "optionExercise",
+        "exercise_date": "2008-09-26",
+        "locator": "/executionNotification/optionExercise",
+        "outstanding_number_of_options": "0.000000000000000000",
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-26T14:57:00",
+        "offset_minutes": 0,
+        "utc": "2000-08-26T14:57:00Z"
+      },
+      "message_id": "112",
+      "message_id_scheme": "http://www.clearinghouse.com/messageId/OTC",
+      "send_to": [
+        "Party A"
+      ],
+      "sent_by": "CLEARING_HOUSE",
+      "sent_by_scheme": "http://www.clearinghouse.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 2
+  }
+]

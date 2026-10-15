@@ -1,0 +1,119 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.imgr.com/schemes/account-id",
+            "value": "FUND100"
+          }
+        ],
+        "beneficiary_href": "_fund",
+        "id": "_FUNDACCT"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.custodian.com/account-id",
+            "value": "98765"
+          }
+        ],
+        "beneficiary_href": "_cust",
+        "id": "_CUSTACCT"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "IM/F002",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2009-09-08T20:03:09Z",
+    "document_bytes": 5804,
+    "document_root": "executionAdvice",
+    "document_sha256": "50a86e1492d243071b6c95f74ca4f6dc0d9647c128d523d88bfd09608a7f7fe4",
+    "events": [
+      {
+        "agreement_date": "2009-09-08",
+        "effective_date": "2009-09-08",
+        "event_type": "amendment",
+        "locator": "/executionAdvice/amendment",
+        "payments": [
+          {
+            "id": "AMENDMENT_FEE",
+            "payer_party_href": "_fund",
+            "payment_amount": {
+              "amount": "4600.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "receiver_party_href": "_broker"
+          }
+        ],
+        "trades": [
+          {
+            "locator": "/executionAdvice/amendment/trade",
+            "party_trade_identifiers": [
+              {
+                "party_href": "_fund",
+                "trade_ids": [
+                  "CONTR3456"
+                ]
+              }
+            ],
+            "product_type": "creditDefaultSwap",
+            "trade_date": "2009-09-08"
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2009-09-08T12:03:09",
+        "offset_minutes": -480,
+        "utc": "2009-09-08T20:03:09Z"
+      },
+      "message_id": "IM/69",
+      "message_id_scheme": "http://www.imgr.com/schemes/message-id",
+      "send_to": [
+        "CUSTUS3T"
+      ],
+      "sent_by": "IMGRUS6S"
+    },
+    "is_correction": true,
+    "parties": [
+      {
+        "id": "_fund",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "INVEST MGR"
+      },
+      {
+        "id": "_broker",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E4CDNNLJRBKF36"
+          }
+        ],
+        "party_name": "BROKER 33"
+      },
+      {
+        "id": "_cust",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FNRNXH6KYKUK07"
+          }
+        ],
+        "party_name": "Custodian"
+      }
+    ],
+    "payment_reference_hrefs": [
+      "AMENDMENT_FEE"
+    ],
+    "sequence_number": 3
+  }
+]

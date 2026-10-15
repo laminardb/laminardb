@@ -1,0 +1,80 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CW/2009/01/27/123",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2009-01-27T15:38:00Z",
+    "document_bytes": 7163,
+    "document_root": "requestConfirmation",
+    "document_sha256": "0990218508f55becfc84824e06aa9c475ff5118f0344fc8fa3ae6f2d6c9ee030",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2009-01-27T15:38:00",
+        "offset_minutes": 0,
+        "utc": "2009-01-27T15:38:00Z"
+      },
+      "message_id": "123",
+      "message_id_scheme": "http://www.fpml.org/msg-id",
+      "send_to": [
+        "BIC16C"
+      ],
+      "sent_by": "BIC1"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC1"
+          }
+        ],
+        "party_name": "SwapsWire Ltd (LE)"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC6"
+          }
+        ],
+        "party_name": "Rusty"
+      },
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300IB5Q45JGNPND58"
+          }
+        ],
+        "party_name": "ClearItAll Corp"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "166555"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "166555"
+            ]
+          }
+        ],
+        "product_type": "varianceOptionTransactionSupplement",
+        "trade_date": "2009-01-27"
+      }
+    ]
+  }
+]

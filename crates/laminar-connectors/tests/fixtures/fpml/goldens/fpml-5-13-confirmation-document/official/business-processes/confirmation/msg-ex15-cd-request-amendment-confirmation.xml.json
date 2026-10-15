@@ -1,0 +1,76 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "12213243233",
+    "correlation_id_scheme": "http://www.abcbank.com/correlation-id",
+    "creation_time_utc": "2002-12-03T04:27:00Z",
+    "document_bytes": 4458,
+    "document_root": "requestConfirmation",
+    "document_sha256": "0be168c0586aa12ad8b680dab0d7ed5b6ba294081169a4c45dbc583f944878d8",
+    "events": [
+      {
+        "agreement_date": "2004-04-28",
+        "effective_date": "2004-04-30",
+        "event_type": "amendment",
+        "locator": "/requestConfirmation/amendment",
+        "trades": [
+          {
+            "locator": "/requestConfirmation/amendment/trade",
+            "party_trade_identifiers": [
+              {
+                "party_href": "party1",
+                "trade_ids": [
+                  "xyz1234"
+                ]
+              },
+              {
+                "party_href": "party2",
+                "trade_ids": [
+                  "abc1234"
+                ]
+              }
+            ],
+            "product_type": "creditDefaultSwap",
+            "trade_date": "2002-12-03"
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-12-03T04:27:00",
+        "offset_minutes": 0,
+        "utc": "2002-12-03T04:27:00Z"
+      },
+      "message_id": "5765765gt6yg76",
+      "message_id_scheme": "http://www.abcbank.com/message-Id",
+      "sent_by": "ABCBICXXX",
+      "sent_by_scheme": "http://www.abcbank.com/party-Id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "sequence_number": 1
+  }
+]

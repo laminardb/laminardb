@@ -9,7 +9,7 @@ use crate::fpml::limits::Limits;
 use crate::fpml::references::{ReferencePolicy, ReferenceRules};
 use crate::fpml::schema_model::SchemaModel;
 use crate::fpml::xsd::{TreeNames, Validator};
-use crate::fpml::{Artifact, BUNDLED_PROFILES};
+use crate::fpml::{Artifact, Profile, ProfileSource, BUNDLED_PROFILES};
 
 const TRADE_PROFILE: &str = "fpml-5-13-confirmation-trade";
 
@@ -170,6 +170,16 @@ fn trades(profile: &str) -> BTreeMap<(String, String), String> {
     trades
 }
 
+/// Asset-class profiles are the ones built on the shared trade-level columns.
+fn is_trade_class_profile(profile: &str) -> bool {
+    let loaded = Profile::load(
+        &ProfileSource::Bundled(profile.to_owned()),
+        &Artifact::bundled().unwrap(),
+    )
+    .unwrap();
+    loaded.schema().field_with_name("trade_header").is_ok()
+}
+
 /// Every schema-valid official example decodes through the trade profile: one row per
 /// confirmation-view trade, none for documents without trades.
 #[test]
@@ -185,7 +195,7 @@ fn asset_class_profiles_partition_the_trades_they_cover() {
     let all = trades(TRADE_PROFILE);
     let mut claimed: BTreeSet<(String, String)> = BTreeSet::new();
     for (profile, _) in BUNDLED_PROFILES {
-        if *profile == TRADE_PROFILE {
+        if *profile == TRADE_PROFILE || !is_trade_class_profile(profile) {
             continue;
         }
         let rows = trades(profile);

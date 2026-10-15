@@ -1,0 +1,79 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CS/2006/04/02/32-12",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2006-04-02T10:38:00Z",
+    "document_bytes": 4941,
+    "document_root": "confirmationAgreed",
+    "document_sha256": "a040b8e2123bc6b1b12bea60df264fc2eaacd0fd7e91f7d24999dca2b2f1aa7a",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-04-02T15:38:00",
+        "offset_minutes": 300,
+        "utc": "2006-04-02T10:38:00Z"
+      },
+      "in_reply_to": "MS/2006/04/02/15-10",
+      "message_id": "MS/2006/04/02/15-12",
+      "message_id_scheme": "http://www.example.com/messageId",
+      "send_to": [
+        "DEFBICXXX"
+      ],
+      "sent_by": "XYZBICXXX"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "DEFBICXXX"
+          }
+        ],
+        "party_name": "DEF Broker"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/confirmationAgreed/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "xyz1234"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "abc1234"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2002-12-03"
+      }
+    ]
+  }
+]

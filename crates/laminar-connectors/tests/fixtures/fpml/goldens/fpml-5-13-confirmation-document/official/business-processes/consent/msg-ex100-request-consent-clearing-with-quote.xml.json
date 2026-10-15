@@ -1,0 +1,79 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "456",
+    "correlation_id_scheme": "http://www.clearingsvc.com/conversationId/OTC",
+    "creation_time_utc": "2006-01-01T04:01:00Z",
+    "document_bytes": 4514,
+    "document_root": "requestConsent",
+    "document_sha256": "211cad86581fa21452e0ae4ecb95a17f4345f0aa009ad99a2745e9643637392a",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-01-01T09:01:00",
+        "offset_minutes": 300,
+        "utc": "2006-01-01T04:01:00Z"
+      },
+      "message_id": "123",
+      "message_id_scheme": "http://www.clearingsvc.com/messageId/OTC",
+      "send_to": [
+        "ABC"
+      ],
+      "sent_by": "CLEARCO",
+      "sent_by_scheme": "http://www.clearingsvc.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      },
+      {
+        "id": "member-firm",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "54930091VMX9E6ST6216"
+          }
+        ]
+      }
+    ],
+    "quotes": [
+      {
+        "currency": "USD",
+        "measure_type": "NPV",
+        "side": "Mid",
+        "value": "123000.000000000000000000"
+      },
+      {
+        "currency": "USD",
+        "measure_type": "ParallelShiftInterestRateSensitivity",
+        "quote_units": "BasisPointValue",
+        "side": "Mid",
+        "value": "125.000000000000000000"
+      }
+    ],
+    "requested_action": "Clearing",
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConsent/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "clearing-svc",
+            "trade_ids": [
+              "SVC_001"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2002-12-02"
+      }
+    ]
+  }
+]

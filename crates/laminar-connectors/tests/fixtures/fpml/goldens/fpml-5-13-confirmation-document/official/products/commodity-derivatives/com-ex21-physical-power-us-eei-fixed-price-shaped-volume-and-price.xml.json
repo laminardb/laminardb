@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 9315,
+    "document_root": "dataDocument",
+    "document_sha256": "b0592d32ff6943556840d7be8eee0e2de8e9b4d9c5ae56fe142c38f639700e3a",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "1234"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "2345"
+            ]
+          }
+        ],
+        "product_type": "commoditySwap",
+        "trade_date": "2002-04-22"
+      }
+    ]
+  }
+]

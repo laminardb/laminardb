@@ -1,0 +1,46 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 1962,
+    "document_root": "executionAdvice",
+    "document_sha256": "c4618c85c1ae42b50c8df3eee5891909d523f56e6eb3efc930af8d5f56e55101",
+    "events": [
+      {
+        "date": "2018-03-20",
+        "event_identifiers": [
+          {
+            "event_id": "obs-1",
+            "party_href": "party1"
+          }
+        ],
+        "event_type": "observation",
+        "locator": "/executionAdvice/observation",
+        "observed_value": "0.850000000000000000"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-20T18:13:51"
+      },
+      "message_id": "1486297",
+      "message_id_scheme": "http://www.isda.org/coding-scheme/isda/message-id",
+      "send_to": [
+        "49300JZDC6K840D7F79"
+      ],
+      "sent_by": "894500DM8LVOSCMP9T34"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "894500DM8LVOSCMP9T34"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,60 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2011-03-01T08:57:00Z",
+    "document_bytes": 8012,
+    "document_root": "executionNotification",
+    "document_sha256": "d89c33d6651e00b451410c626d947af5141e947e60c197ed8180d7fcd4f26a03",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2011-03-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2011-03-01T08:57:00Z"
+      },
+      "message_id": "FX456a789b",
+      "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "EXECSRV",
+      "sent_by_scheme": "http://www.executionnotificationservice.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC Bank"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Counterparty"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "12345"
+            ]
+          }
+        ],
+        "product_type": "fxTargetKnockoutForward",
+        "trade_date": "2011-09-11"
+      }
+    ]
+  }
+]

@@ -1,0 +1,56 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-creditEventNotification",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:34:00Z",
+    "credit_event_notice": {
+      "credit_event_type": "bankruptcy",
+      "event_date": "2026-06-29",
+      "notice_date": "2026-06-30",
+      "notified_party_href": "party2",
+      "notifying_party_href": "party1",
+      "reference_entity_name": "Synthetic Reference Entity plc"
+    },
+    "document_bytes": 1574,
+    "document_root": "creditEventNotification",
+    "document_sha256": "e909980af4c1ff132c69b733db9cf2e842026f23bc6c114588f8bf34aff81d6d",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:34:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:34:00Z"
+      },
+      "message_id": "SYN-creditEventNotification",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

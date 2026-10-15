@@ -1,0 +1,68 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CW/2006/07/02/133",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2006-07-02T16:38:00Z",
+    "document_bytes": 7521,
+    "document_root": "confirmationAgreed",
+    "document_sha256": "7db258a348c5a7a86a735ab693858a590ba7d718bc865bbe5741ce28ce14b2c3",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-07-02T16:38:00",
+        "offset_minutes": 0,
+        "utc": "2006-07-02T16:38:00Z"
+      },
+      "in_reply_to": "MS/2006/04/07/15-99",
+      "message_id": "MS/2006/07/02/15-99",
+      "message_id_scheme": "http://www.example.com/messageId",
+      "send_to": [
+        "PARTYBBICXXX"
+      ],
+      "sent_by": "PARTYABICXXX"
+    },
+    "parties": [
+      {
+        "id": "kom722",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "kow029",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/confirmationAgreed/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "kom722",
+            "trade_ids": [
+              "1734"
+            ]
+          },
+          {
+            "party_href": "kow029",
+            "trade_ids": [
+              "5648"
+            ]
+          }
+        ],
+        "product_type": "dividendSwapTransactionSupplement",
+        "trade_date": "2002-07-19"
+      }
+    ]
+  }
+]

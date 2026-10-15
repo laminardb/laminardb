@@ -1,0 +1,160 @@
+[
+  {
+    "actual_build": 7,
+    "allocation_identifiers": [
+      {
+        "party_href": "EatonVance",
+        "trade_ids": [
+          "ALLOC1"
+        ]
+      },
+      {
+        "party_href": "EatonVance",
+        "trade_ids": [
+          "ALLOC2"
+        ]
+      },
+      {
+        "party_href": "EatonVance",
+        "trade_ids": [
+          "ALLOC3"
+        ]
+      }
+    ],
+    "creation_time_utc": "2017-09-26T09:30:47Z",
+    "document_bytes": 10796,
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "23b7ae4d148307a66d2b9202b430eb0678f9f323aa7e5e68172a910053e432e3",
+    "facility_identifiers": [
+      {
+        "description": "USD 1BN Term Loan B",
+        "id": "TermLoanB",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "AgentParty"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-26T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2017-09-26T09:30:47Z"
+      },
+      "implementation_specification_name": "LoanFpML",
+      "implementation_specification_version": "v5.11",
+      "message_id": "SentMessageID10",
+      "message_id_scheme": "http://www.company.com/messageIdScheme",
+      "send_to": [
+        "EatonVance"
+      ],
+      "sent_by": "JPMorganChase",
+      "sent_by_scheme": "http://www.company.com/messageAddressScheme"
+    },
+    "is_correction": false,
+    "loan_events": [
+      {
+        "event_ids": [
+          "EVENT2"
+        ],
+        "event_type": "loanAllocationSettlement",
+        "locator": "/loanAllocationNotification/loanAllocationSettlement"
+      },
+      {
+        "event_ids": [
+          "EVENT6"
+        ],
+        "event_type": "loanAllocationSettlement",
+        "locator": "/loanAllocationNotification/loanAllocationSettlement[2]"
+      },
+      {
+        "event_ids": [
+          "EVENT7"
+        ],
+        "event_type": "loanAllocationSettlement",
+        "locator": "/loanAllocationNotification/loanAllocationSettlement[3]"
+      }
+    ],
+    "loan_payments": [
+      {
+        "allocation_hrefs": [
+          "LoanAllocation1"
+        ],
+        "id": "AllocationPayment1",
+        "payer_party_href": "EatonVance",
+        "payment_amount": {
+          "amount": "4900000.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2017-09-26"
+        },
+        "receiver_party_href": "JPMorganChase"
+      }
+    ],
+    "loan_trade_identifiers": [
+      {
+        "party_href": "JPMorganChase",
+        "trade_ids": [
+          "TN12345"
+        ]
+      }
+    ],
+    "notice_date": "2017-09-26",
+    "parties": [
+      {
+        "country": "US",
+        "id": "JPMorganChase",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001011"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "EatonVance",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "EV1000001"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "Amazon",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "AMZ1111111"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "AgentParty",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001012"
+          }
+        ],
+        "party_name": "JPMorganChase"
+      }
+    ],
+    "party_hrefs": [
+      "JPMorganChase"
+    ],
+    "role": "Seller"
+  }
+]

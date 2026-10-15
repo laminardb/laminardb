@@ -1,0 +1,75 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR019",
+    "correlation_id_scheme": "http://www.PartyA.com/schemes/correlation-id",
+    "creation_time_utc": "2000-08-26T14:57:00Z",
+    "document_bytes": 3226,
+    "document_root": "executionNotification",
+    "document_sha256": "f0f1793ff8a95308a2f9e7c4c4e7d636565252d4d345796afbe20c7592a88be2",
+    "events": [
+      {
+        "event_type": "optionExercise",
+        "exercise_date": "2008-09-26",
+        "exercise_in_notional_amount": {
+          "amount": "10000000000.000000000000000000",
+          "currency": "JPY",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "locator": "/executionNotification/optionExercise",
+        "outstanding_notional_amounts": [
+          {
+            "amount": "0.000000000000000000",
+            "currency": "JPY",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-26T14:57:00",
+        "offset_minutes": 0,
+        "utc": "2000-08-26T14:57:00Z"
+      },
+      "message_id": "112",
+      "message_id_scheme": "http://www.clearinghouse.com/messageId/OTC",
+      "send_to": [
+        "Party A"
+      ],
+      "sent_by": "CLEARING_HOUSE",
+      "sent_by_scheme": "http://www.clearinghouse.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 2
+  }
+]

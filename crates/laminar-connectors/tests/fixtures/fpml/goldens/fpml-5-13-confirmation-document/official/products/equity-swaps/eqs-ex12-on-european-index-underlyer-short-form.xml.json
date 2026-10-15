@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 13607,
+    "document_root": "dataDocument",
+    "document_sha256": "8f331ee2ed70e815d57774697c50ea57104681b5f0414952eed1e6430761e8c6",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PARTY1234"
+          }
+        ],
+        "party_name": "Party 1234 Ltd"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PARTY5678"
+          }
+        ],
+        "party_name": "Party 5678 Ltd"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "1147071"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "1147071"
+            ]
+          }
+        ],
+        "product_type": "equitySwapTransactionSupplement",
+        "trade_date": "2009-01-19"
+      }
+    ]
+  }
+]

@@ -1,0 +1,56 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-verificationStatusNotification",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:47:00Z",
+    "document_bytes": 1489,
+    "document_root": "verificationStatusNotification",
+    "document_sha256": "7b01aefa8352d85488e93950cc1439ab5bb35bf45b8584ff1101a9465584ae1a",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:47:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:47:00Z"
+      },
+      "message_id": "SYN-verificationStatusNotification",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "status": "Verified",
+    "trade_identifiers": [
+      {
+        "party_href": "party1",
+        "trade_ids": [
+          "TRD-1001"
+        ]
+      }
+    ]
+  }
+]

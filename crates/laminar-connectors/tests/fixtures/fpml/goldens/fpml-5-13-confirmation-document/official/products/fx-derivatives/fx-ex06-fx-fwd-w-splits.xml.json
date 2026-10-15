@@ -1,0 +1,69 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "FX1234",
+    "correlation_id_scheme": "http://www.db.com/coding-scheme/correlationId",
+    "creation_time_utc": "2001-11-12T08:57:00Z",
+    "document_bytes": 6974,
+    "document_root": "requestConfirmation",
+    "document_sha256": "bdde696fda8b2665eb1123534299ff5d8c43b77c15a2d08e95f5d1c97d1b4e66",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2001-11-12T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2001-11-12T08:57:00Z"
+      },
+      "message_id": "FX98765",
+      "message_id_scheme": "http://www.db.com/coding-scheme/messageId",
+      "send_to": [
+        "ABNANL2A"
+      ],
+      "sent_by": "DEUTDEFF",
+      "sent_by_scheme": "http://www.db.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800QILIUD4ROSUO03"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "FX048VS"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "USABC023"
+            ]
+          }
+        ],
+        "product_type": "fxSingleLeg",
+        "trade_date": "2001-11-12"
+      }
+    ]
+  }
+]

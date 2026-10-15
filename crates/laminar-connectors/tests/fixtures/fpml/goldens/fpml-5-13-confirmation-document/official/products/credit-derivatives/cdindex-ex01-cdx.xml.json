@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 3240,
+    "document_root": "dataDocument",
+    "document_sha256": "e4c438e3d12f7967a63c39be28ec8520cc1110d1653aa3c6020f9bb3c03b0d86",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "HPFHU0OQ28E4N0NFVK49"
+          }
+        ],
+        "party_name": "New Bank, New York"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900O1WT2BXINL9612"
+          }
+        ],
+        "party_name": "Massive Bank, New York"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "CDX1234"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "1234A6"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2005-01-24"
+      }
+    ]
+  }
+]

@@ -1,0 +1,55 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2015-08-04T11:03:00Z",
+    "document_bytes": 2532,
+    "document_root": "executionNotification",
+    "document_sha256": "a18cb426b4e8cb44512dd814cbc318a70ffdd942ea5e51a73df934ed49aca03e",
+    "events": [
+      {
+        "event_type": "optionEvent",
+        "locator": "/executionNotification/optionEvent",
+        "trade_identifiers": [
+          {
+            "party_href": "p1234",
+            "trade_ids": [
+              "TRD102326382"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2015-08-04T11:03:00",
+        "offset_minutes": 0,
+        "utc": "2015-08-04T11:03:00Z"
+      },
+      "message_id": "MSG000001",
+      "message_id_scheme": "urn:hsbc:message-id",
+      "sent_by": ""
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "p1234",
+        "party_ids": [
+          {
+            "scheme": "urn:hsbc:party-id",
+            "value": "HSBCLON"
+          }
+        ]
+      },
+      {
+        "id": "p5678",
+        "party_ids": [
+          {
+            "scheme": "urn:hsbc:party-id",
+            "value": "BNPPLON"
+          }
+        ]
+      }
+    ]
+  }
+]

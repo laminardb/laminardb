@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a minimal requestConfirmationRetracted document, written
+     because the FpML 5.13 corpus has no example of this root. -->
+<requestConfirmationRetracted xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-requestConfirmationRetracted</messageId>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYB</sentBy>
+    <sendTo messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sendTo>
+    <creationTimestamp>2026-07-01T09:33:00+02:00</creationTimestamp>
+  </header>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">CORR-requestConfirmationRetracted</correlationId>
+  <sequenceNumber>1</sequenceNumber>
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+  </party>
+</requestConfirmationRetracted>

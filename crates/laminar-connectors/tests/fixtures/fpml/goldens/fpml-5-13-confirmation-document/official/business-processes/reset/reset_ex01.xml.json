@@ -1,0 +1,69 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 4174,
+    "document_root": "executionAdvice",
+    "document_sha256": "3ac24d323216a089b3bf42d9e4222f66b7aeb7c4939bfd39b945ea95e6a6ede6",
+    "events": [
+      {
+        "date": "2018-03-20",
+        "event_identifiers": [
+          {
+            "event_id": "reset-1",
+            "party_href": "party1"
+          }
+        ],
+        "event_type": "reset",
+        "locator": "/executionAdvice/reset",
+        "reset_value": "0.875000000000000000",
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234567"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "7654321"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-20T18:13:51"
+      },
+      "message_id": "1486297",
+      "message_id_scheme": "http://www.isda.org/coding-scheme/isda/message-id",
+      "send_to": [
+        "49300JZDC6K840D7F79"
+      ],
+      "sent_by": "894500DM8LVOSCMP9T34"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "894500DM8LVOSCMP9T34"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300JZDC6K840D7F79"
+          }
+        ]
+      }
+    ]
+  }
+]

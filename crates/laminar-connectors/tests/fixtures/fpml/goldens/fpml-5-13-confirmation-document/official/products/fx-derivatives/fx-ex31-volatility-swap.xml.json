@@ -1,0 +1,70 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "value": "123-acc123"
+          }
+        ],
+        "id": "accountA"
+      }
+    ],
+    "actual_build": 7,
+    "creation_time_utc": "2011-03-01T08:57:00Z",
+    "document_bytes": 4517,
+    "document_root": "executionNotification",
+    "document_sha256": "9daad904765b9c5dafef648d1eb1f9e9528a419039f091d28f5b278b45739a93",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2011-03-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2011-03-01T08:57:00Z"
+      },
+      "message_id": "FX456a789b",
+      "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "EXECSRV",
+      "sent_by_scheme": "http://www.executionnotificationservice.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "12345"
+            ]
+          }
+        ],
+        "product_type": "fxVolatilitySwap",
+        "trade_date": "2011-03-01"
+      }
+    ]
+  }
+]

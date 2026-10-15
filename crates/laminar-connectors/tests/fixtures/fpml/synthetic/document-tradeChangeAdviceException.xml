@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a minimal tradeChangeAdviceException document, written
+     because the FpML 5.13 corpus has no example of this root. -->
+<tradeChangeAdviceException xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-tradeChangeAdviceException</messageId>
+    <inReplyTo messageIdScheme="http://www.example.com/coding-scheme/message-id">REQ-tradeChangeAdviceException</inReplyTo>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYB</sentBy>
+    <sendTo messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sendTo>
+    <creationTimestamp>2026-07-01T09:12:00+02:00</creationTimestamp>
+  </header>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">CORR-tradeChangeAdviceException</correlationId>
+  <reason>
+    <reasonCode reasonCodeScheme="http://www.fpml.org/coding-scheme/reason-code">Message.Syntax</reasonCode>
+    <description>The referenced message could not be processed</description>
+  </reason>
+  <additionalData>
+    <mimeType mimeTypeScheme="http://www.example.com/coding-scheme/mime-type">text/plain</mimeType>
+    <string>Rejected by the synthetic counterparty</string>
+  </additionalData>
+</tradeChangeAdviceException>

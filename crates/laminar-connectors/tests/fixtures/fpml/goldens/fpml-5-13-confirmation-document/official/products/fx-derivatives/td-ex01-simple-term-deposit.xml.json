@@ -1,0 +1,69 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "FX65431",
+    "correlation_id_scheme": "http://www.abn.com/coding-scheme/conversationId",
+    "creation_time_utc": "2001-12-04T08:57:00Z",
+    "document_bytes": 3222,
+    "document_root": "requestConfirmation",
+    "document_sha256": "69c05f4b0cd530914f9d49886df9607c3614e13ff6d042898fc1390a99465037",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2001-12-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2001-12-04T08:57:00Z"
+      },
+      "message_id": "FX87653",
+      "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+      "send_to": [
+        "MIDLGB22"
+      ],
+      "sent_by": "ABNANL2A",
+      "sent_by_scheme": "http://www.abn.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "TR24TWEY5RVRQV65HD49"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "MB87623"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "AA9876"
+            ]
+          }
+        ],
+        "product_type": "termDeposit",
+        "trade_date": "2002-02-14"
+      }
+    ]
+  }
+]

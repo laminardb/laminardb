@@ -1,0 +1,85 @@
+[
+  {
+    "actual_build": 7,
+    "compression_type": "Netting",
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 5137,
+    "document_root": "clearingConfirmed",
+    "document_sha256": "a8fe8c6dc371b9ff7e9190198a65b8e3c57bb99b0f3409f85d6c51db14afd5c5",
+    "events": [
+      {
+        "agreement_date": "2010-11-06",
+        "change_in_notional_amounts": [
+          {
+            "amount": "5000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "effective_date": "2010-11-06",
+        "event_type": "termination",
+        "locator": "/clearingConfirmed/termination",
+        "original_trades": [
+          {
+            "locator": "/clearingConfirmed/termination/originalTrade",
+            "party_trade_identifiers": [
+              {
+                "party_href": "clearer",
+                "trade_ids": [
+                  "CL000002"
+                ]
+              }
+            ],
+            "product_type": "creditDefaultSwap",
+            "trade_date": "2002-01-04"
+          }
+        ],
+        "outstanding_notional_amounts": [
+          {
+            "amount": "0.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "RBSLGB1LXXX"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "RBSLGB1LXXX"
+          }
+        ]
+      }
+    ],
+    "terminating_event": "Netting"
+  }
+]

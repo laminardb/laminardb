@@ -1,0 +1,76 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-03-12T21:35:58.568Z",
+    "document_bytes": 3078,
+    "document_root": "loanCovenantObligationNotification",
+    "document_sha256": "44495536399d9cb487ebc67f25526d579d7979da6927bbb653c0cd1feeb8716b",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-12T16:35:58.568",
+        "offset_minutes": -300,
+        "utc": "2018-03-12T21:35:58.568Z"
+      },
+      "message_id": "P00001549667579",
+      "message_id_scheme": "http://www.pimco.com/fpml/coding-scheme/internal/message-id",
+      "send_to": [
+        "KY1L151440"
+      ],
+      "sent_by": "GB1L104502",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": true,
+    "loan_obligation_identifiers": [
+      {
+        "id": "COVENANT_1",
+        "ids": [
+          "_COVENANT_OBLIGATION_1"
+        ],
+        "name": "Quarterly Financial Statements",
+        "party_href": "KY1L151440"
+      }
+    ],
+    "loan_tasks": [
+      {
+        "responsible_party_href": "KY1L151440",
+        "status": "Active",
+        "task_ids": [
+          "TASK_1"
+        ]
+      }
+    ],
+    "notice_date": "2018-03-12",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "KY1L151440",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY1L151440"
+          }
+        ]
+      }
+    ]
+  }
+]

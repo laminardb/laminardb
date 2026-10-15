@@ -1,0 +1,64 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR019",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2010-09-10T10:00:00Z",
+    "document_bytes": 4195,
+    "document_root": "requestConfirmation",
+    "document_sha256": "70e3f0367d2fc7b73a8c6e80ef9534a8d8bea7bc9123095dfae03d9e56c4f5a4",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-09-10T10:00:00",
+        "offset_minutes": 0,
+        "utc": "2010-09-10T10:00:00Z"
+      },
+      "message_id": "0485674",
+      "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+      "send_to": [
+        "CCSTUS6S"
+      ],
+      "sent_by": "AMAGGB22XXX"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "AMAG",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500T86SHG919ON888"
+          }
+        ],
+        "party_name": "International Bank Asset Management"
+      },
+      {
+        "id": "SKY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300HTD3SZJWA5TS80"
+          }
+        ],
+        "party_name": "Sky Limited"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "SKY",
+            "trade_ids": [
+              "CDS1"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2007-10-31"
+      }
+    ]
+  }
+]

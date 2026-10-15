@@ -1,0 +1,64 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "456",
+    "correlation_id_scheme": "http://www.clearingsvc.com/conversationId/OTC",
+    "creation_time_utc": "2006-01-01T04:07:00Z",
+    "document_bytes": 1995,
+    "document_root": "consentRefused",
+    "document_sha256": "30aab55f9069e4287d02d0636f6eafdb9ac06dfaa8695fd719c6a8ffde6a8df0",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-01-01T09:07:00",
+        "offset_minutes": 300,
+        "utc": "2006-01-01T04:07:00Z"
+      },
+      "in_reply_to": "123",
+      "message_id": "111",
+      "message_id_scheme": "http://www.abc.com/messageId",
+      "send_to": [
+        "ABC"
+      ],
+      "sent_by": "CLEARCO",
+      "sent_by_scheme": "http://www.clearingsvc.com/partyId"
+    },
+    "parties": [
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      },
+      {
+        "id": "member-firm",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "54930091VMX9E6ST6216"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 2,
+    "trade_reference_information": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "clearing-svc",
+          "trade_ids": [
+            "SVC_001"
+          ]
+        },
+        {
+          "party_href": "member-firm",
+          "trade_ids": [
+            "ABC999"
+          ]
+        }
+      ]
+    }
+  }
+]

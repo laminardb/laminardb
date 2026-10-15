@@ -1,0 +1,105 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 6815,
+    "document_root": "executionAdvice",
+    "document_sha256": "a663c041fe5ad3ba5aae2da4d2c3ffe2fd3eff52417ac0ad9d0e8f7fb46f36d3",
+    "events": [
+      {
+        "date": "2018-01-18",
+        "event_identifiers": [
+          {
+            "event_id": "obs-1",
+            "party_href": "party1"
+          }
+        ],
+        "event_type": "observation",
+        "locator": "/executionAdvice/observation",
+        "observed_value": "0.870000000000000000"
+      },
+      {
+        "date": "2018-02-18",
+        "event_identifiers": [
+          {
+            "event_id": "obs-2",
+            "party_href": "party1"
+          }
+        ],
+        "event_type": "observation",
+        "locator": "/executionAdvice/observation[2]",
+        "observed_value": "0.875000000000000000"
+      },
+      {
+        "date": "2018-03-18",
+        "event_identifiers": [
+          {
+            "event_id": "obs-3",
+            "party_href": "party1"
+          }
+        ],
+        "event_type": "observation",
+        "locator": "/executionAdvice/observation[3]",
+        "observed_value": "0.880000000000000000"
+      },
+      {
+        "date": "2018-03-20",
+        "event_identifiers": [
+          {
+            "event_id": "reset-1",
+            "party_href": "party1"
+          }
+        ],
+        "event_type": "reset",
+        "locator": "/executionAdvice/reset",
+        "reset_value": "0.875000000000000000",
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234567"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "7654321"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-20T18:13:51"
+      },
+      "message_id": "1486297",
+      "message_id_scheme": "http://www.isda.org/coding-scheme/isda/message-id",
+      "send_to": [
+        "49300JZDC6K840D7F79"
+      ],
+      "sent_by": "894500DM8LVOSCMP9T34"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "894500DM8LVOSCMP9T34"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300JZDC6K840D7F79"
+          }
+        ]
+      }
+    ]
+  }
+]

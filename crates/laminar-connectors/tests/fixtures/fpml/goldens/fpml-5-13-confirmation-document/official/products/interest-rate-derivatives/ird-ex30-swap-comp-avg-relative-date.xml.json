@@ -1,0 +1,51 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 22253,
+    "document_root": "dataDocument",
+    "document_sha256": "0f34265006ee32c244bc5ccf7279e0c1f7f228c134c36c1e4fcbd5757bacb6f0",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "0103"
+          }
+        ],
+        "party_name": "MarketProducts"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "0617mpm24"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "martin"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "1234567"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2005-07-31"
+      }
+    ]
+  }
+]

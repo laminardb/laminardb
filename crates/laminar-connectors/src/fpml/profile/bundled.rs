@@ -42,6 +42,10 @@ pub const BUNDLED_PROFILES: &[(&str, &str)] = &[
         "fpml-5-13-confirmation-cross-asset",
         "fpml-5-13/confirmation/trade-cross-asset.toml",
     ),
+    (
+        "fpml-5-13-confirmation-document",
+        "fpml-5-13/confirmation/document.toml",
+    ),
 ];
 
 macro_rules! profile_files {
@@ -54,6 +58,8 @@ macro_rules! profile_files {
 const FILES: &[(&str, &str)] = profile_files!(
     "fpml-5-13/confirmation/assets.toml",
     "fpml-5-13/confirmation/common.toml",
+    "fpml-5-13/confirmation/document.toml",
+    "fpml-5-13/confirmation/messages.toml",
     "fpml-5-13/confirmation/options.toml",
     "fpml-5-13/confirmation/products/commodity.toml",
     "fpml-5-13/confirmation/products/credit.toml",

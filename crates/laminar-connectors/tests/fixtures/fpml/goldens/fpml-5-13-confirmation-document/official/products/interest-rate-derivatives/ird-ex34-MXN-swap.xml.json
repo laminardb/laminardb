@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 7736,
+    "document_root": "dataDocument",
+    "document_sha256": "35e0753eba194f1fc6740849fd816df25a5509b2019db7b3829899cbb4318b75",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "Buyside"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "Sellside"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "xyz1234"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "abc1234"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2010-12-12"
+      }
+    ]
+  }
+]

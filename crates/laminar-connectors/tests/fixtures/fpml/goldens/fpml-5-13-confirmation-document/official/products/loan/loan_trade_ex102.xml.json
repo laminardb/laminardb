@@ -1,0 +1,106 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2017-09-16T09:30:47Z",
+    "document_bytes": 6767,
+    "document_root": "loanTradeNotification",
+    "document_sha256": "70399ed1cacfc8963ef00fcceecdc80d3a48dcd421f11c11a6a419871b7cdbbf",
+    "facility_identifiers": [
+      {
+        "description": "USD 1BN Term Loan B",
+        "id": "TermLoanB",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "AgentParty"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-16T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2017-09-16T09:30:47Z"
+      },
+      "implementation_specification_name": "LoanFpML",
+      "implementation_specification_version": "v5.11",
+      "message_id": "SentMessageID3",
+      "message_id_scheme": "http://www.company.com/messageIdScheme",
+      "send_to": [
+        "EatonVance"
+      ],
+      "sent_by": "JPMorganChase",
+      "sent_by_scheme": "http://www.company.com/messageAddressScheme"
+    },
+    "is_correction": false,
+    "loan_tasks": [
+      {
+        "comment": "Buyer Trade Allocation Required",
+        "responsible_party_href": "EatonVance",
+        "status": "Active",
+        "task_ids": [
+          "TASK1"
+        ]
+      }
+    ],
+    "loan_trade_identifiers": [
+      {
+        "party_href": "JPMorganChase",
+        "trade_ids": [
+          "TN12345"
+        ]
+      }
+    ],
+    "notice_date": "2017-09-16",
+    "parties": [
+      {
+        "country": "US",
+        "id": "JPMorganChase",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001011"
+          }
+        ],
+        "party_name": "JPMorganChase"
+      },
+      {
+        "country": "US",
+        "id": "EatonVance",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "EV1000001"
+          }
+        ],
+        "party_name": "EatonVance"
+      },
+      {
+        "country": "US",
+        "id": "Amazon",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "AMZ1111111"
+          }
+        ],
+        "party_name": "Amazon"
+      },
+      {
+        "country": "US",
+        "id": "AgentParty",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001012"
+          }
+        ],
+        "party_name": "JPMorganChase2"
+      }
+    ],
+    "party_hrefs": [
+      "JPMorganChase"
+    ],
+    "role": "Agent"
+  }
+]

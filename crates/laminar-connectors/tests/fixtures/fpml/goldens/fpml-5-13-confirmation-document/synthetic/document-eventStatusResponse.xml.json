@@ -1,0 +1,55 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-eventStatusResponse",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:36:00Z",
+    "document_bytes": 1597,
+    "document_root": "eventStatusResponse",
+    "document_sha256": "4e7951f96b2d8a8fc8a4f2c002e981b8b150b09a04aea820ff1096e140d4426f",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:36:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:36:00Z"
+      },
+      "in_reply_to": "REQ-eventStatusResponse",
+      "message_id": "SYN-eventStatusResponse",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "status_items": [
+      {
+        "correlation_id": "CORR-EVENT-7",
+        "sequence_number": 7,
+        "status": "Matched"
+      }
+    ]
+  }
+]

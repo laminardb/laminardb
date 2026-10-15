@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 9796,
+    "document_root": "dataDocument",
+    "document_sha256": "a2acfbded441c638d4c114c063653f9cdf2153cef368f3482cfbc5a9d0e84f28",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC1"
+          }
+        ],
+        "party_name": "SWL"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC6"
+          }
+        ],
+        "party_name": "RST"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "124897"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "124897"
+            ]
+          }
+        ],
+        "product_type": "equitySwapTransactionSupplement",
+        "trade_date": "2008-06-02"
+      }
+    ]
+  }
+]

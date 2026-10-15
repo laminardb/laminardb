@@ -1,0 +1,32 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR019",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2010-09-09T10:00:00Z",
+    "document_bytes": 1364,
+    "document_root": "executionException",
+    "document_sha256": "77ce93fb813b9804a9ad9def54ec39124605b4fde31abc051039288a1995974d",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-09-09T10:00:00",
+        "offset_minutes": 0,
+        "utc": "2010-09-09T10:00:00Z"
+      },
+      "message_id": "0485674",
+      "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+      "send_to": [
+        "CCSTUS6S"
+      ],
+      "sent_by": "AMAGGB22XXX"
+    },
+    "reasons": [
+      {
+        "description": "you are trying to exercise more options than you have",
+        "reason_code": "305"
+      }
+    ],
+    "sequence_number": 3
+  }
+]

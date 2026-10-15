@@ -1,0 +1,78 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "M00000001",
+    "correlation_id_scheme": "#clearer",
+    "creation_time_utc": "2010-11-04T08:57:00Z",
+    "document_bytes": 2230,
+    "document_root": "requestClearing",
+    "document_sha256": "18bb5ad07b1985a0d6778d91fc7f1394983c7e4ed761e36d9e073852c6aa6593",
+    "events": [
+      {
+        "effective_date": "2010-11-06",
+        "event_type": "deClear",
+        "locator": "/requestClearing/deClear",
+        "trade_identifiers": [
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "CL000001"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-11-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-11-04T08:57:00Z"
+      },
+      "implementation_specification_name": "LCH Message Spec",
+      "implementation_specification_version": "2.1",
+      "message_id": "000456",
+      "message_id_scheme": "http://www.lch.com/message-id",
+      "send_to": [
+        "LCHLGB2LXXX"
+      ],
+      "sent_by": "MATCHERXXX"
+    },
+    "is_correction": false,
+    "on_behalf_of": [
+      {
+        "party_href": "party1"
+      }
+    ],
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.lch.com/coding-scheme/party",
+            "value": "LCH"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.rbs.com/coding-scheme/party",
+            "value": "RBS"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.hsbc.com/coding-scheme/party",
+            "value": "HSBC"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

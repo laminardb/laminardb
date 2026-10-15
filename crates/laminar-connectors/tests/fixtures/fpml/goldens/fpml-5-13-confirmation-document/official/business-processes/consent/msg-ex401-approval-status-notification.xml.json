@@ -1,0 +1,59 @@
+[
+  {
+    "actual_build": 7,
+    "approvals": [
+      {
+        "approval_id": "123",
+        "approving_party_href": "party1",
+        "status": "Approved",
+        "type": "Credit"
+      }
+    ],
+    "correlation_id": "18671867",
+    "correlation_id_scheme": "http://www.party2.com/correlation-id",
+    "creation_time_utc": "2002-12-03T09:57:00Z",
+    "document_bytes": 1803,
+    "document_root": "approvalStatusNotification",
+    "document_sha256": "32a9f3afcf7ac3dfe8478cd1c15fce466889b4ab18dd2ce30dab3d6794151a13",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-12-03T09:57:00",
+        "offset_minutes": 0,
+        "utc": "2002-12-03T09:57:00Z"
+      },
+      "message_id": "123453212",
+      "message_id_scheme": "http://www.party2.com/message-id",
+      "sent_by": "PARTY2US33"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "TR24TWEY5RVRQV65HD49"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trade_identifiers": [
+      {
+        "party_href": "party1",
+        "trade_ids": [
+          "MB87623"
+        ]
+      }
+    ]
+  }
+]

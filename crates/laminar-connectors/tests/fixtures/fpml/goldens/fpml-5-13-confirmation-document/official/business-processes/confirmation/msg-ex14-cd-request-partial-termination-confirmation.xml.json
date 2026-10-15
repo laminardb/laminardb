@@ -1,0 +1,91 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "34231132432",
+    "correlation_id_scheme": "http://www.abcbank.com/correlation-Id",
+    "creation_time_utc": "2002-12-03T04:27:00Z",
+    "document_bytes": 2477,
+    "document_root": "requestConfirmation",
+    "document_sha256": "1affdb3c0364d3b78b1d8818c0c7e325b9654de28391f4044be33187e5a1f35e",
+    "events": [
+      {
+        "agreement_date": "2004-04-28",
+        "change_in_notional_amounts": [
+          {
+            "amount": "1000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "effective_date": "2004-04-30",
+        "event_type": "termination",
+        "locator": "/requestConfirmation/termination",
+        "outstanding_notional_amounts": [
+          {
+            "amount": "4000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "payments": [
+          {
+            "payer_party_href": "party1",
+            "payment_amount": {
+              "amount": "100000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjusted_date": "2004-04-30"
+            },
+            "receiver_party_href": "party2"
+          }
+        ],
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "xyz1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-12-03T04:27:00",
+        "offset_minutes": 0,
+        "utc": "2002-12-03T04:27:00Z"
+      },
+      "message_id": "5765765gt6yg76",
+      "message_id_scheme": "http://www.abcbank.com/message-Id",
+      "sent_by": "ABCBICXXX",
+      "sent_by_scheme": "http://www.abcbank.com/party-Id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "sequence_number": 1
+  }
+]

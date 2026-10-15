@@ -1,0 +1,78 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2021-12-30T10:37:45Z",
+    "document_bytes": 4433,
+    "document_root": "facilityNotification",
+    "document_sha256": "a01d942e375f6e7f957eb8e5d1a5da7e2acfb0da0892fdf5c06c10f8b82a8f81",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2021-12-30T10:37:45",
+        "offset_minutes": 0,
+        "utc": "2021-12-30T10:37:45Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "842302",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": false,
+    "loan_events": [
+      {
+        "effective_date": "2022-01-01",
+        "event_ids": [
+          "41934"
+        ],
+        "event_type": "accrualOptionChange",
+        "locator": "/facilityNotification/accrualOptionChange"
+      }
+    ],
+    "notice_date": "2021-12-30",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ]
+  }
+]

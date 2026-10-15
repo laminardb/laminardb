@@ -1,0 +1,49 @@
+[
+  {
+    "actual_build": 7,
+    "business_process": "Clearing",
+    "correlation_id": "CORR-requestEventStatus",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:40:00Z",
+    "document_bytes": 1386,
+    "document_root": "requestEventStatus",
+    "document_sha256": "64065500de09fec9897d1815658ff272affd925b005250d077171f1369c014c5",
+    "event_correlation_id": "CORR-EVENT-7",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:40:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:40:00Z"
+      },
+      "message_id": "SYN-requestEventStatus",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

@@ -1,0 +1,91 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "NovationCDS_ABC_XYZ",
+    "correlation_id_scheme": "http://www.xyzbank.com/cd-trade-id/conversationId/OTC",
+    "creation_time_utc": "2006-01-01T04:01:00Z",
+    "document_bytes": 5387,
+    "document_root": "requestConsent",
+    "document_sha256": "ab4263aaeaabf10a2866f9fef777ce9330e9b4dc7632437716c89196c08873fe",
+    "events": [
+      {
+        "event_type": "novation",
+        "locator": "/requestConsent/novation",
+        "new_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "TradeXYZ0001"
+            ]
+          }
+        ],
+        "original_trades": [
+          {
+            "locator": "/requestConsent/novation/oldTrade",
+            "party_trade_identifiers": [
+              {
+                "party_href": "party1",
+                "trade_ids": [
+                  "TradeXYZ0001"
+                ]
+              },
+              {
+                "party_href": "party2",
+                "trade_ids": [
+                  "TradeABC0001"
+                ]
+              }
+            ],
+            "product_type": "creditDefaultSwap",
+            "trade_date": "2002-12-02"
+          }
+        ],
+        "transferee_href": "party3",
+        "transferor_href": "party2"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-01-01T09:01:00",
+        "offset_minutes": 300,
+        "utc": "2006-01-01T04:01:00Z"
+      },
+      "message_id": "NovationCDS_ABC_XYZ_msg0001",
+      "message_id_scheme": "http://www.xyzbank.com/cd-trade-id/messageId/OTC",
+      "sent_by": "XYZ Bank",
+      "sent_by_scheme": "http://www.xyzbank.com/cd-trade-id/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XYZBIC345"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "54930091VMX9E6ST6216"
+          }
+        ]
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "NBKXXX342"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]
