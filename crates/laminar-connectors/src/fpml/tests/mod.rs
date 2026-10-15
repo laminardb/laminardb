@@ -2,6 +2,7 @@
 
 mod corpus;
 mod coverage;
+mod extension;
 mod goldens;
 
 use std::path::{Path, PathBuf};

@@ -216,6 +216,11 @@ name = "json_decoder"
 harness = false
 
 [[bench]]
+name = "fpml_decoder"
+harness = false
+required-features = ["fpml"]
+
+[[bench]]
 name = "schema_contract"
 harness = false
 required-features = ["kafka"]

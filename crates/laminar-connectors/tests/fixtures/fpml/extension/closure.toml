@@ -1,0 +1,11 @@
+# Example extension closure: the bundled FpML 5.13 confirmation closure plus one extension schema.
+artifact = "example-fpml-5-13-weather-1"
+base = "fpml-5-13-8-rec-2/confirmation"
+release = "5-13"
+view = "confirmation"
+namespace = "http://www.fpml.org/FpML-5/confirmation"
+extension_namespaces = ["urn:example:fpml-weather"]
+entry = "weather-extension.xsd"
+
+[files]
+"weather-extension.xsd" = "454c83fb9ab75eb5e75c551b71601ae23932fac2152cf8851dfbce6c15bd5751"

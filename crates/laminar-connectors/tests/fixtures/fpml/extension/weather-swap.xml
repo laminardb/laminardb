@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Example document for the weather extension schema (LaminarDB example, not an FpML example). -->
+<dataDocument xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:wx="urn:example:fpml-weather" fpmlVersion="5-13">
+  <trade>
+    <tradeHeader>
+      <partyTradeIdentifier>
+        <partyReference href="party1" />
+        <tradeId tradeIdScheme="urn:example:trade-id">WX-2026-001</tradeId>
+      </partyTradeIdentifier>
+      <tradeDate>2026-09-01</tradeDate>
+    </tradeHeader>
+    <wx:weatherIndexSwap>
+      <productType>Commodity:Weather:IndexSwap</productType>
+      <wx:payerPartyReference href="party1" />
+      <wx:receiverPartyReference href="party2" />
+      <wx:station>KJFK</wx:station>
+      <wx:index>HDD</wx:index>
+      <wx:strike>1250.5</wx:strike>
+      <wx:notional>
+        <currency>USD</currency>
+        <amount>20000</amount>
+      </wx:notional>
+      <wx:observationStart>2026-11-01</wx:observationStart>
+      <wx:observationEnd>2027-03-31</wx:observationEnd>
+    </wx:weatherIndexSwap>
+  </trade>
+  <party id="party1">
+    <partyId partyIdScheme="urn:example:party-id">PARTYA</partyId>
+    <partyName>Example Utility</partyName>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="urn:example:party-id">PARTYB</partyId>
+    <partyName>Example Dealer</partyName>
+  </party>
+</dataDocument>
