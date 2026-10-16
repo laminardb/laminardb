@@ -188,7 +188,7 @@ mongodb-cdc = ["laminar-db/mongodb-cdc"]
 nats = ["laminar-db/nats"]
 # FIX initiator source (builds the QuickFIX C++ engine with CMake); off by default.
 fix = ["laminar-db/fix"]
-# FpML documents on the file source (builds libxml2 with CMake); off by default.
+# FpML documents on the files and Kafka sources (builds libxml2 with CMake); off by default.
 fpml = ["laminar-db/fpml"]
 delta-lake = ["laminar-db/delta-lake", "dep:deltalake", "deltalake/datafusion"]
 delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3", "deltalake/s3"]

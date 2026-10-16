@@ -15,10 +15,9 @@
 //! document root; `|` concatenates the results of alternatives in order (FpML's
 //! value-or-reference choices). `**` is descendant-or-self,
 //! `[name]` keeps elements that have such a child (`[{set}]`: a child in the set), and `->`
-//! follows the current element's `href`. `self::name` keeps the current element only if it has
-//! that name (or, with a set, a name in the set), so a column can type one element of a union
-//! row with that element's own content model.
-//! to the element with that `id`. A value step (`@`, `#…`) may only end a selector; a selector
+//! follows the current element's `href` to the element with that `id`. `self::name` keeps the
+//! current element only if it has that name (or, with a set, a name in the set), so a column can
+//! type one element of a union row with that element's own content model. A value step (`@`, `#…`) may only end a selector; a selector
 //! ending in an element yields that element's character data.
 
 use std::collections::BTreeMap;
