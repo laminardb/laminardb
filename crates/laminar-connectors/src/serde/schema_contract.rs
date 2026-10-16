@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(binding.logical, *super::super::raw::raw_schema());
     }
 
-    /// Only a connector with its own FpML decoder may read the format; generic readers such as
+    /// Only a connector with its own `FpML` decoder may read the format; generic readers such as
     /// NATS fail at schema resolution instead of decoding documents as another format.
     #[test]
     fn generic_readers_refuse_fpml() {
