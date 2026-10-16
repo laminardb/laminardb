@@ -140,6 +140,12 @@ impl Profile {
         }
     }
 
+    /// Whether every document yields exactly one row: the rows selector is the document root.
+    #[must_use]
+    pub fn one_row_per_document(&self) -> bool {
+        matches!(self.plan.rows.alternatives.as_slice(), [only] if only.steps.is_empty())
+    }
+
     /// The Arrow schema every batch from this profile has.
     #[must_use]
     pub fn schema(&self) -> arrow_schema::SchemaRef {

@@ -103,6 +103,13 @@ impl KafkaSource {
             };
             config.set_schema_binding(binding)?;
         }
+        #[cfg(feature = "fpml")]
+        if metadata
+            .get("format")
+            .is_some_and(|format| format.eq_ignore_ascii_case("fpml"))
+        {
+            self.start_fpml(&metadata, config.schema_binding()).await?;
+        }
         self.start_inner(SourceStart::new(config, position, delivery)?)
             .await
     }

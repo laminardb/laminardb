@@ -411,6 +411,11 @@ impl KafkaSinkConfig {
                 "Debezium is a deserialization-only format and cannot be used for sinks".into(),
             ));
         }
+        if self.format == Format::Fpml {
+            return Err(ConnectorError::ConfigurationError(
+                "FpML is a source-only format and cannot be used for sinks".into(),
+            ));
+        }
 
         if self.partition_count.is_some_and(|count| count <= 0) {
             return Err(ConnectorError::ConfigurationError(

@@ -300,7 +300,7 @@ jobs:
         with:
           key: fpml-source
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev mold protobuf-compiler
       - name: Default builds exclude the native validator
         run: |
           if cargo tree -p laminar-server -e normal | grep -q laminardb-libxml2-ffi; then
@@ -308,13 +308,15 @@ jobs:
             exit 1
           fi
       - name: Clippy
-        run: cargo clippy -p laminar-connectors --no-default-features --features "fpml files" --all-targets -- -D warnings
+        run: cargo clippy -p laminar-connectors --no-default-features --features "fpml files kafka" --all-targets -- -D warnings
       - name: Validator security, schema closure, coverage manifest, goldens, and files source
         run: cargo test -p laminar-connectors --no-default-features --features "fpml files" --lib -- fpml
       - name: Independent oracle over every golden
         run: python3 tools/fpml_oracle.py
+      - name: Kafka FpML messages (in-process mock cluster)
+        run: cargo test -p laminar-connectors --no-default-features --features "kafka fpml" --lib -- kafka::source::tests::fpml
       - name: SQL end-to-end across restart
-        run: cargo test -p laminar-db --no-default-features --features fpml --test fpml_source_e2e
+        run: cargo test -p laminar-db --no-default-features --features "fpml kafka" --test fpml_source_e2e
 
   # ============================================
   # Release Build (main/develop only)

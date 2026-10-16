@@ -165,8 +165,15 @@ async fn checkpoint(db: &LaminarDB) {
 }
 
 async fn by_product(db: &LaminarDB) -> BTreeMap<String, i64> {
-    let ExecuteResult::Query(mut query) =
-        db.execute("SELECT * FROM by_product").await.expect("query")
+    counts(db, "by_product").await
+}
+
+/// A two-column (key, count) view as a map.
+async fn counts(db: &LaminarDB, view: &str) -> BTreeMap<String, i64> {
+    let ExecuteResult::Query(mut query) = db
+        .execute(&format!("SELECT * FROM {view}"))
+        .await
+        .expect("query")
     else {
         panic!("expected a query result");
     };
@@ -371,4 +378,75 @@ async fn fpml_documents_feed_sql_aggregates_windows_and_a_sink_across_restart() 
         2,
         "both swaps reach the sink once each: {legs:?}"
     );
+}
+
+/// Kafka carries one FpML document per message; the default document profile yields one row each.
+#[cfg(feature = "kafka")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fpml_kafka_messages_feed_sql() {
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+    use rdkafka::ClientConfig;
+
+    let cluster = rdkafka::mocking::MockCluster::new(1).expect("mock cluster");
+    cluster.create_topic("fpml", 1, 1).expect("topic");
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", cluster.bootstrap_servers())
+        .create()
+        .expect("producer");
+    let documents = [
+        "business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml",
+        "business-processes/allocation/msg-ex20-cds-request-allocation.xml",
+        "products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml",
+    ];
+    for path in documents {
+        let bytes = std::fs::read(Path::new(CORPUS).join(path)).expect("corpus document");
+        producer
+            .send(
+                FutureRecord::<(), [u8]>::to("fpml")
+                    .partition(0)
+                    .payload(&bytes),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce");
+    }
+
+    let dir = tempfile::tempdir().expect("dir");
+    let ddl = [
+        format!(
+            "CREATE SOURCE messages (
+                WATERMARK FOR creation_time_utc AS creation_time_utc - INTERVAL '1' SECOND
+             ) FROM KAFKA (
+                'bootstrap.servers' = '{}',
+                'topic' = 'fpml',
+                'group.id' = 'fpml-sql',
+                'startup.mode' = 'earliest'
+             ) FORMAT FPML",
+            cluster.bootstrap_servers()
+        ),
+        "CREATE MATERIALIZED VIEW by_root AS \
+         SELECT document_root, COUNT(*) AS documents FROM messages GROUP BY document_root"
+            .to_string(),
+    ];
+    let db = reopen(&dir.path().join("storage"), &ddl).await;
+    db.start().await.expect("start");
+    let expected = BTreeMap::from([
+        ("clearingConfirmed".to_string(), 1),
+        ("dataDocument".to_string(), 1),
+        ("requestAllocation".to_string(), 1),
+    ]);
+    let deadline = tokio::time::Instant::now() + CONVERGE;
+    loop {
+        let observed = counts(&db, "by_root").await;
+        if observed == expected {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "by_root {observed:?} never reached {expected:?}; fault {:?}",
+            db.last_fault()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    db.shutdown().await.expect("shutdown");
 }

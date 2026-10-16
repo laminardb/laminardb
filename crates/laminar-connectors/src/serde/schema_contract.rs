@@ -46,9 +46,9 @@ pub(crate) fn validate_reader(format: Format, schema: &SchemaRef) -> Result<(), 
                 &super::raw::raw_schema(),
             )?;
         }
-        Format::Avro => {
+        Format::Avro | Format::Fpml => {
             return Err(ConnectorError::FeatureUnsupported(
-                "Avro requires a connector-provided reader contract".into(),
+                "format requires a connector-provided reader contract".into(),
             ))
         }
     }
@@ -85,7 +85,7 @@ pub(crate) fn validate_writer(format: Format, schema: &SchemaRef) -> Result<(), 
                 ));
             }
         }
-        Format::Avro | Format::Debezium => {
+        Format::Avro | Format::Debezium | Format::Fpml => {
             return Err(ConnectorError::FeatureUnsupported(
                 "format requires a connector-provided writer contract".into(),
             ))

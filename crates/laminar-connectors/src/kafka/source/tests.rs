@@ -3223,3 +3223,197 @@ async fn notify_epoch_committed_treats_missing_consumer_as_advisory_failure() {
         .unwrap();
     assert_eq!(source.metrics.commit_failures.get(), 1);
 }
+
+#[cfg(feature = "fpml")]
+mod fpml {
+    use super::*;
+    use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    const CORPUS: &str = "tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation";
+
+    fn document(path: &str) -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(CORPUS)
+                .join(path),
+        )
+        .unwrap()
+    }
+
+    async fn produce(
+        cluster: &MockCluster<'_, rdkafka::producer::DefaultProducerContext>,
+        payloads: &[Vec<u8>],
+    ) {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", cluster.bootstrap_servers())
+            .create()
+            .unwrap();
+        for payload in payloads {
+            producer
+                .send(
+                    FutureRecord::<(), [u8]>::to("trades")
+                        .partition(0)
+                        .payload(payload.as_slice()),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn config(bootstrap: String) -> ConnectorConfig {
+        let mut config = ConnectorConfig::new("kafka");
+        config.set("bootstrap.servers", bootstrap);
+        config.set("group.id", "fpml-documents");
+        config.set("topic", "trades");
+        config.set("startup.mode", "earliest");
+        config.set("format", "fpml");
+        config.set("laminar.source.name", "fpml-source");
+        config
+    }
+
+    async fn roots(source: &mut KafkaSource, count: usize, limit: usize) -> Vec<String> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut roots = Vec::with_capacity(count);
+            while roots.len() < count {
+                let Some(batch) = source.poll_batch(limit).await.unwrap() else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                };
+                let column = batch
+                    .records
+                    .column_by_name("document_root")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone();
+                roots.extend(column.iter().map(|root| root.unwrap().to_owned()));
+            }
+            roots
+        })
+        .await
+        .expect("FpML messages arrive")
+    }
+
+    fn start(config: &ConnectorConfig, position: SourcePosition) -> SourceStart {
+        SourceStart::new(config.clone(), position, DeliveryGuarantee::AtLeastOnce).unwrap()
+    }
+
+    /// Each message is one document and one row, through the real start, poll, checkpoint, and
+    /// resume path; a malformed document stops a guaranteed source without advancing its cursor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fpml_messages_are_one_row_each_across_resume() {
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("trades", 1, 1).unwrap();
+        produce(
+            &cluster,
+            &[
+                document(
+                    "business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml",
+                ),
+                document("products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml"),
+                document("business-processes/allocation/msg-ex20-cds-request-allocation.xml"),
+            ],
+        )
+        .await;
+        let config = config(cluster.bootstrap_servers());
+        let mut source = KafkaSource::new(Arc::new(Schema::empty()), test_config(), None);
+        source
+            .start(start(&config, SourcePosition::Initial))
+            .await
+            .unwrap();
+        // A document with three trades is still one row.
+        assert_eq!(roots(&mut source, 1, 1).await, ["clearingConfirmed"]);
+        let checkpoint = source.try_checkpoint().unwrap().unwrap();
+        source.close().await.unwrap();
+
+        produce(&cluster, &[b"<dataDocument".to_vec()]).await;
+        let mut resumed = KafkaSource::new(Arc::new(Schema::empty()), test_config(), None);
+        resumed
+            .start(start(
+                &config,
+                SourcePosition::Resume {
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                    checkpoint,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            roots(&mut resumed, 2, 1).await,
+            ["dataDocument", "requestAllocation"]
+        );
+        let error = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match resumed.poll_batch(1).await {
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(5)).await,
+                    Ok(Some(batch)) => panic!("unexpected rows: {}", batch.num_rows()),
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            error.to_string().contains("FpML document rejected"),
+            "{error}"
+        );
+        assert_eq!(resumed.state, ConnectorState::Failed);
+        assert_eq!(resumed.offsets.get("trades", 0), Some(2));
+    }
+
+    #[tokio::test]
+    async fn best_effort_skips_a_rejected_fpml_message() {
+        let config = config("localhost:9092".into());
+        let binding = crate::kafka::schema_resolution::resolve_source(&config, None)
+            .await
+            .unwrap();
+        let good = document("products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml");
+        let mut lenient = test_config();
+        lenient.max_deser_error_rate = 0.5;
+        let (mut source, _tx) = queued_source(
+            lenient,
+            DeliveryGuarantee::BestEffort,
+            vec![record(30, Some(b"<oops")), record(31, Some(&good))],
+        );
+        source.start_fpml(&config, Some(&binding)).await.unwrap();
+        let batch = source.poll_batch(10).await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(source.offsets.get("events", 1), Some(31));
+    }
+
+    #[tokio::test]
+    async fn only_document_row_profiles_fit_kafka() {
+        let mut config = config("localhost:9092".into());
+        config.set("fpml.profile", "fpml-5-13-confirmation-trade");
+        let error = crate::kafka::source::fpml::resolve_kafka_profile(&config)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("must select the document root"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_fpml_contract_fails_closed() {
+        let config = config("localhost:9092".into());
+        let mut binding = crate::kafka::schema_resolution::resolve_source(&config, None)
+            .await
+            .unwrap();
+        let native = binding.value.as_mut().unwrap();
+        native
+            .identity
+            .insert("profile_sha256".into(), "0".repeat(64));
+        let mut source = KafkaSource::new(Arc::new(Schema::empty()), test_config(), None);
+        let error = source
+            .start_fpml(&config, Some(&binding))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ConnectorError::SchemaMismatch(_)),
+            "{error}"
+        );
+    }
+}

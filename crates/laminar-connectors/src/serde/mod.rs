@@ -36,6 +36,10 @@ pub enum Format {
 
     /// Apache Avro format (with optional Confluent Schema Registry).
     Avro,
+
+    /// One complete `FpML` document per record, validated and projected by the `fpml`
+    /// feature's decoder (source-only).
+    Fpml,
 }
 
 impl Format {
@@ -48,6 +52,7 @@ impl Format {
             Format::Raw => "raw",
             Format::Debezium => "debezium",
             Format::Avro => "avro",
+            Format::Fpml => "fpml",
         }
     }
 
@@ -71,6 +76,7 @@ impl std::str::FromStr for Format {
             "raw" | "bytes" => Ok(Format::Raw),
             "debezium" | "debezium-json" => Ok(Format::Debezium),
             "avro" | "confluent-avro" => Ok(Format::Avro),
+            "fpml" => Ok(Format::Fpml),
             other => Err(SerdeError::UnsupportedFormat(other.to_string())),
         }
     }
@@ -182,6 +188,9 @@ pub fn create_deserializer(format: Format) -> Result<Box<dyn RecordDeserializer>
         Format::Avro => Err(SerdeError::UnsupportedFormat(
             "Avro requires a connector-provided deserializer".into(),
         )),
+        Format::Fpml => Err(SerdeError::UnsupportedFormat(
+            "FpML requires a connector-provided decoder".into(),
+        )),
     }
 }
 
@@ -200,6 +209,9 @@ pub fn create_serializer(format: Format) -> Result<Box<dyn RecordSerializer>, Se
         )),
         Format::Avro => Err(SerdeError::UnsupportedFormat(
             "Avro requires a connector-provided serializer".into(),
+        )),
+        Format::Fpml => Err(SerdeError::UnsupportedFormat(
+            "FpML is a source-only format".into(),
         )),
     }
 }

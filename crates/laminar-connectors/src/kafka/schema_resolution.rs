@@ -74,6 +74,11 @@ pub(super) async fn resolve_source_with_registry(
     existing: Option<&SchemaRegistryClient>,
 ) -> Result<SchemaBinding, ConnectorError> {
     let parsed = KafkaSourceConfig::from_config(config)?;
+    #[cfg(feature = "fpml")]
+    if parsed.format == Format::Fpml {
+        reject_registry_for_plain_format(config)?;
+        return resolve_fpml_source(config, &parsed, explicit).await;
+    }
     if parsed.format != Format::Avro {
         reject_registry_for_plain_format(config)?;
         let reader =
@@ -116,6 +121,30 @@ pub(super) async fn resolve_source_with_registry(
         &parsed.metadata.output_schema(&cached.arrow_schema),
     )?;
     binding.value = Some(native_contract(config, &subject, cached)?);
+    Ok(binding)
+}
+
+/// The profile's schema is the payload; the binding records the closure and profile identity
+/// that a restart must find unchanged.
+#[cfg(feature = "fpml")]
+async fn resolve_fpml_source(
+    config: &ConnectorConfig,
+    parsed: &KafkaSourceConfig,
+    explicit: Option<SchemaRef>,
+) -> Result<SchemaBinding, ConnectorError> {
+    let (_, artifact, profile) = super::source::fpml::resolve_kafka_profile(config).await?;
+    let payload = profile.schema();
+    let fixed = crate::schema::resolution::fixed_binding(config, explicit, &payload)?;
+    let declared = Arc::new(fixed.logical);
+    parsed.metadata.validate_payload(&declared)?;
+    let mut binding = logical_binding(
+        config,
+        SchemaDirection::Source,
+        fixed.origin,
+        &parsed.metadata.output_schema(&declared),
+    )?;
+    bind_external(&mut binding, &parsed.metadata.output_schema(&payload))?;
+    binding.value = Some(profile.native_schema(&artifact));
     Ok(binding)
 }
 
