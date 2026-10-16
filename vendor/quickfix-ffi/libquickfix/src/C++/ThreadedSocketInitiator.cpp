@@ -115,12 +115,15 @@ void ThreadedSocketInitiator::onStop() {
     m_threads.clear();
   }
 
+  // LaminarDB: these sockets left the map, so only this call may close them, and only after
+  // their threads stop reading them.
   for (i = threads.begin(); i != threads.end(); ++i) {
-    socket_close(i->first);
+    socket_shutdown(i->first);
   }
 
   for (i = threads.begin(); i != threads.end(); ++i) {
     thread_join(i->second);
+    socket_close(i->first);
   }
   threads.clear();
 }
@@ -177,6 +180,7 @@ void ThreadedSocketInitiator::doConnect(const SessionID &s, const Dictionary &d)
         delete pair;
         pConnection->disconnect();
         delete pConnection;
+        socket_close(socket);
         setDisconnected(s);
       }
     }
@@ -196,6 +200,7 @@ void ThreadedSocketInitiator::removeThread(socket_handle s) {
   if (i != m_threads.end()) {
     thread_detach(i->second);
     m_threads.erase(i);
+    socket_close(s);
   }
 }
 

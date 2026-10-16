@@ -140,11 +140,21 @@ void ThreadedSocketAcceptor::onStop() {
     m_threads.clear();
   }
 
+  // LaminarDB: these sockets left the map, so only this call may close them. A listening socket
+  // is closed first because shutdown does not wake `accept` on every platform; a connection
+  // socket is closed only after its thread stops reading it.
   for (i = threads.begin(); i != threads.end(); ++i) {
-    socket_close(i->first);
+    if (m_sockets.count(i->first)) {
+      socket_close(i->first);
+    } else {
+      socket_shutdown(i->first);
+    }
   }
   for (i = threads.begin(); i != threads.end(); ++i) {
     thread_join(i->second);
+    if (!m_sockets.count(i->first)) {
+      socket_close(i->first);
+    }
   }
 }
 
@@ -160,6 +170,7 @@ void ThreadedSocketAcceptor::removeThread(socket_handle s) {
   if (i != m_threads.end()) {
     thread_detach(i->second);
     m_threads.erase(i);
+    socket_close(s);
   }
 }
 
