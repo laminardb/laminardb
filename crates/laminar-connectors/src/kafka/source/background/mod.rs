@@ -61,7 +61,7 @@ impl KafkaBlockingTasks {
         // code path may clone the grouped terminal guard for provider work.
         let retired = Arc::clone(&self.retired);
         let terminal_guard = Arc::clone(&self.terminal_guard);
-        handles.push(tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             let _terminal_guard = terminal_guard;
             if retired.load(Ordering::Acquire) {
                 let _ = result_tx.send(Err(KafkaBlockingTaskError::Retired));
@@ -73,14 +73,35 @@ impl KafkaBlockingTasks {
             } else {
                 let _ = result_tx.send(Ok(result));
             }
-        }));
+        });
+        let id = worker.id();
+        handles.push(worker);
         drop(handles);
 
         let result = result_rx
             .await
             .map_err(|_| KafkaBlockingTaskError::WorkerDropped)?;
+        // The worker sends its result just before it exits; join it so a caller holding the
+        // result never observes this task as still running.
+        self.join(id).await;
         self.reap_finished().await;
         result
+    }
+
+    async fn join(&self, id: tokio::task::Id) {
+        let worker = {
+            let mut handles = self.handles.lock().await;
+            handles
+                .iter()
+                .position(|handle| handle.id() == id)
+                .map(|index| handles.swap_remove(index))
+        };
+        let Some(worker) = worker else {
+            return;
+        };
+        if let Err(error) = worker.await {
+            warn!(%error, "Kafka blocking worker failed");
+        }
     }
 
     pub(super) async fn reap_finished(&self) {
