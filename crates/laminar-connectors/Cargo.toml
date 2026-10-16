@@ -194,7 +194,7 @@ fix = ["dep:quickfix-ffi", "dep:xxhash-rust", "dep:tokio-rustls", "dep:webpki-ro
 # FpML document decoder (XSD-validated, profile-projected). Builds libxml2 with CMake.
 fpml = ["dep:libxml2-ffi", "dep:quick-xml", "dep:toml"]
 # NATS core + JetStream source and sink
-nats =["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
+nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
 [dev-dependencies]
 apache-avro = { workspace = true }
