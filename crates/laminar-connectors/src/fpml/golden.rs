@@ -9,23 +9,34 @@ use arrow_array::types::{
     Date32Type, Decimal128Type, Int32Type, Int64Type, TimestampNanosecondType, UInt32Type,
     UInt64Type,
 };
-use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, TimeUnit};
+use std::collections::BTreeMap;
+
+use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Fields, TimeUnit};
 use serde_json::{Map, Value};
 
 /// One JSON object per row.
 pub(crate) fn rows(batch: &RecordBatch) -> Vec<Value> {
+    let schema = batch.schema();
     (0..batch.num_rows())
-        .map(|row| {
-            let mut object = Map::new();
-            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-                if let Some(value) = render(column.as_ref(), row) {
-                    object.insert(field.name().clone(), value);
-                }
-            }
-            Value::Object(object)
-        })
+        .map(|row| object(schema.fields(), batch.columns(), row))
         .collect()
+}
+
+/// Keys are inserted in sorted order so the text is identical whether or not another crate in the
+/// build enables `serde_json/preserve_order`.
+fn object(fields: &Fields, columns: &[ArrayRef], row: usize) -> Value {
+    let sorted: BTreeMap<&str, Value> = fields
+        .iter()
+        .zip(columns)
+        .filter_map(|(field, column)| Some((field.name().as_str(), render(column.as_ref(), row)?)))
+        .collect();
+    Value::Object(
+        sorted
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect::<Map<_, _>>(),
+    )
 }
 
 fn render(array: &dyn Array, row: usize) -> Option<Value> {
@@ -61,16 +72,7 @@ fn render(array: &dyn Array, row: usize) -> Option<Value> {
                     .to_string()
             })
         }
-        DataType::Struct(fields) => {
-            let array = array.as_struct();
-            let mut object = Map::new();
-            for (field, child) in fields.iter().zip(array.columns()) {
-                if let Some(value) = render(child.as_ref(), row) {
-                    object.insert(field.name().clone(), value);
-                }
-            }
-            Value::Object(object)
-        }
+        DataType::Struct(fields) => object(fields, array.as_struct().columns(), row),
         DataType::List(_) => {
             let list = array.as_list::<i32>();
             let values = list.value(row);
