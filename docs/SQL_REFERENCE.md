@@ -78,6 +78,18 @@ CREATE SOURCE fills (
 )
 ```
 
+FpML documents (`fpml` feature) arrive through the files or Kafka source with `FORMAT FPML`; a
+projection profile supplies the schema, so declare at most a watermark. See
+[FpML source](FPML_SOURCE.md) for profiles, options, and the recovery contract:
+
+```sql
+CREATE SOURCE rates (
+    WATERMARK FOR creation_time_utc AS creation_time_utc - INTERVAL '1' SECOND
+) FROM FILES (
+    'path' = '/data/fpml', 'fpml.profile' = 'fpml-5-13-confirmation-rates'
+) FORMAT FPML;
+```
+
 **Rust side:**
 ```rust
 #[derive(Record)]

@@ -1,0 +1,59 @@
+[
+  {
+    "actual_build": 7,
+    "clearing_status_items": [
+      {
+        "clearing_status": "AwaitingAcceptance",
+        "trade_identifiers": [
+          {
+            "party_href": "sef",
+            "trade_ids": [
+              "SEF01"
+            ]
+          }
+        ]
+      }
+    ],
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 1881,
+    "document_root": "clearingStatus",
+    "document_sha256": "f62fab8521d16cfd61eed4799dbdbb254daad4e894ebcc7f850fb28359d5940c",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "SEF001"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "parties": [
+      {
+        "id": "sef",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SEFCO"
+          }
+        ]
+      },
+      {
+        "id": "broker2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "QLM_BANK"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,84 @@
+[
+  {
+    "correlation_id": "CORR/2007/01/02/2342322",
+    "creation_time_utc": "2007-01-05T15:38:00Z",
+    "creation_timestamp": {
+      "local": "2007-01-05T15:38:00",
+      "offset_minutes": 0,
+      "utc": "2007-01-05T15:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "4294cd36e8fbb6a8ae6ac28374688d7766aa4e1ae17064af383792ff86a3f5b9",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2003Credit"
+      ],
+      "master_agreement_date": "1997-11-05",
+      "master_agreement_type": "ISDA",
+      "master_confirmation_date": "2004-09-20",
+      "master_confirmation_type": "DJ.CDX.NA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "2342342",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      },
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300IB5Q45JGNPND58"
+          }
+        ],
+        "party_name": "ClearItAll Corp"
+      }
+    ],
+    "product_type": "creditDefaultSwapOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABIC1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/coding-scheme/trade-id",
+              "value": "Trade234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-01-16"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 855,
+    "document_root": "valuationDocument",
+    "document_sha256": "6b7612de5f3193c0c4af0e3cf7783fd0c06930a83dd610356221faac221702ac",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "valuation_set_ids": [
+      "valuations1"
+    ]
+  }
+]

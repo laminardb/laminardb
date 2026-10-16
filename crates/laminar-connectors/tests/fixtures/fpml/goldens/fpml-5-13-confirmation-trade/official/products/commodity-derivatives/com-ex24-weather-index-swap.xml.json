@@ -1,0 +1,75 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "609517700fdd4afbbb7abfafaf094b2fa15fd77f947f5c06b4447677e7660a21",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "ART Reinsurance LLC"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500QCC36R89FI3U25"
+          }
+        ],
+        "party_name": "Mountain Ski Resorts Inc."
+      }
+    ],
+    "product_type": "commoditySwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5299000NIGT14YW8ZD26"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "969500QCC36R89FI3U25"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2011-05-09"
+    },
+    "trade_ordinal": 0
+  }
+]

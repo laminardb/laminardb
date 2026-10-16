@@ -1,0 +1,111 @@
+[
+  {
+    "correlation_id": "FX987",
+    "creation_time_utc": "2001-10-01T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2001-10-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-10-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "9b5a94b5da9dcad9bb3c4427e68490ec3a8cc637ac30aad1926d43054fdfc0fb",
+    "fpml_version": "5-13",
+    "fx_single_leg": {
+      "details": {
+        "exchange_rate": {
+          "quoted_currency_pair": {
+            "currency1": "GBP",
+            "currency2": "USD",
+            "quote_basis": "Currency2PerCurrency1"
+          },
+          "rate": "1.480000000000000000"
+        },
+        "exchanged_currency1": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "10000000.000000000000000000",
+            "currency": "GBP",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party1"
+        },
+        "exchanged_currency2": {
+          "payer_party_href": "party1",
+          "payment_amount": {
+            "amount": "14800000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party2"
+        },
+        "value_date": "2001-10-25"
+      },
+      "product": {}
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.matchingservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000SCC07UI6DB380"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900DTJ5A7S5UCBB52"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "MATCHSRV",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000SCC07UI6DB380"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.citi.com/fx/trade-id",
+              "value": "CITI123"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900DTJ5A7S5UCBB52"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclays.com/fx/trade-id",
+              "value": "BARC987"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-10-23"
+    },
+    "trade_ordinal": 0
+  }
+]

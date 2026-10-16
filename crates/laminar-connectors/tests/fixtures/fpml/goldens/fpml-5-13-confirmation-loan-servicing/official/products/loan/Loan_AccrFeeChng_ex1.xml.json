@@ -1,0 +1,103 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2014-11-13T07:30:47Z",
+    "creation_timestamp": {
+      "local": "2014-11-13T07:30:47",
+      "offset_minutes": 0,
+      "utc": "2014-11-13T07:30:47Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "cfb684af34086a8a7460524a3036a14665c68a91e10a81de9195cb1eef2660e4",
+    "event": {
+      "accrual_options": [
+        {
+          "accrual_option_id": "549731",
+          "day_count_fraction": "30/360",
+          "fee_type": "Utilization",
+          "fixed_rate": "0.007500000000000000",
+          "option_type": "accruingFeeOption",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 3
+          },
+          "start_date": "2014-11-10"
+        }
+      ],
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "comment": "This is a comment field. Optional added information.",
+        "event_identifiers": [
+          {
+            "event_id": "2432312",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-11-10",
+      "facility_href": "FAC12345"
+    },
+    "event_type": "accruingFeeChange",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "656114",
+    "notice_date": "2014-11-13",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/accruingFeeChange",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

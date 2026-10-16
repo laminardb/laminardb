@@ -1,0 +1,160 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "creation_time_utc": "2014-06-24T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2014-06-24T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2014-06-24T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "518b40bba315e174e4fb77cdd95f7eba92e5c74957e88162d5eeae92c561d238",
+    "fpml_version": "5-13",
+    "fx_accrual_digital_option": {
+      "buyer_party_href": "partyB",
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxAccrualDigitalOption"
+          }
+        ]
+      },
+      "seller_party_href": "partyA",
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "day_type": "Business",
+            "end_date": "2014-09-30",
+            "number_of_fixings": 70,
+            "start_date": "2014-06-25"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "DEFR",
+                  "hour_minute_time": "14:15:00"
+                },
+                "rate_source": "Reuters",
+                "rate_source_page": "ECB37"
+              },
+              "quoted_currency_pair": {
+                "currency1": "EUR",
+                "currency2": "HKD",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "lower_bound": {
+                "condition": "Above"
+              },
+              "observable_href": "ob1"
+            }
+          ]
+        },
+        "barriers": [
+          {
+            "accrual_retention": "Keep",
+            "barrier_type": "Knockout",
+            "condition": "AtOrAbove",
+            "scope": "Global",
+            "style": "American",
+            "trigger_rate": {
+              "initial_value": "10.770000000000000000"
+            }
+          }
+        ],
+        "expiry_date": {
+          "adjusted_date": "2014-09-30",
+          "date_adjustments": {
+            "business_centers": [
+              "EUTA",
+              "HKHK"
+            ],
+            "business_day_convention": "FOLLOWING"
+          }
+        },
+        "notional_amount": {
+          "currency": "HKD",
+          "initial_value": "100000.000000000000000000"
+        },
+        "settlement_date": {
+          "adjusted_date": "2014-10-06",
+          "date_adjustments": {
+            "business_centers": [
+              "EUTA",
+              "HKHK"
+            ],
+            "business_day_convention": "FOLLOWING"
+          }
+        }
+      },
+      "trigger": {
+        "quoted_currency_pair": {
+          "currency1": "EUR",
+          "currency2": "HKD",
+          "quote_basis": "Currency2PerCurrency1"
+        },
+        "trigger_condition": "AtOrAbove",
+        "trigger_rate": "10.700000000000000000"
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxAccrualDigitalOption",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300SRLRVTR996F086"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "#partyA",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-06-24"
+    },
+    "trade_ordinal": 0
+  }
+]

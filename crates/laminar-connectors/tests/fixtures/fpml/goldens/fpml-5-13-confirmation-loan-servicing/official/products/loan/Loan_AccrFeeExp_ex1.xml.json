@@ -1,0 +1,81 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2012-12-17T11:38:45Z",
+    "creation_timestamp": {
+      "local": "2012-12-17T11:38:45",
+      "offset_minutes": 0,
+      "utc": "2012-12-17T11:38:45Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "d012b8517f299612af77008423b5d21b6474fe1c0d7494355601d6c15efe0b04",
+    "event": {
+      "accrual_type_id": "73501",
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "61382",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2012-12-31",
+      "facility_href": "FAC12345",
+      "fee_type": "Utilization"
+    },
+    "event_type": "accruingFeeExpiry",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "842301",
+    "notice_date": "2012-12-17",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/accruingFeeExpiry",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

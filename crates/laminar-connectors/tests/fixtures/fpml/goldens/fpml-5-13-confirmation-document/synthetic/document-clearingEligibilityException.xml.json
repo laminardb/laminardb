@@ -1,0 +1,35 @@
+[
+  {
+    "actual_build": 7,
+    "additional_data_mime_type": "text/plain",
+    "additional_data_text": "Rejected by the synthetic counterparty",
+    "correlation_id": "CORR-clearingEligibilityException",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:01:00Z",
+    "document_bytes": 1435,
+    "document_root": "clearingEligibilityException",
+    "document_sha256": "ae484a56582868001b903da8ae58d4936d0be0f1b4119fddbc280ca9cdf52c76",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:01:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:01:00Z"
+      },
+      "in_reply_to": "REQ-clearingEligibilityException",
+      "message_id": "SYN-clearingEligibilityException",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "reasons": [
+      {
+        "description": "The referenced message could not be processed",
+        "reason_code": "Message.Syntax"
+      }
+    ]
+  }
+]

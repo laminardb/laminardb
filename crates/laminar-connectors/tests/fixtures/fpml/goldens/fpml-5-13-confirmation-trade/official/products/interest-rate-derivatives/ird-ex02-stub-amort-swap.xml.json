@@ -1,0 +1,68 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "a6d905dfd1fb34ae589cd3001817e1560a99c904ee472f29ce9e23305b378998",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900DTJ5A7S5UCBB52"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "TW9235"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900DTJ5A7S5UCBB52"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclays.com/swaps/trade-id",
+              "value": "SW2000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "1994-12-12"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,186 @@
+[
+  {
+    "commodity_digital_option": {
+      "feature_payment_amount": {
+        "amount": "20000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "notional_amount": {
+        "amount": "20000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Commodity:Energy:NatGas:Option:Cash"
+          }
+        ]
+      },
+      "terms": {
+        "buyer_party_href": "PartyB",
+        "calculation_periods": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_dates": [
+            "2013-09-29"
+          ]
+        },
+        "commodity": {
+          "commodity_base": "Natural Gas",
+          "commodity_details": "Gas Storage",
+          "currency": "USD",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+              "value": "NATURAL GAS-EIA-WEEKLY NATURAL GAS STORAGE REPORT"
+            }
+          ],
+          "publication_rate_source": "Energy-Information-Agency",
+          "publication_rate_source_page": "Weekly Natural Gas Storage Report",
+          "specified_price": "Index",
+          "unit": "BCF"
+        },
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2013-04-10"
+          }
+        },
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_dates": [
+            {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NONE"
+                },
+                "unadjusted_date": "2013-09-29"
+              }
+            }
+          ],
+          "payment_dates": {
+            "relative": {
+              "calculation_periods_href": "CalculationPeriods",
+              "pay_relative_to": "TerminationOrExpirationDate",
+              "payment_days_offset": {
+                "business_day_convention": "NONE",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 5
+              }
+            }
+          },
+          "style": "europeanExercise"
+        },
+        "notional": {},
+        "option_type": "Call",
+        "premiums": [
+          {
+            "payer_party_href": "PartyB",
+            "payment_amount": {
+              "amount": "62000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "relative_date": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "TradeDate",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "premium_per_unit": {
+              "amount": "0.000010000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "receiver_party_href": "PartyA"
+          }
+        ],
+        "pricing_dates": {
+          "calculation_periods_href": "CalculationPeriods",
+          "pricing_dates": [
+            {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_dates": [
+                "2013-09-29"
+              ]
+            }
+          ]
+        },
+        "seller_party_href": "PartyA"
+      },
+      "trigger": {
+        "level_quantity": "62.000000000000000000",
+        "level_unit": "BCF",
+        "trigger_type": "Less"
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "55f4405480e3b5a6f143190f65d33b9cc4bf364cbfe69def3d3acb64f5a5813d",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "product_type": "commodityDigitalOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "95980020140005196564"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "ABCD1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-05-10"
+    },
+    "trade_ordinal": 0
+  }
+]

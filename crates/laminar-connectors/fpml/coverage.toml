@@ -1,0 +1,1725 @@
+# FpML coverage manifest. The oracle is the pinned closure: every member of the `product`
+# substitution group, every loan facility and loan event representation, and every global
+# element derived from `Document`. CI fails when an oracle member is missing here, and when a
+# `typed` entry lacks its profile column or golden evidence. `outstanding` entries are counted
+# and fail the release gate (FPML_RELEASE_GATE=1). Levels: 1 = validated ingestion with
+# recoverable preservation, 2 = typed projection of the economic structure, 3 = additional
+# business-rule or lifecycle interpretation (not implemented for any entry).
+
+[closure]
+artifact = "fpml-5-13-8-rec-2/confirmation"
+
+[[product]]
+element = "bondOption"
+type = "BondOption"
+asset_class = "interest-rate"
+status = "typed"
+profile = "fpml-5-13-confirmation-rates"
+column = "bond_option"
+notes = "Buyer/seller, option type, premium, exercise, notional or entitlement, settlement, strike, underlying bond or convertible bond identity and terms"
+
+[[product]]
+element = "brokerEquityOption"
+type = "BrokerEquityOption"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "broker_equity_option"
+notes = "Equity option terms plus delta crossed, brokerage fee and broker notes"
+
+[[product]]
+element = "bulletPayment"
+type = "BulletPayment"
+asset_class = "interest-rate"
+status = "typed"
+profile = "fpml-5-13-confirmation-rates"
+column = "bullet_payment"
+notes = "The single payment: payer, receiver, amount, adjustable date"
+
+[[product]]
+element = "capFloor"
+type = "CapFloor"
+asset_class = "interest-rate"
+status = "typed"
+profile = "fpml-5-13-confirmation-rates"
+column = "cap_floor"
+notes = "Cap/floor stream (shared InterestRateStream mapping incl. cap and floor rate schedules), premiums, early termination"
+
+[[product]]
+element = "commodityBasketOption"
+type = "CommodityBasketOption"
+asset_class = "commodity"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_basket_option"
+notes = "Buyer/seller, put/call, dates, calculation periods, basket type, underlyings (commodity, pricing dates, quantity or weight), basket notional, strike references and price, exercise, premiums"
+
+[[product]]
+element = "commodityDigitalOption"
+type = "CommodityDigitalOption"
+asset_class = "commodity"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_digital_option"
+notes = "Buyer/seller, put/call, commodity, Asian terms, digital trigger and feature payment, notional amount or quantity, exercise and payment dates, premiums"
+
+[[product]]
+element = "commodityForward"
+type = "CommodityForward"
+asset_class = "commodity"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_forward"
+notes = "Value date, fixed or average-price leg, bullion or metal physical leg with quantity, delivery location and settlement date"
+
+[[product]]
+element = "commodityOption"
+type = "CommodityOption"
+asset_class = "commodity"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_option"
+notes = "Buyer/seller, put/call, commodity, Asian calculation periods and pricing dates, barrier and trigger, notional quantity, American/European exercise and payment dates, fixed, scheduled or floating strike, physical option underlying swap or forward value date with physical exercise, weather notional, premiums"
+
+[[product]]
+element = "commodityPerformanceSwap"
+type = "CommodityPerformanceSwap"
+asset_class = "commodity"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_performance_swap"
+notes = "Dates, settlement currency, interest, return and variance legs (parties, calculation and payment dates, commodity or basket underlyings, notional amount or href, return formula and initial price, variance or volatility strike, annualization, fixed rate and day count), market disruption"
+
+[[product]]
+element = "commoditySwap"
+type = "CommoditySwap"
+asset_class = "commodity"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_swap"
+notes = "Effective/termination dates, settlement currency, legs by type (fixed price or schedule, floating with commodity reference, pricing dates, averaging, spread; physical gas/oil/electricity/coal/environmental with delivery periods, product type and quantities), calculation and payment dates, notional quantity or quantity href, weather legs, market disruption"
+
+[[product]]
+element = "commoditySwaption"
+type = "CommoditySwaption"
+asset_class = "commodity"
+status = "typed"
+profile = "fpml-5-13-confirmation-commodity"
+column = "commodity_swaption"
+notes = "Buyer/seller, put/call, the underlying commodity swap (dates, legs, physical delivery), physical exercise, premium"
+
+[[product]]
+element = "correlationSwap"
+type = "CorrelationSwap"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "correlation_swap"
+notes = "Correlation leg (parties, dates, underlyer basket, settlement, valuation, observation start, dividends, levels, notional amount, correlation strike, number of data series), additional payments"
+
+[[product]]
+element = "creditDefaultSwap"
+type = "CreditDefaultSwap"
+asset_class = "credit"
+status = "typed"
+profile = "fpml-5-13-confirmation-credit"
+column = "credit_default_swap"
+notes = "General terms (dates, buyer/seller, single-name reference entity and obligations, index name/series/annex/factor and exclusions, basket reference pool, nth/mth-to-default, tranche), fee leg (initial, single and periodic payments, fixed or floating), protection terms (credit events, obligations), cash and physical settlement terms"
+
+[[product]]
+element = "creditDefaultSwapOption"
+type = "CreditDefaultSwapOption"
+asset_class = "credit"
+status = "typed"
+profile = "fpml-5-13-confirmation-credit"
+column = "credit_default_swap_option"
+notes = "Buyer/seller, option type, premium, American/Bermuda/European exercise, procedure, notional or notional reference, settlement, strike spread/price/reference, and the underlying credit default swap mapped in full"
+
+[[product]]
+element = "dividendSwapOptionTransactionSupplement"
+type = "DividendSwapOptionTransactionSupplement"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "dividend_swap_option_transaction_supplement"
+notes = "Option terms as for varianceOptionTransactionSupplement and the underlying dividend swap transaction supplement"
+
+[[product]]
+element = "dividendSwapTransactionSupplement"
+type = "DividendSwapTransactionSupplement"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "dividend_swap_transaction_supplement"
+notes = "Dividend leg (parties, underlyer, settlement, declared cash and cash-equivalent dividend percentages), fixed leg payments, underlyer provisions"
+
+[[product]]
+element = "equityAccumulator"
+type = "EquityAccumulator"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_accumulator"
+synthetic = ["equity-accumulator.xml"]
+notes = "Buyer/seller, notional, underlyer, forward and spot price, shares per day, maximum trading days, gearing, guaranteed period, observation periods, expiration, settlement, knock-out level or target performance"
+
+[[product]]
+element = "equityForward"
+type = "EquityForward"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_forward"
+notes = "Equity derivative terms as for equityOption plus forward price"
+
+[[product]]
+element = "equityOption"
+type = "EquityOption"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_option"
+notes = "Buyer/seller, option type, effective date, underlyer (single asset or basket with constituents), notional, exercise style and dates, valuation, settlement, method of adjustment, strike, spot, number of options, entitlement, premium"
+
+[[product]]
+element = "equityOptionTransactionSupplement"
+type = "EquityOptionTransactionSupplement"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-options"
+column = "equity_option_transaction_supplement"
+notes = "Equity option terms plus exchange look-alike, nearest exchange-traded contract, index annex fallbacks and jurisdictions"
+
+[[product]]
+element = "equitySwapTransactionSupplement"
+type = "EquitySwapTransactionSupplement"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "equity_swap_transaction_supplement"
+notes = "Return swap body as for returnSwap plus early termination elections, break fees, underlyer provisions"
+
+[[product]]
+element = "fra"
+type = "Fra"
+asset_class = "interest-rate"
+status = "typed"
+profile = "fpml-5-13-confirmation-rates"
+column = "fra"
+notes = "Parties, dates, notional, fixed rate, floating index and tenors, discounting, additional payments"
+
+[[product]]
+element = "fxAccrualDigitalOption"
+type = "FxAccrualDigitalOption"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_accrual_digital_option"
+notes = "Buyer/seller, accrual terms, digital trigger, barriers, premiums"
+
+[[product]]
+element = "fxAccrualForward"
+type = "FxAccrualForward"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_accrual_forward"
+notes = "Notional schedule, accrual observables and regions, fixing/expiry/settlement schedules, linear payoff regions (strike, bounds, leverage, caps), average rate, barriers, cash settlement"
+
+[[product]]
+element = "fxAccrualOption"
+type = "FxAccrualOption"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_accrual_option"
+notes = "Buyer/seller, put/call currencies, accrual terms, strike or counter-currency amount or average strike, average rate, barriers, premiums"
+
+[[product]]
+element = "fxDigitalOption"
+type = "FxDigitalOption"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_digital_option"
+notes = "Buyer/seller, exercise, touch and trigger conditions with rates and observation window, payout, premiums"
+
+[[product]]
+element = "fxFlexibleForward"
+type = "FxFlexibleForward"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_flexible_forward"
+notes = "Buyer/seller, put/call currencies, notional and execution limits, execution period and times, settlement date, forward rate, additional payment"
+
+[[product]]
+element = "fxForwardVolatilityAgreement"
+type = "FxForwardVolatilityAgreement"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_forward_volatility_agreement"
+notes = "Buyer/seller, currency pair, fixing date and time, forward volatility strike, straddle type, tenor, exercise, notional"
+
+[[product]]
+element = "fxOption"
+type = "FxOption"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_option"
+notes = "Buyer/seller, exercise (American/European) dates and cut, procedure, put/call amounts, strike and quote basis, spot rate, barrier and Asian features, premiums with quotes, cash settlement"
+
+[[product]]
+element = "fxRangeAccrual"
+type = "FxRangeAccrual"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_range_accrual"
+notes = "Payer/receiver, accrual terms, barriers, premiums"
+
+[[product]]
+element = "fxSingleLeg"
+type = "FxSingleLeg"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_single_leg"
+notes = "Exchanged currencies with payer/receiver and amounts, dealt currency, tenor, value dates, exchange rate with spot/forward points and cross rates, non-deliverable settlement and fixings, disruption provisions (event and fallback types)"
+
+[[product]]
+element = "fxSwap"
+type = "FxSwap"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_swap"
+notes = "Near and far legs with the same FxCoreDetails mapping as fxSingleLeg"
+
+[[product]]
+element = "fxTargetKnockoutForward"
+type = "FxTargetKnockoutForward"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_target_knockout_forward"
+notes = "Currency pair, notional schedule, targets (accumulation multipliers, knockout level or count), expiry/settlement schedules, fixing source, pivot, constant/linear payoff regions, barriers, cash settlement"
+
+[[product]]
+element = "fxVarianceSwap"
+type = "FxPerformanceSwap"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_variance_swap"
+notes = "Currency pair, vega notional, fixed/floating leg parties and fixed rate, fixing source and schedule, valuation/settlement dates, annualization, mean adjustment, returns, cash settlement"
+
+[[product]]
+element = "fxVolatilitySwap"
+type = "FxPerformanceSwap"
+asset_class = "foreign-exchange"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "fx_volatility_swap"
+notes = "Same FxPerformanceSwap mapping as fxVarianceSwap"
+
+[[product]]
+element = "genericProduct"
+type = "GenericProduct"
+asset_class = "cross-asset"
+status = "typed"
+profile = "fpml-5-13-confirmation-cross-asset"
+column = "generic_product"
+synthetic = ["generic-product.xml"]
+notes = "Multi-leg flag, buyer/seller or counterparties, premium, effective/expiration/termination dates, underlyers (rate, exchange rate, asset, reference entity, index, energy product, with parties and day count), notionals, commodity, equity and option attributes, payment and reset frequencies by underlyer, settlement currency and type, additional payments"
+
+[[product]]
+element = "instrumentTradeDetails"
+type = "InstrumentTradeDetails"
+asset_class = "securities"
+status = "typed"
+profile = "fpml-5-13-confirmation-securities"
+column = "instrument_trade_details"
+notes = "Buyer/seller, underlying asset (any underlyingAsset member), quantity or nominal, quotes, coupon start and ex-dividend dates, traded flat, net and gross principal; instances inside business-event payloads are outside trade rows"
+
+[[product]]
+element = "repo"
+type = "Repo"
+asset_class = "securities-financing"
+status = "typed"
+profile = "fpml-5-13-confirmation-securities"
+column = "repo"
+notes = "Fixed or floating rate and day count, term or open duration with extension and call terms, initial margin, near and far legs (buyer/seller, settlement date and amount, FX rate, delivery, collateral valuations, repo interest), payment frequency, collateral bonds, convertibles or equities, generic security or tri-party, collateral arrangement"
+
+[[product]]
+element = "returnSwap"
+type = "ReturnSwap"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-swaps"
+column = "return_swap"
+notes = "Buyer/seller, leg types, return legs (parties, dates, underlyer, settlement, initial/final price, payment dates, notional, amount, return type), interest legs (notional, fixed or floating rate, day count, compounding), principal exchanges, additional payments, early termination parties"
+
+[[product]]
+element = "securityLending"
+type = "SecurityLending"
+asset_class = "securities-financing"
+status = "typed"
+profile = "fpml-5-13-confirmation-securities"
+column = "security_lending"
+notes = "Lender/borrower, principal security valuation, initiation and termination settlement, duration with extension and call terms, fee or rebate rate and minimum fee, day count, dividend rate, minimum billing, collateral type or tri-party, margin ratio or haircut, collateral currency and FX rate, arrangements"
+
+[[product]]
+element = "standardProduct"
+type = "StandardProduct"
+asset_class = "cross-asset"
+status = "typed"
+profile = "fpml-5-13-confirmation-cross-asset"
+column = "standard_product"
+synthetic = ["standard-product.xml"]
+notes = "Product ids and types, notional, quotes (value, measure, side, currency, time, valuation date)"
+
+[[product]]
+element = "strategy"
+type = "Strategy"
+asset_class = "cross-asset"
+status = "typed"
+profile = "fpml-5-13-confirmation-cross-asset"
+column = "strategy"
+notes = "Strategy product model, component identifiers (trade identifier and component hrefs), premium product href, and each component's product type, id, product model and parties; component economics are typed by the component's asset-class profile when traded alone, not within the strategy row"
+
+[[product]]
+element = "swap"
+type = "Swap"
+asset_class = "interest-rate"
+status = "typed"
+profile = "fpml-5-13-confirmation-rates"
+column = "swap"
+notes = "Legs, notional and FX-linked schedules, fixed/floating/inflation rates, stubs, principal exchanges, early termination; cashflows are not generated"
+
+[[product]]
+element = "swaption"
+type = "Swaption"
+asset_class = "interest-rate"
+status = "typed"
+profile = "fpml-5-13-confirmation-rates"
+column = "swaption"
+notes = "Buyer/seller, premiums, exercise style and dates, procedure, settlement, straddle flag, and the underlying swap in full"
+
+[[product]]
+element = "termDeposit"
+type = "TermDeposit"
+asset_class = "loans-and-deposits"
+status = "typed"
+profile = "fpml-5-13-confirmation-fx"
+column = "term_deposit"
+notes = "Payer/receiver, start and maturity dates, tenor, principal, fixed rate, day count, dual-currency feature, interest, payments"
+
+[[product]]
+element = "varianceOptionTransactionSupplement"
+type = "VarianceOptionTransactionSupplement"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "variance_option_transaction_supplement"
+notes = "Buyer/seller, option type, premium, exercise and valuation, look-alike, entitlement or multiplier, and the underlying variance swap transaction supplement"
+
+[[product]]
+element = "varianceSwap"
+type = "VarianceSwap"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "variance_swap"
+notes = "Variance legs (parties, dates, underlyer, settlement, valuation, observation start, dividends, initial/closing/expiring level, expected N, variance amount, variance or volatility strike, caps, vega notional), additional payments"
+
+[[product]]
+element = "varianceSwapTransactionSupplement"
+type = "VarianceSwapTransactionSupplement"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "variance_swap_transaction_supplement"
+notes = "Variance legs as for varianceSwap plus underlyer provisions"
+
+[[product]]
+element = "volatilitySwap"
+type = "VolatilitySwap"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "volatility_swap"
+synthetic = ["volatility-swap.xml"]
+notes = "Volatility legs (parties, dates, underlyer, settlement, valuation, observation start, dividends, levels, expected N, volatility cap, strike, vega notional), additional payments"
+
+[[product]]
+element = "volatilitySwapTransactionSupplement"
+type = "VolatilitySwapTransactionSupplement"
+asset_class = "equity"
+status = "typed"
+profile = "fpml-5-13-confirmation-equity-volatility"
+column = "volatility_swap_transaction_supplement"
+notes = "Volatility legs as for volatilitySwap plus underlyer provisions"
+
+[[loan]]
+element = "delayedDraw"
+group = "facilityGroup"
+type = "DelayedDraw"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency, delayedDraw, mustDrawByDate"
+
+[[loan]]
+element = "letterOfCreditFacility"
+group = "facilityGroup"
+type = "LetterOfCreditFacility"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+synthetic = ["loan-letterOfCreditFacility.xml"]
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency"
+
+[[loan]]
+element = "revolver"
+group = "facilityGroup"
+type = "Revolver"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+synthetic = ["loan-revolver.xml"]
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency"
+
+[[loan]]
+element = "termLoan"
+group = "facilityGroup"
+type = "TermLoan"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-facilities"
+column = "facility"
+notes = "Facility identity and parties; partyReference, instrumentId, description, dealReference, coBorrowerPartyReference, lcIssuingBankPartyReference, guarantorPartyReference, startDate, expiryDate, maturityDate, currentCommitment, originalCommitment, commitmentSchedule, dealFxRate, governingLaw, feature, lien, seniority, fixedRateOption, floatingRateOption, legacyFloatingRateOption, lcOption, accruingPikOption, accruingFeeOption, defaultRate, mandatoryCostRate, penaltyRate, multiCurrency"
+
+[[loan]]
+element = "accrualOptionChange"
+group = "facilityEventGroup"
+type = "AccrualOptionChange"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, fixedRateOption, floatingRateOption, legacyFloatingRateOption, loanContractReference, accruingPikOption, lcOption, letterOfCreditReference"
+
+[[loan]]
+element = "accruingFeeChange"
+group = "facilityEventGroup"
+type = "AccruingFeeChange"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, accruingFeeOption"
+
+[[loan]]
+element = "accruingFeeExpiry"
+group = "facilityEventGroup"
+type = "AccruingFeeExpiry"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, id, type"
+
+[[loan]]
+element = "accruingFeePayment"
+group = "facilityEventGroup"
+type = "AccruingFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, id, startDate, endDate, amount, accrualSchedule, projection"
+
+[[loan]]
+element = "accruingPikPayment"
+group = "facilityEventGroup"
+type = "AccruingPikPayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, startDate, endDate, amount, accrualSchedule"
+
+[[loan]]
+element = "amendmentFeePayment"
+group = "facilityEventGroup"
+type = "AmendmentFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
+
+[[loan]]
+element = "commitmentAdjustment"
+group = "facilityEventGroup"
+type = "CommitmentAdjustment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, refusalAllowed, scheduled, pik, facilityCommitment, adjustment, commitmentSchedule"
+
+[[loan]]
+element = "defaultRateChange"
+group = "facilityEventGroup"
+type = "DefaultRateChange"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference, rate"
+
+[[loan]]
+element = "defaultRateExpiry"
+group = "facilityEventGroup"
+type = "DefaultRateExpiry"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference"
+
+[[loan]]
+element = "facilityExtensionFeePayment"
+group = "facilityEventGroup"
+type = "FacilityExtensionFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
+
+[[loan]]
+element = "facilityPrepayment"
+group = "facilityEventGroup"
+type = "FacilityPrepayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
+
+[[loan]]
+element = "facilityPrepaymentFeePayment"
+group = "facilityEventGroup"
+type = "FacilityPrepaymentFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-facilityPrepaymentFeePayment.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
+
+[[loan]]
+element = "facilityTermination"
+group = "facilityEventGroup"
+type = "FacilityTermination"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference"
+
+[[loan]]
+element = "fundingFeePayment"
+group = "facilityEventGroup"
+type = "FundingFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
+
+[[loan]]
+element = "mandatoryCostRateChange"
+group = "facilityEventGroup"
+type = "MandatoryCostRateChange"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference, rate"
+
+[[loan]]
+element = "mandatoryCostRateExpiry"
+group = "facilityEventGroup"
+type = "MandatoryCostRateExpiry"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-mandatoryCostRateExpiry.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference"
+
+[[loan]]
+element = "miscFeePayment"
+group = "facilityEventGroup"
+type = "MiscFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount, type, description"
+
+[[loan]]
+element = "penaltyRateChange"
+group = "facilityEventGroup"
+type = "PenaltyRateChange"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference, rate"
+
+[[loan]]
+element = "penaltyRateExpiry"
+group = "facilityEventGroup"
+type = "PenaltyRateExpiry"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, loanContractReference"
+
+[[loan]]
+element = "upfrontFeePayment"
+group = "facilityEventGroup"
+type = "UpfrontFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
+
+[[loan]]
+element = "waiverFeePayment"
+group = "facilityEventGroup"
+type = "WaiverFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; facilityReference, amount"
+
+[[loan]]
+element = "baseRateSet"
+group = "loanContractEventGroup"
+type = "LoanContractBaseRateSet"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, fixingDate, rate, spreadAdjustment"
+
+[[loan]]
+element = "borrowing"
+group = "loanContractEventGroup"
+type = "Borrowing"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, amount, conditionsPrecedentMet"
+
+[[loan]]
+element = "breakageFeePayment"
+group = "loanContractEventGroup"
+type = "BreakageFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-breakageFeePayment.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, amount, breakageFeeClaimDate, breakageFeeCalculatedBy"
+
+[[loan]]
+element = "interestCapitalization"
+group = "loanContractEventGroup"
+type = "InterestCapitalization"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, calculationMethod, amount, accrualSchedule, projection"
+
+[[loan]]
+element = "interestPayment"
+group = "loanContractEventGroup"
+type = "LoanInterestPayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, lenderShareCalculationMethod, amount, accrualSchedule, projection"
+
+[[loan]]
+element = "legacyInterestCapitalization"
+group = "loanContractEventGroup"
+type = "LegacyInterestCapitalization"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-legacyInterestCapitalization.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, calculationMethod, amount, accrualSchedule, projection"
+
+[[loan]]
+element = "legacyInterestPayment"
+group = "loanContractEventGroup"
+type = "LegacyLoanInterestPayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+synthetic = ["loan-legacyInterestPayment.xml"]
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, startDate, endDate, calculationMethod, amount, accrualSchedule, projection"
+
+[[loan]]
+element = "loanContractAdjustment"
+group = "loanContractEventGroup"
+type = "LoanContractAdjustment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, adjustment, amount"
+
+[[loan]]
+element = "maturityChange"
+group = "loanContractEventGroup"
+type = "LoanContractMaturityChange"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, currentMaturityDate, priorMaturityDate"
+
+[[loan]]
+element = "repayment"
+group = "loanContractEventGroup"
+type = "Repayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanContractReference, amount, price, refusalAllowed, borrowerMandatory, scheduledRepayment"
+
+[[loan]]
+element = "rollover"
+group = "loanContractEventGroup"
+type = "Rollover"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; currentContracts, newContracts"
+
+[[loan]]
+element = "lcAdjustment"
+group = "lcEventGroup"
+type = "LcAdjustment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, adjustment, amount, relatedBorrowing"
+
+[[loan]]
+element = "lcFxRevaluation"
+group = "lcEventGroup"
+type = "LcFxRevaluation"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, lcFxRate, facilityFxRate"
+
+[[loan]]
+element = "lcIssuance"
+group = "lcEventGroup"
+type = "LcIssuance"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, amount"
+
+[[loan]]
+element = "lcIssuanceFeePayment"
+group = "lcEventGroup"
+type = "LcIssuanceFeePayment"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, id, startDate, endDate, amount, accrualSchedule"
+
+[[loan]]
+element = "lcRateChange"
+group = "lcEventGroup"
+type = "LcRateChange"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, rate"
+
+[[loan]]
+element = "lcRenewal"
+group = "lcEventGroup"
+type = "LcRenewal"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, finalExpiryDate, maturityDate"
+
+[[loan]]
+element = "lcTermination"
+group = "lcEventGroup"
+type = "LcTermination"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-servicing"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; letterOfCreditReference, expiry"
+
+[[loan]]
+element = "loanAllocation"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationEvent"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference"
+
+[[loan]]
+element = "loanAllocationConfirmation"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationEvent"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference"
+
+[[loan]]
+element = "loanAllocationFeeDue"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationTransferFeeDue"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, amount, dueDate"
+
+[[loan]]
+element = "loanAllocationFeeOwed"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationTransferFeeOwed"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, waivedFlag, creditAgreementAmount, agentAmount"
+
+[[loan]]
+element = "loanAllocationSettlement"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationSettlement"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, settlementDate, allocationAmount, facilityPosition, fundingFactors"
+
+[[loan]]
+element = "loanAllocationSettlementDateAvailability"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationSettlementDateAvailability"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, specificDates, startDate, endDate, onOrAfterDate, leadDays, cutOffTime, noSettlePeriod"
+
+[[loan]]
+element = "loanAllocationSettlementDateFinalization"
+group = "loanAllocationEventGroup"
+type = "LoanAllocationSettlementDateFinalization"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; allocationReference, settlementDate"
+
+[[loan]]
+element = "loanTrade"
+group = "loanTradeEventGroup"
+type = "LoanTradeEvent"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference"
+
+[[loan]]
+element = "loanTradeConfirmation"
+group = "loanTradeEventGroup"
+type = "LoanTradeEvent"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference"
+
+[[loan]]
+element = "loanTradeFeeDue"
+group = "loanTradeEventGroup"
+type = "LoanTradeTransferFeeDue"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference, amount, dueDate"
+
+[[loan]]
+element = "loanTradeFeeOwed"
+group = "loanTradeEventGroup"
+type = "LoanTradeTransferFeeOwed"
+status = "typed"
+profile = "fpml-5-13-confirmation-loan-trading"
+column = "event"
+notes = "Event identifiers (and parent, previous, corrected), lender, agent and borrower, cash payable, comment, effective date; loanTradeReference, waivedFlag, creditAgreementAmount, agentAmount"
+
+[[document]]
+element = "allocationAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "allocationApproved"
+type = "AllocationApproved"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationApproved.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level blockTradeIdentifier, allocations; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "allocationException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "allocationRefused"
+type = "AllocationRefused"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-allocationRefused.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level blockTradeIdentifier, allocations, reason; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "approvalStatusNotification"
+type = "ApprovalStatusNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level trade, tradeIdentifier, approvals; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingConfirmed"
+type = "ClearingConfirmed"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level compressionActivity, portfolioReference, tradePackage, originatingEvent, trade, additionalEvent, terminatingEvent, termination, deClear, clearing, change, quote, creditLimitInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingEligibility"
+type = "ClearingEligibility"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, deClear, partyTradeIdentifier, eligibleForClearing, clearingRequirements; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingEligibilityAcknowledgement"
+type = "Acknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingEligibilityAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingEligibilityException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingEligibilityException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingRefused"
+type = "ClearingRefused"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-clearingRefused.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, quote, reason; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "clearingStatus"
+type = "ClearingStatus"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level clearingStatusItem; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "collateralAllocationAccepted"
+type = "CollateralAllocationAccepted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-collateralAllocationAccepted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "collateralAllocationAcknowledgement"
+type = "Acknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-collateralAllocationAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "collateralAllocationRejected"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-collateralAllocationRejected.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "confirmationAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-confirmationAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "confirmationAgreed"
+type = "ConfirmationAgreed"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "confirmationDisputed"
+type = "ConfirmationDisputed"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-confirmationDisputed.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent, reason; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "confirmationException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-confirmationException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "confirmationStatus"
+type = "ConfirmationStatus"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level status, assertedEvent, proposedMatch, allegedEvent; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "consentAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-consentAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "consentException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-consentException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "consentGranted"
+type = "ConsentGranted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level type, approver, approvingPartyReference, approvalId, portfolioReference, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, tradeReferenceInformation, creditLimitInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "consentRefused"
+type = "ConsentRefused"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level type, approver, approvingPartyReference, portfolioReference, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, tradeReferenceInformation, creditLimitInformation, reason; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "creditEventAcknowledgement"
+type = "Acknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "creditEventException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "creditEventNotification"
+type = "CreditEventNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventNotification.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level creditEventNotice; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "creditEventNotificationRetracted"
+type = "CreditEventNotificationRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-creditEventNotificationRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level creditEventNotice; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "dataDocument"
+type = "DataDocument"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originatingEvent, trade, portfolio; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "dealStatement"
+type = "DealStatement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, deal, dealIdentifier, dealSummary, covenantIdentifier, covenantSummary, covenant, facilityIdentifier, facilitySummary; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "eventStatusException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-eventStatusException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "eventStatusResponse"
+type = "EventStatusResponse"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-eventStatusResponse.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statusItem; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-executionAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionAdvice"
+type = "ExecutionAdvice"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level productType, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent, quote, collateralization, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionAdviceAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-executionAdviceAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionAdviceException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-executionAdviceException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionAdviceRetracted"
+type = "ExecutionAdviceRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, change, optionExercise, optionExpiry, optionEvent, additionalEvent, collateralization, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionNotification"
+type = "ExecutionNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, optionExercise, optionExpiry, optionEvent, additionalEvent, quote, collateralization; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "executionRetracted"
+type = "ExecutionRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "facilityNotification"
+type = "FacilityNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, facilityEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "facilityPositionStatement"
+type = "FacilityPositionStatement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, facilityPosition, positionPartyReference, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "facilityStatement"
+type = "FacilityStatement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, facilityGroup, dealIdentifier, dealSummary; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "lcNotification"
+type = "LcNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, lcEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanAllocationNotification"
+type = "LoanAllocationNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, partyReference, role, payment, loanAllocationEventGroup, settlementTask, allocationId, allocationSummary, allocation, tradeIdentifier, tradeSummary, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanBulkServicingNotification"
+type = "LoanBulkServicingNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, facilityEventGroup, lcEventGroup, loanContractEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanContractNotification"
+type = "LoanContractNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityPosition, loanContractEventGroup, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanCovenantObligationNotification"
+type = "LoanCovenantObligationNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, covenantTask, dealIdentifier, dealSummary, covenantIdentifier, covenantSummary, covenant, facilityIdentifier, facilitySummary; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanLegalActionNotification"
+type = "LoanLegalActionNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, isGlobalOnly, eventPayment, facilityEventGroup, lcEventGroup, loanContractEventGroup, legalActionTask, legalActionStatus, legalActionApprovalStatus, legalActionIdentifier, legalActionSummary, legalAction, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary, contractIdentifier, contractSummary, contract, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanLegalActionStatement"
+type = "LoanLegalActionStatement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, legalAction, dealIdentifier, dealSummary, deal, facilityIdentifier, facilitySummary, facilityGroup, contractIdentifier, contractSummary, contract, letterOfCreditIdentifier, letterOfCreditSummary, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanNotificationAcknowledgement"
+type = "LoanNotificationAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, eventIdentifier, taskIdentifier; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanNotificationException"
+type = "LoanNotificationException"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData, eventIdentifier, taskIdentifier; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanNotificationRetracted"
+type = "LoanNotificationRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level eventIdentifier, taskIdentifier, originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanPartyProfileStatement"
+type = "LoanPartyProfileStatement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level comments, partyProfile; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "loanTradeNotification"
+type = "LoanTradeNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level noticeDate, partyReference, role, payment, loanTradeEventGroup, settlementTask, tradeIdentifier, tradeSummary, trade, dealIdentifier, dealSummary, facilityIdentifier, facilitySummary; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "maturityAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-maturityAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "maturityException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-maturityException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "maturityNotification"
+type = "MaturityNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level optionExpiry, tradeMaturity; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "messageRejected"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-messageRejected.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "optionExpirationNotification"
+type = "ExecutionNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, optionExercise, optionExpiry, optionEvent, additionalEvent, quote, collateralization; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "outstandingContractsStatement"
+type = "OutstandingContractsStatement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level statementDate, comments, dealIdentifier, dealSummary, facilityIdentifier, loanContract, letterOfCredit; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestAllocation"
+type = "RequestAllocation"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level relatedParty, blockTradeIdentifier, allocations; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestAllocationRetracted"
+type = "RequestAllocationRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level blockTradeIdentifier, allocations; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestClearing"
+type = "RequestClearing"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level portfolioReference, tradePackage, originatingEvent, trade, additionalEvent, deClear, quote; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestClearingEligibility"
+type = "RequestClearingEligibility"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level requestingPartyReference, tradePackage, originatingEvent, trade, additionalEvent, deClear; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestClearingRetracted"
+type = "RequestClearingRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestClearingRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, deClear; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestCollateralAllocation"
+type = "RequestCollateralAllocation"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestCollateralAllocation.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level serviceName, requestedAction, collateralGiverPartyReference, collateralAllocation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestConfirmation"
+type = "RequestConfirmation"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestConfirmationRetracted"
+type = "ConfirmationRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestConfirmationRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestConsent"
+type = "RequestConsent"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level requestedAction, type, approver, approvingPartyReference, portfolioReference, compressionActivity, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, deClear, quote; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestConsentRetracted"
+type = "RequestConsentRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestConsentRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level type, approver, approvingPartyReference, tradePackage, originatingEvent, trade, amendment, increase, terminatingEvent, termination, novation, withdrawal, observation, reset, additionalEvent, deClear; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestEventStatus"
+type = "RequestEventStatus"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestEventStatus.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level businessProcess, eventIdentifier; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestExecution"
+type = "RequestExecution"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestExecutionRetracted"
+type = "RequestExecutionRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestExecutionRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradePackage, originatingEvent, trade, additionalEvent, optionExercise; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestRetransmission"
+type = "RequestRetransmission"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestRetransmission.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level portfolioReference, reportIdentification; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestTradeReferenceInformationUpdate"
+type = "RequestTradeReferenceInformationUpdate"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "requestTradeReferenceInformationUpdateRetracted"
+type = "RequestTradeReferenceInformationUpdateRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-requestTradeReferenceInformationUpdateRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "serviceNotification"
+type = "ServiceNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-serviceNotification.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level serviceName, status, processingStatus, advisory; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "serviceNotificationException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-serviceNotificationException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "tradeChangeAdvice"
+type = "TradeChangeAdvice"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level change, quote, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "tradeChangeAdviceAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeChangeAdviceAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "tradeChangeAdviceException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeChangeAdviceException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "tradeChangeAdviceRetracted"
+type = "TradeChangeAdviceRetracted"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeChangeAdviceRetracted.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level tradeIdentifier, change, paymentDetails; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "tradeReferenceInformationUpdateAcknowledgement"
+type = "EventRequestAcknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeReferenceInformationUpdateAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage, tradeReferenceInformation; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "tradeReferenceInformationUpdateException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-tradeReferenceInformationUpdateException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "valuationDocument"
+type = "ValuationDocument"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-valuationDocument.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originatingEvent, trade, portfolio, market, valuationSet; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "verificationStatusAcknowledgement"
+type = "Acknowledgement"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-verificationStatusAcknowledgement.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level originalMessage; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "verificationStatusException"
+type = "Exception"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-verificationStatusException.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level reason, additionalData; nested trades and events summarized with locators into the trade and loan profiles"
+
+[[document]]
+element = "verificationStatusNotification"
+type = "VerificationStatusNotification"
+status = "typed"
+profile = "fpml-5-13-confirmation-document"
+column = "document_root"
+synthetic = ["document-verificationStatusNotification.xml"]
+notes = "Message envelope (header, correlation, sequence, on-behalf-of, parties, accounts); root-level status, reason, partyTradeIdentifier; nested trades and events summarized with locators into the trade and loan profiles"

@@ -1,0 +1,74 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-03-12T21:35:58.568Z",
+    "document_bytes": 2669,
+    "document_root": "loanLegalActionNotification",
+    "document_sha256": "aa0243fa3109d77be3b1f799765cb53e959e769161681f30c18b09c4760678dd",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-12T16:35:58.568",
+        "offset_minutes": -300,
+        "utc": "2018-03-12T21:35:58.568Z"
+      },
+      "message_id": "P00001549667579",
+      "message_id_scheme": "http://www.bank.com/fpml/coding-scheme/internal/message-id",
+      "send_to": [
+        "US1L142580"
+      ],
+      "sent_by": "GB1L104502",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": true,
+    "loan_obligation_identifiers": [
+      {
+        "id": "LEGAL_ACTION_1",
+        "ids": [
+          "LEGAL_ACTION_1"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "loan_statuses": [
+      {
+        "description": "The legal action has been completed.",
+        "effective_date": "2018-03-12",
+        "legal_action_href": "LEGAL_ACTION_1",
+        "type": "Completed"
+      }
+    ],
+    "notice_date": "2018-03-12",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      }
+    ]
+  }
+]

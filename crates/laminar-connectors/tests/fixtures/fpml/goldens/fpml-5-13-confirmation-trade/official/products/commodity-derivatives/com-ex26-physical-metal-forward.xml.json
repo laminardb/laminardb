@@ -1,0 +1,76 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "6c5ee80c4b4afd071e37afe97d2155949bf0b892c147b8b805f4d1cc4fcbdde3",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006",
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "BuyerPartyLEI"
+          }
+        ],
+        "party_name": "Bank A"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SellerPartyLEI"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "product_type": "commodityForward",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "BuyerPartyLEI"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.BankA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "SellerPartyLEI"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.BankB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-03-05"
+    },
+    "trade_ordinal": 0
+  }
+]

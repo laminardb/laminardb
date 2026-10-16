@@ -1,0 +1,105 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.sef.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 4193,
+    "document_root": "requestClearingEligibility",
+    "document_sha256": "405f8c2dd33c3aa249b13f17c0bad092a6bb3bfd18c3ced8d744dbc08c8af413",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.sef.com/coding-scheme/message-id",
+      "send_to": [
+        "CLEARCO"
+      ],
+      "sent_by": "SEFCORP",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "is_correction": false,
+    "on_behalf_of": [
+      {
+        "party_href": "broker1"
+      }
+    ],
+    "parties": [
+      {
+        "id": "sef",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SEFCO"
+          }
+        ]
+      },
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC_IM"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "DEF_IM"
+          }
+        ]
+      },
+      {
+        "id": "broker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XYZ_BANK"
+          }
+        ]
+      },
+      {
+        "id": "broker2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "QLM_BANK"
+          }
+        ]
+      }
+    ],
+    "requesting_party_href": "broker2",
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestClearingEligibility/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "sef",
+            "trade_ids": [
+              "SEF01"
+            ]
+          }
+        ],
+        "product_type": "fxSingleLeg",
+        "trade_date": "2010-01-04"
+      }
+    ]
+  }
+]

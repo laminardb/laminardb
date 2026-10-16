@@ -1,0 +1,39 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2017-09-09T00:45:23Z",
+    "document_bytes": 1586,
+    "document_root": "loanNotificationAcknowledgement",
+    "document_sha256": "1e76f357c21b32fbb78ba9fba2ecd0469debe35b961091ec314244a2d4b14889",
+    "event_ids": [
+      "US001"
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-08T20:45:23",
+        "offset_minutes": -240,
+        "utc": "2017-09-09T00:45:23Z"
+      },
+      "in_reply_to": "BPLC0000444445555",
+      "message_id": "X133S1441",
+      "message_id_scheme": "http://www.apexcorp.com/message-id",
+      "send_to": [
+        "US1LFM0001"
+      ],
+      "sent_by": "GB1L213246",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0"
+    },
+    "parties": [
+      {
+        "id": "BANK67890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LFM0001"
+          }
+        ]
+      }
+    ]
+  }
+]

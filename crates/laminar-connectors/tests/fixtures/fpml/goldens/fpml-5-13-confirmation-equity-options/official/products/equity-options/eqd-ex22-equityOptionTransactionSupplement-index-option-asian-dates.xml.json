@@ -1,0 +1,178 @@
+[
+  {
+    "correlation_id": "CW/2009/02/24/123488",
+    "creation_time_utc": "2002-09-24T23:08:40.335Z",
+    "creation_timestamp": {
+      "local": "2002-09-24T18:08:40.335",
+      "offset_minutes": -300,
+      "utc": "2002-09-24T23:08:40.335Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "5bcc50345b558a4bef3092301426fab7e3e0f69a5acea4f16091ee49258a1250",
+    "documentation": {
+      "master_confirmation_date": "2002-06-20",
+      "master_confirmation_type": "ISDA2004EquityAmericasInterdealer"
+    },
+    "equity_option_transaction_supplement": {
+      "option": {
+        "number_of_options": "5250.000000000000000000",
+        "premium": {
+          "payer_party_href": "Party1",
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2002-11-01"
+          },
+          "percentage_of_notional": "0.015000000000000000",
+          "price_per_option": {
+            "amount": "23.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "Party2"
+        },
+        "strike": {
+          "strike_price": "1088.000000000000000000"
+        }
+      },
+      "product": {
+        "id": "equityOption"
+      },
+      "terms": {
+        "buyer_party_href": "Party1",
+        "exercise": {
+          "automatic_exercise": true,
+          "commencement_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2002-10-31"
+            }
+          },
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2003-04-19"
+            }
+          },
+          "expiration_time_type": "Close",
+          "settlement_currency": "CHF",
+          "settlement_date": {
+            "relative_date": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "Valuation",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 2
+            }
+          },
+          "settlement_type": "Cash",
+          "style": "equityAmericanExercise",
+          "valuation": {
+            "futures_price_valuation": true,
+            "valuation_dates": {
+              "date_adjustments": {
+                "business_centers": [
+                  "NYSE"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_dates": [
+                "2002-11-01",
+                "2002-11-15",
+                "2002-12-01",
+                "2002-12-15",
+                "2003-01-01",
+                "2003-01-15",
+                "2003-02-01",
+                "2003-02-15",
+                "2003-03-01",
+                "2003-03-15",
+                "2003-04-01",
+                "2003-04-15"
+              ]
+            }
+          }
+        },
+        "notional": {
+          "amount": "1234.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "option_type": "Call",
+        "seller_party_href": "Party2",
+        "underlyer": {
+          "single": {
+            "asset_type": "index",
+            "exchange_id": "N",
+            "future_id": "0904",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/spec/2003/instrument-id-Reuters-RIC",
+                "value": ".SPX"
+              }
+            ],
+            "related_exchange_ids": [
+              "A"
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "123488-002700000099999",
+    "message_id_scheme": "perFpMLReqmt",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "DTCC00006441"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "DTCC00006440"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOptionTransactionSupplement",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "DTCC00006441",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "DTCC",
+              "value": "DTCC00006441"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "TradeRefNbr",
+              "value": "TW9236"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-10-31"
+    },
+    "trade_ordinal": 0
+  }
+]

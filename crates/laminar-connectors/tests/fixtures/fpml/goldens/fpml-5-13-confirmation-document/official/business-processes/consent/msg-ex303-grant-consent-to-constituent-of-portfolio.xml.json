@@ -1,0 +1,48 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "457",
+    "correlation_id_scheme": "http://www.clearingsvc.com/portfolioId",
+    "creation_time_utc": "2006-01-01T04:07:00Z",
+    "document_bytes": 1551,
+    "document_root": "consentGranted",
+    "document_sha256": "944c0baaa30c58812c5b7027321df845318bfcfc8514c61e4759d15cecd991c2",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-01-01T09:07:00",
+        "offset_minutes": 300,
+        "utc": "2006-01-01T04:07:00Z"
+      },
+      "in_reply_to": "124",
+      "message_id": "111",
+      "message_id_scheme": "http://www.abc.com/messageId",
+      "send_to": [
+        "ABC"
+      ],
+      "sent_by": "CLEARCO",
+      "sent_by_scheme": "http://www.clearingsvc.com/partyId"
+    },
+    "parties": [
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      },
+      {
+        "id": "member-firm",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "54930091VMX9E6ST6216"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 2
+  }
+]

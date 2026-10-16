@@ -1,0 +1,32 @@
+# Example operator profile for an extended FpML closure: every trade carrying the example weather
+# index swap, with the bundled trade-level columns and the extension product's own fields.
+include = ["bundled:fpml-5-13/confirmation/trade-columns.toml"]
+
+[profile]
+name = "example-weather-trades"
+version = 1
+description = "Example: weather index swaps from an FpML extension schema"
+artifact = "example-fpml-5-13-weather-1"
+roots = "documents"
+rows = "**/trade[tradeHeader][wx:weatherIndexSwap]"
+
+[namespaces]
+wx = "urn:example:fpml-weather"
+
+[structs.weather_index_swap]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "wx:payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "wx:receiverPartyReference/@href" },
+  { name = "payer", type = "utf8", path = "wx:payerPartyReference->partyName" },
+  { name = "station", type = "utf8", path = "wx:station" },
+  { name = "index", type = "utf8", path = "wx:index" },
+  { name = "strike", type = "decimal(18, 4)", path = "wx:strike" },
+  { name = "notional", type = "struct<money>", path = "wx:notional" },
+  { name = "observation_start", type = "date32", path = "wx:observationStart" },
+  { name = "observation_end", type = "date32", path = "wx:observationEnd" },
+]
+
+[[columns]]
+name = "weather_index_swap"
+type = "struct<weather_index_swap>"
+path = "wx:weatherIndexSwap"

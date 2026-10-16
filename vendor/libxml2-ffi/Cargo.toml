@@ -1,0 +1,27 @@
+[package]
+name = "laminardb-libxml2-ffi"
+version = "0.32.0"
+edition = "2021"
+rust-version = "1.95"
+links = "xml2"
+description = "LaminarDB-maintained static build of libxml2 2.15.4 (XML Schema validation subset) with allowlisted raw bindings"
+license = "MIT"
+repository = "https://github.com/laminardb/laminardb"
+homepage = "https://laminardb.io"
+categories = ["external-ffi-bindings"]
+build = "build.rs"
+include = [
+    "/VENDORED.md",
+    "/build.rs",
+    "/src",
+    "/libxml2",
+]
+
+[lib]
+name = "libxml2_ffi"
+path = "src/lib.rs"
+
+[dependencies]
+
+[build-dependencies]
+cmake = "0.1.52"

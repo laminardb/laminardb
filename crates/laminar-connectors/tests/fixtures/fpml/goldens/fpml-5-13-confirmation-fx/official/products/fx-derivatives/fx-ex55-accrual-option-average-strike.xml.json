@@ -1,0 +1,182 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "creation_time_utc": "2014-06-24T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2014-06-24T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2014-06-24T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "37378664209b9c0d3e57f511bb44793a7294aecb844b6deb8e08459ec020c81a",
+    "fpml_version": "5-13",
+    "fx_accrual_option": {
+      "average_strike": {
+        "id": "averageStrike",
+        "information_source": {
+          "fixing_time": {
+            "business_center": "JPTO",
+            "hour_minute_time": "15:00:00"
+          },
+          "rate_source": "Reuters",
+          "rate_source_page": "BTMFIX"
+        },
+        "quoted_currency_pair": {
+          "currency1": "USD",
+          "currency2": "JPY",
+          "quote_basis": "Currency2PerCurrency1"
+        }
+      },
+      "buyer_party_href": "partyB",
+      "call_currency": "GBP",
+      "premiums": [
+        {
+          "payer_party_href": "partyB",
+          "payment_amount": {
+            "amount": "40000000.000000000000000000",
+            "currency": "JPY",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2005-10-05"
+            }
+          },
+          "receiver_party_href": "partyA"
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "FxAccrualOption"
+          }
+        ]
+      },
+      "put_currency": "JPY",
+      "seller_party_href": "partyA",
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "day_type": "Business",
+            "end_date": "2005-10-31",
+            "number_of_fixings": 20,
+            "start_date": "2005-10-03"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "JPTO",
+                  "hour_minute_time": "15:00:00"
+                },
+                "rate_source": "Reuters",
+                "rate_source_page": "BTMFIX"
+              },
+              "quoted_currency_pair": {
+                "currency1": "USD",
+                "currency2": "JPY",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "accrual_factor": {
+                "initial_value": "2.000000000000000000"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            },
+            {
+              "lower_bound": {
+                "condition": "AtOrAbove"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            }
+          ]
+        },
+        "expiry_date": {
+          "adjusted_date": "2005-10-31"
+        },
+        "notional_amount": {
+          "currency": "GBP",
+          "initial_value": "4000000.000000000000000000"
+        },
+        "settlement_date": {
+          "adjusted_date": "2005-11-02",
+          "date_adjustments": {
+            "business_centers": [
+              "JPTO",
+              "GBLO"
+            ],
+            "business_day_convention": "FOLLOWING"
+          }
+        }
+      }
+    },
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxAccrualOption",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300SRLRVTR996F086"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "#partyA",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-10-03"
+    },
+    "trade_ordinal": 0
+  }
+]

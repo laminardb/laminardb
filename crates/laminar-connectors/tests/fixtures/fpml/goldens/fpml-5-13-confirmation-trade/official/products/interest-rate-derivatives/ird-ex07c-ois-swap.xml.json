@@ -1,0 +1,60 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "263a74b672187dfd7dbecba328597b80569eb52886f910a952c13f606794f8d6",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "A BANK(\"ABANK\")"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "SELL SECURITIES CO LTD (\"Counterparty\")"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "FpML-test-7c"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2023-02-16"
+    },
+    "trade_ordinal": 0
+  }
+]

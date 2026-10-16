@@ -46,6 +46,8 @@ mod checkpoint;
 mod debezium;
 mod decoding;
 mod drain;
+#[cfg(feature = "fpml")]
+pub(crate) mod fpml;
 mod initialization;
 mod lifecycle;
 mod metadata;
@@ -113,6 +115,9 @@ pub struct KafkaSource {
     /// Only `BestEffort` may discard records that fail deserialization.
     delivery: DeliveryGuarantee,
     deserializer: Box<dyn RecordDeserializer>,
+    /// The `FpML` decoder, started with the source for the `fpml` format.
+    #[cfg(feature = "fpml")]
+    fpml: Option<Arc<crate::fpml::FpmlDecoder>>,
     offsets: OffsetTracker,
     state: ConnectorState,
     metrics: KafkaSourceMetrics,
@@ -313,6 +318,8 @@ impl KafkaSource {
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
             deterministic_unrecorded_position: Arc::new(AtomicBool::new(false)),
             source_name: Arc::from(""),
+            #[cfg(feature = "fpml")]
+            fpml: None,
             vnode_assignment: None,
             vnode_partition_routes: KafkaPartitionRoutes::new(),
             manual_topic_partitions: std::collections::HashSet::new(),
@@ -507,9 +514,26 @@ impl std::fmt::Debug for KafkaSource {
     }
 }
 
+/// Stands in for the `FpML` decoder until the source starts it, so `FpML` messages never reach
+/// another deserializer.
+struct FpmlPending;
+
+impl RecordDeserializer for FpmlPending {
+    fn deserialize(&self, _: &[u8], _: &SchemaRef) -> Result<RecordBatch, SerdeError> {
+        Err(SerdeError::UnsupportedFormat(
+            "FpML messages decode through the FpML decoder, which starts with the source".into(),
+        ))
+    }
+
+    fn format(&self) -> Format {
+        Format::Fpml
+    }
+}
+
 fn select_deserializer(format: Format) -> Box<dyn RecordDeserializer> {
     match format {
         Format::Avro => Box::new(AvroDeserializer::new()),
+        Format::Fpml => Box::new(FpmlPending),
         other => serde::create_deserializer(other).unwrap_or_else(|_| {
             warn!(format = %other, "unsupported format, falling back to JSON");
             Box::new(serde::json::JsonDeserializer::new())

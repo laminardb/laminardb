@@ -1,0 +1,59 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 3161,
+    "document_root": "dataDocument",
+    "document_sha256": "c8f7c029ff53fada59a39a554b6ae41a037f13e65b3f6f153a76609592312e65",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      },
+      {
+        "id": "PartyC",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "TriParty Agent"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "PartyA",
+            "trade_ids": [
+              "12345678"
+            ]
+          },
+          {
+            "party_href": "PartyB",
+            "trade_ids": [
+              "8745632"
+            ]
+          }
+        ],
+        "product_type": "repo",
+        "trade_date": "2010-01-09"
+      }
+    ]
+  }
+]

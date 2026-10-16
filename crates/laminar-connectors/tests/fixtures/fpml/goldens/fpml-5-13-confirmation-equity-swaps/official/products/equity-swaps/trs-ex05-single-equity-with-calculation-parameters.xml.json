@@ -1,0 +1,222 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "4428b1c461d4d541aa338ec17eb867a1f56bf3052f298b8f9a22683c52b04fda",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "Party_1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "QGPGHQ1ENZOOLJRFTH41"
+          }
+        ],
+        "party_name": "ABCD Securities Inc."
+      },
+      {
+        "id": "Party_2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "J6W9XJWVE853A9CVRQ85"
+          }
+        ],
+        "party_name": "HedgeCo Capital L.L.C."
+      }
+    ],
+    "product_type": "returnSwap",
+    "return_swap": {
+      "body": {
+        "buyer_party_href": "Party_1",
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "calculation_method": "Compounding",
+              "floating_rate_index": "USD-SOFR",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "lookback_offset_days": 2,
+              "spread_schedules": [
+                {
+                  "initial_value": "0.002000000000000000"
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency_href": "ReturnLegPaymentCurrency",
+              "reference_amount": "StandardISDA"
+            },
+            "leg": {
+              "id": "id_InterestLeg",
+              "leg_identifiers": [
+                {
+                  "scheme": "http://www.partyA.com/leg-id",
+                  "value": "56789"
+                }
+              ],
+              "payer_party_href": "Party_1",
+              "receiver_party_href": "Party_2"
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "6243400.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            }
+          }
+        ],
+        "leg_types": [
+          "returnLeg",
+          "interestLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency": "USD",
+              "reference_amount": "StandardISDA"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2022-08-29"
+              }
+            },
+            "initial_price": {
+              "net_price": "29.450000000000000000"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NONE"
+                  },
+                  "unadjusted_date": "2021-08-20"
+                }
+              },
+              "id": "id_ReturnLeg",
+              "leg_identifiers": [
+                {
+                  "scheme": "http://www.partyA.com/leg-id",
+                  "value": "12345"
+                }
+              ],
+              "payer_party_href": "Party_2",
+              "receiver_party_href": "Party_1",
+              "termination_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NONE"
+                  },
+                  "unadjusted_date": "2022-08-31"
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "6243400.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Execution",
+            "notional_reset": true,
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "FinalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "payment_dates_interim": {
+              "relative_dates": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "InterimValuationDates",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "equity",
+                "currency": "USD",
+                "description": "US STEEL CORP",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.fpml.org/spec/2002/instrument-id-Bloomberg-1-0",
+                    "value": "X US"
+                  }
+                ]
+              },
+              "single_open_units": "212000.000000000000000000"
+            }
+          }
+        ],
+        "seller_party_href": "Party_2"
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "TotalReturnSwap"
+          }
+        ]
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party_1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "QGPGHQ1ENZOOLJRFTH41"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abc.com/swaps/trade-id",
+              "value": "TRS-01"
+            }
+          ]
+        },
+        {
+          "party_href": "Party_2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "J6W9XJWVE853A9CVRQ85"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.hedgeco.com/swaps/trade-id",
+              "value": "total-ret-swap-01"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2021-08-18"
+    },
+    "trade_id": "trs-eq1-trade",
+    "trade_ordinal": 0
+  }
+]

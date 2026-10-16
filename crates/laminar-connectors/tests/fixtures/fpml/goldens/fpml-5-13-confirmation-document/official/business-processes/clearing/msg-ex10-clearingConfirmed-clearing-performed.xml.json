@@ -1,0 +1,140 @@
+[
+  {
+    "actual_build": 7,
+    "clearing_cleared": [
+      {
+        "locator": "/clearingConfirmed/clearing/cleared/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "LCH02"
+            ]
+          }
+        ],
+        "product_type": "fxSingleLeg",
+        "trade_date": "2010-01-04"
+      },
+      {
+        "locator": "/clearingConfirmed/clearing/cleared[2]/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "LCH03"
+            ]
+          }
+        ],
+        "product_type": "fxSingleLeg",
+        "trade_date": "2010-01-04"
+      }
+    ],
+    "clearing_submitted": [
+      {
+        "locator": "/clearingConfirmed/clearing/submitted/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "sef",
+            "trade_ids": [
+              "SEF01"
+            ]
+          },
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "LCH01"
+            ]
+          }
+        ],
+        "product_type": "fxSingleLeg",
+        "trade_date": "2010-01-04"
+      }
+    ],
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 9937,
+    "document_root": "clearingConfirmed",
+    "document_sha256": "6565fa1dfef098d60a56beef19ee59a6b317d8c0f7a8d1e08e218feeeca6a5ed",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "SEF001"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "parties": [
+      {
+        "id": "sef",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "SEFCO"
+          }
+        ]
+      },
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "RBSLGB1LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "JPMCGB2L"
+          }
+        ]
+      },
+      {
+        "id": "broker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XYZ_BANK"
+          }
+        ]
+      },
+      {
+        "id": "broker2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "QLM_BANK"
+          }
+        ]
+      },
+      {
+        "id": "DCO1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "DCO Corp"
+          }
+        ]
+      }
+    ]
+  }
+]

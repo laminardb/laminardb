@@ -1,0 +1,80 @@
+[
+  {
+    "correlation_id": "IRS987",
+    "creation_time_utc": "2006-08-01T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2006-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2006-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "7a926581894dd03e1af7dadc8e60fe4932f48b84e93fa8e32afdd491edf01960",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "IRS456a789b",
+    "message_id_scheme": "http://www.partyA.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "76095221801"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "00680112001"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "partyA",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "76095221801"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "E2000098N10184"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "00680112001"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclays.com/swaps/trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "1994-12-12"
+    },
+    "trade_ordinal": 0
+  }
+]

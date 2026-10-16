@@ -1,0 +1,395 @@
+# Commodity products: commoditySwap (fixed, floating, and physical gas, oil, electricity, coal,
+# and environmental legs, or weather legs), commodityForward (bullion and metal), commodityOption
+# (financial, physical, and weather), commoditySwaption, commodityDigitalOption,
+# commodityBasketOption, and commodityPerformanceSwap. Quantity and calculation-period references
+# are kept as hrefs: several official examples point them at elements other than the annotated
+# target type.
+include = ["../common.toml", "../assets.toml"]
+
+[sets]
+commodity_swap_leg = { substitution = "commoditySwapLeg" }
+commodity_forward_leg = { substitution = "physicalCommodityForwardLeg" }
+commodity_performance_leg = { substitution = "commodityPerformanceSwapLeg" }
+physical_commodity = ["gas", "oil", "electricity", "coal", "environmental"]
+calculation_periods_pointer = ["calculationPeriodsReference", "calculationPeriodsScheduleReference", "calculationPeriodsDatesReference"]
+commodity_exercise_style = ["americanExercise", "europeanExercise"]
+
+# ── Shared commodity structures ──────────────────────────────────────────────
+
+[structs.commodity]
+description = "Commodity reference price: underlier, unit, currency, source, and delivery date convention"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "instrument_ids", type = "list<struct<instrument_id>>", path = "instrumentId" },
+  { name = "description", type = "utf8", path = "description" },
+  { name = "commodity_base", type = "utf8", path = "commodityBase" },
+  { name = "commodity_details", type = "utf8", path = "commodityDetails" },
+  { name = "unit", type = "utf8", path = "unit" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "exchange_id", type = "utf8", path = "exchangeId" },
+  { name = "publication_rate_source", type = "utf8", path = "publication/rateSource" },
+  { name = "publication_rate_source_page", type = "utf8", path = "publication/rateSourcePage" },
+  { name = "specified_price", type = "utf8", path = "specifiedPrice" },
+  { name = "delivery_dates", type = "utf8", path = "deliveryDates" },
+  { name = "delivery_nearby_multiplier", type = "int64", path = "deliveryNearby/deliveryNearbyMultiplier" },
+  { name = "delivery_nearby_type", type = "utf8", path = "deliveryNearby/deliveryNearbyType" },
+  { name = "delivery_date", type = "struct<adjustable_date>", path = "deliveryDate" },
+  { name = "delivery_date_year_month", type = "utf8", path = "deliveryDateYearMonth" },
+  { name = "multiplier", type = "decimal", path = "multiplier" },
+]
+
+[structs.commodity_quantity]
+fields = [
+  { name = "quantity_unit", type = "utf8", path = "quantityUnit" },
+  { name = "quantity_frequency", type = "utf8", path = "quantityFrequency" },
+  { name = "quantity", type = "decimal", path = "quantity" },
+]
+
+[structs.unit_quantity]
+fields = [
+  { name = "quantity_unit", type = "utf8", path = "quantityUnit" },
+  { name = "quantity", type = "decimal", path = "quantity" },
+]
+
+[structs.commodity_price]
+fields = [
+  { name = "price", type = "decimal", path = "price" },
+  { name = "price_currency", type = "utf8", path = "priceCurrency" },
+  { name = "price_unit", type = "utf8", path = "priceUnit" },
+]
+
+[structs.commodity_period_schedule]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+  { name = "balance_of_first_period", type = "bool", path = "balanceOfFirstPeriod" },
+]
+
+[structs.pricing_dates]
+description = "Pricing date rule (CommodityPricingDates)"
+fields = [
+  { name = "calculation_periods_href", type = "utf8", path = "{calculation_periods_pointer}/@href" },
+  { name = "day_type", type = "utf8", path = "dayType" },
+  { name = "day_distribution", type = "utf8", path = "dayDistribution" },
+  { name = "day_count", type = "int64", path = "dayCount" },
+  { name = "days_of_week", type = "list<utf8>", path = "dayOfWeek" },
+  { name = "day_number", type = "int64", path = "dayNumber" },
+  { name = "business_day_convention", type = "utf8", path = "businessDayConvention" },
+  { name = "business_calendar", type = "utf8", path = "businessCalendar" },
+  { name = "calendar_source", type = "utf8", path = "calendarSource" },
+  { name = "settlement_periods_hrefs", type = "list<utf8>", path = "settlementPeriodsReference/@href" },
+  { name = "pricing_dates", type = "list<struct<adjustable_dates>>", path = "pricingDates" },
+]
+
+[structs.floating_calculation]
+description = "Floating price calculation (FloatingLegCalculation)"
+fields = [
+  { name = "pricing_dates", type = "struct<pricing_dates>", path = "pricingDates" },
+  { name = "averaging_method", type = "utf8", path = "averagingMethod" },
+  { name = "conversion_factor", type = "decimal", path = "conversionFactor" },
+  { name = "spread", type = "struct<money>", path = "spread" },
+  { name = "spread_percentage", type = "decimal", path = "spreadPercentage" },
+]
+
+[structs.relative_payment_dates]
+fields = [
+  { name = "pay_relative_to", type = "utf8", path = "payRelativeTo" },
+  { name = "pay_relative_to_event", type = "utf8", path = "payRelativeToEvent" },
+  { name = "calculation_periods_href", type = "utf8", path = "{calculation_periods_pointer}/@href" },
+  { name = "payment_days_offset", type = "struct<relative_date_offset>", path = "paymentDaysOffset" },
+  { name = "business_centers", type = "list<utf8>", path = "businessCenters/businessCenter" },
+  { name = "business_centers_href", type = "utf8", path = "businessCentersReference/@href" },
+]
+
+[structs.commodity_payment_dates]
+description = "Relative payment dates, explicit or relative payment dates, or master-agreement payment"
+fields = [
+  { name = "relative", type = "struct<relative_payment_dates>", path = "relativePaymentDates" },
+  { name = "adjustable_dates", type = "struct<adjustable_dates>", path = "paymentDates/adjustableDates" },
+  { name = "relative_date", type = "struct<relative_date_offset>", path = "paymentDates/relativeDate" },
+  { name = "master_agreement_payment_dates", type = "bool", path = "masterAgreementPaymentDates" },
+]
+
+[structs.commodity_calculation_periods]
+fields = [
+  { name = "calculation_dates", type = "struct<adjustable_dates>", path = "calculationDates" },
+  { name = "calculation_periods", type = "struct<adjustable_dates>", path = "calculationPeriods" },
+  { name = "calculation_periods_schedule", type = "struct<commodity_period_schedule>", path = "calculationPeriodsSchedule" },
+  { name = "calculation_periods_href", type = "utf8", path = "{calculation_periods_pointer}/@href" },
+]
+
+[structs.commodity_notional]
+description = "Notional quantity: per-period quantity, total, or a reference to another leg's quantity"
+fields = [
+  { name = "notional_quantity", type = "struct<commodity_quantity>", path = "notionalQuantity" },
+  { name = "settlement_periods_notional_quantities", type = "list<struct<commodity_quantity>>", path = "settlementPeriodsNotionalQuantity" },
+  { name = "total_notional_quantity", type = "decimal", path = "totalNotionalQuantity" },
+  { name = "quantity_href", type = "utf8", path = "quantityReference/@href" },
+]
+
+[structs.delivery_periods]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "periods", type = "struct<adjustable_dates>", path = "periods" },
+  { name = "periods_schedule", type = "struct<commodity_period_schedule>", path = "periodsSchedule" },
+  { name = "calculation_periods_href", type = "utf8", path = "{calculation_periods_pointer}/@href" },
+]
+
+[structs.physical_quantity]
+fields = [
+  { name = "physical_quantity", type = "struct<commodity_quantity>", path = "physicalQuantity" },
+  { name = "total_physical_quantity", type = "struct<unit_quantity>", path = "totalPhysicalQuantity" },
+  { name = "min_physical_quantities", type = "list<struct<commodity_quantity>>", path = "minPhysicalQuantity" },
+  { name = "max_physical_quantities", type = "list<struct<commodity_quantity>>", path = "maxPhysicalQuantity" },
+  { name = "electing_party_href", type = "utf8", path = "electingParty/@href" },
+]
+
+[structs.commodity_leg]
+description = "One commodity swap or forward leg: fixed, floating, average-price, or physical delivery"
+fields = [
+  { name = "leg_type", type = "utf8", path = "#name" },
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "calculation_periods", type = "struct<commodity_calculation_periods>", path = "." },
+  { name = "fixed_price", type = "struct<commodity_price>", path = "fixedPrice" },
+  { name = "fixed_price_steps", type = "list<struct<commodity_price>>", path = "fixedPriceSchedule/fixedPriceStep" },
+  { name = "worldscale_rate", type = "decimal", path = "worldscaleRate" },
+  { name = "contract_rate", type = "struct<money>", path = "contractRate" },
+  { name = "total_price", type = "struct<money>", path = "totalPrice" },
+  { name = "commodity", type = "struct<commodity>", path = "commodity" },
+  { name = "notional", type = "struct<commodity_notional>", path = "." },
+  { name = "pricing_start_date", type = "struct<adjustable_date>", path = "pricingStartDate" },
+  { name = "calculation", type = "struct<floating_calculation>", path = "calculation" },
+  { name = "payment_dates", type = "struct<commodity_payment_dates>", path = "." },
+  { name = "flat_rate", type = "utf8", path = "flatRate" },
+  { name = "flat_rate_amount", type = "struct<money>", path = "flatRateAmount" },
+  { name = "delivery_periods", type = "struct<delivery_periods>", path = "deliveryPeriods" },
+  { name = "physical_commodity", type = "utf8", path = "{physical_commodity}/#name" },
+  { name = "physical_commodity_type", type = "utf8", path = "{physical_commodity}/type" },
+  { name = "oil_grade", type = "utf8", path = "oil/grade" },
+  { name = "load_type", type = "utf8", path = "loadType" },
+  { name = "delivery_quantity", type = "struct<physical_quantity>", path = "deliveryQuantity" },
+  { name = "physical_quantity", type = "struct<physical_quantity>", path = "." },
+  { name = "number_of_allowances", type = "struct<unit_quantity>", path = "numberOfAllowances" },
+  { name = "bullion_type", type = "utf8", path = "bullionType" },
+  { name = "delivery_location", type = "utf8", path = "deliveryLocation" },
+  { name = "delivery_date", type = "struct<adjustable_or_relative_date>", path = "deliveryDate" },
+  { name = "settlement_date", type = "struct<adjustable_or_relative_date>", path = "settlementDate" },
+  { name = "conversion_factor", type = "decimal", path = "conversionFactor" },
+]
+
+[structs.weather_leg]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "weather_notional_amount", type = "struct<money>", path = "weatherNotionalAmount" },
+  { name = "weather_calculation_periods_href", type = "utf8", path = "weatherCalculationPeriodsReference/@href" },
+  { name = "payment_dates", type = "struct<relative_payment_dates>", path = "paymentDates" },
+]
+
+[structs.commodity_market_disruption]
+fields = [
+  { name = "market_disruption_events", type = "utf8", path = "marketDisruptionEvents" },
+  { name = "events", type = "list<utf8>", path = "marketDisruptionEvent | additionalMarketDisruptionEvent" },
+  { name = "disruption_fallbacks", type = "utf8", path = "disruptionFallbacks" },
+  { name = "maximum_number_of_days_of_disruption", type = "int64", path = "maximumNumberOfDaysOfDisruption" },
+]
+
+[structs.commodity_swap_details]
+description = "Dates, settlement currency, legs, and pricing conventions of a commodity swap"
+fields = [
+  { name = "effective_date", type = "struct<adjustable_or_relative_date>", path = "effectiveDate" },
+  { name = "termination_date", type = "struct<adjustable_or_relative_date>", path = "terminationDate" },
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "legs", type = "list<struct<commodity_leg>>", path = "{commodity_swap_leg}" },
+  { name = "weather_legs", type = "list<struct<weather_leg>>", path = "weatherLeg" },
+  { name = "common_pricing", type = "bool", path = "commonPricing" },
+  { name = "market_disruption", type = "struct<commodity_market_disruption>", path = "marketDisruption" },
+  { name = "settlement_disruption", type = "utf8", path = "settlementDisruption" },
+]
+
+[structs.commodity_premium]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_date", type = "struct<adjustable_or_relative_date>", path = "paymentDate" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "premium_per_unit", type = "struct<money>", path = "premiumPerUnit" },
+]
+
+[structs.exercise_period]
+fields = [
+  { name = "commencement_date", type = "struct<adjustable_or_relative_date>", path = "commencementDate" },
+  { name = "expiration_date", type = "struct<adjustable_or_relative_date>", path = "expirationDate" },
+]
+
+[structs.commodity_exercise]
+description = "American or European exercise with settlement and payment terms"
+fields = [
+  { name = "style", type = "utf8", path = "{commodity_exercise_style}/#name" },
+  { name = "exercise_periods", type = "list<struct<exercise_period>>", path = "americanExercise/exercisePeriod" },
+  { name = "expiration_dates", type = "list<struct<adjustable_or_relative_date>>", path = "europeanExercise/expirationDate" },
+  { name = "exercise_frequency", type = "struct<frequency>", path = "{commodity_exercise_style}/exerciseFrequency" },
+  { name = "latest_exercise_time", type = "struct<business_center_time>", path = "americanExercise/latestExerciseTime" },
+  { name = "expiration_time", type = "struct<business_center_time>", path = "{commodity_exercise_style}/expirationTime" },
+  { name = "automatic_exercise", type = "bool", path = "automaticExercise" },
+  { name = "written_confirmation", type = "bool", path = "writtenConfirmation" },
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "conversion_factor", type = "decimal", path = "conversionFactor" },
+  { name = "payment_dates", type = "struct<commodity_payment_dates>", path = "." },
+]
+
+[structs.commodity_trigger]
+fields = [
+  { name = "level_quantity", type = "decimal", path = "levelQuantity" },
+  { name = "level_unit", type = "utf8", path = "levelUnit" },
+  { name = "level_percentage", type = "decimal", path = "levelPercentage" },
+  { name = "level_price", type = "struct<commodity_price>", path = "levelPrice" },
+  { name = "trigger_type", type = "utf8", path = "triggerType" },
+]
+
+[structs.commodity_basket_underlying]
+fields = [
+  { name = "commodity", type = "struct<commodity>", path = "commodity" },
+  { name = "pricing_dates", type = "struct<pricing_dates>", path = "pricingDates" },
+  { name = "averaging_method", type = "utf8", path = "averagingMethod" },
+  { name = "conversion_factor", type = "decimal", path = "conversionFactor" },
+  { name = "notional", type = "struct<commodity_notional>", path = "." },
+  { name = "constituent_weight", type = "decimal", path = "constituentWeight" },
+]
+
+[structs.commodity_option_terms]
+description = "Financial (Asian, barrier) commodity option terms shared by option and digital option"
+fields = [
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "commodity", type = "struct<commodity>", path = "commodity" },
+  { name = "effective_date", type = "struct<adjustable_or_relative_date>", path = "effectiveDate" },
+  { name = "termination_date", type = "struct<adjustable_or_relative_date>", path = "terminationDate" },
+  { name = "calculation_periods_schedule", type = "struct<commodity_period_schedule>", path = "calculationPeriodsSchedule" },
+  { name = "calculation_periods", type = "struct<adjustable_dates>", path = "calculationPeriods" },
+  { name = "pricing_dates", type = "struct<pricing_dates>", path = "pricingDates" },
+  { name = "averaging_method", type = "utf8", path = "averagingMethod" },
+  { name = "notional", type = "struct<commodity_notional>", path = "." },
+  { name = "exercise", type = "struct<commodity_exercise>", path = "exercise" },
+  { name = "premiums", type = "list<struct<commodity_premium>>", path = "premium" },
+  { name = "common_pricing", type = "bool", path = "commonPricing" },
+  { name = "market_disruption", type = "struct<commodity_market_disruption>", path = "marketDisruption" },
+]
+
+[structs.commodity_performance_leg]
+description = "Commodity performance swap interest, return, or variance leg"
+fields = [
+  { name = "leg_type", type = "utf8", path = "#name" },
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "calculation_periods", type = "struct<commodity_calculation_periods>", path = "." },
+  { name = "payment_dates", type = "struct<commodity_payment_dates>", path = "." },
+  { name = "commodity", type = "struct<commodity>", path = "commodity" },
+  { name = "basket_name", type = "utf8", path = "commodityBasket/basketName" },
+  { name = "basket_underlyings", type = "list<struct<commodity_basket_underlying>>", path = "commodityBasket/notionalQuantityBasket/underlying | commodityBasket/notionalAmountBasket/underlying" },
+  { name = "notional_amount", type = "struct<money>", path = "notionalAmount" },
+  { name = "notional_reinvestment", type = "bool", path = "notionalAmount/reinvestmentFeature" },
+  { name = "notional_amount_href", type = "utf8", path = "notionalAmountReference/@href" },
+  { name = "return_formula", type = "utf8", path = "commodityReturnCalculation/formula" },
+  { name = "return_initial_price", type = "decimal", path = "commodityReturnCalculation/initialPrice" },
+  { name = "return_pricing_dates", type = "struct<pricing_dates>", path = "commodityReturnCalculation/pricingDates" },
+  { name = "variance_strike_price", type = "decimal", path = "varianceStrikePrice" },
+  { name = "volatility_strike_price", type = "decimal", path = "volatilityStrikePrice" },
+  { name = "annualization_factor", type = "decimal", path = "varianceCalculation/annualizationFactor" },
+  { name = "n_adjustment", type = "bool", path = "varianceCalculation/nAdjustment" },
+  { name = "fixed_rate", type = "decimal", path = "commodityFixedInterestCalculation/fixedRate" },
+  { name = "day_count_fraction", type = "utf8", path = "commodityFixedInterestCalculation/dayCountFraction" },
+]
+
+# ── Products ─────────────────────────────────────────────────────────────────
+
+[structs.commodity_swap]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "details", type = "struct<commodity_swap_details>", path = "." },
+]
+
+[structs.commodity_forward]
+description = "Bullion or metal forward against a fixed or average-price leg"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "value_date", type = "struct<adjustable_or_relative_date>", path = "valueDate" },
+  { name = "fixed_leg", type = "struct<commodity_leg>", path = "fixedLeg" },
+  { name = "average_price_leg", type = "struct<commodity_leg>", path = "averagePriceLeg" },
+  { name = "physical_leg", type = "struct<commodity_leg>", path = "{commodity_forward_leg}" },
+  { name = "common_pricing", type = "bool", path = "commonPricing" },
+  { name = "settlement_disruption", type = "utf8", path = "settlementDisruption" },
+]
+
+[structs.commodity_option]
+description = "Financial, physical (on a swap or forward), or weather commodity option"
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "terms", type = "struct<commodity_option_terms>", path = "." },
+  { name = "barrier_knock", type = "utf8", path = "barrier/knock" },
+  { name = "barrier_feature_payment_amount", type = "struct<money>", path = "barrier/featurePaymentAmount" },
+  { name = "barrier_trigger", type = "struct<commodity_trigger>", path = "barrier/trigger" },
+  { name = "strike_price_per_unit", type = "struct<money>", path = "strikePricePerUnit" },
+  { name = "strike_price_per_unit_steps", type = "list<struct<money>>", path = "strikePricePerUnitSchedule/strikePricePerUnitStep" },
+  { name = "floating_strike_price_per_unit", type = "struct<floating_calculation>", path = "floatingStrikePricePerUnit" },
+  { name = "underlying_swap", type = "struct<commodity_swap_details>", path = "commoditySwap" },
+  { name = "underlying_forward_value_date", type = "struct<adjustable_or_relative_date>", path = "commodityForward/valueDate" },
+  { name = "physical_exercise", type = "struct<commodity_exercise>", path = "physicalExercise" },
+  { name = "weather_notional_amount", type = "struct<money>", path = "weatherNotionalAmount" },
+]
+
+[structs.commodity_swaption]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "underlying", type = "struct<commodity_swap_details>", path = "commoditySwap" },
+  { name = "physical_exercise", type = "struct<commodity_exercise>", path = "physicalExercise" },
+  { name = "premium", type = "struct<commodity_premium>", path = "premium" },
+]
+
+[structs.commodity_digital_option]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "terms", type = "struct<commodity_option_terms>", path = "." },
+  { name = "trigger", type = "struct<commodity_trigger>", path = "digital/trigger" },
+  { name = "feature_payment_amount", type = "struct<money>", path = "digital/featurePaymentAmount" },
+  { name = "notional_amount", type = "struct<money>", path = "notionalAmount" },
+]
+
+[structs.commodity_basket_option]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "buyer_party_href", type = "utf8", path = "buyerPartyReference/@href" },
+  { name = "seller_party_href", type = "utf8", path = "sellerPartyReference/@href" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "effective_date", type = "struct<adjustable_or_relative_date>", path = "effectiveDate" },
+  { name = "termination_date", type = "struct<adjustable_or_relative_date>", path = "terminationDate" },
+  { name = "calculation_periods_schedule", type = "struct<commodity_period_schedule>", path = "calculationPeriodsSchedule" },
+  { name = "calculation_periods", type = "struct<adjustable_dates>", path = "calculationPeriods" },
+  { name = "basket_type", type = "utf8", path = "notionalQuantityBasket/#name | notionalAmountBasket/#name" },
+  { name = "underlyings", type = "list<struct<commodity_basket_underlying>>", path = "notionalQuantityBasket/underlying | notionalAmountBasket/underlying" },
+  { name = "basket_notional_amount", type = "struct<money>", path = "notionalAmountBasket/notionalAmount" },
+  { name = "strike_price_underlying_href", type = "utf8", path = "strikePriceUnderlyingReference/@href" },
+  { name = "strike_price_basket_href", type = "utf8", path = "strikePriceBasketReference/@href" },
+  { name = "strike_price_per_unit", type = "struct<money>", path = "strikePricePerUnit" },
+  { name = "exercise", type = "struct<commodity_exercise>", path = "exercise" },
+  { name = "premiums", type = "list<struct<commodity_premium>>", path = "premium" },
+]
+
+[structs.commodity_performance_swap]
+fields = [
+  { name = "product", type = "struct<product_model>", path = "." },
+  { name = "effective_date", type = "struct<adjustable_or_relative_date>", path = "effectiveDate" },
+  { name = "termination_date", type = "struct<adjustable_or_relative_date>", path = "terminationDate" },
+  { name = "settlement_currency", type = "utf8", path = "settlementCurrency" },
+  { name = "legs", type = "list<struct<commodity_performance_leg>>", path = "{commodity_performance_leg}" },
+  { name = "common_pricing", type = "bool", path = "commonPricing" },
+  { name = "market_disruption", type = "struct<commodity_market_disruption>", path = "marketDisruption" },
+]

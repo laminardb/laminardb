@@ -1,0 +1,93 @@
+[
+  {
+    "context": "loanAllocationNotification",
+    "creation_time_utc": "2018-03-09T21:35:58.568Z",
+    "creation_timestamp": {
+      "local": "2018-03-09T16:35:58.568",
+      "offset_minutes": -300,
+      "utc": "2018-03-09T21:35:58.568Z"
+    },
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "83d1fbdc971b64371fcc470da6f354c310cb91d82aef9bfde0dbc2094dae2a5b",
+    "event": {
+      "allocation_href": "A_001",
+      "amount": {
+        "amount": "3500.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "1750.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "US1L142580",
+            "receiver_party_href": "GB1L104502"
+          }
+        ],
+        "event_identifiers": [
+          {
+            "event_id": "GB007",
+            "event_id_scheme": "http://www.barclays.com/fpml/coding-scheme/internal/loan-transfer-fee-due-event-id",
+            "party_href": "GB1L104502"
+          }
+        ],
+        "lender_party_hrefs": [
+          "US1L142580"
+        ]
+      },
+      "due_date": "2018-03-15"
+    },
+    "event_type": "loanAllocationFeeDue",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "BBPLC00001549667579",
+    "notice_date": "2018-03-09",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "KY1L151440",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY1L151440"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanAllocationNotification/loanAllocationFeeDue",
+    "row_ordinal": 0,
+    "sent_by": "GB1L104502"
+  }
+]

@@ -285,6 +285,40 @@ jobs:
         run: cargo test -p laminar-server --no-default-features --features fix --bin laminardb shipped_server_configs_deserialize
 
   # ============================================
+  # FpML source (vendored libxml2, pinned FpML 5.13 closure)
+  # ============================================
+  fpml-source:
+    name: FpML source (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fpml-source
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev mold protobuf-compiler
+      - name: Default builds exclude the native validator
+        run: |
+          if cargo tree -p laminar-server -e normal | grep -q laminardb-libxml2-ffi; then
+            echo "the default laminar-server graph links libxml2" >&2
+            exit 1
+          fi
+      - name: Clippy
+        run: cargo clippy -p laminar-connectors --no-default-features --features "fpml files kafka" --all-targets -- -D warnings
+      - name: Validator security, schema closure, coverage manifest, goldens, and files source
+        run: cargo test -p laminar-connectors --no-default-features --features "fpml files" --lib -- fpml
+      - name: Independent oracle over every golden
+        run: python3 tools/fpml_oracle.py
+      - name: Kafka FpML messages (in-process mock cluster)
+        run: cargo test -p laminar-connectors --no-default-features --features "kafka fpml" --lib -- kafka::source::tests::fpml
+      - name: SQL end-to-end across restart
+        run: cargo test -p laminar-db --no-default-features --features "fpml kafka" --test fpml_source_e2e
+
+  # ============================================
   # Release Build (main/develop only)
   # ============================================
   release-build:
@@ -460,13 +494,15 @@ jobs:
           cargo package --manifest-path vendor/pgwire/Cargo.toml --no-verify
           cargo package --manifest-path vendor/pgwire-replication/Cargo.toml --no-verify
           cargo package --manifest-path vendor/quickfix-ffi/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/libxml2-ffi/Cargo.toml --no-verify
       - name: Verify workspace packages can be assembled
         run: |
           # The release publishes the maintained forks before the Laminar crates.
           cargo package --workspace --locked --no-verify \
             --config 'patch.crates-io.laminardb-pgwire.path="vendor/pgwire"' \
             --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"' \
-            --config 'patch.crates-io.laminardb-quickfix-ffi.path="vendor/quickfix-ffi"'
+            --config 'patch.crates-io.laminardb-quickfix-ffi.path="vendor/quickfix-ffi"' \
+            --config 'patch.crates-io.laminardb-libxml2-ffi.path="vendor/libxml2-ffi"'
 
   # ============================================
   # MSRV Check

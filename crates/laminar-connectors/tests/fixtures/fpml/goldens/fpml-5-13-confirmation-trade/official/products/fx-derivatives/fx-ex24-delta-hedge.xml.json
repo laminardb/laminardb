@@ -1,0 +1,81 @@
+[
+  {
+    "correlation_id": "FX65432",
+    "creation_time_utc": "2001-12-04T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2001-12-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-12-04T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "7f9739e9bc18cddd03cae217fa42cace3e9faadbd021b42b382910d30a639ba2",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX87654",
+    "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "PARTYA"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ],
+        "party_name": "ABN Amro"
+      }
+    ],
+    "product_type": "strategy",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABNANL2A",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-3-0",
+              "value": "123456789"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-3-0",
+              "value": "123456789"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-12-04"
+    },
+    "trade_ordinal": 0
+  }
+]

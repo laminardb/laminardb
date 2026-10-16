@@ -1,0 +1,60 @@
+# One row per FpML commodity trade (commoditySwap, commodityForward, commodityOption,
+# commoditySwaption, commodityDigitalOption, commodityBasketOption, commodityPerformanceSwap) with
+# the shared trade-level columns and the product's typed economics. Exactly one product struct is
+# non-null per row; `product_type` names it. Trades of other asset classes are not rows of this
+# profile; the fpml-5-13-confirmation-trade profile has every trade.
+include = ["trade-columns.toml", "products/commodity.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-commodity"
+version = 1
+description = "FpML 5.13 confirmation view: one row per commodity trade with typed economics"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/trade[tradeHeader][{commodity_product}]"
+
+[sets]
+commodity_product = [
+  "commoditySwap",
+  "commodityForward",
+  "commodityOption",
+  "commoditySwaption",
+  "commodityDigitalOption",
+  "commodityBasketOption",
+  "commodityPerformanceSwap",
+]
+
+[[columns]]
+name = "commodity_swap"
+type = "struct<commodity_swap>"
+path = "commoditySwap"
+
+[[columns]]
+name = "commodity_forward"
+type = "struct<commodity_forward>"
+path = "commodityForward"
+
+[[columns]]
+name = "commodity_option"
+type = "struct<commodity_option>"
+path = "commodityOption"
+
+[[columns]]
+name = "commodity_swaption"
+type = "struct<commodity_swaption>"
+path = "commoditySwaption"
+
+[[columns]]
+name = "commodity_digital_option"
+type = "struct<commodity_digital_option>"
+path = "commodityDigitalOption"
+
+[[columns]]
+name = "commodity_basket_option"
+type = "struct<commodity_basket_option>"
+path = "commodityBasketOption"
+
+[[columns]]
+name = "commodity_performance_swap"
+type = "struct<commodity_performance_swap>"
+path = "commodityPerformanceSwap"

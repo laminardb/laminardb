@@ -1,0 +1,61 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "3e83c189845e4181da831cad22553d2299d0dec8411ffcee5d0adae445d5a570",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006",
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_date": "2010-03-23",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "product_type": "commodityPerformanceSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "95980020140005196564"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "ACAVS1234567"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-04-08"
+    },
+    "trade_ordinal": 0
+  }
+]

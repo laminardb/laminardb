@@ -159,6 +159,12 @@ impl FileSinkConfig {
                 ConnectorError::ConfigurationError("'format' is required for file sink".into())
             })
             .and_then(|s| FileFormat::parse(s))?;
+        #[cfg(feature = "fpml")]
+        if format == FileFormat::Fpml {
+            return Err(ConnectorError::ConfigurationError(
+                "the file sink does not write FpML; write projected rows as parquet, arrow, csv, or json".into(),
+            ));
+        }
 
         if props.contains_key("mode") {
             return Err(ConnectorError::ConfigurationError(
@@ -290,6 +296,9 @@ pub enum FileFormat {
     Parquet,
     /// Arrow IPC file format (random-access `.arrow` files).
     ArrowIpc,
+    /// One complete document per file, validated and projected by an  profile.
+    #[cfg(feature = "fpml")]
+    Fpml,
 }
 
 impl FileFormat {
@@ -305,6 +314,8 @@ impl FileFormat {
             "text" | "txt" | "plain" => Ok(Self::Text),
             "parquet" | "parq" => Ok(Self::Parquet),
             "arrow" | "ipc" | "arrow_ipc" => Ok(Self::ArrowIpc),
+            #[cfg(feature = "fpml")]
+            "fpml" => Ok(Self::Fpml),
             other => Err(ConnectorError::ConfigurationError(format!(
                 "unknown file format: '{other}' (expected csv, json, text, parquet, or arrow)"
             ))),
@@ -333,6 +344,8 @@ impl FileFormat {
             Self::Text => "txt",
             Self::Parquet => "parquet",
             Self::ArrowIpc => "arrow",
+            #[cfg(feature = "fpml")]
+            Self::Fpml => "xml",
         }
     }
 

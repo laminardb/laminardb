@@ -1,0 +1,102 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2015-12-19T08:15:48Z",
+    "document_bytes": 4104,
+    "document_root": "facilityNotification",
+    "document_sha256": "665c79f352111e2827a5679e1dd573121be06485e3166c6687b5a53c7134726a",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2015-12-19T08:15:48",
+        "offset_minutes": 0,
+        "utc": "2015-12-19T08:15:48Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "112950",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": false,
+    "loan_events": [
+      {
+        "effective_date": "2015-12-20",
+        "event_ids": [
+          "52680"
+        ],
+        "event_type": "accruingPikPayment",
+        "locator": "/facilityNotification/accruingPikPayment"
+      }
+    ],
+    "loan_payments": [
+      {
+        "event_ids": [
+          "52680"
+        ],
+        "payer_party_href": "BANKOFAGENTSNA",
+        "payment_amount": {
+          "amount": "15246.850000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "adjusted_date": "2015-12-20",
+          "date_adjustments": {
+            "business_centers": [
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2015-12-20"
+        },
+        "receiver_party_href": "LENDERCORP"
+      }
+    ],
+    "notice_date": "2015-12-19",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ]
+  }
+]

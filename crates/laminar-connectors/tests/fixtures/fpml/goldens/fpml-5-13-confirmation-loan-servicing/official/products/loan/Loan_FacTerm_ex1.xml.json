@@ -1,0 +1,79 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2014-12-09T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2014-12-09T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2014-12-09T09:30:47Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "7e1f1dc4463f576155656cf77c0ab7d12b5903de6bdd709cff0b4084df9ca23f",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "53802",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2014-12-20",
+      "facility_href": "FAC12345"
+    },
+    "event_type": "facilityTermination",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "115892",
+    "notice_date": "2014-12-09",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/facilityTermination",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

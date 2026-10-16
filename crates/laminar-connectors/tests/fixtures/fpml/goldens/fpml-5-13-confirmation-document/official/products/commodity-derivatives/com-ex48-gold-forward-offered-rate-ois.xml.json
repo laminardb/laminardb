@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 10401,
+    "document_root": "dataDocument",
+    "document_sha256": "77aa0da5d2524e2054f66c7e088ef54c1d2c97a65b0ee8a42f3c82a185487ebd",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank A"
+          }
+        ],
+        "party_name": "Bank a"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank B"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "BankA1234"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "BankB5678"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2021-08-18"
+      }
+    ]
+  }
+]

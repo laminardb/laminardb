@@ -114,6 +114,10 @@ pub mod nats;
 #[cfg(feature = "fix")]
 pub mod fix;
 
+/// FpML document decoder: pinned XML Schema validation and configured typed projection.
+#[cfg(feature = "fpml")]
+pub mod fpml;
+
 /// AutoLoader-style file source and sink connectors.
 #[cfg(feature = "files")]
 #[allow(

@@ -151,6 +151,7 @@ int socket_connect(socket_handle s, const char *address, int port);
 socket_handle socket_accept(socket_handle s);
 ssize_t socket_recv(socket_handle s, char *buf, size_t length);
 ssize_t socket_send(socket_handle s, const char *msg, size_t length);
+void socket_shutdown(socket_handle s);
 void socket_close(socket_handle s);
 std::string socket_get_last_error();
 bool socket_fionread(socket_handle s, int &bytes);

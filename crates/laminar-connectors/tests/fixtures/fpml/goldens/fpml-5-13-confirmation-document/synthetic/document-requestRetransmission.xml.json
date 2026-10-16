@@ -1,0 +1,49 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-requestRetransmission",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:42:00Z",
+    "document_bytes": 1345,
+    "document_root": "requestRetransmission",
+    "document_sha256": "78c7d49e66861913c252509a365c3df8b2c992e5b25f96281c432071df37bd9a",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:42:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:42:00Z"
+      },
+      "message_id": "SYN-requestRetransmission",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "report_id": "RPT-2026-07-01",
+    "report_section_number": 3,
+    "sequence_number": 1
+  }
+]

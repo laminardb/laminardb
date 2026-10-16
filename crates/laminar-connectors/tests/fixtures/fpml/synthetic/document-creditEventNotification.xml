@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a minimal creditEventNotification document, written
+     because the FpML 5.13 corpus has no example of this root. -->
+<creditEventNotification xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-creditEventNotification</messageId>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYB</sentBy>
+    <sendTo messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sendTo>
+    <creationTimestamp>2026-07-01T09:34:00+02:00</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">CORR-creditEventNotification</correlationId>
+  <sequenceNumber>1</sequenceNumber>
+  <creditEventNotice>
+    <referenceEntity>
+      <entityName>Synthetic Reference Entity plc</entityName>
+    </referenceEntity>
+    <bankruptcy />
+    <notifyingPartyReference href="party1" />
+    <notifiedPartyReference href="party2" />
+    <creditEventNoticeDate>2026-06-30</creditEventNoticeDate>
+    <creditEventDate>2026-06-29</creditEventDate>
+  </creditEventNotice>
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+  </party>
+</creditEventNotification>

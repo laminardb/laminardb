@@ -1,0 +1,18 @@
+# One row per FpML trade of any asset class, with its document context, header, product type,
+# parties, and documentation, but not its product economics; the asset-class profiles
+# (fpml-5-13-confirmation-rates, -fx, ...) add those for their own products.
+#
+# Rows are every `trade` element that has a `tradeHeader` (confirmation-view Trade), wherever it
+# appears: directly under a data document or message, inside a trade package, or inside a
+# business event such as an amendment or clearing result. `row_locator` and `trade_context` say
+# where. A document without such trades (for example a loan notice or a status message)
+# produces no rows from this profile.
+include = ["trade-columns.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-trade"
+version = 2
+description = "FpML 5.13 confirmation view: one row per trade of any asset class, without product economics"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/trade[tradeHeader]"

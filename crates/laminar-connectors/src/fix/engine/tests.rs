@@ -240,6 +240,7 @@ impl StoreBackend for MemoryStore {
 #[derive(Debug, Clone)]
 struct Delivery {
     seq: u64,
+    exec_id: Option<Vec<u8>>,
     poss_dup: bool,
     target_during_callback: u64,
     thread: std::thread::ThreadId,
@@ -301,6 +302,12 @@ impl SessionCallbacks for ClientCallbacks {
         let header = message.header().expect("header");
         let seq = decimal(header.field(34).expect("seq"));
         let poss_dup = header.field(43).expect("dup") == Some(b"Y".as_slice());
+        let exec_id = message
+            .body()
+            .expect("body")
+            .field(17)
+            .expect("exec id")
+            .map(<[u8]>::to_vec);
         let target = session_state(&self.key).expect("state").next_target;
         let mut fault = self.fault.lock();
         let outcome = match *fault {
@@ -313,6 +320,7 @@ impl SessionCallbacks for ClientCallbacks {
                 drop(fault);
                 self.deliveries.lock().push(Delivery {
                     seq,
+                    exec_id,
                     poss_dup,
                     target_during_callback: target,
                     thread: std::thread::current().id(),
@@ -324,6 +332,7 @@ impl SessionCallbacks for ClientCallbacks {
         };
         self.deliveries.lock().push(Delivery {
             seq,
+            exec_id,
             poss_dup,
             target_during_callback: target,
             thread: std::thread::current().id(),
@@ -469,8 +478,15 @@ fn disconnect_outcome_does_not_advance_target_and_message_is_retransmitted() {
     client.stop();
 
     let deliveries = callbacks.deliveries.lock().clone();
-    // Venue seq 1 is Logon; application messages are 2, 3, 4.
-    assert_eq!(accepted_sequence(&deliveries), vec![2, 3, 4]);
+    let accepted = deliveries
+        .iter()
+        .filter(|delivery| delivery.outcome == CallbackOutcome::Accept)
+        .map(|delivery| delivery.exec_id.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(accepted, [Some(b"E1".as_slice()), Some(b"E2"), Some(b"E3")]);
+    // Venue seq 1 is Logon, then E1 and E2. E3 is 4, or 5 when the venue sent it after
+    // answering the client's second Logon.
+    assert_eq!(accepted_sequence(&deliveries)[..2], [2, 3]);
     let refused = deliveries
         .iter()
         .find(|delivery| delivery.outcome == CallbackOutcome::Disconnect)

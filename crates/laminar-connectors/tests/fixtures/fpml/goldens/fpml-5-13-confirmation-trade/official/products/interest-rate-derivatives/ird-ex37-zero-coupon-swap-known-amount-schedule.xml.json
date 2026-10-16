@@ -1,0 +1,189 @@
+[
+  {
+    "correlation_id": "LCH00000000001",
+    "creation_timestamp": {
+      "local": "2020-12-17T09:10:11.257918600"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "85e5ac8289067241475e446668f9a1e0cc3f3d8d54fca02b3db8329dcddcc85b",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "LCH00000000001",
+    "message_id_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-portfolio-id",
+            "value": "XXX_H_XXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-counterparty-id",
+            "value": "LCHLGB2L"
+          }
+        ]
+      },
+      {
+        "id": "clearingDCO",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "LCHLGB2L"
+          }
+        ]
+      },
+      {
+        "id": "clearingBroker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "XXX"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "COMPRESSION"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "LCHLGB2L",
+    "sequence_number": 1,
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "tradeSource",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "COMPRESSION"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "1-2"
+            },
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/alpha-trade-id",
+              "value": "11111111"
+            }
+          ]
+        },
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-portfolio-id",
+              "value": "XXX_H_XXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "abc123"
+            }
+          ]
+        },
+        {
+          "party_href": "clearingBroker1",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "XXX"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "def456"
+            }
+          ]
+        },
+        {
+          "party_href": "clearingDCO",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "LCHLGB2L"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-id",
+              "value": "LCH00000000001"
+            },
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/trade-classification",
+              "value": "STM"
+            }
+          ]
+        },
+        {
+          "issuer": {
+            "scheme": "USINamespace",
+            "value": "1010000051"
+          },
+          "trade_ids": [
+            {
+              "scheme": "USI",
+              "value": "XX111111111XXX111111111111111111"
+            }
+          ]
+        },
+        {
+          "issuer": {
+            "scheme": "http://www.fpml.org/coding-scheme/external/issuer-identifier",
+            "value": "1010000051"
+          },
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/unique-transaction-identifier",
+              "value": "XX111111111XXX111111111111111111"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2013-07-31T09:10:11",
+            "offset_minutes": 0,
+            "utc": "2013-07-31T09:10:11Z"
+          },
+          "execution_venue_type": "OffFacility",
+          "party_href": "party1"
+        },
+        {
+          "clearing_status": "Received",
+          "party_href": "clearingDCO"
+        },
+        {
+          "party_href": "tradeSource"
+        }
+      ],
+      "trade_date": "2014-11-17"
+    },
+    "trade_ordinal": 0
+  }
+]

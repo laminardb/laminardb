@@ -1,0 +1,142 @@
+[
+  {
+    "credit_default_swap": {
+      "cash_settlement_terms": [
+        {
+          "recovery_factor": "0.600000000000000000"
+        }
+      ],
+      "fee_leg": {
+        "periodic_payment": {
+          "first_payment_date": "2003-03-06",
+          "fixed_rate": "0.010000000000000000",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 3
+          },
+          "roll_convention": "6"
+        }
+      },
+      "general_terms": {
+        "buyer_party_href": "party1",
+        "effective_date": {
+          "unadjusted_date": "2002-12-04"
+        },
+        "reference_entity": {
+          "entity_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+              "value": "8G836J"
+            }
+          ],
+          "entity_name": "Tenet Healthcare Corporation",
+          "id": "referenceEntity"
+        },
+        "reference_obligations": [
+          {
+            "asset": {
+              "asset_type": "bond",
+              "coupon_rate": "0.060000000000000000",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP",
+                  "value": "88033GAT7"
+                }
+              ],
+              "maturity": "2011-12-01"
+            },
+            "primary_obligor_href": "referenceEntity"
+          }
+        ],
+        "reference_type": "referenceInformation",
+        "scheduled_termination_date": {
+          "unadjusted_date": "2007-09-06"
+        },
+        "seller_party_href": "party2"
+      },
+      "product": {},
+      "protection_terms": [
+        {
+          "calculation_amount": {
+            "amount": "5000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "credit_events": {
+            "restructuring": true,
+            "restructuring_type": "ModR"
+          }
+        }
+      ]
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "8cc28a39a2a106f572b87a0cde3e2d92804907beecdadd7cedf12887214061cb",
+    "documentation": {
+      "master_confirmation_date": "2001-01-04",
+      "master_confirmation_type": "ISDA1999Credit"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900BIAQJIUV6DLE92"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.xyzbank.com/cd-trade-id",
+              "value": "xyz1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abcbank.com/cd-trade-id",
+              "value": "abc1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-12-03"
+    },
+    "trade_ordinal": 0
+  }
+]

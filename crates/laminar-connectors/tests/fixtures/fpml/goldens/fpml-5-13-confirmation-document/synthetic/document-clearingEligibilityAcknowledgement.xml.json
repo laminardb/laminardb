@@ -1,0 +1,49 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-clearingEligibilityAcknowledgement",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:24:00Z",
+    "document_bytes": 1649,
+    "document_root": "clearingEligibilityAcknowledgement",
+    "document_sha256": "cee5243124c11115a733c707744bbe5a40cb95541494148765d2a0447e7b46f0",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:24:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:24:00Z"
+      },
+      "in_reply_to": "REQ-clearingEligibilityAcknowledgement",
+      "message_id": "SYN-clearingEligibilityAcknowledgement",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "original_message_root": "requestConfirmation",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

@@ -1,0 +1,77 @@
+[
+  {
+    "creation_time_utc": "2018-09-17T01:55:42Z",
+    "creation_timestamp": {
+      "local": "2018-09-17T06:55:42",
+      "offset_minutes": 300,
+      "utc": "2018-09-17T01:55:42Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "cbe10bcc315c9a5b2bb96c97a8fb0d1805afaa43c839fa74987a4d2d721bff85",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:2W81Q117",
+    "message_id_scheme": "XXX",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.party1.com/swaps/party-id",
+            "value": "12345"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.party1.com/swaps/party-id",
+            "value": "67890"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "XXXXXXXX",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/party-id",
+              "value": "12345"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "E2000098N10184"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/party-id",
+              "value": "67890"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2018-09-17"
+    },
+    "trade_ordinal": 0
+  }
+]

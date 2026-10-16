@@ -1,0 +1,81 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "EquityShareOption987",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "c44f5afc93a0c55f552343329b7d48eeb1aa0cb2d9096c35c154a6bb7534266c",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "EquityShareOption456a789b",
+    "message_id_scheme": "http://www.msdw.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOption",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "msdw",
+    "sequence_number": 1,
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/eqd-trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2001-07-13T08:57:00"
+          },
+          "party_href": "party2"
+        }
+      ],
+      "trade_date": "2001-07-13"
+    },
+    "trade_ordinal": 0
+  }
+]

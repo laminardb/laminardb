@@ -1,0 +1,50 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 9639,
+    "document_root": "dataDocument",
+    "document_sha256": "50d8715917ccf29be701612b1616cfe55fa7ba0b32ed30c5c04d99e038813139",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "PRIMARY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "0987654321"
+          }
+        ]
+      },
+      {
+        "id": "CROSS",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "1234567890"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "PRIMARY",
+            "trade_ids": [
+              "CFD123456789"
+            ]
+          },
+          {
+            "party_href": "CROSS",
+            "trade_ids": [
+              "CFD123456789"
+            ]
+          }
+        ],
+        "product_type": "returnSwap",
+        "trade_date": "2009-09-30"
+      }
+    ]
+  }
+]

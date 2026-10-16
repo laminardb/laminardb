@@ -1,0 +1,26 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 1462,
+    "document_root": "clearingConfirmed",
+    "document_sha256": "acfb9a499d89b85bad2bbdeb1e647df80b4f8b7fb508008f22c70bf3a5eda262",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "RBSLGB1LXXX"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    }
+  }
+]

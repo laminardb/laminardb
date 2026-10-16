@@ -1,0 +1,23 @@
+# One row per FpML loan allocation or loan trade event, wherever it appears in a loan notification or statement,
+# with the shared loan columns and its typed content.
+include = ["loan-columns.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-loan-trading"
+version = 1
+description = "FpML 5.13 confirmation view: one row per loan allocation or loan trade event"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/{loan_trading_event}"
+
+[[columns]]
+name = "event_type"
+type = "utf8"
+path = "#name"
+required = true
+
+[[columns]]
+name = "event"
+type = "struct<loan_trading_event>"
+path = "."
+required = true

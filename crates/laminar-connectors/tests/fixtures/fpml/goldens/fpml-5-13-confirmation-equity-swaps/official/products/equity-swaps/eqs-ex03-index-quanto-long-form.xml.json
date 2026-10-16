@@ -1,0 +1,267 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CS/2006/07/02/32-09",
+    "creation_time_utc": "2006-07-02T16:38:00Z",
+    "creation_timestamp": {
+      "local": "2006-07-02T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-07-02T16:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "080b2859e288fa3aa4b148ebc31ad1f109eba96f3a9a7a123434cd9d826baeba",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "MS/2006/04/07/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "return_swap": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 3
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "-0.002200000000000000"
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency_href": "ReferenceCurrency",
+              "reference_amount": "Standard ISDA"
+            },
+            "leg": {
+              "payer_party_href": "party2",
+              "receiver_party_href": "party1"
+            },
+            "notional": {
+              "relative_notional_amount_href": "NotionalAmount"
+            }
+          }
+        ],
+        "leg_types": [
+          "returnLeg",
+          "interestLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency_href": "ReferenceCurrency",
+              "reference_amount": "Standard ISDA"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2004-07-21"
+              }
+            },
+            "initial_price": {
+              "net_price": "5591987.410000000000000000",
+              "net_price_currency": "USD"
+            },
+            "leg": {
+              "effective_date": {
+                "relative_date": {
+                  "business_day_convention": "NotApplicable",
+                  "date_relative_to_href": "TradeDate",
+                  "day_type": "ExchangeBusiness",
+                  "period": "D",
+                  "period_multiplier": 3
+                }
+              },
+              "payer_party_href": "party1",
+              "receiver_party_href": "party2",
+              "termination_date": {
+                "relative_date": {
+                  "business_day_convention": "NotApplicable",
+                  "date_relative_to_href": "ReturnLegFinalPaymentDate",
+                  "period": "D",
+                  "period_multiplier": 0
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "5591987.410000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Standard",
+            "notional_reset": true,
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "EUTA",
+                  "HKHK"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "FinalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 3
+              }
+            },
+            "payment_dates_interim": {
+              "relative_dates": {
+                "business_centers": [
+                  "EUTA",
+                  "HKHK"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "InterimValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 3
+              }
+            },
+            "return_type": "Price",
+            "settlement": {},
+            "underlyer": {
+              "basket": {
+                "constituents": [
+                  {
+                    "asset": {
+                      "asset_type": "index",
+                      "currency": "EUR",
+                      "description": "France CAC 40 Index",
+                      "exchange_id": "XPAR",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": ".FCHI"
+                        }
+                      ]
+                    },
+                    "opening_units": "960.000000000000000000"
+                  },
+                  {
+                    "asset": {
+                      "asset_type": "index",
+                      "currency": "EUR",
+                      "description": "IBEX 35",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": ".IBEX"
+                        }
+                      ]
+                    },
+                    "opening_units": "260.000000000000000000"
+                  },
+                  {
+                    "asset": {
+                      "asset_type": "index",
+                      "currency": "HKD",
+                      "description": "Hong Kong Hang Seng Index",
+                      "exchange_id": "XHKG",
+                      "instrument_ids": [
+                        {
+                          "scheme": "http://www.abc.com/instrumentId",
+                          "value": ".HSI"
+                        }
+                      ]
+                    },
+                    "opening_units": "580.000000000000000000"
+                  }
+                ],
+                "open_units": "1.000000000000000000"
+              }
+            }
+          }
+        ]
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Swap:PriceReturnBasicPerformance:Basket"
+          }
+        ]
+      }
+    },
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 8,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "1734"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "5648"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-07-19"
+    },
+    "trade_ordinal": 0
+  }
+]

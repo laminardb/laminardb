@@ -1,0 +1,63 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "844409",
+    "correlation_id_scheme": "trade_id",
+    "creation_time_utc": "2014-09-24T09:30:00Z",
+    "document_bytes": 1862,
+    "document_root": "requestExecution",
+    "document_sha256": "457ec3ce2edf523c091f412e1486ebff9e1590a0c4451e159a957c2e98c93566",
+    "events": [
+      {
+        "event_type": "optionExercise",
+        "exercise_action": "FullExercise",
+        "locator": "/requestExecution/optionExercise",
+        "trade_identifiers": [
+          {
+            "party_href": "clearing_service",
+            "trade_ids": [
+              "844409"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2014-09-24T09:30:00",
+        "offset_minutes": 0,
+        "utc": "2014-09-24T09:30:00Z"
+      },
+      "message_id": "0485674",
+      "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+      "send_to": [
+        "CLEARCO"
+      ],
+      "sent_by": "TESTBOOKLE",
+      "sent_by_scheme": "firm_id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "clearing_firm",
+        "party_ids": [
+          {
+            "scheme": "clearing_member_firms",
+            "value": "TESTBOOKLE"
+          }
+        ]
+      },
+      {
+        "id": "clearing_service",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

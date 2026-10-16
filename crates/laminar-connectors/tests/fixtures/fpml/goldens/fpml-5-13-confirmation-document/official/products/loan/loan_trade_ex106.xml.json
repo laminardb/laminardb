@@ -1,0 +1,92 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2017-09-18T09:30:47Z",
+    "document_bytes": 5877,
+    "document_root": "loanTradeNotification",
+    "document_sha256": "6031d0ef6565e2bdac25e0c956b5c57b2d53e63b77e7407b880b13250dbea076",
+    "facility_identifiers": [
+      {
+        "description": "USD 1BN Term Loan B",
+        "id": "TermLoanB",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "AgentParty"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-18T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2017-09-18T09:30:47Z"
+      },
+      "implementation_specification_name": "LoanFpML",
+      "implementation_specification_version": "v5.10",
+      "message_id": "SentMessageID6",
+      "message_id_scheme": "http://www.company.com/messageIdScheme",
+      "send_to": [
+        "EatonVance"
+      ],
+      "sent_by": "JPMorganChase",
+      "sent_by_scheme": "http://www.company.com/messageAddressScheme"
+    },
+    "is_correction": false,
+    "loan_events": [
+      {
+        "event_ids": [
+          "EVENT1"
+        ],
+        "event_type": "loanTradeFeeOwed",
+        "locator": "/loanTradeNotification/loanTradeFeeOwed"
+      }
+    ],
+    "loan_trade_identifiers": [
+      {
+        "party_href": "JPMorganChase",
+        "trade_ids": [
+          "TN12345"
+        ]
+      }
+    ],
+    "notice_date": "2017-09-18",
+    "parties": [
+      {
+        "country": "US",
+        "id": "JPMorganChase",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001011"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "Amazon",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "AMZ1111111"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "AgentParty",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001012"
+          }
+        ],
+        "party_name": "JPMorganChase"
+      }
+    ],
+    "party_hrefs": [
+      "JPMorganChase"
+    ],
+    "role": "Agent"
+  }
+]

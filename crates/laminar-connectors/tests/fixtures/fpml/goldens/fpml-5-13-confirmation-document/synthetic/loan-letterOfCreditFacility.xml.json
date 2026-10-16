@@ -1,0 +1,79 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2014-12-18T09:30:47Z",
+    "deal_identifiers": [
+      {
+        "description": "2011 Construction Term Loan",
+        "id": "DL2468",
+        "instrument_ids": [
+          "DL24689"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "document_bytes": 4054,
+    "document_root": "facilityStatement",
+    "document_sha256": "243455f6191510b6c56b19ac9ceab2e7dc69ebcfa8c0aafb840fa5046e99452f",
+    "facilities": [
+      "letterOfCreditFacility"
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2014-12-18T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2014-12-18T09:30:47Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "818902",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      }
+    ],
+    "statement_date": "2014-12-18"
+  }
+]

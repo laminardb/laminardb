@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--View is confirmation-->
+<!--Version is 5-13-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--View is confirmation-->
+<!--Version is 5-12-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--
+        == Copyright (c) 2022-2026 All rights reserved.
+        == Financial Products Markup Language is subject to the FpML public license.
+        == A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<!--
+Facility Statement - this notice communicates a single facility definition, in this case, a delayed draw facility.
+-->
+<facilityStatement xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" fpmlVersion="5-13" xsi:schemaLocation="http://www.fpml.org/FpML-5/confirmation ../../fpml-main-5-13.xsd http://www.w3.org/2000/09/xmldsig# ../../xmldsig-core-schema.xsd">
+  <header>
+    <messageId messageIdScheme="http://www.bankofagentsna.com/messaging/messageids">818902</messageId>
+    <sentBy messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US2A432121</sentBy>
+    <sendTo messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US5L567878</sendTo>
+    <creationTimestamp>2015-12-17T08:35:42Z</creationTimestamp>
+    <implementationSpecification>
+      <name>BKLoanSys</name>
+      <version implementationSpecificationVersionScheme="http://www.bkloansys.com/">1.0</version>
+      <date>2012-12-06</date>
+    </implementationSpecification>
+  </header>
+  <isCorrection>false</isCorrection>
+  <statementDate>2015-12-17</statementDate>
+  <delayedDraw id="DDFAC13">
+    <partyReference href="BANKOFAGENTSNA" />
+    <instrumentId instrumentIdScheme="http://www.cusip.com/">DDFAC1357</instrumentId>
+    <description>Delayed Draw Facility</description>
+    <dealReference href="DL1357" />
+    <borrowerPartyReference href="BORROWERINC" />
+    <coBorrowerPartyReference href="COBORROWERINC" />
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <startDate>2016-01-01</startDate>
+    <maturityDate>2016-06-01</maturityDate>
+    <currentCommitment>
+      <totalCommitmentAmount>
+        <currency>USD</currency>
+        <amount>50000000.00</amount>
+        <shareAmount>1500000.00</shareAmount>
+      </totalCommitmentAmount>
+    </currentCommitment>
+    <governingLaw governingLawScheme="http://www.fpml.org/coding-scheme/governing-law">USNY</governingLaw>
+    <fixedRateOption>
+      <accrualOptionId accrualTypeIdScheme="http://www.bankofagentsna.com/messaging/borrowingoptionids">825610</accrualOptionId>
+      <dayCountFraction dayCountFractionScheme="http://www.fpml.org/coding-scheme/day-count-fraction">30/360</dayCountFraction>
+      <paymentFrequency>
+        <periodMultiplier>3</periodMultiplier>
+        <period>M</period>
+      </paymentFrequency>
+      <rate>0.00975</rate>
+      <startDate>2016-01-01</startDate>
+      <endDate>2016-06-01</endDate>
+      <currency>USD</currency>
+      <borrowerPartyReference href="BORROWERINC" />
+      <drawdownNoticeDays>3</drawdownNoticeDays>
+    </fixedRateOption>
+    <defaultRate>
+      <startDate>2016-01-01</startDate>
+      <endDate>2016-06-01</endDate>
+      <rate>0.01175</rate>
+    </defaultRate>
+    <penaltyRate>
+      <startDate>2016-01-01</startDate>
+      <endDate>2016-06-01</endDate>
+      <rate>0.01175</rate>
+    </penaltyRate>
+    <delayedDraw>true</delayedDraw>
+    <mustDrawByDate>2016-03-01</mustDrawByDate>
+  </delayedDraw>
+  <dealIdentifier id="DL1357">
+    <partyReference href="BANKOFAGENTSNA" />
+    <instrumentId instrumentIdScheme="http://www.cusip.com/">D13578</instrumentId>
+    <description>2012 Construction Project</description>
+  </dealIdentifier>
+  <party id="BANKOFAGENTSNA">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US2A432121</partyId>
+  </party>
+  <party id="LENDERCORP">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US5L567878</partyId>
+  </party>
+  <party id="BORROWERINC">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US3B789454</partyId>
+  </party>
+  <party id="COBORROWERINC">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US4C147258</partyId>
+  </party>
+</facilityStatement>
+

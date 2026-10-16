@@ -1,0 +1,139 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "0123456",
+    "correlation_id_scheme": "http://sef1.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2009-12-25T08:57:00Z",
+    "document_bytes": 22551,
+    "document_root": "requestClearing",
+    "document_sha256": "49990bf910815bf03629dc7e16ee78202fa07480441381c8321e0fe6fd7deb39",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2009-12-25T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2009-12-25T08:57:00Z"
+      },
+      "message_id": "M000123",
+      "message_id_scheme": "http://sef1.com/message-id",
+      "send_to": [
+        "LCHLGB2L"
+      ],
+      "sent_by": "SEF1",
+      "sent_by_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "counterpartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493007UORKUC7B3R009"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300CG6M7FPQFSZZ36"
+          }
+        ]
+      },
+      {
+        "id": "counterpartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493001GQM0W2RB8NG57"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "F226TOH6YD6XJB17KS62"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF1"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000OYML8W30IO673"
+          }
+        ]
+      },
+      {
+        "id": "executionVenue",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF2"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500W4M6T99LTBH450"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trade_package": {
+      "size": "2.000000000000000000",
+      "trades": [
+        {
+          "locator": "/requestClearing/tradePackage/trade",
+          "party_trade_identifiers": [
+            {
+              "party_href": "tradeSource",
+              "trade_ids": [
+                "TR1"
+              ]
+            }
+          ],
+          "product_type": "swap",
+          "trade_date": "2009-12-25"
+        },
+        {
+          "locator": "/requestClearing/tradePackage/trade[2]",
+          "party_trade_identifiers": [
+            {
+              "party_href": "tradeSource",
+              "trade_ids": [
+                "TR2"
+              ]
+            }
+          ],
+          "product_type": "swap",
+          "trade_date": "2009-12-25"
+        }
+      ]
+    }
+  }
+]

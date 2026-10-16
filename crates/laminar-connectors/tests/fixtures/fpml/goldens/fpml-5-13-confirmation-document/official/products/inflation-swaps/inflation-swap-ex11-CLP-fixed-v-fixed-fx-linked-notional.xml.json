@@ -1,0 +1,68 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 11742,
+    "document_root": "dataDocument",
+    "document_sha256": "6ba74a3d61a733ad702d406376e0cf4ba4522b2cf958d228f654159ad9de9f31",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "AAA International"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "AAA Capital Services Inc."
+      },
+      {
+        "id": "partyC",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900AYEI57S5UCED35"
+          }
+        ],
+        "party_name": "SWAPSWIRE"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "596604984"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "BCID71046476"
+            ]
+          },
+          {
+            "party_href": "partyC",
+            "trade_ids": [
+              "184467696-2"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2022-05-03"
+      }
+    ]
+  }
+]

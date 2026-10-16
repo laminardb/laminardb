@@ -1,0 +1,53 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 15841,
+    "document_root": "dataDocument",
+    "document_sha256": "39888addb6912a3dc9e21ee93c5651b7922e0caca03fe6849bcf678c5a84d49e",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "QGPGHQ1ENZOOLJRFTH41"
+          }
+        ],
+        "party_name": "ABCD Securities Inc."
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "J6W9XJWVE853A9CVRQ85"
+          }
+        ],
+        "party_name": "HedgeCo Capital L.L.C."
+      }
+    ],
+    "trades": [
+      {
+        "id": "trs-eq1-trade",
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "TRS-01"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "total-ret-swap-01"
+            ]
+          }
+        ],
+        "product_type": "returnSwap",
+        "trade_date": "2004-10-10"
+      }
+    ]
+  }
+]

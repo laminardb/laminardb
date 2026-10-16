@@ -1,0 +1,72 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR/2007/01/02/2342322",
+    "correlation_id_scheme": "http://www.example.com/correlationId",
+    "creation_time_utc": "2007-01-05T15:38:00Z",
+    "document_bytes": 6884,
+    "document_root": "requestConfirmation",
+    "document_sha256": "4294cd36e8fbb6a8ae6ac28374688d7766aa4e1ae17064af383792ff86a3f5b9",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2007-01-05T15:38:00",
+        "offset_minutes": 0,
+        "utc": "2007-01-05T15:38:00Z"
+      },
+      "message_id": "2342342",
+      "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+      "send_to": [
+        "ABC"
+      ],
+      "sent_by": "PARTYABIC1"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      },
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300IB5Q45JGNPND58"
+          }
+        ],
+        "party_name": "ClearItAll Corp"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "Party1",
+            "trade_ids": [
+              "Trade234"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwapOption",
+        "trade_date": "2006-01-16"
+      }
+    ]
+  }
+]

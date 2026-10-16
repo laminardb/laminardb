@@ -1,0 +1,511 @@
+# One row per FpML confirmation-view document of any kind: data documents, requests,
+# responses, notifications, exceptions, and loan notifications and statements. Columns type the
+# message envelope and each root-level element: identifiers, statuses, reasons, approvals,
+# allocations, and summaries of the trades, post-trade events, and loan events the document
+# carries (their `locator` joins the trade and loan profiles, which type them in full). Every
+# document yields exactly one row, so this profile also fits one-message-per-record transports.
+include = ["messages.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-document"
+version = 1
+description = "FpML 5.13 confirmation view: one row per document with its message envelope and root-level content"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "."
+
+[[columns]]
+name = "document_sha256"
+type = "utf8"
+meta = "document_sha256"
+required = true
+
+[[columns]]
+name = "document_bytes"
+type = "uint64"
+meta = "document_bytes"
+required = true
+
+[[columns]]
+name = "document_root"
+type = "utf8"
+meta = "root"
+required = true
+
+[[columns]]
+name = "fpml_version"
+type = "utf8"
+meta = "fpml_version"
+required = true
+
+[[columns]]
+name = "expected_build"
+type = "int64"
+path = "@expectedBuild"
+
+[[columns]]
+name = "actual_build"
+type = "int64"
+path = "@actualBuild"
+
+[[columns]]
+name = "header"
+type = "struct<message_header>"
+path = "header"
+
+[[columns]]
+name = "creation_time_utc"
+type = "timestamp(ns, UTC)"
+path = "header/creationTimestamp"
+offset = "optional"
+description = "Message creation instant; null when the sender wrote no UTC offset"
+
+[[columns]]
+name = "validations"
+type = "list<utf8>"
+path = "validation"
+
+[[columns]]
+name = "is_correction"
+type = "bool"
+path = "isCorrection"
+
+[[columns]]
+name = "correlation_id"
+type = "utf8"
+path = "correlationId"
+
+[[columns]]
+name = "correlation_id_scheme"
+type = "utf8"
+path = "correlationId/@correlationIdScheme"
+
+[[columns]]
+name = "parent_correlation_id"
+type = "utf8"
+path = "parentCorrelationId"
+
+[[columns]]
+name = "sequence_number"
+type = "int64"
+path = "sequenceNumber"
+
+[[columns]]
+name = "on_behalf_of"
+type = "list<struct<on_behalf_of>>"
+path = "onBehalfOf"
+
+[[columns]]
+name = "originating_event"
+type = "utf8"
+path = "originatingEvent"
+
+[[columns]]
+name = "terminating_event"
+type = "utf8"
+path = "terminatingEvent"
+
+[[columns]]
+name = "trades"
+type = "list<struct<trade_reference>>"
+path = "trade"
+
+[[columns]]
+name = "trade_package"
+type = "struct<trade_package>"
+path = "tradePackage"
+
+[[columns]]
+name = "events"
+type = "list<struct<trading_event>>"
+path = "{post_trade_event}"
+
+[[columns]]
+name = "quotes"
+type = "list<struct<basic_quotation>>"
+path = "quote"
+
+[[columns]]
+name = "trade_reference_information"
+type = "struct<trade_reference_information>"
+path = "tradeReferenceInformation"
+
+[[columns]]
+name = "trade_identifiers"
+type = "list<struct<trade_identifier>>"
+path = "tradeIdentifier | partyTradeIdentifier"
+
+[[columns]]
+name = "block_trade_identifier"
+type = "struct<trade_identifier>"
+path = "blockTradeIdentifier"
+
+[[columns]]
+name = "product_type"
+type = "utf8"
+path = "productType"
+
+[[columns]]
+name = "portfolio_name"
+type = "utf8"
+path = "portfolioReference/portfolioName"
+
+[[columns]]
+name = "portfolio_sequence_number"
+type = "int64"
+path = "portfolioReference/sequenceNumber"
+
+[[columns]]
+name = "portfolio_submissions_complete"
+type = "bool"
+path = "portfolioReference/submissionsComplete"
+
+[[columns]]
+name = "portfolio_ids"
+type = "list<utf8>"
+path = "portfolio/@id"
+
+[[columns]]
+name = "report_id"
+type = "utf8"
+path = "reportIdentification/reportId"
+
+[[columns]]
+name = "report_section_number"
+type = "int64"
+path = "reportIdentification/sectionNumber"
+
+[[columns]]
+name = "compression_type"
+type = "utf8"
+path = "compressionActivity/compressionType"
+
+[[columns]]
+name = "credit_limit_models"
+type = "list<utf8>"
+path = "creditLimitInformation/limitModel"
+
+[[columns]]
+name = "reasons"
+type = "list<struct<reason>>"
+path = "reason"
+
+[[columns]]
+name = "additional_data_mime_type"
+type = "utf8"
+path = "additionalData/mimeType"
+
+[[columns]]
+name = "additional_data_text"
+type = "utf8"
+path = "additionalData/string"
+
+[[columns]]
+name = "original_message_root"
+type = "utf8"
+path = "originalMessage/*/#name"
+description = "Root name of an echoed original message; its content is kept as unvalidated data"
+
+[[columns]]
+name = "comments"
+type = "utf8"
+path = "comments"
+whitespace = "collapse"
+
+[[columns]]
+name = "approval_type"
+type = "utf8"
+path = "type"
+
+[[columns]]
+name = "approver"
+type = "utf8"
+path = "approver"
+
+[[columns]]
+name = "approving_party_href"
+type = "utf8"
+path = "approvingPartyReference/@href"
+
+[[columns]]
+name = "approval_id"
+type = "utf8"
+path = "approvalId"
+
+[[columns]]
+name = "approvals"
+type = "list<struct<approval>>"
+path = "approvals/approval"
+
+[[columns]]
+name = "requested_action"
+type = "utf8"
+path = "requestedAction"
+
+[[columns]]
+name = "allocating_party_href"
+type = "utf8"
+path = "allocations/allocatingPartyReference/@href"
+
+[[columns]]
+name = "allocations"
+type = "list<struct<allocation>>"
+path = "allocations/allocation"
+
+[[columns]]
+name = "related_party_hrefs"
+type = "list<utf8>"
+path = "relatedParty/partyReference/@href"
+
+[[columns]]
+name = "clearing_submitted"
+type = "list<struct<trade_reference>>"
+path = "clearing/submitted/trade"
+
+[[columns]]
+name = "clearing_cleared"
+type = "list<struct<trade_reference>>"
+path = "clearing/cleared/trade"
+
+[[columns]]
+name = "clearing_status_items"
+type = "list<struct<status_item>>"
+path = "clearingStatusItem"
+
+[[columns]]
+name = "status_items"
+type = "list<struct<status_item>>"
+path = "statusItem"
+
+[[columns]]
+name = "eligible_for_clearing"
+type = "bool"
+path = "eligibleForClearing"
+
+[[columns]]
+name = "clearing_requirements"
+type = "list<struct<clearing_requirement>>"
+path = "clearingRequirements"
+
+[[columns]]
+name = "status"
+type = "utf8"
+path = "status"
+
+[[columns]]
+name = "credit_event_notice"
+type = "struct<credit_event_notice>"
+path = "creditEventNotice"
+
+[[columns]]
+name = "event_correlation_id"
+type = "utf8"
+path = "eventIdentifier/correlationId"
+
+[[columns]]
+name = "event_ids"
+type = "list<utf8>"
+path = "eventIdentifier/eventId"
+
+[[columns]]
+name = "business_process"
+type = "utf8"
+path = "businessProcess"
+
+[[columns]]
+name = "service_name"
+type = "utf8"
+path = "serviceName"
+
+[[columns]]
+name = "service_processing_cycle"
+type = "utf8"
+path = "processingStatus/cycle"
+
+[[columns]]
+name = "service_processing_step"
+type = "utf8"
+path = "processingStatus/step"
+
+[[columns]]
+name = "service_advisory_category"
+type = "utf8"
+path = "advisory/category"
+
+[[columns]]
+name = "service_advisory_description"
+type = "utf8"
+path = "advisory/description"
+whitespace = "collapse"
+
+[[columns]]
+name = "collateral_giver_party_href"
+type = "utf8"
+path = "collateralGiverPartyReference/@href"
+
+[[columns]]
+name = "collateral_allocation_party_hrefs"
+type = "list<utf8>"
+path = "collateralAllocation/allocationPartyReference/@href"
+
+[[columns]]
+name = "requesting_party_href"
+type = "utf8"
+path = "requestingPartyReference/@href"
+
+[[columns]]
+name = "trade_maturity_date"
+type = "date32"
+path = "tradeMaturity/date"
+
+[[columns]]
+name = "asserted_event_types"
+type = "list<utf8>"
+path = "assertedEvent/*/#name"
+
+[[columns]]
+name = "alleged_event_types"
+type = "list<utf8>"
+path = "allegedEvent/*/#name"
+
+[[columns]]
+name = "proposed_match_ids"
+type = "list<utf8>"
+path = "proposedMatch/matchId"
+
+[[columns]]
+name = "payment_reference_hrefs"
+type = "list<utf8>"
+path = "paymentDetails/paymentReference/@href"
+
+[[columns]]
+name = "collateralization_types"
+type = "list<utf8>"
+path = "collateralization/collateralizationType"
+
+[[columns]]
+name = "market_ids"
+type = "list<utf8>"
+path = "market/@id"
+
+[[columns]]
+name = "valuation_set_ids"
+type = "list<utf8>"
+path = "valuationSet/@id"
+
+[[columns]]
+name = "valued_object_hrefs"
+type = "list<utf8>"
+path = "valuationSet/assetValuation/objectReference/@href"
+
+[[columns]]
+name = "notice_date"
+type = "date32"
+path = "noticeDate"
+
+[[columns]]
+name = "statement_date"
+type = "date32"
+path = "statementDate"
+
+[[columns]]
+name = "is_global_only"
+type = "bool"
+path = "isGlobalOnly"
+
+[[columns]]
+name = "deal_identifiers"
+type = "list<struct<loan_identifier>>"
+path = "dealIdentifier | dealSummary"
+
+[[columns]]
+name = "facility_identifiers"
+type = "list<struct<loan_identifier>>"
+path = "facilityIdentifier | facilitySummary"
+
+[[columns]]
+name = "contract_identifiers"
+type = "list<struct<contract_identifier>>"
+path = "contractIdentifier | contractSummary | letterOfCreditIdentifier | letterOfCreditSummary"
+
+[[columns]]
+name = "loan_trade_identifiers"
+type = "list<struct<trade_identifier>>"
+path = "tradeSummary | allocationSummary"
+
+[[columns]]
+name = "loan_events"
+type = "list<struct<loan_event_reference>>"
+path = "{facility_event} | {lc_event} | {loan_contract_event} | {loan_allocation_event} | {loan_trade_event}"
+
+[[columns]]
+name = "facilities"
+type = "list<utf8>"
+path = "{facility}/#name"
+
+[[columns]]
+name = "task_ids"
+type = "list<utf8>"
+path = "taskIdentifier/taskId"
+
+[[columns]]
+name = "role"
+type = "utf8"
+path = "role"
+
+[[columns]]
+name = "position_party_href"
+type = "utf8"
+path = "positionPartyReference/@href"
+
+[[columns]]
+name = "facility_position_hrefs"
+type = "list<utf8>"
+path = "facilityPosition/facilityReference/@href"
+
+[[columns]]
+name = "party_hrefs"
+type = "list<utf8>"
+path = "partyReference/@href"
+
+[[columns]]
+name = "loan_payments"
+type = "list<struct<loan_payment>>"
+path = "eventPayment | payment"
+
+[[columns]]
+name = "allocation_identifiers"
+type = "list<struct<trade_identifier>>"
+path = "allocationId"
+
+[[columns]]
+name = "loan_tasks"
+type = "list<struct<loan_task>>"
+path = "settlementTask | covenantTask | legalActionTask"
+
+[[columns]]
+name = "loan_statuses"
+type = "list<struct<loan_status>>"
+path = "legalActionStatus | legalActionApprovalStatus"
+
+[[columns]]
+name = "loan_obligation_identifiers"
+type = "list<struct<loan_obligation_identifier>>"
+path = "covenantIdentifier | covenantSummary | legalActionIdentifier | legalActionSummary"
+
+[[columns]]
+name = "loan_contents"
+type = "list<struct<element_reference>>"
+path = "allocation | letterOfCredit | contract | loanContract | deal | covenant | legalAction | partyProfile"
+description = "Loan allocations, contracts, letters of credit, deals, covenants, legal actions, and party profiles, typed by the loan profiles"
+
+[[columns]]
+name = "parties"
+type = "list<struct<party>>"
+path = "party"
+description = "Every party declared at the document root"
+
+[[columns]]
+name = "accounts"
+type = "list<struct<account>>"
+path = "account"

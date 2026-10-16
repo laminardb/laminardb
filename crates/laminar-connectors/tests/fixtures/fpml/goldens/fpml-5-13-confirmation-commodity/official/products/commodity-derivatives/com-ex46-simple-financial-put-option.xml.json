@@ -1,0 +1,176 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "commodity_option": {
+      "product": {},
+      "strike_price_per_unit": {
+        "amount": "1.950000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "terms": {
+        "buyer_party_href": "partyB",
+        "calculation_periods_schedule": {
+          "balance_of_first_period": false,
+          "id": "CalculationPeriods",
+          "period": "M",
+          "period_multiplier": 1
+        },
+        "commodity": {
+          "instrument_ids": [
+            {
+              "scheme": "http://www.partyA.com/instrumentId/commodity-reference-price",
+              "value": "NATURAL GAS-LOUISIANA (HENRY HUB)-GAS DAILY"
+            }
+          ],
+          "specified_price": "Midpoint"
+        },
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2012-09-01"
+          }
+        },
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_dates": [
+            {
+              "relative_date": {
+                "business_day_convention": "NotApplicable",
+                "date_relative_to_href": "PricingDate",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            }
+          ],
+          "payment_dates": {
+            "relative": {
+              "calculation_periods_href": "CalculationPeriods",
+              "pay_relative_to": "LastPricingDate",
+              "payment_days_offset": {
+                "business_day_convention": "MODFOLLOWING",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 5
+              }
+            }
+          },
+          "settlement_currency": "USD",
+          "style": "europeanExercise"
+        },
+        "notional": {
+          "notional_quantity": {
+            "quantity": "10000.000000000000000000",
+            "quantity_frequency": "PerCalendarDay",
+            "quantity_unit": "MMBTU"
+          },
+          "total_notional_quantity": "300000.000000000000000000"
+        },
+        "option_type": "Put",
+        "premiums": [
+          {
+            "payer_party_href": "partyB",
+            "payment_amount": {
+              "amount": "40500.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2012-04-12"
+              }
+            },
+            "premium_per_unit": {
+              "amount": "0.135000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "pricing_dates": {
+          "business_calendar": "GAS-DAILY-PRICE-GUIDE",
+          "calculation_periods_href": "CalculationPeriods",
+          "day_distribution": "Last",
+          "day_type": "CommodityBusiness"
+        },
+        "seller_party_href": "partyA",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2012-09-30"
+          }
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "ea7f9ab5bc07849da274ac2f301bc43d380dc5fab1f848c9426eeac99b6a14c9",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_date": "2010-11-10",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "Bank A"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500QCC36R89FI3U25"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5299000NIGT14YW8ZD26"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "GHJK0987"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-04-10"
+    },
+    "trade_ordinal": 0
+  }
+]

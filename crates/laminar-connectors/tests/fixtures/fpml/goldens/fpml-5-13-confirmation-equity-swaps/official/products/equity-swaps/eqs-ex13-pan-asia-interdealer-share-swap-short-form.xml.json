@@ -1,0 +1,240 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party2"
+      ]
+    },
+    "correlation_id": "CS/2009/09/01/32-09",
+    "creation_time_utc": "2009-09-01T16:38:00Z",
+    "creation_timestamp": {
+      "local": "2009-09-01T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2009-09-01T16:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "1412013fbeb7e652de7191e64d5800d775b5d4030bd5cd1140dc812a191926ee",
+    "documentation": {
+      "master_confirmation_date": "2009-09-01",
+      "master_confirmation_type": "ISDA2009EquityPanAsia"
+    },
+    "equity_swap_transaction_supplement": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 1
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "0.000000000000000000"
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency_href": "equityPaymentCurrency",
+              "reference_amount": "StandardISDA"
+            },
+            "interpolation_method": "LinearZeroYield",
+            "leg": {
+              "id": "interestLeg",
+              "payer_party_href": "party2",
+              "receiver_party_href": "party1"
+            },
+            "notional": {
+              "relative_notional_amount_href": "equityNotionalAmount"
+            }
+          }
+        ],
+        "leg_types": [
+          "interestLeg",
+          "returnLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency": "USD",
+              "reference_amount": "StandardISDA"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "KRSE"
+                  ],
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2010-03-02"
+              }
+            },
+            "initial_price": {
+              "net_price": "5.000000000000000000",
+              "net_price_currency": "USD"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_centers": [
+                      "KRSE"
+                    ],
+                    "business_day_convention": "FOLLOWING"
+                  },
+                  "unadjusted_date": "2009-09-01"
+                }
+              },
+              "id": "returnLeg",
+              "payer_party_href": "party1",
+              "receiver_party_href": "party2",
+              "termination_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_centers": [
+                      "KRSE"
+                    ],
+                    "business_day_convention": "FOLLOWING"
+                  },
+                  "unadjusted_date": "2010-03-02"
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "300000.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Standard",
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "finalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "payment_dates_interim": {
+              "relative_dates": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "interimValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "equity",
+                "currency": "KRW",
+                "description": "KOREA AIR SVC ORDINARY",
+                "exchange_id": "XKRX",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.example.com/instrument-id-Reuters-RIC-1-0",
+                    "value": "005430.KS"
+                  },
+                  {
+                    "scheme": "http://www.example.com/instrument-id-ISIN-1-0",
+                    "value": "KR7005430004"
+                  }
+                ]
+              },
+              "single_open_units": "60000.000000000000000000"
+            }
+          }
+        ]
+      },
+      "break_fee_election": "FundingFee",
+      "break_fee_rate": "1.200000000000000000",
+      "optional_early_termination": true,
+      "product": {},
+      "provisions": {
+        "local_jurisdiction": "NotApplicable"
+      }
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "MS/2009/09/01/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PartyABIC1"
+          }
+        ],
+        "party_name": "A.N.Example"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PartyBBIC2"
+          }
+        ],
+        "party_name": "A.N.Other.Example"
+      }
+    ],
+    "product_type": "equitySwapTransactionSupplement",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABIC1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "PartyABIC1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/trade-id-1-0",
+              "value": "299442"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "PartyBBIC2"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/trade-id-1-0",
+              "value": "299442"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-09-01"
+    },
+    "trade_ordinal": 0
+  }
+]

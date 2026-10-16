@@ -1,0 +1,73 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.partyA.com/coding-scheme/account-id",
+            "value": "4345334"
+          }
+        ],
+        "id": "gh4903-uw2992"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "CORR/2007/05/02/234233423419",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2007-05-02T08:57:00Z",
+    "document_bytes": 10834,
+    "document_root": "requestConfirmation",
+    "document_sha256": "86178282d058c2fb95c7c719539989acf7b0d7cbf3612df090c97d3235813915",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2007-05-02T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2007-05-02T08:57:00Z"
+      },
+      "message_id": "234233423420",
+      "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+      "sent_by": "23902",
+      "sent_by_scheme": "http://www.partyA.com/coding-scheme/party-id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "ab9560",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "Client"
+      },
+      {
+        "id": "gh4903",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ],
+        "party_name": "Bank A"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "gh4903",
+            "trade_ids": [
+              "6234"
+            ]
+          }
+        ],
+        "product_type": "correlationSwap",
+        "trade_date": "2005-11-07"
+      }
+    ]
+  }
+]

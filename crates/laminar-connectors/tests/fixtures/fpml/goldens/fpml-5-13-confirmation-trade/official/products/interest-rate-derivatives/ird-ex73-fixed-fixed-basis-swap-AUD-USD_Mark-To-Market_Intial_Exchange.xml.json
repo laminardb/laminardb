@@ -1,0 +1,73 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "b47ad22a7b0d678d72db781ea4f390a9e748a46e9830d67703168b9fcdb4f077",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "00000"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "00000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2022-09-13"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,59 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "83aede9901095b376289049b2cff24335586c065f6588a6b7bd1f791b08f3919",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "A BANK(\"ABANK\")"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "SELL SECURITIES CO LTD (\"Counterparty\")"
+      }
+    ],
+    "product_type": "fra",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "FpML-test-8"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2019-01-14"
+    },
+    "trade_ordinal": 0
+  }
+]

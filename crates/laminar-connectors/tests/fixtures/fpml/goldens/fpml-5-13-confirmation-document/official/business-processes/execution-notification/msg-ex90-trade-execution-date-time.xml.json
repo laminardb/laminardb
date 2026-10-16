@@ -1,0 +1,57 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "EquityShareOption987",
+    "correlation_id_scheme": "http://www.msdw.com/conversationId/OTC",
+    "document_bytes": 7646,
+    "document_root": "executionNotification",
+    "document_sha256": "c44f5afc93a0c55f552343329b7d48eeb1aa0cb2d9096c35c154a6bb7534266c",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-01T08:57:00"
+      },
+      "message_id": "EquityShareOption456a789b",
+      "message_id_scheme": "http://www.msdw.com/messageId/OTC",
+      "sent_by": "msdw",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ],
+        "product_type": "equityOption",
+        "trade_date": "2001-07-13"
+      }
+    ]
+  }
+]

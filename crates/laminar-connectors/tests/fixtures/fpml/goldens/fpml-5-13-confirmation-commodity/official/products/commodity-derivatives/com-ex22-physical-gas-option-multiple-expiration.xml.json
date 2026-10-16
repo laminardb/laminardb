@@ -1,0 +1,179 @@
+[
+  {
+    "commodity_swaption": {
+      "buyer_party_href": "partyA",
+      "option_type": "Call",
+      "physical_exercise": {
+        "automatic_exercise": false,
+        "payment_dates": {},
+        "style": "europeanExercise",
+        "written_confirmation": false
+      },
+      "premium": {
+        "payer_party_href": "partyA",
+        "payment_amount": {
+          "amount": "36500.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "USNY",
+                "GBLO"
+              ],
+              "business_centers_href": "bc1",
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2009-04-24"
+          }
+        },
+        "premium_per_unit": {
+          "amount": "1.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "receiver_party_href": "partyB"
+      },
+      "product": {},
+      "seller_party_href": "partyB",
+      "underlying": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2010-01-01"
+          }
+        },
+        "legs": [
+          {
+            "calculation_periods": {
+              "calculation_periods_schedule": {
+                "balance_of_first_period": false,
+                "id": "calculationPeriodsSchedule",
+                "period": "M",
+                "period_multiplier": 1
+              }
+            },
+            "fixed_price": {
+              "price": "45.600000000000000000",
+              "price_currency": "USD",
+              "price_unit": "MMBTU"
+            },
+            "leg_type": "fixedLeg",
+            "notional": {
+              "quantity_href": "deliveryQuantity"
+            },
+            "payer_party_href": "partyA",
+            "payment_dates": {
+              "master_agreement_payment_dates": true
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyB"
+          },
+          {
+            "calculation_periods": {},
+            "delivery_periods": {
+              "calculation_periods_href": "calculationPeriodsSchedule"
+            },
+            "delivery_quantity": {
+              "physical_quantity": {
+                "quantity": "100.000000000000000000",
+                "quantity_frequency": "PerCalendarDay",
+                "quantity_unit": "MMBTU"
+              },
+              "total_physical_quantity": {
+                "quantity": "36500.000000000000000000",
+                "quantity_unit": "MMBTU"
+              }
+            },
+            "leg_type": "gasPhysicalLeg",
+            "notional": {},
+            "payer_party_href": "partyB",
+            "payment_dates": {},
+            "physical_commodity": "gas",
+            "physical_commodity_type": "NaturalGas",
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "settlement_currency": "USD",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2010-12-31"
+          }
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "ed2583a724136cf411a7ef3102923778a859adae444ba550c17dd33a05e3e709",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commoditySwaption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-04-22"
+    },
+    "trade_ordinal": 0
+  }
+]

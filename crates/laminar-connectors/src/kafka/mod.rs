@@ -90,7 +90,12 @@ pub fn register_kafka_source(
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         schema_capabilities: crate::schema::resolution::SchemaCapabilities {
-            built_in_formats: vec!["raw".into(), "bytes".into()],
+            built_in_formats: vec![
+                "raw".into(),
+                "bytes".into(),
+                #[cfg(feature = "fpml")]
+                "fpml".into(),
+            ],
             ..crate::schema::resolution::SchemaCapabilities::metadata(
                 &["avro"],
                 false,
@@ -182,7 +187,11 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
         // Format
-        ConfigKeySpec::optional("format", "Data format (json/csv/avro/raw/debezium)", "json"),
+        ConfigKeySpec::optional(
+            "format",
+            "Data format (json/csv/avro/raw/debezium/fpml)",
+            "json",
+        ),
         // Security
         ConfigKeySpec::optional(
             "security.protocol",
@@ -206,6 +215,8 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
     ];
     keys.extend(kafka_source_consumer_config_keys());
+    #[cfg(feature = "fpml")]
+    keys.extend(source::fpml::config_keys());
     keys.extend([
         // Schema Registry
         ConfigKeySpec::optional(

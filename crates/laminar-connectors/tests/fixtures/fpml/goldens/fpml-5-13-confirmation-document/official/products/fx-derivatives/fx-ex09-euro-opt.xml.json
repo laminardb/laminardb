@@ -1,0 +1,71 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "FX12345",
+    "correlation_id_scheme": "http://www.abn.com/coding-scheme/correlationId",
+    "creation_time_utc": "2002-01-04T08:57:00Z",
+    "document_bytes": 7534,
+    "document_root": "requestConfirmation",
+    "document_sha256": "3cd3d65fa623772367b6f53a7ede81e92d42981276c37ab0f095ecfa787c148c",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2002-01-04T08:57:00Z"
+      },
+      "message_id": "FX098765",
+      "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+      "send_to": [
+        "PARTYAUS33"
+      ],
+      "sent_by": "ABNANL2A",
+      "sent_by_scheme": "http://www.abn.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ],
+        "party_name": "ABN Amro"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "IBFXO-0123456789"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "IBFXO-0123456789"
+            ]
+          }
+        ],
+        "product_type": "fxOption",
+        "trade_date": "2002-01-04"
+      }
+    ]
+  }
+]

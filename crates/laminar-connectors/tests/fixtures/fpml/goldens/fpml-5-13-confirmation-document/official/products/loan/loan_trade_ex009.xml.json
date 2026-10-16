@@ -1,0 +1,82 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2017-09-09T00:41:29.484604200Z",
+    "document_bytes": 3121,
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "37378b9fe20751b54dfb5434a3a2718af28ee1ac8ea8e3249ae17bc4e42cfb1e",
+    "facility_identifiers": [
+      {
+        "id": "FAC12345",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "BANK67890"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-08T20:41:29.484604200",
+        "offset_minutes": -240,
+        "utc": "2017-09-09T00:41:29.484604200Z"
+      },
+      "message_id": "BPLC00001760279063",
+      "message_id_scheme": "http://www.barclays.com/coding-scheme/message-id-1-0",
+      "send_to": [
+        "GB1L213246"
+      ],
+      "sent_by": "US1LFM0001",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0"
+    },
+    "is_correction": false,
+    "loan_contents": [
+      {
+        "element": "allocation",
+        "locator": "/loanAllocationNotification/allocation"
+      }
+    ],
+    "loan_events": [
+      {
+        "event_ids": [
+          "US002"
+        ],
+        "event_type": "loanAllocationConfirmation",
+        "locator": "/loanAllocationNotification/loanAllocationConfirmation"
+      }
+    ],
+    "loan_trade_identifiers": [
+      {
+        "issuer": "US1LFM0001",
+        "trade_ids": [
+          "TN12345"
+        ]
+      }
+    ],
+    "notice_date": "2017-09-08",
+    "parties": [
+      {
+        "id": "BANK12345",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "GB1L213246"
+          }
+        ]
+      },
+      {
+        "id": "BANK67890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LFM0001"
+          }
+        ]
+      }
+    ],
+    "party_hrefs": [
+      "BANK67890"
+    ],
+    "role": "Seller"
+  }
+]

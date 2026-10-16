@@ -11,6 +11,12 @@
   record that is not yet durable, dictionary-validated column mappings for header, body, group,
   and metadata fields, deterministic replay, and at-least-once or exactly-once delivery in
   embedded and single-node deployments. Cluster placement is rejected. See `docs/FIX_SOURCE.md`.
+- FpML documents on the files and Kafka sources (`FORMAT FPML`, `fpml` feature, off by default).
+  Each document is validated against the bundled FpML 5.13 confirmation schema with a vendored,
+  network-free libxml2, its `id`/`href` references are checked, and a profile turns it into typed
+  rows with exact decimals and dates. Fourteen bundled profiles cover every product, loan
+  representation, and document type in the schema; your own schemas and profiles extend them
+  without code. Embedded and single-node only. See `docs/FPML_SOURCE.md`.
 - Certified commit-coupled sources are admitted for exactly-once delivery; uncertified ones are
   still rejected.
 - FIX source `logon.field.<tag>` for static venue-specific Logon fields, and

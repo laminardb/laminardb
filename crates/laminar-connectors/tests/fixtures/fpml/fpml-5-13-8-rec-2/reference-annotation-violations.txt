@@ -1,0 +1,42 @@
+# Schema-valid official examples whose href targets do not have the type named by the
+# ecore:reference annotation of the referencing element (fpml.references = 'schema').
+# The ref-8/ref-11 errata are among them; the rest are not listed in the published errata.
+business-processes/clearing/msg-ex102-clearingConfirmed-credit-event-single-name.xml
+business-processes/clearing/msg-ex103-clearingConfirmed-credit-event-index.xml
+products/commodity-derivatives/com-ex10-physical-oil-pipeline-crude-wti-floating-price.xml
+products/commodity-derivatives/com-ex11-physical-oil-pipeline-heating-oil-fixed-price.xml
+products/commodity-derivatives/com-ex12-physical-gas-europe-zbt-fixed-price.xml
+products/commodity-derivatives/com-ex14-physical-gas-europe-ttf-fixed-price.xml
+products/commodity-derivatives/com-ex15-physical-oil-pipeline-crude-wcs-fixed-price.xml
+products/commodity-derivatives/com-ex18-physical-power-us-eei-fixed-price-shaped-volume.xml
+products/commodity-derivatives/com-ex19-physical-bullion-forward.xml
+products/commodity-derivatives/com-ex21-physical-power-us-eei-fixed-price-shaped-volume-and-price.xml
+products/commodity-derivatives/com-ex24-weather-index-swap.xml
+products/commodity-derivatives/com-ex25-physical-bullion-forward-average-price.xml
+products/commodity-derivatives/com-ex26-physical-metal-forward.xml
+products/commodity-derivatives/com-ex27-wti-put-option-asian-listedoption-date.xml
+products/commodity-derivatives/com-ex29-physical-eu-emissions-option.xml
+products/commodity-derivatives/com-ex30-physical-eu-emissions-forward.xml
+products/commodity-derivatives/com-ex31-physical-us-emissions-option.xml
+products/commodity-derivatives/com-ex33-physical-bullion-forward-average-price.xml
+products/commodity-derivatives/com-ex39-basket-option-confirmation.xml
+products/commodity-derivatives/com-ex40-gas-digital-option-storage-volume-trigger.xml
+products/commodity-derivatives/com-ex46-simple-financial-put-option.xml
+products/commodity-derivatives/com-ex47-physical-eu-emissions-option-pred-clearing.xml
+products/commodity-derivatives/com-ex6-gas-call-option.xml
+products/commodity-derivatives/com-ex7-gas-put-option.xml
+products/commodity-derivatives/com-ex8-oil-call-option-strip.xml
+products/equity-swaps/eqs-ex12-on-european-index-underlyer-short-form.xml
+products/equity-swaps/eqs-ex13-pan-asia-interdealer-share-swap-short-form.xml
+products/equity-swaps/eqs-ex14-european-interdealer-share-swap-short-form.xml
+products/equity-swaps/eqs-ex15-forward-starting-pre-european-interdealer-share-swap-short-form.xml
+products/equity-swaps/eqs-ex16-forward-starting-post-european-interdealer-share-swap-short-form.xml
+products/equity-swaps/eqs-ex18-pan-asia-interdealer-index-swap-short-form.xml
+products/equity-swaps/eqs-ex19-european-interdealer-fair-value-share-swap-short-form.xml
+products/equity-swaps/trs-ex03-single-stock-execution-swap-with-fixing-and-dividend-payment-dates.xml
+products/equity-swaps/trs-ex04-index-ios.xml
+products/fx-derivatives/fx-ex55-accrual-option-average-strike.xml
+products/interest-rate-derivatives/ird-ex29-non-deliverable-settlement-swap.xml
+products/interest-rate-derivatives/ird-ex31-non-deliverable-settlement-swap.xml
+products/interest-rate-derivatives/ird-ex33-BRL-CDI-swap.xml
+products/loan/loan_party_ex100.xml

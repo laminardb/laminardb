@@ -1,0 +1,79 @@
+[
+  {
+    "correlation_id": "FX12345",
+    "creation_time_utc": "2001-11-12T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2001-11-12T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-11-12T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "d9933fb4ced1641166a2612a053ee0e0fa0e6b6489d52a16ce5a6f32060427aa",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX019876",
+    "message_id_scheme": "http://www.citi.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000SCC07UI6DB380"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFM8T61CT2L1QCEMIK50"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxDigitalOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "CITI10015",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000SCC07UI6DB380"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.citi.com/fx/trade-id",
+              "value": "CITI10016"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFM8T61CT2L1QCEMIK50"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.ubsw.com/fx/trade-id",
+              "value": "UBSW20016"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-11-12"
+    },
+    "trade_ordinal": 0
+  }
+]

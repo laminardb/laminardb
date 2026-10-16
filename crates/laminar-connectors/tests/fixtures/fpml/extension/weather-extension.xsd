@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Example FpML extension schema (not part of FpML): a weather index swap product that joins the
+     FpML product substitution group. Used by the operator extension example and its test. -->
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            xmlns:fpml="http://www.fpml.org/FpML-5/confirmation"
+            xmlns="urn:example:fpml-weather"
+            targetNamespace="urn:example:fpml-weather"
+            elementFormDefault="qualified"
+            attributeFormDefault="unqualified">
+  <xsd:import namespace="http://www.fpml.org/FpML-5/confirmation" schemaLocation="fpml-main-5-13.xsd" />
+  <xsd:complexType name="WeatherIndexSwap">
+    <xsd:complexContent>
+      <xsd:extension base="fpml:Product">
+        <xsd:sequence>
+          <xsd:element name="payerPartyReference" type="fpml:PartyReference" />
+          <xsd:element name="receiverPartyReference" type="fpml:PartyReference" />
+          <xsd:element name="station" type="xsd:token" />
+          <xsd:element name="index" type="xsd:token" />
+          <xsd:element name="strike" type="xsd:decimal" />
+          <xsd:element name="notional" type="fpml:Money" />
+          <xsd:element name="observationStart" type="xsd:date" />
+          <xsd:element name="observationEnd" type="xsd:date" />
+        </xsd:sequence>
+      </xsd:extension>
+    </xsd:complexContent>
+  </xsd:complexType>
+  <xsd:element name="weatherIndexSwap" type="WeatherIndexSwap" substitutionGroup="fpml:product" />
+</xsd:schema>

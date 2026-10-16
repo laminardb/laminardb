@@ -1,0 +1,161 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.party2.com/bondifre",
+            "value": "5462346"
+          }
+        ],
+        "account_name": "LDF Main Fund",
+        "beneficiary_href": "party2",
+        "id": "ACC1"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.barclaysglobal.com",
+            "value": "5462346"
+          }
+        ],
+        "account_name": "CALPERS A/C 1",
+        "beneficiary_href": "party4",
+        "id": "ACC2"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "cvgh45h"
+          }
+        ],
+        "account_name": "CALPERS Acount 23",
+        "beneficiary_href": "party5",
+        "id": "ACC3"
+      }
+    ],
+    "correlation_id": "COR-1223121232",
+    "creation_time_utc": "2006-04-02T10:38:00Z",
+    "creation_timestamp": {
+      "local": "2006-04-02T15:38:00",
+      "offset_minutes": 300,
+      "utc": "2006-04-02T10:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "67dae2cbdfdddce95877aa40aa4cc50d6dff7f4bc2d017d28ac922bc24d5a737",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "MS/2006/04/02/15-12",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "LDF"
+          }
+        ],
+        "party_name": "London Diversified Fund"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300Q4B2OQW6FDBA48"
+          }
+        ]
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300DYUPMMJDE0YO60"
+          }
+        ]
+      },
+      {
+        "id": "party4",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SC000TFX78OJ56"
+          }
+        ],
+        "party_name": "Barclays Global Investors"
+      },
+      {
+        "id": "party5",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "ANDYUAU1XXX"
+          }
+        ],
+        "party_name": "ANDRIYIVSKY BANK"
+      },
+      {
+        "id": "party6",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "CALPERS"
+          }
+        ],
+        "party_name": "California Public Employees' Retirement System"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTY2US33",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300Q4B2OQW6FDBA48"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "TW9235"
+            }
+          ]
+        },
+        {
+          "party_href": "party3",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300DYUPMMJDE0YO60"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclays.com/swaps/trade-id",
+              "value": "SW2000"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "party_href": "party3"
+        },
+        {
+          "party_href": "party1"
+        }
+      ],
+      "trade_date": "1994-12-12"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,83 @@
+[
+  {
+    "context": "loanTradeNotification",
+    "creation_time_utc": "2017-09-19T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2017-09-19T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2017-09-19T09:30:47Z"
+    },
+    "document_root": "loanTradeNotification",
+    "document_sha256": "812ff5fcf15198fcf263444242144d7938cf0860032e4cf8d595cbb09eaaafd8",
+    "event": {
+      "amount": {
+        "amount": "3500.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "EVENT1A",
+            "event_id_scheme": "http://www.company.com/eventIdScheme",
+            "party_href": "JPMorganChase"
+          }
+        ]
+      },
+      "due_date": "2017-09-26",
+      "loan_trade_href": "LoanTradeSummary1"
+    },
+    "event_type": "loanTradeFeeDue",
+    "facility_identifiers": [
+      {
+        "description": "USD 1BN Term Loan B",
+        "id": "TermLoanB",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "AgentParty"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SentMessageID9",
+    "notice_date": "2017-09-19",
+    "parties": [
+      {
+        "country": "US",
+        "id": "JPMorganChase",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001011"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "Amazon",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "AMZ1111111"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "AgentParty",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "JPM001012"
+          }
+        ],
+        "party_name": "JPMorganChase"
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanTradeNotification/loanTradeFeeDue",
+    "row_ordinal": 0,
+    "sent_by": "JPMorganChase"
+  }
+]

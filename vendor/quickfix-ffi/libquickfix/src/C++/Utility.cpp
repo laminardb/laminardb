@@ -278,6 +278,8 @@ ssize_t socket_send(socket_handle s, const char *msg, size_t length) {
 #endif
 }
 
+void socket_shutdown(socket_handle s) { shutdown(s, 2); }
+
 void socket_close(socket_handle s) {
   shutdown(s, 2);
 #ifdef _MSC_VER

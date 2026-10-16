@@ -1,0 +1,46 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 14984,
+    "document_root": "dataDocument",
+    "document_sha256": "627a0d205827a354583f7c1a60b6a569b720121fdfec0bf1e699e165d500ea62",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "DELTA123"
+          }
+        ],
+        "party_name": "Delta Bank Ltd"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "METRO123"
+          }
+        ],
+        "party_name": "Metro Bank Ltd"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "987654321-0"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2012-06-29"
+      }
+    ]
+  }
+]

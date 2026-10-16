@@ -1,0 +1,144 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.imgr.com/schemes/account-id",
+            "value": "FUND100"
+          }
+        ],
+        "beneficiary_href": "party1",
+        "id": "_FUNDACCT"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.custodian.com/account-id",
+            "value": "98765"
+          }
+        ],
+        "beneficiary_href": "_cust",
+        "id": "_CUSTACCT"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 8075,
+    "document_root": "clearingConfirmed",
+    "document_sha256": "b233f21e293f2a52c1d322e5cbc0757cf9f9ffac06e32c02832a59532b7b9b10",
+    "events": [
+      {
+        "effective_date": "2005-10-20",
+        "event_type": "change",
+        "locator": "/clearingConfirmed/change",
+        "payments": [
+          {
+            "payer_party_href": "party1",
+            "payment_amount": {
+              "amount": "100000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjusted_date": "2006-04-30"
+            },
+            "receiver_party_href": "party2"
+          },
+          {
+            "payer_party_href": "party1",
+            "payment_amount": {
+              "amount": "200000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjusted_date": "2006-05-30"
+            },
+            "payment_type": "CreditEvent",
+            "receiver_party_href": "party2"
+          }
+        ],
+        "trades": [
+          {
+            "locator": "/clearingConfirmed/change/trade",
+            "party_trade_identifiers": [
+              {
+                "party_href": "party1",
+                "trade_ids": [
+                  "CDX1234"
+                ]
+              },
+              {
+                "party_href": "party2",
+                "trade_ids": [
+                  "1234A6"
+                ]
+              }
+            ],
+            "product_type": "creditDefaultSwap",
+            "trade_date": "2005-01-24"
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "RBSLGB1LXXX"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "INVEST MGR"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E4CDNNLJRBKF36"
+          }
+        ],
+        "party_name": "BROKER 33"
+      },
+      {
+        "id": "_cust",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FNRNXH6KYKUK07"
+          }
+        ],
+        "party_name": "Custodian"
+      }
+    ]
+  }
+]

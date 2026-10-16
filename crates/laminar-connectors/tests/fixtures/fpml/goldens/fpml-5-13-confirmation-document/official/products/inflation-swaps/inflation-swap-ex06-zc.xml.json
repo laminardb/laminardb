@@ -1,0 +1,123 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "LCH00000000001",
+    "correlation_id_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/correlation-id",
+    "document_bytes": 12378,
+    "document_root": "executionNotification",
+    "document_sha256": "fe1de875e01eb7b47dbcc6a968cd0930a01b8ae9913eebfba7d11d0b8ca8e03f",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2020-12-17T09:10:11.355430200"
+      },
+      "message_id": "LCH00000000001",
+      "message_id_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/message-id",
+      "send_to": [
+        "LCHLGB2L"
+      ],
+      "sent_by": "LCHLGB2L",
+      "sent_by_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id"
+    },
+    "is_correction": false,
+    "originating_event": "NetPositionTrade",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-portfolio-id",
+            "value": "XXX_H_XXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/murex-counterparty-id",
+            "value": "LCHLGB2L"
+          }
+        ]
+      },
+      {
+        "id": "clearingDCO",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "LCHLGB2L"
+          }
+        ]
+      },
+      {
+        "id": "clearingBroker1",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "XXX"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "NETTING"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "tradeSource",
+            "trade_ids": [
+              "1",
+              "12345678"
+            ]
+          },
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "abc123"
+            ]
+          },
+          {
+            "party_href": "clearingBroker1",
+            "trade_ids": [
+              "def456"
+            ]
+          },
+          {
+            "party_href": "clearingDCO",
+            "trade_ids": [
+              "LCH00000000001",
+              "11111111",
+              "12",
+              "1111111",
+              "STM"
+            ]
+          },
+          {
+            "issuer": "1010000051",
+            "trade_ids": [
+              "XX11111111XXX1111111111111111111"
+            ]
+          },
+          {
+            "issuer": "1010000051",
+            "trade_ids": [
+              "XX11111111XXX1111111111111111111"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2019-09-23"
+      }
+    ]
+  }
+]

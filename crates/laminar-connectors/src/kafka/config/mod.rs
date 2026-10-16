@@ -781,6 +781,12 @@ impl KafkaSourceConfig {
                 "schema.registry.url is required when format is 'avro'".into(),
             ));
         }
+        #[cfg(not(feature = "fpml"))]
+        if self.format == Format::Fpml {
+            return Err(ConnectorError::ConfigurationError(
+                "format 'fpml' requires a build with the fpml feature".into(),
+            ));
+        }
 
         super::librdkafka::require_supported_client(
             self.security_protocol,

@@ -33,12 +33,12 @@ pub enum ExternalOutputPressure {
 }
 
 impl ExternalOutputPressure {
-    #[cfg(any(feature = "cluster", test))]
+    #[cfg(feature = "cluster")]
     pub(crate) const fn checkpoint_due(self) -> bool {
         matches!(self, Self::CheckpointDue)
     }
 
-    #[cfg(any(feature = "cluster", test))]
+    #[cfg(feature = "cluster")]
     pub(crate) const fn commit_backpressured(self) -> bool {
         matches!(self, Self::CommitBackpressured)
     }

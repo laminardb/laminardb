@@ -1,0 +1,155 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party2"
+      ]
+    },
+    "correlation_id": "CS/2000/08/01/EquityIndexOption369",
+    "creation_time_utc": "2000-08-01T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "b7374dee9a9b2bab07aa0262571747b8e828baad57c949f800f6c4705ebb91d4",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "equity_option": {
+      "option": {
+        "number_of_options": "2500.000000000000000000",
+        "option_entitlement": "1.000000000000000000",
+        "premium": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "300000.000000000000000000",
+            "currency": "CHF",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2001-09-06"
+          },
+          "receiver_party_href": "party1"
+        },
+        "strike": {
+          "strike_price": "8700.000000000000000000"
+        }
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Equity:Option:PriceReturnBasicPerformance:SingleIndex"
+          }
+        ]
+      },
+      "terms": {
+        "buyer_party_href": "party2",
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2004-12-19"
+            }
+          },
+          "expiration_time_type": "OSP",
+          "settlement_currency": "CHF",
+          "settlement_date": {
+            "relative_date": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "valuation",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 2
+            }
+          },
+          "settlement_price_source": "OfficialClose",
+          "settlement_type": "Cash",
+          "style": "equityEuropeanExercise",
+          "valuation": {
+            "valuation_time_type": "OSP"
+          }
+        },
+        "method_of_adjustment": "CalculationAgent",
+        "option_type": "Call",
+        "seller_party_href": "party1",
+        "underlyer": {
+          "single": {
+            "asset_type": "index",
+            "description": "Swiss Market Index",
+            "exchange_id": "XNYS",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/schemes/4.1/instrumentId",
+                "value": ".SSMI"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "EquityIndexOption456a789b",
+    "message_id_scheme": "http://www.msdw.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "equityOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "msdw",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/eqd-trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-09-04"
+    },
+    "trade_ordinal": 0
+  }
+]

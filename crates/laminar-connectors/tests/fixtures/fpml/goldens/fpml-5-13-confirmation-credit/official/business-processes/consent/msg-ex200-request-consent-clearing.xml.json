@@ -1,0 +1,136 @@
+[
+  {
+    "correlation_id": "456",
+    "creation_time_utc": "2006-01-01T04:01:00Z",
+    "creation_timestamp": {
+      "local": "2006-01-01T09:01:00",
+      "offset_minutes": 300,
+      "utc": "2006-01-01T04:01:00Z"
+    },
+    "credit_default_swap": {
+      "fee_leg": {
+        "periodic_payment": {
+          "first_payment_date": "2003-01-15",
+          "fixed_rate": "0.009000000000000000",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 3
+          },
+          "roll_convention": "15"
+        }
+      },
+      "general_terms": {
+        "buyer_party_href": "clearing-svc",
+        "effective_date": {
+          "unadjusted_date": "2002-12-03"
+        },
+        "reference_entity": {
+          "entity_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+              "value": "002BB2"
+            }
+          ],
+          "entity_name": "Abbey National PLC",
+          "id": "referenceEntity"
+        },
+        "reference_obligations": [
+          {
+            "asset": {
+              "asset_type": "bond",
+              "coupon_rate": "0.053750000000000000",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN",
+                  "value": "XS009316049"
+                }
+              ],
+              "maturity": "2009-12-30"
+            },
+            "primary_obligor": {
+              "entity_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+                  "value": "GLEECI"
+                }
+              ],
+              "entity_name": "Abbey National Treasury Services plc"
+            }
+          }
+        ],
+        "reference_type": "referenceInformation",
+        "scheduled_termination_date": {
+          "unadjusted_date": "2008-01-15"
+        },
+        "seller_party_href": "member-firm"
+      },
+      "product": {},
+      "protection_terms": [
+        {
+          "calculation_amount": {
+            "amount": "5000000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        }
+      ]
+    },
+    "document_root": "requestConsent",
+    "document_sha256": "5da5b3d6211be1a359af68fbabc320b461b7b700f006b9556bad144fad9f3c94",
+    "documentation": {
+      "master_confirmation_date": "2003-06-06",
+      "master_confirmation_type": "ISDA2003CreditEuropean"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "123",
+    "message_id_scheme": "http://www.clearingsvc.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      },
+      {
+        "id": "member-firm",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "54930091VMX9E6ST6216"
+          }
+        ]
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/requestConsent/trade",
+    "sent_by": "CLEARCO",
+    "sequence_number": 1,
+    "trade_context": "requestConsent",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "clearing-svc",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "CLEARCO"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.clearingsvc.com/tradeId/OTC",
+              "value": "SVC_001"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-12-02"
+    },
+    "trade_ordinal": 0
+  }
+]

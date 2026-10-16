@@ -1,0 +1,57 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "123",
+    "correlation_id_scheme": "http://www.msdw.com/conversationId/OTC",
+    "document_bytes": 2434,
+    "document_root": "executionNotification",
+    "document_sha256": "7375639f3def8193b0faebeaaad02850004f72860c22b663ea0a56f414ed3f42",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2012-08-01T08:57:00"
+      },
+      "message_id": "123456",
+      "message_id_scheme": "http://www.msdw.com/messageId/OTC",
+      "sent_by": "msdw",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "exchange",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Exchange 123"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ],
+        "product_type": "instrumentTradeDetails",
+        "trade_date": "2012-07-13"
+      }
+    ]
+  }
+]

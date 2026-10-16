@@ -1,0 +1,73 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "DTCCPty1"
+      ]
+    },
+    "correlation_id": "CORR/2007/10/30/002400000000001",
+    "creation_time_utc": "2007-10-31T23:08:40.335Z",
+    "creation_timestamp": {
+      "local": "2007-10-31T18:08:40.335",
+      "offset_minutes": -300,
+      "utc": "2007-10-31T23:08:40.335Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "e47956caf20713caff8eaf9ac12e4fc37f52d174c8aab813265b561c8c49c98b",
+    "documentation": {
+      "master_agreement_date": "2007-12-12",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "123456-002700000000001",
+    "message_id_scheme": "www.dtcc.com",
+    "parties": [
+      {
+        "id": "DTCCPty1",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "Party1"
+          }
+        ]
+      },
+      {
+        "id": "DTCCPty2",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "Party2"
+          }
+        ]
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "DTCCPty1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "DTCCPty1",
+          "party_ids": [
+            {
+              "scheme": "DTCC",
+              "value": "Party1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "TradeRefNbr",
+              "value": "TW9236"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2007-10-31"
+    },
+    "trade_ordinal": 0
+  }
+]

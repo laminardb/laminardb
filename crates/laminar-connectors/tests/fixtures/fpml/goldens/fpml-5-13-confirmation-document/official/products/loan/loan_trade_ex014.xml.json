@@ -1,0 +1,84 @@
+[
+  {
+    "actual_build": 7,
+    "allocation_identifiers": [
+      {
+        "issuer": "GB1L213246",
+        "trade_ids": [
+          "ALLOC1"
+        ]
+      }
+    ],
+    "creation_time_utc": "2017-09-09T00:41:33.720027700Z",
+    "document_bytes": 3012,
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "615e72269c20f0b37aee5ae277e592e003ba25a83ba727b8cec44dd1185fed5d",
+    "facility_identifiers": [
+      {
+        "id": "FAC12345",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "AGENT24680"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-08T20:41:33.720027700",
+        "offset_minutes": -240,
+        "utc": "2017-09-09T00:41:33.720027700Z"
+      },
+      "message_id": "BPLC00001009965681",
+      "message_id_scheme": "http://www.barclays.com/coding-scheme/message-id-1-0",
+      "send_to": [
+        "GB1L213246"
+      ],
+      "sent_by": "US1LA00001",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0"
+    },
+    "is_correction": false,
+    "loan_events": [
+      {
+        "event_ids": [
+          "AG003"
+        ],
+        "event_type": "loanAllocationSettlementDateFinalization",
+        "locator": "/loanAllocationNotification/loanAllocationSettlementDateFinalization"
+      }
+    ],
+    "loan_trade_identifiers": [
+      {
+        "issuer": "US1LFM0001",
+        "trade_ids": [
+          "TN12345"
+        ]
+      }
+    ],
+    "notice_date": "2017-09-08",
+    "parties": [
+      {
+        "id": "BANK12345",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "GB1L213246"
+          }
+        ]
+      },
+      {
+        "id": "AGENT24680",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LA00001"
+          }
+        ]
+      }
+    ],
+    "party_hrefs": [
+      "AGENT24680"
+    ],
+    "role": "Agent"
+  }
+]

@@ -1,0 +1,63 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "OTCCallorPutSpread45678",
+    "correlation_id_scheme": "http://www.drkw.com/conversationId/OTC",
+    "creation_time_utc": "2000-08-01T08:57:00Z",
+    "document_bytes": 1854,
+    "document_root": "requestConsent",
+    "document_sha256": "a41db09378452719dc856813195725b91bbb15490dbc5b110da55b795e562ccf",
+    "events": [
+      {
+        "agreement_date": "2004-04-28",
+        "change_in_number_of_options": "-7000.000000000000000000",
+        "effective_date": "2004-04-30",
+        "event_type": "termination",
+        "locator": "/requestConsent/termination",
+        "outstanding_number_of_options": "3000.000000000000000000",
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2000-08-01T08:57:00Z"
+      },
+      "message_id": "OTCCallorPutSpread456a789b",
+      "message_id_scheme": "http://www.drkw.com/messageId/OTC",
+      "sent_by": "drkw",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

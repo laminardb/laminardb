@@ -1,0 +1,54 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "547ba543336cf721ca2619dc94d46fe20fc74eb5c2c4fd476277f75b33df7b47",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493001RKR55V4X61F71"
+          }
+        ],
+        "party_name": "BNP Paribas S.A."
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XXXXYYYZZ"
+          }
+        ],
+        "party_name": "Client"
+      }
+    ],
+    "product_type": "fxFlexibleForward",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493001RKR55V4X61F71"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.bnpparibas.com/trade-id",
+              "value": "87654321"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2011-09-20"
+    },
+    "trade_ordinal": 0
+  }
+]

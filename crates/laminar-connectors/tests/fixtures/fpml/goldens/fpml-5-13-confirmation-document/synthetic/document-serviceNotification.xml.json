@@ -1,0 +1,30 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-serviceNotification",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:44:00Z",
+    "document_bytes": 1255,
+    "document_root": "serviceNotification",
+    "document_sha256": "007d3c2918f7728185591e5469c31fa83adec9593ce3833691cabbcd2f302db4",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:44:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:44:00Z"
+      },
+      "in_reply_to": "REQ-serviceNotification",
+      "message_id": "SYN-serviceNotification",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "service_advisory_category": "Scheduled",
+    "service_advisory_description": "Planned maintenance window",
+    "service_name": "SyntheticClearingService"
+  }
+]

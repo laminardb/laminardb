@@ -1,0 +1,233 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "39888addb6912a3dc9e21ee93c5651b7922e0caca03fe6849bcf678c5a84d49e",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "QGPGHQ1ENZOOLJRFTH41"
+          }
+        ],
+        "party_name": "ABCD Securities Inc."
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "J6W9XJWVE853A9CVRQ85"
+          }
+        ],
+        "party_name": "HedgeCo Capital L.L.C."
+      }
+    ],
+    "product_type": "returnSwap",
+    "return_swap": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 1
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "0.002000000000000000"
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency_href": "trs-eq1-EquityPaymentCurrency",
+              "reference_amount": "Standard ISDA"
+            },
+            "leg": {
+              "id": "trs-eq1-interestLeg",
+              "leg_identifiers": [
+                {
+                  "scheme": "http://www.partyA.com/leg-id",
+                  "value": "56789"
+                }
+              ],
+              "payer_party_href": "party2",
+              "receiver_party_href": "party1"
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "19785157.160000000000000000",
+                "currency": "EUR",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            }
+          }
+        ],
+        "leg_types": [
+          "returnLeg",
+          "interestLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency": "USD",
+              "reference_amount": "ISDA Standard"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2005-09-24"
+              }
+            },
+            "initial_price": {
+              "net_price": "37.440000000000000000",
+              "net_price_currency": "USD"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NONE"
+                  },
+                  "unadjusted_date": "2004-10-12"
+                }
+              },
+              "id": "trs-eq1-equityLeg",
+              "leg_identifiers": [
+                {
+                  "scheme": "http://www.partyA.com/leg-id",
+                  "value": "12345"
+                }
+              ],
+              "payer_party_href": "party1",
+              "receiver_party_href": "party2",
+              "termination_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NONE"
+                  },
+                  "unadjusted_date": "2006-10-12"
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "28469376.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Execution",
+            "notional_reset": true,
+            "payment_date_final": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "EUTA",
+                    "GBLO"
+                  ],
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2006-10-14"
+              }
+            },
+            "payment_dates_interim": {
+              "adjustable_dates": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "EUTA",
+                    "GBLO"
+                  ],
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_dates": [
+                  "2004-10-14",
+                  "2005-10-14",
+                  "2006-10-14"
+                ]
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "equity",
+                "currency": "EUR",
+                "description": "Shire Pharmeceuticals Group - American Depositary Receipts",
+                "exchange_id": "XNAS",
+                "id": "trs-eq1-equity-asset",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP",
+                    "value": "SHPGY.O"
+                  }
+                ]
+              },
+              "single_open_units": "760400.000000000000000000"
+            }
+          }
+        ]
+      },
+      "early_termination_parties": [
+        "party1",
+        "party2"
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "TotalReturnSwap"
+          }
+        ]
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "QGPGHQ1ENZOOLJRFTH41"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abc.com/swaps/trade-id",
+              "value": "TRS-01"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "J6W9XJWVE853A9CVRQ85"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.hedgeco.com/swaps/trade-id",
+              "value": "total-ret-swap-01"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2004-10-10"
+    },
+    "trade_id": "trs-eq1-trade",
+    "trade_ordinal": 0
+  }
+]

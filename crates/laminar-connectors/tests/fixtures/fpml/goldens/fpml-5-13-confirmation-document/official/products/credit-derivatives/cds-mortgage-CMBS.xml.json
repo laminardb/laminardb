@@ -1,0 +1,68 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR/2000/08/01/456a779b",
+    "correlation_id_scheme": "http://www.example.com/correlationId",
+    "creation_time_utc": "2000-08-01T08:57:00Z",
+    "document_bytes": 7290,
+    "document_root": "requestConfirmation",
+    "document_sha256": "139d1d6acfe5ddc8c54743ef61fb066497c6b685f577640a25a85f8c32aa2afa",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2000-08-01T08:57:00Z"
+      },
+      "message_id": "456a789b",
+      "message_id_scheme": "http://www.partyA.com/coding-scheme/messsage-id",
+      "sent_by": "msdw",
+      "sent_by_scheme": "http://www.partyA.com/coding-scheme/party-id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "109257"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "1234567"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2006-11-14"
+      }
+    ]
+  }
+]

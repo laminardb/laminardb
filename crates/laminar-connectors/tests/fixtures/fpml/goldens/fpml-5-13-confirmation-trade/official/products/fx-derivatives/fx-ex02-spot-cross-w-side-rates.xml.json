@@ -1,0 +1,79 @@
+[
+  {
+    "correlation_id": "FX987",
+    "creation_time_utc": "2001-10-23T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2001-10-23T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-10-23T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "0c08737bfc0240cc63d73d86a9a6a9b87da88cab0ef9efb8873c8128b463f1e4",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.matchingservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "391200ZGI3FROE0WYF22"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYAUS",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/fx/trade-id",
+              "value": "PARTYA345"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "391200ZGI3FROE0WYF22"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.csfb.com/fx/trade-id",
+              "value": "CSFB9842"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-10-23"
+    },
+    "trade_ordinal": 0
+  }
+]

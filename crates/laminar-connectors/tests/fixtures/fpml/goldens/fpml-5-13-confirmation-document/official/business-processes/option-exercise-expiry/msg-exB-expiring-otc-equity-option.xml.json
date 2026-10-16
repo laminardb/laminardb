@@ -1,0 +1,63 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "111",
+    "correlation_id_scheme": "http://www.clearinghouse.com/conversationId",
+    "creation_time_utc": "2008-09-01T13:57:00Z",
+    "document_bytes": 1802,
+    "document_root": "optionExpirationNotification",
+    "document_sha256": "0991a6b6cbbd14da060cdaf22cc2d7b4d3ffe19cd2a3979aba831a3a2981c835",
+    "events": [
+      {
+        "date": "2008-09-27",
+        "event_type": "optionExpiry",
+        "locator": "/optionExpirationNotification/optionExpiry",
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2008-09-01T13:57:00",
+        "offset_minutes": 0,
+        "utc": "2008-09-01T13:57:00Z"
+      },
+      "message_id": "111",
+      "message_id_scheme": "http://www.clearinghouse.com/messageId/OTC",
+      "send_to": [
+        "Party A"
+      ],
+      "sent_by": "CLEARING_HOUSE",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

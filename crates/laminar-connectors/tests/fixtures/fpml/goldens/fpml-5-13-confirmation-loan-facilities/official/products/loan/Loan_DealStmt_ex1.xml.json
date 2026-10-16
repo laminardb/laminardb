@@ -1,0 +1,113 @@
+[
+  {
+    "context": "deal",
+    "creation_time_utc": "2014-11-11T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2014-11-11T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2014-11-11T09:30:47Z"
+    },
+    "document_root": "dealStatement",
+    "document_sha256": "cf7a9cc68d88412eeefdb853b1bcdf61e97e411fc607f51e5469b53a117eb7d3",
+    "facility": {
+      "accrual_options": [
+        {
+          "accrual_option_id": "540685",
+          "currency": "USD",
+          "day_count_fraction": "30/360",
+          "end_date": "2015-02-15",
+          "fixed_rate": "0.002500000000000000",
+          "option_type": "fixedRateOption",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 3
+          },
+          "start_date": "2014-11-15"
+        }
+      ],
+      "agent_party_href": "BANKOFAGENTSNA",
+      "borrower_party_href": "BORROWERINC",
+      "current_commitment": {
+        "total_commitment_amount": {
+          "amount": "10000000.000000000000000000",
+          "currency": "USD",
+          "share_amount": "100000.000000000000000000"
+        }
+      },
+      "deal_href": "DL198",
+      "default_rate": {
+        "end_date": "2015-02-15",
+        "rate": "0.002000000000000000",
+        "start_date": "2014-11-15"
+      },
+      "description": "Term Loan A",
+      "governing_law": "USNY",
+      "id": "TL15",
+      "instrument_ids": [
+        {
+          "scheme": "http://www.cusip.com/",
+          "value": "TL159836"
+        }
+      ],
+      "maturity_date": "2015-02-15",
+      "party_href": "BANKOFAGENTSNA",
+      "start_date": "2014-11-15"
+    },
+    "facility_type": "termLoan",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "159304",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "ISSUINGBANK",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3I786123"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "SYNLEADBANK",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4S126598"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/dealStatement/deal/termLoan",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121",
+    "statement_date": "2014-11-12"
+  }
+]

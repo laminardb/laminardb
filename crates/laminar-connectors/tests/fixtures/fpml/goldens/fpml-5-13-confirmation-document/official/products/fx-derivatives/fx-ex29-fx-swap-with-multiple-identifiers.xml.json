@@ -1,0 +1,80 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORRELATIONID",
+    "correlation_id_scheme": "MarkitSERV",
+    "creation_time_utc": "2013-01-01T00:00:00Z",
+    "document_bytes": 5484,
+    "document_root": "executionNotification",
+    "document_sha256": "f39da4f861d2c90405155436c02b692fb2332224524b283642f054b39aebf98b",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2013-01-01T00:00:00",
+        "offset_minutes": 0,
+        "utc": "2013-01-01T00:00:00Z"
+      },
+      "message_id": "MESSAGEID",
+      "message_id_scheme": "MarkitSERV",
+      "send_to": [
+        "STP_Client"
+      ],
+      "sent_by": "MARKITSERV"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "ExecutingParty",
+        "party_ids": [
+          {
+            "scheme": "MarkitSERV",
+            "value": "PartyA"
+          }
+        ]
+      },
+      {
+        "id": "Counterparty",
+        "party_ids": [
+          {
+            "scheme": "MarkitSERV",
+            "value": "PartyB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "issuer": "USIPREFIX",
+            "trade_ids": [
+              "USITRADEID"
+            ]
+          },
+          {
+            "issuer": "UTIPREFIX",
+            "trade_ids": [
+              "UTITRADEID"
+            ]
+          },
+          {
+            "issuer": "USIPREFIX",
+            "trade_ids": [
+              "USITRADEID"
+            ]
+          },
+          {
+            "issuer": "UTIPREFIX",
+            "trade_ids": [
+              "UTITRADEID"
+            ]
+          }
+        ],
+        "product_type": "fxSwap",
+        "trade_date": "2012-01-01"
+      }
+    ]
+  }
+]

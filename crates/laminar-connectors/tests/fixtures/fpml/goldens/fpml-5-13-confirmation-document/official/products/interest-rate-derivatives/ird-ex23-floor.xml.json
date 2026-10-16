@@ -1,0 +1,50 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 6037,
+    "document_root": "dataDocument",
+    "document_sha256": "4352b5061f1da7d24af46b5b1c8dd7ad91bd320d2b9623ba2c772b5e7d629e1a",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "123"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "123"
+            ]
+          }
+        ],
+        "product_type": "capFloor",
+        "trade_date": "2001-04-29"
+      }
+    ]
+  }
+]

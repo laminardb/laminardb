@@ -1,0 +1,100 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.party2.com/bondifre",
+            "value": "5462346"
+          }
+        ],
+        "account_name": "LDF Main Fund",
+        "id": "ACC0"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "CORR019",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2010-09-10T15:00:00Z",
+    "document_bytes": 3681,
+    "document_root": "executionAdvice",
+    "document_sha256": "2a1a4320e2b2ee6a00ae72713cb353f1bd14751d95fb7868386c7ff83999755f",
+    "events": [
+      {
+        "event_type": "optionExercise",
+        "exercise_date": "2010-09-09",
+        "locator": "/executionAdvice/optionExercise",
+        "outstanding_number_of_options": "0.000000000000000000",
+        "payments": [
+          {
+            "id": "OPTION_EXERCISE_FEE",
+            "payer_party_href": "AMAG",
+            "payment_amount": {
+              "amount": "100000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {},
+            "receiver_party_href": "SKY"
+          }
+        ],
+        "settlement_type": "Cash",
+        "trade_identifiers": [
+          {
+            "party_href": "SKY",
+            "trade_ids": [
+              "IRS2"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-09-10T15:00:00",
+        "offset_minutes": 0,
+        "utc": "2010-09-10T15:00:00Z"
+      },
+      "message_id": "0485674",
+      "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+      "send_to": [
+        "AMAGGB22XXX"
+      ],
+      "sent_by": "CCSTUS6S"
+    },
+    "is_correction": false,
+    "on_behalf_of": [
+      {
+        "party_href": "SKY"
+      }
+    ],
+    "parties": [
+      {
+        "id": "AMAG",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500T86SHG919ON888"
+          }
+        ],
+        "party_name": "International Bank Asset Management"
+      },
+      {
+        "id": "SKY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300HTD3SZJWA5TS80"
+          }
+        ],
+        "party_name": "Sky Limited"
+      }
+    ],
+    "payment_reference_hrefs": [
+      "OPTION_EXERCISE_FEE"
+    ],
+    "product_type": "InterestRateSwaption",
+    "sequence_number": 3
+  }
+]

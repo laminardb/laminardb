@@ -1,0 +1,208 @@
+[
+  {
+    "commodity_swap": {
+      "details": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2008-07-01"
+          }
+        },
+        "legs": [
+          {
+            "calculation": {
+              "pricing_dates": {
+                "business_calendar": "NYMEX-NATURAL-GAS",
+                "calculation_periods_href": "floatingLeg1CalculationPeriods",
+                "day_distribution": "Last",
+                "day_type": "CommodityBusiness"
+              },
+              "spread": {
+                "amount": "-1.450000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "calculation_periods": {
+              "calculation_periods_schedule": {
+                "balance_of_first_period": false,
+                "id": "floatingLeg1CalculationPeriods",
+                "period": "M",
+                "period_multiplier": 1
+              }
+            },
+            "commodity": {
+              "delivery_dates": "FirstNearby",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price",
+                  "value": "NATURAL GAS-HENRY HUB-NYMEX"
+                }
+              ],
+              "specified_price": "Settlement"
+            },
+            "leg_type": "floatingLeg",
+            "notional": {
+              "notional_quantity": {
+                "quantity": "15000.000000000000000000",
+                "quantity_frequency": "PerCalendarDay",
+                "quantity_unit": "MMBTU"
+              },
+              "total_notional_quantity": "465000.000000000000000000"
+            },
+            "payer_party_href": "partyA",
+            "payment_dates": {
+              "relative": {
+                "calculation_periods_href": "floatingLeg1CalculationPeriods",
+                "pay_relative_to": "CalculationPeriodEndDate",
+                "payment_days_offset": {
+                  "business_day_convention": "NotApplicable",
+                  "day_type": "Business",
+                  "period": "D",
+                  "period_multiplier": 5
+                }
+              }
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyB"
+          },
+          {
+            "calculation": {
+              "averaging_method": "Unweighted",
+              "conversion_factor": "0.491300000000000000",
+              "pricing_dates": {
+                "business_calendar": "DowJonesPower",
+                "calculation_periods_href": "floatingLeg1CalculationPeriods",
+                "day_distribution": "All",
+                "day_type": "Calendar"
+              }
+            },
+            "calculation_periods": {
+              "calculation_periods_href": "floatingLeg1CalculationPeriods"
+            },
+            "commodity": {
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-1-0",
+                  "value": "ELECTRICITY-MID-COLUMBIA FIRM (ON-PEAK)-DOW JONES POWER"
+                }
+              ],
+              "specified_price": "MeanOfHighAndLow"
+            },
+            "leg_type": "floatingLeg",
+            "notional": {
+              "notional_quantity": {
+                "quantity": "15000.000000000000000000",
+                "quantity_frequency": "PerCalendarDay",
+                "quantity_unit": "MMBTU"
+              },
+              "total_notional_quantity": "465000.000000000000000000"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {
+              "relative": {
+                "calculation_periods_href": "floatingLeg1CalculationPeriods",
+                "pay_relative_to": "CalculationPeriodEndDate",
+                "payment_days_offset": {
+                  "business_day_convention": "NotApplicable",
+                  "day_type": "Business",
+                  "period": "D",
+                  "period_multiplier": 5
+                }
+              }
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "market_disruption": {
+          "disruption_fallbacks": "AsSpecifiedInMasterAgreement",
+          "market_disruption_events": "AsSpecifiedInMasterAgreement"
+        },
+        "settlement_currency": "USD",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2008-07-31"
+          }
+        }
+      },
+      "product": {}
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "73f34b2d2d44e1086824128e19ae3ba1639356a26c869cb19297f8338cd8117a",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commoditySwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2008-06-11"
+    },
+    "trade_ordinal": 0
+  }
+]

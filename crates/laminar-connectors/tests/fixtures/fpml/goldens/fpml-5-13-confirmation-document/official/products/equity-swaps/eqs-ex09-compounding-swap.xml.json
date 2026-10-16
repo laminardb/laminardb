@@ -1,0 +1,44 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 8313,
+    "document_root": "dataDocument",
+    "document_sha256": "a241ec30c4b56387f019d43cd9f227061213588d3cf8ee7b1d840bc261a4c5bc",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "BankB",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "BankB"
+          }
+        ]
+      },
+      {
+        "id": "BankA",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "BankA"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "BankB",
+            "trade_ids": [
+              "TRADEABC"
+            ]
+          }
+        ],
+        "product_type": "equitySwapTransactionSupplement",
+        "trade_date": "2008-01-01"
+      }
+    ]
+  }
+]

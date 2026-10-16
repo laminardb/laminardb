@@ -1,0 +1,76 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "0e31c26d1459f79fedf561307be605f881a2ca544fc0af215ae2bcf4672ade0a",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_date": "2007-07-05",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300U2FJ850G1P3962"
+          }
+        ],
+        "party_name": "Company A Inc."
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300B23HNTO1OHFU87"
+          }
+        ],
+        "party_name": "Company B Inc."
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300U2FJ850G1P3962"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyA.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300B23HNTO1OHFU87"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyB.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-04-10"
+    },
+    "trade_ordinal": 0
+  }
+]

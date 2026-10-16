@@ -1,0 +1,82 @@
+[
+  {
+    "creation_time_utc": "2019-02-07T14:05:42.267Z",
+    "creation_timestamp": {
+      "local": "2019-02-07T14:05:42.267",
+      "offset_minutes": 0,
+      "utc": "2019-02-07T14:05:42.267Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "1ca194dca3a3cf10b36959602243439058c5857553fee3f6a8f18131855e4f8f",
+    "documentation": {
+      "master_agreement_type": "GMSLA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "1234455",
+    "message_id_scheme": "http://www.abc.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "PARTY1-LEI"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "PARTY2-LEI"
+          }
+        ]
+      },
+      {
+        "id": "BondIssuer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BONDISSUER-LEI"
+          }
+        ]
+      }
+    ],
+    "product_type": "securityLending",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "ABC",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "PARTY1-LEI"
+            }
+          ],
+          "version_ids": [
+            {
+              "scheme": "http://www.abc.com/coding-scheme/trade-id",
+              "value": "9999999"
+            }
+          ],
+          "versions": [
+            1
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "party_href": "Party1"
+        }
+      ],
+      "trade_date": "2019-02-07"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 1809,
+    "document_root": "clearingConfirmed",
+    "document_sha256": "9df22dc58b2609cd22db466d04370dc316342b07fa7dacbca71fa5b0fcee7a41",
+    "events": [
+      {
+        "effective_date": "2010-11-06",
+        "event_type": "deClear",
+        "locator": "/clearingConfirmed/deClear",
+        "trade_identifiers": [
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "CL000001"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "RBSLGB1LXXX"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      }
+    ]
+  }
+]

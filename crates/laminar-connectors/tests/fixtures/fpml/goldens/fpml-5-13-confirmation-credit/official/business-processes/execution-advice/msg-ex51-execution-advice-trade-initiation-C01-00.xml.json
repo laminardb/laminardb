@@ -1,0 +1,190 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.imgr.com/schemes/account-id",
+            "value": "FUND100"
+          }
+        ],
+        "beneficiary_href": "_fund",
+        "id": "_FUNDACCT"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.custodian.com/account-id",
+            "value": "98765"
+          }
+        ],
+        "beneficiary_href": "_cust",
+        "id": "_CUSTACCT"
+      }
+    ],
+    "correlation_id": "IM/C001",
+    "creation_time_utc": "2009-06-08T18:03:09Z",
+    "creation_timestamp": {
+      "local": "2009-06-08T10:03:09",
+      "offset_minutes": -480,
+      "utc": "2009-06-08T18:03:09Z"
+    },
+    "credit_default_swap": {
+      "fee_leg": {
+        "initial_payment": {
+          "payer_party_href": "_fund",
+          "payment_amount": {
+            "amount": "387300.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "_broker"
+        },
+        "periodic_payment": {
+          "first_payment_date": "2009-06-20",
+          "first_period_start_date": "2009-03-20",
+          "fixed_rate": "0.023000000000000000",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 3
+          },
+          "roll_convention": "20"
+        }
+      },
+      "general_terms": {
+        "buyer_party_href": "_broker",
+        "effective_date": {
+          "unadjusted_date": "2009-06-09"
+        },
+        "reference_entity": {
+          "entity_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+              "value": "0E69A8"
+            }
+          ],
+          "entity_name": "0E69A8"
+        },
+        "reference_obligations": [
+          {
+            "asset": {
+              "asset_type": "bond",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN",
+                  "value": "US042735AL41"
+                }
+              ]
+            },
+            "primary_obligor": {
+              "entity_ids": [
+                {
+                  "scheme": "http://www.imgr.com/schemes/entity-id",
+                  "value": "ARW"
+                }
+              ],
+              "entity_name": "ARW"
+            }
+          }
+        ],
+        "reference_type": "referenceInformation",
+        "scheduled_termination_date": {
+          "unadjusted_date": "2012-06-20"
+        },
+        "seller_party_href": "_fund"
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Credit:SingleName:Corporate:StandardNorthAmericanCorporate"
+          }
+        ]
+      },
+      "protection_terms": [
+        {
+          "calculation_amount": {
+            "amount": "70000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "credit_events": {
+            "restructuring": true
+          }
+        }
+      ]
+    },
+    "document_root": "executionAdvice",
+    "document_sha256": "4d0257485913d330d160eada7458fda8280ce6115eb8afa754b347d21dedd681",
+    "documentation": {
+      "master_confirmation_date": "2009-05-22",
+      "master_confirmation_type": "ISDA2003StandardCreditNorthAmerican"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "IM/5",
+    "message_id_scheme": "http://www.imgr.com/schemes/message-id",
+    "parties": [
+      {
+        "id": "_fund",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "INVEST MGR"
+      },
+      {
+        "id": "_broker",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E4CDNNLJRBKF36"
+          }
+        ],
+        "party_name": "BROKER 33"
+      },
+      {
+        "id": "_cust",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FNRNXH6KYKUK07"
+          }
+        ],
+        "party_name": "Custodian"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/executionAdvice/trade",
+    "sent_by": "IMGRUS6S",
+    "sequence_number": 1,
+    "trade_context": "executionAdvice",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "_fund",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "959800NKRMZ8NEKQ0A23"
+            }
+          ],
+          "version_ids": [
+            {
+              "scheme": "http://www.swift.com/coding-scheme/contract-id",
+              "value": "CONTR2345"
+            }
+          ],
+          "versions": [
+            1
+          ]
+        }
+      ],
+      "trade_date": "2009-06-08"
+    },
+    "trade_ordinal": 0
+  }
+]

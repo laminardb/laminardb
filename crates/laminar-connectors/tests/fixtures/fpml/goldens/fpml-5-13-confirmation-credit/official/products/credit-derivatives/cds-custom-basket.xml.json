@@ -1,0 +1,253 @@
+[
+  {
+    "correlation_id": "CORR/2005/01/24/0EB30A0q",
+    "creation_time_utc": "2005-01-24T12:36:35Z",
+    "creation_timestamp": {
+      "local": "2005-01-24T04:36:35",
+      "offset_minutes": -480,
+      "utc": "2005-01-24T12:36:35Z"
+    },
+    "credit_default_swap": {
+      "cash_settlement_terms": [
+        {
+          "settlement_currency": "USD"
+        },
+        {
+          "settlement_currency": "EUR"
+        }
+      ],
+      "fee_leg": {
+        "periodic_payment": {
+          "calculation_amount": {
+            "amount": "25000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "day_count_fraction": "ACT/ACT.ISDA",
+          "fixed_rate": "0.006000000000000000"
+        }
+      },
+      "general_terms": {
+        "basket_ids": [
+          "BASKET089"
+        ],
+        "basket_name": "CDS Basket Sample",
+        "buyer_party_href": "party2",
+        "effective_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2004-03-23"
+        },
+        "nth_to_default": 1,
+        "reference_pool": [
+          {
+            "basket_percentage": "0.400000000000000000",
+            "entity_type": "NorthAmericanInvestmentGrade",
+            "reference_entity": {
+              "entity_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+                  "value": "008HA7"
+                }
+              ],
+              "entity_name": "Agrium Inc.",
+              "id": "agriumEntity"
+            },
+            "reference_obligation": {
+              "asset": {
+                "asset_type": "bond",
+                "coupon_rate": "0.077000000000000000",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP",
+                    "value": "008916AB4"
+                  }
+                ],
+                "maturity": "2017-02-01"
+              },
+              "primary_obligor_href": "agriumEntity"
+            }
+          },
+          {
+            "basket_percentage": "0.300000000000000000",
+            "entity_type": "NorthAmericanInvestmentGrade",
+            "reference_entity": {
+              "entity_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+                  "value": "8G836J"
+                }
+              ],
+              "entity_name": "Tenet Healthcare Corporation",
+              "id": "tenetEntity"
+            },
+            "reference_obligation": {
+              "asset": {
+                "asset_type": "bond",
+                "coupon_rate": "0.060000000000000000",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP",
+                    "value": "88033GAT7"
+                  }
+                ],
+                "maturity": "2011-12-01"
+              },
+              "primary_obligor_href": "tenetEntity"
+            }
+          },
+          {
+            "basket_percentage": "0.300000000000000000",
+            "entity_type": "NorthAmericanInvestmentGrade",
+            "reference_entity": {
+              "entity_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+                  "value": "8G8KT"
+                }
+              ],
+              "entity_name": "Teleco Corporation Europe",
+              "id": "telecoEntity"
+            },
+            "reference_obligation": {
+              "asset": {
+                "asset_type": "bond",
+                "coupon_rate": "0.080000000000000000",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP",
+                    "value": "88033GAT7"
+                  }
+                ],
+                "maturity": "2009-12-01"
+              },
+              "primary_obligor_href": "tenetEntity"
+            }
+          }
+        ],
+        "reference_type": "basketReferenceInformation",
+        "scheduled_termination_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2009-03-20"
+        },
+        "seller_party_href": "party1"
+      },
+      "product": {},
+      "protection_terms": [
+        {
+          "calculation_amount": {
+            "amount": "25000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "credit_events": {
+            "bankruptcy": true,
+            "credit_event_notice_parties": [
+              "party2",
+              "party1"
+            ],
+            "failure_to_pay": true,
+            "failure_to_pay_grace_period_extension": true,
+            "failure_to_pay_payment_requirement": {
+              "amount": "1000000.000000000000000000",
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          },
+          "obligation_category": "BondOrLoan"
+        },
+        {
+          "calculation_amount": {
+            "amount": "10000000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "credit_events": {
+            "bankruptcy": true,
+            "credit_event_notice_parties": [
+              "party2",
+              "party1"
+            ],
+            "failure_to_pay": true,
+            "failure_to_pay_grace_period_extension": true,
+            "failure_to_pay_payment_requirement": {
+              "amount": "1000000.000000000000000000",
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          },
+          "obligation_category": "BondOrLoan"
+        }
+      ]
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "964fcd15fbbce3951e87b97705205c014e1c09f5661da86aefe104553ed634bb",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2003Credit"
+      ]
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:0EB40A0q",
+    "message_id_scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/messageID",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "I7331LVCZKQKX5T7XV54"
+          }
+        ],
+        "party_name": "Morgan Stanley Captial Services"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800H14XVWOV87OI72"
+          }
+        ],
+        "party_name": "Barclays Global Investors"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "BGIAGB2L",
+    "sequence_number": 1,
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "linked_trade_ids": [
+            {
+              "scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/linkID",
+              "value": "USDINDEX"
+            }
+          ],
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "213800H14XVWOV87OI72"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/tradeID",
+              "value": "DJITRAXXUSDMS5Y"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2004-01-24"
+    },
+    "trade_ordinal": 0
+  }
+]

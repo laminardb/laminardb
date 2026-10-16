@@ -1,0 +1,114 @@
+[
+  {
+    "context": "lcNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "lcNotification",
+    "document_sha256": "0d951e969630fd101f18f653d08864b1e963febdf2882497e07cc96761e67abb",
+    "event": {
+      "accrual_schedule": [
+        {
+          "accrual_amount": {
+            "amount": "209.590000000000000000",
+            "currency": "USD",
+            "share_amount": "86.900000000000000000"
+          },
+          "end_date": "2014-06-29",
+          "number_of_days": 60,
+          "rate": "0.012750000000000000",
+          "reference_amount": {
+            "amount": "100000.000000000000000000",
+            "currency": "USD",
+            "share_amount": "41461.540000000000000000"
+          },
+          "start_date": "2014-05-01"
+        }
+      ],
+      "accrual_type_id": "54325",
+      "amount": {
+        "amount": "209.590000000000000000",
+        "currency": "USD",
+        "share_amount": "86.900000000000000000"
+      },
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "65159",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "effective_date": "2014-06-30",
+      "end_date": "2014-06-29",
+      "letter_of_credit_hrefs": [
+        "LOC234"
+      ],
+      "start_date": "2014-05-01"
+    },
+    "event_type": "lcIssuanceFeePayment",
+    "facility_identifiers": [
+      {
+        "description": "Revolver",
+        "id": "FAC67890",
+        "instrument_ids": [
+          "F234564REV"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "724152",
+    "notice_date": "2014-11-12",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "BENEFICIARYBANK",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1B987656"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/lcNotification/lcIssuanceFeePayment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

@@ -1,0 +1,69 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "40983ac436013b28d7a235fdceb2e8716498877b90026edc35771944335f2168",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank A"
+          }
+        ],
+        "party_name": "Bank a"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank B"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Bank A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.bankB.com/swaps/com-trade-id",
+              "value": "BankA1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Bank B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.bankA.com/swaps/com-trade-id",
+              "value": "BankB5678"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-01-01"
+    },
+    "trade_ordinal": 0
+  }
+]

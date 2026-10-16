@@ -47,6 +47,8 @@ otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
 # FIX initiator source (builds the QuickFIX C++ engine with CMake); off by default.
 fix = ["laminar-connectors/fix"]
+# FpML documents on the files and Kafka sources (builds libxml2 with CMake); off by default.
+fpml = ["files", "laminar-connectors/fpml"]
 cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
 # Non-default visibility for Criterion targets that exercise private cluster data-plane paths.
 benchmark-internals = ["cluster"]

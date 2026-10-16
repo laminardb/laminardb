@@ -1,0 +1,69 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2019-02-07T14:05:42.267Z",
+    "document_bytes": 8111,
+    "document_root": "executionNotification",
+    "document_sha256": "1ca194dca3a3cf10b36959602243439058c5857553fee3f6a8f18131855e4f8f",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2019-02-07T14:05:42.267",
+        "offset_minutes": 0,
+        "utc": "2019-02-07T14:05:42.267Z"
+      },
+      "message_id": "1234455",
+      "message_id_scheme": "http://www.abc.com/coding-scheme/message-id",
+      "send_to": [
+        "ABCDEF"
+      ],
+      "sent_by": "ABC",
+      "sent_by_scheme": "http://www.abc.com/coding-scheme/message-address-id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "PARTY1-LEI"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "PARTY2-LEI"
+          }
+        ]
+      },
+      {
+        "id": "BondIssuer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BONDISSUER-LEI"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/executionNotification/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "Party1",
+            "trade_ids": [
+              "9999999"
+            ]
+          }
+        ],
+        "product_type": "securityLending",
+        "trade_date": "2019-02-07"
+      }
+    ]
+  }
+]

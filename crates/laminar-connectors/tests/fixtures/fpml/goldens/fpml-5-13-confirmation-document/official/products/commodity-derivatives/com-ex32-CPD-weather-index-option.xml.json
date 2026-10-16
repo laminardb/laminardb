@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 6687,
+    "document_root": "dataDocument",
+    "document_sha256": "5d7c9727be1fd0be7d6d84c68baad05ff69fda7fd60b36446177af76402f2203",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "ART Reinsurance LLC"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500QCC36R89FI3U25"
+          }
+        ],
+        "party_name": "Mountain Ski Resorts Inc."
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "1234"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "2345"
+            ]
+          }
+        ],
+        "product_type": "commodityOption",
+        "trade_date": "2012-04-04"
+      }
+    ]
+  }
+]

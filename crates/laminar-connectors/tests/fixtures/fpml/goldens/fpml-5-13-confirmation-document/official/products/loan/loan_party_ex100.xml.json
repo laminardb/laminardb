@@ -1,0 +1,45 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2017-09-15T09:30:47Z",
+    "document_bytes": 5667,
+    "document_root": "loanPartyProfileStatement",
+    "document_sha256": "fe7effd1e970c5ad76e9555081c01eb293eda2e09a1b6662dae3bcbdf8051d8f",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2017-09-15T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2017-09-15T09:30:47Z"
+      },
+      "implementation_specification_name": "LoanFpML",
+      "implementation_specification_version": "v5.10",
+      "message_id": "SentProfileMessageID1",
+      "message_id_scheme": "http://www.company.com/messageIdScheme",
+      "send_to": [
+        "JPMorganChase"
+      ],
+      "sent_by": "EatonVance",
+      "sent_by_scheme": "http://www.company.com/messageAddressScheme"
+    },
+    "is_correction": false,
+    "loan_contents": [
+      {
+        "element": "partyProfile",
+        "locator": "/loanPartyProfileStatement/partyProfile"
+      }
+    ],
+    "parties": [
+      {
+        "country": "US",
+        "id": "EatonVance",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "EV1000001"
+          }
+        ]
+      }
+    ]
+  }
+]

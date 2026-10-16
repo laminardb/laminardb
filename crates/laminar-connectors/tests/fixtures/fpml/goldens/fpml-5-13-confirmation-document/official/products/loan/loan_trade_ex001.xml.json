@@ -1,0 +1,74 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-09-26T14:00:00Z",
+    "document_bytes": 3360,
+    "document_root": "loanTradeNotification",
+    "document_sha256": "fd8d7585c79f8deaf6597731dbbe4ec07a708304af3a0ec8f8e765ba17335abd",
+    "facility_identifiers": [
+      {
+        "id": "FAC12345",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "BANK67890"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-09-26T10:00:00",
+        "offset_minutes": -240,
+        "utc": "2018-09-26T14:00:00Z"
+      },
+      "message_id": "BPLC0000444445555",
+      "message_id_scheme": "http://www.abcbank.com/coding-scheme/message-id-1-0",
+      "send_to": [
+        "GB1L213146"
+      ],
+      "sent_by": "US1LFM0001",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0"
+    },
+    "is_correction": false,
+    "loan_events": [
+      {
+        "event_ids": [
+          "US001"
+        ],
+        "event_type": "loanTrade",
+        "locator": "/loanTradeNotification/loanTrade"
+      }
+    ],
+    "notice_date": "2018-09-26",
+    "parties": [
+      {
+        "id": "BANK12345",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "GB1L213246"
+          }
+        ]
+      },
+      {
+        "id": "BANK67890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LFM0001"
+          }
+        ]
+      }
+    ],
+    "party_hrefs": [
+      "BANK67890"
+    ],
+    "role": "Seller",
+    "trades": [
+      {
+        "id": "T1",
+        "locator": "/loanTradeNotification/trade"
+      }
+    ]
+  }
+]

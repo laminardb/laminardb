@@ -1,0 +1,153 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "dd6bb2e0a45c57e42d6d1e687225b8e33e4b7b24de0b197f1d65c221a62f803d",
+    "documentation": {
+      "master_confirmation_date": "2011-01-01",
+      "master_confirmation_type": "ISDA2010EquityEMEAInterdealer"
+    },
+    "equity_option_transaction_supplement": {
+      "exchange_traded_contract_nearest": true,
+      "multiple_exchange_index_annex_fallback": false,
+      "option": {
+        "number_of_options": "1000.000000000000000000",
+        "premium": {
+          "payer_party_href": "partyA",
+          "payment_amount": {
+            "amount": "50000.000000000000000000",
+            "currency": "PLN",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2011-02-15"
+          },
+          "price_per_option": {
+            "amount": "50.000000000000000000",
+            "currency": "PLN",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "partyB"
+        },
+        "strike": {
+          "strike_price": "100.000000000000000000"
+        }
+      },
+      "product": {},
+      "terms": {
+        "buyer_party_href": "partyA",
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NotApplicable"
+              },
+              "unadjusted_date": "2012-11-16"
+            }
+          },
+          "expiration_time_type": "OSP",
+          "settlement_currency": "PLN",
+          "settlement_date": {
+            "relative_date": {
+              "business_day_convention": "NotApplicable",
+              "date_relative_to_href": "valuationDate",
+              "day_type": "CurrencyBusiness",
+              "period": "D",
+              "period_multiplier": 2
+            }
+          },
+          "settlement_type": "Cash",
+          "style": "equityEuropeanExercise",
+          "valuation": {
+            "futures_price_valuation": true
+          }
+        },
+        "option_type": "Call",
+        "seller_party_href": "partyB",
+        "underlyer": {
+          "single": {
+            "asset_type": "index",
+            "currency": "PLN",
+            "description": "WIG20 INDEX",
+            "exchange_id": "XWAR",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.example.com/instrument-id-Reuters-RIC-1-0",
+                "value": ".WIG20"
+              }
+            ],
+            "related_exchange_ids": [
+              "XWAR"
+            ]
+          }
+        }
+      }
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XXXX1111"
+          }
+        ],
+        "party_name": "XXXX Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "YYYY2222"
+          }
+        ],
+        "party_name": "YYYY Bank"
+      }
+    ],
+    "product_type": "equityOptionTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "XXXX1111"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/trade-id-1-0",
+              "value": "2783639"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "YYYY2222"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/trade-id-1-0",
+              "value": "2783639"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2011-02-11"
+    },
+    "trade_ordinal": 0
+  }
+]

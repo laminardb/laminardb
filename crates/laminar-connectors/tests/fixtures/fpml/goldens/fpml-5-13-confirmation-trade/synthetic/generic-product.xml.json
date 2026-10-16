@@ -1,0 +1,79 @@
+[
+  {
+    "correlation_id": "SYN-GEN",
+    "creation_time_utc": "2026-05-11T14:00:00Z",
+    "creation_timestamp": {
+      "local": "2026-05-11T14:00:00",
+      "offset_minutes": 0,
+      "utc": "2026-05-11T14:00:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "80b25968bcfe1672e933bd4e65f3f03f08b5c5b4770b2a4569a5ad0b1a8f4dbc",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SYN-GEN-0001",
+    "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "product_type": "genericProduct",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYA",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYA"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "GEN-3001"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/party-id",
+              "value": "PARTYB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.example.com/coding-scheme/trade-id",
+              "value": "GEN-3001"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2026-05-11"
+    },
+    "trade_ordinal": 0
+  }
+]

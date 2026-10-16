@@ -1,0 +1,185 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "value": "bgcf22j"
+          }
+        ],
+        "account_name": "Barclays Global Investors 2",
+        "id": "ACC1"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.party2.com/bondifre",
+            "value": "5462346"
+          }
+        ],
+        "account_name": "LDF Main Fund",
+        "id": "ACC0"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "cvgh44h"
+          }
+        ],
+        "account_name": "CALPERS A/C 1",
+        "id": "ACC2"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "cvgh45h"
+          }
+        ],
+        "account_name": "CALPERS Account 23",
+        "id": "ACC3"
+      }
+    ],
+    "calculation_agent": {
+      "party_hrefs": [
+        "party2"
+      ]
+    },
+    "calculation_agent_business_center": "USNY",
+    "correlation_id": "234231132",
+    "creation_time_utc": "2002-12-03T09:57:00Z",
+    "creation_timestamp": {
+      "local": "2002-12-03T09:57:00",
+      "offset_minutes": 0,
+      "utc": "2002-12-03T09:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "87d1d7a2acbefc3906c8ed08df7ed6576e900d34a5e02174985820b8b82edff2",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA1999Credit"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "123453212",
+    "message_id_scheme": "http://www.party2.com/message-id",
+    "other_party_payments": [
+      {
+        "payer_party_href": "party3",
+        "payment_amount": {
+          "amount": "20000.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "GBLO",
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2003-03-06"
+        },
+        "payment_type": "Premium",
+        "receiver_party_href": "party2"
+      },
+      {
+        "payer_party_href": "party2",
+        "payment_amount": {
+          "amount": "10000.000000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "date_adjustments": {
+            "business_centers": [
+              "GBLO",
+              "USNY"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "unadjusted_date": "2003-03-08"
+        },
+        "payment_type": "External Party Payment",
+        "receiver_party_href": "party1"
+      }
+    ],
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RK1FB0VMTPD087"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "BARCGB22"
+          }
+        ],
+        "party_name": "Barclays Global Investors"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300Q4B2OQW6FDBA48"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "NBILGB2L"
+          }
+        ],
+        "party_name": "Nomura Bank Global Risk Management"
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "IBY5X3QKOI3QLECZM838"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "CPERUS61"
+          }
+        ],
+        "party_name": "California Public Employees' Retirement System"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "PARTY2US33",
+    "sequence_number": 1,
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300Q4B2OQW6FDBA48"
+            },
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+              "value": "NBILGB2L"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "10000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-12-03"
+    },
+    "trade_ordinal": 0
+  }
+]

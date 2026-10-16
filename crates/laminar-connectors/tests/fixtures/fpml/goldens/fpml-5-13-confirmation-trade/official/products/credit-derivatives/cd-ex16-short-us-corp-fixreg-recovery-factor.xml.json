@@ -1,0 +1,73 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "8cc28a39a2a106f572b87a0cde3e2d92804907beecdadd7cedf12887214061cb",
+    "documentation": {
+      "master_confirmation_date": "2001-01-04",
+      "master_confirmation_type": "ISDA1999Credit"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900BIAQJIUV6DLE92"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.xyzbank.com/cd-trade-id",
+              "value": "xyz1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abcbank.com/cd-trade-id",
+              "value": "abc1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-12-03"
+    },
+    "trade_ordinal": 0
+  }
+]

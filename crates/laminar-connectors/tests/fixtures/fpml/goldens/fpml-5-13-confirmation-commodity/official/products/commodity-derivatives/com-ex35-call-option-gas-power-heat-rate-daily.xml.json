@@ -1,0 +1,182 @@
+[
+  {
+    "commodity_option": {
+      "floating_strike_price_per_unit": {
+        "pricing_dates": {
+          "calculation_periods_href": "calculationPeriodsSchedule",
+          "settlement_periods_hrefs": [
+            "settlementPeriods"
+          ]
+        }
+      },
+      "product": {},
+      "terms": {
+        "buyer_party_href": "partyA",
+        "calculation_periods_schedule": {
+          "balance_of_first_period": true,
+          "id": "calculationPeriodsSchedule",
+          "period": "D",
+          "period_multiplier": 1
+        },
+        "commodity": {
+          "instrument_ids": [
+            {
+              "scheme": "http://www.companyA.com/coding-scheme/commodity-reference-price",
+              "value": "ELECTRICITY-CAISO-SP 15 GEN HUB-DAY AHEAD"
+            }
+          ],
+          "multiplier": "11.000000000000000000",
+          "specified_price": "LocationalMarginal"
+        },
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-07-01"
+          }
+        },
+        "exercise": {
+          "automatic_exercise": true,
+          "expiration_dates": [
+            {
+              "relative_date": {
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "pricingDates",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 0
+              }
+            }
+          ],
+          "payment_dates": {
+            "relative": {
+              "calculation_periods_href": "calculationPeriodsSchedule",
+              "pay_relative_to": "CalculationPeriodMonthEnd",
+              "payment_days_offset": {
+                "business_day_convention": "NONE",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 10
+              }
+            }
+          },
+          "settlement_currency": "USD",
+          "style": "europeanExercise"
+        },
+        "notional": {
+          "notional_quantity": {
+            "quantity": "25.000000000000000000",
+            "quantity_frequency": "PerCalendarDay",
+            "quantity_unit": "MW"
+          },
+          "total_notional_quantity": "2300.000000000000000000"
+        },
+        "option_type": "Call",
+        "premiums": [
+          {
+            "payer_party_href": "partyA",
+            "payment_amount": {
+              "amount": "342000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2012-04-05"
+              }
+            },
+            "receiver_party_href": "partyB"
+          }
+        ],
+        "pricing_dates": {
+          "calculation_periods_href": "calculationPeriodsSchedule"
+        },
+        "seller_party_href": "partyB",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-09-30"
+          }
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "0e31c26d1459f79fedf561307be605f881a2ca544fc0af215ae2bcf4672ade0a",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_date": "2007-07-05",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300U2FJ850G1P3962"
+          }
+        ],
+        "party_name": "Company A Inc."
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300B23HNTO1OHFU87"
+          }
+        ],
+        "party_name": "Company B Inc."
+      }
+    ],
+    "product_type": "commodityOption",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300U2FJ850G1P3962"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyA.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300B23HNTO1OHFU87"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.companyB.com/spec/2001/trade-id-1-0",
+              "value": "163476"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-04-10"
+    },
+    "trade_ordinal": 0
+  }
+]

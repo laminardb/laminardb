@@ -1,0 +1,107 @@
+# Columns every loan profile shares: the document and notification context of a loan event or
+# facility. Loan profiles include this file first and add their own columns after it.
+include = ["loans.toml"]
+
+[[columns]]
+name = "document_sha256"
+type = "utf8"
+meta = "document_sha256"
+required = true
+
+[[columns]]
+name = "document_root"
+type = "utf8"
+meta = "root"
+required = true
+
+[[columns]]
+name = "fpml_version"
+type = "utf8"
+meta = "fpml_version"
+required = true
+
+[[columns]]
+name = "row_ordinal"
+type = "uint32"
+meta = "row"
+required = true
+
+[[columns]]
+name = "row_count"
+type = "uint32"
+meta = "row_count"
+required = true
+
+[[columns]]
+name = "row_locator"
+type = "utf8"
+meta = "row_locator"
+required = true
+
+[[columns]]
+name = "context"
+type = "utf8"
+path = "../#name"
+description = "Local name of the element holding the row (the notification or statement, or an enclosing element)"
+
+[[columns]]
+name = "message_id"
+type = "utf8"
+path = "/header/messageId"
+
+[[columns]]
+name = "sent_by"
+type = "utf8"
+path = "/header/sentBy"
+
+[[columns]]
+name = "creation_timestamp"
+type = "datetime"
+path = "/header/creationTimestamp"
+
+[[columns]]
+name = "creation_time_utc"
+type = "timestamp(ns, UTC)"
+path = "/header/creationTimestamp"
+offset = "optional"
+description = "Message creation instant; null when the sender wrote no UTC offset"
+
+[[columns]]
+name = "is_correction"
+type = "bool"
+path = "/isCorrection"
+
+[[columns]]
+name = "correlation_id"
+type = "utf8"
+path = "/correlationId"
+
+[[columns]]
+name = "sequence_number"
+type = "int64"
+path = "/sequenceNumber"
+
+[[columns]]
+name = "notice_date"
+type = "date32"
+path = "/noticeDate"
+
+[[columns]]
+name = "statement_date"
+type = "date32"
+path = "/statementDate"
+
+[[columns]]
+name = "deal_identifiers"
+type = "list<struct<loan_identifier>>"
+path = "/dealIdentifier | /dealSummary"
+
+[[columns]]
+name = "facility_identifiers"
+type = "list<struct<loan_identifier>>"
+path = "/facilityIdentifier | /facilitySummary"
+
+[[columns]]
+name = "parties"
+type = "list<struct<party>>"
+path = "/party"

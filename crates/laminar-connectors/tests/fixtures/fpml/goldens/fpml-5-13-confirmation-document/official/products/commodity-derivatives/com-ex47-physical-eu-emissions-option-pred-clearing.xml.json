@@ -1,0 +1,56 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 6616,
+    "document_root": "dataDocument",
+    "document_sha256": "70734e4dcee4ebd157c05c5dcc0ccbc3646026bc0ae5633b837f3787dc4c9670",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "EnergyCoA"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500QCC36R89FI3U25"
+          }
+        ],
+        "party_name": "EnergyCoB"
+      },
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300IB5Q45JGNPND58"
+          }
+        ],
+        "party_name": "ClearItAll Corp"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "123456"
+            ]
+          }
+        ],
+        "product_type": "commoditySwaption",
+        "trade_date": "2012-06-04"
+      }
+    ]
+  }
+]

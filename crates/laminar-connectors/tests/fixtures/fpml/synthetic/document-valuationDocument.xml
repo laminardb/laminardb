@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a minimal valuationDocument document, written
+     because the FpML 5.13 corpus has no example of this root. -->
+<valuationDocument xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+  </party>
+  <valuationSet id="valuations1">
+    <name>End of day</name>
+    <baseParty href="party1" />
+    <assetValuation>
+      <quote>
+        <value>1234567.89</value>
+        <measureType>NPV</measureType>
+        <currency>USD</currency>
+      </quote>
+    </assetValuation>
+  </valuationSet>
+</valuationDocument>

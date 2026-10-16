@@ -1,0 +1,196 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.partyA.com/coding-scheme/account-id",
+            "value": "4345334"
+          }
+        ],
+        "id": "gh4903-uw2992"
+      }
+    ],
+    "calculation_agent": {
+      "party_hrefs": [
+        "ab9560",
+        "gh4903"
+      ]
+    },
+    "correlation_id": "CORR/2007/05/02/234233423419",
+    "correlation_swap": {
+      "leg": {
+        "amount": {
+          "closing_level": true,
+          "correlation_notional_amount": {
+            "amount": "15000000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "correlation_strike_price": "0.601230000000000000",
+          "expected_n": 30,
+          "number_of_data_series": 1,
+          "observation_start_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NotApplicable"
+              },
+              "unadjusted_date": "2005-01-31"
+            }
+          }
+        },
+        "leg": {
+          "payer_party_href": "ab9560",
+          "receiver_party_href": "gh4903",
+          "termination_date": {
+            "relative_date": {
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "sd2344",
+              "period": "D",
+              "period_multiplier": 0
+            }
+          }
+        },
+        "leg_type": "correlationLeg",
+        "settlement": {
+          "settlement_date": {
+            "relative_date": {
+              "business_centers": [
+                "EUTA"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "vs8292",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": 3
+            }
+          },
+          "settlement_type": "Cash"
+        },
+        "underlyer": {
+          "basket": {
+            "constituents": [
+              {
+                "asset": {
+                  "asset_type": "equity",
+                  "description": "ABN AMRO HOLDING NV",
+                  "exchange_id": "XAMS",
+                  "instrument_ids": [
+                    {
+                      "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN",
+                      "value": "IBM.N"
+                    }
+                  ]
+                }
+              },
+              {
+                "asset": {
+                  "asset_type": "equity",
+                  "description": "AEGON NV",
+                  "exchange_id": "XAMS",
+                  "instrument_ids": [
+                    {
+                      "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN",
+                      "value": "MSFT.O"
+                    }
+                  ]
+                }
+              },
+              {
+                "asset": {
+                  "asset_type": "equity",
+                  "description": "AIR LIQUIDE",
+                  "exchange_id": "XPAR",
+                  "instrument_ids": [
+                    {
+                      "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN",
+                      "value": "B.N"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        "valuation": {
+          "valuation_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2005-12-16"
+          }
+        }
+      },
+      "product": {}
+    },
+    "creation_time_utc": "2007-05-02T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2007-05-02T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2007-05-02T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "86178282d058c2fb95c7c719539989acf7b0d7cbf3612df090c97d3235813915",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2000",
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "USNY",
+    "is_correction": false,
+    "message_id": "234233423420",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "ab9560",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "Client"
+      },
+      {
+        "id": "gh4903",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ],
+        "party_name": "Bank A"
+      }
+    ],
+    "product_type": "correlationSwap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "23902",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "gh4903",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/coding-scheme/trade-id",
+              "value": "6234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-11-07"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+== Copyright (c) 2022-2026 2024 All rights reserved.
+== Financial Products Markup Language is subject to the FpML public license.
+== A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<xsd:schema xmlns:ecore="http://www.eclipse.org/emf/2002/Ecore" xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:fpml-annotation="http://www.fpml.org/annotation" xmlns:xsd="http://www.w3.org/2001/XMLSchema" targetNamespace="http://www.fpml.org/FpML-5/confirmation" ecore:documentRoot="FpML" ecore:nsPrefix="conf" ecore:package="org.fpml.confirmation" version="$Revision: 11940 $" xml:lang="en" elementFormDefault="qualified" attributeFormDefault="unqualified">
+  <xsd:include schemaLocation="fpml-eqd-5-13.xsd" />
+  <xsd:element name="equityAccumulator" type="EquityAccumulator" substitutionGroup="product" />
+  <xsd:complexType name="EquityAccumulator">
+    <xsd:complexContent>
+      <xsd:extension base="Product">
+        <xsd:sequence>
+          <xsd:group ref="BuyerSeller.model" />
+          <xsd:sequence>
+            <xsd:element name="notional" type="NonNegativeMoney">
+              <xsd:annotation>
+                <xsd:documentation>The notional amount</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="underlyer" type="Underlyer">
+              <xsd:annotation>
+                <xsd:documentation>Specifies the underlying component, which can be either one security or a basket.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="forwardPrice" type="NonNegativeMoney" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>The price the shares will be accumulated at.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="spotPrice" type="NonNegativeMoney" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>The current price of the stock</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="numberOfSharesPerDay" type="NonNegativeDecimal">
+              <xsd:annotation>
+                <xsd:documentation>The number of shares to be purchased per day</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="maxNoOfTradingDays" type="xsd:positiveInteger" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>Maximum number of trading days</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="gearing" type="Gearing" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>Leverage or Gearing. Optional condition where if shares fall below trigger price, number of shares purchased increase by the gearing factor.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="guaranteedPeriodEndDate" type="xsd:date" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>End date of guaranteed period. If knock out is triggered within guaranteed period, guaranteed number of shares will be delivered.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="observationPeriod" type="ObservationPeriod" maxOccurs="unbounded">
+              <xsd:annotation>
+                <xsd:documentation>Period when accumulator will accumulate shares</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="expiration" type="EquityForwardExpiration">
+              <xsd:annotation>
+                <xsd:documentation>Expiration date of accumulator.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="prePayment" type="PrePayment" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>A payment made in advance for the purchase of the shares.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="settlementType" type="SettlementTypeEnum">
+              <xsd:annotation>
+                <xsd:documentation>How the accululator will be settled.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="settlementCurrency" type="Currency" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>The currency in which a cash settlement for non-deliverable forward and non-deliverable options.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="settlementPriceSource" type="SettlementPriceSource" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>The source from which the settlement price is to be obtained, e.g. a Reuters page, Prezzo di Riferimento, etc.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+            <xsd:element name="knockOut" type="AccumulatorKnockOut" minOccurs="0">
+              <xsd:annotation>
+                <xsd:documentation>Termination of contract prior to maturity date as a result of stock price exceeding specified level or performance reaching target performance.</xsd:documentation>
+              </xsd:annotation>
+            </xsd:element>
+          </xsd:sequence>
+        </xsd:sequence>
+      </xsd:extension>
+    </xsd:complexContent>
+  </xsd:complexType>
+  <xsd:complexType name="EquityForwardExpiration">
+    <xsd:annotation>
+      <xsd:documentation>A type for defining expiry of an equity forward contract.</xsd:documentation>
+    </xsd:annotation>
+    <xsd:complexContent>
+      <xsd:extension base="Exercise">
+        <xsd:sequence>
+          <xsd:element name="expirationDate" type="AdjustableOrRelativeDate">
+            <xsd:annotation>
+              <xsd:documentation>The last day within an exercise period for an American style option. For a European style option it is the only day within the exercise period.</xsd:documentation>
+            </xsd:annotation>
+          </xsd:element>
+          <xsd:group ref="EquityExpiration.model" />
+        </xsd:sequence>
+      </xsd:extension>
+    </xsd:complexContent>
+  </xsd:complexType>
+  <xsd:complexType name="SharesPerDay">
+    <xsd:sequence />
+  </xsd:complexType>
+  <xsd:complexType name="Gearing">
+    <xsd:annotation>
+      <xsd:documentation>Leverage or Gearing. Optional condition where if shares fall below trigger price, number of shares puchased increase by the gearing factor.</xsd:documentation>
+    </xsd:annotation>
+    <xsd:sequence>
+      <xsd:element name="gearingFactor" type="xsd:decimal">
+        <xsd:annotation>
+          <xsd:documentation>Increase in number of shares purchased.</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+      <xsd:element name="leverageTriggerPrice" type="xsd:decimal" minOccurs="0">
+        <xsd:annotation>
+          <xsd:documentation>If specified, gearing factor applied only if share price falls below this trigger price.</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+    </xsd:sequence>
+  </xsd:complexType>
+  <xsd:complexType name="ObservationPeriod">
+    <xsd:annotation>
+      <xsd:documentation>Period when accumulator will accumulate shares.</xsd:documentation>
+    </xsd:annotation>
+    <xsd:sequence>
+      <xsd:element name="observationPeriodStartDate" type="xsd:date">
+        <xsd:annotation>
+          <xsd:documentation>Start date of observation period</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+      <xsd:element name="observationPeriodEndDate" type="xsd:date">
+        <xsd:annotation>
+          <xsd:documentation>End date of observation period</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+      <xsd:element name="observationPeriodSettlementDate" type="xsd:date" minOccurs="0">
+        <xsd:annotation>
+          <xsd:documentation>Settlement date for shares accumulated during the observation period.</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+      <xsd:element name="observationPeriodNoOfTradingDays" type="xsd:positiveInteger" minOccurs="0">
+        <xsd:annotation>
+          <xsd:documentation>Number of trading days in observation period</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+      <xsd:element name="upFrontSettlement" type="xsd:boolean" minOccurs="0">
+        <xsd:annotation>
+          <xsd:documentation>Does the investor need to invest the maximum notional amount for this observation period upfront ? The alternative is to transact on a margin basis.</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+      <xsd:element name="noOfScheduledTradingDays" type="xsd:positiveInteger" minOccurs="0">
+        <xsd:annotation>
+          <xsd:documentation>Number of scheduled trading days in observation period</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+    </xsd:sequence>
+  </xsd:complexType>
+  <xsd:complexType name="AccumulatorKnockOut">
+    <xsd:annotation>
+      <xsd:documentation>Termination of contract prior to maturity date as a result of stock price reaching specified level or performance reaching target performance.</xsd:documentation>
+    </xsd:annotation>
+    <xsd:sequence>
+      <xsd:choice>
+        <xsd:annotation>
+          <xsd:documentation>At least one of</xsd:documentation>
+        </xsd:annotation>
+        <xsd:sequence>
+          <xsd:element name="targetPerformance" type="NonNegativeDecimal">
+            <xsd:annotation>
+              <xsd:documentation>The target performance.</xsd:documentation>
+            </xsd:annotation>
+          </xsd:element>
+          <xsd:element name="level" type="xsd:decimal" minOccurs="0">
+            <xsd:annotation>
+              <xsd:documentation>The share price, above which the contract is terminated.</xsd:documentation>
+            </xsd:annotation>
+          </xsd:element>
+        </xsd:sequence>
+        <xsd:element name="level" type="xsd:decimal">
+          <xsd:annotation>
+            <xsd:documentation>The share price, above which the contract is terminated.</xsd:documentation>
+          </xsd:annotation>
+        </xsd:element>
+      </xsd:choice>
+      <xsd:element name="triggerTimeType" type="TriggerTimeTypeEnum">
+        <xsd:annotation>
+          <xsd:documentation>The time of day which would be considered for valuing the knock event.</xsd:documentation>
+        </xsd:annotation>
+      </xsd:element>
+    </xsd:sequence>
+  </xsd:complexType>
+</xsd:schema>
+

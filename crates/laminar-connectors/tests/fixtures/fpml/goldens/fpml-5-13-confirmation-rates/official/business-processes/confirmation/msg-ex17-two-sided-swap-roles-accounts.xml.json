@@ -1,0 +1,319 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.party2.com/bondifre",
+            "value": "5462346"
+          }
+        ],
+        "account_name": "LDF Main Fund",
+        "beneficiary_href": "party2",
+        "id": "ACC1"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.barclaysglobal.com",
+            "value": "5462346"
+          }
+        ],
+        "account_name": "CALPERS A/C 1",
+        "beneficiary_href": "party4",
+        "id": "ACC2"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "cvgh45h"
+          }
+        ],
+        "account_name": "CALPERS Acount 23",
+        "beneficiary_href": "party5",
+        "id": "ACC3"
+      }
+    ],
+    "correlation_id": "COR-1223121232",
+    "creation_time_utc": "2006-04-02T10:38:00Z",
+    "creation_timestamp": {
+      "local": "2006-04-02T15:38:00",
+      "offset_minutes": 300,
+      "utc": "2006-04-02T10:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "67dae2cbdfdddce95877aa40aa4cc50d6dff7f4bc2d017d28ac922bc24d5a737",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "MS/2006/04/02/15-12",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "LDF"
+          }
+        ],
+        "party_name": "London Diversified Fund"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300Q4B2OQW6FDBA48"
+          }
+        ]
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300DYUPMMJDE0YO60"
+          }
+        ]
+      },
+      {
+        "id": "party4",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SC000TFX78OJ56"
+          }
+        ],
+        "party_name": "Barclays Global Investors"
+      },
+      {
+        "id": "party5",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "ANDYUAU1XXX"
+          }
+        ],
+        "party_name": "ANDRIYIVSKY BANK"
+      },
+      {
+        "id": "party6",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "CALPERS"
+          }
+        ],
+        "party_name": "California Public Employees' Retirement System"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTY2US33",
+    "sequence_number": 1,
+    "swap": {
+      "product": {},
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "EUR-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 6
+              }
+            },
+            "notional_schedule": {
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "50000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "DEFR"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "14"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "1994-12-14"
+            },
+            "id": "floatingCalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "DEFR"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "1999-12-14"
+            }
+          },
+          "payer_party_href": "party6",
+          "payment_dates": {
+            "calculation_period_dates_href": "floatingCalcPeriodDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "DEFR"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            }
+          },
+          "receiver_party_href": "party2",
+          "reset_dates": {
+            "calculation_period_dates_href": "floatingCalcPeriodDates",
+            "fixing_dates": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "resetDates",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "resetDates",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "DEFR"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 6
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          }
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "30E/360",
+            "fixed_rate_schedule": {
+              "initial_value": "0.060000000000000000"
+            },
+            "notional_schedule": {
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "50000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "DEFR"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "Y",
+              "period_multiplier": 1,
+              "roll_convention": "14"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "1994-12-14"
+            },
+            "id": "fixedCalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "DEFR"
+                ],
+                "business_centers_href": "primaryBusinessCenters",
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "1999-12-14"
+            }
+          },
+          "payer_party_href": "party2",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedCalcPeriodDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "DEFR"
+              ],
+              "business_centers_href": "primaryBusinessCenters",
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "Y",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "party6"
+        }
+      ]
+    },
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300Q4B2OQW6FDBA48"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "TW9235"
+            }
+          ]
+        },
+        {
+          "party_href": "party3",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300DYUPMMJDE0YO60"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclays.com/swaps/trade-id",
+              "value": "SW2000"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "party_href": "party3"
+        },
+        {
+          "party_href": "party1"
+        }
+      ],
+      "trade_date": "1994-12-12"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,23 @@
+# One row per FpML facility, loan contract, or letter of credit servicing event, wherever it appears in a loan notification or statement,
+# with the shared loan columns and its typed content.
+include = ["loan-columns.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-loan-servicing"
+version = 1
+description = "FpML 5.13 confirmation view: one row per facility, loan contract, or letter of credit servicing event"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/{loan_servicing_event}"
+
+[[columns]]
+name = "event_type"
+type = "utf8"
+path = "#name"
+required = true
+
+[[columns]]
+name = "event"
+type = "struct<loan_servicing_event>"
+path = "."
+required = true

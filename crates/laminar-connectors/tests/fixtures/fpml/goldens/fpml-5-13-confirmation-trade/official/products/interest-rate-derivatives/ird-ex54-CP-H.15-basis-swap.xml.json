@@ -1,0 +1,75 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "6de739d53f7ed45aab2d514317724f9cdff05631f892f8dc72713962ac83d4ee",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "A BANK(\"ABANK\")"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "SELL SECURITIES CO LTD (\"Counterparty\")"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "58005713"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900CPTY57S5UCBB52"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "58005713"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2021-04-07"
+    },
+    "trade_ordinal": 0
+  }
+]

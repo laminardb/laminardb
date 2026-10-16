@@ -97,9 +97,11 @@ bool ThreadedSocketConnection::connect() {
   return socket_connect(getSocket(), m_address.c_str(), m_port) >= 0;
 }
 
+// LaminarDB: shut down only. Whoever removes the socket from the owner's thread map closes it,
+// once; closing here as well let a reused descriptor number be closed a second time.
 void ThreadedSocketConnection::disconnect() {
   m_disconnect = true;
-  socket_close(m_socket);
+  socket_shutdown(m_socket);
 }
 
 bool ThreadedSocketConnection::read() {

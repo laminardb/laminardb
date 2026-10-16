@@ -1,0 +1,49 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "123456",
+    "correlation_id_scheme": "http://www.clearingsvc.com/portfolioId",
+    "creation_time_utc": "2006-01-01T04:07:00Z",
+    "document_bytes": 1706,
+    "document_root": "consentGranted",
+    "document_sha256": "2687e2f4732e1a0477636ef9fb52e9d0bd4f367b9a4ce97bdeb6855672929eaf",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-01-01T09:07:00",
+        "offset_minutes": 300,
+        "utc": "2006-01-01T04:07:00Z"
+      },
+      "in_reply_to": "124",
+      "message_id": "111",
+      "message_id_scheme": "http://www.abc.com/messageId",
+      "send_to": [
+        "ABC"
+      ],
+      "sent_by": "CLEARCO",
+      "sent_by_scheme": "http://www.clearingsvc.com/partyId"
+    },
+    "parties": [
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CLEARCO"
+          }
+        ]
+      },
+      {
+        "id": "member-firm",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "54930091VMX9E6ST6216"
+          }
+        ]
+      }
+    ],
+    "portfolio_name": "Port1",
+    "sequence_number": 1
+  }
+]

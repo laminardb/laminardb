@@ -1,0 +1,35 @@
+[
+  {
+    "actual_build": 7,
+    "additional_data_mime_type": "text/plain",
+    "additional_data_text": "Rejected by the synthetic counterparty",
+    "correlation_id": "CORR-executionAdviceException",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:08:00Z",
+    "document_bytes": 1411,
+    "document_root": "executionAdviceException",
+    "document_sha256": "6ff275dffbebcc6271aac0fbaa86adb55f1e30a6179e30b1a4dc5fa5529e58d2",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:08:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:08:00Z"
+      },
+      "in_reply_to": "REQ-executionAdviceException",
+      "message_id": "SYN-executionAdviceException",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "reasons": [
+      {
+        "description": "The referenced message could not be processed",
+        "reason_code": "Message.Syntax"
+      }
+    ]
+  }
+]

@@ -1,0 +1,157 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "creation_time_utc": "2014-01-17T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2014-01-17T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2014-01-17T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "dbdb74a34c11bc5547747b5c645a618fb070c5acf4b9b60355acdcc0da7fb495",
+    "fpml_version": "5-13",
+    "fx_accrual_forward": {
+      "linear_payoff_regions": [
+        {
+          "counter_currency_amount": {
+            "currency": "EUR",
+            "initial_value": "371584.700000000000000000"
+          },
+          "exchanged_currency1": {
+            "currency": "EUR",
+            "payer_party_href": "partyA",
+            "receiver_party_href": "partyB"
+          },
+          "exchanged_currency2": {
+            "currency": "USD",
+            "payer_party_href": "partyB",
+            "receiver_party_href": "partyA"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "initial_value": "1.372500000000000000"
+          }
+        }
+      ],
+      "product": {},
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "day_type": "Business",
+            "end_date": "2015-01-19",
+            "number_of_fixings": 255,
+            "start_date": "2014-01-20"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "DEFR",
+                  "hour_minute_time": "14:15:00"
+                },
+                "rate_source": "Reuters",
+                "rate_source_page": "ECB37"
+              },
+              "quoted_currency_pair": {
+                "currency1": "EUR",
+                "currency2": "USD",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "lower_bound": {
+                "condition": "Above"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "AtOrBelow"
+              }
+            },
+            {
+              "accrual_factor": {
+                "initial_value": "1.500000000000000000"
+              },
+              "lower_bound": {
+                "condition": "Above"
+              },
+              "observable_href": "ob1"
+            }
+          ]
+        },
+        "expiry_date": {
+          "adjusted_date": "2015-01-19"
+        },
+        "notional_amount": {
+          "currency": "USD",
+          "initial_value": "510000.000000000000000000"
+        },
+        "settlement_date": {
+          "adjusted_date": "2015-01-21",
+          "date_adjustments": {
+            "business_centers": [
+              "USNY",
+              "EUTA"
+            ],
+            "business_day_convention": "FOLLOWING"
+          }
+        }
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxAccrualForward",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300SRLRVTR996F086"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "#partyA",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-01-17"
+    },
+    "trade_ordinal": 0
+  }
+]

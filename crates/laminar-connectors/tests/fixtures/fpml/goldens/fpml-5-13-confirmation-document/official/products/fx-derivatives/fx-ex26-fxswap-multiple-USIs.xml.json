@@ -1,0 +1,81 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "FX12345",
+    "correlation_id_scheme": "http://www.partyA.com/coding-scheme/correlationId",
+    "creation_time_utc": "2007-01-05T20:38:00Z",
+    "document_bytes": 5246,
+    "document_root": "requestConfirmation",
+    "document_sha256": "9172813f13423e21900ad0a5f05403e94efb7aa9aa8e42ee252962f5a45f26c8",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2007-01-05T15:38:00",
+        "offset_minutes": -300,
+        "utc": "2007-01-05T20:38:00Z"
+      },
+      "message_id": "FX098765",
+      "message_id_scheme": "http://www.partyA.com/coding-scheme/messageId",
+      "send_to": [
+        "PARTYAUS33"
+      ],
+      "sent_by": "DEUTDEFF",
+      "sent_by_scheme": "http://www.partyA.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800QILIUD4ROSUO03"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "issuer": "1031234567",
+            "trade_ids": [
+              "712345678901234567890123456789012"
+            ]
+          },
+          {
+            "issuer": "1031234567",
+            "trade_ids": [
+              "712345678901234567890123456789013"
+            ]
+          },
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "PARTYAUS33"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "DEUTDEFF"
+            ]
+          }
+        ],
+        "product_type": "fxSwap",
+        "trade_date": "2002-01-23"
+      }
+    ]
+  }
+]

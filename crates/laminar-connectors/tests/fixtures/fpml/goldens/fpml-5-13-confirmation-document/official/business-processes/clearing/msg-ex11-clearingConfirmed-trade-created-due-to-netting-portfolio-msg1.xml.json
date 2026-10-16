@@ -1,0 +1,66 @@
+[
+  {
+    "actual_build": 7,
+    "compression_type": "Netting",
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 4838,
+    "document_root": "clearingConfirmed",
+    "document_sha256": "94cb97a6680dda1d945c2ba1986039c17132f38b536480544df8ce1357ca999f",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "RBSLGB1LXXX"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "originating_event": "Netting",
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "RBSLGB1LXXX"
+          }
+        ]
+      }
+    ],
+    "portfolio_name": "Port1",
+    "portfolio_sequence_number": 1,
+    "portfolio_submissions_complete": false,
+    "trades": [
+      {
+        "locator": "/clearingConfirmed/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "CL000003"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2010-01-04"
+      }
+    ]
+  }
+]

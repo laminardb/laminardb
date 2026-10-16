@@ -1,0 +1,114 @@
+[
+  {
+    "correlation_id": "FX987",
+    "creation_time_utc": "2001-11-19T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2001-11-19T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-11-19T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "b3ee17684f787575fe1af492b1dda49742a07a685115c0a3e6ff97c822f5f16e",
+    "fpml_version": "5-13",
+    "fx_single_leg": {
+      "details": {
+        "exchange_rate": {
+          "forward_points": "0.004500000000000000",
+          "point_value": "0.000100000000000000",
+          "quoted_currency_pair": {
+            "currency1": "EUR",
+            "currency2": "USD",
+            "quote_basis": "Currency2PerCurrency1"
+          },
+          "rate": "0.917500000000000000",
+          "spot_rate": "0.913000000000000000"
+        },
+        "exchanged_currency1": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "10000000.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party1"
+        },
+        "exchanged_currency2": {
+          "payer_party_href": "party1",
+          "payment_amount": {
+            "amount": "9175000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party2"
+        },
+        "value_date": "2001-12-21"
+      },
+      "product": {}
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.matchingservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800QILIUD4ROSUO03"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABN",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abn-amro.com/fx/trade-id",
+              "value": "ABN1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "213800QILIUD4ROSUO03"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.db.com/fx/trade-id",
+              "value": "DB5678"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-11-19"
+    },
+    "trade_ordinal": 0
+  }
+]

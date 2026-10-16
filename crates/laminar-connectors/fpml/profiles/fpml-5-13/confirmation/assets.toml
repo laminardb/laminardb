@@ -1,0 +1,113 @@
+# Underlying assets (the `underlyingAsset` substitution group): bonds, equities, indices,
+# baskets, commodities, loans, mortgages, funds, futures, options, warrants, and cash.
+# One union template; fields that do not apply to an asset type are null.
+include = ["common.toml"]
+
+[sets]
+underlying_asset = { substitution = "underlyingAsset" }
+
+[structs.instrument_id]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@instrumentIdScheme" },
+]
+
+[structs.asset]
+description = "One underlying asset; asset_type names the substitution member"
+fields = [
+  { name = "asset_type", type = "utf8", path = "#name" },
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "instrument_ids", type = "list<struct<instrument_id>>", path = "instrumentId" },
+  { name = "instrument_types", type = "list<utf8>", path = "instrumentType" },
+  { name = "description", type = "utf8", path = "description" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "exchange_id", type = "utf8", path = "exchangeId" },
+  { name = "related_exchange_ids", type = "list<utf8>", path = "relatedExchangeId" },
+  { name = "options_exchange_ids", type = "list<utf8>", path = "optionsExchangeId" },
+  { name = "clearance_system", type = "utf8", path = "clearanceSystem" },
+  { name = "issuer_name", type = "utf8", path = "issuerName" },
+  { name = "issuer_party_href", type = "utf8", path = "issuerPartyReference/@href" },
+  { name = "seniority", type = "utf8", path = "seniority" },
+  { name = "coupon_type", type = "utf8", path = "couponType" },
+  { name = "coupon_rate", type = "decimal", path = "couponRate" },
+  { name = "maturity", type = "date32", path = "maturity" },
+  { name = "par_value", type = "decimal", path = "parValue" },
+  { name = "face_amount", type = "decimal", path = "faceAmount" },
+  { name = "payment_frequency", type = "struct<frequency>", path = "paymentFrequency" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "future_id", type = "utf8", path = "futureId" },
+  { name = "multiplier", type = "decimal", path = "multiplier" },
+  { name = "contract_reference", type = "utf8", path = "contractReference | futureContractReference" },
+  { name = "strike", type = "decimal", path = "strike" },
+  { name = "option_type", type = "utf8", path = "optionType" },
+  { name = "lien", type = "utf8", path = "lien" },
+  { name = "facility_type", type = "utf8", path = "facilityType" },
+  { name = "credit_agreement_date", type = "date32", path = "creditAgreementDate" },
+  { name = "tranche", type = "utf8", path = "tranche" },
+  { name = "commodity_base", type = "utf8", path = "commodityBase" },
+  { name = "commodity_details", type = "utf8", path = "commodityDetails" },
+  { name = "unit", type = "utf8", path = "unit" },
+  { name = "specified_price", type = "utf8", path = "specifiedPrice" },
+  { name = "fund_manager", type = "utf8", path = "fundManager" },
+  { name = "basket", type = "struct<basket>", path = ".[basketConstituent]" },
+]
+
+[structs.basket]
+description = "Basket identity and constituents (a constituent that is itself a basket is identified, not expanded)"
+fields = [
+  { name = "basket_name", type = "utf8", path = "basketName" },
+  { name = "basket_ids", type = "list<utf8>", path = "basketId" },
+  { name = "basket_currency", type = "utf8", path = "basketCurrency" },
+  { name = "open_units", type = "decimal", path = "openUnits" },
+  { name = "basket_divisor", type = "decimal", path = "basketDivisor" },
+  { name = "basket_version", type = "int64", path = "basketVersion" },
+  { name = "constituents", type = "list<struct<basket_constituent>>", path = "basketConstituent" },
+]
+
+[structs.basket_constituent]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "asset", type = "struct<constituent_asset>", path = "{underlying_asset}" },
+  { name = "opening_units", type = "decimal", path = "constituentWeight/openUnits" },
+  { name = "basket_percentage", type = "decimal", path = "constituentWeight/basketPercentage" },
+  { name = "basket_amount", type = "struct<money>", path = "constituentWeight/basketAmount" },
+  { name = "underlyer_notional", type = "struct<money>", path = "underlyerNotional" },
+]
+
+[structs.constituent_asset]
+fields = [
+  { name = "asset_type", type = "utf8", path = "#name" },
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "instrument_ids", type = "list<struct<instrument_id>>", path = "instrumentId" },
+  { name = "description", type = "utf8", path = "description" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "exchange_id", type = "utf8", path = "exchangeId" },
+  { name = "basket_name", type = "utf8", path = "basketName" },
+  { name = "basket_ids", type = "list<utf8>", path = "basketId" },
+]
+
+[structs.bond_asset]
+description = "A bond or convertible bond"
+fields = [
+  { name = "asset_type", type = "utf8", path = "#name" },
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "instrument_ids", type = "list<struct<instrument_id>>", path = "instrumentId" },
+  { name = "instrument_types", type = "list<utf8>", path = "instrumentType" },
+  { name = "description", type = "utf8", path = "description" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "exchange_id", type = "utf8", path = "exchangeId" },
+  { name = "clearance_system", type = "utf8", path = "clearanceSystem" },
+  { name = "issuer_name", type = "utf8", path = "issuerName" },
+  { name = "issuer_party_href", type = "utf8", path = "issuerPartyReference/@href" },
+  { name = "seniority", type = "utf8", path = "seniority" },
+  { name = "coupon_type", type = "utf8", path = "couponType" },
+  { name = "coupon_rate", type = "decimal", path = "couponRate" },
+  { name = "maturity", type = "date32", path = "maturity" },
+  { name = "par_value", type = "decimal", path = "parValue" },
+  { name = "face_amount", type = "decimal", path = "faceAmount" },
+  { name = "payment_frequency", type = "struct<frequency>", path = "paymentFrequency" },
+  { name = "day_count_fraction", type = "utf8", path = "dayCountFraction" },
+  { name = "underlying_equity_ids", type = "list<struct<instrument_id>>", path = "underlyingEquity/instrumentId" },
+]

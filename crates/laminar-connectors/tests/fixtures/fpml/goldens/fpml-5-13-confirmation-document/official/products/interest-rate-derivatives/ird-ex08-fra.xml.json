@@ -1,0 +1,50 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 2926,
+    "document_root": "dataDocument",
+    "document_sha256": "75b37bb1dec7b7ffabe113aaa0351d1273caae94446eae2fc7d2dc866d062499",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "TR24TWEY5RVRQV65HD49"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "MB87623"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "AA9876"
+            ]
+          }
+        ],
+        "product_type": "fra",
+        "trade_date": "1991-05-14"
+      }
+    ]
+  }
+]

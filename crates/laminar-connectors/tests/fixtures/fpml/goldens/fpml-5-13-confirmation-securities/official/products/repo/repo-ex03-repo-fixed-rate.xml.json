@@ -1,0 +1,150 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "714419246a85fa913cc8cfddcb197baa5755346ad82fa2bb7024d3b4c401d877",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 1"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 2"
+          }
+        ]
+      }
+    ],
+    "product_type": "repo",
+    "repo": {
+      "collateral_assets": [
+        {
+          "asset_type": "bond",
+          "currency": "USD",
+          "description": "OPQ Corp Bond",
+          "id": "OPQ",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN-1-0",
+              "value": "OPQ"
+            }
+          ]
+        }
+      ],
+      "day_count_fraction": "ACT/365.FIXED",
+      "duration": "Term",
+      "far_leg": {
+        "buyer_party_href": "Party2",
+        "collateral": [
+          {
+            "accruals": "5.375000000000000000",
+            "asset_href": "OPQ",
+            "clean_price": "108.978472200000000000",
+            "nominal_amount": {
+              "amount": "9000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "id": "forwardLeg",
+        "seller_party_href": "Party1",
+        "settlement_currency": "USD",
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2013-11-10"
+          }
+        }
+      },
+      "initial_margin_type": "Cash",
+      "near_leg": {
+        "buyer_party_href": "Party1",
+        "collateral": [
+          {
+            "accruals": "5.375000000000000000",
+            "asset_href": "OPQ",
+            "clean_price": "108.978472200000000000",
+            "nominal_amount": {
+              "amount": "9000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "seller_party_href": "Party2",
+        "settlement_amount": {
+          "amount": "8336850.210000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2013-11-03"
+          }
+        }
+      },
+      "open_term": {},
+      "product": {},
+      "rate": {
+        "fixed_rate_schedule": {
+          "initial_value": "0.800000000000000000"
+        }
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "Party19235"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 2"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "Party22000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-11-03"
+    },
+    "trade_ordinal": 0
+  }
+]

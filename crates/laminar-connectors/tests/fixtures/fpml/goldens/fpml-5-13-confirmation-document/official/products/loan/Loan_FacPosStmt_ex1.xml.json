@@ -1,0 +1,82 @@
+[
+  {
+    "actual_build": 7,
+    "comments": "Facility Position Statement effective 12/17/2014.",
+    "creation_time_utc": "2014-12-17T09:30:47Z",
+    "deal_identifiers": [
+      {
+        "description": "2012 Construction Deal",
+        "id": "DL123",
+        "instrument_ids": [
+          "Deal1234"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "document_bytes": 3129,
+    "document_root": "facilityPositionStatement",
+    "document_sha256": "dad97eb757faa2efea604e2746fadc9bac5366c3113bfe98b91e2c65627bd575",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC1234",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "facility_position_hrefs": [
+      "FAC1234"
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2014-12-17T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2014-12-17T09:30:47Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "155677",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "position_party_href": "BANKOFAGENTSNA",
+    "statement_date": "2014-12-17"
+  }
+]

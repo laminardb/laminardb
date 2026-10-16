@@ -1,0 +1,111 @@
+[
+  {
+    "correlation_id": "FX1234",
+    "creation_time_utc": "2001-11-12T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2001-11-12T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-11-12T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "bdde696fda8b2665eb1123534299ff5d8c43b77c15a2d08e95f5d1c97d1b4e66",
+    "fpml_version": "5-13",
+    "fx_single_leg": {
+      "details": {
+        "exchange_rate": {
+          "quoted_currency_pair": {
+            "currency1": "USD",
+            "currency2": "EUR",
+            "quote_basis": "Currency2PerCurrency1"
+          },
+          "rate": "1.107200000000000000"
+        },
+        "exchanged_currency1": {
+          "payer_party_href": "party1",
+          "payment_amount": {
+            "amount": "13000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party2"
+        },
+        "exchanged_currency2": {
+          "payer_party_href": "party2",
+          "payment_amount": {
+            "amount": "14393600.000000000000000000",
+            "currency": "EUR",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "receiver_party_href": "party1"
+        },
+        "value_date": "2002-02-14"
+      },
+      "product": {}
+    },
+    "is_correction": false,
+    "message_id": "FX98765",
+    "message_id_scheme": "http://www.db.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "213800QILIUD4ROSUO03"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxSingleLeg",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "DEUTDEFF",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "213800QILIUD4ROSUO03"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.db.com/fx/trade-id",
+              "value": "FX048VS"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abn.com/fx/trade-id",
+              "value": "USABC023"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-11-12"
+    },
+    "trade_ordinal": 0
+  }
+]

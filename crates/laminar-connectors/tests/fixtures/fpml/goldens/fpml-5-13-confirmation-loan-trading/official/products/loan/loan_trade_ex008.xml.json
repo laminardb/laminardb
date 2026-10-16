@@ -1,0 +1,63 @@
+[
+  {
+    "context": "loanAllocationNotification",
+    "creation_time_utc": "2017-09-09T00:41:28.251480900Z",
+    "creation_timestamp": {
+      "local": "2017-09-08T20:41:28.251480900",
+      "offset_minutes": -240,
+      "utc": "2017-09-09T00:41:28.251480900Z"
+    },
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "f17f64af3327ad8105bb1724a3aa2fa822b156861b2e15c727535eb1ca5b5016",
+    "event": {
+      "allocation_href": "A1",
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "GB003",
+            "event_id_scheme": "http://www.barclays.com/coding-scheme/event-id-1-0",
+            "party_href": "BANK12345"
+          }
+        ]
+      }
+    },
+    "event_type": "loanAllocation",
+    "facility_identifiers": [
+      {
+        "id": "FAC12345",
+        "instrument_ids": [
+          "CUSIP0001"
+        ],
+        "party_href": "BANK67890"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "BPLC0000411687076",
+    "notice_date": "2017-09-08",
+    "parties": [
+      {
+        "id": "BANK12345",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "GB1L213246"
+          }
+        ]
+      },
+      {
+        "id": "BANK67890",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US1LFM0001"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanAllocationNotification/loanAllocation",
+    "row_ordinal": 0,
+    "sent_by": "GB1L213246"
+  }
+]

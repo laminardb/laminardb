@@ -1,0 +1,92 @@
+# One row per FpML foreign exchange trade (spot, forward, swap, options, accruals, target
+# forwards, FX variance and volatility swaps) or term deposit, with the shared trade-level columns
+# and the product's typed economics. Exactly one product struct is non-null per row;
+# `product_type` names it. Trades of other asset classes are not rows of this profile; the
+# fpml-5-13-confirmation-trade profile has every trade.
+include = ["trade-columns.toml", "products/fx.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-fx"
+version = 1
+description = "FpML 5.13 confirmation view: one row per FX trade or term deposit with typed economics"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/trade[tradeHeader][{fx_product}]"
+
+[sets]
+fx_product = [
+  "fxSingleLeg", "fxSwap", "fxOption", "fxDigitalOption", "fxFlexibleForward",
+  "fxForwardVolatilityAgreement", "fxVarianceSwap", "fxVolatilitySwap", "fxAccrualForward",
+  "fxAccrualOption", "fxAccrualDigitalOption", "fxRangeAccrual", "fxTargetKnockoutForward",
+  "termDeposit",
+]
+
+[[columns]]
+name = "fx_single_leg"
+type = "struct<fx_single_leg>"
+path = "fxSingleLeg"
+
+[[columns]]
+name = "fx_swap"
+type = "struct<fx_swap>"
+path = "fxSwap"
+
+[[columns]]
+name = "fx_option"
+type = "struct<fx_option>"
+path = "fxOption"
+
+[[columns]]
+name = "fx_digital_option"
+type = "struct<fx_digital_option>"
+path = "fxDigitalOption"
+
+[[columns]]
+name = "fx_flexible_forward"
+type = "struct<fx_flexible_forward>"
+path = "fxFlexibleForward"
+
+[[columns]]
+name = "fx_forward_volatility_agreement"
+type = "struct<fx_forward_volatility_agreement>"
+path = "fxForwardVolatilityAgreement"
+
+[[columns]]
+name = "fx_variance_swap"
+type = "struct<fx_performance_swap>"
+path = "fxVarianceSwap"
+
+[[columns]]
+name = "fx_volatility_swap"
+type = "struct<fx_performance_swap>"
+path = "fxVolatilitySwap"
+
+[[columns]]
+name = "fx_accrual_forward"
+type = "struct<fx_accrual_forward>"
+path = "fxAccrualForward"
+
+[[columns]]
+name = "fx_accrual_option"
+type = "struct<fx_accrual_option>"
+path = "fxAccrualOption"
+
+[[columns]]
+name = "fx_accrual_digital_option"
+type = "struct<fx_accrual_digital_option>"
+path = "fxAccrualDigitalOption"
+
+[[columns]]
+name = "fx_range_accrual"
+type = "struct<fx_range_accrual>"
+path = "fxRangeAccrual"
+
+[[columns]]
+name = "fx_target_knockout_forward"
+type = "struct<fx_target_knockout_forward>"
+path = "fxTargetKnockoutForward"
+
+[[columns]]
+name = "term_deposit"
+type = "struct<term_deposit>"
+path = "termDeposit"

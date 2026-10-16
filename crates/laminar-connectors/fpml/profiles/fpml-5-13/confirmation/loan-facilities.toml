@@ -1,0 +1,23 @@
+# One row per FpML loan facility (term loan, revolver, delayed draw, or letter of credit facility), wherever it appears in a loan notification or statement,
+# with the shared loan columns and its typed content.
+include = ["loan-columns.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-loan-facilities"
+version = 1
+description = "FpML 5.13 confirmation view: one row per loan facility"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/{facility}"
+
+[[columns]]
+name = "facility_type"
+type = "utf8"
+path = "#name"
+required = true
+
+[[columns]]
+name = "facility"
+type = "struct<facility>"
+path = "."
+required = true

@@ -1,0 +1,250 @@
+[
+  {
+    "calculation_agent": {
+      "calculation_agent_party": "AsSpecifiedInMasterAgreement"
+    },
+    "calculation_agent_business_center": "GBLO",
+    "creation_time_utc": "2018-09-17T01:55:42Z",
+    "creation_timestamp": {
+      "local": "2018-09-17T06:55:42",
+      "offset_minutes": 300,
+      "utc": "2018-09-17T01:55:42Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "ee8dad63923347f1adc48e19fbf3ffe12d9be5b5b40539f4327c47bd0ab5612f",
+    "documentation": {
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:2W81Q117",
+    "message_id_scheme": "XXX",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "XXXXXXXX",
+    "swap": {
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-type-simple",
+            "value": "TotalReturnSwap"
+          }
+        ]
+      },
+      "streams": [
+        {
+          "calculation": {
+            "compounding_method": "Flat",
+            "day_count_fraction": "ACT/365.FIXED",
+            "notional_schedule": {
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "10000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 6,
+              "roll_convention": "15"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2024-01-15"
+            },
+            "id": "returnLeg2CalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2026-01-15"
+            }
+          },
+          "id": "returnLeg2",
+          "payer_party_href": "Party2",
+          "payment_dates": {
+            "calculation_period_dates_href": "returnLeg2CalcPeriodDates",
+            "id": "returnLeg2PaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "Party1"
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "GBP-SONIA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 3
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "0.010000000000000000"
+                }
+              ]
+            },
+            "notional_schedule": {
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "105000000.000000000000000000"
+            },
+            "rate_calculation_type": "floatingRateCalculation"
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 3,
+              "roll_convention": "15"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2024-01-15"
+            },
+            "id": "floatingLeg2CalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "GBLO"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2026-01-15"
+            }
+          },
+          "id": "Floating-leg-2",
+          "payer_party_href": "Party1",
+          "payment_dates": {
+            "calculation_period_dates_href": "floatingLeg2CalcPeriodDates",
+            "id": "floatingLeg2PaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            }
+          },
+          "receiver_party_href": "Party2",
+          "reset_dates": {
+            "calculation_period_dates_href": "floatingLeg2CalcPeriodDates",
+            "fixing_dates": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "NONE",
+              "date_relative_to_href": "resetDates",
+              "day_type": "Business",
+              "period": "D",
+              "period_multiplier": -2
+            },
+            "id": "resetDates",
+            "reset_dates_adjustments": {
+              "business_centers": [
+                "GBLO"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "reset_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            },
+            "reset_relative_to": "CalculationPeriodStartDate"
+          }
+        }
+      ]
+    },
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "E2000098N10184"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900CPTY57S5UCBB52"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2018-09-17"
+    },
+    "trade_ordinal": 0
+  }
+]

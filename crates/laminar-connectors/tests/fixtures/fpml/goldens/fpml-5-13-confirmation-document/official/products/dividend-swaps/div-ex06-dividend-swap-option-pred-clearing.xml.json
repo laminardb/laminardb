@@ -1,0 +1,80 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CW/2012/01/27/123",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2012-01-27T15:38:00Z",
+    "document_bytes": 9022,
+    "document_root": "requestConfirmation",
+    "document_sha256": "760ddf5cb4da1afa01da7bee73151e5532eae58d55fd7b83f44e96dba28c1c2f",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2012-01-27T15:38:00",
+        "offset_minutes": 0,
+        "utc": "2012-01-27T15:38:00Z"
+      },
+      "message_id": "123",
+      "message_id_scheme": "http://www.fpml.org/msg-id",
+      "send_to": [
+        "CPTY"
+      ],
+      "sent_by": "GS"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "CPTY"
+          }
+        ],
+        "party_name": "Counterparty Inc."
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "GS"
+          }
+        ],
+        "party_name": "Goldman Sachs International"
+      },
+      {
+        "id": "clearing-svc",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300IB5Q45JGNPND58"
+          }
+        ],
+        "party_name": "ClearItAll Corp"
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "166555"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "166555"
+            ]
+          }
+        ],
+        "product_type": "dividendSwapOptionTransactionSupplement",
+        "trade_date": "2012-01-27"
+      }
+    ]
+  }
+]

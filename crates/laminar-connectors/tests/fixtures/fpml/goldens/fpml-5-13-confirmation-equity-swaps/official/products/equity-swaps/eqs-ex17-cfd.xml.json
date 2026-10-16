@@ -1,0 +1,197 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "50d8715917ccf29be701612b1616cfe55fa7ba0b32ed30c5c04d99e038813139",
+    "documentation": {
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "PRIMARY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "0987654321"
+          }
+        ]
+      },
+      {
+        "id": "CROSS",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "1234567890"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "return_swap": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 1
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "125.000000000000000000"
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency": "USD",
+              "reference_amount": "ISDA Standard"
+            },
+            "leg": {
+              "id": "FI__CFD123456789",
+              "payer_party_href": "CROSS",
+              "receiver_party_href": "PRIMARY"
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "3840000.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            }
+          }
+        ],
+        "leg_types": [
+          "returnLeg",
+          "interestLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency": "USD",
+              "reference_amount": "StandardISDA"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2019-10-01"
+              }
+            },
+            "initial_price": {
+              "gross_price": "80.000000000000000000",
+              "net_price": "80.000000000000000000"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2009-10-07"
+                }
+              },
+              "id": "EQ__CFD123456789",
+              "payer_party_href": "PRIMARY",
+              "receiver_party_href": "CROSS",
+              "termination_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2019-10-01"
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "3840000.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Standard",
+            "notional_reset": false,
+            "payment_date_final": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_centers": [
+                    "NYSE"
+                  ],
+                  "business_day_convention": "FOLLOWING"
+                },
+                "unadjusted_date": "2019-10-01"
+              }
+            },
+            "return_type": "Total",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "equity",
+                "exchange_id": "NYSE",
+                "instrument_ids": [
+                  {
+                    "scheme": "RIC",
+                    "value": "XYZ.N"
+                  }
+                ]
+              },
+              "single_open_units": "48000.000000000000000000"
+            }
+          }
+        ]
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.primarybank.com/productType",
+            "value": "EQCFD"
+          }
+        ]
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PRIMARY",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "0987654321"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.primarybank.com/trade-id",
+              "value": "CFD123456789"
+            }
+          ]
+        },
+        {
+          "party_href": "CROSS",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "1234567890"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.crossbank.com/tradeId",
+              "value": "CFD123456789"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-09-30"
+    },
+    "trade_ordinal": 0
+  }
+]

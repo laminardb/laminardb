@@ -1,0 +1,94 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "1fdd931b83375246afbd8b56e6e4e8b8e0bd712abbe10e2ac3a857b8b0d16f48",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "AAA International"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "AAA Capital Services Inc."
+      },
+      {
+        "id": "partyC",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900AYEI57S5UCED35"
+          }
+        ],
+        "party_name": "SWAPSWIRE"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party-a.com/swaps/trade-id",
+              "value": "43660124A"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900CPTY57S5UCBB52"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party-b.com/swaps/trade-id",
+              "value": "43660133A"
+            }
+          ]
+        },
+        {
+          "party_href": "partyC",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900AYEI57S5UCED35"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "187355008-2"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2022-06-13"
+    },
+    "trade_ordinal": 0
+  }
+]

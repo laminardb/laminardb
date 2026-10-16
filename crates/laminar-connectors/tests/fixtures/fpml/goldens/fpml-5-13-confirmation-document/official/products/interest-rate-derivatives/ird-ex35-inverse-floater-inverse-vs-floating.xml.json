@@ -1,0 +1,50 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 9067,
+    "document_root": "dataDocument",
+    "document_sha256": "44d7ea7210f9bc34a9add5091b598568d801716e925ae5dff914f88860c66117",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "123456"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "654321"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "2009-04-29"
+      }
+    ]
+  }
+]

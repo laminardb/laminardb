@@ -1,0 +1,62 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CS/2006/04/02/32-12",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2006-04-02T15:38:00Z",
+    "document_bytes": 7805,
+    "document_root": "requestConfirmation",
+    "document_sha256": "39609d633b7275420b1ebfdd254d300e65fb03b9c62c30dc2b4c2ba609157624",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-04-02T15:38:00",
+        "offset_minutes": 0,
+        "utc": "2006-04-02T15:38:00Z"
+      },
+      "message_id": "MS/2006/04/02/15-12",
+      "message_id_scheme": "http://www.example.com/messageId",
+      "send_to": [
+        "PARTYBBICXXX"
+      ],
+      "sent_by": "PARTYABICXXX"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ],
+        "product_type": "equityOption",
+        "trade_date": "2002-03-25"
+      }
+    ]
+  }
+]

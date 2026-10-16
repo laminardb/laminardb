@@ -1,0 +1,141 @@
+[
+  {
+    "calculation_agent": {
+      "calculation_agent_party": "AsSpecifiedInMasterAgreement"
+    },
+    "commodity_performance_swap": {
+      "effective_date": {
+        "adjustable_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2013-03-01"
+        }
+      },
+      "legs": [
+        {
+          "annualization_factor": "252.000000000000000000",
+          "calculation_periods": {
+            "calculation_periods_schedule": {
+              "balance_of_first_period": false,
+              "id": "CalculationPeriodSchedule",
+              "period": "T",
+              "period_multiplier": 1
+            }
+          },
+          "commodity": {
+            "delivery_date_year_month": "2013-06",
+            "instrument_ids": [
+              {
+                "scheme": "http://www.fpml.org/coding-scheme/commodity-reference-price-3-0",
+                "value": "OIL-WTI-NYMEX"
+              }
+            ],
+            "specified_price": "Closing"
+          },
+          "leg_type": "commodityVarianceLeg",
+          "n_adjustment": false,
+          "notional_amount": {
+            "amount": "16666666.670000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "notional_reinvestment": false,
+          "payer_party_href": "PartyA",
+          "payment_dates": {
+            "relative": {
+              "calculation_periods_href": "CalculationPeriodSchedule",
+              "pay_relative_to": "ValuationDate",
+              "payment_days_offset": {
+                "business_day_convention": "NONE",
+                "day_type": "Business",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            }
+          },
+          "receiver_party_href": "PartyB",
+          "variance_strike_price": "0.090000000000000000"
+        }
+      ],
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "Commodity:Energy:Oil:Swap:Cash"
+          }
+        ]
+      },
+      "settlement_currency": "USD",
+      "termination_date": {
+        "relative_date": {
+          "business_day_convention": "NONE",
+          "date_relative_to_href": "CashSettlementPaymentDate",
+          "period": "D",
+          "period_multiplier": 0
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "b64b895e45fc5d2c2e284f3c570acd9a0bf659921a9f0a3908e060593c91f91c",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006",
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_date": "1999-04-16",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "product_type": "commodityPerformanceSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "95980020140005196564"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "T901234-123456"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-05-20"
+    },
+    "trade_ordinal": 0
+  }
+]

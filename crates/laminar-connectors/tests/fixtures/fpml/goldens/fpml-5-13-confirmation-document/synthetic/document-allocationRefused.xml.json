@@ -1,0 +1,60 @@
+[
+  {
+    "actual_build": 7,
+    "block_trade_identifier": {
+      "party_href": "party1",
+      "trade_ids": [
+        "TRD-1001"
+      ]
+    },
+    "correlation_id": "CORR-allocationRefused",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:29:00Z",
+    "document_bytes": 1636,
+    "document_root": "allocationRefused",
+    "document_sha256": "4406d84378015391e75e7883c6f91b9fa66c38d3912ac1750b620438f38982a8",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:29:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:29:00Z"
+      },
+      "in_reply_to": "REQ-allocationRefused",
+      "message_id": "SYN-allocationRefused",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "reasons": [
+      {
+        "description": "Allocation fractions do not sum to one",
+        "reason_code": "Allocation.Invalid"
+      }
+    ],
+    "sequence_number": 1
+  }
+]

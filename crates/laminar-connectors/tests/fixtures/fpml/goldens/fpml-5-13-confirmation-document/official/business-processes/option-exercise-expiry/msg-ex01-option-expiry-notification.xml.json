@@ -1,0 +1,77 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR019",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2010-07-10T15:00:00Z",
+    "document_bytes": 2545,
+    "document_root": "optionExpirationNotification",
+    "document_sha256": "a30b5299b021782140a322986c877f1ba469c780b63394c394a7d1983476f28a",
+    "events": [
+      {
+        "date": "2010-09-10",
+        "event_type": "optionExpiry",
+        "locator": "/optionExpirationNotification/optionExpiry",
+        "trade_identifiers": [
+          {
+            "party_href": "SKY",
+            "trade_ids": [
+              "IRS2"
+            ]
+          }
+        ]
+      },
+      {
+        "date": "2010-12-05",
+        "event_type": "optionExpiry",
+        "locator": "/optionExpirationNotification/optionExpiry[2]",
+        "trade_identifiers": [
+          {
+            "party_href": "SKY",
+            "trade_ids": [
+              "CDSwaption1"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-07-10T15:00:00",
+        "offset_minutes": 0,
+        "utc": "2010-07-10T15:00:00Z"
+      },
+      "message_id": "0485674",
+      "message_id_scheme": "http://www.amag.com/coding-scheme/message-id",
+      "send_to": [
+        "CCSTUS6S"
+      ],
+      "sent_by": "AMAGGB22XXX"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "AMAG",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500T86SHG919ON888"
+          }
+        ],
+        "party_name": "International Bank Asset Management"
+      },
+      {
+        "id": "SKY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300HTD3SZJWA5TS80"
+          }
+        ],
+        "party_name": "Sky Limited"
+      }
+    ],
+    "sequence_number": 1
+  }
+]

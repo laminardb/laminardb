@@ -1,0 +1,82 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "creation_time_utc": "2014-10-01T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2014-10-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2014-10-01T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "0996cdab693a7687214f9d1b4752786d77aae9eb4d4289eefef6d1fa12419dbb",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "product_type": "strategy",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300SRLRVTR996F086"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-3-0",
+              "value": "123456789"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300RE0FSXJE8G1L65"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-3-0",
+              "value": "123456789"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2014-10-01"
+    },
+    "trade_ordinal": 0
+  }
+]

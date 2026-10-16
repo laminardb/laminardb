@@ -10,6 +10,10 @@ impl KafkaSource {
     pub(super) async fn decode_polled_payloads(
         &mut self,
     ) -> Result<(arrow_array::RecordBatch, Option<Vec<usize>>), ConnectorError> {
+        #[cfg(feature = "fpml")]
+        if let Some(decoder) = self.fpml.clone() {
+            return self.decode_fpml_payloads(decoder).await;
+        }
         self.resolve_polled_avro_schemas().await?;
         self.deserialize_polled_payloads()
     }
@@ -179,36 +183,8 @@ impl KafkaSource {
                         }
                     }
                 }
-                if good_batches.is_empty() {
-                    return Err(ConnectorError::Serde(batch_err));
-                }
-                // Escalate if the error rate exceeds the configured threshold.
-                if error_count > 0 {
-                    let error_count = u32::try_from(error_count).map_err(|_| {
-                        ConnectorError::Internal(
-                            "Kafka deserialization error count exceeds u32".into(),
-                        )
-                    })?;
-                    let record_count = u32::try_from(refs.len()).map_err(|_| {
-                        ConnectorError::Internal("Kafka batch record count exceeds u32".into())
-                    })?;
-                    let error_rate = f64::from(error_count) / f64::from(record_count);
-                    if error_rate > self.config.max_deser_error_rate {
-                        return Err(ConnectorError::Serde(batch_err));
-                    }
-                    warn!(
-                        skipped = error_count,
-                        total = refs.len(),
-                        error_rate = %format_args!("{error_rate:.1}"),
-                        "deserialized batch with poison pill isolation"
-                    );
-                }
-                let concat_schema = good_batches[0].schema();
-                let batch = arrow_select::concat::concat_batches(&concat_schema, &good_batches)
-                    .map_err(|e| {
-                        ConnectorError::Internal(format!("failed to concat batches: {e}"))
-                    })?;
-                (batch, Some(good_idx))
+                let total = refs.len();
+                self.isolate_poison_pills(&good_batches, good_idx, error_count, total, batch_err)?
             }
         };
 
@@ -230,6 +206,43 @@ impl KafkaSource {
         }
 
         Ok((batch, good_indices))
+    }
+
+    /// Best-effort only: emit the records that decoded, unless none did or the error rate
+    /// exceeds `max.deser.error.rate`.
+    pub(super) fn isolate_poison_pills(
+        &self,
+        good_batches: &[arrow_array::RecordBatch],
+        good_idx: Vec<usize>,
+        error_count: usize,
+        total: usize,
+        batch_err: SerdeError,
+    ) -> Result<(arrow_array::RecordBatch, Option<Vec<usize>>), ConnectorError> {
+        if good_batches.is_empty() {
+            return Err(ConnectorError::Serde(batch_err));
+        }
+        if error_count > 0 {
+            let error_count = u32::try_from(error_count).map_err(|_| {
+                ConnectorError::Internal("Kafka deserialization error count exceeds u32".into())
+            })?;
+            let record_count = u32::try_from(total).map_err(|_| {
+                ConnectorError::Internal("Kafka batch record count exceeds u32".into())
+            })?;
+            let error_rate = f64::from(error_count) / f64::from(record_count);
+            if error_rate > self.config.max_deser_error_rate {
+                return Err(ConnectorError::Serde(batch_err));
+            }
+            warn!(
+                skipped = error_count,
+                total,
+                error_rate = %format_args!("{error_rate:.1}"),
+                "deserialized batch with poison pill isolation"
+            );
+        }
+        let concat_schema = good_batches[0].schema();
+        let batch = arrow_select::concat::concat_batches(&concat_schema, good_batches)
+            .map_err(|e| ConnectorError::Internal(format!("failed to concat batches: {e}")))?;
+        Ok((batch, Some(good_idx)))
     }
 }
 

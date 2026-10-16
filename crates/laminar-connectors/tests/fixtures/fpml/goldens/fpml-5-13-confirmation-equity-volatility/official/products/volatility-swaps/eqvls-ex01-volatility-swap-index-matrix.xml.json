@@ -1,0 +1,142 @@
+[
+  {
+    "correlation_id": "PA/2007/05/02/234234923415",
+    "creation_time_utc": "2007-05-02T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2007-05-02T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2007-05-02T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "2e4a1112d6b51926e6ffcb2af8f90db2dfdc22d6356bf8fb86b09d698a9e4eb4",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2011Equity"
+      ],
+      "contractual_matrix": [
+        "EquityDerivativesMatrix"
+      ],
+      "master_agreement_date": "2003-10-01",
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "234233423420",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "volatilitySwapTransactionSupplement",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "23902",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "6403855"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "6403855"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2015-03-30"
+    },
+    "trade_ordinal": 0,
+    "volatility_swap_transaction_supplement": {
+      "legs": [
+        {
+          "amount": {
+            "expected_n": 5,
+            "observation_start_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2015-03-30"
+              }
+            },
+            "vega_notional_amount": "1000.000000000000000000",
+            "volatility_cap": true,
+            "volatility_strike_price": "299.000000000000000000"
+          },
+          "leg": {
+            "payer_party_href": "party1",
+            "receiver_party_href": "party2"
+          },
+          "leg_type": "volatilityLeg",
+          "settlement": {
+            "settlement_currency": "GBP"
+          },
+          "underlyer": {
+            "single": {
+              "asset_type": "index",
+              "exchange_id": "XLIF",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-Reuters-RIC",
+                  "value": ".FTSE"
+                }
+              ],
+              "related_exchange_ids": [
+                "XLIF"
+              ]
+            }
+          },
+          "valuation": {
+            "valuation_date": {
+              "date_adjustments": {
+                "business_day_convention": "NotApplicable"
+              },
+              "unadjusted_date": "2015-04-07"
+            }
+          }
+        }
+      ],
+      "product": {},
+      "provisions": {}
+    }
+  }
+]

@@ -9,6 +9,7 @@ members = [
 ]
 exclude = [
     "tools/*",
+    "vendor/libxml2-ffi",
     "vendor/pgwire",
     "vendor/pgwire-replication",
     "vendor/quick-xml",

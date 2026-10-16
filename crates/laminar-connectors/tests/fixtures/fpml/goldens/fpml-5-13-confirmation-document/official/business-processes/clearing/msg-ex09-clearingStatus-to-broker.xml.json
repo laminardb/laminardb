@@ -1,0 +1,50 @@
+[
+  {
+    "actual_build": 7,
+    "clearing_status_items": [
+      {
+        "clearing_status": "PendingTheirApproval",
+        "trade_identifiers": [
+          {
+            "party_href": "clearer",
+            "trade_ids": [
+              "LCH02"
+            ]
+          }
+        ]
+      }
+    ],
+    "correlation_id": "TRD0001",
+    "correlation_id_scheme": "http://www.rbs.com/coding-scheme/trade-id",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "document_bytes": 1769,
+    "document_root": "clearingStatus",
+    "document_sha256": "6d6bf6012676a8e29cc88788e6466e573b8cd30235dd5427778932fa472627e5",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2010-01-04T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2010-01-04T08:57:00Z"
+      },
+      "message_id": "R00ABC1",
+      "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+      "send_to": [
+        "XYZ_BANK"
+      ],
+      "sent_by": "LCHLGB2LXXX",
+      "sent_by_scheme": "http://www.fpml.org/coding-scheme/external/iso9362"
+    },
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      }
+    ]
+  }
+]

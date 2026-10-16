@@ -160,7 +160,9 @@ subscriptions.
 
 PostgreSQL tables and MongoDB collections can feed sinks and SQL directly. See
 [PostgreSQL change data capture](#postgresql-change-data-capture) and
-[MongoDB change data capture](#mongodb-change-data-capture) to get started.
+[MongoDB change data capture](#mongodb-change-data-capture) to get started. FpML trade
+confirmations can come in from files or Kafka; see
+[FpML trade confirmations](#fpml-trade-confirmations).
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
 
@@ -426,6 +428,111 @@ not copy the collection a second time.
 The [connector guide](crates/laminar-connectors/README.md#mongodb-cdc) covers every option, the
 history record format, and failure handling in detail.
 
+### FpML trade confirmations
+
+Derivatives confirmations, clearing messages, and loan notices often arrive as FpML: large XML
+documents full of nested legs, cross-references, and amounts that must not be rounded. LaminarDB
+reads them from a directory or a Kafka topic, checks each one against the official FpML 5.13
+schema, and turns the parts you need into typed columns. From there it's ordinary SQL, and you
+don't write a parser for each product.
+
+A profile decides what a row is. The fourteen bundled profiles cover every product in FpML 5.13
+confirmations, with one row per trade (with or without the product's economics), per message, or
+per loan event or facility.
+
+#### Try it locally
+
+You need a Rust toolchain, CMake, a C compiler, and a checkout of this repository. These steps
+watch a folder for swap confirmations and write the trade date, first leg, and notional of each
+swap to a JSON file.
+
+1. Save this as `laminardb.toml`:
+
+   ```toml
+   sql = '''
+   CREATE SOURCE rates FROM FILES (
+       'path' = '/tmp/laminardb-fpml/inbox',
+       'glob_pattern' = '*.xml',
+       'fpml.profile' = 'fpml-5-13-confirmation-rates'
+   ) FORMAT FPML;
+
+   CREATE STREAM swaps AS
+       SELECT
+           trade_header['trade_date'] AS trade_date,
+           swap['streams'][1]['payer_party_href'] AS first_leg_payer,
+           swap['streams'][1]['calculation']['notional_schedule']['currency'] AS currency,
+           swap['streams'][1]['calculation']['notional_schedule']['initial_value'] AS notional
+       FROM rates
+       WHERE product_type = 'swap';
+
+   CREATE SINK swaps_out FROM swaps INTO FILES (
+       'path' = '/tmp/laminardb-fpml/out'
+   ) FORMAT JSON;
+   '''
+
+   [server]
+   bind = "127.0.0.1:8080"
+   delivery = "at_least_once"
+
+   [checkpoint]
+   url = "file:///tmp/laminardb-fpml/checkpoints"
+   interval = "1s"
+   ```
+
+   The source has no column list because the profile defines the columns. Nested values are
+   ordinary SQL structs and lists.
+
+2. Create the inbox and start the server with the `fpml` feature. The first build takes a few
+   minutes.
+
+   ```bash
+   mkdir -p /tmp/laminardb-fpml/inbox
+   cargo run --release -p laminar-server --features fpml --bin laminardb -- --config laminardb.toml
+   ```
+
+3. In another terminal, drop in some of the official FpML examples. They include swaps, FRAs,
+   and swaptions; the stream keeps only the swaps.
+
+   ```bash
+   cp crates/laminar-connectors/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/products/interest-rate-derivatives/ird-ex0*.xml \
+     /tmp/laminardb-fpml/inbox/
+   cat /tmp/laminardb-fpml/out/*.jsonl
+   ```
+
+   Rows land in `out` when the next checkpoint commits, about a second later. You should see 14
+   lines, one per swap, such as these:
+
+   ```json
+   {"trade_date":"1994-12-12","first_leg_payer":"party1","currency":"EUR","notional":50000000.000000000000000000}
+   {"trade_date":"2018-11-14","first_leg_payer":"partyB","currency":"USD","notional":86000000.000000000000000000}
+   {"trade_date":"2018-09-09","first_leg_payer":"partyB","currency":"USD","notional":121700000.000000000000000000}
+   ```
+
+   The notional keeps all 18 decimal places of its column, because amounts never pass through a
+   float. Some examples are variants of the same trade, so a few lines look the same.
+
+If you stop the server and start it again, it carries on from its last checkpoint and doesn't
+read the same files twice. To start over, stop it and delete `/tmp/laminardb-fpml`.
+
+#### Things to know
+
+- Each file or Kafka message is one complete document. A document produces all of its rows or
+  none of them.
+- Amounts are exact decimals, and dates keep the day that was written. A value that doesn't fit
+  its column exactly makes the document fail instead of being rounded.
+- A document that fails validation stops the source at that document, so nothing is silently
+  dropped. Fix or remove it and restart. There's no dead-letter route yet.
+- The profile and schema are locked in when the source is created. To change them, drop the
+  source and create it again.
+- Kafka sources need a profile with one row per document; the default document profile works.
+- Your own schema extensions and column mappings are configuration files, not code:
+  `fpml.schema.path` and `fpml.profile.path`.
+- Run it with checkpointing on and at-least-once delivery. It runs embedded or on a single-node
+  server. Cluster mode isn't supported.
+
+The [FpML source guide](docs/FPML_SOURCE.md) covers every profile and option, the column types,
+extending the schema, failure handling, and security in detail.
+
 ### Connector schemas
 
 You can omit source columns when the connector can read them from metadata, such as an Avro
@@ -530,6 +637,7 @@ See the [deployment guide](deploy/README.md) for setup and operational details.
 - [Connector schema resolution and recovery](docs/SCHEMA_RESOLUTION.md)
 - [Server configuration](crates/laminar-server/README.md)
 - [Connector guide](crates/laminar-connectors/README.md)
+- [FpML source guide](docs/FPML_SOURCE.md)
 - [Rust API](https://docs.rs/laminar-db)
 - [Examples](examples/)
 

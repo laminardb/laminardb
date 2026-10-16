@@ -46,9 +46,9 @@ pub(crate) fn validate_reader(format: Format, schema: &SchemaRef) -> Result<(), 
                 &super::raw::raw_schema(),
             )?;
         }
-        Format::Avro => {
+        Format::Avro | Format::Fpml => {
             return Err(ConnectorError::FeatureUnsupported(
-                "Avro requires a connector-provided reader contract".into(),
+                "format requires a connector-provided reader contract".into(),
             ))
         }
     }
@@ -85,7 +85,7 @@ pub(crate) fn validate_writer(format: Format, schema: &SchemaRef) -> Result<(), 
                 ));
             }
         }
-        Format::Avro | Format::Debezium => {
+        Format::Avro | Format::Debezium | Format::Fpml => {
             return Err(ConnectorError::FeatureUnsupported(
                 "format requires a connector-provided writer contract".into(),
             ))
@@ -175,5 +175,16 @@ mod tests {
         let binding = reader_binding(&ConnectorConfig::new("nats"), Format::Raw, None).unwrap();
         assert_eq!(binding.origin, SchemaOrigin::BuiltIn);
         assert_eq!(binding.logical, *super::super::raw::raw_schema());
+    }
+
+    /// Only a connector with its own `FpML` decoder may read the format; generic readers such as
+    /// NATS fail at schema resolution instead of decoding documents as another format.
+    #[test]
+    fn generic_readers_refuse_fpml() {
+        let declared = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+        let error = reader_binding(&ConnectorConfig::new("nats"), Format::Fpml, Some(declared))
+            .unwrap_err();
+        assert!(error.to_string().contains("FpML requires"), "{error}");
+        assert!(validate_writer(Format::Fpml, &Arc::new(Schema::empty())).is_err());
     }
 }

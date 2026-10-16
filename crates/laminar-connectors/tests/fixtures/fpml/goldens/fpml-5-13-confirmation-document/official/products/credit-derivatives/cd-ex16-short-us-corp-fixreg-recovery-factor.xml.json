@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 3943,
+    "document_root": "dataDocument",
+    "document_sha256": "8cc28a39a2a106f572b87a0cde3e2d92804907beecdadd7cedf12887214061cb",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "xyz1234"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "abc1234"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2002-12-03"
+      }
+    ]
+  }
+]

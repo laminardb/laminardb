@@ -1,0 +1,79 @@
+[
+  {
+    "correlation_id": "CW/2006/07/02/123",
+    "creation_time_utc": "2006-07-02T16:38:00Z",
+    "creation_timestamp": {
+      "local": "2006-07-02T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2006-07-02T16:38:00Z"
+    },
+    "document_root": "confirmationAgreed",
+    "document_sha256": "fd38e318c86f2282400586fa90989fd1aa70a91094b529e3c8df82389eec71eb",
+    "fpml_version": "5-13",
+    "in_reply_to": "MS/2006/04/07/15-99",
+    "message_id": "MS/2006/07/02/15-99",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "kom722",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "kow029",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "dividendSwapTransactionSupplement",
+    "row_locator": "/confirmationAgreed/trade",
+    "sent_by": "PARTYABICXXX",
+    "sequence_number": 1,
+    "trade_context": "confirmationAgreed",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "kom722",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/eqs-trade-id",
+              "value": "1734"
+            }
+          ]
+        },
+        {
+          "party_href": "kow029",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/eqs-trade-id",
+              "value": "5648"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-07-19"
+    },
+    "trade_ordinal": 0
+  }
+]

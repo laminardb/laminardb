@@ -1,0 +1,52 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 7768,
+    "document_root": "dataDocument",
+    "document_sha256": "b6c7a5ec44b0a6a49e94df9ce11bcb0ddcb68cb973e39c217f318028b28532f0",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300U2FJ850G1P3962"
+          }
+        ],
+        "party_name": "Company A Inc."
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300B23HNTO1OHFU87"
+          }
+        ],
+        "party_name": "Company B Inc."
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "COA24680"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "COB13579"
+            ]
+          }
+        ],
+        "product_type": "commodityOption",
+        "trade_date": "2012-06-06"
+      }
+    ]
+  }
+]

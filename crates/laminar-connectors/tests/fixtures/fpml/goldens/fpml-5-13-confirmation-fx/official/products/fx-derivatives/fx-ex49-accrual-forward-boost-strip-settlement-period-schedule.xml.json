@@ -1,0 +1,210 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "partyA"
+      ]
+    },
+    "creation_time_utc": "2010-10-15T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2010-10-15T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2010-10-15T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "8046dac4441ea3755f46f418655864a84a6b94d933d1a08b339c8cbc60f57d91",
+    "fpml_version": "5-13",
+    "fx_accrual_forward": {
+      "additional_payments": [
+        {
+          "payer_party_href": "partyB",
+          "payment_amount": {
+            "amount": "10000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "USNY"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2012-12-10"
+            }
+          },
+          "receiver_party_href": "partyA"
+        }
+      ],
+      "linear_payoff_regions": [
+        {
+          "counter_currency_amount": {
+            "currency": "JPY",
+            "initial_value": "49280000.000000000000000000",
+            "steps": [
+              {
+                "step_date": "2010-12-16",
+                "step_value": "51520000.000000000000000000"
+              },
+              {
+                "step_date": "2011-01-18",
+                "step_value": "47040000.000000000000000000"
+              }
+            ]
+          },
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "partyB",
+            "receiver_party_href": "partyA"
+          },
+          "exchanged_currency2": {
+            "currency": "JPY",
+            "payer_party_href": "partyA",
+            "receiver_party_href": "partyB"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "initial_value": "112.000000000000000000"
+          }
+        }
+      ],
+      "product": {},
+      "terms": {
+        "accrual": {
+          "fixing_schedule": {
+            "day_type": "Business",
+            "end_date": "2011-02-15",
+            "start_date": "2010-10-15"
+          },
+          "observables": [
+            {
+              "id": "ob1",
+              "information_source": {
+                "fixing_time": {
+                  "business_center": "USNY",
+                  "hour_minute_time": "10:00:00"
+                },
+                "rate_source": "WM Company",
+                "rate_source_page": "JPY1"
+              },
+              "quoted_currency_pair": {
+                "currency1": "USD",
+                "currency2": "JPY",
+                "quote_basis": "Currency2PerCurrency1"
+              }
+            }
+          ],
+          "regions": [
+            {
+              "accrual_factor": {
+                "initial_value": "2.000000000000000000"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            },
+            {
+              "lower_bound": {
+                "condition": "AtOrAbove"
+              },
+              "observable_href": "ob1",
+              "upper_bound": {
+                "condition": "Below"
+              }
+            }
+          ]
+        },
+        "expiry_schedule": {
+          "adjusted_dates": [
+            "2010-11-15",
+            "2010-12-15",
+            "2011-01-17",
+            "2011-02-15"
+          ],
+          "final_expiry_date": "2011-02-15"
+        },
+        "notional_amount": {
+          "currency": "USD",
+          "initial_value": "440000.000000000000000000",
+          "steps": [
+            {
+              "step_date": "2010-12-16",
+              "step_value": "460000.000000000000000000"
+            },
+            {
+              "step_date": "2011-01-18",
+              "step_value": "420000.000000000000000000"
+            }
+          ]
+        },
+        "settlement_schedule": {
+          "adjusted_dates": [
+            "2010-11-17",
+            "2010-12-17",
+            "2011-01-19",
+            "2011-02-17"
+          ],
+          "date_adjustments": {
+            "business_centers": [
+              "USNY",
+              "JPTO"
+            ],
+            "business_day_convention": "FOLLOWING"
+          },
+          "final_settlement_date": "2011-02-17"
+        }
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300SRLRVTR996F086"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300RE0FSXJE8G1L65"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxAccrualForward",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300SRLRVTR996F086"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "#partyA",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2010-10-15"
+    },
+    "trade_ordinal": 0
+  }
+]

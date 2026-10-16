@@ -1,0 +1,66 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "SYN-EQAC",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-04-01T02:30:00Z",
+    "document_bytes": 4432,
+    "document_root": "requestConfirmation",
+    "document_sha256": "febeb5ef4740fb05a5ebfefc1ba0eb6b8a8f70c76ac5ee9c1426ac9e7ea1fbb1",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-04-01T10:30:00",
+        "offset_minutes": 480,
+        "utc": "2026-04-01T02:30:00Z"
+      },
+      "message_id": "SYN-EQAC-0001",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "sent_by": "PARTYA",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "EQAC-2001"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "EQAC-2001"
+            ]
+          }
+        ],
+        "product_type": "equityAccumulator",
+        "trade_date": "2026-04-01"
+      }
+    ]
+  }
+]

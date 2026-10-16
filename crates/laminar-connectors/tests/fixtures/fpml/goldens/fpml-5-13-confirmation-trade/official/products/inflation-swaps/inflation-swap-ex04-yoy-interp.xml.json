@@ -1,0 +1,101 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "value": "PRIM_450"
+          }
+        ],
+        "account_name": "PRIMARY_ACCOUNT",
+        "beneficiary_href": "party1",
+        "id": "primaryAct1"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "CROSS_560"
+          }
+        ],
+        "account_name": "CROSS_ACCOUNT",
+        "beneficiary_href": "party2",
+        "id": "crossAct1"
+      }
+    ],
+    "correlation_id": "1234556",
+    "creation_time_utc": "2004-06-23T01:55:42Z",
+    "creation_timestamp": {
+      "local": "2004-06-23T06:55:42",
+      "offset_minutes": 300,
+      "utc": "2004-06-23T01:55:42Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "4b8501b3ccd2295be78459bc669f3e638ff1cdd8bcf86dc85c7764883358819d",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:2W81Q117",
+    "message_id_scheme": "http://www.barclaysglobal.com/partners/schema/v1-1/schemes/messageID",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "12345"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "67890"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "BGIAGB2L",
+    "sequence_number": 1,
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "12345"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "E2000098N10184"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "67890"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.barclays.com/swaps/trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2003-11-15"
+    },
+    "trade_ordinal": 0
+  }
+]

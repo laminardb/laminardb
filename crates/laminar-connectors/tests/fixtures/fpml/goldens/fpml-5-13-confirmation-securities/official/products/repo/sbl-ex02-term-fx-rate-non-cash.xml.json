@@ -1,0 +1,155 @@
+[
+  {
+    "creation_time_utc": "2019-02-07T14:05:42.267Z",
+    "creation_timestamp": {
+      "local": "2019-02-07T14:05:42.267",
+      "offset_minutes": 0,
+      "utc": "2019-02-07T14:05:42.267Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "1ca194dca3a3cf10b36959602243439058c5857553fee3f6a8f18131855e4f8f",
+    "documentation": {
+      "master_agreement_type": "GMSLA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "1234455",
+    "message_id_scheme": "http://www.abc.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "PARTY1-LEI"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "PARTY2-LEI"
+          }
+        ]
+      },
+      {
+        "id": "BondIssuer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BONDISSUER-LEI"
+          }
+        ]
+      }
+    ],
+    "product_type": "securityLending",
+    "row_locator": "/executionNotification/trade",
+    "security_lending": {
+      "borrower_party_href": "Party2",
+      "collateral_arrangement": "SecurityFinancial",
+      "collateral_currency": "USD",
+      "collateral_fx_rate": {
+        "currency1": "USD",
+        "currency2": "GBP",
+        "quote_basis": "Currency1PerCurrency2",
+        "rate": "1.240000000000000000"
+      },
+      "collateral_type": "nonCash",
+      "day_count_fraction": "ACT/360",
+      "duration": "Term",
+      "exclusive_arrangements": false,
+      "fee": {
+        "fixed_rate_schedule": {
+          "initial_value": "0.550000000000000000"
+        }
+      },
+      "initiation_settlement_date": "2019-08-29",
+      "lender_party_href": "Party1",
+      "margin_ratio": "1.000000000000000000",
+      "open_term": {},
+      "principal": {
+        "all_in_price": "1.160000000000000000",
+        "clean_price": "1.152000000000000000",
+        "dirty_price": "1.160000000000000000",
+        "nominal_amount": {
+          "amount": "38107291.900000000000000000",
+          "currency": "GBP",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "quantity": "38100000.000000000000000000",
+        "security": {
+          "credit_qualities": [
+            "INVG"
+          ],
+          "currency": "GBP",
+          "description": "UKT 1.75 07SEP37 1.7500 07-Sep-2037",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN",
+              "value": "GB0882634976"
+            }
+          ],
+          "instrument_types": [
+            "DBFTFM",
+            "NFID"
+          ],
+          "issuer_party_href": "BondIssuer",
+          "maturity": "2050-01-01"
+        },
+        "valuation_amount": {
+          "amount": "44204458.610000000000000000",
+          "currency": "GBP",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "yield_to_maturity": "0.840000000000000000"
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "SecuritiesFinancing"
+        },
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "SecurityLending"
+          }
+        ]
+      },
+      "termination_settlement_date": "2019-12-02"
+    },
+    "sent_by": "ABC",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "PARTY1-LEI"
+            }
+          ],
+          "version_ids": [
+            {
+              "scheme": "http://www.abc.com/coding-scheme/trade-id",
+              "value": "9999999"
+            }
+          ],
+          "versions": [
+            1
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "party_href": "Party1"
+        }
+      ],
+      "trade_date": "2019-02-07"
+    },
+    "trade_ordinal": 0
+  }
+]

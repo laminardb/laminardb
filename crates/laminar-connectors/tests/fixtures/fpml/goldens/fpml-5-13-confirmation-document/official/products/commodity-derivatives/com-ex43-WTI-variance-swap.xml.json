@@ -1,0 +1,45 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 5275,
+    "document_root": "dataDocument",
+    "document_sha256": "b64b895e45fc5d2c2e284f3c570acd9a0bf659921a9f0a3908e060593c91f91c",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "PartyA",
+            "trade_ids": [
+              "T901234-123456"
+            ]
+          }
+        ],
+        "product_type": "commodityPerformanceSwap",
+        "trade_date": "2012-05-20"
+      }
+    ]
+  }
+]

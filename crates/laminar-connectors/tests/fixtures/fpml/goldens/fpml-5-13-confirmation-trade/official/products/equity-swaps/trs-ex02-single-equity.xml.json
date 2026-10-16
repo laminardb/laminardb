@@ -1,0 +1,70 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "39888addb6912a3dc9e21ee93c5651b7922e0caca03fe6849bcf678c5a84d49e",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "QGPGHQ1ENZOOLJRFTH41"
+          }
+        ],
+        "party_name": "ABCD Securities Inc."
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "J6W9XJWVE853A9CVRQ85"
+          }
+        ],
+        "party_name": "HedgeCo Capital L.L.C."
+      }
+    ],
+    "product_type": "returnSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "QGPGHQ1ENZOOLJRFTH41"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abc.com/swaps/trade-id",
+              "value": "TRS-01"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "J6W9XJWVE853A9CVRQ85"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.hedgeco.com/swaps/trade-id",
+              "value": "total-ret-swap-01"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2004-10-10"
+    },
+    "trade_id": "trs-eq1-trade",
+    "trade_ordinal": 0
+  }
+]

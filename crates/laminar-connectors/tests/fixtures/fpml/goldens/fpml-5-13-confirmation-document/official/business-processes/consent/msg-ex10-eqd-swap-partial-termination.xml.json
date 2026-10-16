@@ -1,0 +1,92 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "OTCCallorPutSpread45678",
+    "correlation_id_scheme": "http://www.drkw.com/conversationId/OTC",
+    "creation_time_utc": "2000-08-01T03:57:00Z",
+    "document_bytes": 2503,
+    "document_root": "consentGranted",
+    "document_sha256": "af4dc9a3aed54a637d7fc6df8123137ae6333b2c2de2c87656be955d7fc7b5eb",
+    "events": [
+      {
+        "agreement_date": "2004-04-28",
+        "change_in_notional_amounts": [
+          {
+            "amount": "2000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "effective_date": "2004-04-30",
+        "event_type": "termination",
+        "locator": "/consentGranted/termination",
+        "outstanding_notional_amounts": [
+          {
+            "amount": "359198.740000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "payments": [
+          {
+            "payer_party_href": "party2",
+            "payment_amount": {
+              "amount": "200000.000000000000000000",
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2004-04-28"
+            },
+            "receiver_party_href": "party1"
+          }
+        ],
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-01T08:57:00",
+        "offset_minutes": 300,
+        "utc": "2000-08-01T03:57:00Z"
+      },
+      "in_reply_to": "OTCCallorPutSpread456a789a",
+      "message_id": "OTCCallorPutSpread456a789b",
+      "message_id_scheme": "http://www.drkw.com/messageId/OTC",
+      "sent_by": "drkw",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 4
+  }
+]

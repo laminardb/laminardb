@@ -1,0 +1,51 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 9544,
+    "document_root": "dataDocument",
+    "document_sha256": "043b58418943fc32e42c6ffd21e05817cf68e1f66d4539f385ccf5f17887b3b9",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "country": "US",
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "95980020140005196564"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300XQFX97CITUR430"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "PartyA",
+            "trade_ids": [
+              "ABCD1234"
+            ]
+          },
+          {
+            "party_href": "PartyB",
+            "trade_ids": [
+              "EFGH2345"
+            ]
+          }
+        ],
+        "product_type": "commodityBasketOption",
+        "trade_date": "2013-04-01"
+      }
+    ]
+  }
+]

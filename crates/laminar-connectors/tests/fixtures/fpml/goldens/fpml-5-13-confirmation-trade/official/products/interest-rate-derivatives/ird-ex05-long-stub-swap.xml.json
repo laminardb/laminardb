@@ -1,0 +1,68 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "56594bb31acb8ab6e25fdce62b33093cfd3ef13560fb8eda4904f357edbbf616",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFM8T61CT2L1QCEMIK50"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/swaps/trade-id",
+              "value": "921934"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFM8T61CT2L1QCEMIK50"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.ubsw.com/swaps/trade-id",
+              "value": "204334"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2000-04-03"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,162 @@
+[
+  {
+    "bond_option": {
+      "buyer_party_href": "Party1",
+      "entitlement_currency": "JPY",
+      "exercise": {
+        "european": {
+          "earliest_exercise_time": {
+            "business_center": "JPTO",
+            "hour_minute_time": "09:00:00"
+          },
+          "expiration_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "JPTO"
+                ],
+                "business_day_convention": "FOLLOWING"
+              },
+              "unadjusted_date": "2006-06-19"
+            }
+          },
+          "expiration_time": {
+            "business_center": "JPTO",
+            "hour_minute_time": "14:30:00"
+          }
+        },
+        "style": "europeanExercise"
+      },
+      "exercise_procedure": {
+        "follow_up_confirmation": true,
+        "limited_right_to_confirm": false,
+        "manual_exercise_present": "manualExercise",
+        "split_ticket": false
+      },
+      "notional_amount": {
+        "amount": "10000000000.000000000000000000",
+        "currency": "JPY",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "number_of_options": "1.000000000000000000",
+      "option_entitlement": "10000000000.000000000000000000",
+      "option_type": "Call",
+      "premium": {
+        "payer_party_href": "Party1",
+        "payment_amount": {
+          "amount": "25000000.000000000000000000",
+          "currency": "JPY",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "payment_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2006-05-15"
+          }
+        },
+        "receiver_party_href": "Party2"
+      },
+      "product": {},
+      "seller_party_href": "Party2",
+      "settlement": {
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_centers": [
+                "JPTO"
+              ],
+              "business_day_convention": "FOLLOWING"
+            },
+            "unadjusted_date": "2006-06-22"
+          }
+        },
+        "settlement_type": "Physical"
+      },
+      "strike": {
+        "strike_price": "99.700000000000000000"
+      },
+      "underlying": {
+        "asset_type": "bond",
+        "coupon_rate": "0.014000000000000000",
+        "currency": "JPY",
+        "instrument_ids": [
+          {
+            "scheme": "CUSIP",
+            "value": "ExampleCUSIP1"
+          }
+        ],
+        "maturity": "2011-03-20"
+      }
+    },
+    "calculation_agent": {
+      "party_hrefs": [
+        "Party1"
+      ]
+    },
+    "correlation_id": "CRR/2007/01/04/2342342",
+    "creation_time_utc": "2007-01-05T20:38:00Z",
+    "creation_timestamp": {
+      "local": "2007-01-05T15:38:00",
+      "offset_minutes": -300,
+      "utc": "2007-01-05T20:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "5ca6209520ab44163f9d3e89dd41dd8fd84f5981e1d30134873329e88f27de64",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "2342342",
+    "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "bondOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABIC1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/coding-scheme/trade-id",
+              "value": "Trade234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2006-05-10"
+    },
+    "trade_ordinal": 0
+  }
+]

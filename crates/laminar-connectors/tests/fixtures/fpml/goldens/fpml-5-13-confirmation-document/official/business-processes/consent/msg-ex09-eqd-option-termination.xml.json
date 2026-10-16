@@ -1,0 +1,75 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "OTCCallorPutSpread45678",
+    "correlation_id_scheme": "http://www.drkw.com/conversationId/OTC",
+    "creation_time_utc": "2000-08-01T08:57:00Z",
+    "document_bytes": 1969,
+    "document_root": "requestConsent",
+    "document_sha256": "90f41aaef6a25fde3e0647ddbc8b0ac712a096d1f96ce4fc3526acb221e7958a",
+    "events": [
+      {
+        "agreement_date": "2004-04-28",
+        "change_in_notional_amounts": [
+          {
+            "amount": "1000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "effective_date": "2004-04-30",
+        "event_type": "termination",
+        "locator": "/requestConsent/termination",
+        "outstanding_notional_amounts": [
+          {
+            "amount": "0.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2000-08-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2000-08-01T08:57:00Z"
+      },
+      "message_id": "OTCCallorPutSpread456a789b",
+      "message_id_scheme": "http://www.drkw.com/messageId/OTC",
+      "sent_by": "drkw",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

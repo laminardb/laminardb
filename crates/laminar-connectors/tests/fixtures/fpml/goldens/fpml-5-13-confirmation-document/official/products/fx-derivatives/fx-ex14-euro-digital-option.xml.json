@@ -1,0 +1,69 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "FX01234",
+    "correlation_id_scheme": "http://www.citi.com/coding-scheme/correlationId",
+    "creation_time_utc": "2001-11-12T08:57:00Z",
+    "document_bytes": 4160,
+    "document_root": "requestConfirmation",
+    "document_sha256": "fd1fb6523d7149594ccaea48c078507e910bf68a698e6cc57cbb9c67ced27f36",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2001-11-12T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2001-11-12T08:57:00Z"
+      },
+      "message_id": "FX109876",
+      "message_id_scheme": "http://www.citi.com/coding-scheme/messageId",
+      "send_to": [
+        "UBSWGB2L"
+      ],
+      "sent_by": "CITIUS33",
+      "sent_by_scheme": "http://www.citi.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000SCC07UI6DB380"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFM8T61CT2L1QCEMIK50"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "CITI10014"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "UBSW20014"
+            ]
+          }
+        ],
+        "product_type": "fxDigitalOption",
+        "trade_date": "2001-11-12"
+      }
+    ]
+  }
+]

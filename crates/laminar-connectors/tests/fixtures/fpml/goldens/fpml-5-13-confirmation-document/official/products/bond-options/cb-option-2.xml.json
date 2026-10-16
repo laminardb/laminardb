@@ -1,0 +1,62 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CRR/2007/01/04/2342342",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2007-01-05T20:38:00Z",
+    "document_bytes": 5757,
+    "document_root": "requestConfirmation",
+    "document_sha256": "ee5f3d6f2086df45828b0a55e3706e0859586b1dbaf39abdebccf24b05488fc0",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2007-01-05T15:38:00",
+        "offset_minutes": -300,
+        "utc": "2007-01-05T20:38:00Z"
+      },
+      "message_id": "2342342",
+      "message_id_scheme": "http://www.partyA.com/coding-scheme/message-id",
+      "send_to": [
+        "ABC"
+      ],
+      "sent_by": "PARTYABIC1"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "PartyA",
+            "trade_ids": [
+              "Bond1"
+            ]
+          }
+        ],
+        "product_type": "bondOption",
+        "trade_date": "2004-12-24"
+      }
+    ]
+  }
+]

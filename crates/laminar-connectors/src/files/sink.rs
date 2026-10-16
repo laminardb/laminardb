@@ -825,6 +825,10 @@ fn build_encoder(
             let encoder = super::arrow_ipc_codec::ArrowIpcEncoder::new(schema.clone());
             Ok(Box::new(encoder))
         }
+        #[cfg(feature = "fpml")]
+        FileFormat::Fpml => Err(ConnectorError::ConfigurationError(
+            "the file sink does not write FpML".into(),
+        )),
     }
 }
 

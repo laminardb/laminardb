@@ -1,0 +1,74 @@
+[
+  {
+    "context": "facilityNotification",
+    "creation_time_utc": "2014-10-07T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2014-10-07T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2014-10-07T09:30:47Z"
+    },
+    "document_root": "facilityNotification",
+    "document_sha256": "388f82fbd7f8dd2b4920798fa5081c454f03e91c8edde53a16474d8fe915f311",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "1000000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "50256.480000000000000000"
+      },
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "62058",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "effective_date": "2014-10-08",
+      "facility_href": "FAC12345"
+    },
+    "event_type": "fundingFeePayment",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "198302",
+    "notice_date": "2014-10-07",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/facilityNotification/fundingFeePayment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

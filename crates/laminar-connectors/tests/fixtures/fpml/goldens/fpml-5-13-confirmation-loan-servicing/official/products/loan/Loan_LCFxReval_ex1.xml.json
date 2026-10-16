@@ -1,0 +1,105 @@
+[
+  {
+    "context": "lcNotification",
+    "creation_time_utc": "2013-12-17T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-12-17T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-12-17T09:30:47Z"
+    },
+    "document_root": "lcNotification",
+    "document_sha256": "131d7a0b118c23a5e56fc316be66c96f5986f64bba2d65d3626ff7ba417e858c",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "base": {
+        "comment": "Letter of Credit F/X Revaluation",
+        "event_identifiers": [
+          {
+            "event_id": "52899",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2013-12-17",
+      "facility_fx_rate": {
+        "currency1": "USD",
+        "currency2": "GBP",
+        "fixing_date": "2013-12-19",
+        "quote_basis": "Currency1PerCurrency2",
+        "rate": "0.001000000000000000"
+      },
+      "lc_fx_rate": {
+        "currency1": "USD",
+        "currency2": "GBP",
+        "fixing_date": "2013-12-19",
+        "quote_basis": "Currency1PerCurrency2",
+        "rate": "0.001000000000000000"
+      },
+      "letter_of_credit_hrefs": [
+        "LOC123"
+      ]
+    },
+    "event_type": "lcFxRevaluation",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "763249",
+    "notice_date": "2013-12-17",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "ISSUINGBANK",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US6I874125"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/lcNotification/lcFxRevaluation",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

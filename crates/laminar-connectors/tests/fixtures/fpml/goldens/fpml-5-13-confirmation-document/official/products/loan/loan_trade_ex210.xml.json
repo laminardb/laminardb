@@ -1,0 +1,92 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-03-15T21:35:58.568Z",
+    "document_bytes": 3241,
+    "document_root": "loanAllocationNotification",
+    "document_sha256": "a33d8d0a6bbcf192d4d225fc942fb80e05e8f6ddddf4379f8aafbc64ecc9855f",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-15T16:35:58.568",
+        "offset_minutes": -300,
+        "utc": "2018-03-15T21:35:58.568Z"
+      },
+      "message_id": "P00001549667579",
+      "message_id_scheme": "http://www.pimco.com/fpml/coding-scheme/internal/message-id",
+      "send_to": [
+        "CH1L122575"
+      ],
+      "sent_by": "US1L142580",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "loan_contents": [
+      {
+        "element": "allocation",
+        "locator": "/loanAllocationNotification/allocation"
+      }
+    ],
+    "loan_events": [
+      {
+        "event_ids": [
+          "US005"
+        ],
+        "event_type": "loanAllocationSettlementDateAvailability",
+        "locator": "/loanAllocationNotification/loanAllocationSettlementDateAvailability"
+      }
+    ],
+    "notice_date": "2018-03-08",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "KY1L151440",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY1L151440"
+          }
+        ]
+      }
+    ],
+    "party_hrefs": [
+      "US1L142580"
+    ],
+    "role": "Buyer",
+    "trade_identifiers": [
+      {
+        "party_href": "GB1L104502",
+        "trade_ids": [
+          "BBPLC_T_001"
+        ]
+      }
+    ]
+  }
+]

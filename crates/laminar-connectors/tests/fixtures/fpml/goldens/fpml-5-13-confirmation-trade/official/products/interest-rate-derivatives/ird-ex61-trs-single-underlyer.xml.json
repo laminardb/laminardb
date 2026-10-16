@@ -1,0 +1,84 @@
+[
+  {
+    "calculation_agent": {
+      "calculation_agent_party": "AsSpecifiedInMasterAgreement"
+    },
+    "calculation_agent_business_center": "GBLO",
+    "creation_time_utc": "2018-09-17T01:55:42Z",
+    "creation_timestamp": {
+      "local": "2018-09-17T06:55:42",
+      "offset_minutes": 300,
+      "utc": "2018-09-17T01:55:42Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "3005046dc4edc029ac06995f6690ef28fbe485c71ac8b63ee8eee9b6ad4c8b17",
+    "documentation": {
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "GW:2W81Q117",
+    "message_id_scheme": "XXX",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "XXXXXXXX",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300ABANKV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "E2000098N10184"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "529900CPTY57S5UCBB52"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2018-09-17"
+    },
+    "trade_ordinal": 0
+  }
+]

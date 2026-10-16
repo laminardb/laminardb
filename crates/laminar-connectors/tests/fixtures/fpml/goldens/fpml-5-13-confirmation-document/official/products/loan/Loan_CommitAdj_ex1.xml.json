@@ -1,0 +1,99 @@
+[
+  {
+    "actual_build": 7,
+    "contract_identifiers": [
+      {
+        "contract_ids": [
+          "CC1234"
+        ],
+        "facility_href": "FAC12345",
+        "id": "CONT123",
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "creation_time_utc": "2013-10-30T11:38:20Z",
+    "deal_identifiers": [
+      {
+        "description": "Borrower Inc. Revolver",
+        "id": "DEAL456",
+        "instrument_ids": [
+          "75362ZUU6"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "document_bytes": 4453,
+    "document_root": "facilityNotification",
+    "document_sha256": "e6a7e69eeb37b7005d8f9d5f779d7e7063a6477bb1558520dc07a03dbfb6c67a",
+    "facility_identifiers": [
+      {
+        "description": "Tranche B",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "75362ZUT8"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2013-10-30T11:38:20",
+        "offset_minutes": 0,
+        "utc": "2013-10-30T11:38:20Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "656114",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": false,
+    "loan_events": [
+      {
+        "effective_date": "2013-10-31",
+        "event_ids": [
+          "598423"
+        ],
+        "event_type": "commitmentAdjustment",
+        "locator": "/facilityNotification/commitmentAdjustment"
+      }
+    ],
+    "notice_date": "2013-10-30",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ],
+        "party_name": ""
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ]
+  }
+]

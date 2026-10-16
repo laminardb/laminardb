@@ -1,0 +1,73 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "dd6bb2e0a45c57e42d6d1e687225b8e33e4b7b24de0b197f1d65c221a62f803d",
+    "documentation": {
+      "master_confirmation_date": "2011-01-01",
+      "master_confirmation_type": "ISDA2010EquityEMEAInterdealer"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "XXXX1111"
+          }
+        ],
+        "party_name": "XXXX Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "YYYY2222"
+          }
+        ],
+        "party_name": "YYYY Bank"
+      }
+    ],
+    "product_type": "equityOptionTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "XXXX1111"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/trade-id-1-0",
+              "value": "2783639"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "YYYY2222"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyB.com/trade-id-1-0",
+              "value": "2783639"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2011-02-11"
+    },
+    "trade_ordinal": 0
+  }
+]

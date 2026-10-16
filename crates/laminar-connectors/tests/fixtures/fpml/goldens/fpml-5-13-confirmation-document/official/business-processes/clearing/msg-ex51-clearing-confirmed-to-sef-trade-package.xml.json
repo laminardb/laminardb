@@ -1,0 +1,88 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "13D2DLRXD04I012H2927",
+    "correlation_id_scheme": "http://www.tradeweb.com/swaps/correlation-id",
+    "creation_time_utc": "2013-12-02T22:31:48Z",
+    "document_bytes": 6741,
+    "document_root": "clearingConfirmed",
+    "document_sha256": "926c765b726410838d61336fa6ecc480c9b25d8b7f709569083046f6e1b2b72f",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2013-12-02T22:31:48",
+        "offset_minutes": 0,
+        "utc": "2013-12-02T22:31:48Z"
+      },
+      "in_reply_to": "TW20131202NY000075",
+      "message_id": "LCH_8789992",
+      "message_id_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/message-id",
+      "send_to": [
+        "TWEB"
+      ],
+      "sent_by": "LCHLGB2L",
+      "sent_by_scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "counterpartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTA"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERA"
+          }
+        ]
+      },
+      {
+        "id": "counterpartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENT3"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERB"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF1"
+          }
+        ]
+      },
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "LCHLGB2L"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "F226TOH6YD6XJB17KS62"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

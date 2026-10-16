@@ -1,0 +1,74 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "77aa0da5d2524e2054f66c7e088ef54c1d2c97a65b0ee8a42f3c82a185487ebd",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021"
+      ]
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank A"
+          }
+        ],
+        "party_name": "Bank a"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Bank B"
+          }
+        ],
+        "party_name": "Bank B"
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Bank A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.bankB.com/swaps/com-trade-id",
+              "value": "BankA1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Bank B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.bankA.com/swaps/com-trade-id",
+              "value": "BankB5678"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2021-08-18"
+    },
+    "trade_ordinal": 0
+  }
+]

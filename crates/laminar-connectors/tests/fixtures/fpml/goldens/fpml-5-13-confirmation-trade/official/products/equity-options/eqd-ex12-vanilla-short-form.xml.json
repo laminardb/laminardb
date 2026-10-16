@@ -1,0 +1,76 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "correlation_id": "CORR/2000/08/01/OTCCallorPutSpread45678",
+    "creation_time_utc": "2000-08-01T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2000-08-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2000-08-01T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "f5556f084acb41aee48d68facf67e9fe643c4292d70a202155d33fa4b2c82ff3",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2002Equity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "governing_law": "GBEN",
+    "is_correction": false,
+    "message_id": "OTCCallorPutSpread456a789b",
+    "message_id_scheme": "http://www.PartyA.com/messageId/OTC",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "brokerEquityOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "Party A",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/tradeId/OTC",
+              "value": "1234"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-07-13"
+    },
+    "trade_ordinal": 0
+  }
+]

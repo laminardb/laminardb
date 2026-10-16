@@ -1,0 +1,67 @@
+[
+  {
+    "actual_build": 7,
+    "approval_type": "Credit",
+    "approving_party_href": "party1",
+    "correlation_id": "18671867",
+    "correlation_id_scheme": "http://www.party2.com/correlation-id",
+    "creation_time_utc": "2002-12-03T09:57:00Z",
+    "document_bytes": 3458,
+    "document_root": "requestConsent",
+    "document_sha256": "2de4d80c122690fad777d63aa1012bc0455bc3053cde4a39b7117462abd3bdf8",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-12-03T09:57:00",
+        "offset_minutes": 0,
+        "utc": "2002-12-03T09:57:00Z"
+      },
+      "message_id": "123453212",
+      "message_id_scheme": "http://www.party2.com/message-id",
+      "sent_by": "PARTY2US33"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "TR24TWEY5RVRQV65HD49"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConsent/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "MB87623"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "AA9876"
+            ]
+          }
+        ],
+        "product_type": "fra",
+        "trade_date": "1991-05-14"
+      }
+    ]
+  }
+]

@@ -1,0 +1,70 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "50d8715917ccf29be701612b1616cfe55fa7ba0b32ed30c5c04d99e038813139",
+    "documentation": {
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "PRIMARY",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "0987654321"
+          }
+        ]
+      },
+      {
+        "id": "CROSS",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "1234567890"
+          }
+        ]
+      }
+    ],
+    "product_type": "returnSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PRIMARY",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "0987654321"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.primarybank.com/trade-id",
+              "value": "CFD123456789"
+            }
+          ]
+        },
+        {
+          "party_href": "CROSS",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "1234567890"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.crossbank.com/tradeId",
+              "value": "CFD123456789"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-09-30"
+    },
+    "trade_ordinal": 0
+  }
+]

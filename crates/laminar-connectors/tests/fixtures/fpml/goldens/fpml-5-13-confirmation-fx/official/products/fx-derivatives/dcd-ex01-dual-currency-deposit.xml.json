@@ -1,0 +1,121 @@
+[
+  {
+    "correlation_id": "FX65431",
+    "creation_time_utc": "2008-06-04T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2008-06-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2008-06-04T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "6290dcd365ccff1084220ec000c61ff132e54806bbbaa0f345ae43b668d49a51",
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "FX87653",
+    "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "TR24TWEY5RVRQV65HD49"
+          }
+        ],
+        "party_name": "MIDLAND"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ],
+        "party_name": "ABN AMRO"
+      }
+    ],
+    "product_type": "termDeposit",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABNANL2A",
+    "sequence_number": 1,
+    "term_deposit": {
+      "day_count_fraction": "ACT/360",
+      "dual_currency": {
+        "currency": "JPY",
+        "fixing_date": "2008-07-22",
+        "fixing_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "10:00:00"
+        },
+        "interest_at_risk": false,
+        "spot_rate": "107.850000000000000000",
+        "strike": {
+          "rate": "109.480000000000000000",
+          "strike_quote_basis": "AlternateCurrencyPerDepositCurrency"
+        }
+      },
+      "fixed_rate": "0.080000000000000000",
+      "interest": {
+        "amount": "6666.670000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "maturity_date": "2008-07-24",
+      "payer_party_href": "party1",
+      "principal": {
+        "amount": "1000000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.sample.com/coding-scheme/product-type-simple",
+            "value": "DualCurrencyDeposit"
+          }
+        ]
+      },
+      "receiver_party_href": "party2",
+      "start_date": "2008-06-24"
+    },
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "TR24TWEY5RVRQV65HD49"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.midlandnb.com/swaps/trade-id",
+              "value": "MB87623"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.abn.com/swaps/trade-id",
+              "value": "AA9876"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2008-06-24"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,163 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "ptyA"
+      ]
+    },
+    "creation_time_utc": "2011-03-01T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2011-03-01T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2011-03-01T08:57:00Z"
+    },
+    "document_root": "executionNotification",
+    "document_sha256": "cb33cec5fa6ab42ec9ea76b9197cf37c90512885e74d496b3758fa2794cdcec0",
+    "fpml_version": "5-13",
+    "fx_target_knockout_forward": {
+      "expiry_schedule": {
+        "adjusted_dates": [
+          "2014-12-23",
+          "2014-01-27",
+          "2014-02-25",
+          "2014-03-26",
+          "2014-04-27",
+          "2014-05-27"
+        ],
+        "date_adjustments": {
+          "business_centers": [
+            "USNY"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "final_expiry_date": "2015-05-27"
+      },
+      "fixing_information_source": {
+        "fixing_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "10:00:00"
+        },
+        "rate_source": "Reuters",
+        "rate_source_page": "WMRSPOT09"
+      },
+      "notional_amount": {
+        "currency": "USD",
+        "initial_value": "1000000.000000000000000000"
+      },
+      "payoff_regions": [
+        {
+          "constant_payoff_payer_href": "ptyB",
+          "constant_payoff_receiver_href": "ptyA",
+          "region_type": "constantPayoffRegion",
+          "upper_bound": {
+            "condition": "Below",
+            "strike_href": "s1"
+          }
+        },
+        {
+          "counter_currency_amount": {
+            "currency": "CAD",
+            "initial_value": "1045000.000000000000000000"
+          },
+          "exchanged_currency1": {
+            "currency": "USD",
+            "payer_party_href": "ptyA",
+            "receiver_party_href": "ptyB"
+          },
+          "exchanged_currency2": {
+            "currency": "CAD",
+            "payer_party_href": "ptyB",
+            "receiver_party_href": "ptyA"
+          },
+          "lower_bound": {
+            "condition": "AtOrAbove",
+            "strike_href": "s1"
+          },
+          "region_type": "linearPayoffRegion",
+          "strike": {
+            "id": "s1",
+            "initial_value": "1.045000000000000000"
+          }
+        }
+      ],
+      "product": {},
+      "quoted_currency_pair": {
+        "currency1": "USD",
+        "currency2": "CAD",
+        "quote_basis": "Currency2PerCurrency1"
+      },
+      "settlement_schedule": {
+        "adjusted_dates": [
+          "2014-12-24",
+          "2014-01-28",
+          "2014-02-26",
+          "2014-03-27",
+          "2014-04-28",
+          "2014-05-28"
+        ],
+        "date_adjustments": {
+          "business_centers": [
+            "USNY"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "final_settlement_date": "2015-05-28"
+      },
+      "targets": [
+        {
+          "knockout_conditional_fixings": 4,
+          "settlement_at_knockout": true
+        }
+      ]
+    },
+    "is_correction": false,
+    "message_id": "FX456a789b",
+    "message_id_scheme": "http://www.executionnotificationservice.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "ptyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "ptyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "fxTargetKnockoutForward",
+    "row_locator": "/executionNotification/trade",
+    "sent_by": "EXECSRV",
+    "trade_context": "executionNotification",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "ptyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyA.com/fx/trade-id",
+              "value": "12345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-06-23"
+    },
+    "trade_ordinal": 0
+  }
+]

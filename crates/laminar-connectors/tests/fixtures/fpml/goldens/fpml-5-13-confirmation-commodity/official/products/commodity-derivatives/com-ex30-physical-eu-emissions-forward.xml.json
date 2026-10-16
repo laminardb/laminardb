@@ -1,0 +1,134 @@
+[
+  {
+    "commodity_swap": {
+      "details": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-12-31"
+          }
+        },
+        "legs": [
+          {
+            "calculation_periods": {
+              "calculation_periods_schedule": {
+                "balance_of_first_period": false,
+                "period": "T",
+                "period_multiplier": 1
+              }
+            },
+            "fixed_price": {
+              "price": "7.380000000000000000",
+              "price_currency": "EUR",
+              "price_unit": "Allowances"
+            },
+            "leg_type": "fixedLeg",
+            "notional": {
+              "quantity_href": "deliveryQuantity"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {
+              "master_agreement_payment_dates": false
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyA",
+            "total_price": {
+              "amount": "7380.000000000000000000",
+              "currency": "EUR",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          },
+          {
+            "calculation_periods": {},
+            "delivery_date": {
+              "adjustable_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NONE"
+                },
+                "unadjusted_date": "2012-12-31"
+              }
+            },
+            "leg_type": "environmentalPhysicalLeg",
+            "notional": {},
+            "number_of_allowances": {
+              "quantity": "1000.000000000000000000",
+              "quantity_unit": "Allowances"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {},
+            "physical_commodity": "environmental",
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "settlement_currency": "EUR",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2012-12-31"
+          }
+        }
+      },
+      "product": {
+        "primary_asset_class": {
+          "scheme": "http://www.fpml.org/coding-scheme/asset-class",
+          "value": "Commodity"
+        }
+      }
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "34b609883bdd7315eeb67f4e4273c7bce9e8878cb76e223cec30d79e2b07db4e",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5299000NIGT14YW8ZD26"
+          }
+        ],
+        "party_name": "EnergyCoA"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500QCC36R89FI3U25"
+          }
+        ],
+        "party_name": "EnergyCoB"
+      }
+    ],
+    "product_type": "commoditySwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5299000NIGT14YW8ZD26"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "123456"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-06-04"
+    },
+    "trade_ordinal": 0
+  }
+]

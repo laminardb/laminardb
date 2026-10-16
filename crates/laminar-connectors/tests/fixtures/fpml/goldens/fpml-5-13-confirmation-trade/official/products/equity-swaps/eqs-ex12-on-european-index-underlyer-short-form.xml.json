@@ -1,0 +1,73 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "8f331ee2ed70e815d57774697c50ea57104681b5f0414952eed1e6430761e8c6",
+    "documentation": {
+      "master_confirmation_date": "2009-01-01",
+      "master_confirmation_type": "ISDA2007EquityEuropean"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PARTY1234"
+          }
+        ],
+        "party_name": "Party 1234 Ltd"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "PARTY5678"
+          }
+        ],
+        "party_name": "Party 5678 Ltd"
+      }
+    ],
+    "product_type": "equitySwapTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "PARTY1234"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.tradeIdScheme.com/tradeIdScheme",
+              "value": "1147071"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "PARTY5678"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.tradeIdScheme.com/tradeIdScheme",
+              "value": "1147071"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-01-19"
+    },
+    "trade_ordinal": 0
+  }
+]

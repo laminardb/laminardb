@@ -1,0 +1,149 @@
+[
+  {
+    "commodity_swap": {
+      "details": {
+        "effective_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2009-03-01"
+          }
+        },
+        "legs": [
+          {
+            "calculation_periods": {},
+            "delivery_periods": {
+              "periods_schedule": {
+                "balance_of_first_period": false,
+                "id": "deliveryPeriods",
+                "period": "T",
+                "period_multiplier": 1
+              }
+            },
+            "delivery_quantity": {
+              "physical_quantity": {
+                "quantity": "2400.000000000000000000",
+                "quantity_frequency": "PerCalendarDay",
+                "quantity_unit": "GJ"
+              },
+              "total_physical_quantity": {
+                "quantity": "74400.000000000000000000",
+                "quantity_unit": "GJ"
+              }
+            },
+            "leg_type": "gasPhysicalLeg",
+            "notional": {},
+            "payer_party_href": "partyA",
+            "payment_dates": {},
+            "physical_commodity": "gas",
+            "physical_commodity_type": "NaturalGas",
+            "physical_quantity": {},
+            "receiver_party_href": "partyB"
+          },
+          {
+            "calculation_periods": {
+              "calculation_periods_href": "deliveryPeriods"
+            },
+            "fixed_price": {
+              "price": "5.000000000000000000",
+              "price_currency": "EUR",
+              "price_unit": "GJ"
+            },
+            "leg_type": "fixedLeg",
+            "notional": {
+              "quantity_href": "deliveryQuantity"
+            },
+            "payer_party_href": "partyB",
+            "payment_dates": {
+              "master_agreement_payment_dates": true
+            },
+            "physical_quantity": {},
+            "receiver_party_href": "partyA"
+          }
+        ],
+        "settlement_currency": "EUR",
+        "termination_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NotApplicable"
+            },
+            "unadjusted_date": "2009-03-31"
+          }
+        }
+      },
+      "product": {}
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "b55eb71bd62931580b10e6cb1990cede01b81ca14754bcab585728b870064729",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2005Commodity"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300KFSLY4U7N3LL12"
+          }
+        ],
+        "party_name": "Bank"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300AJRHKBLY9GM262"
+          }
+        ],
+        "party_name": "Energy Co."
+      }
+    ],
+    "product_type": "commoditySwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300KFSLY4U7N3LL12"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyA.com/com-trade-id",
+              "value": "1234"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300AJRHKBLY9GM262"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.PartyB.com/com-trade-id",
+              "value": "2345"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2009-01-28"
+    },
+    "trade_ordinal": 0
+  }
+]

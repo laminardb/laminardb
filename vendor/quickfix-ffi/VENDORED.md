@@ -42,6 +42,15 @@ upstream repository published no security advisories as of 2026-10-14.
   `MessageStoreFactory` whose stores persist every sequence-number change and reset through
   caller callbacks before caching it (outbound messages are never stored). Every function
   catches all C++ exceptions, including non-`std::exception` ones.
+- `libquickfix/src/C++/ThreadedSocket{Connection,Initiator,Acceptor}.cpp` and `Utility.{h,cpp}`:
+  each connection socket is closed exactly once. Upstream closed it in
+  `ThreadedSocketConnection::disconnect()` and again in `onStop()` (or in `disconnect()` after
+  `onStop()` had closed it), so a descriptor number reused by another thread in between was closed
+  under it; Rust's debug-build `OwnedFd` check then aborted the process with "owned file
+  descriptor already closed". `disconnect()` and `onStop()` now only shut a connection down; the
+  socket is closed by whoever removes it from the thread map (`removeThread`, or `onStop()` after
+  joining the thread). Listening sockets are still closed before the join, since shutdown does
+  not wake `accept` on every platform.
 - `quickfix-bind/CMakeLists.txt` compiles the bridge into `quickfixbind`.
 - `build.rs` compiles both libraries with `/EHsc` on MSVC. `cmake-rs` replaces CMake's default
   MSVC flags, so the published crate builds without unwind semantics (warning C4530): an engine

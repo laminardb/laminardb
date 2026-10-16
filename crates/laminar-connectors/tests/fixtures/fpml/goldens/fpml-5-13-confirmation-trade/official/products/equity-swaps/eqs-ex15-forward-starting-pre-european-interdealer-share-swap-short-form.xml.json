@@ -1,0 +1,91 @@
+[
+  {
+    "correlation_id": "CS/2009/09/09/32-09",
+    "creation_time_utc": "2009-09-09T16:38:00Z",
+    "creation_timestamp": {
+      "local": "2009-09-09T16:38:00",
+      "offset_minutes": 0,
+      "utc": "2009-09-09T16:38:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "7cb3ff5fafe7ab71371900380948926bdfb76bb112ed62eb9cc74d8dd109c266",
+    "documentation": {
+      "master_confirmation_date": "2009-09-01",
+      "master_confirmation_type": "ISDA2009EquityEuropeanInterdealer"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "MS/2009/09/09/15-89",
+    "message_id_scheme": "http://www.example.com/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ],
+        "party_name": "AAA Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ],
+        "party_name": "Mega Bank Ltd"
+      }
+    ],
+    "product_type": "equitySwapTransactionSupplement",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "PARTYABIC1",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "version_ids": [
+            {
+              "scheme": "http://www.partyA.com/trade-id-1-0",
+              "value": "1558488"
+            }
+          ],
+          "versions": [
+            1
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "version_ids": [
+            {
+              "scheme": "http://www.partyB.com/trade-id-1-0",
+              "value": "8848551"
+            }
+          ],
+          "versions": [
+            1
+          ]
+        }
+      ],
+      "trade_date": "2009-09-09"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,193 @@
+[
+  {
+    "calculation_agent": {
+      "party_hrefs": [
+        "party1"
+      ]
+    },
+    "calculation_agent_business_center": "GBLO",
+    "credit_default_swap": {
+      "fee_leg": {
+        "periodic_payment": {
+          "calculation_amount": {
+            "amount": "50000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "day_count_fraction": "ACT/360",
+          "first_payment_date": "2003-02-14",
+          "fixed_rate": "0.001100000000000000",
+          "payment_frequency": {
+            "period": "M",
+            "period_multiplier": 3
+          },
+          "roll_convention": "14"
+        }
+      },
+      "general_terms": {
+        "buyer_party_href": "party2",
+        "date_adjustments": {
+          "business_centers": [
+            "GBLO",
+            "USNY"
+          ],
+          "business_day_convention": "MODFOLLOWING"
+        },
+        "effective_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2002-11-14"
+        },
+        "reference_entity": {
+          "entity_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/entity-id-RED",
+              "value": "4AB951"
+            }
+          ],
+          "entity_name": "Republic of Italy",
+          "id": "referenceEntity"
+        },
+        "reference_obligations": [
+          {
+            "asset": {
+              "asset_type": "bond",
+              "coupon_rate": "0.060000000000000000",
+              "instrument_ids": [
+                {
+                  "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN",
+                  "value": "XS0125141316"
+                }
+              ],
+              "maturity": "2011-02-22"
+            },
+            "primary_obligor_href": "referenceEntity"
+          }
+        ],
+        "reference_price": "1.000000000000000000",
+        "reference_type": "referenceInformation",
+        "scheduled_termination_date": {
+          "date_adjustments": {
+            "business_day_convention": "NONE"
+          },
+          "unadjusted_date": "2007-11-14"
+        },
+        "seller_party_href": "party1"
+      },
+      "physical_settlement_terms": [
+        {
+          "deliverable_not_contingent": true,
+          "deliverable_obligation_category": "BondOrLoan",
+          "deliverable_transferable": true,
+          "escrow": true,
+          "physical_settlement_period_business_days": 30,
+          "settlement_currency": "USD"
+        }
+      ],
+      "product": {},
+      "protection_terms": [
+        {
+          "calculation_amount": {
+            "amount": "50000000.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "credit_events": {
+            "credit_event_notice_parties": [
+              "party2",
+              "party1"
+            ],
+            "default_requirement": {
+              "amount": "10000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "failure_to_pay": true,
+            "failure_to_pay_payment_requirement": {
+              "amount": "1000000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "obligation_acceleration": true,
+            "repudiation_moratorium": true,
+            "restructuring": true,
+            "restructuring_type": "R"
+          },
+          "obligation_category": "BorrowedMoney"
+        }
+      ]
+    },
+    "document_root": "dataDocument",
+    "document_sha256": "227412264af39dd787cba92836a3a0fdffe9fd7520ca23ca0afd03ef7eac43fd",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA1999Credit"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900BIAQJIUV6DLE92"
+          }
+        ],
+        "party_name": "XYZ Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "ABC Bank"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "254900BIAQJIUV6DLE92"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "37263"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "37263"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2002-11-13"
+    },
+    "trade_ordinal": 0
+  }
+]

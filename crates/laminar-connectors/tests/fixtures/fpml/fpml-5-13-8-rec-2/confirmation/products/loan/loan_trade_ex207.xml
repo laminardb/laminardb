@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--View is confirmation-->
+<!--Version is 5-13-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--
+        == Copyright (c) 2022-2026 All rights reserved.
+        == Financial Products Markup Language is subject to the FpML public license.
+        == A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<loanAllocationNotification xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" fpmlVersion="5-13" xsi:schemaLocation="http://www.fpml.org/FpML-5/confirmation ../../fpml-main-5-13.xsd http://www.w3.org/2000/09/xmldsig# ../../xmldsig-core-schema.xsd">
+  <header>
+    <messageId messageIdScheme="http://www.barclays.com/fpml/coding-scheme/internal/message-id">BBPLC00001549667579</messageId>
+    <sentBy messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">GB1L104502</sentBy>
+    <sendTo messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US1L142580</sendTo>
+    <creationTimestamp>2018-03-05T16:35:58.568-05:00</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <noticeDate>2018-03-05</noticeDate>
+  <partyReference href="GB1L104502" />
+  <role tradingPartyRoleScheme="http://www.fpml.org/coding-scheme/trading-party-role">Seller</role>
+  <loanAllocationConfirmation>
+    <eventIdentifier>
+      <partyReference href="US1L142580" />
+      <eventId eventIdScheme="http://www.pimco.com/fpml/coding-scheme/internal/allocation-event-id">GB004</eventId>
+    </eventIdentifier>
+    <lenderPartyReference href="US1L142580" />
+    <allocationReference href="A_001" />
+  </loanAllocationConfirmation>
+  <loanAllocationConfirmation>
+    <eventIdentifier>
+      <partyReference href="US1L142580" />
+      <eventId eventIdScheme="http://www.pimco.com/fpml/coding-scheme/internal/allocation-event-id">GB005</eventId>
+    </eventIdentifier>
+    <lenderPartyReference href="US1L142580" />
+    <allocationReference href="A_002" />
+  </loanAllocationConfirmation>
+  <allocation id="A_001">
+    <partyReference href="US1L142580" />
+    <tradeId tradeIdScheme="http://www.pimco.com/fpml/coding-scheme/internal/allocation-id">001</tradeId>
+    <loanTradeReference href="TI_BBPLC_T_001" />
+    <amount>
+      <currency currencyScheme="http://www.fpml.org/coding-scheme/external/iso4217">USD</currency>
+      <amount>5000000.00</amount>
+    </amount>
+    <comment>Test allocation for FpML sample messages.</comment>
+    <originalPartyReference href="US1L142580" />
+    <allocatedPartyReference href="KY1L151440" />
+  </allocation>
+  <allocation id="A_002">
+    <partyReference href="US1L142580" />
+    <tradeId tradeIdScheme="http://www.pimco.com/fpml/coding-scheme/internal/allocation-id">002</tradeId>
+    <loanTradeReference href="TI_BBPLC_T_001" />
+    <amount>
+      <currency currencyScheme="http://www.fpml.org/coding-scheme/external/iso4217">USD</currency>
+      <amount>5000000.00</amount>
+    </amount>
+    <comment>Test allocation for FpML sample messages.</comment>
+    <originalPartyReference href="US1L142580" />
+    <allocatedPartyReference href="KY0M003Z48" />
+  </allocation>
+  <tradeIdentifier id="TI_BBPLC_T_001">
+    <partyReference href="GB1L104502" />
+    <tradeId tradeIdScheme="http://www.barclays.com/fpml/coding-scheme/internal/trade-id">BBPLC_T_001</tradeId>
+  </tradeIdentifier>
+  <facilityIdentifier id="CUSIP1003">
+    <partyReference href="GB1L104502" />
+    <instrumentId instrumentIdScheme="http://www.fpml.org/coding-scheme/external/instrument-id-CUSIP">CUSIP1003</instrumentId>
+    <description>Term Loan A</description>
+  </facilityIdentifier>
+  <party id="GB1L104502">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">GB1L104502</partyId>
+  </party>
+  <party id="US1L142580">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US1L142580</partyId>
+  </party>
+  <party id="KY1L151440">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">KY1L151440</partyId>
+  </party>
+  <party id="KY0M003Z48">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">KY0M003Z48</partyId>
+  </party>
+</loanAllocationNotification>
+

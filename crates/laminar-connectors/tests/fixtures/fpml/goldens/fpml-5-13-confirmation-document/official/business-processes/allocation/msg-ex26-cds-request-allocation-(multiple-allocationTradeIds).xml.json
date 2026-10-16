@@ -1,0 +1,135 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "value": "bgcf22j"
+          }
+        ],
+        "account_name": "Barclays Global Investors 2",
+        "id": "ACC1"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.party2.com/bondifre",
+            "value": "5462346"
+          }
+        ],
+        "account_name": "LDF Main Fund",
+        "id": "ACC0"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "cvgh44h"
+          }
+        ],
+        "account_name": "CALPERS A/C 1",
+        "id": "ACC2"
+      },
+      {
+        "account_ids": [
+          {
+            "value": "cvgh45h"
+          }
+        ],
+        "account_name": "CALPERS Account 23",
+        "id": "ACC3"
+      }
+    ],
+    "actual_build": 7,
+    "allocations": [
+      {
+        "account_href": "ACC2",
+        "allocated_fraction": "0.400000000000000000",
+        "allocation_trade_identifiers": [
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "30001"
+            ]
+          },
+          {
+            "issuer": "1031234567",
+            "trade_ids": [
+              "712345678901234567890123456789012"
+            ]
+          }
+        ],
+        "party_href": "party3"
+      },
+      {
+        "account_href": "ACC3",
+        "allocated_fraction": "0.600000000000000000",
+        "allocation_trade_identifiers": [
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "30002"
+            ]
+          }
+        ],
+        "party_href": "party3"
+      }
+    ],
+    "block_trade_identifier": {
+      "party_href": "party2",
+      "trade_ids": [
+        "10000"
+      ]
+    },
+    "correlation_id": "18671867",
+    "correlation_id_scheme": "http://www.party2.com/correlation-id",
+    "creation_time_utc": "2002-12-03T09:57:00Z",
+    "document_bytes": 5517,
+    "document_root": "requestAllocation",
+    "document_sha256": "32954328efbcab864d534e61743f82d8e33113634f435e700f272b0260fab952",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-12-03T09:57:00",
+        "offset_minutes": 0,
+        "utc": "2002-12-03T09:57:00Z"
+      },
+      "message_id": "123453212",
+      "message_id_scheme": "http://www.party2.com/message-id",
+      "sent_by": "PARTY2US33"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "BGIUS42"
+          }
+        ],
+        "party_name": "Barclays Global Investors"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300Q4B2OQW6FDBA48"
+          }
+        ],
+        "party_name": "Party 2 Global Risk Management"
+      },
+      {
+        "id": "party3",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "CALPERS"
+          }
+        ],
+        "party_name": "California Public Employees' Retirement System"
+      }
+    ],
+    "sequence_number": 1
+  }
+]

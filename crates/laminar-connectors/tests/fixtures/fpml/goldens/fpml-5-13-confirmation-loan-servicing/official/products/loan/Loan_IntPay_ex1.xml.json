@@ -1,0 +1,96 @@
+[
+  {
+    "context": "loanContractNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "loanContractNotification",
+    "document_sha256": "78f09c3d776cbd95cf5c7c322069b5e5398b63d4d78fa0abd8a6848f11319129",
+    "event": {
+      "amount": {
+        "amount": "141469.780000000000000000",
+        "currency": "USD",
+        "share_amount": "70734.890000000000000000"
+      },
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "61724",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "calculation_method": "ContractPositionThruPeriod",
+      "effective_date": "2014-10-31",
+      "end_date": "2014-10-30",
+      "loan_contract_hrefs": [
+        "CONT123"
+      ],
+      "start_date": "2014-09-30"
+    },
+    "event_type": "interestPayment",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "541772",
+    "notice_date": "2014-11-12",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanContractNotification/interestPayment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  }
+]

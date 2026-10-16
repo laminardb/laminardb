@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a minimal verificationStatusNotification document, written
+     because the FpML 5.13 corpus has no example of this root. -->
+<verificationStatusNotification xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-verificationStatusNotification</messageId>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYB</sentBy>
+    <sendTo messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sendTo>
+    <creationTimestamp>2026-07-01T09:47:00+02:00</creationTimestamp>
+  </header>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">CORR-verificationStatusNotification</correlationId>
+  <sequenceNumber>1</sequenceNumber>
+  <status verificationStatusScheme="http://www.fpml.org/coding-scheme/verification-status">Verified</status>
+  <partyTradeIdentifier>
+    <partyReference href="party1" />
+    <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">TRD-1001</tradeId>
+  </partyTradeIdentifier>
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+  </party>
+</verificationStatusNotification>

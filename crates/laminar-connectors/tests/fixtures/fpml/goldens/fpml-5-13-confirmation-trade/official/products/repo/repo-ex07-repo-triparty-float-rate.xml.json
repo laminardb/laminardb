@@ -1,0 +1,76 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "a5bcf34ce0aabaeef5e8236b0509a9d92552d71b59397435a0a6a384f78ee4f6",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "PartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "PartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      },
+      {
+        "id": "PartyC",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "TriParty Agent"
+          }
+        ]
+      }
+    ],
+    "product_type": "repo",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "PartyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partya.com",
+              "value": "12345678"
+            }
+          ]
+        },
+        {
+          "party_href": "PartyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.partyb.com",
+              "value": "8745632"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2012-08-05"
+    },
+    "trade_ordinal": 0
+  }
+]

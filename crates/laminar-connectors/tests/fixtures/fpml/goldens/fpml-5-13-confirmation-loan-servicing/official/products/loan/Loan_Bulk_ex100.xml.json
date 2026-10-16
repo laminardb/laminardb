@@ -1,0 +1,204 @@
+[
+  {
+    "context": "loanBulkServicingNotification",
+    "creation_time_utc": "2017-09-30T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2017-09-30T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2017-09-30T09:30:47Z"
+    },
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "03cf0cc3e06b4e4e6404194561ae3c2cb1cd04526247f00bee3544074963f9ed",
+    "event": {
+      "accrual_type_id": "Utilization",
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "100000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "5000.000000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "100000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "comment": "Accruing Fee Payment",
+        "event_identifiers": [
+          {
+            "event_id": "ACFP1",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "effective_date": "2017-06-30",
+      "end_date": "2017-09-30",
+      "facility_href": "TermLoanB",
+      "start_date": "2017-06-30"
+    },
+    "event_type": "accruingFeePayment",
+    "facility_identifiers": [
+      {
+        "description": "USD 1BN Term Loan B",
+        "id": "TermLoanB",
+        "instrument_ids": [
+          "123456ABC"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SentProfileMessageID1",
+    "notice_date": "2017-09-30",
+    "parties": [
+      {
+        "country": "US",
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 2,
+    "row_locator": "/loanBulkServicingNotification/accruingFeePayment",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  },
+  {
+    "context": "loanBulkServicingNotification",
+    "creation_time_utc": "2017-09-30T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2017-09-30T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2017-09-30T09:30:47Z"
+    },
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "03cf0cc3e06b4e4e6404194561ae3c2cb1cd04526247f00bee3544074963f9ed",
+    "event": {
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "50000.000000000000000000",
+        "currency": "USD",
+        "share_amount": "2500.000000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "2500.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "comment": "Interest Payment",
+        "event_identifiers": [
+          {
+            "event_id": "IP1",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "calculation_method": "ContractPositionThruPeriod",
+      "effective_date": "2017-09-30",
+      "end_date": "2017-09-30",
+      "loan_contract_hrefs": [
+        "LoanContract1"
+      ],
+      "start_date": "2017-06-30"
+    },
+    "event_type": "interestPayment",
+    "facility_identifiers": [
+      {
+        "description": "USD 1BN Term Loan B",
+        "id": "TermLoanB",
+        "instrument_ids": [
+          "123456ABC"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "SentProfileMessageID1",
+    "notice_date": "2017-09-30",
+    "parties": [
+      {
+        "country": "US",
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US5L567878"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "country": "US",
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/party-id-MEI-1-0",
+            "value": "US3B789454"
+          }
+        ]
+      }
+    ],
+    "row_count": 2,
+    "row_locator": "/loanBulkServicingNotification/interestPayment",
+    "row_ordinal": 1,
+    "sent_by": "US2A432121"
+  }
+]

@@ -1,0 +1,60 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "OTCCallorPutSpread45678",
+    "correlation_id_scheme": "http://www.drkw.com/conversationId/OTC",
+    "creation_time_utc": "2002-08-01T08:57:00Z",
+    "document_bytes": 5067,
+    "document_root": "requestConfirmation",
+    "document_sha256": "359984f171a5a5add296b1a094268e23208f263b7fe7169d41d7088afe7d8303",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2002-08-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2002-08-01T08:57:00Z"
+      },
+      "message_id": "OTCCallorPutSpread456a789b",
+      "message_id_scheme": "http://www.drkw.com/messageId/OTC",
+      "sent_by": "drkw",
+      "sent_by_scheme": "http://www.MsgParty.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ],
+        "product_type": "equityOptionTransactionSupplement",
+        "trade_date": "2002-07-13"
+      }
+    ]
+  }
+]

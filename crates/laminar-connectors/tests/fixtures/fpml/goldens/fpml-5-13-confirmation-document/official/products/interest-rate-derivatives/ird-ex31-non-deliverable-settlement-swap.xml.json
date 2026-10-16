@@ -1,0 +1,70 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "IRS987",
+    "correlation_id_scheme": "http://www.partyA.com/conversationId/OTC",
+    "creation_time_utc": "2006-08-01T08:57:00Z",
+    "document_bytes": 11472,
+    "document_root": "requestConfirmation",
+    "document_sha256": "7a926581894dd03e1af7dadc8e60fe4932f48b84e93fa8e32afdd491edf01960",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2006-08-01T08:57:00",
+        "offset_minutes": 0,
+        "utc": "2006-08-01T08:57:00Z"
+      },
+      "message_id": "IRS456a789b",
+      "message_id_scheme": "http://www.partyA.com/messageId/OTC",
+      "send_to": [
+        "barclays"
+      ],
+      "sent_by": "partyA",
+      "sent_by_scheme": "http://www.partyA.com/partyId"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "76095221801"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "00680112001"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "E2000098N10184"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ],
+        "product_type": "swap",
+        "trade_date": "1994-12-12"
+      }
+    ]
+  }
+]

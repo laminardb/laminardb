@@ -1,0 +1,197 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "a2acfbded441c638d4c114c063653f9cdf2153cef368f3482cfbc5a9d0e84f28",
+    "equity_swap_transaction_supplement": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "EUR-EURIBOR-Reuters",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 1
+              }
+            },
+            "interest_amount": {
+              "currency_href": "equityPaymentCurrency",
+              "reference_amount": "StandardISDA"
+            },
+            "leg": {
+              "id": "interestLeg",
+              "payer_party_href": "party1",
+              "receiver_party_href": "party2"
+            },
+            "notional": {
+              "relative_notional_amount_href": "equityNotionalAmount"
+            }
+          }
+        ],
+        "leg_types": [
+          "interestLeg",
+          "returnLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency": "EUR",
+              "reference_amount": "StandardISDA"
+            },
+            "final_price": {
+              "determination_method": "HedgeExecution",
+              "valuation_date": {
+                "date_adjustments": {
+                  "business_day_convention": "NotApplicable"
+                },
+                "unadjusted_date": "2009-06-02"
+              }
+            },
+            "initial_price": {
+              "net_price": "10.000000000000000000",
+              "net_price_currency": "EUR"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2008-06-02"
+                }
+              },
+              "payer_party_href": "party2",
+              "receiver_party_href": "party1",
+              "termination_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NotApplicable"
+                  },
+                  "unadjusted_date": "2008-06-04"
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "300000.000000000000000000",
+                "currency": "EUR",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Standard",
+            "notional_reset": true,
+            "payment_date_final": {
+              "relative_date": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "finalValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "payment_dates_interim": {
+              "relative_dates": {
+                "business_centers": [
+                  "EUTA"
+                ],
+                "business_day_convention": "FOLLOWING",
+                "date_relative_to_href": "interimValuationDate",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 2
+              }
+            },
+            "return_type": "Price",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "equity",
+                "description": "PHILIPS BUY BACK ORD",
+                "exchange_id": "XAMS",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.abc.com/instrument-id-Reuters-RIC-1-0",
+                    "value": "PHGe.AS"
+                  },
+                  {
+                    "scheme": "http://www.abc.com/instrument-id-ISIN-1-0",
+                    "value": "NL0000009322"
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "product": {},
+      "provisions": {}
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC1"
+          }
+        ],
+        "party_name": "SWL"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "ABC6"
+          }
+        ],
+        "party_name": "RST"
+      }
+    ],
+    "product_type": "equitySwapTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "ABC1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id",
+              "value": "124897"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "ABC6"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id",
+              "value": "124897"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2008-06-02"
+    },
+    "trade_ordinal": 0
+  }
+]

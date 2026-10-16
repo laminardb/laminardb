@@ -1,0 +1,2787 @@
+# Official FpML 5.13 REC-2 confirmation-view examples, as linked from
+# https://www.fpml.org/spec/fpml-5-13-8-rec-2/html/confirmation/fpml-5-13-examples.html
+# (retrieved 2026-10-15). `xsd` is the verdict of xmllint (libxml2 2.12.10) against the pinned
+# closure; `errata` names the FpML business rule the published errata says the file fails.
+# `unavailable` entries are linked by the index but were not served (HTTP 404).
+
+[[example]]
+path = "business-processes/allocation/msg-ex20-cds-request-allocation.xml"
+sha256 = "9db59e10636ef145795f027a69ed32113537f44329b4daa7f789a68aff789bf9"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/allocation/msg-ex24-cds-request-allocation-retracted.xml"
+sha256 = "c6d1fb0d977bec893a7c4a73b0074236c8b2887a1e6278cae49608399084aaf2"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/allocation/msg-ex26-cds-request-allocation-(multiple-allocationTradeIds).xml"
+sha256 = "32954328efbcab864d534e61743f82d8e33113634f435e700f272b0260fab952"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex01-clearing-status.xml"
+sha256 = "00fd0c8cd164f97e74a6c4ebebca8e0258989549bc684836f7c3ae0e20240c1c"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex02-request-clearing-declear.xml"
+sha256 = "18bb5ad07b1985a0d6778d91fc7f1394983c7e4ed761e36d9e073852c6aa6593"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex03-clearingConfirmed-declear-sample1.xml"
+sha256 = "9df22dc58b2609cd22db466d04370dc316342b07fa7dacbca71fa5b0fcee7a41"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex04-clearingConfirmed-declear-sample2.xml"
+sha256 = "acfb9a499d89b85bad2bbdeb1e647df80b4f8b7fb508008f22c70bf3a5eda262"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex05-clearingConfirmed-trade-terminated-due-to-netting.xml"
+sha256 = "a8fe8c6dc371b9ff7e9190198a65b8e3c57bb99b0f3409f85d6c51db14afd5c5"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex06-clearingConfirmed-trade-created-due-to-netting.xml"
+sha256 = "8c55e07e4ea08b04be0077dd0c44ba318ce2fcf4936ba7140a35b795b823355e"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex07-clearingRequested-from-sef.xml"
+sha256 = "e8e48adabe87f25194fac8f277f131ee7000bec45c1340759d26253fe9d43bdb"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex08-clearingStatus-to-sef.xml"
+sha256 = "f62fab8521d16cfd61eed4799dbdbb254daad4e894ebcc7f850fb28359d5940c"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex09-clearingStatus-to-broker.xml"
+sha256 = "6d6bf6012676a8e29cc88788e6466e573b8cd30235dd5427778932fa472627e5"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml"
+sha256 = "6565fa1dfef098d60a56beef19ee59a6b317d8c0f7a8d1e08e218feeeca6a5ed"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex100-request-clearing-eligibility.xml"
+sha256 = "405f8c2dd33c3aa249b13f17c0bad092a6bb3bfd18c3ced8d744dbc08c8af413"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex101-clearing-eligiblity.xml"
+sha256 = "d18a7dd543e6a2c47199beee2618ab985492525b78388fb91507d5bc28a790af"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex102-clearingConfirmed-credit-event-single-name.xml"
+sha256 = "5af153d2cc3d3b13795c45a4403989c98ffe7cd1003d2002b01220786b1ca12c"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex103-clearingConfirmed-credit-event-index.xml"
+sha256 = "b233f21e293f2a52c1d322e5cbc0757cf9f9ffac06e32c02832a59532b7b9b10"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex11-clearingConfirmed-trade-created-due-to-netting-portfolio-msg1.xml"
+sha256 = "94cb97a6680dda1d945c2ba1986039c17132f38b536480544df8ce1357ca999f"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex12-clearingConfirmed-trade-created-due-to-netting-portfolio-msg1.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/clearing/msg-ex20-clearingRequested-from-sef-with-approved-allocations.xml"
+sha256 = "920c50eafd19bedd5e074624ef80554385935322a33dadec53047ce218c12eda"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex50-request-clearing-trade-package.xml"
+sha256 = "49990bf910815bf03629dc7e16ee78202fa07480441381c8321e0fe6fd7deb39"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/clearing/msg-ex51-clearing-confirmed-to-sef-trade-package.xml"
+sha256 = "926c765b726410838d61336fa6ecc480c9b25d8b7f709569083046f6e1b2b72f"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex05-eqd-cash-share-request-confirmation.xml"
+sha256 = "359984f171a5a5add296b1a094268e23208f263b7fe7169d41d7088afe7d8303"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex06-eqd-index-option-request-confirmation.xml"
+sha256 = "40e57998cb7bb81644882e752dbe158f0f75e995b9fe8016a98e359b37044dc1"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex07-eqd-physical-share-request-confirmation.xml"
+sha256 = "d250a6a5c59c4a15f909dbb601c489ef56dc9e73c88bb9e9f17d1d0bbcdbf168"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex12-cd-request-increase-confirmation.xml"
+sha256 = "515e2765abd24e947ff9ac784f13bd99da94d5d2a9a55fc5cb610f5607a6c2a8"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex13-cd-request-full-termination-confirmation.xml"
+sha256 = "0551d8526c02db2981c77ec50bd657790199d7d7fb309a718570c5a23355a22e"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex14-cd-request-partial-termination-confirmation.xml"
+sha256 = "1affdb3c0364d3b78b1d8818c0c7e325b9654de28391f4044be33187e5a1f35e"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex15-cd-request-amendment-confirmation.xml"
+sha256 = "0be168c0586aa12ad8b680dab0d7ed5b6ba294081169a4c45dbc583f944878d8"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex17-two-sided-swap-roles-accounts.xml"
+sha256 = "67dae2cbdfdddce95877aa40aa4cc50d6dff7f4bc2d017d28ac922bc24d5a737"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex18-cds-2003-short-us-corp-broker-role.xml"
+sha256 = "a040b8e2123bc6b1b12bea60df264fc2eaacd0fd7e91f7d24999dca2b2f1aa7a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/confirmation/msg-ex26-cds-alleged-novation.xml"
+sha256 = "e7eae9b0b9172f3723d906ee755b50fe23e0f99f0001e1d3c8dace5b1b419091"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex04-eqd-option-increase.xml"
+sha256 = "d021fde049cbf1d76a5a3d28b36ae40b0dbd09d03bcd6bf81b60b61d38fac6a1"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex08-eqd-option-partial-termination.xml"
+sha256 = "a41db09378452719dc856813195725b91bbb15490dbc5b110da55b795e562ccf"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex09-eqd-option-termination.xml"
+sha256 = "90f41aaef6a25fde3e0647ddbc8b0ac712a096d1f96ce4fc3526acb221e7958a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex10-eqd-swap-partial-termination.xml"
+sha256 = "af4dc9a3aed54a637d7fc6df8123137ae6333b2c2de2c87656be955d7fc7b5eb"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex100-request-consent-clearing-with-quote.xml"
+sha256 = "211cad86581fa21452e0ae4ecb95a17f4345f0aa009ad99a2745e9643637392a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex11-eqd-swap-full-termination.xml"
+sha256 = "1cd4f029ebcd0f32f31a5cb4128d14697b0fadfda5473fa82aa26b5285852ff1"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex200-grant-consent.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/consent/msg-ex200-request-consent-clearing.xml"
+sha256 = "5da5b3d6211be1a359af68fbabc320b461b7b700f006b9556bad144fad9f3c94"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex202-consent-refused.xml"
+sha256 = "30aab55f9069e4287d02d0636f6eafdb9ac06dfaa8695fd719c6a8ffde6a8df0"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex203-consent-refused-with-credit-limit-information.xml"
+sha256 = "c9e39a5c59446c1e2afdd30100124b28364c497fc85d16ff96571821ebe4152e"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex27-request-consent-novation.xml"
+sha256 = "ab4263aaeaabf10a2866f9fef777ce9330e9b4dc7632437716c89196c08873fe"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex300-request-consent-clearing-portfolio-msg1.xml"
+sha256 = "72bb767386fea477e9e2c347c8fa61511af8668ce384c845993b5ae87b88d0d2"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex301-request-consent-clearing-portfolio-msg2.xml"
+sha256 = "98a048b5034837b10c6d5374955fe55601d3d38705796921c442a59d8316eb8a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex302-grant-consent-to-portfolio.xml"
+sha256 = "2687e2f4732e1a0477636ef9fb52e9d0bd4f367b9a4ce97bdeb6855672929eaf"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex303-grant-consent-to-constituent-of-portfolio.xml"
+sha256 = "944c0baaa30c58812c5b7027321df845318bfcfc8514c61e4759d15cecd991c2"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex400-request-approval-fra.xml"
+sha256 = "2de4d80c122690fad777d63aa1012bc0455bc3053cde4a39b7117462abd3bdf8"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/consent/msg-ex401-approval-status-notification.xml"
+sha256 = "32a9f3afcf7ac3dfe8478cd1c15fce466889b4ab18dd2ce30dab3d6794151a13"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex51-execution-advice-trade-initiation-C01-00.xml"
+sha256 = "4d0257485913d330d160eada7458fda8280ce6115eb8afa754b347d21dedd681"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex52-execution-advice-trade-partial-novation-C02-00.xml"
+sha256 = "dee9871b3fd268fa0cb4a004581a1dad2d30acc2d9816597dac568cdcf9ce3ff"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex53-execution-advice-trade-partial-novation-correction-C02-10.xml"
+sha256 = "23a2a8a3ce158794566fb5b7ee8f9924de6cea98faac6e64ebf5b9299aa47db3"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex54-execution-advice-trade-partial-termination-C11-00.xml"
+sha256 = "016a6a6ce1335e45583f3be129d13031848a81d3558ad2dd6343c537c1cb871b"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex55-execution-advice-trade-partial-termination-cancellation-C11-10.xml"
+sha256 = "f42effd9a574f557dfa34824cdf1232121df40c930fa16707034c9476d70f0ac"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex56-execution-advice-trade-full-termination-C12-00.xml"
+sha256 = "6b382f24af3e4f03ce550dc14b4f011470c1e39eae494644c7e902ff1b66c45e"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex57-execution-advice-trade-full-termination_correction-C12-20.xml"
+sha256 = "84955536cab9564151c0d779b453aad2c1366d857c4119328f924c2e30928122"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex58-execution-advice-trade-initiation-F01-00.xml"
+sha256 = "bfaed848879c8932057f9d86ab7babcc2cb0507d88fdedb1fb2ae8674305a007"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex60-execution-advice-trade-amendment-correction-F02-10.xml"
+sha256 = "50a86e1492d243071b6c95f74ca4f6dc0d9647c128d523d88bfd09608a7f7fe4"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex61-execution-advice-trade-change-F03-00.xml"
+sha256 = "6d86b11be355040280bb4705f595093fc16784188e53b9f96484b8466007dac1"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex62-execution-advice-trade-change-correction-F03-10.xml"
+sha256 = "a3db38257d87c2a6a25daf8bf57ab109252b6001a66d2f9d5ffad7e695aadd13"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex63-execution-advice-trade-initiation.xml"
+sha256 = "041f0b140d6190f044d35ea03fe79f92ae02e6f5503a2a846b443788d5950107"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex64-execution-advice-trade-initiation-correction.xml"
+sha256 = "d757f1f5850e65460b846f7b8b9c8de17785c404960ac416932dbd597f109564"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex65-execution-advice-trade-partial-termination.xml"
+sha256 = "a979cc7c74d6be75363e54000afd2e2bffaa2c2daf97b02ca351d739d1d15889"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex66-execution-advice-trade-full-termination.xml"
+sha256 = "911149ba08cb295c11082367f4145fe59a12a7e0e8a4d52acce99d651de25cb8"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex67-execution-advice-trade-full-termination-correction.xml"
+sha256 = "9de2951ebd090fa1c60911931c1894cf1d94275b2013fb16c15afa83d7755ed2"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex68-execution-advice-warrant.xml"
+sha256 = "9c25c5b10642a17bd9eb7c5c55d663901db522a799d67f693009fd826ff94588"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-advice/msg-ex69-execution-advice-commodity-swap-classification-new-trade-esma-emir-refit.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/execution-notification/msg-ex19-cds-execution-allocations.xml"
+sha256 = "87d1d7a2acbefc3906c8ed08df7ed6576e900d34a5e02174985820b8b82edff2"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/execution-notification/msg-ex90-trade-execution-date-time.xml"
+sha256 = "c44f5afc93a0c55f552343329b7d48eeb1aa0cb2d9096c35c154a6bb7534266c"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/msg-ex22-cds-execution-allocations.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/msg-ex23-cds-execution-allocation-amended.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/msg-ex24-package-execution-notification.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/msg-ex25-cds-request-allocation.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/msg-ex59-execution-advice-trade-amendment-F02-00.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/observation/obs_ex01_commc.xml"
+sha256 = "6d9d1ba90d46f60a519fe8217104d924901c57f7e1d58f0874f56a7eb8782cef"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/observation/obs_ex02_irc.xml"
+sha256 = "c9f2455d9f3187a520d8b5ad0e33409cffd9a4a31710e347fcb684166d614f99"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/observation/obs_ex03_drvd_1.xml"
+sha256 = "c4618c85c1ae42b50c8df3eee5891909d523f56e6eb3efc930af8d5f56e55101"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/observation/obs_ex04_drvd_2.xml"
+sha256 = "13de7cbcf5e971fa1b65bd356bc31e97d9f95a97fae1393b31f7a489ccb5588d"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-events/opt-ex1-knock-in.xml"
+sha256 = "1b3cc1729ab7703641219732d7797a6226b95f850e078d06dab78fb9b0dadc25"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-events/opt-ex2-knock-out.xml"
+sha256 = "3dc75a8a4bde9d0fc433a85b04947b58c3193d620c0ecc59c4a3e153d4d6d384"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-events/opt-ex3-noTouch.xml"
+sha256 = "30b4f166cbdb7c5d1152193978afd7810c5c4fb413e118da8d07bb07bd6f2948"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-events/opt-ex4-touch.xml"
+sha256 = "a18cb426b4e8cb44512dd814cbc318a70ffdd942ea5e51a73df934ed49aca03e"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex01-option-expiry-notification.xml"
+sha256 = "a30b5299b021782140a322986c877f1ba469c780b63394c394a7d1983476f28a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex02-request-execution-1-interest-rate-swaption.xml"
+sha256 = "978cad553a72a41603608c1aa472a71951fea76519588028b53bf331be8f0fce"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex02-request-execution-2-do-not-exercise.xml"
+sha256 = "73274c0e7c32ca4bbf774a10b5c82e44a60ce380f6be88af5aad99b1bf0bc565"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex03a-execution-notification-option-exercised-1-cash.xml"
+sha256 = "94db7d56f39bfcf9a29836de8cf7f637380bdc0c89cac194714a080675a58a72"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex03a-execution-notification-option-exercised-2-physical-trade.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex03a-execution-notification-option-exercised-3-physical-security.xml"
+status = "unavailable"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex03b-request-confirmation-physical.xml"
+sha256 = "70e3f0367d2fc7b73a8c6e80ef9534a8d8bea7bc9123095dfae03d9e56c4f5a4"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex04-execution-advice-option-exercised.xml"
+sha256 = "2a1a4320e2b2ee6a00ae72713cb353f1bd14751d95fb7868386c7ff83999755f"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex05-execution-exception.xml"
+sha256 = "77ce93fb813b9804a9ad9def54ec39124605b4fde31abc051039288a1995974d"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex06-maturity-notification-option-expired.xml"
+sha256 = "a35d896d846f1afc8c4a7c40ddcf866e18d0c607e44db58a35af2bb7e3c1853a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex07-maturity-notification-trade-matured.xml"
+sha256 = "094d689d46fdb6cb031784ae850f34148068972ae48ed675a369defad49f014b"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex08-option-expiry-notification-with-original-trade.xml"
+sha256 = "ec41f5fc03211cbf16c8f42dc6092d6bb4892ccd45655f6815eb92640c859f32"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex130-request-execution-option-exercise-straddle.xml"
+sha256 = "457ec3ce2edf523c091f412e1486ebff9e1590a0c4451e159a957c2e98c93566"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-ex131-execution-notification-option-exercised-straddle.xml"
+sha256 = "c00aa08f0bf5b44ae095687151c1a8f91ccf5eee896bf80cf8a2cd5cc04fe00a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exA-confirm-otc-equity-option.xml"
+sha256 = "9e154883a7afd4e898f2433a56799ba1dd46508306c3fbccb94b6c9baf6fca35"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exB-expiring-otc-equity-option.xml"
+sha256 = "0991a6b6cbbd14da060cdaf22cc2d7b4d3ffe19cd2a3979aba831a3a2981c835"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exC-request-execution-exercise-otc-equity-option.xml"
+sha256 = "a738a53fbed7b9ccd5da8b4cd2d3d87a50db3835eb637790eb1c4d5d36bd6893"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exD-exercise-notification-otc-equity-option.xml"
+sha256 = "69dc8b35fb50efa43cc840ea0fe6a2e81c48081120a43b2a6d534c0829f85beb"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exM-confirm-bond-option.xml"
+sha256 = "5ca6209520ab44163f9d3e89dd41dd8fd84f5981e1d30134873329e88f27de64"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exN-expiring-otc-bond-option.xml"
+sha256 = "068dc34090ce456a2be2dbc1068c3b25fd461b7d4a30a5aab29ef4fe6101ce8a"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exO-request-exercise-otc-bond-option.xml"
+sha256 = "ffdd079c66d8b4e25a9d500794bf934fee419b838639cfe04175300f1639ee55"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exP-exercise-notification-new-trade-for-otc-bond-option.xml"
+sha256 = "f0f1793ff8a95308a2f9e7c4c4e7d636565252d4d345796afbe20c7592a88be2"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exX-exercise-notification-fx-option.xml"
+sha256 = "f74185a934bc7fb308768699d5c88bd84e46144e8f20b73ceaed09bcd11e576b"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/option-exercise-expiry/msg-exY-exercise-notification-ir-swaption.xml"
+sha256 = "39e551d9286d3cf05aa83a39003959a894fb8ef0ac24f6c3c8acfd7c450b6dbc"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/reset/reset_ex01.xml"
+sha256 = "3ac24d323216a089b3bf42d9e4222f66b7aeb7c4939bfd39b945ea95e6a6ede6"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/reset/reset_ex02_reset_with_observations.xml"
+sha256 = "a663c041fe5ad3ba5aae2da4d2c3ffe2fd3eff52417ac0ad9d0e8f7fb46f36d3"
+status = "xsd-valid"
+
+[[example]]
+path = "business-processes/trade-info-update/trade-info-ex01-request-info-update.xml"
+sha256 = "70047306a7a436019d3d3b09c0ec48d4c41cb6fe44c2814256a73a50da3c784a"
+status = "xsd-valid"
+
+[[example]]
+path = "packages/pkg-ex01-pkge-execution-notification.xml"
+status = "unavailable"
+
+[[example]]
+path = "packages/pkg-ex02-swap-spread-single-trade-execution-notification.xml"
+status = "unavailable"
+
+[[example]]
+path = "packages/pkg-ex55-execution-notification.xml"
+status = "unavailable"
+
+[[example]]
+path = "packages/pkg-ex60-request-clearing.xml"
+status = "unavailable"
+
+[[example]]
+path = "packages/pkg-ex61-clearing-confirmed.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/bond-options/bond-option.xml"
+sha256 = "0d8353810032b99db9655b5506aa21816cff74567dd33f2043dc9561213def1f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/bond-options/cb-option-2.xml"
+sha256 = "ee5f3d6f2086df45828b0a55e3706e0859586b1dbaf39abdebccf24b05488fc0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/bond-options/cb-option-ois.xml"
+sha256 = "1805ffb6d82494f5bbe28ecd091eb7c159e0d960e489632bd6f9edd23e36d110"
+status = "xsd-valid"
+
+[[example]]
+path = "products/bond-options/cb-option.xml"
+sha256 = "8e1eda64c81846b6c61bf0b1948596bf774631db8f98d7ca764531c6a5261ebc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex1-gas-swap-daily-delivery-prices-last.xml"
+sha256 = "6d0b038e77b6fbd327598b312a8bc385be245906828e5c7099def013041b30de"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex10-physical-oil-pipeline-crude-wti-floating-price.xml"
+sha256 = "272cfd6f3d1929bebfbe65d9ec090dd24f594eb2ed1891bec045d8d69bad1573"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex11-physical-oil-pipeline-heating-oil-fixed-price.xml"
+sha256 = "92ceda9eb3f62b0779ad26e8102730d61a44f4d4059dae03a409355cada733d5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex12-physical-gas-europe-zbt-fixed-price.xml"
+sha256 = "b55eb71bd62931580b10e6cb1990cede01b81ca14754bcab585728b870064729"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex13-physical-gas-us-tw-west-texas-pool-floating-price-4-days.xml"
+sha256 = "78042e1b807d9e7519d6b1082e7616a744c18cd71c789992b058dcb0a3c9fc83"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex14-physical-gas-europe-ttf-fixed-price.xml"
+sha256 = "3c6e9a6042e50a0db9073f478c7f1eb8e0f1a087c3896cdb0faecbdac790deab"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex15-physical-oil-pipeline-crude-wcs-fixed-price.xml"
+sha256 = "191467c3bf3e172b939ea143cee893f329d5e4529175097ac39f0e524d36af22"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex16-physical-power-us-eei-floating-price.xml"
+sha256 = "36c4f62198795483da0f70a730020344c5282df5beaac1a3060670bc9318cab2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex17-physical-power-uk-gtma-fixed-price.xml"
+sha256 = "c3188d5ae6bda66237ccd08d8655aa2af3dedf5f2702b2d2efc94356e4cbf27a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex18-physical-power-us-eei-fixed-price-shaped-volume.xml"
+sha256 = "2da652d9eb5412ae95299e20493644924358df51c43624f73e08bbddeca0d4f9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex19-physical-bullion-forward.xml"
+sha256 = "58c8259105eaece173065ed27b3f76e37e19cad911af195e1a254e866b085961"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex2-gas-swap-prices-first-day.xml"
+sha256 = "6f8617a069978e9d5fd8d3bacd6e69e796e0d3202e75dc1ef1e56479a066ec1a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex20-physical-coal-us-fixed-price.xml"
+sha256 = "74014b21b984678a0fbeb13d29673e4ea3917d33d3bee4a11dc5ac245d81dd53"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex21-physical-power-us-eei-fixed-price-shaped-volume-and-price.xml"
+sha256 = "b0592d32ff6943556840d7be8eee0e2de8e9b4d9c5ae56fe142c38f639700e3a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex22-physical-gas-option-multiple-expiration.xml"
+sha256 = "ed2583a724136cf411a7ef3102923778a859adae444ba550c17dd33a05e3e709"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex23-physical-power-option-daily-expiration-efet.xml"
+sha256 = "1f1f11caf48a16a8c6801be140780b241737e658b253317596ca17a025cee656"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex24-weather-index-swap.xml"
+sha256 = "609517700fdd4afbbb7abfafaf094b2fa15fd77f947f5c06b4447677e7660a21"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex25-physical-bullion-forward-average-price.xml"
+sha256 = "3566020d4ff5c5ff6c6c884dc3fbaafdc24739f73ee2b0096d7fb5c7555fa88f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex26-physical-metal-forward.xml"
+sha256 = "6c5ee80c4b4afd071e37afe97d2155949bf0b892c147b8b805f4d1cc4fcbdde3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex27-wti-put-option-asian-listedoption-date.xml"
+sha256 = "a5bf95b7d2244a2288622e1e2470cfa66372426583a104f7add4877017b57e46"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex28-gas-swap-daily-delivery-prices-option-last.xml"
+sha256 = "7c887c50688f42bc4ee6e474bac526566967b10c973db2a8c6e9396467f25580"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex29-physical-eu-emissions-option.xml"
+sha256 = "fa6d205c4a7876b937724c260f1ae94ac5113d581c7d049a03e035104b0dc358"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex3-gas-swap-prices-last-three-days.xml"
+sha256 = "e827c8669aaa5625308351c295a87b10e1076724dae60f218b7263460710acae"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex30-physical-eu-emissions-forward.xml"
+sha256 = "34b609883bdd7315eeb67f4e4273c7bce9e8878cb76e223cec30d79e2b07db4e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex31-physical-us-emissions-option.xml"
+sha256 = "9c4051e38f9436a51edd31385b46ff7c87239ff7720d0e4bb005bb668416ffb2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex32-CPD-weather-index-option.xml"
+sha256 = "5d7c9727be1fd0be7d6d84c68baad05ff69fda7fd60b36446177af76402f2203"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex33-physical-bullion-forward-average-price.xml"
+sha256 = "cfd1e28aca793580495a17342c08130c42aa2a2b89b032f72d5b6578fbfb0cd5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex34-gas-put-option-european-floating-strike.xml"
+sha256 = "1a634c5f73f244be8784b9693c63e533f403fa5a1509eb532d9dd1acd63f2f5f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex35-call-option-gas-power-heat-rate-daily.xml"
+sha256 = "0e31c26d1459f79fedf561307be605f881a2ca544fc0af215ae2bcf4672ade0a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex36-gas-call-option-european-spread-negative-premium-floating-strike.xml"
+sha256 = "b6c7a5ec44b0a6a49e94df9ce11bcb0ddcb68cb973e39c217f318028b28532f0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex37-gold-forward-offered-rate.xml"
+sha256 = "40983ac436013b28d7a235fdceb2e8716498877b90026edc35771944335f2168"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex39-basket-option-confirmation.xml"
+sha256 = "043b58418943fc32e42c6ffd21e05817cf68e1f66d4539f385ccf5f17887b3b9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex4-electricity-swap-hourly-off-peak.xml"
+sha256 = "15b03766ad4a42d3c2190a5d94de4393aa1f84a54ea3bf95464fad7d3269fc48"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex40-gas-digital-option-storage-volume-trigger.xml"
+sha256 = "55f4405480e3b5a6f143190f65d33b9cc4bf364cbfe69def3d3acb64f5a5813d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex41-oil-asian-barrier-option-strip.xml"
+sha256 = "b25be94c845fe4015bf9e9123b82355535fdeb2296660660577ebdc6b837096f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex42-index-return-swap-reinvestment-feature.xml"
+sha256 = "261e11e60f34bd76cefae2a505d8ee9f832faedaaa10acf2214b18c08fa1ea6a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex43-WTI-variance-swap.xml"
+sha256 = "b64b895e45fc5d2c2e284f3c570acd9a0bf659921a9f0a3908e060593c91f91c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex44-index-return-swap-fixed-notional.xml"
+sha256 = "332f674e25469cc4e861c6873dbaffce122d14584955ea40691237bc677bbb7f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex45-ag-variance-swap.xml"
+sha256 = "3e83c189845e4181da831cad22553d2299d0dec8411ffcee5d0adae445d5a570"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex46-simple-financial-put-option.xml"
+sha256 = "ea7f9ab5bc07849da274ac2f301bc43d380dc5fab1f848c9426eeac99b6a14c9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex47-physical-eu-emissions-option-pred-clearing.xml"
+sha256 = "70734e4dcee4ebd157c05c5dcc0ccbc3646026bc0ae5633b837f3787dc4c9670"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex48-gold-forward-offered-rate-ois.xml"
+sha256 = "77aa0da5d2524e2054f66c7e088ef54c1d2c97a65b0ee8a42f3c82a185487ebd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex5-gas-v-electricity-spark-spread.xml"
+sha256 = "73f34b2d2d44e1086824128e19ae3ba1639356a26c869cb19297f8338cd8117a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex6-gas-call-option.xml"
+sha256 = "79224f496ff0ed0a5d6742698fb9dfdd860d477b3e925ca3c3242b59859810ee"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex7-gas-put-option.xml"
+sha256 = "5559d2feee4aa496da1723dc2733064d10604874c083062425acc81247df18c6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex8-oil-call-option-strip.xml"
+sha256 = "c41883ead651b6b006864f9838d60d772de717033100bf3efe37aac4193a1b37"
+status = "xsd-valid"
+
+[[example]]
+path = "products/commodity-derivatives/com-ex9-oil-put-option-american.xml"
+sha256 = "986535faacf185733c2bc902b140654982cdc8eb9048303dc7cdd4488ab395be"
+status = "xsd-valid"
+
+[[example]]
+path = "products/correlation-swaps/eqcs-ex01-correlation-swap.xml"
+sha256 = "54ab2cbc26db0cf7e07c3d9acd5965777bd2b8db5323eeb90314d32da37f564f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/correlation-swaps/eqcs-ex02-correlation-swap-confirmation.xml"
+sha256 = "30688254fb2365eccb979c2eb090c89f57a324d402473c9ab8cdcf15016e9311"
+status = "xsd-valid"
+
+[[example]]
+path = "products/correlation-swaps/eqcs-ex03-correlation-swap-confirmation.xml"
+sha256 = "86178282d058c2fb95c7c719539989acf7b0d7cbf3612df090c97d3235813915"
+status = "xsd-valid"
+
+[[example]]
+path = "products/correlation-swaps/eqcs-ex04-correlation-swap-confirmation.xml"
+sha256 = "6b47c69bdfc4f4e79e2b7a17413b2c25ab64299ba0e64cefbf0ae3c76aab53f0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex01-long-asia-corp-fixreg.xml"
+sha256 = "b46b1c4879a03355ba888316808ecec5b3ae0a49ff4427a3d0c8929cbea10841"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex02-2003-short-asia-corp-fixreg.xml"
+sha256 = "98da05c042f46e76c601c1c5becd914a672a17a7da59a86cbc5dded9036d444b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex02-short-asia-corp-fixreg.xml"
+sha256 = "f490f74827abc79c399d3c5dd0a360823774711bd3e7b4a3cabf7cc675dd1c00"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex03-long-aussie-corp-fixreg.xml"
+sha256 = "0f36e5aa4c7f3d568db46abd6317c44f54bf6175d5345d89c3f8f659587eca34"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex04-short-aussie-corp-fixreg.xml"
+sha256 = "1ba230e38031589f28d31d8008ea4d99251ac766e11abfc0290876a391900470"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex05-long-emasia-corp-fixreg.xml"
+sha256 = "9fcf3c45c9360b7617f02bdb90922851557c22f7cf3bf0acc9be99299aa63347"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex06-long-emeur-sov-fixreg.xml"
+sha256 = "08eae04066596490d72d8ab63263d7147da4031ee90b393dc7a41fa2fd47f333"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex07-2003-long-euro-corp-fixreg.xml"
+sha256 = "3fe93e71420e8d99ab6306b030878767b0e3f4416d2b59a3ced10e2190c34836"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex07-long-euro-corp-fixreg.xml"
+sha256 = "beac55b1c0e778aa465d45c78d470b3579040bbc210da73827714833d0d1d153"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex08-2003-short-euro-corp-fixreg.xml"
+sha256 = "7a5778eabbb6105696467b93eff6e2c33948a8abb05bf061e25b04aef0cf51a5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex08-short-euro-corp-fixreg.xml"
+sha256 = "175a551545f9074ed0d4749aa3a6edecdf6751d50d7502d0448953e74a8f6e7e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex09-long-euro-sov-fixreg.xml"
+sha256 = "227412264af39dd787cba92836a3a0fdffe9fd7520ca23ca0afd03ef7eac43fd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex10-2003-long-us-corp-fixreg.xml"
+sha256 = "0e1374078cd13604e51fc34f52f81be43f02863feb0b9698417a95017552c429"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex10-long-us-corp-fixreg.xml"
+sha256 = "c77bd89cda41b55523341c972b3f4b20576a7e3651f9441279496340121ad19e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex11-2003-short-us-corp-fixreg.xml"
+sha256 = "ee0ad836f2f5fb12368155e2c7c2502088b886dd42a7c952c48c10b376c2177a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex11-short-us-corp-fixreg.xml"
+sha256 = "517313141f162d73fce45c919bca502c523fe5de1119de654a286db50c3370fb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex12-long-emasia-sov-fixreg.xml"
+sha256 = "082af222009eeeae8107ec00467c6ca7e123aebeaf60278d2da56e41d5a1d970"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex13-long-asia-sov-fixreg.xml"
+sha256 = "528f993f2482e6f04ce6d056af694e8ac35108c8e384f948f5d31aeda70e86b2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex14-long-emlatin-corp-fixreg.xml"
+sha256 = "4693a49e981fb46c8bb619fb83c39aab1a31a68e795872c1a598518ede4639d2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex15-long-emlatin-sov-fixreg.xml"
+sha256 = "73ed505aa7707a8785d9951ef6220af9a1f2591383090918bdf025eb4eaabeb9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex16-short-us-corp-fixreg-recovery-factor.xml"
+sha256 = "8cc28a39a2a106f572b87a0cde3e2d92804907beecdadd7cedf12887214061cb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex17-short-us-corp-portfolio-compression.xml"
+sha256 = "832c6a6ec5fff897b9182f62f6e65e1339957060a6c5a751bf0df366f965bf59"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex18-standard-north-american-corp.xml"
+sha256 = "0d16e506860420e4ed49899d1aeaa41a160370538299b28e1472274ab901ef21"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-ex19-cdx-index-option-pred-clearing.xml"
+sha256 = "4294cd36e8fbb6a8ae6ac28374688d7766aa4e1ae17064af383792ff86a3f5b9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-indamt-ex01-short-us-corp-fixreg.xml"
+sha256 = "33e96ac0083ad5ec4d182cf3733cb820d36eb0fb06c5be96aeeee33c68d54cd3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-swaption-1.xml"
+sha256 = "07a671966b8849034f91aa2bab6779e0fdc58b71401cecbe549d5d3f4eda6402"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cd-swaption-2.xml"
+sha256 = "a5522acbb3faa04401c6b562356b1cb6494071320e4e2010eae0ab776b9aaecb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cdindex-ex01-cdx.xml"
+sha256 = "e4c438e3d12f7967a63c39be28ec8520cc1110d1653aa3c6020f9bb3c03b0d86"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cdindex-ex02-iTraxx.xml"
+sha256 = "aecc290fcf629bf504212e4b687aeb9219265c2e5427e0d0d37d39a8d58e8de2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cdindex-ex03-iTraxx-contractual-supplement.xml"
+sha256 = "4a5be14496651d0a8b0a57af5eef3e1787dfaf6f3c1694e02062a11a0a98b9e2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cdindex-ex04-iBoxx.xml"
+sha256 = "5bb589607be763fe284719f29be2965c6e95027d31f40e205e884dd17a9f6592"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cdindex-ex06-iBoxx-ois.xml"
+sha256 = "d9ad57580086981c8312c458ffac7ecf46debdad815548faaaf1628843dc28e6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-ELCDS-ReferenceObligation.xml"
+sha256 = "e47956caf20713caff8eaf9ac12e4fc37f52d174c8aab813265b561c8c49c98b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-basket-tranche.xml"
+sha256 = "58df97495864945ea5441146d8b3624d9a624b25850d8bccc5fa7dd3b8706938"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-basket.xml"
+sha256 = "bc711672034f26d3464b7e2c41d148501ba21bdc5cb8f65efbbdb4c9345c0ac5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-custom-basket.xml"
+sha256 = "964fcd15fbbce3951e87b97705205c014e1c09f5661da86aefe104553ed634bb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-index-tranche.xml"
+sha256 = "0d25c3fb1247fd24641d0ce7236e928f200881de15459c92798fbf763d792377"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-loan-ReferenceObligation.xml"
+sha256 = "5714530bc898b0e411e26ed6135aae99de884ebcdfe77fde45592425c9144740"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-loan-SecuredList.xml"
+sha256 = "d267b96f1991fe2fff9e0740275b06bdcb5ad8a12d6659341ca8b13ba7e9be6c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-mortgage-CMBS.xml"
+sha256 = "139d1d6acfe5ddc8c54743ef61fb066497c6b685f577640a25a85f8c32aa2afa"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cds-mortgage-RMBS.xml"
+sha256 = "b6d0e42845236afe2fc7f33ea0c773b9aa46e1368eac9fea640d99a803775570"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/cdx-index-option.xml"
+sha256 = "1371b1cc966161ed7398ff5e30bc3de30970e33c482411d8472f11f1864fbc75"
+status = "xsd-valid"
+
+[[example]]
+path = "products/credit-derivatives/itraxx-index-option.xml"
+sha256 = "601eb577e3ebbb965b89f7d119c9741eda95b51eb59912c9f4b8e90ec94ff433"
+status = "xsd-valid"
+
+[[example]]
+path = "products/dividend-swaps/div-ex01-dividend-swap.xml"
+sha256 = "23b9c255365a0f14209c71ed12bcc07dcdf0fbcbc63f3484327bfc77d79a8503"
+status = "xsd-valid"
+
+[[example]]
+path = "products/dividend-swaps/div-ex02-dividend-swap-collateral.xml"
+sha256 = "7db258a348c5a7a86a735ab693858a590ba7d718bc865bbe5741ce28ce14b2c3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/dividend-swaps/div-ex03-dividend-swap-short-form-japanese-underlyer.xml"
+sha256 = "fd38e318c86f2282400586fa90989fd1aa70a91094b529e3c8df82389eec71eb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/dividend-swaps/div-ex06-dividend-swap-option-pred-clearing.xml"
+sha256 = "760ddf5cb4da1afa01da7bee73151e5532eae58d55fd7b83f44e96dba28c1c2f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-forwards/eqf-ex01-forward-stock-long-form.xml"
+sha256 = "7989a0ad78ebed5c2e3355689b8e1a42b7829bea44a9de617a32615360c1274a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex-27-equityOptionTransactionSupplement-EMEA-interdealer.xml"
+sha256 = "dd6bb2e0a45c57e42d6d1e687225b8e33e4b7b24de0b197f1d65c221a62f803d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex01-american-call-stock-long-form.xml"
+sha256 = "bac4d0a7259c2b4cb861370d9c9eaba462e8b86bf4bd6cfc932f02ac4e0978a7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex02-calendar-spread-short-form.xml"
+sha256 = "5c39dfddb4dcefdf84dc2e534d656590ffd9284da535fccc4c2774426dee994b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex03-call-or-put-spread-short-form.xml"
+sha256 = "98d8edc7480f83573fcfc02f5c22c98a714ff0e0453c8ac0e4e3660679c37260"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex04-european-call-index-long-form.xml"
+sha256 = "b7374dee9a9b2bab07aa0262571747b8e828baad57c949f800f6c4705ebb91d4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex05-asian-long-form.xml"
+sha256 = "c62487a41e3dd42fe7ed789a347d4a52d7a16a1487fa1071f92915b88b0dc36f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex06-averaging-in-long-form.xml"
+sha256 = "e8ff459cb91c7e79d1da90400640968d8318cee6d38436d5801a5de0374a0dd3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex07-barrier-knockout-rebate-long-form.xml"
+sha256 = "c5ec1574401c84a12687fff97263ac94b90a7e247a2f691edae5ce57c0645894"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex08-basket-long-form.xml"
+sha256 = "30c9b16ea26901f17c5b57932e5cb4d4b951a5c918a2f01e2026f638a3c22dbc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex09-bermuda-long-form.xml"
+sha256 = "4327177559ff95496f12c94195fdc9929ea4903a6510ed2d17b593758caa7554"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex10-binary-barrier-long-form.xml"
+sha256 = "39609d633b7275420b1ebfdd254d300e65fb03b9c62c30dc2b4c2ba609157624"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex11-quanto-long-form.xml"
+sha256 = "078f579fbfee261bf04dd4dc4a7221a47c2455e6cd6b8d9d5843224467541ff4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex12-vanilla-short-form.xml"
+sha256 = "f5556f084acb41aee48d68facf67e9fe643c4292d70a202155d33fa4b2c82ff3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex13-1996-american-call-stock.xml"
+sha256 = "e908d7256ff93fc728c515d857bf87c5d43980cf4a57dafc9a1d9f4cb8b419d8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex14-american-call-stock-passthrough-long-form.xml"
+sha256 = "eb58ce1c201323c57c1ba433351fae37c2e9b958641ac4006233353621831318"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex15-basket-passthrough-long-form.xml"
+sha256 = "b92f589be019741ecdfd98e3bf1b0623d7150979c68771b28612c499a5354070"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex16-equityOptionTransactionSupplement.xml"
+sha256 = "c21a2cc4e59c6e81dc5426d29ac515f979ed9ea0354a5800ee749531ae5f5e51"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex17-equityOptionTransactionSupplement-non-deliverable-share.xml"
+sha256 = "c3e6daa6bc40bd903da5d6bfbbbc3f3004d6c9b279581ce7212ec7f2dbb60591"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex18-equityOptionTransactionSupplement-non-deliverable-index.xml"
+sha256 = "bfd24acd13cb49d7d53ade5d4c1743226341c9b91d3b95f4481d3dbc7f69b91e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex19-dividend-adjustment.xml"
+sha256 = "5759e564c8525824cc3f4d734ad1e446b32ce541b083a80ee12f14149ba4854b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex20-nested-basket.xml"
+sha256 = "9596326cbb5fc40958c6968b45b00e283b81897ae5e43217d91f247d60160244"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex21-flat-weight-basket.xml"
+sha256 = "202b4d0db1759e7282d03eae3ca41c5fcf40d51f68aa8cf45f7d9b563c76fd20"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex22-equityOptionTransactionSupplement-index-option-asian-dates.xml"
+sha256 = "5bcc50345b558a4bef3092301426fab7e3e0f69a5acea4f16091ee49258a1250"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex23-equityOptionTransactionSupplement-index-option-cliquet.xml"
+sha256 = "59681a3d472795e2c353032f61856df6a38a39f4b7a1bec2acfa525ff7a3e444"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex24-equityOptionTransactionSupplement-index-option-asian-schedule.xml"
+sha256 = "767ab01d59e524ecb2e781aad3560b32d3085ccb5be6b7065368cbf647630e45"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex25-equityOptionTransactionSupplement-index-option-knock-in-knock-out-features.xml"
+sha256 = "210fba50aa27c5a0253fc64b725f0bc658a240b3846d340d0b8da2450b0f1804"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-options/eqd-ex26-mixed-asset-basket.xml"
+sha256 = "49042987cd423f6705d8e6050207fed079dd69c2f581a81ab026ebc08c853fc8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex01-single-underlyer-execution-long-form.xml"
+sha256 = "d7d19310a07b40cb5f383c24c9800791f08de7b30dd633a154c8551e938aa3b7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex02-composite-basket-long-form.xml"
+sha256 = "b67bce874e5cbb6592a44dd590070e076a7d4a6e9025166569fa186815966133"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex03-index-quanto-long-form.xml"
+sha256 = "080b2859e288fa3aa4b148ebc31ad1f109eba96f3a9a7a123434cd9d826baeba"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex04-zero-strike-long-form.xml"
+sha256 = "0984285785c77f12a8aab27c96a0f1ab9196cd710b9389c3797e59d48a52aa69"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex05-single-stock-plus-fee-long-form.xml"
+sha256 = "001a19dcccfc8ccef76df76f5da1d8280e4905c41c472852ba1093df9222cb08"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex06-single-index-long-form.xml"
+sha256 = "8cf924e049c09b5ab28a734cd19e2ee8b00a52a5d8aeaa122bca8217b44e654b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex07-long-form-with-stub.xml"
+sha256 = "f28272fa39b6e26c12da06eade7743312bec86637c3867a9e35c6b5e19313de9"
+status = "xsd-invalid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex08-composite-basket-long-form-separate-spreads.xml"
+sha256 = "348c1f9b33e7218ae11179a671e0a9b9b30373eb381d9a4e7793ccf9fdd8a16c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex09-compounding-swap.xml"
+sha256 = "a241ec30c4b56387f019d43cd9f227061213588d3cf8ee7b1d840bc261a4c5bc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex10-short-form-interestLeg-driving-schedule-dates.xml"
+sha256 = "a2acfbded441c638d4c114c063653f9cdf2153cef368f3482cfbc5a9d0e84f28"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex11-on-european-single-stock-underlyer-short-form.xml"
+sha256 = "0c258e14fb4c9b571e15444744d706e976c72fcd2ff0083fc99aa2ca44906661"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex12-on-european-index-underlyer-short-form.xml"
+sha256 = "8f331ee2ed70e815d57774697c50ea57104681b5f0414952eed1e6430761e8c6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex13-pan-asia-interdealer-share-swap-short-form.xml"
+sha256 = "1412013fbeb7e652de7191e64d5800d775b5d4030bd5cd1140dc812a191926ee"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex14-european-interdealer-share-swap-short-form.xml"
+sha256 = "ca1fdcdd90e0be1675748ff61240c9561444ebf22bde29bd45281748558a05a7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex15-forward-starting-pre-european-interdealer-share-swap-short-form.xml"
+sha256 = "7cb3ff5fafe7ab71371900380948926bdfb76bb112ed62eb9cc74d8dd109c266"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex16-forward-starting-post-european-interdealer-share-swap-short-form.xml"
+sha256 = "147482ceb74214383b3033dbeb4267795bb6fde9e0a62e72e0700c4764d255e0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex17-cfd.xml"
+sha256 = "50d8715917ccf29be701612b1616cfe55fa7ba0b32ed30c5c04d99e038813139"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex18-pan-asia-interdealer-index-swap-short-form.xml"
+sha256 = "63d76de1c16e19fd7b3d6920a8bbf88d6da25fce1bc72dac592c392130bb24e2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex19-european-interdealer-fair-value-share-swap-short-form.xml"
+sha256 = "9663765eb78fa7d40c6eca3a673422b6fed720179bc6f61608fb5d76bc9eda48"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/eqs-ex20-single-underlyer-execution-long-form-ois.xml"
+sha256 = "d8b1b91cc115e17cf9b7c4aa23cb15641c0f4569bb5b3b2996569d6949e27ac7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/trs-ex01-equity-basket.xml"
+sha256 = "5ef84d5b77eeabd7dba65dc7fef7af27882a254080173b95b39e8dc5cbd7c6ab"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/trs-ex01a-equity-basket-with-relative-date.xml"
+sha256 = "98955731312dd959bad61022b700417bbd15552bf0d203af3575a8ad225ca179"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/trs-ex02-single-equity.xml"
+sha256 = "39888addb6912a3dc9e21ee93c5651b7922e0caca03fe6849bcf678c5a84d49e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/trs-ex03-single-stock-execution-swap-with-fixing-and-dividend-payment-dates.xml"
+sha256 = "b0f3730ecd7b6aede47b08ff73985bd102cc5fa15fcc6d2ea496ed5bc1ac1e4d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/trs-ex04-index-ios.xml"
+sha256 = "eebc6a8902800963f7e90f3186e9488177e3511ff0ac448393f0baed15b315ef"
+status = "xsd-valid"
+
+[[example]]
+path = "products/equity-swaps/trs-ex05-single-equity-with-calculation-parameters.xml"
+sha256 = "4428b1c461d4d541aa338ec17eb867a1f56bf3052f298b8f9a22683c52b04fda"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/dcd-ex01-dual-currency-deposit.xml"
+sha256 = "6290dcd365ccff1084220ec000c61ff132e54806bbbaa0f345ae43b668d49a51"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex01-fx-spot.xml"
+sha256 = "9b5a94b5da9dcad9bb3c4427e68490ec3a8cc637ac30aad1926d43054fdfc0fb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex02-spot-cross-w-side-rates.xml"
+sha256 = "0c08737bfc0240cc63d73d86a9a6a9b87da88cab0ef9efb8873c8128b463f1e4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex03-fx-fwd.xml"
+sha256 = "2d9d63f943ba647e4754296b66249cafd4b83da53365a18e4d39d4eaba32ee6f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex04-fx-fwd-w-settlement.xml"
+sha256 = "1d019328d2ce3c1e62b48f51884a66f715cfa8faa7ac590f86911a479ffbb3ba"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex05-fx-fwd-w-ssi.xml"
+sha256 = "b3ee17684f787575fe1af492b1dda49742a07a685115c0a3e6ff97c822f5f16e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex06-fx-fwd-w-splits.xml"
+sha256 = "bdde696fda8b2665eb1123534299ff5d8c43b77c15a2d08e95f5d1c97d1b4e66"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex07-non-deliverable-forward.xml"
+sha256 = "12622f8429ed9063c05b2fa5657db46f8d27cc06d9995a15bb7afb98502414da"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex08-fx-swap.xml"
+sha256 = "ff4e75fcb2fd5d50cba649102824ad9e4b0e5c072793db03ff43a12d01911779"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex09-euro-opt.xml"
+sha256 = "3cd3d65fa623772367b6f53a7ede81e92d42981276c37ab0f095ecfa787c148c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex10-amer-opt.xml"
+sha256 = "de2abef714e3d44e6e20e125be05269eef06d4d631e2a613bdb2a7e2afd7cedd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex11-non-deliverable-option.xml"
+sha256 = "b40667c87ce4f4acda912bde7f32e6fe6bd22edc276439573c52fecb9b297045"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex12-fx-barrier-option.xml"
+sha256 = "853e0f1ea2f3c84499fe46ffbecd7d1363ecfc8d3fe3e232614296917d155bd2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex13-fx-dbl-barrier-option.xml"
+sha256 = "8f600464fae456ea4f468ad8eeafcc86580ea7a3f2e7268b1ffbfffc19612643"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex14-euro-digital-option.xml"
+sha256 = "fd1fb6523d7149594ccaea48c078507e910bf68a698e6cc57cbb9c67ced27f36"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex15-euro-range-digital-option.xml"
+sha256 = "41928dcce27c59b2c6ec76fbe0e86b692f1bb4a0d00f753764ee6c2e161b0403"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex16-one-touch-option.xml"
+sha256 = "d9933fb4ced1641166a2612a053ee0e0fa0e6b6489d52a16ce5a6f32060427aa"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex17-no-touch-option.xml"
+sha256 = "bbcdb5c2aab5063211c9fe13f3ac6dd8f258ee0af154de60777b4341b3f1930a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex18-double-one-touch-option.xml"
+sha256 = "cdb33c4e4720a39e00f671a6d738d031eebb3c0d319bab4bee8977c567e20247"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex19-double-no-touch-option.xml"
+sha256 = "f993c117f7757ac2391b171b2383e5b69c333de3cafae852fb7c19dc89069fc7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex20-avg-rate-option-parametric.xml"
+sha256 = "9741672560aae2ff957ff7a05a32faccc666f21fd0329fc14158dc5b25a9a00b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex21-avg-rate-option-parametric-plus-rate-observation.xml"
+sha256 = "2429848c8784cdf7124ac89dcc438046b545df6c1dd685a87f1d0ae298ed06d0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex22-avg-rate-option-specific.xml"
+sha256 = "881c065a7dc8062bdd92c0ae3f976d499cf5a2da569aaf2059805447e68c914b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex23-straddle.xml"
+sha256 = "48557064754212fd849a8a2e9b756a2ebd0f80f0e4b503b761f2ed2a8f504978"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex24-delta-hedge.xml"
+sha256 = "7f9739e9bc18cddd03cae217fa42cace3e9faadbd021b42b382910d30a639ba2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex25-option-strategyComponentIdentifier.xml"
+sha256 = "49e3d7b3b6db9b1021f3d0f8b1539f02431fb5a385ebee4adf33be93d8493d6b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex26-fxswap-multiple-USIs.xml"
+sha256 = "9172813f13423e21900ad0a5f05403e94efb7aa9aa8e42ee252962f5a45f26c8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex27-flexible-term-forward.xml"
+sha256 = "547ba543336cf721ca2619dc94d46fe20fc74eb5c2c4fd476277f75b33df7b47"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex28-non-deliverable-w-disruption.xml"
+sha256 = "372508fdea67a9235cc8d7d16f4949c8b51ff78c9eec0b13d9596a836eec9fa3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex29-fx-swap-with-multiple-identifiers.xml"
+sha256 = "f39da4f861d2c90405155436c02b692fb2332224524b283642f054b39aebf98b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex30-variance-swap.xml"
+sha256 = "ab47c2d38226153fd356e30d0493dc1fce022c3a9735314151355851f42fb4d8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex31-volatility-swap.xml"
+sha256 = "9daad904765b9c5dafef648d1eb1f9e9528a419039f091d28f5b278b45739a93"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex32-forward-volatility-agreement.xml"
+sha256 = "e524f665aa735056c71d73f8afb54b30d3cf0f151a5ff67a3f99a5e425265304"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex33-target.xml"
+sha256 = "d89c33d6651e00b451410c626d947af5141e947e60c197ed8180d7fcd4f26a03"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex34-target-digital.xml"
+sha256 = "cb33cec5fa6ab42ec9ea76b9197cf37c90512885e74d496b3758fa2794cdcec0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex35-target-pivot-settlement-period-schedule.xml"
+sha256 = "4f768635304a7e6c81b66419963c97eaab8a72d08b54390ff8615418bc97f770"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex35-target-pivot.xml"
+sha256 = "04ae94e68811243d368eb322c826e222708bc673c4522ee7c0cd898adfb35549"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex36-target-leverage.xml"
+sha256 = "74277db1dd3ef3a30894ab2f37e56d3b23f18bdc439611b2b547d51d2bacdb86"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex37-target-knockout.xml"
+sha256 = "27bd60e1580e340d036702dedc17f11187c8fd879e583e07b8c4b4988478acc2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex38-target-rebate.xml"
+sha256 = "13e4e670c940c70b62e82d75dead3dc340594b9a9be542e9298aa7c630c1110c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex39-target-split.xml"
+sha256 = "f8946168db71e4d7d84a06f25b7db335a4eb4947e18e8c58cca911e8d36b7686"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex40-target-accelerated.xml"
+sha256 = "06f1b4e9bdeb6390e204900dc073829c2d3ccf82fcc0b1b116d9f2e810620f63"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex41-target-bonus-collar-settlement-period-schedule.xml"
+sha256 = "655f465b0f47d56b0fa90f8202cdaeff5a31ccf8a7b985fcf1e6ea6b001b6b5e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex41-target-bonus-collar.xml"
+sha256 = "bb6d769a4f3da42c065d192d37bca92542f4fa6208b991e2552a575fe7f4581d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex42-target-eki.xml"
+sha256 = "f07e0bfa2b0845554af145652adf8eaad58871b8caa9e6b15e19f93ba10243da"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex43-target-eki-settlement-period-schedule-references.xml"
+sha256 = "2da182f0eeae1692bd0c81e706ba26cddda0d02dba37465bda22b11348daae7f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex43-target-eki-settlement-period-schedule.xml"
+sha256 = "997c908cb75fb7460c09f5bac57e7319cec6ccfed6ff329325454c583e2dfb61"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex43-target-eki.xml"
+sha256 = "70aa5de5a481fe367e1e46e87db0480403c7c507e1e026f3858769cec9a7d59d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex44-accrual-forward.xml"
+sha256 = "ca04a335507657470781c0222405e023d7c4e7b80fafc102f5f291fa592e7385"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex45-accrual-forward-leverage.xml"
+sha256 = "fbf4f29f1e715cb4b1339e6215f137c8456a3b20055ec3c34bd2a5cd22d71a33"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex46-accrual-forward-american-lose-boost.xml"
+sha256 = "16e826c97ce8710dfdd043536dbf1d323cbb4e310ca9aa1e3d6feff16916e992"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex47-accrual-forward-european-fading-forward.xml"
+sha256 = "aa03792f293d71052ff9a849fbfb0bc659b96cc71b4790cb1880d94247248fe5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex48-accrual-option-strategy-fading-extra.xml"
+sha256 = "0996cdab693a7687214f9d1b4752786d77aae9eb4d4289eefef6d1fa12419dbb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex49-accrual-forward-boost-strip-settlement-period-schedule.xml"
+sha256 = "8046dac4441ea3755f46f418655864a84a6b94d933d1a08b339c8cbc60f57d91"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex49-accrual-forward-boost-strip.xml"
+sha256 = "11790aaed25e4419e7ca650967a59040da7e4bc674c3f8601a9c589a9ee6f717"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex50-accrual-forward-double-accrual.xml"
+sha256 = "dbdb74a34c11bc5547747b5c645a618fb070c5acf4b9b60355acdcc0da7fb495"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex51-accrual-forward-american-keep-double-multi-settlement-settlement-period-schedule.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex51-accrual-forward-american-keep-double-multi-settlement.xml"
+sha256 = "a70a2055fc60501c370e8466ff0e24d8a1fa8f222e80650cd49d22b8055b01c5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex52-accrual-forward-collar.xml"
+sha256 = "44bda617ce24ec1584296d9ff509d4dcd88ccadd82a706e19776de7335fca17f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex53-accrual-forward-variable-strike.xml"
+sha256 = "d3fb7577779a51bee1f56e9303d41b73eb3234f30f2818bf8847c63863313aaa"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex54-accrual-option-american.xml"
+sha256 = "a04a68db93ed573f8f2268570953b10ebde558babc9af4b76849340e932e3a3f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex55-accrual-option-average-strike.xml"
+sha256 = "37378664209b9c0d3e57f511bb44793a7294aecb844b6deb8e08459ec020c81a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex56-accrual-option-average-rate.xml"
+sha256 = "f9383c639a558c9a50d4c0929302d2419e9163a20ae2b412589f06f346d3f60c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex57-accrual-digital-option-american.xml"
+sha256 = "518b40bba315e174e4fb77cdd95f7eba92e5c74957e88162d5eeae92c561d238"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex58-accrual-range-accrual-european.xml"
+sha256 = "f4428dc2ec94e1ef2b3d565b837f4e7a46ba57255cd191fc5b474fee1f560eb7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/fx-ex59-accrual-range-accrual-european.xml"
+sha256 = "22378b2263f483a7747ebe92c14428236ce1bc3e67b9862ce8a91d0af207962f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/td-ex01-simple-term-deposit.xml"
+sha256 = "69c05f4b0cd530914f9d49886df9607c3614e13ff6d042898fc1390a99465037"
+status = "xsd-valid"
+
+[[example]]
+path = "products/fx-derivatives/td-ex02-term-deposit-w-settlement-etc.xml"
+sha256 = "8a6002a6015d6698328004b3ba5fea604762660aaf94117f117b17de0469f3d0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-asset-swap-ex01-ratio-zc-floored.xml"
+sha256 = "cbe10bcc315c9a5b2bb96c97a8fb0d1805afaa43c839fa74987a4d2d721bff85"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-asset-swap-ex02ratio-zc-floored.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex01-yoy.xml"
+sha256 = "c15a98c5b0f0be018a856653095dc8e02dc50392b337f5b2065c2916f9c6923a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex02-yoy-bond-reference.xml"
+sha256 = "934ce9afbb7033478b3e28fab0a8a23cb72c15e3881af628f1152480956f762a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex03-yoy-initial-level.xml"
+sha256 = "dd870c0ef21e90a892f601fa005aeb3b7f597af1ccc8fcde52743c46267e453c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex04-yoy-interp.xml"
+sha256 = "4b8501b3ccd2295be78459bc669f3e638ff1cdd8bcf86dc85c7764883358819d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex05-zc.xml"
+sha256 = "f09d7cf3feffd0cf8f10ad9b4d7b5925a86176a8b4bb20d9417fc82b6f4bdee1"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex06-zc.xml"
+sha256 = "fe1de875e01eb7b47dbcc6a968cd0930a01b8ae9913eebfba7d11d0b8ca8e03f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex10-float-v-float-BRL.xml"
+sha256 = "1fdd931b83375246afbd8b56e6e4e8b8e0bd712abbe10e2ac3a857b8b0d16f48"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex11-CLP-fixed-v-fixed-fx-linked-notional.xml"
+sha256 = "6ba74a3d61a733ad702d406376e0cf4ba4522b2cf958d228f654159ad9de9f31"
+status = "xsd-valid"
+
+[[example]]
+path = "products/inflation-swaps/inflation-swap-ex12-CLP-fixed-v-ICP-fx-linked-notional.xml"
+sha256 = "ae52b575043c6057593e503b6472b3f36dd1a19739697040619b4f18070a1603"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml"
+sha256 = "562fd6f8aee5e0c4fef539d633d7abe96aeba9fab7f1917c734e23a70ce7f7da"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex01a-vanilla-swap.xml"
+sha256 = "5f6c50129700598d955ef4f63dbd2804f91bc4c02aea6467bb94585d23cdff1e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex02-stub-amort-swap.xml"
+sha256 = "a6d905dfd1fb34ae589cd3001817e1560a99c904ee472f29ce9e23305b378998"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex03-compound-swap.xml"
+sha256 = "06847c266000a0d4fd9fb3c13fff23e7db1df6b24d0927853cfe276723d53876"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex04-arrears-stepup-fee-swap.xml"
+sha256 = "eebeaee908a57a808a5ec7de8ca903b248f9dd7760070c2c982ef68c305a35d1"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex04a-arrears-stepup-fee-swap.xml"
+sha256 = "8b40764d0a838620a40a789410a9c607e72222c0ca13e65144430b5d9f67b317"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex05-long-stub-swap.xml"
+sha256 = "56594bb31acb8ab6e25fdce62b33093cfd3ef13560fb8eda4904f357edbbf616"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex05a-long-stub-swap.xml"
+sha256 = "f3344a9eec7f2e15785aed8db31a90288e4c07ea87341f47292850b20addd54d"
+status = "xsd-valid"
+errata = "scheme-10"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex06-xccy-swap.xml"
+sha256 = "2a4181d5352f4ccf1f1f83748364e81a73a0eacef447a069c4016dcd928e08ae"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex06a-xccy-swap.xml"
+sha256 = "06a738422e28f8cfe84925465a1ea095077950aa7f0c83e7ec4873856a9a2533"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex07-ois-swap.xml"
+sha256 = "1a9770da0605ba8b760ceaa7035822b1aaf643e4043d794c842914420eb3af6e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex07a-ois-swap.xml"
+sha256 = "d865fa48364a9fac6a8c45aa24e2eef9e683a2330a557d1b77b731258a2f06f9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex07b-ois-swap.xml"
+sha256 = "2a48a941addf8afede2ad27bf66ac7d02ad5652646e0b13f7848f2373db924cf"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex07c-ois-swap.xml"
+sha256 = "263a74b672187dfd7dbecba328597b80569eb52886f910a952c13f606794f8d6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex08-fra.xml"
+sha256 = "75b37bb1dec7b7ffabe113aaa0351d1273caae94446eae2fc7d2dc866d062499"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex08a-fra.xml"
+sha256 = "83aede9901095b376289049b2cff24335586c065f6588a6b7bd1f791b08f3919"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex09-euro-swaption-explicit.xml"
+sha256 = "90073e2ba123063873e1944226c5345edf6d431ffc1eee9f945ee7fd05e3cd12"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex09a-euro-swaption-explicit.xml"
+sha256 = "6ae7c086b4e54b287aaeaae8d18c9219ba818b99c9a2f3f9241e3816d662f7ae"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex10-euro-swaption-relative.xml"
+sha256 = "0d4197ce7eb7f0c06059099a81a76226984e88ef272e2fdcc7690bd25e966b20"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex11-euro-swaption-partial-auto-ex.xml"
+sha256 = "948db1376f0ea00a0af626e2c02cd4561f6f26e8dd3a8ec7cc624c0ac5f43ed8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex12-euro-swaption-straddle-cash.xml"
+sha256 = "32004ffeffc5901319d992f265c54b9f0e5033e3a5988b0858beb092971244db"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex13-euro-swaption-cash-with-cfs.xml"
+sha256 = "ac79eecf0c7fd6b0bc1bb25f054e5f7e36c5fdb0582987f8a85428b0e8994288"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex14-berm-swaption.xml"
+sha256 = "c93e320ac3dfce547fec2baed03f827f0a4a6b11ddb1f63e2c86f584e18bc9bd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex15-amer-swaption.xml"
+sha256 = "2ee2203f43fda65b5d3e352424f4bef5f60da4a4f58d0e94c5c6af4c451620a7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex16-mand-term-swap.xml"
+sha256 = "ba7974598c1a79e154da7e3a7d852557dafd8c5aac3e3ba0ebc03170b4e921cd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex17-opt-euro-term-swap.xml"
+sha256 = "1c93475f5dd70ae317d5e47044b8c7fcd77af8ee4fd74143977499613192071a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex18-opt-berm-term-swap.xml"
+sha256 = "3286d0efbc73ead1177b7f3287627966a2ef5fba0a2f6bf9fc056aa00c046630"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex19-opt-amer-term-swap.xml"
+sha256 = "9e707fe18ac23412621fdffd333134679a8eafc7446f030c041c5d8814bf6429"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex20-euro-cancel-swap.xml"
+sha256 = "4399b48add9729f476508b634e9eef5ccde1348114d8f5f8a69006833bd9eccf"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex21-euro-extend-swap.xml"
+sha256 = "5285bacf60499043c91a8abc28b6295d331e53edaef8bc21fcf1ed13c1ae2578"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex22-cap.xml"
+sha256 = "1092fefe230ee110e44b51d835f2a02dfaf2271372e128a4ce41c43293c5c78d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex23-floor.xml"
+sha256 = "4352b5061f1da7d24af46b5b1c8dd7ad91bd320d2b9623ba2c772b5e7d629e1a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex24-collar.xml"
+sha256 = "841f366dda5860f6c15dd604518c2b12bbe1a868254fc2f12f9ead1672a5b602"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex25-fxnotional-swap.xml"
+sha256 = "62e53b62ce2d42cc6050a72f09c0e096e9a819133b97b5d120c8856f6a6bd73c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex26-fxnotional-swap-with-cfs.xml"
+sha256 = "3f74ed8f8b47fedb2430b5e0a235c2b77b189614848a36acc85895cdc99f71bc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex27-inverse-floater.xml"
+sha256 = "af1bf74c39a6a9859a4a07ae0832a644c26b7127cbff8281712cf6246a8a3d5c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex28-bullet-payments.xml"
+sha256 = "1459f803dd5250c09011212a8eca563c0d9d3107f1f3ee764e0a34fa77c23a6d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex29-non-deliverable-settlement-swap.xml"
+sha256 = "13ce92cdad0a13bae3c5f760afe72017c720f5d813be1208177786a4a41acf9f"
+status = "xsd-valid"
+errata = "ref-11"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex30-swap-comp-avg-relative-date.xml"
+sha256 = "0f34265006ee32c244bc5ccf7279e0c1f7f228c134c36c1e4fcbd5757bacb6f0"
+status = "xsd-valid"
+errata = "ird-57"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex31-non-deliverable-settlement-swap.xml"
+sha256 = "7a926581894dd03e1af7dadc8e60fe4932f48b84e93fa8e32afdd491edf01960"
+status = "xsd-valid"
+errata = "ref-11"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex32-zero-coupon-swap-normal-rate.xml"
+sha256 = "d33a1d5c476b22e2ce414cf8bac4ceb00e8f57b40a5ec6ae5c8c77fb5c64bf0d"
+status = "xsd-valid"
+errata = "scheme-130"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex33-BRL-CDI-swap.xml"
+sha256 = "627a0d205827a354583f7c1a60b6a569b720121fdfec0bf1e699e165d500ea62"
+status = "xsd-valid"
+errata = "ref-8"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex34-MXN-swap.xml"
+sha256 = "35e0753eba194f1fc6740849fd816df25a5509b2019db7b3829899cbb4318b75"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex35-inverse-floater-inverse-vs-floating.xml"
+sha256 = "44d7ea7210f9bc34a9add5091b598568d801716e925ae5dff914f88860c66117"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex37-zero-coupon-swap-known-amount-schedule.xml"
+sha256 = "85e5ac8289067241475e446668f9a1e0cc3f3d8d54fca02b3db8329dcddcc85b"
+status = "xsd-valid"
+errata = "scheme-130"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex38-rfr-avg-swap-pmt-delay.xml"
+sha256 = "5a0bbf7b092ace190ff8a5b59e52df9b8ec6a5b2c631bfa0ee956a9379dbf851"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex39-rfr-avg-swap-rate-cutoff.xml"
+sha256 = "725378e86f4d4d800d1e786feacf35143f5f3869f28af1070fc5aa21fefe1109"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex40-rfr-avg-swap-obs-period-shift.xml"
+sha256 = "852652a2cecfbca09cd4b41f15b4d7c9b7d837670e445b3c619d2405960f5c93"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex41-rfr-avg-swap-lookback.xml"
+sha256 = "b789a4570399e74c2757b1215506cbf1bd2fe2012ba35a9768e4393c572bc0e9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex42-rfr-compound-swap-pmt-delay.xml"
+sha256 = "2b86f1311028df7469d4d19185d9a5cb0c229e03ff8e1333afa55a06d861a948"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex43-rfr-compound-swap-rate-cutoff.xml"
+sha256 = "46f1e7cc01b2c153c8686a5d297e6152beac46dd2b0230edd983a4883ce4669f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex44-rfr-compound-swap-obs-period-shift.xml"
+sha256 = "eadbde876d64234243c97ae20b94d9e40f8a5a3ba2f2c6b3d2025c525c5a728e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex45-rfr-compound-swap-lookback.xml"
+sha256 = "174c3dde0ac6571e4f3141516a25c8d21b66f240dbe795adb8d9f939e7b9c41f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex46-rfr-compound-swap-lookback-oet-mmviq.xml"
+sha256 = "142579027a5e84ef58ad473823c98c13c1344543cda72a10c9801d53b22ebdb1"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex47-rfr-compound-swap-lookback-oet-rvfq.xml"
+sha256 = "2db1e06308eaa5d666c742ab9a6c6120de1e2247fcc559d2149f142cbcbff1d4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex48-rfr-compound-swap-lookback-oet-ccp.xml"
+sha256 = "2bf53057ddeb36affd3ebfef7b0e17cc9e851e6ef6b1cb123e9617f0292f07a0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex49-rfr-euro-swaption-cash.xml"
+sha256 = "8e4e6cbbdc43cd52a96aa54184c62856a00f95c51bb61579001920283eaa77a7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex50-rfr-euro-swaption-cleared-physical_with_met.xml"
+sha256 = "a36d6dba00aca4a33b206e8e6aadfde491a512fb232f0f52bd71b121e8f51ede"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex51-vanilla-swap-with-fallback.xml"
+sha256 = "114c686933758410f7ad41c92515ad7fc76bd11bce4b60ff5170dac70eb06330"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex51a-rfr-vanilla-swap.xml"
+sha256 = "ec70c7ccc444f9a20a5bd9ae0c8905a8ed6e5622e797850172903d74ea984e0d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex52-xccy-swap-fallback.xml"
+sha256 = "4d5da59fc50f8ccc2a12d8e5838c693584be474661d8106188af7525d4c1cfbc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex52a-rfr-xccy-swap-fallback.xml"
+sha256 = "15d552c60b27aa1c24614c251444c5bdd7c6b37bc7c9bbd4280e2ed79e8d4459"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex53-xccy-swap-OIS.xml"
+sha256 = "e0ddbca1ddccced3859d834b5f00551340bfbed8736ca2c56ea5fd89c5f18d4a"
+status = "xsd-valid"
+errata = "ird-9"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex54-CP-H.15-basis-swap.xml"
+sha256 = "6de739d53f7ed45aab2d514317724f9cdff05631f892f8dc72713962ac83d4ee"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex55-muni-basis-swap.xml"
+sha256 = "770984b9a046cfd4bcac29148c0a19b5f894d671f53ca153740e975d8483e943"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex56-CNREPOFIX-swap.xml"
+sha256 = "2218258fb889e85f34095672d10d5f5d76cd4b0361c93858b72ac91dfe9ac90d"
+status = "xsd-valid"
+errata = "ird-49"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex57-compound-index-obs-period-shift.xml"
+sha256 = "9742383d83dd15d507c15cf2bb12db9d2cbf96aa0d99254a1cae0ed257b3ff55"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex58-xccy-swap-lookback_compound.xml"
+sha256 = "3271ef8e20a8e302a8afdd7aafb0a4ac5d1344bee363dc3219e336dd85a38e0d"
+status = "xsd-valid"
+errata = "ird-9"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex60-trs-basket.xml"
+sha256 = "e7bc643f594cc8b394ff7f8c7ecfda1f7fe28f3da02bd5e1c2b6f78c60788de7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex61-trs-single-underlyer.xml"
+sha256 = "3005046dc4edc029ac06995f6690ef28fbe485c71ac8b63ee8eee9b6ad4c8b17"
+status = "xsd-valid"
+errata = "ird-9"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex62-trs-single-underlyer-short.xml"
+sha256 = "ee8dad63923347f1adc48e19fbf3ffe12d9be5b5b40539f4327c47bd0ab5612f"
+status = "xsd-valid"
+errata = "ird-9"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex70-xccy-basis-swap-USD-JPY_Mark-To-Market_Initial_Exchange.xml"
+sha256 = "2378b63d843253621394b280c37f58b48de2f860ba8f3b754a389b06d8310aac"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex71-xccy-basis-swap-USD-ZAR_Mark-To-Market_Initial_and_Final_Exchanges.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex72-xccy-basis-swap-USD-ILS_Non_Mark-To-Market.xml"
+sha256 = "87b49ed8b1af7c18ab1fbd5bf5268e6ba154c7a1afaa4a8bc8fd8ded0e4d4be4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex73-fixed-fixed-basis-swap-AUD-USD_Mark-To-Market_Intial_Exchange.xml"
+sha256 = "b47ad22a7b0d678d72db781ea4f390a9e748a46e9830d67703168b9fcdb4f077"
+status = "xsd-valid"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex74-fixed-fixed-basis-swap-AUD.xml"
+sha256 = "a4b812210616724be4b50245dfbd0eb5ef8cb5bd7940dac4ed5668a3e14212dc"
+status = "xsd-valid"
+errata = "ird-16"
+
+[[example]]
+path = "products/interest-rate-derivatives/ird-ex75-fixed-fixed-basis-swap-JPY-USD_Non_Mark-To-Market.xml"
+sha256 = "43b186bf29d7a1375521004def8c1495f74b02f7c3d0d23246444785d9ceea1a"
+status = "xsd-valid"
+errata = "ird-25"
+
+[[example]]
+path = "products/loan/(Loan_MndCstRtExp_ex1.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/loan/Loan_AccrFeeChng_ex1.xml"
+sha256 = "cfb684af34086a8a7460524a3036a14665c68a91e10a81de9195cb1eef2660e4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrFeeChng_ex2.xml"
+sha256 = "a0dd52e2c4e17acbf982d784dba18365d5c5a2cb89520a72216b0e61645f6026"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrFeeChng_ex3.xml"
+sha256 = "c6317163240bc897e075f94553cc1a9036826b23d56b0bf540679ef625b86a1a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrFeeExp_ex1.xml"
+sha256 = "d012b8517f299612af77008423b5d21b6474fe1c0d7494355601d6c15efe0b04"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrFeePay_ex1.xml"
+sha256 = "2079a0853caec5a014d83016907936d864e7702ed75aa25943ed4f252dce7422"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrFeePay_ex2.xml"
+sha256 = "c9522324fba43b766335546143a67778fcdc3b9981a81b31874fc7bf120a4635"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrOptChng_ex1.xml"
+sha256 = "37351d0b0e11101e7548e6ee2c42f062159fdb49ecfb83c62cbe136a6dc9e785"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrOptChng_ex2.xml"
+sha256 = "a01d942e375f6e7f957eb8e5d1a5da7e2acfb0da0892fdf5c06c10f8b82a8f81"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AccrPikPay_ex1.xml"
+sha256 = "665c79f352111e2827a5679e1dd573121be06485e3166c6687b5a53c7134726a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_AmendFeePay_ex1.xml"
+sha256 = "003c7adaf0471ab1993f7f47263f3e5e0b94ade8dbd4376add9afd6ed1d8d432"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_BrkgFeePymt_ex1.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex100.xml"
+sha256 = "03cf0cc3e06b4e4e6404194561ae3c2cb1cd04526247f00bee3544074963f9ed"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex101(Roll).xml"
+sha256 = "f3b88bdb3cb975a3b3ac83ac5a27ed3860e1e5541c93b1d0d340f8307fa03c98"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex102(Roll).xml"
+sha256 = "8a095aeedc8f5207abd7b82fa50dd2a7a39e71368ce2a659c6983149cc149ec0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex103(Roll).xml"
+sha256 = "922266da6204d23fa4136542184b53381d3554760077e54f12bb389bac885039"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex104(Roll).xml"
+sha256 = "ed85f3c9b8b631cfa6095cea8b2c4160cd8d4d66729df01c3113c1fc3e07346d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex105(Roll).xml"
+sha256 = "ed85f3c9b8b631cfa6095cea8b2c4160cd8d4d66729df01c3113c1fc3e07346d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex106(Roll).xml"
+sha256 = "085e1a2f009819b76ed8e61aaf3072b6fe5cd5fda39cca72898d5737f14d02ed"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex107(Roll).xml"
+sha256 = "7e9753680f5cf0d00c1a89bf1ac8bac0aa12a5d20198caa868eeec8ea8faefde"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex108(Roll).xml"
+sha256 = "a8b43ed80994ccff3930f7aa1039ea63ed99f40ff8bb2484265467afee549dd5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex109(Roll).xml"
+sha256 = "6f21716de06ac0f3b455f771fa855249ba35a6ff0bc5052ab309fa20ec34adf6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex110(Roll).xml"
+sha256 = "a8b43ed80994ccff3930f7aa1039ea63ed99f40ff8bb2484265467afee549dd5"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex111(Roll).xml"
+sha256 = "f3e5cd899dc268e9cd7bb3e0e31a42db6fe57694060d7c243642d2309d5bd3f1"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex112(Roll).xml"
+sha256 = "e4bf92c5ea983a2af7949e63282a1977bfe527b0588f943ee642f6ab7a7943bd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_Bulk_ex113(Roll).xml"
+sha256 = "8c550aa61d2d377cc73ecadc41c11a49dd33fc1c179a12bf3aed7c7c46733336"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_CommitAdj_ex1.xml"
+sha256 = "e6a7e69eeb37b7005d8f9d5f779d7e7063a6477bb1558520dc07a03dbfb6c67a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_ContAdj_ex1.xml"
+sha256 = "136e17d92e4cb0413d270b9207eec77df329fc766c9c0447be1db38dd99affb4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_CovObNotif_ex1.xml"
+sha256 = "44495536399d9cb487ebc67f25526d579d7979da6927bbb653c0cd1feeb8716b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_DealStmt_ex1.xml"
+sha256 = "cf7a9cc68d88412eeefdb853b1bcdf61e97e411fc607f51e5469b53a117eb7d3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_DefRtChg_ex1.xml"
+sha256 = "fd05a098d01e76d50b8aeef6b26cfdb1fca008b597e8b830057bf86bb9f70906"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_DefRtExp_ex1.xml"
+sha256 = "3f763a423865985313cb9018e09aeda584827503734f3ba142c1e71fb931da05"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_FacExtFeePay_ex1.xml"
+sha256 = "9468bd0b9cae08b4b16afa993aac1096c10f9bbe90a788fa68446dcfde975a40"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_FacPosStmt_ex1.xml"
+sha256 = "dad97eb757faa2efea604e2746fadc9bac5366c3113bfe98b91e2c65627bd575"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_FacPrepay_ex1.xml"
+sha256 = "c62fedbbeb80bd121912290714cb4f9dc9cb47d616c05ba80133e04f5e7d9334"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_FacStmt_ex1.xml"
+sha256 = "7b9e08491747286842ef07e5c447b311167c2a17c9ee0a4fc853ed75e8c67d38"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_FacStmt_ex2.xml"
+sha256 = "639bb08747fc0da03b15f67ff7a817bd36c08bb7b84abf0efdd2753f6ea8b046"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_FacTerm_ex1.xml"
+sha256 = "7e1f1dc4463f576155656cf77c0ab7d12b5903de6bdd709cff0b4084df9ca23f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_FundFeePay_ex1.xml"
+sha256 = "388f82fbd7f8dd2b4920798fa5081c454f03e91c8edde53a16474d8fe915f311"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_IntCap_ex1.xml"
+sha256 = "bdef03263e6367149f18dc36173ab7614d2b6ac158b31b8792da006d394ff465"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_IntPay_ex1.xml"
+sha256 = "78f09c3d776cbd95cf5c7c322069b5e5398b63d4d78fa0abd8a6848f11319129"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCAdj_ex1.xml"
+sha256 = "690eab841de8ffb8fddc6b17bba4164caebb3b70f405f015debca8f93ec4be4b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCFeePay_ex1_1.xml"
+sha256 = "0d951e969630fd101f18f653d08864b1e963febdf2882497e07cc96761e67abb"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCFeePay_ex1_2.xml"
+sha256 = "6e7eb66c4e742555b0d69a3ef4f61a298525c29f0cab2d14af3ef78f66d0bc9d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCFeePay_ex2.xml"
+sha256 = "29eb8cad09dd02f688b2333b013c6d4f734ba2cc3c75ac52872a814ee0deb60b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCFxReval_ex1.xml"
+sha256 = "131d7a0b118c23a5e56fc316be66c96f5986f64bba2d65d3626ff7ba417e858c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCIss_ex1.xml"
+sha256 = "6a6c3b042645b861e08a35413565fd01bd6c2b1498ad86b522df8272e206c9e8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCIss_ex2.xml"
+sha256 = "c5373f3b776762635f6d98699ee72877aeec62f4c8c777e0f765b0b96943b80c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCIss_ex3.xml"
+sha256 = "41b058a921cb85b1abb9d30f162f05ae650025ba58832d17ffe530fe443dd081"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCIss_ex4.xml"
+sha256 = "a7515b1ae0654bd9fe9ba05e3e27bb7864e13372215d16506aee56fc7c1018bd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCRenwl_ex1.xml"
+sha256 = "0f667487f34dc66a5f1505a2e90bc995662275f640598ea1f608d7c3e8a536ce"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCRtChg_ex1.xml"
+sha256 = "4c17213db599d9ed1d11270db592e80a463bc9f4c3fdc1b3954f659c157de713"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LCTerm_ex1.xml"
+sha256 = "bc8fdd64c99dd6a02b2aa1f1d50a0adbb00d77bb8a9316a83ddf5fcb375695d1"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LegalActNotif_ex1.xml"
+sha256 = "aa0243fa3109d77be3b1f799765cb53e959e769161681f30c18b09c4760678dd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_LegalActStmt_ex1.xml"
+sha256 = "3a42e40cfb99420c8cdb430c3c322fc42ee00e634405a54549c5e12ecc4a5fc3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_MatChg_ex1.xml"
+sha256 = "60369c5ef2537dfd4b67adea3e4adaa6875dc402de4b20f00f942a13cb476bb6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_MiscFeePay_ex1.xml"
+sha256 = "5fed5a915ff3679b5c83b1effde6c81b868fea1be28fcd61c044bbdc6e0f4c87"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_MndCstRtChg_ex1.xml"
+sha256 = "739f09732e223ddccc2aeaafd426456924a2f137d85205512a4ec905de558687"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_NonRecFeePay_ex1.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/loan/Loan_OustdContractsStmt_ex1.xml"
+status = "unavailable"
+
+[[example]]
+path = "products/loan/Loan_OutstdContractsStmt_ex2.xml"
+sha256 = "58462a939a9dbdae4835035fa4ec8537aa1bdebb019eefb31a18f5debda88e77"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_PenRtChg_ex1.xml"
+sha256 = "dca31c3c14a59734c3c3f6d45e9a5893f58fcde066a778e6a1a977900a0b9faa"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_PenRtExp_ex1.xml"
+sha256 = "53b94f4a70869d29147ee11a346cb8bd66ea9e1c884488c3e8f783b081976577"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_UpfrontFeePay_ex1.xml"
+sha256 = "ef8306d561a77008c85906335454b9f21403f07ed8136d82da87f1570b378785"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/Loan_WaiverFeePay_ex1.xml"
+sha256 = "9da770b4576a89d3e21573941e034deb1749c7ef62065327775bc79369dc39ec"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_party_ex100.xml"
+sha256 = "fe7effd1e970c5ad76e9555081c01eb293eda2e09a1b6662dae3bcbdf8051d8f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex001.xml"
+sha256 = "fd8d7585c79f8deaf6597731dbbe4ec07a708304af3a0ec8f8e765ba17335abd"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex002.xml"
+sha256 = "1e76f357c21b32fbb78ba9fba2ecd0469debe35b961091ec314244a2d4b14889"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex003.xml"
+sha256 = "ad7e389d053acec46cc3aa3de0bdada738d7e46e420f3b20813cf948d2c3c014"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex004.xml"
+sha256 = "dfff94857b1cbe394b22d2ed956f120033bf47a913cb2d657c5b2890274fa905"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex005.xml"
+sha256 = "84feac706f23426896ab80147395676aea5cf93320d89f71c19c540f670f8654"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex006.xml"
+sha256 = "e23be5e4550ad78190458e6659fa7a4485936a3600dad8d3c14d076777a46e9b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex007.xml"
+sha256 = "7c358327e7b0e4f8ecb7c1edf477a561456067c3bfc1955fa2aeb3e463dc9aca"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex008.xml"
+sha256 = "f17f64af3327ad8105bb1724a3aa2fa822b156861b2e15c727535eb1ca5b5016"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex009.xml"
+sha256 = "37378b9fe20751b54dfb5434a3a2718af28ee1ac8ea8e3249ae17bc4e42cfb1e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex010.xml"
+sha256 = "8f2bb0662baeaa97cfb880f9e9496791423cd106b0cbb37fc8dc199d11864fc4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex011.xml"
+sha256 = "9e972b936a674c5f1eafb037722c00c4843ad8cf5b36858fde7adc8a89e05228"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex012.xml"
+sha256 = "753cc66a3eea0926e250af1afedc60abc0b03541a64d0ea89dd60e609e7bd9d4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex013.xml"
+sha256 = "ca76ead71e39d3d947f7c501d7b5cda3c813c77365055dde58071ce69ef2eae8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex014.xml"
+sha256 = "615e72269c20f0b37aee5ae277e592e003ba25a83ba727b8cec44dd1185fed5d"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex015.xml"
+sha256 = "2d4134ca6428e15cf2e53a8bbfdb48c8d7a59dca81658dfb6d7fbeb459b70a26"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex016.xml"
+sha256 = "00f7d08d6e6309b858c9ac45151b7cb752364e35ad8225f10e7e3107730a9b03"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex017.xml"
+sha256 = "7b1336736fe4980ef9fcb12e6d12233db3c117a5226ad50ebbd4eb89ce36f914"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex018.xml"
+sha256 = "9cc16a1770fceb7aaa74387e2ed96925ea668096237c4ee05b5593efc6ee0787"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex100.xml"
+sha256 = "4207c727862c5fde1dd1c8431a6ee9305e9d33c09f3b102cddf31c45ea2449ab"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex101.xml"
+sha256 = "dc3af9300ee517e3627f619c337ed65fa5968977d8b32d7b501d472db96e53ce"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex102.xml"
+sha256 = "70399ed1cacfc8963ef00fcceecdc80d3a48dcd421f11c11a6a419871b7cdbbf"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex104.xml"
+sha256 = "6c154cc2331e84e4b25ab703cbfe7f2d0246d3b7c6ea57a8804daea3c31bf32a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex105.xml"
+sha256 = "a10337644d607418958c3cbc463bd1f254764ffd3db73b0b4e40fb971ec5a565"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex106.xml"
+sha256 = "6031d0ef6565e2bdac25e0c956b5c57b2d53e63b77e7407b880b13250dbea076"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex107.xml"
+sha256 = "6da8dffbc7a731abcda47368cb8e90ec86c52bd3ad82e6e3c7df4c0dbf5886e6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex108.xml"
+sha256 = "9ae0ce2e6f46186cdb67d2e132eca931207c115d914a6331ebb61b35e50fbad0"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex109.xml"
+sha256 = "8fcd3f6e755571f106da648024421f3e351e0d4ffaea5dc455ea6a61e2e30c70"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex110.xml"
+sha256 = "812ff5fcf15198fcf263444242144d7938cf0860032e4cf8d595cbb09eaaafd8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex111.xml"
+sha256 = "23b7ae4d148307a66d2b9202b430eb0678f9f323aa7e5e68172a910053e432e3"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex112.xml"
+sha256 = "b746145cd68b42a141788ee2bbd8c468e9b6899bd0fc66c3a52476030411cf3a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex201.xml"
+sha256 = "932b20b8a12abb5064191f2885a8bc7a180f4e7e3a6ee00a38c7a00f84159181"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex202.xml"
+sha256 = "7eab5c884eb2a313408481c02522581192d3550d8177b78ac86e7681bd0ae356"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex203.xml"
+sha256 = "1187d5eee37a862acea2d21f8b7d243aef06b97ec4d0435125afe60a5aafdc62"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex204.xml"
+sha256 = "f5cc34a1e51cf494e0943309abc711a9bf372a438b55ee9ba08112fa1a5aa121"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex205.xml"
+sha256 = "8704213ef1dd046f283ea2b4b3a8fe69897688c43a549c423f9fea124d908744"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex206.xml"
+sha256 = "fb70fd05df9aef95fdcfb204ccbfc4435079a4c290ecd270d86bbce1a65e6106"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex207.xml"
+sha256 = "23d0b9cd859ff372b74ab8f79c0a0a8facef08624c4e6c3d2448903f383d0dce"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex208.xml"
+sha256 = "ee7d53d45e31f37925bb0650ad58b3e4f94f89b5b2a9e395f138473bfcd2d0bc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex209.xml"
+sha256 = "9cea417813e607f7ec0fbbc2ac636b3aadf48b479bfe36b7a14574903df10c43"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex210.xml"
+sha256 = "a33d8d0a6bbcf192d4d225fc942fb80e05e8f6ddddf4379f8aafbc64ecc9855f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex211.xml"
+sha256 = "405afb843e052a38eb7aab3463645f7f633d8065a8b18542da7fea1ce2a92a32"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex212.xml"
+sha256 = "3b4c9cf338d6fd34b59fb69c0082c1d79b5a8b27bcc5a6ea2bbcfd094f4f91a6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex213.xml"
+sha256 = "83d1fbdc971b64371fcc470da6f354c310cb91d82aef9bfde0dbc2094dae2a5b"
+status = "xsd-valid"
+
+[[example]]
+path = "products/loan/loan_trade_ex214.xml"
+sha256 = "e6dfbe2c1ece6d21966ff7afc0ca50b09d6d9cc258694e47171107cc21cf6df2"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex01-repo-fixed-rate.xml"
+sha256 = "0ad1224f0c69ac9c02b1ee7fe36f7c1d9721aaa3adab83ceb64d18a13eee3655"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex02-repo-open-fixed-rate.xml"
+sha256 = "091fffd5a3c0976f166cae497eda0001ae90d757497b1849608b27391cecd7db"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex03-repo-fixed-rate.xml"
+sha256 = "714419246a85fa913cc8cfddcb197baa5755346ad82fa2bb7024d3b4c401d877"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex04-repo-floating-rate.xml"
+sha256 = "d36b1656ee4a26516cdc1ae7c4550dcbffcd6f57fafcea6a138a361f5c6a4ee9"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex05-repo-fixed-rate.xml"
+sha256 = "0a417b7280501f73c4a23818dba0f9983c026d6e08ae677f311c8fefcc797445"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex06-repo-fixed-rate.xml"
+sha256 = "ca68088ab2c00c02d6ac1c3598b2ddf15b7db084e029f33d5685def11ed9098e"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex07-repo-triparty-float-rate.xml"
+sha256 = "a5bcf34ce0aabaeef5e8236b0509a9d92552d71b59397435a0a6a384f78ee4f6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex08-repo-triparty-fixed-rate.xml"
+sha256 = "c8f7c029ff53fada59a39a554b6ae41a037f13e65b3f6f153a76609592312e65"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/repo-ex09-repo-ois-rate.xml"
+sha256 = "1cf43252982c864c3ca453c623bfc48e1414b7c54cf8841337297c0e1ed53ae6"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/sbl-ex01-term-egrn-cash.xml"
+sha256 = "815aefd6cfa8409270a0e91c09f12d4efb21c3d6eda6840f387f038a17b548d8"
+status = "xsd-valid"
+
+[[example]]
+path = "products/repo/sbl-ex02-term-fx-rate-non-cash.xml"
+sha256 = "1ca194dca3a3cf10b36959602243439058c5857553fee3f6a8f18131855e4f8f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/securities/sec-ex001-trade-execution-future.xml"
+sha256 = "7375639f3def8193b0faebeaaad02850004f72860c22b663ea0a56f414ed3f42"
+status = "xsd-valid"
+
+[[example]]
+path = "products/securities/sec-ex002-trade-execution-exchange-traded-option.xml"
+sha256 = "f1f8e3864b13ef58a099dc1df1643a6aa0b40500e277e3a43ef47c3405c15204"
+status = "xsd-valid"
+
+[[example]]
+path = "products/variance-swaps/eqvs-ex01-variance-swap-index.xml"
+sha256 = "ca235e253632db7e7bb6f109a9b24073175f82d757e95153613591fc8a85f9cc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/variance-swaps/eqvs-ex02-variance-swap-single-stock.xml"
+sha256 = "c710da75c96c37a0b0479c28a58a5af2410ad287416e29e324c74b4546c636b7"
+status = "xsd-valid"
+
+[[example]]
+path = "products/variance-swaps/eqvs-ex03-conditional-variance-swap.xml"
+sha256 = "ef5cc641aef74d664d76a2b1191e47a994fdf9537719ac90e1cce54d8a278cbc"
+status = "xsd-valid"
+
+[[example]]
+path = "products/variance-swaps/eqvs-ex04-dispersion-variance-swap.xml"
+sha256 = "52ea233b32ad7326c632aa48c25bab5d459ba42b81d0562898051aeac6b9f03f"
+status = "xsd-valid"
+
+[[example]]
+path = "products/variance-swaps/eqvs-ex05-dispersion-variance-swap-transaction-supplement.xml"
+sha256 = "bb13450f6116fb71b677c7a5baaa6502e0a13d0f6a9b9734f38b1c7bda77910c"
+status = "xsd-valid"
+
+[[example]]
+path = "products/variance-swaps/eqvs-ex06-variance-option-transaction-supplement.xml"
+sha256 = "6ea0ee18812fe9633c4e8ba1d1931b2f02a6ff1392eee0949e8b0b907026980a"
+status = "xsd-valid"
+
+[[example]]
+path = "products/variance-swaps/eqvs-ex07-variance-option-transaction-supplement-pred-clearing.xml"
+sha256 = "0990218508f55becfc84824e06aa9c475ff5118f0344fc8fa3ae6f2d6c9ee030"
+status = "xsd-valid"
+
+[[example]]
+path = "products/volatility-swaps/eqvls-ex01-volatility-swap-index-matrix.xml"
+sha256 = "2e4a1112d6b51926e6ffcb2af8f90db2dfdc22d6356bf8fb86b09d698a9e4eb4"
+status = "xsd-valid"
+
+[[example]]
+path = "products/volatility-swaps/eqvls-ex02-volatility-swap-index-mca.xml"
+sha256 = "893873e5ed6027cc02170664e3982ea20ed3979506140f4175d2d52a2ffa7424"
+status = "xsd-valid"

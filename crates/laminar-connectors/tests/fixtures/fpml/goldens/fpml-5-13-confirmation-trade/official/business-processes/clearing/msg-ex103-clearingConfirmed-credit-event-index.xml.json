@@ -1,0 +1,124 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.imgr.com/schemes/account-id",
+            "value": "FUND100"
+          }
+        ],
+        "beneficiary_href": "party1",
+        "id": "_FUNDACCT"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.custodian.com/account-id",
+            "value": "98765"
+          }
+        ],
+        "beneficiary_href": "_cust",
+        "id": "_CUSTACCT"
+      }
+    ],
+    "correlation_id": "TRD0001",
+    "creation_time_utc": "2010-01-04T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2010-01-04T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2010-01-04T08:57:00Z"
+    },
+    "document_root": "clearingConfirmed",
+    "document_sha256": "b233f21e293f2a52c1d322e5cbc0757cf9f9ffac06e32c02832a59532b7b9b10",
+    "documentation": {
+      "master_confirmation_date": "2004-10-18",
+      "master_confirmation_type": "DJ.CDX.NA"
+    },
+    "fpml_version": "5-13",
+    "message_id": "R00ABC1",
+    "message_id_scheme": "http://www.rbs.com/coding-scheme/message-id",
+    "parties": [
+      {
+        "id": "clearer",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso9362",
+            "value": "LCHLGB2LXXX"
+          }
+        ]
+      },
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "INVEST MGR"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E4CDNNLJRBKF36"
+          }
+        ],
+        "party_name": "BROKER 33"
+      },
+      {
+        "id": "_cust",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FNRNXH6KYKUK07"
+          }
+        ],
+        "party_name": "Custodian"
+      }
+    ],
+    "product_type": "creditDefaultSwap",
+    "row_locator": "/clearingConfirmed/change/trade",
+    "sent_by": "LCHLGB2LXXX",
+    "trade_context": "change",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "959800NKRMZ8NEKQ0A23"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.newbank.com/trade-id",
+              "value": "CDX1234"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300E4CDNNLJRBKF36"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.massivebank.com/trade-id",
+              "value": "1234A6"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2005-01-24"
+    },
+    "trade_ordinal": 0
+  }
+]

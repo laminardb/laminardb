@@ -1,0 +1,112 @@
+[
+  {
+    "actual_build": 7,
+    "contract_identifiers": [
+      {
+        "contract_ids": [
+          "NC5678"
+        ],
+        "facility_href": "FAC12345",
+        "party_href": "BANKOFAGENTSNA"
+      },
+      {
+        "contract_ids": [
+          "CC1234"
+        ],
+        "facility_href": "FAC12345",
+        "id": "CONT12345",
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "document_bytes": 8252,
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "f3b88bdb3cb975a3b3ac83ac5a27ed3860e1e5541c93b1d0d340f8307fa03c98",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2013-10-21T09:30:47",
+        "offset_minutes": 0,
+        "utc": "2013-10-21T09:30:47Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "591357",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": false,
+    "loan_events": [
+      {
+        "effective_date": "2013-10-23",
+        "event_ids": [
+          "72200"
+        ],
+        "event_type": "rollover",
+        "locator": "/loanBulkServicingNotification/rollover"
+      },
+      {
+        "effective_date": "2013-10-23",
+        "event_ids": [
+          "72253"
+        ],
+        "event_type": "baseRateSet",
+        "locator": "/loanBulkServicingNotification/baseRateSet"
+      }
+    ],
+    "notice_date": "2013-10-21",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ]
+  }
+]

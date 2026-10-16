@@ -1,0 +1,154 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "0ad1224f0c69ac9c02b1ee7fe36f7c1d9721aaa3adab83ceb64d18a13eee3655",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "Party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 1"
+          }
+        ]
+      },
+      {
+        "id": "Party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party 2"
+          }
+        ]
+      }
+    ],
+    "product_type": "repo",
+    "repo": {
+      "collateral_assets": [
+        {
+          "asset_type": "bond",
+          "coupon_rate": "7.875000000000000000",
+          "currency": "USD",
+          "description": "Corp Bond 7.875 25-Sep-2017",
+          "id": "OPQ",
+          "instrument_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/instrument-id-ISIN-1-0",
+              "value": "XS"
+            }
+          ],
+          "maturity": "2017-09-25"
+        }
+      ],
+      "day_count_fraction": "ACT/365.FIXED",
+      "duration": "Term",
+      "far_leg": {
+        "buyer_party_href": "Party2",
+        "collateral": [
+          {
+            "asset_href": "OPQ",
+            "clean_price": "112.334750000000000000",
+            "nominal_amount": {
+              "amount": "1096000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "id": "forwardLeg",
+        "seller_party_href": "Party1",
+        "settlement_amount": {
+          "amount": "1292586.710000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2013-11-04"
+          }
+        }
+      },
+      "initial_margin_type": "Cash",
+      "near_leg": {
+        "buyer_party_href": "Party1",
+        "collateral": [
+          {
+            "asset_href": "OPQ",
+            "clean_price": "112.334750000000000000",
+            "nominal_amount": {
+              "amount": "1096000.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            }
+          }
+        ],
+        "delivery_method": "DeliveryVersusPayment",
+        "seller_party_href": "Party2",
+        "settlement_amount": {
+          "amount": "1292748.300000000000000000",
+          "currency": "USD",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "settlement_date": {
+          "adjustable_date": {
+            "date_adjustments": {
+              "business_day_convention": "NONE"
+            },
+            "unadjusted_date": "2013-10-29"
+          }
+        }
+      },
+      "open_term": {},
+      "product": {},
+      "rate": {
+        "fixed_rate_schedule": {
+          "initial_value": "-0.007500000000000000"
+        }
+      }
+    },
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "Party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 1"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party1.com/swaps/trade-id",
+              "value": "Party19235"
+            }
+          ]
+        },
+        {
+          "party_href": "Party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party 2"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.party2.com/swaps/trade-id",
+              "value": "Party22000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2013-10-29"
+    },
+    "trade_ordinal": 0
+  }
+]

@@ -1,0 +1,62 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 12888,
+    "document_root": "dataDocument",
+    "document_sha256": "a36d6dba00aca4a33b206e8e6aadfde491a512fb232f0f52bd71b121e8f51ede",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300ABANKV6BYQOWM67"
+          }
+        ],
+        "party_name": "A BANK(\"ABANK\")"
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "529900CPTY57S5UCBB52"
+          }
+        ],
+        "party_name": "SELL SECURITIES CO LTD (\"Counterparty\")"
+      },
+      {
+        "id": "dco",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "123456QQQQ57S5UCBB11"
+          }
+        ],
+        "party_name": "ABC CENTRAL PARTY CLEARING SVC LTD"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "partyA",
+            "trade_ids": [
+              "62546871"
+            ]
+          },
+          {
+            "party_href": "partyB",
+            "trade_ids": [
+              "62546871"
+            ]
+          }
+        ],
+        "product_type": "swaption",
+        "trade_date": "2021-08-30"
+      }
+    ]
+  }
+]

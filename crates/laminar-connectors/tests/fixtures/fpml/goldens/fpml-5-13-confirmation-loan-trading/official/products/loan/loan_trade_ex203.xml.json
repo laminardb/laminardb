@@ -1,0 +1,64 @@
+[
+  {
+    "context": "loanTradeNotification",
+    "creation_time_utc": "2018-03-01T21:35:58.568Z",
+    "creation_timestamp": {
+      "local": "2018-03-01T16:35:58.568",
+      "offset_minutes": -300,
+      "utc": "2018-03-01T21:35:58.568Z"
+    },
+    "document_root": "loanTradeNotification",
+    "document_sha256": "1187d5eee37a862acea2d21f8b7d243aef06b97ec4d0435125afe60a5aafdc62",
+    "event": {
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "GB002",
+            "event_id_scheme": "http://www.barclays.com/fpml/coding-scheme/internal/loan-trade-initiation-event-id",
+            "party_href": "GB1L104502"
+          }
+        ]
+      },
+      "loan_trade_href": "T_BBPLC_T_001"
+    },
+    "event_type": "loanTrade",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "BBPLC00001549667579",
+    "notice_date": "2018-03-01",
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      }
+    ],
+    "row_count": 1,
+    "row_locator": "/loanTradeNotification/loanTrade",
+    "row_ordinal": 0,
+    "sent_by": "GB1L104502"
+  }
+]

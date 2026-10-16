@@ -1,0 +1,87 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2014-11-13T07:30:47Z",
+    "document_bytes": 4006,
+    "document_root": "facilityNotification",
+    "document_sha256": "cfb684af34086a8a7460524a3036a14665c68a91e10a81de9195cb1eef2660e4",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "FAC12345",
+        "instrument_ids": [
+          "F123452TLA"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2014-11-13T07:30:47",
+        "offset_minutes": 0,
+        "utc": "2014-11-13T07:30:47Z"
+      },
+      "implementation_specification_name": "BKLoanSys",
+      "implementation_specification_version": "1.0",
+      "message_id": "656114",
+      "message_id_scheme": "http://www.bankofagentsna.com/messaging/messageids",
+      "send_to": [
+        "US5L567878"
+      ],
+      "sent_by": "US2A432121",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "is_global_only": false,
+    "loan_events": [
+      {
+        "effective_date": "2014-11-10",
+        "event_ids": [
+          "2432312"
+        ],
+        "event_type": "accruingFeeChange",
+        "locator": "/facilityNotification/accruingFeeChange"
+      }
+    ],
+    "notice_date": "2014-11-13",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "COBORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US4C147258"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ]
+  }
+]

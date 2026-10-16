@@ -51,6 +51,7 @@ wal/
 /tools/*
 !/tools/check_analytical_dependencies.py
 !/tools/check_dependency_exceptions.py
+!/tools/fpml_oracle.py
 !/tools/test_dependency_exceptions.py
 !/tools/run_workload_qualification.py
 !/tools/independent-soak-contract/

@@ -1,0 +1,306 @@
+[
+  {
+    "correlation_id": "0123456",
+    "creation_time_utc": "2009-12-25T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2009-12-25T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2009-12-25T08:57:00Z"
+    },
+    "document_root": "requestClearing",
+    "document_sha256": "49990bf910815bf03629dc7e16ee78202fa07480441381c8321e0fe6fd7deb39",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "M000123",
+    "message_id_scheme": "http://sef1.com/message-id",
+    "parties": [
+      {
+        "id": "counterpartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493007UORKUC7B3R009"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300CG6M7FPQFSZZ36"
+          }
+        ]
+      },
+      {
+        "id": "counterpartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493001GQM0W2RB8NG57"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "F226TOH6YD6XJB17KS62"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF1"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000OYML8W30IO673"
+          }
+        ]
+      },
+      {
+        "id": "executionVenue",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF2"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500W4M6T99LTBH450"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/requestClearing/tradePackage/trade",
+    "sent_by": "SEF1",
+    "sequence_number": 1,
+    "trade_context": "tradePackage",
+    "trade_count": 2,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "tradeSource",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "SEF1"
+            },
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000OYML8W30IO673"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/trade-package-id",
+              "value": "TR1"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyA"
+        },
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyB"
+        }
+      ],
+      "trade_date": "2009-12-25"
+    },
+    "trade_ordinal": 0
+  },
+  {
+    "correlation_id": "0123456",
+    "creation_time_utc": "2009-12-25T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2009-12-25T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2009-12-25T08:57:00Z"
+    },
+    "document_root": "requestClearing",
+    "document_sha256": "49990bf910815bf03629dc7e16ee78202fa07480441381c8321e0fe6fd7deb39",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2006"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "M000123",
+    "message_id_scheme": "http://sef1.com/message-id",
+    "parties": [
+      {
+        "id": "counterpartyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493007UORKUC7B3R009"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerA",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERA"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300CG6M7FPQFSZZ36"
+          }
+        ]
+      },
+      {
+        "id": "counterpartyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLIENTB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493001GQM0W2RB8NG57"
+          }
+        ]
+      },
+      {
+        "id": "clearingBrokerB",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "CLEARINGBROKERB"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "F226TOH6YD6XJB17KS62"
+          }
+        ]
+      },
+      {
+        "id": "tradeSource",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF1"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "5493000OYML8W30IO673"
+          }
+        ]
+      },
+      {
+        "id": "executionVenue",
+        "party_ids": [
+          {
+            "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+            "value": "SEF2"
+          },
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "969500W4M6T99LTBH450"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/requestClearing/tradePackage/trade[2]",
+    "sent_by": "SEF1",
+    "sequence_number": 1,
+    "trade_context": "tradePackage",
+    "trade_count": 2,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "tradeSource",
+          "party_ids": [
+            {
+              "scheme": "http://www.lchclearnet.com/clearlink/coding-scheme/party-id",
+              "value": "SEF1"
+            },
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "5493000OYML8W30IO673"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/trade-package-id",
+              "value": "TR2"
+            }
+          ]
+        }
+      ],
+      "party_trade_information": [
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyA"
+        },
+        {
+          "execution_date_time": {
+            "local": "2009-12-25T08:57:00",
+            "offset_minutes": 0,
+            "utc": "2009-12-25T08:57:00Z"
+          },
+          "execution_venue_type": "SEF",
+          "party_href": "counterpartyB"
+        }
+      ],
+      "trade_date": "2009-12-25"
+    },
+    "trade_ordinal": 1
+  }
+]

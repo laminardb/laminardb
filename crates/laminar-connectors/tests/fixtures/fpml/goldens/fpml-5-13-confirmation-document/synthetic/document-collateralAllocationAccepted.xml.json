@@ -1,0 +1,28 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-collateralAllocationAccepted",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:31:00Z",
+    "document_bytes": 1064,
+    "document_root": "collateralAllocationAccepted",
+    "document_sha256": "1bf3ff1bf50d8faabc0c65f5096a0f180d37e4c3b364a00d78d03fc2da575a34",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:31:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:31:00Z"
+      },
+      "in_reply_to": "REQ-collateralAllocationAccepted",
+      "message_id": "SYN-collateralAllocationAccepted",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "sequence_number": 1
+  }
+]

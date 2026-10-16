@@ -1,0 +1,175 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "a241ec30c4b56387f019d43cd9f227061213588d3cf8ee7b1d840bc261a4c5bc",
+    "documentation": {
+      "master_confirmation_date": "2002-06-20",
+      "master_confirmation_type": "EquityAmericas"
+    },
+    "equity_swap_transaction_supplement": {
+      "body": {
+        "interest_legs": [
+          {
+            "day_count_fraction": "ACT/360",
+            "floating_rate_calculation": {
+              "floating_rate_index": "USD-LIBOR-BBA",
+              "floating_rate_index_scheme": "http://www.fpml.org/coding-scheme/floating-rate-index",
+              "id": "floatingRateCalculation",
+              "index_tenor": {
+                "period": "M",
+                "period_multiplier": 1
+              },
+              "spread_schedules": [
+                {
+                  "initial_value": "0.010000000000000000"
+                }
+              ]
+            },
+            "interest_amount": {
+              "currency_href": "settlementCurrency",
+              "reference_amount": "StandardISDA"
+            },
+            "leg": {
+              "payer_party_href": "BankA",
+              "receiver_party_href": "BankB"
+            },
+            "notional": {
+              "relative_notional_amount_href": "equityNotionalAmount"
+            }
+          }
+        ],
+        "leg_types": [
+          "returnLeg",
+          "interestLeg"
+        ],
+        "return_legs": [
+          {
+            "amount": {
+              "currency": "USD",
+              "reference_amount": "StandardISDA"
+            },
+            "final_price": {
+              "determination_method": "ValuationTime"
+            },
+            "initial_price": {
+              "net_price": "100.000000000000000000"
+            },
+            "leg": {
+              "effective_date": {
+                "adjustable_date": {
+                  "date_adjustments": {
+                    "business_day_convention": "NONE"
+                  },
+                  "unadjusted_date": "2008-01-01"
+                }
+              },
+              "payer_party_href": "BankB",
+              "receiver_party_href": "BankA",
+              "termination_date": {
+                "relative_date": {
+                  "business_day_convention": "NONE",
+                  "date_relative_to_href": "finalCashSettlementPaymentDate",
+                  "period": "D",
+                  "period_multiplier": 0
+                }
+              }
+            },
+            "notional": {
+              "notional_amount": {
+                "amount": "1000000.000000000000000000",
+                "currency": "USD",
+                "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+              }
+            },
+            "notional_adjustments": "Standard",
+            "notional_reset": true,
+            "payment_date_final": {
+              "relative_date": {
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "equityValuationDates",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 3
+              }
+            },
+            "payment_dates_interim": {
+              "relative_dates": {
+                "business_day_convention": "NONE",
+                "date_relative_to_href": "equityValuationDates",
+                "day_type": "CurrencyBusiness",
+                "period": "D",
+                "period_multiplier": 3
+              }
+            },
+            "return_type": "Price",
+            "settlement": {},
+            "underlyer": {
+              "single": {
+                "asset_type": "index",
+                "exchange_id": "N",
+                "instrument_ids": [
+                  {
+                    "scheme": "http://www.abc.com/instrument-id-Reuters-RIC-1-0",
+                    "value": ".SPX"
+                  }
+                ],
+                "related_exchange_ids": [
+                  "ALL"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "mutual_early_termination": false,
+      "product": {},
+      "provisions": {}
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "BankB",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "BankB"
+          }
+        ]
+      },
+      {
+        "id": "BankA",
+        "party_ids": [
+          {
+            "scheme": "DTCC",
+            "value": "BankA"
+          }
+        ]
+      }
+    ],
+    "product_type": "equitySwapTransactionSupplement",
+    "row_locator": "/dataDocument/trade",
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "BankB",
+          "party_ids": [
+            {
+              "scheme": "DTCC",
+              "value": "BankB"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "TradeRefNbr",
+              "value": "TRADEABC"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2008-01-01"
+    },
+    "trade_ordinal": 0
+  }
+]

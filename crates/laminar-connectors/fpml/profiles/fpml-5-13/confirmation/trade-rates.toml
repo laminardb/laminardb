@@ -1,0 +1,46 @@
+# One row per FpML interest rate trade (swap, fra, capFloor, swaption, bulletPayment, bondOption)
+# with the shared trade-level columns and the product's typed economics. Exactly one product struct
+# is non-null per row; `product_type` names it. Trades of other asset classes are not rows of this
+# profile; the fpml-5-13-confirmation-trade profile has every trade.
+include = ["trade-columns.toml", "products/rates.toml"]
+
+[profile]
+name = "fpml-5-13-confirmation-rates"
+version = 1
+description = "FpML 5.13 confirmation view: one row per interest rate trade with typed economics"
+artifact = "fpml-5-13-8-rec-2/confirmation"
+roots = "documents"
+rows = "**/trade[tradeHeader][{rates_product}]"
+
+[sets]
+rates_product = ["swap", "fra", "capFloor", "swaption", "bulletPayment", "bondOption"]
+
+[[columns]]
+name = "swap"
+type = "struct<swap>"
+path = "swap"
+
+[[columns]]
+name = "fra"
+type = "struct<fra>"
+path = "fra"
+
+[[columns]]
+name = "cap_floor"
+type = "struct<cap_floor>"
+path = "capFloor"
+
+[[columns]]
+name = "swaption"
+type = "struct<swaption>"
+path = "swaption"
+
+[[columns]]
+name = "bullet_payment"
+type = "struct<bullet_payment>"
+path = "bulletPayment"
+
+[[columns]]
+name = "bond_option"
+type = "struct<bond_option>"
+path = "bondOption"

@@ -1,0 +1,72 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.partyA/accountId",
+            "value": "12345PartyA"
+          }
+        ],
+        "id": "accountParty1"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://partyB/accountId",
+            "value": "67899PartyB"
+          }
+        ],
+        "id": "accountParty2"
+      }
+    ],
+    "actual_build": 7,
+    "document_bytes": 3772,
+    "document_root": "dataDocument",
+    "document_sha256": "4a5be14496651d0a8b0a57af5eef3e1787dfaf6f3c1694e02062a11a0a98b9e2",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "254900O1WT2BXINL9612"
+          }
+        ],
+        "party_name": "Party A"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300P7IVTDP12DEA19"
+          }
+        ],
+        "party_name": "Party B"
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "ITRAXX1234"
+            ]
+          },
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234B6"
+            ]
+          }
+        ],
+        "product_type": "creditDefaultSwap",
+        "trade_date": "2005-11-03"
+      }
+    ]
+  }
+]

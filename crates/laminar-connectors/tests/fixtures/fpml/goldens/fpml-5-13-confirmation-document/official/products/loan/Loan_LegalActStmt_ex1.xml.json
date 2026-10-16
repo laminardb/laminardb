@@ -1,0 +1,71 @@
+[
+  {
+    "actual_build": 7,
+    "creation_time_utc": "2018-03-12T21:35:58.568Z",
+    "document_bytes": 3017,
+    "document_root": "loanLegalActionStatement",
+    "document_sha256": "3a42e40cfb99420c8cdb430c3c322fc42ee00e634405a54549c5e12ecc4a5fc3",
+    "facility_identifiers": [
+      {
+        "description": "Term Loan A",
+        "id": "CUSIP1003",
+        "instrument_ids": [
+          "CUSIP1003"
+        ],
+        "party_href": "GB1L104502"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2018-03-12T16:35:58.568",
+        "offset_minutes": -300,
+        "utc": "2018-03-12T21:35:58.568Z"
+      },
+      "message_id": "P00001549667579",
+      "message_id_scheme": "http://www.pimco.com/fpml/coding-scheme/internal/message-id",
+      "send_to": [
+        "US1L142580"
+      ],
+      "sent_by": "GB1L104502",
+      "sent_by_scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI"
+    },
+    "is_correction": false,
+    "loan_contents": [
+      {
+        "element": "legalAction",
+        "locator": "/loanLegalActionStatement/legalAction"
+      }
+    ],
+    "parties": [
+      {
+        "id": "GB1L104502",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "GB1L104502"
+          }
+        ]
+      },
+      {
+        "id": "US1L142580",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US1L142580"
+          }
+        ]
+      },
+      {
+        "id": "KY1L151440",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "KY1L151440"
+          }
+        ]
+      }
+    ],
+    "statement_date": "1957-08-13"
+  }
+]

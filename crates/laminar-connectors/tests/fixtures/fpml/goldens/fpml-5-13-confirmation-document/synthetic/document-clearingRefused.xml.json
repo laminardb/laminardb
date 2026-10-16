@@ -1,0 +1,54 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-clearingRefused",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:30:00Z",
+    "document_bytes": 1441,
+    "document_root": "clearingRefused",
+    "document_sha256": "4b8378ccd8ba08abbbdc1067c8c2bdf037b8432ac8ac9ddcb957f82da9ef8f5e",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:30:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:30:00Z"
+      },
+      "in_reply_to": "REQ-clearingRefused",
+      "message_id": "SYN-clearingRefused",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "reasons": [
+      {
+        "description": "Product is not eligible for clearing",
+        "reason_code": "Clearing.Ineligible"
+      }
+    ],
+    "sequence_number": 1
+  }
+]

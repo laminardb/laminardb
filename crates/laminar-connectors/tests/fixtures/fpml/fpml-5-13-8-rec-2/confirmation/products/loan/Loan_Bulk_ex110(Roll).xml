@@ -1,0 +1,426 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--View is confirmation-->
+<!--Version is 5-13-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--View is confirmation-->
+<!--Version is 5-12-->
+<!--NS is http://www.fpml.org/FpML-5/confirmation-->
+<!--
+        == Copyright (c) 2022-2026 All rights reserved.
+        == Financial Products Markup Language is subject to the FpML public license.
+        == A copy of this license is available at http://www.fpml.org/license/license.html
+-->
+<!--
+Loan Bulk Servicing notifications provide a means for agent banks to communicate multiple events for 1 asset, such as floating rate margin resets and/or 
+re-definitions of the way in which outstanding contracts are structured. 
+
+This example represents a rollover with:
+        - Single LIBOR contract repricing (maturing)
+        - Interest payment on the LIBOR loan
+        - The LIBOR loan is being increased as part of the rollover
+-->
+<loanBulkServicingNotification xmlns="http://www.fpml.org/FpML-5/confirmation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" fpmlVersion="5-13" xsi:schemaLocation="http://www.fpml.org/FpML-5/confirmation ../../fpml-main-5-13.xsd http://www.w3.org/2000/09/xmldsig# ../../xmldsig-core-schema.xsd">
+  <header>
+    <messageId messageIdScheme="http://www.bankofagentsna.com/messaging/messageids">715448</messageId>
+    <sentBy messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US2A432121</sentBy>
+    <sendTo messageAddressScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US5L567878</sendTo>
+    <creationTimestamp>2013-10-21T09:30:47Z</creationTimestamp>
+    <implementationSpecification>
+      <name>BKLoanSys</name>
+      <version implementationSpecificationVersionScheme="http://www.bkloansys.com/">1.0</version>
+      <date>2012-12-06</date>
+    </implementationSpecification>
+  </header>
+  <isCorrection>false</isCorrection>
+  <noticeDate>2014-01-14</noticeDate>
+  <isGlobalOnly>false</isGlobalOnly>
+  <eventPayment>
+    <payerPartyReference href="BANKOFAGENTSNA" />
+    <receiverPartyReference href="LENDERCORP" />
+    <paymentAmount>
+      <currency>USD</currency>
+      <amount>40882.65</amount>
+    </paymentAmount>
+    <paymentDate>
+      <unadjustedDate>2013-09-30</unadjustedDate>
+      <dateAdjustments>
+        <businessDayConvention>FOLLOWING</businessDayConvention>
+        <businessCenters>
+          <businessCenter>USNY</businessCenter>
+        </businessCenters>
+      </dateAdjustments>
+    </paymentDate>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73472</eventId>
+    </eventIdentifier>
+  </eventPayment>
+  <eventPayment>
+    <payerPartyReference href="BANKOFAGENTSNA" />
+    <receiverPartyReference href="LENDERCORP" />
+    <paymentAmount>
+      <currency>USD</currency>
+      <amount>16852.39</amount>
+    </paymentAmount>
+    <paymentDate>
+      <unadjustedDate>2013-09-30</unadjustedDate>
+      <dateAdjustments>
+        <businessDayConvention>FOLLOWING</businessDayConvention>
+        <businessCenters>
+          <businessCenter>USNY</businessCenter>
+        </businessCenters>
+      </dateAdjustments>
+    </paymentDate>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">62956</eventId>
+    </eventIdentifier>
+  </eventPayment>
+  <rollover>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73400</eventId>
+    </eventIdentifier>
+    <parentEventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">RolloverGroup10</eventId>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73400</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73472</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">62956</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">61948</eventId>
+      </childEventIdentifier>
+    </parentEventIdentifier>
+    <effectiveDate>2013-09-30</effectiveDate>
+    <currentContracts>
+      <loanContractReference href="CONT12345" />
+      <loanContractReference href="CONT54321" />
+    </currentContracts>
+    <newContracts>
+      <contract id="CONT67890">
+        <partyReference href="BANKOFAGENTSNA" />
+        <contractId contractIdScheme="http://www.bankofagentsna.com/messaging/contractids">NC5678</contractId>
+        <facilityReference href="FAC54321" />
+        <effectiveDate>2013-09-30</effectiveDate>
+        <borrowerPartyReference href="BORROWERINC" />
+        <amount>
+          <currency>USD</currency>
+          <amount>786000000.00</amount>
+          <shareAmount>17649301.81</shareAmount>
+        </amount>
+        <repricingDate>2013-10-31</repricingDate>
+        <legacyFloatingRateAccrual>
+          <accrualOptionId accrualTypeIdScheme="http://www.bankofagentsna.com/messaging/accrualtypeids">51962</accrualOptionId>
+          <dayCountFraction dayCountFractionScheme="http://www.fpml.org/coding-scheme/day-count-fraction">ACT/360</dayCountFraction>
+          <legacyFloatingRateIndex legacyFloatingRateIndexScheme="http://www.fpml.org/coding-scheme/floating-rate-index">USD-LIBOR-LIBO</legacyFloatingRateIndex>
+          <spread>0.025</spread>
+          <startDate>2013-09-30</startDate>
+          <endDate>2013-10-31</endDate>
+          <numberOfDays>30</numberOfDays>
+          <rateFixingDate>2013-09-30</rateFixingDate>
+          <baseRate>0.0018</baseRate>
+          <allInRate>0.0268</allInRate>
+          <paymentProjection>
+            <nextPaymentDate>2013-10-31</nextPaymentDate>
+            <projectedAmount>
+              <currency>USD</currency>
+              <amount>1813913.33</amount>
+              <shareAmount>40730.67</shareAmount>
+            </projectedAmount>
+          </paymentProjection>
+        </legacyFloatingRateAccrual>
+      </contract>
+      <contract id="CONT09876">
+        <partyReference href="BANKOFAGENTSNA" />
+        <contractId contractIdScheme="http://www.bankofagentsna.com/messaging/contractids">NC8765</contractId>
+        <facilityReference href="FAC54321" />
+        <effectiveDate>2013-09-30</effectiveDate>
+        <borrowerPartyReference href="BORROWERINC" />
+        <amount>
+          <currency>USD</currency>
+          <amount>314000000.00</amount>
+          <shareAmount>7050738.89</shareAmount>
+        </amount>
+        <repricingDate>2013-10-31</repricingDate>
+        <legacyFloatingRateAccrual>
+          <accrualOptionId accrualTypeIdScheme="http://www.bankofagentsna.com/messaging/accrualtypeids">51962</accrualOptionId>
+          <dayCountFraction dayCountFractionScheme="http://www.fpml.org/coding-scheme/day-count-fraction">ACT/360</dayCountFraction>
+          <legacyFloatingRateIndex legacyFloatingRateIndexScheme="http://www.fpml.org/coding-scheme/floating-rate-index">USD-LIBOR-LIBO</legacyFloatingRateIndex>
+          <spread>0.025</spread>
+          <startDate>2013-09-30</startDate>
+          <endDate>2013-10-31</endDate>
+          <numberOfDays>30</numberOfDays>
+          <rateFixingDate>2013-09-30</rateFixingDate>
+          <baseRate>0.0018</baseRate>
+          <allInRate>0.0268</allInRate>
+          <paymentProjection>
+            <nextPaymentDate>2013-10-31</nextPaymentDate>
+            <projectedAmount>
+              <currency>USD</currency>
+              <amount>724642.22</amount>
+              <shareAmount>16271.54</shareAmount>
+            </projectedAmount>
+          </paymentProjection>
+        </legacyFloatingRateAccrual>
+      </contract>
+      <contract id="CONT76543">
+        <partyReference href="BANKOFAGENTSNA" />
+        <contractId contractIdScheme="http://www.bankofagentsna.com/messaging/contractids">NC7654</contractId>
+        <facilityReference href="FAC54321" />
+        <effectiveDate>2013-09-30</effectiveDate>
+        <borrowerPartyReference href="BORROWERINC" />
+        <amount>
+          <currency>USD</currency>
+          <amount>10000000.00</amount>
+          <shareAmount>224545.83</shareAmount>
+        </amount>
+        <legacyFloatingRateAccrual>
+          <accrualOptionId accrualTypeIdScheme="http://www.bankofagentsna.com/messaging/accrualtypeids">63425</accrualOptionId>
+          <dayCountFraction dayCountFractionScheme="http://www.fpml.org/coding-scheme/day-count-fraction">ACT/360</dayCountFraction>
+          <legacyFloatingRateIndex legacyFloatingRateIndexScheme="http://www.fpml.org/coding-scheme/floating-rate-index">USD-Prime-Reference Banks</legacyFloatingRateIndex>
+          <spread>0.00</spread>
+          <startDate>2013-09-30</startDate>
+          <endDate>2013-10-31</endDate>
+          <numberOfDays>30</numberOfDays>
+        </legacyFloatingRateAccrual>
+      </contract>
+    </newContracts>
+  </rollover>
+  <interestPayment>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73472</eventId>
+    </eventIdentifier>
+    <parentEventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">RolloverGroup10</eventId>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73400</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73472</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">62956</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">61948</eventId>
+      </childEventIdentifier>
+    </parentEventIdentifier>
+    <lenderPartyReference href="LENDERCORP" />
+    <cashPayable>
+      <payerPartyReference href="BANKOFAGENTSNA" />
+      <receiverPartyReference href="LENDERCORP" />
+      <netAmount>
+        <currency>USD</currency>
+        <amount>40882.65</amount>
+      </netAmount>
+      <taxWithholding>
+        <amount>
+          <currency>USD</currency>
+          <amount>0.00</amount>
+        </amount>
+      </taxWithholding>
+    </cashPayable>
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <borrowerPartyReference href="BORROWERINC" />
+    <effectiveDate>2013-09-30</effectiveDate>
+    <loanContractReference href="CONT12345" />
+    <startDate>2013-08-30</startDate>
+    <endDate>2013-09-29</endDate>
+    <lenderShareCalculationMethod>ContractPositionThruPeriod</lenderShareCalculationMethod>
+    <amount>
+      <currency>USD</currency>
+      <amount>1820681.67</amount>
+      <shareAmount>40882.65</shareAmount>
+    </amount>
+    <accrualSchedule>
+      <startDate>2013-08-30</startDate>
+      <endDate>2013-09-29</endDate>
+      <numberOfDays>31</numberOfDays>
+      <referenceAmount>
+        <currency>USD</currency>
+        <amount>786000000.00</amount>
+        <shareAmount>17649301.81</shareAmount>
+      </referenceAmount>
+      <rate>0.0269</rate>
+      <accrualAmount>
+        <currency>USD</currency>
+        <amount>1820681.67</amount>
+        <shareAmount>40882.65</shareAmount>
+      </accrualAmount>
+    </accrualSchedule>
+  </interestPayment>
+  <interestPayment>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">62956</eventId>
+    </eventIdentifier>
+    <parentEventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">RolloverGroup10</eventId>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73400</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73472</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">62956</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">61948</eventId>
+      </childEventIdentifier>
+    </parentEventIdentifier>
+    <lenderPartyReference href="LENDERCORP" />
+    <cashPayable>
+      <payerPartyReference href="BANKOFAGENTSNA" />
+      <receiverPartyReference href="LENDERCORP" />
+      <netAmount>
+        <currency>USD</currency>
+        <amount>16852.39</amount>
+      </netAmount>
+      <taxWithholding>
+        <amount>
+          <currency>USD</currency>
+          <amount>0.00</amount>
+        </amount>
+      </taxWithholding>
+    </cashPayable>
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <borrowerPartyReference href="BORROWERINC" />
+    <effectiveDate>2013-09-30</effectiveDate>
+    <loanContractReference href="CONT54321" />
+    <startDate>2013-08-30</startDate>
+    <endDate>2013-09-29</endDate>
+    <lenderShareCalculationMethod>ContractPositionThruPeriod</lenderShareCalculationMethod>
+    <amount>
+      <currency>USD</currency>
+      <amount>750510.00</amount>
+      <shareAmount>16852.39</shareAmount>
+    </amount>
+    <accrualSchedule>
+      <startDate>2013-08-30</startDate>
+      <endDate>2013-09-29</endDate>
+      <numberOfDays>31</numberOfDays>
+      <referenceAmount>
+        <currency>USD</currency>
+        <amount>324000000.00</amount>
+        <shareAmount>7275284.72</shareAmount>
+      </referenceAmount>
+      <referenceAmountType>Funded</referenceAmountType>
+      <rate>0.0269</rate>
+      <accrualAmount>
+        <currency>USD</currency>
+        <amount>750510.00</amount>
+        <shareAmount>16852.39</shareAmount>
+      </accrualAmount>
+    </accrualSchedule>
+  </interestPayment>
+  <borrowing>
+    <eventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">61948</eventId>
+    </eventIdentifier>
+    <parentEventIdentifier>
+      <partyReference href="BANKOFAGENTSNA" />
+      <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">RolloverGroup10</eventId>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73400</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">73472</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">62956</eventId>
+      </childEventIdentifier>
+      <childEventIdentifier>
+        <partyReference href="BANKOFAGENTSNA" />
+        <eventId eventIdScheme="http://www.bankofagentsna.com/messaging/eventids">61948</eventId>
+      </childEventIdentifier>
+    </parentEventIdentifier>
+    <lenderPartyReference href="LENDERCORP" />
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <borrowerPartyReference href="BORROWERINC" />
+    <effectiveDate>2014-09-05</effectiveDate>
+    <loanContractReference href="CONT76543" />
+    <amount>
+      <currency>USD</currency>
+      <amount>10000000.00</amount>
+      <shareAmount>224545.83</shareAmount>
+    </amount>
+  </borrowing>
+  <facilitySummary id="FAC54321">
+    <partyReference href="BANKOFAGENTSNA" />
+    <instrumentId instrumentIdScheme="http://www.cusip.com/">F123999REV</instrumentId>
+    <description>Revolver</description>
+    <borrowerPartyReference href="BORROWERINC" />
+    <agentPartyReference href="BANKOFAGENTSNA" />
+    <startDate>2013-01-01</startDate>
+    <currentCommitment>
+      <totalCommitmentAmount>
+        <currency>USD</currency>
+        <amount>1110000000.00</amount>
+        <shareAmount>24924586.53</shareAmount>
+      </totalCommitmentAmount>
+    </currentCommitment>
+  </facilitySummary>
+  <contractSummary id="CONT12345">
+    <partyReference href="BANKOFAGENTSNA" />
+    <contractId contractIdScheme="http://www.bankofagentsna.com/messaging/contractids">CC1234</contractId>
+    <facilityReference href="FAC54321" />
+    <effectiveDate>2013-08-30</effectiveDate>
+    <borrowerPartyReference href="BORROWERINC" />
+    <amount>
+      <currency>USD</currency>
+      <amount>786000000.00</amount>
+      <shareAmount>17649301.81</shareAmount>
+    </amount>
+  </contractSummary>
+  <contractSummary id="CONT54321">
+    <partyReference href="BANKOFAGENTSNA" />
+    <contractId contractIdScheme="http://www.bankofagentsna.com/messaging/contractids">CC4321</contractId>
+    <facilityReference href="FAC54321" />
+    <effectiveDate>2013-08-30</effectiveDate>
+    <borrowerPartyReference href="BORROWERINC" />
+    <amount>
+      <currency>USD</currency>
+      <amount>324000000.00</amount>
+      <shareAmount>7275284.72</shareAmount>
+    </amount>
+  </contractSummary>
+  <party id="BANKOFAGENTSNA">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US2A432121</partyId>
+  </party>
+  <party id="BORROWERINC">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US3B789454</partyId>
+  </party>
+  <party id="COBORROWERINC">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US4C147258</partyId>
+  </party>
+  <party id="LENDERCORP">
+    <partyId partyIdScheme="http://www.loanmarketdirectory.com/external/schemes/MEI">US5L567878</partyId>
+  </party>
+</loanBulkServicingNotification>
+

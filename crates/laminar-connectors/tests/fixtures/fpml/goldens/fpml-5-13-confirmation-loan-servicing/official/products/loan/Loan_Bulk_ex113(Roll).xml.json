@@ -1,0 +1,233 @@
+[
+  {
+    "context": "loanBulkServicingNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "8c550aa61d2d377cc73ecadc41c11a49dd33fc1c179a12bf3aed7c7c46733336",
+    "event": {
+      "base": {
+        "event_identifiers": [
+          {
+            "event_id": "64102",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "parent_event_ids": [
+          "RolloverGroup13"
+        ]
+      },
+      "current_contract_hrefs": [
+        "CONT12345"
+      ],
+      "effective_date": "2014-01-15",
+      "new_contracts": [
+        {
+          "accrual_type": "legacyFloatingRateAccrual",
+          "amount": {
+            "amount": "8100000.000000000000000000",
+            "currency": "GBP",
+            "share_amount": "1139062.500000000000000000"
+          },
+          "borrower_party_href": "BORROWERINC",
+          "contract_ids": [
+            "NC5678"
+          ],
+          "effective_date": "2014-01-15",
+          "facility_href": "FAC54321",
+          "id": "CONT67890",
+          "party_href": "BANKOFAGENTSNA",
+          "repricing_date": "2014-02-14"
+        }
+      ]
+    },
+    "event_type": "rollover",
+    "facility_identifiers": [
+      {
+        "description": "Revolver",
+        "id": "FAC54321",
+        "instrument_ids": [
+          "F123999REV"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "615254",
+    "notice_date": "2014-01-13",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 2,
+    "row_locator": "/loanBulkServicingNotification/rollover",
+    "row_ordinal": 0,
+    "sent_by": "US2A432121"
+  },
+  {
+    "context": "loanBulkServicingNotification",
+    "creation_time_utc": "2013-10-21T09:30:47Z",
+    "creation_timestamp": {
+      "local": "2013-10-21T09:30:47",
+      "offset_minutes": 0,
+      "utc": "2013-10-21T09:30:47Z"
+    },
+    "document_root": "loanBulkServicingNotification",
+    "document_sha256": "8c550aa61d2d377cc73ecadc41c11a49dd33fc1c179a12bf3aed7c7c46733336",
+    "event": {
+      "accrual_schedule": [
+        {
+          "accrual_amount": {
+            "amount": "7380.000000000000000000",
+            "currency": "GBP",
+            "share_amount": "1037.810000000000000000"
+          },
+          "end_date": "2013-12-31",
+          "number_of_days": 16,
+          "rate": "0.020500000000000000",
+          "reference_amount": {
+            "amount": "8100000.000000000000000000",
+            "currency": "GBP",
+            "share_amount": "1139062.500000000000000000"
+          },
+          "start_date": "2013-12-16"
+        },
+        {
+          "accrual_amount": {
+            "amount": "6457.500000000000000000",
+            "currency": "GBP",
+            "share_amount": "908.090000000000000000"
+          },
+          "end_date": "2014-01-14",
+          "number_of_days": 14,
+          "rate": "0.020500000000000000",
+          "reference_amount": {
+            "amount": "8100000.000000000000000000",
+            "currency": "GBP",
+            "share_amount": "1139062.500000000000000000"
+          },
+          "start_date": "2014-01-01"
+        }
+      ],
+      "agent_party_href": "BANKOFAGENTSNA",
+      "amount": {
+        "amount": "13837.500000000000000000",
+        "currency": "GBP",
+        "share_amount": "1037.810000000000000000"
+      },
+      "base": {
+        "cash_payable": [
+          {
+            "net_amount": {
+              "amount": "1037.810000000000000000",
+              "currency": "GBP",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payer_party_href": "BANKOFAGENTSNA",
+            "receiver_party_href": "LENDERCORP"
+          }
+        ],
+        "event_identifiers": [
+          {
+            "event_id": "64125",
+            "event_id_scheme": "http://www.bankofagentsna.com/messaging/eventids",
+            "party_href": "BANKOFAGENTSNA"
+          }
+        ],
+        "lender_party_hrefs": [
+          "LENDERCORP"
+        ],
+        "parent_event_ids": [
+          "RolloverGroup13"
+        ]
+      },
+      "borrower_party_href": "BORROWERINC",
+      "calculation_method": "ContractPositionThruPeriod",
+      "effective_date": "2014-01-15",
+      "end_date": "2013-12-31",
+      "loan_contract_hrefs": [
+        "CONT12345"
+      ],
+      "start_date": "2013-12-16"
+    },
+    "event_type": "interestPayment",
+    "facility_identifiers": [
+      {
+        "description": "Revolver",
+        "id": "FAC54321",
+        "instrument_ids": [
+          "F123999REV"
+        ],
+        "party_href": "BANKOFAGENTSNA"
+      }
+    ],
+    "fpml_version": "5-13",
+    "is_correction": false,
+    "message_id": "615254",
+    "notice_date": "2014-01-13",
+    "parties": [
+      {
+        "id": "BANKOFAGENTSNA",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US2A432121"
+          }
+        ]
+      },
+      {
+        "id": "BORROWERINC",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US3B789454"
+          }
+        ]
+      },
+      {
+        "id": "LENDERCORP",
+        "party_ids": [
+          {
+            "scheme": "http://www.loanmarketdirectory.com/external/schemes/MEI",
+            "value": "US5L567878"
+          }
+        ]
+      }
+    ],
+    "row_count": 2,
+    "row_locator": "/loanBulkServicingNotification/interestPayment",
+    "row_ordinal": 1,
+    "sent_by": "US2A432121"
+  }
+]

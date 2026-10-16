@@ -1,0 +1,50 @@
+[
+  {
+    "actual_build": 7,
+    "document_bytes": 5190,
+    "document_root": "dataDocument",
+    "document_sha256": "bfd24acd13cb49d7d53ade5d4c1743226341c9b91d3b95f4481d3dbc7f69b91e",
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "trades": [
+      {
+        "locator": "/dataDocument/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "2"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "2"
+            ]
+          }
+        ],
+        "product_type": "equityOptionTransactionSupplement",
+        "trade_date": "2006-02-09"
+      }
+    ]
+  }
+]

@@ -1,0 +1,70 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CS/2009/09/09/32-09",
+    "correlation_id_scheme": "http://www.example.com/conversationId",
+    "creation_time_utc": "2009-10-09T16:38:00Z",
+    "document_bytes": 15675,
+    "document_root": "requestConfirmation",
+    "document_sha256": "147482ceb74214383b3033dbeb4267795bb6fde9e0a62e72e0700c4764d255e0",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2009-10-09T16:38:00",
+        "offset_minutes": 0,
+        "utc": "2009-10-09T16:38:00Z"
+      },
+      "message_id": "MS/2009/10/09/15-99",
+      "message_id_scheme": "http://www.example.com/messageId",
+      "send_to": [
+        "PARTYBBIC2"
+      ],
+      "sent_by": "PARTYABIC1"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ],
+        "party_name": "AAA Bank"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ],
+        "party_name": "Mega Bank Ltd"
+      }
+    ],
+    "sequence_number": 2,
+    "trades": [
+      {
+        "locator": "/requestConfirmation/trade",
+        "party_trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1558488"
+            ]
+          },
+          {
+            "party_href": "party2",
+            "trade_ids": [
+              "8848551"
+            ]
+          }
+        ],
+        "product_type": "equitySwapTransactionSupplement",
+        "trade_date": "2009-09-09"
+      }
+    ]
+  }
+]

@@ -1,0 +1,309 @@
+# Shared namespaces, sets, and struct templates for FpML 5.13 confirmation-view profiles.
+# Templates mirror FpML complex types; a field's path is relative to the element the template
+# is applied to.
+
+[namespaces]
+"" = "http://www.fpml.org/FpML-5/confirmation"
+
+[sets]
+product = { substitution = "product" }
+exercise = { substitution = "exercise" }
+
+# ── Identifiers and parties ───────────────────────────────────────────────────
+
+[structs.party]
+description = "A party declared in the document"
+fields = [
+  { name = "id", type = "utf8", path = "@id", description = "Document-local id; not a global identifier" },
+  { name = "party_ids", type = "list<struct<party_id>>", path = "partyId" },
+  { name = "party_name", type = "utf8", path = "partyName" },
+  { name = "classification", type = "list<utf8>", path = "classification" },
+  { name = "country", type = "utf8", path = "country" },
+]
+
+[structs.party_id]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@partyIdScheme" },
+]
+
+[structs.account]
+description = "An account declared in the document"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "account_ids", type = "list<struct<account_id>>", path = "accountId" },
+  { name = "account_name", type = "utf8", path = "accountName" },
+  { name = "beneficiary_href", type = "utf8", path = "accountBeneficiary/@href" },
+]
+
+[structs.account_id]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@accountIdScheme" },
+]
+
+[structs.party_trade_identifier]
+description = "Trade identifiers assigned by one party, with that party's own identifiers"
+fields = [
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "party_ids", type = "list<struct<party_id>>", path = "partyReference->partyId" },
+  { name = "account_href", type = "utf8", path = "accountReference/@href" },
+  { name = "issuer", type = "struct<issuer>", path = "issuer" },
+  { name = "trade_ids", type = "list<struct<trade_id>>", path = "tradeId" },
+  { name = "version_ids", type = "list<struct<trade_id>>", path = "versionedTradeId/tradeId" },
+  { name = "versions", type = "list<int64>", path = "versionedTradeId/version" },
+  { name = "linked_trade_ids", type = "list<struct<linked_trade_id>>", path = "linkId" },
+]
+
+[structs.issuer]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@issuerIdScheme" },
+]
+
+[structs.trade_id]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@tradeIdScheme" },
+]
+
+[structs.linked_trade_id]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@linkIdScheme" },
+]
+
+[structs.product_id]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@productIdScheme" },
+]
+
+[structs.product_type]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@productTypeScheme" },
+]
+
+[structs.asset_class]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@assetClassScheme" },
+]
+
+[structs.product_model]
+description = "FpML Product.model: classification shared by every product"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "primary_asset_class", type = "struct<asset_class>", path = "primaryAssetClass" },
+  { name = "secondary_asset_classes", type = "list<struct<asset_class>>", path = "secondaryAssetClass" },
+  { name = "product_types", type = "list<struct<product_type>>", path = "productType" },
+  { name = "product_ids", type = "list<struct<product_id>>", path = "productId" },
+]
+
+# ── Money, quantities, and schedules ──────────────────────────────────────────
+
+[structs.money]
+fields = [
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "currency_scheme", type = "utf8", path = "currency/@currencyScheme" },
+  { name = "amount", type = "decimal", path = "amount" },
+]
+
+[structs.currency]
+fields = [
+  { name = "value", type = "utf8", path = "." },
+  { name = "scheme", type = "utf8", path = "@currencyScheme" },
+]
+
+[structs.step]
+fields = [
+  { name = "step_date", type = "date32", path = "stepDate" },
+  { name = "step_value", type = "decimal", path = "stepValue" },
+]
+
+[structs.schedule]
+description = "Initial value with dated steps (FpML Schedule)"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "initial_value", type = "decimal", path = "initialValue" },
+  { name = "steps", type = "list<struct<step>>", path = "step" },
+]
+
+[structs.amount_schedule]
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "initial_value", type = "decimal", path = "initialValue" },
+  { name = "steps", type = "list<struct<step>>", path = "step" },
+  { name = "currency", type = "utf8", path = "currency" },
+]
+
+[structs.period]
+fields = [
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+]
+
+[structs.frequency]
+fields = [
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+  { name = "roll_convention", type = "utf8", path = "rollConvention" },
+]
+
+# ── Dates and business-day conventions ───────────────────────────────────────
+
+[structs.business_day_adjustments]
+description = "Convention and business centres, resolving a businessCentersReference"
+fields = [
+  { name = "business_day_convention", type = "utf8", path = "businessDayConvention" },
+  { name = "business_centers", type = "list<utf8>", path = "businessCenters/businessCenter | businessCentersReference->businessCenter" },
+  { name = "business_centers_href", type = "utf8", path = "businessCentersReference/@href" },
+]
+
+[structs.adjustable_date2]
+fields = [
+  { name = "unadjusted_date", type = "date32", path = "unadjustedDate" },
+  { name = "date_adjustments", type = "struct<business_day_adjustments>", path = "dateAdjustments" },
+  { name = "date_adjustments_href", type = "utf8", path = "dateAdjustmentsReference/@href" },
+  { name = "adjusted_date", type = "date32", path = "adjustedDate" },
+]
+
+[structs.adjustable_date]
+description = "Unadjusted date as supplied, its adjustments, and any supplied adjusted date"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "unadjusted_date", type = "date32", path = "unadjustedDate" },
+  { name = "date_adjustments", type = "struct<business_day_adjustments>", path = "dateAdjustments" },
+  { name = "adjusted_date", type = "date32", path = "adjustedDate" },
+]
+
+[structs.relative_date_offset]
+description = "Offset from another date in the document (not computed here)"
+fields = [
+  { name = "period_multiplier", type = "int64", path = "periodMultiplier" },
+  { name = "period", type = "utf8", path = "period" },
+  { name = "day_type", type = "utf8", path = "dayType" },
+  { name = "business_day_convention", type = "utf8", path = "businessDayConvention" },
+  { name = "business_centers", type = "list<utf8>", path = "businessCenters/businessCenter | businessCentersReference->businessCenter" },
+  { name = "date_relative_to_href", type = "utf8", path = "dateRelativeTo/@href" },
+  { name = "adjusted_date", type = "date32", path = "adjustedDate" },
+]
+
+[structs.adjustable_or_relative_date]
+fields = [
+  { name = "adjustable_date", type = "struct<adjustable_date>", path = "adjustableDate" },
+  { name = "relative_date", type = "struct<relative_date_offset>", path = "relativeDate" },
+]
+
+[structs.adjustable_dates]
+fields = [
+  { name = "unadjusted_dates", type = "list<date32>", path = "unadjustedDate" },
+  { name = "date_adjustments", type = "struct<business_day_adjustments>", path = "dateAdjustments" },
+  { name = "adjusted_dates", type = "list<date32>", path = "adjustedDate" },
+]
+
+[structs.business_center_time]
+fields = [
+  { name = "hour_minute_time", type = "utf8", path = "hourMinuteTime" },
+  { name = "business_center", type = "utf8", path = "businessCenter" },
+]
+
+# ── Payments and settlement ───────────────────────────────────────────────────
+
+[structs.fx_spot_rate_source]
+fields = [
+  { name = "rate_source", type = "utf8", path = "primaryRateSource/rateSource" },
+  { name = "rate_source_page", type = "utf8", path = "primaryRateSource/rateSourcePage" },
+  { name = "secondary_rate_source", type = "utf8", path = "secondaryRateSource/rateSource" },
+  { name = "fixing_time", type = "struct<business_center_time>", path = "fixingTime" },
+]
+
+[structs.basic_quotation]
+description = "A quoted value with its measure, units, side, and source (BasicQuotation)"
+fields = [
+  { name = "value", type = "decimal", path = "value" },
+  { name = "measure_type", type = "utf8", path = "measureType" },
+  { name = "quote_units", type = "utf8", path = "quoteUnits" },
+  { name = "side", type = "utf8", path = "side" },
+  { name = "currency", type = "utf8", path = "currency" },
+  { name = "currency_type", type = "utf8", path = "currencyType" },
+  { name = "timing", type = "utf8", path = "timing" },
+  { name = "business_center", type = "utf8", path = "businessCenter" },
+  { name = "exchange_id", type = "utf8", path = "exchangeId" },
+  { name = "pricing_model", type = "utf8", path = "pricingModel" },
+  { name = "time", type = "datetime", path = "time" },
+  { name = "valuation_date", type = "date32", path = "valuationDate" },
+  { name = "expiry_time", type = "datetime", path = "expiryTime" },
+  { name = "cashflow_type", type = "utf8", path = "cashflowType" },
+]
+
+[structs.payment]
+description = "A payment between two parties (fees, premiums, other payments)"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<adjustable_date>", path = "paymentDate" },
+  { name = "payment_type", type = "utf8", path = "paymentType" },
+]
+
+[structs.simple_payment]
+description = "A payment whose date may be adjustable or relative (SimplePayment)"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<adjustable_or_relative_date>", path = "paymentDate" },
+]
+
+[structs.premium]
+fields = [
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<adjustable_or_relative_date>", path = "paymentDate" },
+  { name = "price_per_option", type = "struct<money>", path = "pricePerOption" },
+  { name = "percentage_of_notional", type = "decimal", path = "percentageOfNotional" },
+]
+
+# ── Trade header ──────────────────────────────────────────────────────────────
+
+[structs.trade_header]
+fields = [
+  { name = "party_trade_identifiers", type = "list<struct<party_trade_identifier>>", path = "partyTradeIdentifier" },
+  { name = "trade_date", type = "date32", path = "tradeDate" },
+  { name = "party_trade_information", type = "list<struct<party_trade_information>>", path = "partyTradeInformation" },
+  { name = "cleared_date", type = "date32", path = "clearedDate" },
+]
+
+[structs.party_trade_information]
+fields = [
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "account_href", type = "utf8", path = "accountReference/@href" },
+  { name = "trader", type = "list<utf8>", path = "trader" },
+  { name = "execution_date_time", type = "datetime", path = "executionDateTime" },
+  { name = "confirmation_method", type = "utf8", path = "confirmationMethod" },
+  { name = "execution_venue_type", type = "utf8", path = "executionVenueType" },
+  { name = "intent_to_clear", type = "bool", path = "intentToClear" },
+  { name = "clearing_status", type = "utf8", path = "clearingStatus" },
+  { name = "execution_type", type = "utf8", path = "executionType" },
+]
+
+[structs.calculation_agent]
+fields = [
+  { name = "party_hrefs", type = "list<utf8>", path = "calculationAgentPartyReference/@href" },
+  { name = "calculation_agent_party", type = "utf8", path = "calculationAgentParty" },
+]
+
+[structs.documentation]
+fields = [
+  { name = "master_agreement_type", type = "utf8", path = "masterAgreement/masterAgreementType" },
+  { name = "master_agreement_date", type = "date32", path = "masterAgreement/masterAgreementDate" },
+  { name = "master_confirmation_type", type = "utf8", path = "masterConfirmation/masterConfirmationType" },
+  { name = "master_confirmation_date", type = "date32", path = "masterConfirmation/masterConfirmationDate" },
+  { name = "contractual_definitions", type = "list<utf8>", path = "contractualDefinitions" },
+  { name = "contractual_matrix", type = "list<utf8>", path = "contractualMatrix/matrixType" },
+]

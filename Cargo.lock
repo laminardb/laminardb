@@ -5250,6 +5250,7 @@ dependencies = [
  "iceberg-storage-opendal",
  "jiff",
  "laminar-core",
+ "laminardb-libxml2-ffi",
  "laminardb-pgwire-replication",
  "laminardb-quickfix-ffi",
  "libc",
@@ -5263,6 +5264,7 @@ dependencies = [
  "postgres-types",
  "prometheus",
  "proptest",
+ "quick-xml 0.41.0",
  "quick_cache",
  "rand 0.10.3",
  "rcgen",
@@ -5285,6 +5287,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.28.0",
  "tokio-util",
+ "toml",
  "tonic",
  "tracing",
  "tungstenite 0.28.0",
@@ -5513,6 +5516,13 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "laminardb-libxml2-ffi"
+version = "0.32.0"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]

@@ -1,0 +1,249 @@
+# Message envelopes and the root-level content of every FpML confirmation-view document: message
+# headers, correlation, trade references, post-trade events, statuses, reasons, and loan
+# notification identifiers. Trades and loan events nested in a document are summarized here
+# (identifiers, dates, product or event type, locator) and typed in full by the trade and loan
+# profiles; `locator` joins the two.
+include = ["common.toml"]
+
+[sets]
+post_trade_event = [
+  "amendment", "increase", "termination", "novation", "change", "withdrawal", "deClear",
+  "optionExercise", "optionExpiry", "optionEvent", "observation", "reset",
+]
+credit_event = { substitution = "creditEvent" }
+facility_event = { substitution = "facilityEventGroup" }
+lc_event = { substitution = "lcEventGroup" }
+loan_contract_event = { substitution = "loanContractEventGroup" }
+loan_allocation_event = { substitution = "loanAllocationEventGroup" }
+loan_trade_event = { substitution = "loanTradeEventGroup" }
+facility = { substitution = "facilityGroup" }
+
+[structs.message_header]
+description = "Message header (request, response, notification, or exception header)"
+fields = [
+  { name = "message_id", type = "utf8", path = "messageId" },
+  { name = "message_id_scheme", type = "utf8", path = "messageId/@messageIdScheme" },
+  { name = "in_reply_to", type = "utf8", path = "inReplyTo" },
+  { name = "sent_by", type = "utf8", path = "sentBy" },
+  { name = "sent_by_scheme", type = "utf8", path = "sentBy/@messageAddressScheme" },
+  { name = "send_to", type = "list<utf8>", path = "sendTo" },
+  { name = "copy_to", type = "list<utf8>", path = "copyTo" },
+  { name = "creation_timestamp", type = "datetime", path = "creationTimestamp" },
+  { name = "expiry_timestamp", type = "datetime", path = "expiryTimestamp" },
+  { name = "implementation_specification_name", type = "utf8", path = "implementationSpecification/name" },
+  { name = "implementation_specification_version", type = "utf8", path = "implementationSpecification/version" },
+  { name = "party_message_information_hrefs", type = "list<utf8>", path = "partyMessageInformation/partyReference/@href" },
+]
+
+[structs.on_behalf_of]
+fields = [
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "account_hrefs", type = "list<utf8>", path = "accountReference/@href" },
+]
+
+[structs.trade_identifier]
+description = "Party trade identifier: the party, issuer, and trade or versioned trade ids"
+fields = [
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "issuer", type = "utf8", path = "issuer" },
+  { name = "trade_ids", type = "list<utf8>", path = "tradeId | versionedTradeId/tradeId" },
+]
+
+[structs.trade_reference]
+description = "A trade in the document, summarized; the trade profiles type it in full"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "locator", type = "utf8", path = "#locator" },
+  { name = "trade_date", type = "date32", path = "tradeHeader/tradeDate" },
+  { name = "party_trade_identifiers", type = "list<struct<trade_identifier>>", path = "tradeHeader/partyTradeIdentifier" },
+  { name = "product_type", type = "utf8", path = "{product}/#name" },
+]
+
+[structs.event_identifier]
+fields = [
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "event_id", type = "utf8", path = "eventId" },
+  { name = "event_id_scheme", type = "utf8", path = "eventId/@eventIdScheme" },
+]
+
+[structs.reason]
+fields = [
+  { name = "reason_code", type = "utf8", path = "reasonCode" },
+  { name = "location", type = "utf8", path = "location" },
+  { name = "description", type = "utf8", path = "description", whitespace = "collapse" },
+  { name = "validation_rule_id", type = "utf8", path = "validationRuleId" },
+]
+
+[structs.trading_event]
+description = "A post-trade event (amendment, increase, termination, novation, change, withdrawal, de-clear, option exercise, expiry or event, observation, or reset)"
+fields = [
+  { name = "event_type", type = "utf8", path = "#name" },
+  { name = "locator", type = "utf8", path = "#locator" },
+  { name = "event_identifiers", type = "list<struct<event_identifier>>", path = "eventIdentifier" },
+  { name = "trade_identifiers", type = "list<struct<trade_identifier>>", path = "tradeIdentifier | partyTradeIdentifier | oldTradeIdentifier | tradeReference/partyTradeIdentifier" },
+  { name = "original_trades", type = "list<struct<trade_reference>>", path = "originalTrade | oldTrade" },
+  { name = "trades", type = "list<struct<trade_reference>>", path = "trade | resultingTrade | newTrade" },
+  { name = "new_trade_identifiers", type = "list<struct<trade_identifier>>", path = "newTradeIdentifier" },
+  { name = "agreement_date", type = "date32", path = "agreementDate" },
+  { name = "execution_date_time", type = "datetime", path = "executionDateTime" },
+  { name = "effective_date", type = "date32", path = "effectiveDate" },
+  { name = "change_in_notional_amounts", type = "list<struct<money>>", path = "changeInNotionalAmount | changeInNotional" },
+  { name = "outstanding_notional_amounts", type = "list<struct<money>>", path = "outstandingNotionalAmount" },
+  { name = "change_in_number_of_options", type = "decimal", path = "changeInNumberOfOptions" },
+  { name = "outstanding_number_of_options", type = "decimal", path = "outstandingNumberOfOptions" },
+  { name = "payments", type = "list<struct<payment>>", path = "payment" },
+  { name = "transferor_href", type = "utf8", path = "transferor/@href" },
+  { name = "transferee_href", type = "utf8", path = "transferee/@href" },
+  { name = "exercise_date", type = "date32", path = "exerciseDate" },
+  { name = "exercise_action", type = "utf8", path = "exerciseAction" },
+  { name = "full_exercise", type = "bool", path = "fullExercise" },
+  { name = "exercise_in_notional_amount", type = "struct<money>", path = "exerciseInNotionalAmount" },
+  { name = "settlement_type", type = "utf8", path = "settlementType" },
+  { name = "date", type = "date32", path = "date" },
+  { name = "observed_value", type = "decimal", path = "observedValue" },
+  { name = "reset_value", type = "decimal", path = "resetValue" },
+  { name = "requested_action", type = "utf8", path = "requestedAction" },
+  { name = "reasons", type = "list<utf8>", path = "reason" },
+]
+
+[structs.trade_reference_information]
+fields = [
+  { name = "originating_event", type = "utf8", path = "originatingEvent" },
+  { name = "terminating_event", type = "utf8", path = "terminatingEvent" },
+  { name = "party_trade_identifiers", type = "list<struct<trade_identifier>>", path = "partyTradeIdentifier" },
+  { name = "product_type", type = "utf8", path = "productType" },
+  { name = "product_id", type = "utf8", path = "productId" },
+]
+
+[structs.trade_package]
+fields = [
+  { name = "package_types", type = "list<utf8>", path = "packageHeader/packageType" },
+  { name = "size", type = "decimal", path = "packageHeader/size" },
+  { name = "trades", type = "list<struct<trade_reference>>", path = "trade" },
+  { name = "trade_identifiers", type = "list<struct<trade_identifier>>", path = "tradeIdentifier" },
+]
+
+[structs.approval]
+fields = [
+  { name = "type", type = "utf8", path = "type" },
+  { name = "status", type = "utf8", path = "status" },
+  { name = "approver", type = "utf8", path = "approver" },
+  { name = "approving_party_href", type = "utf8", path = "approvingPartyReference/@href" },
+  { name = "approval_id", type = "utf8", path = "approvalId" },
+]
+
+[structs.allocation]
+fields = [
+  { name = "allocation_trade_identifiers", type = "list<struct<trade_identifier>>", path = "allocationTradeId" },
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "account_href", type = "utf8", path = "accountReference/@href" },
+  { name = "allocated_fraction", type = "decimal", path = "allocatedFraction" },
+  { name = "allocated_notionals", type = "list<struct<money>>", path = "allocatedNotional" },
+]
+
+[structs.status_item]
+description = "Clearing or event status item"
+fields = [
+  { name = "trade_identifiers", type = "list<struct<trade_identifier>>", path = "tradeIdentifier" },
+  { name = "event_trade_identifiers", type = "list<struct<trade_identifier>>", path = "eventIdentifier/tradeIdentifier" },
+  { name = "correlation_id", type = "utf8", path = "eventIdentifier/correlationId" },
+  { name = "sequence_number", type = "int64", path = "eventIdentifier/sequenceNumber" },
+  { name = "clearing_status", type = "utf8", path = "clearingStatusValue" },
+  { name = "status", type = "utf8", path = "status" },
+  { name = "updated_date_time", type = "datetime", path = "updatedDateTime" },
+  { name = "reasons", type = "list<struct<reason>>", path = "reason" },
+]
+
+[structs.credit_event_notice]
+fields = [
+  { name = "reference_entity_name", type = "utf8", path = "referenceEntity/entityName" },
+  { name = "reference_entity_ids", type = "list<utf8>", path = "referenceEntity/entityId" },
+  { name = "credit_event_type", type = "utf8", path = "{credit_event}/#name" },
+  { name = "notifying_party_href", type = "utf8", path = "notifyingPartyReference/@href" },
+  { name = "notified_party_href", type = "utf8", path = "notifiedPartyReference/@href" },
+  { name = "notice_date", type = "date32", path = "creditEventNoticeDate" },
+  { name = "event_date", type = "date32", path = "creditEventDate" },
+]
+
+[structs.loan_identifier]
+description = "Deal or facility identifier or summary"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "instrument_ids", type = "list<utf8>", path = "instrumentId" },
+  { name = "description", type = "utf8", path = "description" },
+]
+
+[structs.contract_identifier]
+description = "Loan contract or letter of credit identifier or summary"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "contract_ids", type = "list<utf8>", path = "contractId | versionedContractId/contractId" },
+  { name = "facility_href", type = "utf8", path = "facilityReference/@href" },
+]
+
+[structs.loan_event_reference]
+description = "A loan servicing, LC, allocation, or trade event, summarized; the loan profiles type it"
+fields = [
+  { name = "event_type", type = "utf8", path = "#name" },
+  { name = "locator", type = "utf8", path = "#locator" },
+  { name = "event_ids", type = "list<utf8>", path = "eventIdentifier/eventId" },
+  { name = "effective_date", type = "date32", path = "effectiveDate" },
+]
+
+[structs.clearing_requirement]
+fields = [
+  { name = "supervisory_body", type = "utf8", path = "supervisoryBody" },
+  { name = "mandatorily_clearable", type = "bool", path = "mandatorilyClearable" },
+  { name = "reasons", type = "list<struct<reason>>", path = "reason" },
+]
+
+[structs.loan_payment]
+description = "Loan event, allocation, or trade payment"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "payer_party_href", type = "utf8", path = "payerPartyReference/@href" },
+  { name = "receiver_party_href", type = "utf8", path = "receiverPartyReference/@href" },
+  { name = "payment_amount", type = "struct<money>", path = "paymentAmount" },
+  { name = "payment_date", type = "struct<adjustable_date>", path = "paymentDate" },
+  { name = "event_ids", type = "list<utf8>", path = "eventIdentifier/eventId" },
+  { name = "allocation_hrefs", type = "list<utf8>", path = "allocationReference/@href" },
+  { name = "trade_href", type = "utf8", path = "tradeReference/@href" },
+]
+
+[structs.loan_task]
+description = "Settlement, covenant, or legal-action task"
+fields = [
+  { name = "task_ids", type = "list<utf8>", path = "taskIdentifier/taskId" },
+  { name = "responsible_party_href", type = "utf8", path = "responsibleParty/@href" },
+  { name = "status", type = "utf8", path = "status" },
+  { name = "comment", type = "utf8", path = "comment", whitespace = "collapse" },
+]
+
+[structs.loan_status]
+description = "Legal action status or approval status"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "type", type = "utf8", path = "type" },
+  { name = "effective_date", type = "date32", path = "effectiveDate" },
+  { name = "legal_action_href", type = "utf8", path = "legalActionReference/@href" },
+  { name = "description", type = "utf8", path = "description", whitespace = "collapse" },
+]
+
+[structs.loan_obligation_identifier]
+description = "Covenant obligation or legal action identifier or summary"
+fields = [
+  { name = "id", type = "utf8", path = "@id" },
+  { name = "name", type = "utf8", path = "name" },
+  { name = "party_href", type = "utf8", path = "partyReference/@href" },
+  { name = "ids", type = "list<utf8>", path = "covenantObligationId | versionedCovenantObligationId/covenantObligationId | legalActionId | versionedLegalActionId/legalActionId" },
+  { name = "effective_date", type = "date32", path = "effectiveDate" },
+]
+
+[structs.element_reference]
+description = "A nested element typed by another profile: its name and locator"
+fields = [
+  { name = "element", type = "utf8", path = "#name" },
+  { name = "locator", type = "utf8", path = "#locator" },
+]

@@ -1,0 +1,201 @@
+[
+  {
+    "document_root": "dataDocument",
+    "document_sha256": "a4b812210616724be4b50245dfbd0eb5ef8cb5bd7940dac4ed5668a3e14212dc",
+    "documentation": {
+      "contractual_definitions": [
+        "ISDA2021"
+      ],
+      "master_agreement_type": "ISDA"
+    },
+    "fpml_version": "5-13",
+    "parties": [
+      {
+        "id": "partyA",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "partyB",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "product_type": "swap",
+    "row_locator": "/dataDocument/trade",
+    "swap": {
+      "product": {},
+      "streams": [
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "fixed_rate_schedule": {
+              "initial_value": "0.012234300000000000"
+            },
+            "notional_schedule": {
+              "currency": "AUD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "1000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "AUSY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "Y",
+              "period_multiplier": 1,
+              "roll_convention": "20"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2022-07-20"
+            },
+            "first_regular_period_start_date": "2023-04-20",
+            "id": "fixedLegCalcPeriodDates",
+            "stub_period_type": "ShortInitial",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "AUSY"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2023-04-20"
+            }
+          },
+          "id": "fixedLeg",
+          "payer_party_href": "partyA",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedLegCalcPeriodDates",
+            "first_payment_date": "2023-04-20",
+            "id": "fixedLegShort",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "AUSY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "Y",
+              "period_multiplier": 1
+            }
+          },
+          "receiver_party_href": "partyB"
+        },
+        {
+          "calculation": {
+            "day_count_fraction": "ACT/365.FIXED",
+            "fixed_rate_schedule": {
+              "initial_value": "0.012343240000000000"
+            },
+            "notional_schedule": {
+              "currency": "AUD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217",
+              "initial_value": "2000000.000000000000000000"
+            }
+          },
+          "calculation_period_dates": {
+            "calculation_period_dates_adjustments": {
+              "business_centers": [
+                "AUSY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "calculation_period_frequency": {
+              "period": "M",
+              "period_multiplier": 3,
+              "roll_convention": "20"
+            },
+            "effective_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2022-07-20"
+            },
+            "id": "fixedLeg2CalcPeriodDates",
+            "termination_date": {
+              "date_adjustments": {
+                "business_centers": [
+                  "AUSY"
+                ],
+                "business_day_convention": "MODFOLLOWING"
+              },
+              "unadjusted_date": "2023-04-20"
+            }
+          },
+          "id": "fixedLeg2",
+          "payer_party_href": "partyB",
+          "payment_dates": {
+            "calculation_period_dates_href": "fixedLeg2CalcPeriodDates",
+            "id": "fixedLeg2PaymentDates",
+            "pay_relative_to": "CalculationPeriodEndDate",
+            "payment_dates_adjustments": {
+              "business_centers": [
+                "AUSY"
+              ],
+              "business_day_convention": "MODFOLLOWING"
+            },
+            "payment_frequency": {
+              "period": "M",
+              "period_multiplier": 3
+            }
+          },
+          "receiver_party_href": "partyA"
+        }
+      ]
+    },
+    "trade_context": "dataDocument",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "partyA",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party A"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "00000"
+            }
+          ]
+        },
+        {
+          "party_href": "partyB",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+              "value": "Party B"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.swapswire.com/spec/2001/trade-id-1-0",
+              "value": "00000"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2022-07-20"
+    },
+    "trade_ordinal": 0
+  }
+]

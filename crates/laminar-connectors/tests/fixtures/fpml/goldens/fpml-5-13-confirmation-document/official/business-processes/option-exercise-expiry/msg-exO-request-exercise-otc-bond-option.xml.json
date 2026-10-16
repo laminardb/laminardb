@@ -1,0 +1,75 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR019",
+    "correlation_id_scheme": "http://www.PartyA.com/schemes/correlation-id",
+    "creation_time_utc": "2008-09-26T13:30:00Z",
+    "document_bytes": 2031,
+    "document_root": "requestExecution",
+    "document_sha256": "ffdd079c66d8b4e25a9d500794bf934fee419b838639cfe04175300f1639ee55",
+    "events": [
+      {
+        "event_type": "optionExercise",
+        "exercise_date": "2008-09-27",
+        "exercise_in_notional_amount": {
+          "amount": "10000000000.000000000000000000",
+          "currency": "JPY",
+          "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+        },
+        "locator": "/requestExecution/optionExercise",
+        "outstanding_notional_amounts": [
+          {
+            "amount": "0.000000000000000000",
+            "currency": "JPY",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          }
+        ],
+        "settlement_type": "Physical",
+        "trade_identifiers": [
+          {
+            "party_href": "party1",
+            "trade_ids": [
+              "1234"
+            ]
+          }
+        ]
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2008-09-26T13:30:00",
+        "offset_minutes": 0,
+        "utc": "2008-09-26T13:30:00Z"
+      },
+      "message_id": "10",
+      "message_id_scheme": "http://www.PartyA.com/messageId/OTC",
+      "send_to": [
+        "CLEARING_HOUSE"
+      ],
+      "sent_by": "Party A"
+    },
+    "is_correction": false,
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party A"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/dummy-party-id",
+            "value": "Party B"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

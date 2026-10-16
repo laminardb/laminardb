@@ -1,0 +1,47 @@
+[
+  {
+    "actual_build": 7,
+    "correlation_id": "CORR-requestConfirmationRetracted",
+    "correlation_id_scheme": "http://www.example.com/coding-scheme/correlation-id",
+    "creation_time_utc": "2026-07-01T07:33:00Z",
+    "document_bytes": 1188,
+    "document_root": "requestConfirmationRetracted",
+    "document_sha256": "864f308f31951ebb51d8a94d6448ce0c9057fe1ad9d09e0d10c44781a996e3b5",
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2026-07-01T09:33:00",
+        "offset_minutes": 120,
+        "utc": "2026-07-01T07:33:00Z"
+      },
+      "message_id": "SYN-requestConfirmationRetracted",
+      "message_id_scheme": "http://www.example.com/coding-scheme/message-id",
+      "send_to": [
+        "PARTYA"
+      ],
+      "sent_by": "PARTYB",
+      "sent_by_scheme": "http://www.example.com/coding-scheme/party-id"
+    },
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYA"
+          }
+        ]
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.example.com/coding-scheme/party-id",
+            "value": "PARTYB"
+          }
+        ]
+      }
+    ],
+    "sequence_number": 1
+  }
+]

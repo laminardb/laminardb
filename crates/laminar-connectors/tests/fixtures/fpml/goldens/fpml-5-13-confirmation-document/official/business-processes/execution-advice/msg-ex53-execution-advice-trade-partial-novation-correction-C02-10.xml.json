@@ -1,0 +1,141 @@
+[
+  {
+    "accounts": [
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.imgr.com/schemes/account-id",
+            "value": "FUND100"
+          }
+        ],
+        "beneficiary_href": "_fund",
+        "id": "_FUNDACCT"
+      },
+      {
+        "account_ids": [
+          {
+            "scheme": "http://www.custodian.com/account-id",
+            "value": "98765"
+          }
+        ],
+        "beneficiary_href": "_cust",
+        "id": "_CUSTACCT"
+      }
+    ],
+    "actual_build": 7,
+    "correlation_id": "IM/C002",
+    "correlation_id_scheme": "http://www.imgr.com/schemes/correlation-id",
+    "creation_time_utc": "2009-06-15T21:15:09Z",
+    "document_bytes": 7033,
+    "document_root": "executionAdvice",
+    "document_sha256": "23a2a8a3ce158794566fb5b7ee8f9924de6cea98faac6e64ebf5b9299aa47db3",
+    "events": [
+      {
+        "event_type": "novation",
+        "locator": "/executionAdvice/novation",
+        "new_trade_identifiers": [
+          {
+            "party_href": "_fund",
+            "trade_ids": [
+              "CONTR2345"
+            ]
+          }
+        ],
+        "original_trades": [
+          {
+            "locator": "/executionAdvice/novation/oldTrade",
+            "party_trade_identifiers": [
+              {
+                "party_href": "_fund",
+                "trade_ids": [
+                  "CONTR2345"
+                ]
+              }
+            ],
+            "product_type": "creditDefaultSwap",
+            "trade_date": "2009-06-08"
+          }
+        ],
+        "payments": [
+          {
+            "id": "NOVATION_FEE",
+            "payer_party_href": "_broker2",
+            "payment_amount": {
+              "amount": "53555.000000000000000000",
+              "currency": "USD",
+              "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+            },
+            "payment_date": {
+              "adjusted_date": "2009-08-16"
+            },
+            "payment_type": "Novation Fee",
+            "receiver_party_href": "_fund"
+          }
+        ],
+        "transferee_href": "_broker2",
+        "transferor_href": "_fund"
+      }
+    ],
+    "fpml_version": "5-13",
+    "header": {
+      "creation_timestamp": {
+        "local": "2009-06-15T13:15:09",
+        "offset_minutes": -480,
+        "utc": "2009-06-15T21:15:09Z"
+      },
+      "message_id": "IM/7",
+      "message_id_scheme": "http://www.imgr.com/schemes/message-id",
+      "send_to": [
+        "CUSTUS3T"
+      ],
+      "sent_by": "IMGRUS6S"
+    },
+    "is_correction": true,
+    "parties": [
+      {
+        "id": "_fund",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "959800NKRMZ8NEKQ0A23"
+          }
+        ],
+        "party_name": "INVEST MGR"
+      },
+      {
+        "id": "_broker",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300E4CDNNLJRBKF36"
+          }
+        ],
+        "party_name": "BROKER 33"
+      },
+      {
+        "id": "_broker2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300L7VWW3G1702646"
+          }
+        ],
+        "party_name": "BROKER 53"
+      },
+      {
+        "id": "_cust",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300FNRNXH6KYKUK07"
+          }
+        ],
+        "party_name": "Custodian"
+      }
+    ],
+    "payment_reference_hrefs": [
+      "NOVATION_FEE"
+    ],
+    "sequence_number": 3
+  }
+]

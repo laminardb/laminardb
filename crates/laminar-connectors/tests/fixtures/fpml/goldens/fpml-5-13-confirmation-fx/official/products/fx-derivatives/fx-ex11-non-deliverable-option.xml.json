@@ -1,0 +1,156 @@
+[
+  {
+    "correlation_id": "FX01234",
+    "creation_time_utc": "2001-01-15T08:57:00Z",
+    "creation_timestamp": {
+      "local": "2001-01-15T08:57:00",
+      "offset_minutes": 0,
+      "utc": "2001-01-15T08:57:00Z"
+    },
+    "document_root": "requestConfirmation",
+    "document_sha256": "b40667c87ce4f4acda912bde7f32e6fe6bd22edc276439573c52fecb9b297045",
+    "fpml_version": "5-13",
+    "fx_option": {
+      "buyer_party_href": "party1",
+      "call_currency_amount": {
+        "amount": "15000000.000000000000000000",
+        "currency": "USD",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "cash_settlement": {
+        "fixings": [
+          {
+            "fixing_date": "2001-04-09",
+            "fx_spot_rate_source": {
+              "fixing_time": {
+                "business_center": "VECA",
+                "hour_minute_time": "17:00:00"
+              },
+              "rate_source": "Reuters",
+              "rate_source_page": "VEB01"
+            },
+            "quoted_currency_pair": {
+              "currency1": "VEB",
+              "currency2": "USD",
+              "quote_basis": "Currency1PerCurrency2"
+            }
+          }
+        ],
+        "settlement_currency": "USD"
+      },
+      "exercise": {
+        "expiry_date": "2001-04-09",
+        "expiry_time": {
+          "business_center": "USNY",
+          "hour_minute_time": "10:00:00"
+        },
+        "style": "europeanExercise",
+        "value_date": "2001-04-11"
+      },
+      "premiums": [
+        {
+          "payer_party_href": "party1",
+          "payment_amount": {
+            "amount": "372750.000000000000000000",
+            "currency": "USD",
+            "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+          },
+          "payment_date": {
+            "adjustable_date": {
+              "date_adjustments": {
+                "business_day_convention": "NONE"
+              },
+              "unadjusted_date": "2001-01-17"
+            }
+          },
+          "receiver_party_href": "party2"
+        }
+      ],
+      "product": {
+        "product_types": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/product-taxonomy",
+            "value": "ForeignExchange:NDO"
+          }
+        ]
+      },
+      "put_currency_amount": {
+        "amount": "17250000.000000000000000000",
+        "currency": "VEB",
+        "currency_scheme": "http://www.fpml.org/coding-scheme/external/iso4217"
+      },
+      "seller_party_href": "party2",
+      "strike": {
+        "rate": "1.150000000000000000",
+        "strike_quote_basis": "PutCurrencyPerCallCurrency"
+      }
+    },
+    "is_correction": false,
+    "message_id": "FX109876",
+    "message_id_scheme": "http://www.abn.com/coding-scheme/messageId",
+    "parties": [
+      {
+        "id": "party1",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "549300VBWWV6BYQOWM67"
+          }
+        ],
+        "party_name": "PARTYA"
+      },
+      {
+        "id": "party2",
+        "party_ids": [
+          {
+            "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+            "value": "BFXS5XCH7N0Y05NIXW11"
+          }
+        ],
+        "party_name": "ABN Amro"
+      }
+    ],
+    "product_type": "fxOption",
+    "row_locator": "/requestConfirmation/trade",
+    "sent_by": "ABNANL2A",
+    "sequence_number": 1,
+    "trade_context": "requestConfirmation",
+    "trade_count": 1,
+    "trade_header": {
+      "party_trade_identifiers": [
+        {
+          "party_href": "party1",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "549300VBWWV6BYQOWM67"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-2-0",
+              "value": "IBFXO-0123456789"
+            }
+          ]
+        },
+        {
+          "party_href": "party2",
+          "party_ids": [
+            {
+              "scheme": "http://www.fpml.org/coding-scheme/external/iso17442",
+              "value": "BFXS5XCH7N0Y05NIXW11"
+            }
+          ],
+          "trade_ids": [
+            {
+              "scheme": "http://www.markets.Reuters.com/rss/spec/2001/trade-id-2-0",
+              "value": "IBFXO-0123456789"
+            }
+          ]
+        }
+      ],
+      "trade_date": "2001-01-15"
+    },
+    "trade_ordinal": 0
+  }
+]

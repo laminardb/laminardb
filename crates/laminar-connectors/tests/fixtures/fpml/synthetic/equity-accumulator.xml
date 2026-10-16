@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LaminarDB synthetic fixture, not an FpML example: a single-stock equity accumulator with
+     two observation periods and a knock-out, written because the FpML 5.13 corpus has no
+     equityAccumulator example. -->
+<requestConfirmation xmlns="http://www.fpml.org/FpML-5/confirmation" fpmlVersion="5-13">
+  <header>
+    <messageId messageIdScheme="http://www.example.com/coding-scheme/message-id">SYN-EQAC-0001</messageId>
+    <sentBy messageAddressScheme="http://www.example.com/coding-scheme/party-id">PARTYA</sentBy>
+    <creationTimestamp>2026-04-01T10:30:00+08:00</creationTimestamp>
+  </header>
+  <isCorrection>false</isCorrection>
+  <correlationId correlationIdScheme="http://www.example.com/coding-scheme/correlation-id">SYN-EQAC</correlationId>
+  <sequenceNumber>1</sequenceNumber>
+  <trade>
+    <tradeHeader>
+      <partyTradeIdentifier>
+        <partyReference href="party1" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">EQAC-2001</tradeId>
+      </partyTradeIdentifier>
+      <partyTradeIdentifier>
+        <partyReference href="party2" />
+        <tradeId tradeIdScheme="http://www.example.com/coding-scheme/trade-id">EQAC-2001</tradeId>
+      </partyTradeIdentifier>
+      <tradeDate>2026-04-01</tradeDate>
+    </tradeHeader>
+    <equityAccumulator>
+      <primaryAssetClass>Equity</primaryAssetClass>
+      <productType>Equity:Forward:Accumulator</productType>
+      <buyerPartyReference href="party1" />
+      <sellerPartyReference href="party2" />
+      <notional>
+        <currency>HKD</currency>
+        <amount>7800000.00</amount>
+      </notional>
+      <underlyer>
+        <singleUnderlyer>
+          <equity>
+            <instrumentId instrumentIdScheme="http://www.fpml.org/coding-scheme/external/instrument-id-Reuters-RIC">0700.HK</instrumentId>
+            <description>Synthetic ordinary shares</description>
+            <currency>HKD</currency>
+            <exchangeId exchangeIdScheme="http://www.fpml.org/coding-scheme/external/exchange-id-MIC">XHKG</exchangeId>
+          </equity>
+        </singleUnderlyer>
+      </underlyer>
+      <forwardPrice>
+        <currency>HKD</currency>
+        <amount>390.00</amount>
+      </forwardPrice>
+      <spotPrice>
+        <currency>HKD</currency>
+        <amount>420.50</amount>
+      </spotPrice>
+      <numberOfSharesPerDay>400</numberOfSharesPerDay>
+      <maxNoOfTradingDays>50</maxNoOfTradingDays>
+      <gearing>
+        <gearingFactor>2</gearingFactor>
+        <leverageTriggerPrice>390.00</leverageTriggerPrice>
+      </gearing>
+      <guaranteedPeriodEndDate>2026-04-15</guaranteedPeriodEndDate>
+      <observationPeriod>
+        <observationPeriodStartDate>2026-04-02</observationPeriodStartDate>
+        <observationPeriodEndDate>2026-04-30</observationPeriodEndDate>
+        <observationPeriodSettlementDate>2026-05-05</observationPeriodSettlementDate>
+        <observationPeriodNoOfTradingDays>19</observationPeriodNoOfTradingDays>
+      </observationPeriod>
+      <observationPeriod>
+        <observationPeriodStartDate>2026-05-01</observationPeriodStartDate>
+        <observationPeriodEndDate>2026-05-29</observationPeriodEndDate>
+        <observationPeriodSettlementDate>2026-06-03</observationPeriodSettlementDate>
+        <observationPeriodNoOfTradingDays>19</observationPeriodNoOfTradingDays>
+      </observationPeriod>
+      <expiration>
+        <expirationDate>
+          <adjustableDate>
+            <unadjustedDate>2026-05-29</unadjustedDate>
+            <dateAdjustments>
+              <businessDayConvention>FOLLOWING</businessDayConvention>
+              <businessCenters>
+                <businessCenter>HKHK</businessCenter>
+              </businessCenters>
+            </dateAdjustments>
+          </adjustableDate>
+        </expirationDate>
+        <equityExpirationTimeType>Close</equityExpirationTimeType>
+      </expiration>
+      <settlementType>Physical</settlementType>
+      <settlementCurrency>HKD</settlementCurrency>
+      <knockOut>
+        <level>440.00</level>
+        <triggerTimeType>Closing</triggerTimeType>
+      </knockOut>
+    </equityAccumulator>
+  </trade>
+  <party id="party1">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYA</partyId>
+  </party>
+  <party id="party2">
+    <partyId partyIdScheme="http://www.example.com/coding-scheme/party-id">PARTYB</partyId>
+  </party>
+</requestConfirmation>
