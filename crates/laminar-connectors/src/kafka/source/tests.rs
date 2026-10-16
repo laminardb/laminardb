@@ -3416,4 +3416,30 @@ mod fpml {
             "{error}"
         );
     }
+
+    #[tokio::test]
+    async fn cluster_assignment_rejects_fpml_before_io() {
+        let config = config("localhost:9092".into());
+        let binding = crate::kafka::schema_resolution::resolve_source(&config, None)
+            .await
+            .unwrap();
+        let node = laminar_core::state::NodeId(1);
+        let mut source = KafkaSource::new(Arc::new(Schema::empty()), test_config(), None);
+        source
+            .set_vnode_assignment(
+                "fpml-source",
+                Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node)),
+                node,
+            )
+            .unwrap();
+        let error = source
+            .start_fpml(&config, Some(&binding))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not qualified for cluster"),
+            "{error}"
+        );
+        assert!(source.fpml.is_none());
+    }
 }

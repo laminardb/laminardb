@@ -85,6 +85,11 @@ impl KafkaSource {
         config: &ConnectorConfig,
         binding: Option<&SchemaBinding>,
     ) -> Result<(), ConnectorError> {
+        if self.vnode_assignment.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "format 'fpml' is not qualified for cluster Kafka sources".into(),
+            ));
+        }
         let (fpml, artifact, profile) = resolve_kafka_profile(config).await?;
         let committed = binding
             .and_then(|binding| binding.value.as_ref())
