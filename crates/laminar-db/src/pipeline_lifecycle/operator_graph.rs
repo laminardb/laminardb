@@ -390,6 +390,7 @@ impl LaminarDB {
                     subscription,
                     entry.schema.clone(),
                     entry.data_notify(),
+                    Arc::clone(&entry),
                 );
                 let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                     Arc::<str>::from(format!("source:{name}")),
@@ -437,6 +438,7 @@ impl LaminarDB {
                     subscription,
                     entry.schema.clone(),
                     entry.data_notify(),
+                    Arc::clone(&entry),
                 );
                 let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                     Arc::<str>::from(format!("source:{name}")),
