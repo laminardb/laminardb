@@ -251,6 +251,51 @@ jobs:
           docker compose -f tests/docker/iceberg-compose.yml logs --tail=200
 
   # ============================================
+  # RabbitMQ source and sink (live broker)
+  # ============================================
+  # IBM MQ's live suites stay a manual lane: the queue manager image is amd64-only and licensed
+  # for developer use (IBM MQ Advanced for Developers), so CI only compiles the `ibmmq` feature.
+  rabbitmq-integration:
+    name: RabbitMQ (live broker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rabbitmq
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config mold protobuf-compiler
+      - name: Default builds exclude the AMQP client
+        run: |
+          if cargo tree -p laminar-server -e normal | grep -q '^.* lapin v'; then
+            echo "the default laminar-server graph includes lapin" >&2
+            exit 1
+          fi
+      - name: Start RabbitMQ
+        run: docker compose -f tests/docker/compose.yml up -d --wait rabbitmq
+      - name: Connector tests against the broker
+        run: cargo test -p laminar-connectors --no-default-features --features "rabbitmq fpml" --test rabbitmq_integration -- --test-threads=2
+        env:
+          LAMINAR_REQUIRE_RABBITMQ: "1"
+          LAMINAR_TEST_RABBITMQ_CONTAINER: laminardb-rabbitmq
+          LAMINAR_TEST_RABBITMQ_TLS: "1"
+      - name: SQL end-to-end tests
+        run: cargo test -p laminar-db --no-default-features --features "rabbitmq fpml" --test rabbitmq_e2e -- --test-threads=1
+        env:
+          LAMINAR_REQUIRE_RABBITMQ: "1"
+      - name: Standalone-server hard kills and broker restarts
+        run: cargo test --release -p laminar-server --no-default-features --features rabbitmq --test rabbitmq_kill -- --ignored --test-threads=1 rabbitmq_at_least_once
+        env:
+          LAMINAR_RABBITMQ_KILL_SECONDS: "45"
+      - name: Broker logs
+        if: failure()
+        run: docker compose -f tests/docker/compose.yml logs --tail=200 rabbitmq
+
+  # ============================================
   # FIX source (QuickFIX C++ engine, local acceptor)
   # ============================================
   fix-source:
@@ -309,6 +354,8 @@ jobs:
           fi
       - name: Clippy
         run: cargo clippy -p laminar-connectors --no-default-features --features "fpml files kafka" --all-targets -- -D warnings
+      - name: Clippy with the queue and FIX sources
+        run: cargo clippy -p laminar-connectors --no-default-features --features "fpml fix rabbitmq ibmmq testing" --all-targets -- -D warnings
       - name: Validator security, schema closure, coverage manifest, goldens, and files source
         run: cargo test -p laminar-connectors --no-default-features --features "fpml files" --lib -- fpml
       - name: Independent oracle over every golden
@@ -317,6 +364,12 @@ jobs:
         run: cargo test -p laminar-connectors --no-default-features --features "kafka fpml" --lib -- kafka::source::tests::fpml
       - name: SQL end-to-end across restart
         run: cargo test -p laminar-db --no-default-features --features "fpml kafka" --test fpml_source_e2e
+      - name: RabbitMQ and IBM MQ FpML options
+        run: cargo test -p laminar-connectors --no-default-features --features "rabbitmq ibmmq fpml" --lib -- config::tests::fpml
+      - name: FpML in FIX SecurityXML (local acceptor)
+        run: |
+          cargo test -p laminar-connectors --no-default-features --features "fix fpml" --lib -- fix::tests::fpml
+          cargo test -p laminar-db --no-default-features --features "fix fpml" --test fix_source_e2e fpml_in_security_xml
 
   # ============================================
   # Release Build (main/develop only)
@@ -428,6 +481,10 @@ jobs:
           cargo check -p laminar-connectors --no-default-features --features delta-lake-azure
           cargo check -p laminar-connectors --no-default-features --features delta-lake-gcs
           cargo check -p laminar-connectors --no-default-features --features parquet-lookup
+          cargo check -p laminar-connectors --all-targets --no-default-features --features rabbitmq
+          # IBM MQ loads IBM's client library at run time; building needs no IBM software.
+          cargo check -p laminar-connectors --all-targets --no-default-features --features ibmmq
+          cargo check -p laminar-server --no-default-features --features rabbitmq,ibmmq
 
           # Iceberg catalog and storage isolation
           cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-core
@@ -663,7 +720,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, mongodb-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, mongodb-cdc-integration, rabbitmq-integration, features, iceberg-integration, dependency-generations, msrv, docs, audit, deny, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:

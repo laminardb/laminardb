@@ -3387,7 +3387,7 @@ mod fpml {
     async fn only_document_row_profiles_fit_kafka() {
         let mut config = config("localhost:9092".into());
         config.set("fpml.profile", "fpml-5-13-confirmation-trade");
-        let error = crate::kafka::source::fpml::resolve_kafka_profile(&config)
+        let error = crate::fpml::message::resolve_profile(&config, "Kafka")
             .await
             .unwrap_err();
         assert!(

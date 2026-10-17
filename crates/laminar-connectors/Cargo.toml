@@ -11,7 +11,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.32.0" }
+laminar-core = { path = "../laminar-core", version = "0.33.0" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
@@ -25,7 +25,7 @@ tokio-postgres = { version = "0.7", optional = true, features = ["with-chrono-0_
 postgres-types = { version = "0.2", optional = true, features = ["with-chrono-0_4"] }
 pgpq = { version = "0.11", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
-pgwire-replication = { package = "laminardb-pgwire-replication", path = "../../vendor/pgwire-replication", version = "=0.32.0", optional = true }
+pgwire-replication = { package = "laminardb-pgwire-replication", path = "../../vendor/pgwire-replication", version = "=0.33.0", optional = true }
 # Client-side verified TLS for PostgreSQL CDC, sink, and lookup connections.
 tokio-postgres-rustls = { version = "0.13", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws-lc-rs", "tls12"] }
@@ -106,19 +106,29 @@ async-nats = { version = "0.47", optional = true }
 # async-nats — making the dep direct so we can name the type.
 time = { version = "0.3", optional = true, features = ["parsing"] }
 
+# RabbitMQ AMQP 0-9-1 client; rustls with the aws-lc-rs provider the workspace already builds.
+lapin = { version = "4.12.2", optional = true, default-features = false, features = ["tokio", "rustls--aws_lc_rs", "rustls-webpki-roots-certs"] }
+
+# IBM MQ through IBM's MQI client library, loaded at run time (dlopen2): building needs no IBM
+# software. `mqai` is enabled only because mqi 0.3.0's dlopen2 build otherwise fails to compile.
+mqi = { version = "0.3.0", optional = true, default-features = false, features = ["dlopen2", "mqai", "mqc_9_3_0_0"] }
+libmqm-sys = { version = "0.10.2", optional = true, default-features = false, features = ["dlopen2", "mqc_9_3_0_0"] }
+libmqm-default = { version = "0.10.2", optional = true, default-features = false, features = ["mqc_9_3_0_0"] }
+dlopen2 = { version = "0.8", optional = true }
+
 # OpenTelemetry OTLP/gRPC receiver
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"], optional = true }
 tonic = { version = "0.14", optional = true }
 base64 = { workspace = true, optional = true }
 
 # FIX source: QuickFIX C++ session engine (vendored binding with a length-aware bridge)
-quickfix-ffi = { package = "laminardb-quickfix-ffi", path = "../../vendor/quickfix-ffi", version = "=0.32.0", optional = true }
+quickfix-ffi = { package = "laminardb-quickfix-ffi", path = "../../vendor/quickfix-ffi", version = "=0.33.0", optional = true }
 xxhash-rust = { workspace = true, optional = true }
 # Ed25519 Logon signatures for the Binance profile; already built for the FIX TLS bridge.
 aws-lc-rs = { version = "1.18", optional = true, default-features = false, features = ["aws-lc-sys"] }
 
 # FpML decoder: libxml2 XML Schema validation (static, vendored), quick-xml pre-scan, TOML profiles
-libxml2-ffi = { package = "laminardb-libxml2-ffi", path = "../../vendor/libxml2-ffi", version = "=0.32.0", optional = true }
+libxml2-ffi = { package = "laminardb-libxml2-ffi", path = "../../vendor/libxml2-ffi", version = "=0.33.0", optional = true }
 quick-xml = { version = "0.41", default-features = false, optional = true }
 toml = { version = "1.1", optional = true }
 
@@ -193,6 +203,10 @@ otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:base64"]
 fix = ["dep:quickfix-ffi", "dep:xxhash-rust", "dep:tokio-rustls", "dep:webpki-roots", "dep:aws-lc-rs", "dep:base64"]
 # FpML document decoder (XSD-validated, profile-projected). Builds libxml2 with CMake.
 fpml = ["dep:libxml2-ffi", "dep:quick-xml", "dep:toml"]
+# IBM MQ queue source and sink; the IBM MQ client is required only at run time.
+ibmmq = ["dep:mqi", "dep:libmqm-sys", "dep:libmqm-default", "dep:dlopen2"]
+# RabbitMQ AMQP 0-9-1 source and sink
+rabbitmq = ["dep:lapin", "dep:futures-util"]
 # NATS core + JetStream source and sink
 nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 

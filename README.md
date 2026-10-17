@@ -154,15 +154,17 @@ subscriptions.
 
 | Use | Available connectors |
 |---|---|
-| Sources | Kafka, NATS, PostgreSQL logical replication, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
-| Sinks | Kafka, NATS, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
+| Sources | Kafka, NATS, RabbitMQ, IBM MQ, PostgreSQL logical replication, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
+| Sinks | Kafka, NATS, RabbitMQ, IBM MQ, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
 | Lookups | PostgreSQL, MongoDB, Delta Lake, and Iceberg. |
 
 PostgreSQL tables and MongoDB collections can feed sinks and SQL directly. See
 [PostgreSQL change data capture](#postgresql-change-data-capture) and
 [MongoDB change data capture](#mongodb-change-data-capture) to get started. FpML trade
-confirmations can come in from files or Kafka; see
-[FpML trade confirmations](#fpml-trade-confirmations).
+confirmations can come in from files, Kafka, RabbitMQ, IBM MQ, or a FIX field such as SecurityXML;
+see
+[FpML trade confirmations](#fpml-trade-confirmations). RabbitMQ and IBM MQ are optional build
+features (`rabbitmq`, `ibmmq`); see [RabbitMQ](docs/RABBITMQ.md) and [IBM MQ](docs/IBMMQ.md).
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
 
@@ -432,9 +434,9 @@ history record format, and failure handling in detail.
 
 Derivatives confirmations, clearing messages, and loan notices often arrive as FpML: large XML
 documents full of nested legs, cross-references, and amounts that must not be rounded. LaminarDB
-reads them from a directory or a Kafka topic, checks each one against the official FpML 5.13
-schema, and turns the parts you need into typed columns. From there it's ordinary SQL, and you
-don't write a parser for each product.
+reads them from a directory, a Kafka topic, a RabbitMQ or IBM MQ queue, or a FIX field such as
+SecurityXML, checks each one against the official FpML 5.13 schema, and turns the parts you need
+into typed columns. From there it's ordinary SQL, and you don't write a parser for each product.
 
 A profile decides what a row is. The fourteen bundled profiles cover every product in FpML 5.13
 confirmations, with one row per trade (with or without the product's economics), per message, or
@@ -651,3 +653,9 @@ support@laminardb.io.
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+Builds with the `fix` or `fpml` feature, including the prebuilt server binaries, also contain
+third-party software under its own licence; release archives carry the notices in `licenses/`.
+This product includes software developed by quickfixengine.org (http://www.quickfixengine.org/).
+libxml2 is under the MIT License, and the bundled FpML schemas are FpML Specifications under the
+FpML Public License (Licensor: International Swaps and Derivatives Association, Inc.).

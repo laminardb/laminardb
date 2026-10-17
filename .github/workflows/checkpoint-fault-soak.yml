@@ -2,7 +2,7 @@ name: Checkpoint fault and soak
 
 # Process-death and coordinated-recovery soaks. Expensive and timing-sensitive, so they run weekly
 # (and on demand) rather than on the per-PR critical path. Cluster jobs use Redpanda plus MinIO for
-# replayable partitions and cluster-shared durability.
+# replayable partitions and cluster-shared durability; the RabbitMQ sink leg also starts RabbitMQ.
 on:
   workflow_dispatch:
     inputs:
@@ -216,6 +216,20 @@ jobs:
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
+          - label: Cluster ALO RabbitMQ sink (gossip)
+            test: messaging_sinks::three_node_rabbitmq_sink_kill9_soak
+            features: cluster,aws,kafka,rabbitmq
+            delivery: alo
+            topology: cluster-rabbitmq
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "500"
+            # Every node publishes its share to one queue; the oracle requires every input id.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+            services: minio redpanda rabbitmq
     steps:
       - uses: actions/checkout@v6
         with:
@@ -250,8 +264,10 @@ jobs:
           exit 1
 
       - name: Start cluster-shared dependencies
+        env:
+          SOAK_SERVICES: ${{ matrix.services || 'minio redpanda' }}
         run: |
-          docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 minio redpanda
+          docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 $SOAK_SERVICES
           docker run --rm --network host --entrypoint /bin/sh \
             minio/mc:RELEASE.2024-10-08T09-37-26Z -c \
             'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
@@ -306,6 +322,8 @@ jobs:
           LAMINAR_SOAK_DELTA_BUCKET: laminardb-soak
           LAMINAR_SOAK_ALLOW_S3_EMULATOR: ${{ matrix.emulator }}
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
+          # The compose broker's default account; only the RabbitMQ sink leg reads it.
+          LAMINAR_SOAK_RABBITMQ_PASSWORD: guest
 
       - name: Upload join soak logs
         if: always()
@@ -320,9 +338,11 @@ jobs:
 
       - name: Print dependency diagnostics on failure
         if: failure()
+        env:
+          SOAK_SERVICES: ${{ matrix.services || 'minio redpanda' }}
         run: |
           docker compose -f tests/docker/compose.yml ps -a
-          docker compose -f tests/docker/compose.yml logs minio redpanda
+          docker compose -f tests/docker/compose.yml logs $SOAK_SERVICES
           docker inspect --format '{{json .State.Health}}' laminardb-redpanda || true
 
       - name: Stop cluster-shared dependencies

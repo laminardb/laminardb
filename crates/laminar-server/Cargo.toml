@@ -20,6 +20,16 @@ path = "src/bin/hash_test.rs"
 required-features = ["cluster"]
 
 [[test]]
+name = "ibmmq_kill"
+path = "tests/ibmmq_kill.rs"
+required-features = ["ibmmq"]
+
+[[test]]
+name = "rabbitmq_kill"
+path = "tests/rabbitmq_kill.rs"
+required-features = ["rabbitmq"]
+
+[[test]]
 name = "cluster_soak"
 path = "tests/cluster_soak.rs"
 required-features = ["cluster"]
@@ -33,9 +43,9 @@ required-features = ["cluster", "aws", "kafka", "iceberg"]
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
-laminar-core = { path = "../laminar-core", version = "0.32.0" }
-laminar-db = { path = "../laminar-db", version = "0.32.0", default-features = false, features = ["api", "remote", "local"] }
-laminar-sql = { path = "../laminar-sql", version = "0.32.0" }
+laminar-core = { path = "../laminar-core", version = "0.33.0" }
+laminar-db = { path = "../laminar-db", version = "0.33.0", default-features = false, features = ["api", "remote", "local"] }
+laminar-sql = { path = "../laminar-sql", version = "0.33.0" }
 # Read-only Delta snapshot oracle for the ignored end-to-end EO soak.
 deltalake = { workspace = true, optional = true, features = ["rustls"] }
 
@@ -83,7 +93,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
 # pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
 # extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
-pgwire = { package = "laminardb-pgwire", path = "../../vendor/pgwire", version = "=0.32.0", default-features = false, features = [
+pgwire = { package = "laminardb-pgwire", path = "../../vendor/pgwire", version = "=0.33.0", default-features = false, features = [
     "server-api",
     "_aws-lc-rs",
     "pg-type-chrono",
@@ -143,7 +153,7 @@ rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 
 [dev-dependencies]
 # Exercise the existing Kafka initialization contract from the real-process soak.
-laminar-connectors = { path = "../laminar-connectors", version = "0.32.0", default-features = false }
+laminar-connectors = { path = "../laminar-connectors", version = "0.33.0", default-features = false }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
@@ -152,6 +162,9 @@ mongodb = "3"
 tokio-postgres-rustls = "0.13"
 rcgen = "0.13"
 serde_json = { workspace = true }
+# The RabbitMQ kill test and cluster soak publish inputs and read outputs directly.
+lapin = { version = "4.12.2", default-features = false, features = ["tokio", "rustls--aws_lc_rs", "rustls-webpki-roots-certs"] }
+futures-util = "0.3"
 
 [features]
 # Cross-platform defaults.
@@ -186,9 +199,14 @@ postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mongodb-cdc = ["laminar-db/mongodb-cdc"]
 nats = ["laminar-db/nats"]
+# RabbitMQ AMQP 0-9-1 source and sink (pure Rust); off by default.
+rabbitmq = ["laminar-db/rabbitmq"]
+# IBM MQ source and sink; the IBM MQ client library is loaded at run time, never at build time.
+ibmmq = ["laminar-db/ibmmq"]
 # FIX initiator source (builds the QuickFIX C++ engine with CMake); off by default.
 fix = ["laminar-db/fix"]
-# FpML documents on the files and Kafka sources (builds libxml2 with CMake); off by default.
+# FpML documents on the files, Kafka, RabbitMQ, and IBM MQ sources and in FIX fields (builds
+# libxml2 with CMake); off by default.
 fpml = ["laminar-db/fpml"]
 delta-lake = ["laminar-db/delta-lake", "dep:deltalake", "deltalake/datafusion"]
 delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3", "deltalake/s3"]

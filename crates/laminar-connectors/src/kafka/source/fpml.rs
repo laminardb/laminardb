@@ -10,73 +10,10 @@ use super::{
     terminalize_guaranteed_poll_error, warn, ConnectorError, DeliveryGuarantee, KafkaSource,
     SerdeError,
 };
-use crate::config::{ConfigKeySpec, ConnectorConfig};
-use crate::fpml::{Artifact, FpmlConfig, FpmlDecoder, Profile};
+use crate::config::ConnectorConfig;
+use crate::fpml::{message, FpmlDecoder};
 use crate::schema::resolution::SchemaBinding;
 use crate::schema::traits::FormatDecoder;
-
-/// Kafka maps one message to one row, so a source without a profile uses the document profile.
-pub(crate) const KAFKA_DEFAULT_PROFILE: &str = "fpml-5-13-confirmation-document";
-
-/// Source options of the `fpml` format.
-pub(crate) fn config_keys() -> Vec<ConfigKeySpec> {
-    vec![
-        ConfigKeySpec::optional(
-            "fpml.profile",
-            "Bundled FpML profile (format = 'fpml'); it must yield one row per document",
-            KAFKA_DEFAULT_PROFILE,
-        ),
-        ConfigKeySpec::optional(
-            "fpml.profile.path",
-            "Operator FpML profile file, instead of a bundled profile",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "fpml.schema.path",
-            "Directory of an operator FpML schema closure (closure.toml), instead of the \
-             bundled closure",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "fpml.references",
-            "FpML reference checking: resolve (every href resolves) or schema (also annotated \
-             target types)",
-            "resolve",
-        ),
-    ]
-}
-
-fn kafka_fpml_config(config: &ConnectorConfig) -> Result<FpmlConfig, ConnectorError> {
-    if config.get("fpml.profile").is_some() || config.get("fpml.profile.path").is_some() {
-        return FpmlConfig::from_connector_config(config);
-    }
-    let mut config = config.clone();
-    config.set("fpml.profile", KAFKA_DEFAULT_PROFILE);
-    FpmlConfig::from_connector_config(&config)
-}
-
-/// Resolve the closure and profile off the async runtime; only a profile that yields exactly
-/// one row per document fits a one-row-per-message transport.
-pub(crate) async fn resolve_kafka_profile(
-    config: &ConnectorConfig,
-) -> Result<(FpmlConfig, Artifact, Profile), ConnectorError> {
-    let fpml = kafka_fpml_config(config)?;
-    let resolving = fpml.clone();
-    let (artifact, profile) = tokio::task::spawn_blocking(move || resolving.resolve())
-        .await
-        .map_err(|error| {
-            ConnectorError::Internal(format!("FpML profile loader failed: {error}"))
-        })??;
-    if !profile.one_row_per_document() {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "Kafka maps one message to one row, so an FpML profile must select the document root \
-             (rows = \".\"); '{}' does not. Use '{KAFKA_DEFAULT_PROFILE}' or a document-row \
-             operator profile",
-            profile.name
-        )));
-    }
-    Ok((fpml, artifact, profile))
-}
 
 impl KafkaSource {
     /// Start the decoder for the closure and profile the committed binding names.
@@ -90,17 +27,6 @@ impl KafkaSource {
                 "format 'fpml' is not qualified for cluster Kafka sources".into(),
             ));
         }
-        let (fpml, artifact, profile) = resolve_kafka_profile(config).await?;
-        let committed = binding
-            .and_then(|binding| binding.value.as_ref())
-            .map(|native| &native.identity);
-        if committed != Some(&profile.native_schema(&artifact).identity) {
-            return Err(ConnectorError::SchemaMismatch(
-                "the FpML profile or schema closure differs from the one this source was created \
-                 with; recreate the source to change it"
-                    .into(),
-            ));
-        }
         let guard = self
             .task_owner
             .track()
@@ -108,14 +34,12 @@ impl KafkaSource {
                 expected: "live Kafka task owner".into(),
                 actual: "retired".into(),
             })?;
-        let source = config.get("laminar.source.name").unwrap_or("kafka");
-        let decoder = FpmlDecoder::start(
-            artifact,
-            &profile,
-            &fpml,
-            source,
+        let decoder = message::start_decoder(
+            config,
+            binding,
+            "Kafka",
             self.metrics_registry.as_ref(),
-            Some(guard),
+            guard,
         )
         .await?;
         self.fpml = Some(Arc::new(decoder));

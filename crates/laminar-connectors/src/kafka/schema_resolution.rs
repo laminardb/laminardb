@@ -132,20 +132,11 @@ async fn resolve_fpml_source(
     parsed: &KafkaSourceConfig,
     explicit: Option<SchemaRef>,
 ) -> Result<SchemaBinding, ConnectorError> {
-    let (_, artifact, profile) = super::source::fpml::resolve_kafka_profile(config).await?;
-    let payload = profile.schema();
-    let fixed = crate::schema::resolution::fixed_binding(config, explicit, &payload)?;
-    let declared = Arc::new(fixed.logical);
-    parsed.metadata.validate_payload(&declared)?;
-    let mut binding = logical_binding(
-        config,
-        SchemaDirection::Source,
-        fixed.origin,
-        &parsed.metadata.output_schema(&declared),
-    )?;
-    bind_external(&mut binding, &parsed.metadata.output_schema(&payload))?;
-    binding.value = Some(profile.native_schema(&artifact));
-    Ok(binding)
+    crate::fpml::message::source_binding(config, explicit, "Kafka", |payload| {
+        parsed.metadata.validate_payload(payload)?;
+        Ok(parsed.metadata.output_schema(payload))
+    })
+    .await
 }
 
 pub(super) async fn resolve_sink(

@@ -21,6 +21,8 @@ mod capture;
 mod config;
 mod dictionary;
 mod engine;
+#[cfg(feature = "fpml")]
+mod fpml;
 mod journal;
 mod metrics;
 mod projection;

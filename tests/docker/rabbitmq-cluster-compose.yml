@@ -1,0 +1,33 @@
+# Three-node RabbitMQ 4.3.6 cluster for quorum-queue broker-node-loss tests
+# (crates/laminar-server/tests/rabbitmq_kill.rs). Nodes listen on 127.0.0.1:5681-5683.
+#
+#   docker compose -f tests/docker/rabbitmq-cluster-compose.yml up -d --wait
+x-node: &node
+  image: rabbitmq:4.3.6-management
+  environment:
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-setcookie laminar-cluster-cookie"
+    RABBITMQ_CTL_ERL_ARGS: "-setcookie laminar-cluster-cookie"
+  volumes:
+    - ./rabbitmq-cluster.conf:/etc/rabbitmq/conf.d/20-cluster.conf:ro
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+    interval: 3s
+    timeout: 10s
+    retries: 40
+
+services:
+  rmq1:
+    <<: *node
+    hostname: rmq1
+    container_name: laminardb-rmq1
+    ports: ["127.0.0.1:5681:5672"]
+  rmq2:
+    <<: *node
+    hostname: rmq2
+    container_name: laminardb-rmq2
+    ports: ["127.0.0.1:5682:5672"]
+  rmq3:
+    <<: *node
+    hostname: rmq3
+    container_name: laminardb-rmq3
+    ports: ["127.0.0.1:5683:5672"]

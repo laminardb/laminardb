@@ -17,6 +17,13 @@ mod error;
 #[cfg(test)]
 mod golden;
 mod limits;
+#[cfg(any(
+    feature = "kafka",
+    feature = "rabbitmq",
+    feature = "ibmmq",
+    feature = "fix"
+))]
+pub(crate) mod message;
 mod metrics;
 mod prescan;
 mod profile;

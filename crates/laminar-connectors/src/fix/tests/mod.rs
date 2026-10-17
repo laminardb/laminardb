@@ -1,6 +1,8 @@
 //! Source-level scenarios against a real local QuickFIX acceptor.
 
 mod binance;
+#[cfg(feature = "fpml")]
+mod fpml;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

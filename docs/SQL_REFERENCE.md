@@ -78,9 +78,11 @@ CREATE SOURCE fills (
 )
 ```
 
-FpML documents (`fpml` feature) arrive through the files or Kafka source with `FORMAT FPML`; a
-projection profile supplies the schema, so declare at most a watermark. See
-[FpML source](FPML_SOURCE.md) for profiles, options, and the recovery contract:
+FpML documents (`fpml` feature) arrive through the files, Kafka, RabbitMQ, or IBM MQ source with
+`FORMAT FPML`; a projection profile supplies the schema, so declare at most a watermark. A FIX
+source reads them from a field such as SecurityXML with `'fpml.field' = '1185'` and appends them as
+an `fpml` struct column. See [FpML source](FPML_SOURCE.md) for profiles, options, and the recovery
+contract:
 
 ```sql
 CREATE SOURCE rates (
@@ -431,6 +433,30 @@ once per committed checkpoint, after a crash at any point included; `read_uncomm
 also see aborted attempts. Cluster deployments keep Kafka output at-least-once. A Kafka source
 keyed by message key (key + value = upsert, key + NULL = delete) is not available; use the
 Debezium envelope for keyed changes.
+
+### RabbitMQ and IBM MQ
+
+`FROM RABBITMQ` / `INTO RABBITMQ` (`rabbitmq` feature) and `FROM IBMMQ` / `INTO IBMMQ` (`ibmmq`
+feature) read queues and write exchanges or queues with at-least-once delivery. Both sources are
+commit-coupled: a message is acknowledged (RabbitMQ) or committed (`MQCMIT`) only after the
+checkpoint containing it is durable, so they need checkpointing and at-least-once delivery, and
+cluster mode rejects them. In cluster mode the sinks run on every node as independent
+at-least-once writers, like Kafka output. `FORMAT RAW` with a `value BYTEA` column keeps payload
+bytes exactly; `metadata.columns` appends typed broker metadata after the declared columns.
+
+```sql
+CREATE SOURCE orders (id BIGINT, amount DOUBLE) FROM RABBITMQ (
+    'url' = 'amqps://broker:5671/sales', 'username' = 'laminar',
+    'password' = '${RABBITMQ_PASSWORD}', 'queue' = 'orders',
+    'metadata.columns' = 'routing_key,redelivered') FORMAT JSON;
+
+CREATE SINK large_orders FROM big INTO IBMMQ (
+    'queue.manager' = 'QM1', 'channel' = 'APP.SVRCONN', 'connection.name' = 'mq1(1414)',
+    'username' = 'laminar', 'password' = '${MQ_PASSWORD}', 'queue' = 'ORDERS.LARGE') FORMAT JSON;
+```
+
+See [RabbitMQ](RABBITMQ.md) and [IBM MQ](IBMMQ.md) for options, the acknowledgement and commit
+boundaries, poison-message handling, and tested behaviour.
 
 ### Cluster SQL boundary
 

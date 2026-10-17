@@ -1,9 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [0.33.0]
 
 ### Added
 
+- RabbitMQ source and sink (`rabbitmq` feature, off by default) over AMQP 0-9-1. The source
+  acknowledges deliveries only after the checkpoint holding them is durable and can dead-letter
+  undecodable messages; the sink publishes with confirms and `mandatory` and drains every pending
+  confirm before a checkpoint commits. See `docs/RABBITMQ.md`.
+- IBM MQ source and sink (`ibmmq` feature, off by default; IBM's client library is loaded at run
+  time and never bundled). The source commits its unit of work only when a durable checkpoint
+  covers it and can move poison messages to the backout queue in the same unit of work; the sink
+  commits bounded units of work per write. See `docs/IBMMQ.md`.
+- Both message sources run embedded and single-node; cluster mode rejects them. Both sinks also
+  run in cluster mode as at-least-once writers.
+- `FORMAT RAW` with a single Binary `value` column keeps payload bytes exactly.
 - FIX TagValue source (`fix` feature, off by default) on the QuickFIX C++ engine: one initiator
   session per source (FIX.4.2, FIX.4.4, or FIXT.1.1 with one FIX 5.0 application version) over
   verified TLS or loopback TCP, a group-committed receive journal written inside the engine
@@ -11,12 +22,13 @@
   record that is not yet durable, dictionary-validated column mappings for header, body, group,
   and metadata fields, deterministic replay, and at-least-once or exactly-once delivery in
   embedded and single-node deployments. Cluster placement is rejected. See `docs/FIX_SOURCE.md`.
-- FpML documents on the files and Kafka sources (`FORMAT FPML`, `fpml` feature, off by default).
-  Each document is validated against the bundled FpML 5.13 confirmation schema with a vendored,
-  network-free libxml2, its `id`/`href` references are checked, and a profile turns it into typed
-  rows with exact decimals and dates. Fourteen bundled profiles cover every product, loan
-  representation, and document type in the schema; your own schemas and profiles extend them
-  without code. Embedded and single-node only. See `docs/FPML_SOURCE.md`.
+- FpML documents (`fpml` feature, off by default) on the files, Kafka, RabbitMQ, and IBM MQ
+  sources (`FORMAT FPML`), and in a FIX data field such as SecurityXML (`fpml.field`, an appended
+  `fpml` struct column). Each document is validated against the bundled FpML 5.13 confirmation
+  schema with a vendored, network-free libxml2, its `id`/`href` references are checked, and a
+  profile turns it into typed rows with exact decimals and dates. Fourteen bundled profiles cover
+  every product, loan representation, and document type in the schema; your own schemas and
+  profiles extend them without code. Embedded and single-node only. See `docs/FPML_SOURCE.md`.
 - Certified commit-coupled sources are admitted for exactly-once delivery; uncertified ones are
   still rejected.
 - FIX source `logon.field.<tag>` for static venue-specific Logon fields, and
@@ -29,6 +41,25 @@
   flow, rejects, large fills, order bursts, drop-copy delay, feed health, and an exactly-once
   Delta Lake audit trail reconciled in DuckDB), with one connection file per counterparty and a
   local broker simulator (`laminar-connectors` example `fix_venue`).
+
+### Changed
+
+- The prebuilt server binaries for Linux (glibc), macOS, and Windows include the `fix` and `fpml`
+  features, and their archives carry the third-party notices in `licenses/`. The Linux musl
+  binary does not include them yet.
+
+### Fixed
+
+- Kafka sources with `metadata.columns` restart on persistent storage: declared columns are
+  checked as the prefix of the committed schema binding.
+- Managed aggregates coerce mixed operand types in group keys, aggregate arguments, and `WHERE`
+  (`SUM(CASE WHEN ... THEN decimal ELSE 0 END)`, `double * 1000`, `decimal >= 1`) instead of
+  failing at runtime with `LDB-8051`. A `CASE` whose branches cannot be narrowed exactly to its
+  first branch's type is rejected at `CREATE` with a request to `CAST` them.
+
+## [0.32.0]
+
+### Added
 
 - Kafka exactly-once output in embedded and single-node deployments: each checkpoint's records are
   published by one fenced transactional committer together with a cursor marker in a compacted
@@ -59,10 +90,6 @@
 - A sink reading an incremental materialized view directly binds the view's changelog, including
   its weight column, so a keyed Kafka upsert sink over a `GROUP BY` view no longer fails with a
   schema mismatch on its first write.
-- Managed aggregates coerce mixed operand types in group keys, aggregate arguments, and `WHERE`
-  (`SUM(CASE WHEN ... THEN decimal ELSE 0 END)`, `double * 1000`, `decimal >= 1`) instead of
-  failing at runtime with `LDB-8051`. A `CASE` whose branches cannot be narrowed exactly to its
-  first branch's type is rejected at `CREATE` with a request to `CAST` them.
 
 ### Removed
 

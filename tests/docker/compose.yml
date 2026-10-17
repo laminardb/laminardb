@@ -73,3 +73,38 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management
+    container_name: laminardb-rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 3s
+      timeout: 10s
+      retries: 30
+
+  # IBM MQ Advanced for Developers (non-production developer license; amd64-only image).
+  # Opt in with `--profile ibmmq` and IBM_MQ_LICENSE=accept after reading the license
+  # (`docker run --rm icr.io/ibm-messaging/mq:9.4.0.26-r2 --license`). On Apple silicon,
+  # also pass `-f tests/docker/ibmmq-rosetta.compose.yml` (see that file for why).
+  ibmmq:
+    image: icr.io/ibm-messaging/mq:9.4.0.26-r2
+    platform: linux/amd64
+    container_name: laminardb-ibmmq
+    profiles: ["ibmmq"]
+    ports:
+      - "127.0.0.1:1414:1414"
+    environment:
+      # Empty unless the operator accepts: the image refuses to start without LICENSE=accept.
+      LICENSE: ${IBM_MQ_LICENSE:-}
+      MQ_QMGR_NAME: QM1
+      MQ_APP_PASSWORD: laminar-test-app
+      MQ_ADMIN_PASSWORD: laminar-test-admin
+    healthcheck:
+      test: ["CMD", "chkmqstarted"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
