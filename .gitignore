@@ -60,14 +60,16 @@ wal/
 /tools/readability-check/Cargo.lock
 /tools/readability-check/target/
 
-# Private configs and engineering context (linked from laminardb-claude-context)
+# Private configs and engineering context (linked from laminardb-claude-context).
+# No trailing slash: bootstrap creates symlinks on macOS/Linux, which a
+# directory-only pattern does not match.
 CLAUDE.md
 AGENTS.md
-.claude/
-docs/architecture/
-docs/adr/
-/docs/private-archive/
-/docs/private-decisions/
+.claude
+/docs/architecture
+/docs/adr
+/docs/private-archive
+/docs/private-decisions
 .desloppify/
 /examples/microstructure/target
 /examples/microstructure/Cargo.lock
