@@ -139,6 +139,72 @@ impl ConnectorConfig {
         })
     }
 
+    /// Gets a trimmed property that must not be empty when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` for a present but blank value.
+    pub fn get_non_empty(&self, key: &str) -> Result<Option<String>, ConnectorError> {
+        match self.get(key).map(str::trim) {
+            None => Ok(None),
+            Some("") => Err(ConnectorError::ConfigurationError(format!(
+                "'{key}' must not be empty"
+            ))),
+            Some(value) => Ok(Some(value.to_string())),
+        }
+    }
+
+    /// Gets a comma-separated property as trimmed, non-empty items; absent is empty.
+    #[must_use]
+    pub fn get_list(&self, key: &str) -> Vec<String> {
+        self.get(key)
+            .into_iter()
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Gets a positive count, or `default` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` for zero or an unparseable value.
+    pub fn get_positive(&self, key: &str, default: usize) -> Result<usize, ConnectorError> {
+        match self.get_parsed::<usize>(key)? {
+            Some(0) => Err(ConnectorError::ConfigurationError(format!(
+                "'{key}' must be positive"
+            ))),
+            Some(value) => Ok(value),
+            None => Ok(default),
+        }
+    }
+
+    /// Gets a millisecond duration in `1..=max`, or `default` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` for an unparseable or out-of-range value.
+    pub fn get_millis(
+        &self,
+        key: &str,
+        default: std::time::Duration,
+        max: std::time::Duration,
+    ) -> Result<std::time::Duration, ConnectorError> {
+        let Some(millis) = self.get_parsed::<u64>(key)? else {
+            return Ok(default);
+        };
+        let value = std::time::Duration::from_millis(millis);
+        if value.is_zero() || value > max {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "'{key}' must be between 1 and {} milliseconds",
+                max.as_millis()
+            )));
+        }
+        Ok(value)
+    }
+
     /// Install a validated committed reader/writer contract for connector activation.
     ///
     /// # Errors

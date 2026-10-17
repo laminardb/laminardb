@@ -17,6 +17,8 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | PostgreSQL CDC | `postgres-cdc` | Logical replication of one table as typed keyed upserts or a retractable changelog; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | MongoDB CDC | `mongodb-cdc` | Change streams as history records or keyed document mutations; optional initial snapshot; replayable at-least-once, embedded/single-node | Implemented |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
+| RabbitMQ | `rabbitmq` | AMQP 0-9-1 classic/quorum queue consumer; manual acknowledgements released only by a durable checkpoint (commit-coupled at-least-once), embedded/single-node ([guide](../../docs/RABBITMQ.md)) | Implemented |
+| IBM MQ | `ibmmq` | MQI syncpoint gets committed with each durable checkpoint; queue-defined poison moves to `BOQNAME` in the same unit of work; IBM client loaded at run time; embedded/single-node ([guide](../../docs/IBMMQ.md)) | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
@@ -712,6 +714,8 @@ backpressures rather than dropping rows.
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | Durable broker-acknowledged at-least-once (append, or upsert from a singleton writer); exactly-once append and upsert in embedded/single-node mode via checkpoint-staged output and one fenced transactional committer | Implemented |
 | NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
+| RabbitMQ | `rabbitmq` | Publisher-confirmed, mandatory publishes to one exchange; durable at-least-once for persistent messages on durable queues | Implemented |
+| IBM MQ | `ibmmq` | `MQPUT` under syncpoint with `MQCMIT` per unit of work; durable at-least-once for persistent messages | Implemented |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert, history `cdc_replay`, durable at-least-once | Implemented |
 | Delta Lake | `delta-lake` | Coordinated append (cluster EO certified only for direct S3/S3A); at-least-once append, MERGE upsert on non-null keys, and whole-table overwrite | Implemented |
@@ -865,6 +869,8 @@ requirements:
 | `postgres-sink` | PostgreSQL sink via tokio-postgres |
 | `mongodb-cdc` | MongoDB CDC source, sink, and lookup |
 | `nats` | NATS Core and JetStream source/sink via async-nats |
+| `rabbitmq` | RabbitMQ AMQP 0-9-1 source/sink via lapin (pure Rust, rustls) |
+| `ibmmq` | IBM MQ source/sink via the `mqi` binding; IBM's client library is loaded at run time, so builds need no IBM software |
 | `changelog-collapse` | Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pulled in by `delta-lake`) |
 | `delta-lake` | Delta Lake sink/source via deltalake crate |
 | `delta-lake-s3` | S3 storage backend for Delta Lake |

@@ -154,15 +154,16 @@ subscriptions.
 
 | Use | Available connectors |
 |---|---|
-| Sources | Kafka, NATS, PostgreSQL logical replication, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
-| Sinks | Kafka, NATS, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
+| Sources | Kafka, NATS, RabbitMQ, IBM MQ, PostgreSQL logical replication, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
+| Sinks | Kafka, NATS, RabbitMQ, IBM MQ, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
 | Lookups | PostgreSQL, MongoDB, Delta Lake, and Iceberg. |
 
 PostgreSQL tables and MongoDB collections can feed sinks and SQL directly. See
 [PostgreSQL change data capture](#postgresql-change-data-capture) and
 [MongoDB change data capture](#mongodb-change-data-capture) to get started. FpML trade
 confirmations can come in from files or Kafka; see
-[FpML trade confirmations](#fpml-trade-confirmations).
+[FpML trade confirmations](#fpml-trade-confirmations). RabbitMQ and IBM MQ are optional build
+features (`rabbitmq`, `ibmmq`); see [RabbitMQ](docs/RABBITMQ.md) and [IBM MQ](docs/IBMMQ.md).
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
 

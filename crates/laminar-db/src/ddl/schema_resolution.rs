@@ -71,7 +71,7 @@ impl LaminarDB {
             Some(binding) => {
                 validate_supplied(&binding, &config, SchemaDirection::Source)?;
                 if let Some(explicit) = &explicit {
-                    validate_explicit_source_fields(&binding, &config, &explicit.schema)?;
+                    validate_explicit_source_fields(&binding, &explicit.schema)?;
                 }
                 binding
             }
@@ -198,40 +198,21 @@ fn validate_supplied(
     Ok(())
 }
 
+/// Declared columns are the payload prefix of a source binding; connectors append their own
+/// metadata columns after it and validate those against their configuration.
 fn validate_explicit_source_fields(
     binding: &SchemaBinding,
-    config: &ConnectorConfig,
     explicit: &arrow_schema::SchemaRef,
 ) -> Result<(), DbError> {
-    let extra = match config.connector_type() {
-        "kafka" => {
-            usize::from(
-                config
-                    .get_parsed::<bool>("include.metadata")?
-                    .unwrap_or(false),
-            ) * 3
-                + usize::from(
-                    config
-                        .get_parsed::<bool>("include.headers")?
-                        .unwrap_or(false),
-                )
-        }
-        "files" => usize::from(
-            config
-                .get_parsed::<bool>("include_metadata")?
-                .unwrap_or(false),
-        ),
-        _ => 0,
-    };
-    let expected = binding
-        .logical
-        .fields()
-        .len()
-        .checked_sub(extra)
-        .ok_or_else(|| DbError::Checkpoint("committed source metadata is incomplete".into()))?;
+    let declared = explicit.fields().len();
+    if binding.logical.fields().len() < declared {
+        return Err(DbError::Checkpoint(
+            "committed source contract has fewer fields than the declared columns".into(),
+        ));
+    }
     let payload = binding
         .logical
-        .project(&(0..expected).collect::<Vec<_>>())
+        .project(&(0..declared).collect::<Vec<_>>())
         .map_err(|error| DbError::Checkpoint(error.to_string()))?;
     let mut payload_binding = binding.clone();
     payload_binding.logical = payload;

@@ -110,6 +110,14 @@ pub mod otel;
 #[cfg(feature = "nats")]
 pub mod nats;
 
+/// RabbitMQ AMQP 0-9-1 source and sink.
+#[cfg(feature = "rabbitmq")]
+pub mod rabbitmq;
+
+/// IBM MQ source and sink over MQI (client library loaded at run time).
+#[cfg(feature = "ibmmq")]
+pub mod ibmmq;
+
 /// FIX TagValue session source connector.
 #[cfg(feature = "fix")]
 pub mod fix;

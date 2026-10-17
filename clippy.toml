@@ -20,3 +20,6 @@ disallowed-types = [
     { path = "std::collections::HashSet", reason = "use rustc_hash::FxHashSet (integer/internal keys) or ahash::AHashSet (user-derived keys)" },
     { path = "std::sync::Mutex", reason = "use parking_lot::Mutex (faster, no poisoning) or lock-free structures" },
 ]
+
+# Product names that are not code identifiers in rustdoc.
+doc-valid-idents = ["RabbitMQ", ".."]

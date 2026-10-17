@@ -20,6 +20,16 @@ path = "src/bin/hash_test.rs"
 required-features = ["cluster"]
 
 [[test]]
+name = "ibmmq_kill"
+path = "tests/ibmmq_kill.rs"
+required-features = ["ibmmq"]
+
+[[test]]
+name = "rabbitmq_kill"
+path = "tests/rabbitmq_kill.rs"
+required-features = ["rabbitmq"]
+
+[[test]]
 name = "cluster_soak"
 path = "tests/cluster_soak.rs"
 required-features = ["cluster"]
@@ -152,6 +162,9 @@ mongodb = "3"
 tokio-postgres-rustls = "0.13"
 rcgen = "0.13"
 serde_json = { workspace = true }
+# The RabbitMQ kill test and cluster soak publish inputs and read outputs directly.
+lapin = { version = "4.12.2", default-features = false, features = ["tokio", "rustls--aws_lc_rs", "rustls-webpki-roots-certs"] }
+futures-util = "0.3"
 
 [features]
 # Cross-platform defaults.
@@ -186,6 +199,10 @@ postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mongodb-cdc = ["laminar-db/mongodb-cdc"]
 nats = ["laminar-db/nats"]
+# RabbitMQ AMQP 0-9-1 source and sink (pure Rust); off by default.
+rabbitmq = ["laminar-db/rabbitmq"]
+# IBM MQ source and sink; the IBM MQ client library is loaded at run time, never at build time.
+ibmmq = ["laminar-db/ibmmq"]
 # FIX initiator source (builds the QuickFIX C++ engine with CMake); off by default.
 fix = ["laminar-db/fix"]
 # FpML documents on the files and Kafka sources (builds libxml2 with CMake); off by default.

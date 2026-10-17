@@ -89,6 +89,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "kafka", any(feature = "rabbitmq", feature = "ibmmq")))]
+#[path = "cluster_soak/messaging_sinks.rs"]
+mod messaging_sinks;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology.rs"]
 mod topology_adoption;
@@ -11144,6 +11147,51 @@ fn write_config(
     matrix_sinks: &str,
     extra_workload: &str,
 ) -> PathBuf {
+    let toml = format!(
+        r#"{node}
+# Guaranteed delivery uses engine-owned vnode assignment. The group ID below is only the
+# advisory broker-offset namespace; LaminarDB checkpoints remain the recovery authority.
+{workload}
+"#,
+        node = cluster_node_config(
+            id,
+            interval_ms,
+            checkpoint_timeout,
+            key_groups,
+            checkpoint_url,
+            delivery
+        ),
+        workload = kafka_join_workload_config(
+            brokers,
+            left_topic,
+            right_topic,
+            temporal_left_topic,
+            temporal_right_topic,
+            consumer_group,
+            matrix_left_topic,
+            matrix_right_topic,
+            matrix_consumer_group,
+            sink,
+            matrix_sinks,
+            extra_workload,
+        ),
+    );
+
+    let path = dir.join(format!("node{id}.toml"));
+    std::fs::write(&path, toml).unwrap();
+    path
+}
+
+/// The `[server]`, `[discovery]`, and `[checkpoint]` sections of one three-node soak member.
+#[cfg(feature = "kafka")]
+fn cluster_node_config(
+    id: usize,
+    interval_ms: u64,
+    checkpoint_timeout: Duration,
+    key_groups: u32,
+    checkpoint_url: &str,
+    delivery: JoinDelivery,
+) -> String {
     let http = BASE_PORT + id as u16;
     let gossip = BASE_PORT + 100 + id as u16;
     let seeds: Vec<String> = (0..NODES)
@@ -11177,7 +11225,7 @@ fn write_config(
         "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
     );
 
-    let toml = format!(
+    format!(
         r#"
 node_id = "n{id}"
 
@@ -11204,34 +11252,13 @@ timeout = "{checkpoint_timeout}"
 [checkpoint.storage]
 {storage}
 
-# Guaranteed delivery uses engine-owned vnode assignment. The group ID below is only the
-# advisory broker-offset namespace; LaminarDB checkpoints remain the recovery authority.
-{workload}
 "#,
         seeds = seeds.join(", "),
         url = checkpoint_url,
         delivery = delivery.server_value(),
         source_idle_timeout_secs = SOAK_SOURCE_IDLE_TIMEOUT.as_secs(),
         event_time_max_future_skew_ms = SOAK_EVENT_MAX_FUTURE_SKEW_MS,
-        workload = kafka_join_workload_config(
-            brokers,
-            left_topic,
-            right_topic,
-            temporal_left_topic,
-            temporal_right_topic,
-            consumer_group,
-            matrix_left_topic,
-            matrix_right_topic,
-            matrix_consumer_group,
-            sink,
-            matrix_sinks,
-            extra_workload,
-        ),
-    );
-
-    let path = dir.join(format!("node{id}.toml"));
-    std::fs::write(&path, toml).unwrap();
-    path
+    )
 }
 
 #[cfg(feature = "kafka")]

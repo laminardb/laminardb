@@ -9,6 +9,8 @@ pub mod raw;
     test,
     feature = "kafka",
     feature = "nats",
+    feature = "rabbitmq",
+    feature = "ibmmq",
     feature = "websocket",
     feature = "files"
 ))]

@@ -3,22 +3,49 @@
 use arrow_schema::{DataType, SchemaRef};
 
 use super::Format;
-#[cfg(any(test, feature = "kafka", feature = "nats", feature = "files"))]
+#[cfg(any(
+    test,
+    feature = "kafka",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "ibmmq",
+    feature = "files"
+))]
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
-#[cfg(any(test, feature = "kafka", feature = "nats", feature = "files"))]
+#[cfg(any(
+    test,
+    feature = "kafka",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "ibmmq",
+    feature = "files"
+))]
 use crate::schema::resolution::fixed_binding;
-#[cfg(any(test, feature = "kafka", feature = "nats"))]
+#[cfg(any(
+    test,
+    feature = "kafka",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "ibmmq"
+))]
 use crate::schema::resolution::{logical_binding, SchemaBinding, SchemaDirection, SchemaOrigin};
 
-#[cfg(any(test, feature = "kafka", feature = "nats"))]
+#[cfg(any(
+    test,
+    feature = "kafka",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "ibmmq"
+))]
 pub(crate) fn reader_binding(
     config: &ConnectorConfig,
     format: Format,
     explicit: Option<SchemaRef>,
 ) -> Result<SchemaBinding, ConnectorError> {
     if format == Format::Raw {
-        return fixed_binding(config, explicit, &super::raw::raw_schema());
+        let protocol = super::raw::raw_protocol_for(explicit.as_ref());
+        return fixed_binding(config, explicit, &protocol);
     }
     let schema = explicit.ok_or_else(|| ConnectorError::FeatureUnsupported(format!(
         "{} {} source has no authoritative field schema; declare columns or use a metadata-capable format",
@@ -33,7 +60,14 @@ pub(crate) fn reader_binding(
     )
 }
 
-#[cfg(any(test, feature = "kafka", feature = "nats", feature = "files"))]
+#[cfg(any(
+    test,
+    feature = "kafka",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "ibmmq",
+    feature = "files"
+))]
 pub(crate) fn validate_reader(format: Format, schema: &SchemaRef) -> Result<(), ConnectorError> {
     super::create_deserializer(format).map_err(ConnectorError::Serde)?;
     match format {
@@ -43,7 +77,7 @@ pub(crate) fn validate_reader(format: Format, schema: &SchemaRef) -> Result<(), 
             fixed_binding(
                 &ConnectorConfig::new("raw"),
                 Some(schema.clone()),
-                &super::raw::raw_schema(),
+                &super::raw::raw_protocol_for(Some(schema)),
             )?;
         }
         Format::Avro | Format::Fpml => {
@@ -78,9 +112,15 @@ pub(crate) fn validate_writer(format: Format, schema: &SchemaRef) -> Result<(), 
                 })?;
         }
         Format::Raw => {
-            if schema.fields().len() != 1 || schema.field(0).data_type() != &DataType::Utf8 {
+            if schema.fields().len() != 1
+                || !matches!(
+                    schema.field(0).data_type(),
+                    DataType::Utf8 | DataType::Binary | DataType::LargeBinary
+                )
+            {
                 return Err(ConnectorError::SchemaMismatch(
-                    "raw writer requires exactly one Utf8 query field; project it in CREATE STREAM"
+                    "raw writer requires exactly one Utf8, Binary, or LargeBinary query field; \
+                     project it in CREATE STREAM"
                         .into(),
                 ));
             }
