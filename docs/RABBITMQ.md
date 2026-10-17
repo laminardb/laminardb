@@ -25,7 +25,7 @@ because without checkpoints nothing would ever acknowledge its messages.
 |---|---|---|
 | Protocol | AMQP 0-9-1, tested against RabbitMQ 4.3.6 with `lapin` 4.12.2 | AMQP 1.0 and the RabbitMQ stream protocol |
 | Queues (source) | Classic and quorum queues, existing or declared on request | Stream queues: declared ones are rejected at configuration; an existing one is detected by its `x-stream-offset` header and stops the source before anything is handed off |
-| Formats | `JSON`, `CSV` (a message may hold several lines), and `RAW` (`value BYTEA` keeps bytes exactly; `value VARCHAR` requires UTF-8) | `AVRO`, `DEBEZIUM`, `FPML` |
+| Formats | `JSON`, `CSV` (a message may hold several lines), and `RAW` (`value BYTEA` keeps bytes exactly; `value VARCHAR` requires UTF-8). Sources also read `FPML` (the `fpml` build feature): one document per message | `AVRO` and `DEBEZIUM`; `FPML` sinks |
 | Delivery | At-least-once with checkpointing; a persistent sink is durable at-least-once | Exactly-once (neither direction is certified) and best-effort sources |
 | Deployment | Embedded and single-node server. In cluster mode the sink runs on every node as an independent at-least-once writer, under the same rule as Kafka and NATS output | Cluster mode rejects the source: it is a singleton |
 | TLS | `amqps://` with peer and hostname verification against the Web PKI roots plus an optional CA bundle, and mutual TLS with a PEM certificate and PKCS#8 key | Plain `amqp://` with TLS options |
@@ -241,11 +241,12 @@ are wired to run in CI's `rabbitmq-integration` job.
 - a missing exchange;
 - pipelined confirms;
 - TLS: trusted CA, hostname verification, and a required client certificate, each rejected when
-  missing or wrong.
+  missing or wrong;
+- FpML documents becoming rows, with a rejected document dead-lettered.
 
 `crates/laminar-db/tests/rabbitmq_e2e.rs` covers SQL JSON and byte-exact binary round trips,
-redelivery after a restart without loss, metadata columns across a restart, and the best-effort
-rejection.
+redelivery after a restart without loss, metadata columns across a restart, FpML documents with
+metadata across a restart, and the best-effort rejection.
 
 `crates/laminar-server/tests/rabbitmq_kill.rs` runs the standalone server with a confirmed
 publisher and an independent oracle. Every scenario reached the output with no published message
@@ -312,9 +313,12 @@ process rose from 79 to 99 MiB across the matrix, and CPU time was 6.4 to 11.9 s
 (p50 9.9 ms, p99 29.7 ms). At 30,000 offered, the pipeline delivered about 24,900 messages/s with
 latency growing to about 2 seconds as the backlog built.
 
-## FpML and other formats
+## FpML
 
-The source decodes through the shared `RecordDeserializer` contract, and a message may become zero,
-one, or several rows; metadata is repeated per row. A future FpML integration adapts the FpML
-`FormatDecoder` to that contract, gets the complete message body and metadata, and uses the same
-acknowledgement and `reject` lifecycle. FpML is not supported by these connectors today.
+With the `fpml` build feature, `FORMAT FPML` makes each message one FpML document and one row,
+validated against the pinned FpML schema and projected by a profile; the
+[FpML source guide](FPML_SOURCE.md#from-rabbitmq-or-ibm-mq) has the profiles and options.
+Metadata columns follow the profile's columns. Validation runs on a blocking thread, never on the
+async runtime. A rejected document follows `on.decode.error` like any other undecodable message:
+`fail` stops the source and leaves it unacknowledged, and `reject` hands it to the queue's
+dead-letter exchange. The `fpml.*` options are refused for other formats.

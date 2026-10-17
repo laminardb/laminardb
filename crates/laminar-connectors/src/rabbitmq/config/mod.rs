@@ -314,9 +314,15 @@ impl RabbitMqSourceConfig {
     /// # Errors
     /// Returns a configuration error for unknown, missing, conflicting, or invalid options.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        let format = parse_source_format(config)?;
         reject_unknown(
             config,
-            &[RUNTIME_SOURCE_KEYS, CONNECTION_KEYS, SOURCE_KEYS],
+            &[
+                RUNTIME_SOURCE_KEYS,
+                CONNECTION_KEYS,
+                SOURCE_KEYS,
+                format.source_option_keys(),
+            ],
             "source",
         )?;
         let connection = ConnectionConfig::from_config(config, "laminardb-rabbitmq-source")?;
@@ -377,7 +383,6 @@ impl RabbitMqSourceConfig {
                  fits one batch",
             ));
         }
-        let format = parse_format(config)?;
         let metadata = MetadataColumns::parse(config.get("metadata.columns"))?;
         Ok(Self {
             connection,
@@ -518,7 +523,7 @@ impl RabbitMqSinkConfig {
             max_pending,
             max_pending_bytes,
             confirm_timeout,
-            format: parse_format(config)?,
+            format: parse_sink_format(config)?,
         };
         let mut seen = std::collections::BTreeSet::new();
         if let Some(duplicate) = sink
@@ -675,17 +680,37 @@ fn reject_stream_queue(arguments: &FieldTable) -> Result<(), ConnectorError> {
     Ok(())
 }
 
-fn parse_format(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
-    let format = config
+fn format_option(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
+    Ok(config
         .get("format")
         .map(Format::parse)
         .transpose()
         .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?
-        .unwrap_or(Format::Json);
-    match format {
-        Format::Json | Format::Csv | Format::Raw => Ok(format),
+        .unwrap_or(Format::Json))
+}
+
+/// Sources also read FORMAT FPML: one complete document per message.
+fn parse_source_format(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
+    match format_option(config)? {
+        format @ (Format::Json | Format::Csv | Format::Raw) => Ok(format),
+        #[cfg(feature = "fpml")]
+        Format::Fpml => Ok(Format::Fpml),
+        #[cfg(not(feature = "fpml"))]
+        Format::Fpml => Err(ConnectorError::ConfigurationError(
+            "format 'fpml' requires a build with the fpml feature".into(),
+        )),
         other => Err(ConnectorError::FeatureUnsupported(format!(
-            "RabbitMQ supports FORMAT JSON, CSV, and RAW; {other} is not qualified for it"
+            "RabbitMQ sources support FORMAT JSON, CSV, RAW, and FPML; {other} is not qualified \
+             for them"
+        ))),
+    }
+}
+
+fn parse_sink_format(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
+    match format_option(config)? {
+        format @ (Format::Json | Format::Csv | Format::Raw) => Ok(format),
+        other => Err(ConnectorError::FeatureUnsupported(format!(
+            "RabbitMQ sinks support FORMAT JSON, CSV, and RAW; {other} is not qualified for them"
         ))),
     }
 }

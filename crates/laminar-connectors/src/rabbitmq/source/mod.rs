@@ -27,11 +27,12 @@ use super::metrics::{saturating, SourceMetrics};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
-    ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector, SourceConsistency,
-    SourceContract, SourceInputMode, SourcePosition, SourceStart, SourceTopology,
+    ConnectorTaskAdmission, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
-use crate::serde::{self, RecordDeserializer};
+use crate::serde::{self, Format, RecordDeserializer};
 
 const GENERATION: &str = "generation";
 const DELIVERY_TAG: &str = "delivery_tag";
@@ -57,9 +58,10 @@ struct Running {
     deliveries: mpsc::Receiver<Result<Delivery, String>>,
     reader: tokio::task::JoinHandle<()>,
     carry: Option<Delivery>,
-    decoder: Decoder,
+    decoder: Arc<Decoder>,
     ledger: AckLedger,
     metrics: SourceMetrics,
+    tasks: ConnectorTaskAdmission,
 }
 
 impl Drop for Running {
@@ -300,6 +302,43 @@ impl RabbitMqSource {
         terminal(cause)
     }
 
+    /// The payload codec and the schemas of the committed contract.
+    #[cfg_attr(not(feature = "fpml"), allow(clippy::unused_async))]
+    async fn decoder(
+        &self,
+        config: &ConnectorConfig,
+        parsed: &RabbitMqSourceConfig,
+    ) -> Result<Decoder, ConnectorError> {
+        #[cfg(feature = "fpml")]
+        if parsed.format == Format::Fpml {
+            use crate::schema::traits::FormatDecoder;
+            let guard = self.task_owner.track().ok_or_else(retired)?;
+            let decoder = crate::fpml::message::start_decoder(
+                config,
+                config.schema_binding(),
+                "RabbitMQ",
+                self.registry.as_ref(),
+                guard,
+            )
+            .await?;
+            let payload = decoder.output_schema();
+            parsed.metadata.validate_payload(&payload)?;
+            return Ok(Decoder {
+                deserializer: Box::new(crate::fpml::message::MessageDecoder(Arc::new(decoder))),
+                output: parsed.metadata.output_schema(&payload),
+                payload,
+                config: parsed.clone(),
+            });
+        }
+        let (payload, output) = self.resolve_output(config, parsed)?;
+        Ok(Decoder {
+            deserializer: serde::create_deserializer(parsed.format)?,
+            payload,
+            output,
+            config: parsed.clone(),
+        })
+    }
+
     fn resolve_output(
         &self,
         config: &ConnectorConfig,
@@ -366,9 +405,7 @@ impl RabbitMqSource {
                 ))
             })?;
         let (sender, deliveries) = mpsc::channel(usize::from(parsed.prefetch));
-        let guard = self.task_owner.track().ok_or_else(|| {
-            ConnectorError::Internal("RabbitMQ source task generation is retired".into())
-        })?;
+        let guard = self.task_owner.track().ok_or_else(retired)?;
         let data_ready = Arc::clone(&self.data_ready);
         let reader = tokio::spawn(async move {
             let _guard = guard;
@@ -380,9 +417,10 @@ impl RabbitMqSource {
             deliveries,
             reader,
             carry: None,
-            decoder,
+            decoder: Arc::new(decoder),
             ledger: AckLedger::new(rand::random()),
             metrics,
+            tasks: self.task_owner.admission(),
         })
     }
 }
@@ -415,6 +453,10 @@ async fn read_deliveries(
         ))
         .await;
     data_ready.notify_one();
+}
+
+fn retired() -> ConnectorError {
+    ConnectorError::Internal("RabbitMQ source task generation is retired".into())
 }
 
 fn terminal(cause: String) -> ConnectorError {
@@ -458,6 +500,29 @@ impl Running {
         Collected::Deliveries(deliveries)
     }
 
+    /// `FpML` validation blocks, so it runs on a tracked blocking thread; other codecs decode
+    /// inline.
+    async fn decode(&self, deliveries: Vec<Delivery>) -> Result<(Vec<Delivery>, Decoded), String> {
+        if self.decoder.config.format != Format::Fpml {
+            let decoded = self
+                .decoder
+                .decode(&deliveries)
+                .map_err(|error| format!("decode failed: {error}"))?;
+            return Ok((deliveries, decoded));
+        }
+        let guard = self.tasks.track().ok_or_else(|| retired().to_string())?;
+        let codec = Arc::clone(&self.decoder);
+        let (deliveries, result) = tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let result = codec.decode(&deliveries);
+            (deliveries, result)
+        })
+        .await
+        .map_err(|error| format!("decode task failed: {error}"))?;
+        let decoded = result.map_err(|error| format!("decode failed: {error}"))?;
+        Ok((deliveries, decoded))
+    }
+
     /// Decode and hand off ready deliveries. Any error ends the generation.
     async fn poll(&mut self, max_records: usize) -> Result<Option<SourceBatch>, String> {
         let deliveries = match self.collect(max_records) {
@@ -484,10 +549,7 @@ impl Running {
                 config.max_message_bytes
             ));
         }
-        let decoded = self
-            .decoder
-            .decode(&accepted)
-            .map_err(|error| format!("decode failed: {error}"))?;
+        let (accepted, decoded) = self.decode(accepted).await?;
         let mut rejected: Vec<u64> = oversized
             .iter()
             .map(|delivery| delivery.delivery_tag)
@@ -581,6 +643,14 @@ impl SourceConnector for RabbitMqSource {
     ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
         use crate::schema::resolution::{logical_binding, SchemaDirection};
         let parsed = RabbitMqSourceConfig::from_config(config)?;
+        #[cfg(feature = "fpml")]
+        if parsed.format == Format::Fpml {
+            return crate::fpml::message::source_binding(config, explicit, "RabbitMQ", |payload| {
+                parsed.metadata.validate_payload(payload)?;
+                Ok(parsed.metadata.output_schema(payload))
+            })
+            .await;
+        }
         let reader = serde::schema_contract::reader_binding(config, parsed.format, explicit)?;
         let payload = Arc::new(reader.logical);
         parsed.metadata.validate_payload(&payload)?;
@@ -620,16 +690,10 @@ impl SourceConnector for RabbitMqSource {
         // A resume needs no positioning: every delivery the committed cut did not cover is still
         // unacknowledged, and the broker redelivered it when the previous channel closed.
         let parsed = RabbitMqSourceConfig::from_config(&config)?;
-        let (payload, output) = self.resolve_output(&config, &parsed)?;
-        let deserializer = serde::create_deserializer(parsed.format)?;
         let name = config.get("laminar.source.name").unwrap_or("rabbitmq");
         let metrics = SourceMetrics::new(name, self.registry.as_ref())?;
-        let decoder = Decoder {
-            deserializer,
-            payload,
-            output: Arc::clone(&output),
-            config: parsed.clone(),
-        };
+        let decoder = self.decoder(&config, &parsed).await?;
+        let output = Arc::clone(&decoder.output);
         let running = self.open(&parsed, decoder, metrics).await?;
         tracing::info!(
             queue = %parsed.queue,

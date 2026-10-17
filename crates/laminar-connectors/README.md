@@ -24,7 +24,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | Delta Lake Source | `delta-lake` | Change data feed and snapshots through the Delta kernel as a retractable changelog; replayable at-least-once at commit/file boundaries, embedded/single-node | Implemented |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog fails closed | Implemented |
 | File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
-| FpML documents | `fpml` | `FORMAT FPML` on the files and Kafka sources: schema-validated FpML 5.13 documents projected to typed rows by profiles; embedded/single-node ([guide](../../docs/FPML_SOURCE.md)) | Implemented |
+| FpML documents | `fpml` | `FORMAT FPML` on the files, Kafka, RabbitMQ, and IBM MQ sources, and `fpml.field` on the FIX source: schema-validated FpML 5.13 documents projected to typed rows by profiles; embedded/single-node ([guide](../../docs/FPML_SOURCE.md)) | Implemented |
 
 Feature flags compile connector implementations; startup validates the complete source/SQL/sink
 composition before any connector I/O.
@@ -886,7 +886,7 @@ requirements:
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
 | `files` | Local file source (auto-loader) and sink (rolling files); remote URLs are rejected |
-| `fpml` | FpML format for the files and Kafka sources; builds a vendored libxml2 with CMake |
+| `fpml` | FpML format for the files, Kafka, RabbitMQ, and IBM MQ sources and FIX fields; builds a vendored libxml2 with CMake |
 
 ## Custom Connectors
 

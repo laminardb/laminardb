@@ -6,9 +6,10 @@ that tie legs to parties and dates to schedules, and amounts that must never be 
 usually end up writing a parser for each product they care about and maintaining it every time
 the standard or a counterparty changes.
 
-LaminarDB reads FpML documents directly. Set the format of a files or Kafka source to `FPML`, and
-each document is checked against the official FpML schema, its internal references are resolved,
-and the parts you care about become typed columns you can query with SQL. A profile decides what a
+LaminarDB reads FpML documents directly. Set the format of a files, Kafka, RabbitMQ, or IBM MQ
+source to `FPML`, or name the FIX field that carries the document, and each document is checked
+against the official FpML schema, its internal references are resolved, and the parts you care
+about become typed columns you can query with SQL. A profile decides what a
 row is: one per trade, one per message, or one per loan event or facility.
 
 ## Before you start
@@ -28,11 +29,11 @@ compiler. Builds without the feature don't compile or link libxml2.
 | Area | Supported | Rejected before the source starts |
 |---|---|---|
 | Standard | FpML 5.13 Recommendation 2, build 8, confirmation view. It ships with LaminarDB and every schema file is pinned by SHA-256. You can extend it with your own schemas. | Other releases or views unless you supply their schemas. `xsi:schemaLocation` hints in documents are ignored. |
-| Transports | Files source (one document per file) and Kafka source (one document per message, with a profile that gives one row per document) | Files and Kafka sinks, and other transports |
+| Transports | Files source (one document per file); Kafka, RabbitMQ, and IBM MQ sources (one document per message, with a profile that gives one row per document); and a FIX source field such as SecurityXML (1185), which adds one `fpml` column per message | Sinks, and other transports |
 | Coverage | Every product (50), loan facility and event (54), and document type (90) in the schema, each typed by a bundled profile. See the [support matrix](FPML_SUPPORT_MATRIX.md). | |
-| Deployment | Embedded and single-node server | Cluster mode. A files source can't be spread across nodes, and a Kafka FpML source refuses a cluster partition assignment. |
-| Delivery | At-least-once with checkpointing. A best-effort Kafka source can skip a rejected message. | No new exactly-once path. The usual source and sink rules decide, and FpML hasn't been tested on its own for exactly-once. |
-| Bad documents | A rejected document stops a guaranteed source at that document | There's no dead-letter or quarantine route yet |
+| Deployment | Embedded and single-node server | Cluster mode. A files source can't be spread across nodes, a Kafka FpML source refuses a cluster partition assignment, and cluster mode rejects RabbitMQ, IBM MQ, and FIX sources. |
+| Delivery | At-least-once with checkpointing. A best-effort Kafka source can skip a rejected message. | No new exactly-once path. The usual source and sink rules decide, and FpML hasn't been tested on its own for exactly-once, including on a FIX source. |
+| Bad documents | A rejected document stops a guaranteed source at that document. RabbitMQ and IBM MQ sources can route it through the broker instead, with their `on.decode.error` setting. | Files, Kafka, and FIX sources have no dead-letter or quarantine route |
 
 The bundled profiles are tested against all 535 schema-valid example documents published with
 FpML 5.13, plus synthetic documents written by the LaminarDB team for the cases the official
@@ -75,6 +76,55 @@ watermark. Nested values work like any other SQL struct or list, for example
 
 The [README](../README.md#fpml-trade-confirmations) has a walkthrough that runs on your machine in
 a few minutes.
+
+### From RabbitMQ or IBM MQ
+
+Queues work like Kafka: each message is one document and one row, the document profile is the
+default, and you don't declare columns. Metadata columns are added after the profile's columns:
+
+```sql
+CREATE SOURCE confirmations FROM RABBITMQ (
+    'url' = 'amqps://broker.example.com:5671/trading',
+    'username' = 'laminar',
+    'password' = '${RABBITMQ_PASSWORD}',
+    'queue' = 'fpml.confirmations',
+    'metadata.columns' = 'message_id,redelivered'
+) FORMAT FPML;
+```
+
+`FROM IBMMQ (...) FORMAT FPML` takes the same `fpml.*` options. The rest of the
+[RabbitMQ](RABBITMQ.md) and [IBM MQ](IBMMQ.md) settings apply unchanged.
+
+### From a FIX field
+
+FIX 5.0 SP1 and later carry an FpML document in SecurityXML (1185), with its length in
+SecurityXMLLen (1184). Name the field with `fpml.field` and the source adds a column called `fpml`
+after the columns you declare. It's a struct of the profile's columns, so you read it like any
+other struct:
+
+```sql
+CREATE SOURCE confirmations (
+    exec_id VARCHAR NOT NULL,
+    symbol VARCHAR NOT NULL
+) FROM FIX (
+    -- session, dictionary, and journal options as in the FIX source guide
+    messages = '8',
+    'column.exec_id' = '17',
+    'column.symbol' = '55',
+    'fpml.field' = '1185'
+);
+
+SELECT exec_id, fpml['document_root'], fpml['header']['message_id'] FROM confirmations;
+```
+
+- The field must be a body field of a selected message type, typed DATA or XMLDATA in your
+  dictionary. A message without it has a null `fpml`.
+- Each message holds one document, so the profile must give one row per document. The document
+  profile is the default. If `expand` turns a message into several rows, each row carries the same
+  document.
+- The document must be a complete FpML document in the configured view. Fragments, or documents
+  from another view or release, are rejected like any other bad document.
+- `max.message.bytes` on the FIX source bounds the whole message, document included.
 
 ## Choosing a profile
 
@@ -120,8 +170,8 @@ nested structure, open the profiles in
 ## What happens to each document
 
 1. **The size is checked.** A document is read only up to `fpml.max.document.bytes` (16 MiB by
-   default). The files source caps `max_file_bytes` to the same value, and Kafka bounds messages
-   with `record.max.bytes`.
+   default). The files source caps `max_file_bytes` to the same value, Kafka bounds messages with
+   `record.max.bytes`, and RabbitMQ, IBM MQ, and FIX bound them with `max.message.bytes`.
 2. **A quick scan runs before any parsing.** Only UTF-8 is accepted, with or without a byte order
    mark or an explicit UTF-8 declaration. Other encodings are rejected rather than converted, so
    nothing is ever decoded lossily. The scan also rejects DTDs, processing instructions, unknown
@@ -149,7 +199,7 @@ block the async runtime.
 
 | Option | Default | What it does |
 |---|---|---|
-| `fpml.profile` | trade for files, document for Kafka | A bundled profile name |
+| `fpml.profile` | trade for files, document for message sources and FIX fields | A bundled profile name |
 | `fpml.profile.path` | | Your own profile file, instead of a bundled one |
 | `fpml.schema.path` | The bundled schema | A directory with your own `closure.toml` and schema files |
 | `fpml.references` | `resolve` | `resolve` checks that every `href` points at something; `schema` also checks the target's type |
@@ -268,6 +318,15 @@ never reads a file again past its committed rows.
 **Kafka.** One message is one document and one row, positioned by topic, partition, and offset.
 Only profiles whose rows are whole documents (`rows = "."`) are accepted.
 
+**RabbitMQ and IBM MQ.** One message is one document and one row, with the same profile rule. A
+message is acknowledged (RabbitMQ) or committed (IBM MQ) only when the checkpoint that holds its
+row is durable, as for any other format. On IBM MQ, validation runs inside the get, so
+`operation.timeout.ms` has to cover validating a full batch.
+
+**FIX.** The document is validated when its message is read from the journal, live or on replay.
+The field, schema bundle, and profile are part of the source's contract, so replaying the journal
+gives the same `fpml` values.
+
 **The contract is fixed when the source is created.** LaminarDB records the schema bundle's
 fingerprint, release, build, and view, and the profile's name, version, and fingerprint. If any of
 them changes, the next start fails with a schema mismatch before reading anything. To change
@@ -280,7 +339,7 @@ exactly-once path, and only at-least-once recovery has been tested with FpML.
 
 | What goes wrong | What happens |
 |---|---|
-| A document is malformed, too large, in the wrong encoding, invalid against the schema, or has a broken reference | A guaranteed source stops at that document without moving past it. A best-effort Kafka source skips the message, within `max.deser.error.rate`. |
+| A document is malformed, too large, in the wrong encoding, invalid against the schema, or has a broken reference | A guaranteed source stops at that document without moving past it. A best-effort Kafka source skips the message, within `max.deser.error.rate`. A RabbitMQ or IBM MQ source with a dead-letter setting hands the message to the broker instead. |
 | A value can't be converted exactly, a single-value column matches two elements, or a reference points at the wrong type | The same, and none of that document's rows are sent |
 | The process is killed | The source resumes from its last committed position, and rows after it are sent again |
 | The profile, schema, or release changed | The source refuses to start, with a schema mismatch |
@@ -293,6 +352,14 @@ When a source stops on a bad document, someone has to decide what to do with it:
   `startup.mode = 'latest'`, or with a consumer group whose committed offset is past the message.
   Both skip data, so check the topic for what was skipped. If losing rejected messages is
   acceptable, use best-effort delivery instead.
+- **RabbitMQ:** the message stays unacknowledged and comes back after recovery. To set rejected
+  documents aside, give the queue a dead-letter exchange and set `on.decode.error = 'reject'`.
+- **IBM MQ:** the get is backed out and the message comes back. To set rejected documents aside,
+  give the queue `BOTHRESH` and a local `BOQNAME` and set `on.decode.error = 'backout-queue'`; the
+  move commits with the checkpoint.
+- **FIX:** the record stays in the journal, so the source stops at it again after every restart,
+  as it does for a FIX value that can't be converted. There's no setting to skip one record.
+  Dropping the source and creating it again without `fpml.field` reads the session without FpML.
 
 We tested recovery by hard-killing the standalone server every 15 seconds for 15 minutes while
 45,000 documents arrived at 50 per second. Every expected row reached the files sink. There were

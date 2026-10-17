@@ -58,6 +58,16 @@ impl Format {
         }
     }
 
+    /// Source options this format reads in addition to the connector's own.
+    #[cfg(any(feature = "rabbitmq", feature = "ibmmq"))]
+    pub(crate) fn source_option_keys(self) -> &'static [&'static str] {
+        match self {
+            #[cfg(feature = "fpml")]
+            Format::Fpml => crate::fpml::message::OPTION_KEYS,
+            _ => &[],
+        }
+    }
+
     /// Parses a format from a string.
     ///
     /// # Errors

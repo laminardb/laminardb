@@ -412,3 +412,100 @@ async fn metadata_columns_survive_a_restart_with_the_same_storage() {
     assert_eq!(ready(&channel, &input).await, 0);
     delete(&channel, &[&input, &output]).await;
 }
+
+#[cfg(feature = "fpml")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fpml_documents_feed_sql_across_a_restart() {
+    const CORPUS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../laminar-connectors/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/"
+    );
+    let Some((url, channel)) = broker().await else {
+        return;
+    };
+    let (input, output) = (unique("fpml.in"), unique("fpml.out"));
+    queue(&channel, &input).await;
+    queue(&channel, &output).await;
+    let storage = tempfile::tempdir().unwrap();
+    let ddl = [
+        format!(
+            "CREATE SOURCE confirmations FROM RABBITMQ ('url' = '{url}', {CREDENTIALS}, \
+             'queue' = '{input}', 'metadata.columns' = 'message_id') FORMAT FPML"
+        ),
+        "CREATE STREAM roots AS SELECT document_root, _message_id AS id FROM confirmations"
+            .to_string(),
+        format!(
+            "CREATE SINK roots_out FROM roots INTO RABBITMQ ('url' = '{url}', {CREDENTIALS}, \
+             'routing.key' = '{output}') FORMAT JSON"
+        ),
+    ];
+    let rounds = [
+        vec![
+            (
+                "swap",
+                "products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml",
+            ),
+            (
+                "clearing",
+                "business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml",
+            ),
+        ],
+        vec![(
+            "allocation",
+            "business-processes/allocation/msg-ex20-cds-request-allocation.xml",
+        )],
+    ];
+    let expected = [
+        BTreeMap::from([("swap", "dataDocument"), ("clearing", "clearingConfirmed")]),
+        BTreeMap::from([("allocation", "requestAllocation")]),
+    ];
+    for (round, documents) in rounds.iter().enumerate() {
+        let db = open(storage.path(), DeliveryGuarantee::AtLeastOnce).await;
+        for statement in &ddl {
+            db.execute(statement)
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {statement}: {error}"));
+        }
+        db.start()
+            .await
+            .unwrap_or_else(|error| panic!("round {round} start: {error}"));
+        for (id, path) in documents {
+            let body = std::fs::read(format!("{CORPUS}{path}")).expect("corpus document");
+            channel
+                .basic_publish(
+                    "".into(),
+                    input.as_str().into(),
+                    BasicPublishOptions::default(),
+                    &body,
+                    BasicProperties::default()
+                        .with_delivery_mode(2)
+                        .with_message_id((*id).into()),
+                )
+                .await
+                .expect("publish");
+        }
+        let received = drain_until(&channel, &output, Duration::from_secs(30), |seen| {
+            seen.len() >= documents.len()
+        })
+        .await;
+        let roots: BTreeMap<String, String> = received
+            .iter()
+            .map(|message| {
+                let value: serde_json::Value = serde_json::from_slice(message).unwrap();
+                (
+                    value["id"].as_str().unwrap().to_string(),
+                    value["document_root"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let wanted: BTreeMap<String, String> = expected[round]
+            .iter()
+            .map(|(id, root)| ((*id).to_string(), (*root).to_string()))
+            .collect();
+        assert_eq!(roots, wanted, "round {round}; fault {:?}", db.last_fault());
+        assert!(db.checkpoint().await.expect("checkpoint").success);
+        db.shutdown().await.expect("shutdown");
+    }
+    assert_eq!(ready(&channel, &input).await, 0);
+    delete(&channel, &[&input, &output]).await;
+}

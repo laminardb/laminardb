@@ -278,13 +278,13 @@ jobs:
       - name: Start RabbitMQ
         run: docker compose -f tests/docker/compose.yml up -d --wait rabbitmq
       - name: Connector tests against the broker
-        run: cargo test -p laminar-connectors --no-default-features --features rabbitmq --test rabbitmq_integration -- --test-threads=2
+        run: cargo test -p laminar-connectors --no-default-features --features "rabbitmq fpml" --test rabbitmq_integration -- --test-threads=2
         env:
           LAMINAR_REQUIRE_RABBITMQ: "1"
           LAMINAR_TEST_RABBITMQ_CONTAINER: laminardb-rabbitmq
           LAMINAR_TEST_RABBITMQ_TLS: "1"
       - name: SQL end-to-end tests
-        run: cargo test -p laminar-db --no-default-features --features rabbitmq --test rabbitmq_e2e -- --test-threads=1
+        run: cargo test -p laminar-db --no-default-features --features "rabbitmq fpml" --test rabbitmq_e2e -- --test-threads=1
         env:
           LAMINAR_REQUIRE_RABBITMQ: "1"
       - name: Standalone-server hard kills and broker restarts
@@ -354,6 +354,8 @@ jobs:
           fi
       - name: Clippy
         run: cargo clippy -p laminar-connectors --no-default-features --features "fpml files kafka" --all-targets -- -D warnings
+      - name: Clippy with the queue and FIX sources
+        run: cargo clippy -p laminar-connectors --no-default-features --features "fpml fix rabbitmq ibmmq testing" --all-targets -- -D warnings
       - name: Validator security, schema closure, coverage manifest, goldens, and files source
         run: cargo test -p laminar-connectors --no-default-features --features "fpml files" --lib -- fpml
       - name: Independent oracle over every golden
@@ -362,6 +364,12 @@ jobs:
         run: cargo test -p laminar-connectors --no-default-features --features "kafka fpml" --lib -- kafka::source::tests::fpml
       - name: SQL end-to-end across restart
         run: cargo test -p laminar-db --no-default-features --features "fpml kafka" --test fpml_source_e2e
+      - name: RabbitMQ and IBM MQ FpML options
+        run: cargo test -p laminar-connectors --no-default-features --features "rabbitmq ibmmq fpml" --lib -- config::tests::fpml
+      - name: FpML in FIX SecurityXML (local acceptor)
+        run: |
+          cargo test -p laminar-connectors --no-default-features --features "fix fpml" --lib -- fix::tests::fpml
+          cargo test -p laminar-db --no-default-features --features "fix fpml" --test fix_source_e2e fpml_in_security_xml
 
   # ============================================
   # Release Build (main/develop only)

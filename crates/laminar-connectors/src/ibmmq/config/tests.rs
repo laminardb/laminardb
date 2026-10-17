@@ -139,3 +139,17 @@ fn sink_descriptor_fields_use_native_units_and_ranges() {
     ]))
     .contains("more than one"));
 }
+
+#[test]
+fn fpml_options_need_the_fpml_source_format() {
+    assert!(message(source(&[("fpml.profile", "x")])).contains("unknown IBM MQ source"));
+    assert!(message(sink(&[("format", "fpml")])).contains("not qualified"));
+    let fpml = source(&[("format", "fpml"), ("fpml.max.document.bytes", "1024")]);
+    if cfg!(feature = "fpml") {
+        assert_eq!(fpml.unwrap().format, Format::Fpml);
+        assert!(message(source(&[("format", "fpml"), ("fpml.profle", "x")]))
+            .contains("unknown IBM MQ source"));
+    } else {
+        assert!(message(fpml).contains("requires a build with the fpml feature"));
+    }
+}

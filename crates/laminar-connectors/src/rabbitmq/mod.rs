@@ -33,7 +33,12 @@ pub fn register_rabbitmq_source(
 ) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         schema_capabilities: crate::schema::resolution::SchemaCapabilities {
-            built_in_formats: vec!["raw".into(), "bytes".into()],
+            built_in_formats: vec![
+                "raw".into(),
+                "bytes".into(),
+                #[cfg(feature = "fpml")]
+                "fpml".into(),
+            ],
             ..crate::schema::resolution::SchemaCapabilities::declared(false)
         },
         name: "rabbitmq".to_string(),
@@ -206,6 +211,8 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
     ]);
+    #[cfg(feature = "fpml")]
+    keys.extend(crate::fpml::message::config_keys());
     keys
 }
 

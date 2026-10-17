@@ -431,3 +431,96 @@ async fn metadata_columns_survive_a_restart_with_the_same_storage() {
     assert_eq!(mq.depth(&input), 0);
     mq.delete(&[&input, &output]);
 }
+
+#[cfg(feature = "fpml")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fpml_documents_feed_sql_across_a_restart() {
+    const CORPUS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../laminar-connectors/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/"
+    );
+    let Some(mq) = fixture() else { return };
+    let (input, output) = (mq.queue("FPML.IN"), mq.queue("FPML.OUT"));
+    let storage = tempfile::tempdir().unwrap();
+    let options = mq.options();
+    let rounds = [
+        vec![
+            "products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml",
+            "business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml",
+        ],
+        vec!["business-processes/allocation/msg-ex20-cds-request-allocation.xml"],
+    ];
+    let expected = [
+        vec!["clearingConfirmed", "dataDocument"],
+        vec!["requestAllocation"],
+    ];
+    for (round, documents) in rounds.iter().enumerate() {
+        let db = open(storage.path()).await;
+        for statement in [
+            format!(
+                "CREATE SOURCE confirmations FROM IBMMQ ({options}, 'queue' = '{input}', \
+                 'wait.interval.ms' = '50') FORMAT FPML"
+            ),
+            "CREATE STREAM roots AS SELECT document_root FROM confirmations".to_string(),
+            format!(
+                "CREATE SINK roots_out FROM roots INTO IBMMQ ({options}, 'queue' = '{output}') \
+                 FORMAT JSON"
+            ),
+        ] {
+            db.execute(&statement)
+                .await
+                .unwrap_or_else(|error| panic!("round {round}: {statement}: {error}"));
+        }
+        db.start()
+            .await
+            .unwrap_or_else(|error| panic!("round {round} start: {error}"));
+        let bodies: Vec<Vec<u8>> = documents
+            .iter()
+            .map(|path| std::fs::read(format!("{CORPUS}{path}")).expect("corpus document"))
+            .collect();
+        let raw = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Binary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&raw),
+            vec![Arc::new(BinaryArray::from(
+                bodies.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        mq.put(&input, raw, batch, "raw").await;
+        let text = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let batches = mq
+            .drain_until(&output, text, "raw", |batches| {
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>() >= documents.len()
+            })
+            .await;
+        let mut roots: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_string::<i32>()
+                    .iter()
+                    .flatten()
+                    .map(|text| {
+                        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                        value["document_root"].as_str().unwrap().to_string()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        roots.sort();
+        assert_eq!(roots, expected[round], "round {round}");
+        assert!(db.checkpoint().await.expect("checkpoint").success);
+        db.shutdown().await.expect("shutdown");
+    }
+    assert_eq!(mq.depth(&input), 0);
+    mq.delete(&[&input, &output]);
+}

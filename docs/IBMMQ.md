@@ -39,7 +39,7 @@ The source needs checkpointing and at-least-once delivery; a best-effort pipelin
 |---|---|---|
 | API | MQI through IBM's client (`MQCONNX`, `MQOPEN`, `MQGET`, `MQPUT`, `MQPUT1`, `MQCMIT`, `MQBACK`, `MQINQ`, message handles) | AMQP, JMS, REST, and MQ topics/subscriptions |
 | Objects | Queues: local, alias, cluster, and (sink) remote definitions | Topics |
-| Formats | `JSON`, `CSV` (several lines per message), and `RAW` (`value BYTEA` keeps bytes exactly; `value VARCHAR` requires UTF-8) | `AVRO`, `DEBEZIUM`, `FPML` |
+| Formats | `JSON`, `CSV` (several lines per message), and `RAW` (`value BYTEA` keeps bytes exactly; `value VARCHAR` requires UTF-8). Sources also read `FPML` (the `fpml` build feature): one document per message | `AVRO` and `DEBEZIUM`; `FPML` sinks |
 | Messages | Complete messages up to `max.message.bytes`, including group members | Segmented messages (`MQMF_SEGMENT`), which would be partial records |
 | Delivery | At-least-once with checkpointing; a persistent sink is durable at-least-once | Exactly-once, XA, and best-effort sources |
 | Deployment | Embedded and single-node server. In cluster mode the sink runs on every node as an independent at-least-once writer, under the same rule as Kafka and NATS output | Cluster mode rejects the source: it is a singleton |
@@ -287,10 +287,12 @@ Connector tests (`crates/laminar-connectors/tests/ibmmq_integration.rs`) cover:
 - sink units of work and `MAXMSGL` refusal;
 - bad credentials;
 - CCDT;
-- a cancelled poll that taints its unit of work.
+- a cancelled poll that taints its unit of work;
+- FpML documents becoming rows, with a rejected document moved to the backout queue.
 
 SQL tests (`crates/laminar-db/tests/ibmmq_e2e.rs`) cover JSON and byte-exact binary round trips,
-backout-and-replay without loss across a restart, and metadata columns across a restart.
+backout-and-replay without loss across a restart, metadata columns across a restart, and FpML
+documents across a restart.
 `crates/laminar-server/tests/ibmmq_kill.rs` hard-kills the standalone server while a publisher
 runs; every published message reached the output, with duplicates.
 `crates/laminar-server/tests/cluster_soak/messaging_sinks.rs` runs the sink in a three-node
@@ -336,10 +338,15 @@ Offered rate: 1,000 messages/s. Peak resident memory of the whole test process r
 more often, which shows in its median. Pushed harder (JSON, 1 KiB, 300 ms), the pipeline delivered
 about 2,600 messages/s when offered 3,000, with latency growing with the backlog (p50 1.4 s).
 
-## FpML and other formats
+## FpML
 
-The source decodes on its worker thread through the shared `RecordDeserializer` contract, and a
-message may become zero, one, or several rows, with metadata repeated per row. A future FpML
-integration adapts the FpML `FormatDecoder` to that contract, gets the complete message body
-(byte-preserving by default) with its descriptor and properties, and uses the same
-`fail`/`backout-queue` lifecycle. FpML is not supported by this connector today.
+With the `fpml` build feature, `FORMAT FPML` makes each message one FpML document and one row,
+validated against the pinned FpML schema and projected by a profile; the
+[FpML source guide](FPML_SOURCE.md#from-rabbitmq-or-ibm-mq) has the profiles and options.
+Metadata columns follow the profile's columns. Validation runs on the worker thread inside the
+get, so `operation.timeout.ms` must cover validating a full batch (`max.batch.bytes`). A rejected
+document follows `on.decode.error`: `fail` stops the source and backs the get out, and
+`backout-queue` moves the message to `BOQNAME` in the same unit of work. FpML accepts only UTF-8.
+With `convert = 'true'`, MQ converts a text message to UTF-8 first, but a document whose XML
+declaration names another encoding is still rejected. The `fpml.*` options are refused for other
+formats.

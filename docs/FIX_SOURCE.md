@@ -133,6 +133,7 @@ inbound application messages only.
 | `expand` | none | Group count tag whose entries become rows |
 | `expand.empty` | `row` | `row` (one row with null entry values) or `skip` |
 | `column.<name>` | required per column | Field path; see below |
+| `fpml.field` | none | Tag of a DATA or XMLDATA body field holding an FpML document, such as SecurityXML (1185); needs the `fpml` build feature. See [FpML documents](#fpml-documents) |
 
 Unknown options are rejected, as are engine settings outside this list. The source's Logon
 carries MaxMessageSize (383) = `max.message.bytes`, because the engine buffers a whole message
@@ -362,6 +363,18 @@ CREATE SOURCE venue_events (
 
 Each party (453) becomes a row; its sub-IDs stay inside the row; the fee group (136) is carried
 whole on every row of the message as two aligned arrays.
+
+### FpML documents
+
+With the `fpml` build feature, `fpml.field` names the field that carries an FpML document, such as
+SecurityXML (1185, with its length in 1184). The source validates each document against the pinned
+FpML schema and appends a nullable `fpml` struct column of the profile's columns after the declared
+columns; every row of a message carries its document, and a message without the field has a null.
+The `fpml.*` options and profiles are those of the [FpML source](FPML_SOURCE.md#from-a-fix-field),
+limited to profiles with one row per document. A rejected document stops the source at that journal
+record, like an unconvertible value. The field, schema bundle, and profile are bound into the
+source's schema contract, so a replay of the journal yields the same values, and changing any of
+them requires recreating the source. Validation runs on a blocking thread, off the async runtime.
 
 ## Delivery and recovery contract
 

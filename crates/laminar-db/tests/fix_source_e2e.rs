@@ -473,3 +473,101 @@ async fn fix_source_requires_checkpointed_at_least_once_delivery() {
     assert!(!venue.logged_on(), "rejected before connecting: {error}");
     venue.stop().expect("stop venue");
 }
+
+/// FpML confirmations in SecurityXML (1185): the source appends an `fpml` struct column that
+/// SQL reads like any struct, and the committed contract survives a restart.
+#[cfg(feature = "fpml")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fpml_in_security_xml_feeds_sql_across_restart() {
+    const CORPUS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../laminar-connectors/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/"
+    );
+    let dir = tempfile::tempdir().expect("dir");
+    let venue = FixTestVenue::start_with_settings(
+        &dir.path().join("venue"),
+        Path::new(APPLICATION_DICTIONARY),
+        "FIXT.1.1",
+        "VENUE_FPML",
+        "LAMINAR_FPML",
+        &[
+            ("TransportDataDictionary", TRANSPORT_DICTIONARY.to_string()),
+            ("AppDataDictionary", APPLICATION_DICTIONARY.to_string()),
+            ("DefaultApplVerID", "FIX.5.0SP2".to_string()),
+        ],
+    )
+    .expect("venue");
+    let ddl = [
+        format!(
+            "CREATE SOURCE fills (symbol VARCHAR NOT NULL) FROM FIX (
+                host = '127.0.0.1',
+                port = '{port}',
+                transport = 'tcp',
+                'begin.string' = 'FIXT.1.1',
+                'appl.ver.id' = 'FIX.5.0SP2',
+                'sender.comp.id' = 'LAMINAR_FPML',
+                'target.comp.id' = 'VENUE_FPML',
+                'dictionary.path' = '{application}',
+                'transport.dictionary.path' = '{transport}',
+                messages = '8',
+                'journal.path' = '{journal}',
+                'max.message.bytes' = '65536',
+                'reconnect.interval.seconds' = '1',
+                'column.symbol' = '55',
+                'fpml.field' = '1185'
+             )",
+            port = venue.port(),
+            application = APPLICATION_DICTIONARY.replace('\\', "/"),
+            transport = TRANSPORT_DICTIONARY.replace('\\', "/"),
+            journal = sql_path(&dir.path().join("journal")),
+        ),
+        "CREATE STREAM roots AS \
+         SELECT COALESCE(fpml['document_root'], 'none') AS root FROM fills"
+            .to_string(),
+        "CREATE MATERIALIZED VIEW totals AS \
+         SELECT root, COUNT(*) AS fills FROM roots GROUP BY root"
+            .to_string(),
+    ];
+    let send = |exec_id: &str, document: Option<&str>| {
+        let mut message = fill(exec_id, "AAA", "10", "20261014-12:00:00");
+        if let Some(path) = document {
+            let xml = std::fs::read_to_string(format!("{CORPUS}{path}")).expect("corpus document");
+            message.fields.push((1184, xml.len().to_string()));
+            message.fields.push((1185, xml));
+        }
+        venue.send(&message).expect("send");
+    };
+    let storage = dir.path().join("storage");
+    let db = reopen(&storage, &ddl).await;
+    db.start().await.expect("start");
+    assert!(venue.wait_logged_on(CONVERGE), "FIXT logon");
+    send(
+        "F1",
+        Some("products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml"),
+    );
+    send("F2", None);
+    send(
+        "F3",
+        Some("business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml"),
+    );
+    let mut expected = BTreeMap::from([
+        ("dataDocument".to_string(), 1),
+        ("none".to_string(), 1),
+        ("clearingConfirmed".to_string(), 1),
+    ]);
+    wait_totals(&db, &expected).await;
+    checkpoint(&db).await;
+    db.shutdown().await.expect("shutdown");
+
+    let db = reopen(&storage, &ddl).await;
+    db.start().await.expect("restart");
+    assert!(venue.wait_logged_on(CONVERGE), "FIXT logon after restart");
+    send(
+        "F4",
+        Some("business-processes/allocation/msg-ex20-cds-request-allocation.xml"),
+    );
+    expected.insert("requestAllocation".to_string(), 1);
+    wait_totals(&db, &expected).await;
+    db.shutdown().await.expect("shutdown");
+    venue.stop().expect("stop venue");
+}

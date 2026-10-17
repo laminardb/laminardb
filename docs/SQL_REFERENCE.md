@@ -78,9 +78,11 @@ CREATE SOURCE fills (
 )
 ```
 
-FpML documents (`fpml` feature) arrive through the files or Kafka source with `FORMAT FPML`; a
-projection profile supplies the schema, so declare at most a watermark. See
-[FpML source](FPML_SOURCE.md) for profiles, options, and the recovery contract:
+FpML documents (`fpml` feature) arrive through the files, Kafka, RabbitMQ, or IBM MQ source with
+`FORMAT FPML`; a projection profile supplies the schema, so declare at most a watermark. A FIX
+source reads them from a field such as SecurityXML with `'fpml.field' = '1185'` and appends them as
+an `fpml` struct column. See [FpML source](FPML_SOURCE.md) for profiles, options, and the recovery
+contract:
 
 ```sql
 CREATE SOURCE rates (

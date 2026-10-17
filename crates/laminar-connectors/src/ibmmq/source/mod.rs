@@ -31,7 +31,7 @@ use crate::connector::{
     SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
-use crate::serde;
+use crate::serde::{self, RecordDeserializer};
 use fetch::{BackoutRoute, Limits, SourceSession};
 
 const GENERATION: &str = "generation";
@@ -173,6 +173,35 @@ impl IbmMqSource {
         terminal(cause)
     }
 
+    /// The payload codec and the payload and output schemas of the committed contract.
+    #[cfg_attr(not(feature = "fpml"), allow(clippy::unused_async))]
+    async fn codec(
+        &self,
+        config: &ConnectorConfig,
+        parsed: &IbmMqSourceConfig,
+    ) -> Result<(Box<dyn RecordDeserializer>, SchemaRef, SchemaRef), ConnectorError> {
+        #[cfg(feature = "fpml")]
+        if parsed.format == serde::Format::Fpml {
+            use crate::schema::traits::FormatDecoder;
+            let guard = self.task_owner.track().ok_or_else(retired)?;
+            let decoder = crate::fpml::message::start_decoder(
+                config,
+                config.schema_binding(),
+                "IBM MQ",
+                self.registry.as_ref(),
+                guard,
+            )
+            .await?;
+            let payload = decoder.output_schema();
+            parsed.metadata.validate_payload(&payload)?;
+            let output = parsed.metadata.output_schema(&payload);
+            let codec = crate::fpml::message::MessageDecoder(Arc::new(decoder));
+            return Ok((Box::new(codec), payload, output));
+        }
+        let (payload, output) = self.resolve_output(config, parsed)?;
+        Ok((serde::create_deserializer(parsed.format)?, payload, output))
+    }
+
     fn resolve_output(
         &self,
         config: &ConnectorConfig,
@@ -204,7 +233,7 @@ impl IbmMqSource {
 fn open_session(
     config: &Arc<IbmMqSourceConfig>,
     library: library::Library,
-    deserializer: Box<dyn serde::RecordDeserializer>,
+    deserializer: Box<dyn RecordDeserializer>,
     payload: SchemaRef,
     output: SchemaRef,
 ) -> Result<SourceSession, ConnectorError> {
@@ -254,6 +283,10 @@ fn open_session(
     ))
 }
 
+fn retired() -> ConnectorError {
+    ConnectorError::Internal("IBM MQ source task generation is retired".into())
+}
+
 fn terminal(cause: String) -> ConnectorError {
     ConnectorError::InvalidState {
         expected: "a live IBM MQ connection".into(),
@@ -281,6 +314,14 @@ impl SourceConnector for IbmMqSource {
     ) -> Result<crate::schema::resolution::SchemaBinding, ConnectorError> {
         use crate::schema::resolution::{logical_binding, SchemaDirection};
         let parsed = IbmMqSourceConfig::from_config(config)?;
+        #[cfg(feature = "fpml")]
+        if parsed.format == serde::Format::Fpml {
+            return crate::fpml::message::source_binding(config, explicit, "IBM MQ", |payload| {
+                parsed.metadata.validate_payload(payload)?;
+                Ok(parsed.metadata.output_schema(payload))
+            })
+            .await;
+        }
         let reader = serde::schema_contract::reader_binding(config, parsed.format, explicit)?;
         let payload = Arc::new(reader.logical);
         parsed.metadata.validate_payload(&payload)?;
@@ -320,17 +361,14 @@ impl SourceConnector for IbmMqSource {
         // A resume needs no positioning: the queue manager backed out every message the
         // committed cut did not cover when the previous connection ended.
         let parsed = Arc::new(IbmMqSourceConfig::from_config(&config)?);
-        let (payload, output) = self.resolve_output(&config, &parsed)?;
-        let deserializer = serde::create_deserializer(parsed.format)?;
+        let (deserializer, payload, output) = self.codec(&config, &parsed).await?;
         let library = library::load(parsed.connection.client_library.as_deref())?;
         let name = config
             .get("laminar.source.name")
             .unwrap_or("ibmmq")
             .to_string();
         let metrics = SourceMetrics::new(&name, self.registry.as_ref())?;
-        let guard = self.task_owner.track().ok_or_else(|| {
-            ConnectorError::Internal("IBM MQ source task generation is retired".into())
-        })?;
+        let guard = self.task_owner.track().ok_or_else(retired)?;
         let session_config = Arc::clone(&parsed);
         let session_output = Arc::clone(&output);
         let worker = Worker::start(

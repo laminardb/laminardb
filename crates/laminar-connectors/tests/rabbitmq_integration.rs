@@ -441,6 +441,104 @@ async fn rejected_messages_follow_the_operator_dead_letter_policy() {
     }
 }
 
+/// One FpML document per message: valid documents become rows, and a rejected document
+/// follows the operator's dead-letter route like any undecodable message.
+#[cfg(feature = "fpml")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fpml_documents_become_rows_and_rejected_documents_dead_letter() {
+    const CORPUS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/"
+    );
+    let Some((url, admin)) = broker().await else {
+        return;
+    };
+    let channel = admin.create_channel().await.unwrap();
+    let queue = unique("fpml.src");
+    let dead = unique("fpml.dead");
+    declare_queue(&channel, &dead, FieldTable::default()).await;
+    let mut arguments = FieldTable::default();
+    arguments.insert(
+        "x-dead-letter-exchange".into(),
+        AMQPValue::LongString("".into()),
+    );
+    arguments.insert(
+        "x-dead-letter-routing-key".into(),
+        AMQPValue::LongString(dead.as_str().into()),
+    );
+    declare_queue(&channel, &queue, arguments).await;
+    let document = |path: &str| std::fs::read(format!("{CORPUS}{path}")).expect("corpus document");
+    publish(
+        &channel,
+        &queue,
+        &[
+            document("products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml"),
+            b"<notFpml/>".to_vec(),
+            document(
+                "business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml",
+            ),
+        ],
+    )
+    .await;
+
+    let mut config = connector_config(
+        &url,
+        &[
+            ("queue", queue.as_str()),
+            ("format", "fpml"),
+            ("on.decode.error", "reject"),
+            ("metadata.columns", "redelivered"),
+        ],
+    );
+    let mut source = RabbitMqSource::new(Arc::new(Schema::empty()), None);
+    let binding = source.resolve_schema(&config, None).await.unwrap();
+    config.set_schema_binding(binding).unwrap();
+    source
+        .start(
+            SourceStart::new(
+                config,
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let batches = poll_rows(&mut source, 2, Duration::from_secs(20)).await;
+    let roots: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            let roots = batch
+                .column_by_name("document_root")
+                .expect("profile column")
+                .as_string::<i32>();
+            (0..batch.num_rows())
+                .map(|row| roots.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(roots, vec!["dataDocument", "clearingConfirmed"]);
+    let last = batches[0].schema();
+    assert_eq!(last.fields().last().unwrap().name(), "_redelivered");
+    wait_ready(&channel, &dead, 1).await;
+    let dead_letter = channel
+        .basic_get(dead.as_str().into(), BasicGetOptions { no_ack: true })
+        .await
+        .unwrap()
+        .expect("dead-lettered document");
+    assert_eq!(dead_letter.delivery.data, b"<notFpml/>");
+    let cut = source.checkpoint();
+    source.notify_epoch_committed(1, &cut).await.unwrap();
+    source.close().await.unwrap();
+    wait_ready(&channel, &queue, 0).await;
+    for name in [&queue, &dead] {
+        channel
+            .queue_delete(name.as_str().into(), QueueDeleteOptions::default())
+            .await
+            .unwrap();
+    }
+}
+
 fn regex_escape(name: &str) -> String {
     name.replace('.', "\\.")
 }

@@ -239,3 +239,17 @@ fn malformed_urls_never_echo_credentials() {
         assert!(!error.contains("hunter2"), "{error}");
     }
 }
+
+#[test]
+fn fpml_options_need_the_fpml_source_format() {
+    assert!(message(source(&[("fpml.profile", "x")])).contains("unknown RabbitMQ source"));
+    assert!(message(sink(&[("routing.key", "r"), ("format", "fpml")])).contains("not qualified"));
+    let fpml = source(&[("format", "fpml"), ("fpml.max.document.bytes", "1024")]);
+    if cfg!(feature = "fpml") {
+        assert_eq!(fpml.unwrap().format, Format::Fpml);
+        assert!(message(source(&[("format", "fpml"), ("fpml.profle", "x")]))
+            .contains("unknown RabbitMQ source"));
+    } else {
+        assert!(message(fpml).contains("requires a build with the fpml feature"));
+    }
+}

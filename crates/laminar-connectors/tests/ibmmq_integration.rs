@@ -535,6 +535,72 @@ async fn undecodable_and_oversized_messages_follow_the_configured_policy() {
     mq.delete(&[&queue, &backout]);
 }
 
+/// One FpML document per message, validated on the MQI worker: valid documents become rows,
+/// and a rejected document moves to `BOQNAME` in the same unit of work.
+#[cfg(feature = "fpml")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fpml_documents_become_rows_and_rejected_documents_move_to_the_backout_queue() {
+    const CORPUS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fpml/fpml-5-13-8-rec-2/confirmation/"
+    );
+    let Some(mq) = fixture() else { return };
+    let backout = mq.queue("FPMLBOQ", "");
+    let queue = mq.queue("FPML", &format!("BOTHRESH(5) BOQNAME('{backout}')"));
+    let swap = std::fs::read(format!(
+        "{CORPUS}products/interest-rate-derivatives/ird-ex01-vanilla-swap.xml"
+    ))
+    .unwrap();
+    let clearing = std::fs::read(format!(
+        "{CORPUS}business-processes/clearing/msg-ex10-clearingConfirmed-clearing-performed.xml"
+    ))
+    .unwrap();
+    mq.put_raw(&queue, &[&swap, b"<notFpml/>", &clearing], &[])
+        .await;
+
+    let mut config = mq.config(&[
+        ("queue", queue.as_str()),
+        ("format", "fpml"),
+        ("wait.interval.ms", "50"),
+        ("on.decode.error", "backout-queue"),
+        ("metadata.columns", "backout_count"),
+    ]);
+    let mut source = IbmMqSource::new(Arc::new(Schema::empty()), None);
+    let binding = source.resolve_schema(&config, None).await.unwrap();
+    config.set_schema_binding(binding).unwrap();
+    source
+        .start(
+            SourceStart::new(
+                config,
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let batches = poll_rows(&mut source, 2, Duration::from_secs(20)).await;
+    let roots: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            let roots = batch
+                .column_by_name("document_root")
+                .expect("profile column")
+                .as_string::<i32>();
+            (0..batch.num_rows())
+                .map(|row| roots.value(row).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(roots, vec!["dataDocument", "clearingConfirmed"]);
+    let cut = source.checkpoint();
+    source.notify_epoch_committed(1, &cut).await.unwrap();
+    mq.wait_depth(&queue, 0);
+    mq.wait_depth(&backout, 1);
+    source.close().await.unwrap();
+    mq.delete(&[&queue, &backout]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unusable_backout_settings_fail_before_any_get() {
     let Some(mq) = fixture() else { return };

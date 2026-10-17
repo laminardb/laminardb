@@ -308,9 +308,15 @@ impl IbmMqSourceConfig {
     /// # Errors
     /// Returns a configuration error for unknown, missing, conflicting, or invalid options.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        let format = parse_source_format(config)?;
         reject_unknown(
             config,
-            &[RUNTIME_SOURCE_KEYS, CONNECTION_KEYS, SOURCE_KEYS],
+            &[
+                RUNTIME_SOURCE_KEYS,
+                CONNECTION_KEYS,
+                SOURCE_KEYS,
+                format.source_option_keys(),
+            ],
             "source",
         )?;
         let connection = ConnectionConfig::from_config(config)?;
@@ -349,7 +355,7 @@ impl IbmMqSourceConfig {
             max_uow_bytes,
             on_decode_error: config.get_parsed("on.decode.error")?.unwrap_or_default(),
             convert: config.get_parsed("convert")?.unwrap_or(false),
-            format: parse_format(config)?,
+            format,
             metadata: MetadataColumns::parse(config.get("metadata.columns"))?,
         })
     }
@@ -424,7 +430,7 @@ impl IbmMqSinkConfig {
             ccsid: config.get_parsed("ccsid")?.unwrap_or(1208),
             property_columns: config.get_list("property.columns"),
             max_uow_messages: config.get_positive("max.uow.messages", DEFAULT_SINK_UOW_MESSAGES)?,
-            format: parse_format(config)?,
+            format: parse_sink_format(config)?,
         };
         let mut seen = std::collections::BTreeSet::new();
         if let Some(duplicate) = sink
@@ -550,17 +556,37 @@ fn reject_unknown(
     config.reject_unknown_properties(&allowed, &format!("IBM MQ {direction}"))
 }
 
-fn parse_format(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
-    let format = config
+fn format_option(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
+    Ok(config
         .get("format")
         .map(Format::from_str)
         .transpose()
         .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?
-        .unwrap_or(Format::Json);
-    match format {
-        Format::Json | Format::Csv | Format::Raw => Ok(format),
+        .unwrap_or(Format::Json))
+}
+
+/// Sources also read FORMAT FPML: one complete document per message.
+fn parse_source_format(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
+    match format_option(config)? {
+        format @ (Format::Json | Format::Csv | Format::Raw) => Ok(format),
+        #[cfg(feature = "fpml")]
+        Format::Fpml => Ok(Format::Fpml),
+        #[cfg(not(feature = "fpml"))]
+        Format::Fpml => Err(ConnectorError::ConfigurationError(
+            "format 'fpml' requires a build with the fpml feature".into(),
+        )),
         other => Err(ConnectorError::FeatureUnsupported(format!(
-            "IBM MQ supports FORMAT JSON, CSV, and RAW; {other} is not qualified for it"
+            "IBM MQ sources support FORMAT JSON, CSV, RAW, and FPML; {other} is not qualified \
+             for them"
+        ))),
+    }
+}
+
+fn parse_sink_format(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
+    match format_option(config)? {
+        format @ (Format::Json | Format::Csv | Format::Raw) => Ok(format),
+        other => Err(ConnectorError::FeatureUnsupported(format!(
+            "IBM MQ sinks support FORMAT JSON, CSV, and RAW; {other} is not qualified for them"
         ))),
     }
 }
