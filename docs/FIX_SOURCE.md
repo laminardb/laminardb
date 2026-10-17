@@ -6,6 +6,8 @@ the QuickFIX C++ engine; LaminarDB owns the receive journal, projection, checkpo
 
 The connector is behind the `fix` Cargo feature, which is off by default and builds the engine
 with CMake and a C++17 compiler. Builds without the feature do not compile or link the engine.
+The prebuilt server binaries for Linux (glibc), macOS, and Windows include it; the Linux musl
+binary does not.
 
 ## Support matrix
 

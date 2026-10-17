@@ -51,7 +51,8 @@ rabbitmq = ["laminar-connectors/rabbitmq"]
 ibmmq = ["laminar-connectors/ibmmq"]
 # FIX initiator source (builds the QuickFIX C++ engine with CMake); off by default.
 fix = ["laminar-connectors/fix"]
-# FpML documents on the files and Kafka sources (builds libxml2 with CMake); off by default.
+# FpML documents on the files, Kafka, RabbitMQ, and IBM MQ sources and in FIX fields (builds
+# libxml2 with CMake); off by default.
 fpml = ["files", "laminar-connectors/fpml"]
 cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
 # Non-default visibility for Criterion targets that exercise private cluster data-plane paths.
@@ -67,9 +68,9 @@ process-remote = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:windows-sys"
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.32.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.32.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.32.0", default-features = false }
+laminar-core = { path = "../laminar-core", version = "0.33.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.33.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.33.0", default-features = false }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 quick_cache = { workspace = true }
@@ -167,8 +168,8 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-derive = { path = "../laminar-derive", version = "0.32.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.32.0", default-features = false, features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.33.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.33.0", default-features = false, features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }

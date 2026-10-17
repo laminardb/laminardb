@@ -22,7 +22,8 @@ cargo build --release -p laminar-server --features fpml
 ```
 
 The feature compiles a trimmed copy of libxml2 2.15.4 with CMake, so you need CMake and a C
-compiler. Builds without the feature don't compile or link libxml2.
+compiler. Builds without the feature don't compile or link libxml2. The prebuilt server binaries
+for Linux (glibc), macOS, and Windows include it; the Linux musl binary does not.
 
 ## What's supported
 

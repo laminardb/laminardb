@@ -1,6 +1,6 @@
 # Connector schema resolution
 
-Implementation contract for LaminarDB 0.32.0, updated 2026-10-08.
+Implementation contract for LaminarDB 0.33.0, updated 2026-10-17.
 
 Sources can omit columns when their connector has an authoritative metadata or
 protocol schema. Sinks derive their input fields from a named source or stream.

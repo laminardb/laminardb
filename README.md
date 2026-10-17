@@ -653,3 +653,9 @@ support@laminardb.io.
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
+
+Builds with the `fix` or `fpml` feature, including the prebuilt server binaries, also contain
+third-party software under its own licence; release archives carry the notices in `licenses/`.
+This product includes software developed by quickfixengine.org (http://www.quickfixengine.org/).
+libxml2 is under the MIT License, and the bundled FpML schemas are FpML Specifications under the
+FpML Public License (Licensor: International Swaps and Derivatives Association, Inc.).
