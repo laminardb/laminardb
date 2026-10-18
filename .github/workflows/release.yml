@@ -73,24 +73,26 @@ jobs:
             target: aarch64-unknown-linux-gnu
             cross: false
             # Native ARM runner — no QEMU emulation, system libssl-dev is available
-            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket,fix,fpml"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
-            # vendored-openssl: musl has no system libssl-dev; compile from source
+            # vendored-openssl: musl has no system libssl-dev; compile from source.
+            # No fix/fpml yet: the QuickFIX C++ and libxml2 builds are unverified on cross's musl
+            # toolchain, and one failed leg blocks the whole release.
             features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
-            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket,fix,fpml"
           - os: macos-15  # Cross-compile Intel from ARM64 (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
-            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket,fix,fpml"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
-            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket,fix,fpml"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -174,6 +176,12 @@ jobs:
 
           # Include documentation and example config in server archive
           cp README.md LICENSE server-pkg/ 2>/dev/null || true
+          # The fix and fpml features redistribute QuickFIX, libxml2, and the FpML schemas, whose
+          # licences require their notices with the binary.
+          mkdir -p server-pkg/licenses
+          cp vendor/quickfix-ffi/libquickfix/LICENSE server-pkg/licenses/QuickFIX-LICENSE.txt
+          cp vendor/libxml2-ffi/libxml2/Copyright server-pkg/licenses/libxml2-Copyright.txt
+          cp crates/laminar-connectors/fpml/artifacts/fpml-5-13-8-rec-2/NOTICE.md server-pkg/licenses/FpML-NOTICE.md
           mkdir -p server-pkg/examples
           cp examples/laminardb.toml server-pkg/examples/ 2>/dev/null || true
 
@@ -257,7 +265,9 @@ jobs:
         run: |
           VERSION="${{ needs.verify.outputs.version }}"
           if [ -f CHANGELOG.md ]; then
-            awk "/^## \[?${VERSION}\]?/,/^## \[/" CHANGELOG.md | head -n -1 > notes.md || true
+            awk -v heading="## [${VERSION}]" \
+              'found && /^## / { exit } found; $0 == heading { found = 1 }' \
+              CHANGELOG.md > notes.md || true
           fi
           if [ ! -s notes.md ]; then
             echo "Release v${VERSION}" > notes.md

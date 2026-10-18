@@ -3977,6 +3977,16 @@ impl LaminarDB {
             laminar_connectors::nats::register_nats_source(registry)?;
             laminar_connectors::nats::register_nats_sink(registry)?;
         }
+        #[cfg(feature = "rabbitmq")]
+        {
+            laminar_connectors::rabbitmq::register_rabbitmq_source(registry)?;
+            laminar_connectors::rabbitmq::register_rabbitmq_sink(registry)?;
+        }
+        #[cfg(feature = "ibmmq")]
+        {
+            laminar_connectors::ibmmq::register_ibmmq_source(registry)?;
+            laminar_connectors::ibmmq::register_ibmmq_sink(registry)?;
+        }
         #[cfg(feature = "fix")]
         {
             laminar_connectors::fix::register_fix_source(registry)?;

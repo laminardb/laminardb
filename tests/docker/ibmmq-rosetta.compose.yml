@@ -1,0 +1,12 @@
+# Apple-silicon override for the `ibmmq` service. Under Rosetta, `ps` reports an emulated
+# process as "<path> <argv0>", so the image's single-instance check counts `runmqserver` twice
+# and exits ("You cannot run more than one instance of this program"). The wrapper image only
+# changes argv[0]; the queue manager, configuration, and MQ binaries are the stock image's.
+# Native amd64 hosts (CI) use the stock image without this file.
+services:
+  ibmmq:
+    image: laminardb-ibmmq-rosetta:9.4.0.26-r2
+    build:
+      context: .
+      dockerfile: ibmmq-rosetta.Dockerfile
+      platforms: ["linux/amd64"]

@@ -377,6 +377,16 @@ pub(crate) fn config_keys() -> Vec<ConfigKeySpec> {
         "Static Logon body field (not for secrets)",
         "",
     ));
+    #[cfg(feature = "fpml")]
+    {
+        keys.push(ConfigKeySpec::optional(
+            "fpml.field",
+            "DATA or XMLDATA body field holding one FpML document, such as SecurityXML (1185); \
+             adds an 'fpml' struct column",
+            "",
+        ));
+        keys.extend(crate::fpml::message::config_keys());
+    }
     keys
 }
 
@@ -443,6 +453,14 @@ fn reject_unknown(config: &ConnectorConfig) -> Result<(), ConnectorError> {
             || RUNTIME_KEYS.contains(&key.as_str())
             || key.starts_with(COLUMN_PREFIX)
             || key.starts_with(LOGON_FIELD_PREFIX);
+        #[cfg(feature = "fpml")]
+        let known = known || super::fpml::is_option(key);
+        #[cfg(not(feature = "fpml"))]
+        if key.starts_with("fpml.") {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "FIX source option '{key}' requires a build with the fpml feature"
+            )));
+        }
         if !known {
             return Err(ConnectorError::ConfigurationError(format!(
                 "unknown FIX source option '{key}'"

@@ -93,5 +93,93 @@ pub fn reg_or_local<'a>(
     }
 }
 
+/// Metric families of one connector instance, labelled by one bounded constant label and
+/// unregistered on drop so a restarted generation can register again.
+///
+/// A family another live instance already exports keeps this instance's metrics unexported
+/// rather than failing connector startup.
+pub struct LabelledFamilies {
+    label: (&'static str, String),
+    counters: Vec<IntCounter>,
+    gauges: Vec<IntGauge>,
+    registry: Option<Registry>,
+}
+
+impl LabelledFamilies {
+    /// Start a set labelled `key = value`.
+    #[must_use]
+    pub fn new(key: &'static str, value: &str) -> Self {
+        Self {
+            label: (key, value.to_string()),
+            counters: Vec::new(),
+            gauges: Vec::new(),
+            registry: None,
+        }
+    }
+
+    /// A labelled counter added to this set.
+    ///
+    /// # Errors
+    /// Returns an error when `name` or `help` is not a valid descriptor.
+    pub fn counter(&mut self, name: &str, help: &str) -> Result<IntCounter, prometheus::Error> {
+        let counter =
+            IntCounter::with_opts(Opts::new(name, help).const_label(self.label.0, &self.label.1))?;
+        self.counters.push(counter.clone());
+        Ok(counter)
+    }
+
+    /// A labelled gauge added to this set.
+    ///
+    /// # Errors
+    /// Returns an error when `name` or `help` is not a valid descriptor.
+    pub fn gauge(&mut self, name: &str, help: &str) -> Result<IntGauge, prometheus::Error> {
+        let gauge =
+            IntGauge::with_opts(Opts::new(name, help).const_label(self.label.0, &self.label.1))?;
+        self.gauges.push(gauge.clone());
+        Ok(gauge)
+    }
+
+    fn collectors(&self) -> Vec<Box<dyn prometheus::core::Collector>> {
+        let counters = self
+            .counters
+            .iter()
+            .map(|counter| Box::new(counter.clone()) as Box<dyn prometheus::core::Collector>);
+        let gauges = self
+            .gauges
+            .iter()
+            .map(|gauge| Box::new(gauge.clone()) as Box<dyn prometheus::core::Collector>);
+        counters.chain(gauges).collect()
+    }
+
+    /// Register every family on `registry`, rolling back on the first failure.
+    #[must_use]
+    pub fn register(mut self, registry: Option<&Registry>) -> Self {
+        let Some(registry) = registry else {
+            return self;
+        };
+        for (index, collector) in self.collectors().into_iter().enumerate() {
+            if let Err(error) = registry.register(collector) {
+                for previous in self.collectors().into_iter().take(index) {
+                    let _ = registry.unregister(previous);
+                }
+                tracing::warn!(%error, "connector metrics are not exported for this instance");
+                return self;
+            }
+        }
+        self.registry = Some(registry.clone());
+        self
+    }
+}
+
+impl Drop for LabelledFamilies {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.take() {
+            for collector in self.collectors() {
+                let _ = registry.unregister(collector);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

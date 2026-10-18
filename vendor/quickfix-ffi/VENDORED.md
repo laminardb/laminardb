@@ -57,7 +57,7 @@ upstream repository published no security advisories as of 2026-10-14.
   exception then skips destructors, and an `IOException` from a store left the session-state
   mutex locked, deadlocking the reconnect thread.
 - `src/lib.rs` declares the bridge functions.
-- `Cargo.toml` is renamed to `laminardb-quickfix-ffi` 0.32.0, declares `links = "quickfixbind"`
+- `Cargo.toml` is renamed to `laminardb-quickfix-ffi` 0.33.0, declares `links = "quickfixbind"`
   so Cargo rejects a second copy of the native library in one build, and packages this file;
   `.cargo-ok`, `.cargo_vcs_info.json`, `Cargo.toml.orig`, and `Cargo.lock` from the crate archive
   are omitted.

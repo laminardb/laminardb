@@ -5619,6 +5619,8 @@ async fn test_connector_registry_accessor() {
         + usize::from(cfg!(feature = "files"))
         + usize::from(cfg!(feature = "otel"))
         + usize::from(cfg!(feature = "nats"))
+        + usize::from(cfg!(feature = "rabbitmq"))
+        + usize::from(cfg!(feature = "ibmmq"))
         + usize::from(cfg!(feature = "fix"));
     let expected_sinks = usize::from(cfg!(feature = "kafka"))
         + usize::from(cfg!(feature = "postgres-sink"))
@@ -5631,7 +5633,9 @@ async fn test_connector_registry_accessor() {
         + usize::from(cfg!(feature = "websocket"))
         + usize::from(cfg!(feature = "mongodb-cdc"))
         + usize::from(cfg!(feature = "files"))
-        + usize::from(cfg!(feature = "nats"));
+        + usize::from(cfg!(feature = "nats"))
+        + usize::from(cfg!(feature = "rabbitmq"))
+        + usize::from(cfg!(feature = "ibmmq"));
 
     assert_eq!(registry.list_sources().len(), expected_sources);
     assert_eq!(registry.list_sinks().len(), expected_sinks);

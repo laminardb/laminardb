@@ -129,6 +129,19 @@ struct Running {
     /// Journal index of the latest committed checkpoint.
     committed: u64,
     engine: Option<Engine>,
+    #[cfg(feature = "fpml")]
+    fpml: Option<super::fpml::Documents>,
+}
+
+impl Running {
+    /// Discard partially projected rows after an error.
+    fn discard(&mut self) {
+        self.projection.reset();
+        #[cfg(feature = "fpml")]
+        if let Some(fpml) = &mut self.fpml {
+            fpml.reset();
+        }
+    }
 }
 
 impl FixSource {
@@ -292,18 +305,32 @@ impl SourceConnector for FixSource {
         let files = parsed.dictionary_files();
         let digests = dictionary::digests(&files)?;
         let dictionaries = dictionary::load(&parsed, &files)?;
+        #[cfg(feature = "fpml")]
+        let fpml = match super::fpml::field_tag(config)? {
+            Some(tag) => Some(
+                super::fpml::resolve(config, tag, &schema, &dictionaries, &parsed.messages).await?,
+            ),
+            None => None,
+        };
         let plan = compile(config, &schema, &dictionaries, &parsed.messages)?;
-        let mut binding = logical_binding(
-            config,
-            SchemaDirection::Source,
-            SchemaOrigin::Explicit,
-            &schema,
-        )?;
-        bind_external(&mut binding, &schema)?;
+        #[cfg_attr(not(feature = "fpml"), allow(unused_mut))]
+        let mut output = Arc::clone(&schema);
         let mut identity = std::collections::BTreeMap::from([
             ("dictionary_sha256".into(), digests.application),
             ("session".into(), parsed.session.display()),
         ]);
+        #[cfg(feature = "fpml")]
+        if let Some(resolved) = fpml {
+            output = resolved.output;
+            identity.extend(resolved.identity);
+        }
+        let mut binding = logical_binding(
+            config,
+            SchemaDirection::Source,
+            SchemaOrigin::Explicit,
+            &output,
+        )?;
+        bind_external(&mut binding, &output)?;
         if let Some(transport) = digests.transport {
             identity.insert("transport_dictionary_sha256".into(), transport);
         }
@@ -332,7 +359,18 @@ impl SourceConnector for FixSource {
         };
         let pinned = dictionary::pin_all(&parsed.journal_path, &digests, &files)?;
         let dictionaries = Arc::new(dictionary::load(&parsed, &pinned)?);
+        #[cfg(feature = "fpml")]
+        let (schema, fpml) = super::fpml::open(
+            &config,
+            schema,
+            &dictionaries,
+            self.registry.as_deref(),
+            self.task_owner.admission(),
+        )
+        .await?;
         let plan = compile(&config, &schema, &dictionaries, &parsed.messages)?;
+        #[cfg(feature = "fpml")]
+        let schema = fpml.as_ref().map_or(schema, super::fpml::Documents::schema);
         let logon = Logon::load(&parsed)?;
         let session = parsed.session.display();
         let (journal, store) = open_durable_state(&parsed, &digests, self.data_ready.clone())?;
@@ -419,6 +457,8 @@ impl SourceConnector for FixSource {
             resends: parsed.resends,
             committed: start_index,
             engine: Some(engine),
+            #[cfg(feature = "fpml")]
+            fpml,
         });
         self.data_ready.notify_one();
         Ok(())
@@ -447,10 +487,22 @@ impl SourceConnector for FixSource {
             match record {
                 Record::Application(application) => {
                     bytes += application.message.len();
-                    if let Err(error) = running.projection.push(index, &application) {
-                        running.projection.reset();
-                        running.metrics.projection_errors.inc();
-                        return Err(error.into());
+                    #[cfg_attr(not(feature = "fpml"), allow(unused_variables))]
+                    let rows = match running.projection.push(index, &application) {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            running.discard();
+                            running.metrics.projection_errors.inc();
+                            return Err(error.into());
+                        }
+                    };
+                    #[cfg(feature = "fpml")]
+                    if let Some(fpml) = &mut running.fpml {
+                        if let Err(error) = fpml.capture(index, &application, rows) {
+                            running.discard();
+                            running.metrics.projection_errors.inc();
+                            return Err(error);
+                        }
                     }
                 }
                 Record::SequenceReset {
@@ -459,7 +511,7 @@ impl SourceConnector for FixSource {
                     running.metrics.feed_incomplete.set(1);
                     match running.on_sequence_reset {
                         SequenceResetPolicy::Fail => {
-                            running.projection.reset();
+                            running.discard();
                             return Err(terminal(format!(
                                 "counterparty skipped inbound sequence numbers {from_seq}..{new_seq} with \
                                  SequenceReset-Reset; that history is unrecoverable. Reconcile it, then set \
@@ -498,6 +550,17 @@ impl SourceConnector for FixSource {
             return Ok(None);
         }
         let (records, positions) = running.projection.finish()?;
+        #[cfg(feature = "fpml")]
+        let records = match &mut running.fpml {
+            Some(fpml) => match fpml.append(records).await {
+                Ok(records) => records,
+                Err(error) => {
+                    running.metrics.projection_errors.inc();
+                    return Err(error);
+                }
+            },
+            None => records,
+        };
         running
             .metrics
             .rows_emitted

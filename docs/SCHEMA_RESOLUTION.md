@@ -1,6 +1,6 @@
 # Connector schema resolution
 
-Implementation contract for LaminarDB 0.32.0, updated 2026-10-08.
+Implementation contract for LaminarDB 0.33.0, updated 2026-10-17.
 
 Sources can omit columns when their connector has an authoritative metadata or
 protocol schema. Sinks derive their input fields from a named source or stream.
@@ -26,8 +26,8 @@ limitation before activation.
 | `generator` | Streaming source | Fixed `seq`, `ts_ms`, `value` protocol | Built-in | Deterministic generator configuration; explicit fields must retain the full protocol layout |
 | `kafka` | Streaming source | Registry-backed Avro | Metadata | Registry scope, concrete value subject/version/ID, complete native schema and references |
 | `kafka` | Streaming source | Plain JSON, CSV, Debezium JSON | Explicit fields required | A registry URL requires Avro; it does not select a different codec |
-| `kafka` | Streaming source | Raw / bytes | Built-in `value` | Existing Kafka metadata/header settings remain separate |
-| `kafka` | Sink | Avro, JSON, CSV, raw | Bound query | Avro uses a concrete registry writer ID; raw needs one Utf8 query field; no Debezium writer |
+| `kafka` | Streaming source | Raw / bytes | Built-in `value` (Utf8), or a declared Binary `value` that keeps bytes exactly | Existing Kafka metadata/header settings remain separate |
+| `kafka` | Sink | Avro, JSON, CSV, raw | Bound query | Avro uses a concrete registry writer ID; raw needs one Utf8 or Binary query field; no Debezium writer |
 | `postgres-cdc` | Streaming source | Declared typed columns of one published table; `output.mode=changelog` adds a trailing `__weight` | Explicit fields required | PostgreSQL 17+; the declared `PRIMARY KEY` must equal the table's and every column must map exactly; system, timeline, database, publication and table identities, the exact claimed slot (`<slot.name>_<claim id>`, recorded in the source checkpoint) and the relation layout are persisted and revalidated on resume; layout drift stops the source |
 | `postgres` | Reference / lookup source | PostgreSQL table catalog | Metadata | Database/relation OIDs, column OIDs/modifiers/defaults/constraints; keys separately declared and validated |
 | `postgres-sink` | Sink | Named PostgreSQL COPY / keyed writes | Bound query plus target metadata | Database/relation OIDs and target layout; explicit table-creation policy; no implicit evolution |
@@ -43,14 +43,18 @@ limitation before activation.
 | `mongodb` | Lookup source | BSON collection validator | Closed flat validator, otherwise explicit projection | Collection UUID and validator retained; supported scalar types only; unique single-column key/index separately validated |
 | `mongodb-sink` | Sink | BSON query writer plus collection validator | Bound query | Standard collection UUID or explicit time-series bucket UUID; flat validator checks; explicit `auto.create` for a missing standard collection; explicit time-series settings retain their existing preparation policy |
 | `nats` | Streaming source | JSON / CSV / Debezium JSON; raw | Explicit fields; raw built-in | No authoritative JSON descriptor; existing ephemeral source contract remains |
-| `nats` | Sink | JSON / CSV / raw | Bound query | Core and JetStream delivery admission remains; raw requires one Utf8 field |
+| `nats` | Sink | JSON / CSV / raw | Bound query | Core and JetStream delivery admission remains; raw requires one Utf8 or Binary field |
+| `rabbitmq` | Streaming source | JSON / CSV; raw (Utf8 `value`, or Binary to keep bytes) | Explicit fields; raw built-in | Payload fields followed by the configured `metadata.columns`; commit-coupled at-least-once |
+| `rabbitmq` | Sink | JSON / CSV / raw | Bound query minus routing/property columns | Property columns are type-checked; raw needs one Utf8 or Binary payload field |
+| `ibmmq` | Streaming source | JSON / CSV; raw (Utf8 `value`, or Binary to keep bytes) | Explicit fields; raw built-in | Payload fields followed by the configured `metadata.columns`; commit-coupled at-least-once |
+| `ibmmq` | Sink | JSON / CSV / raw | Bound query minus descriptor/property columns | Descriptor and property columns are type-checked; raw needs one Utf8 or Binary payload field |
 | `websocket` | Streaming source | JSON / CSV / binary | Explicit fields required | Validate the installed decoder before connecting; no remote discovery API |
 | `websocket` | Sink server / client | JSON | Bound query | Server and client retain their different topology contracts |
 | `otel` | Streaming source | OTLP traces / metrics / logs | Built-in per signal | Explicit fields must retain that signal's full protocol layout |
 | Custom factories | Registered directions | Declared capability and hook | According to that declaration | Empty, malformed, oversized and wrong-direction/wrong-connector results are rejected |
 
 Features are `kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `iceberg`
-(or its catalog/storage feature composition), `files`, `mongodb-cdc`, `nats`,
+(or its catalog/storage feature composition), `files`, `mongodb-cdc`, `nats`, `rabbitmq`, `ibmmq`,
 `websocket` and `otel`. The generator requires no external connector feature.
 Parquet lookup helpers are not a separately registered connector.
 

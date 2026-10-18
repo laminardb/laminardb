@@ -45,9 +45,14 @@ parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
+# RabbitMQ AMQP 0-9-1 source and sink (pure Rust); off by default.
+rabbitmq = ["laminar-connectors/rabbitmq"]
+# IBM MQ source and sink; the IBM MQ client library is loaded at run time, never at build time.
+ibmmq = ["laminar-connectors/ibmmq"]
 # FIX initiator source (builds the QuickFIX C++ engine with CMake); off by default.
 fix = ["laminar-connectors/fix"]
-# FpML documents on the files and Kafka sources (builds libxml2 with CMake); off by default.
+# FpML documents on the files, Kafka, RabbitMQ, and IBM MQ sources and in FIX fields (builds
+# libxml2 with CMake); off by default.
 fpml = ["files", "laminar-connectors/fpml"]
 cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
 # Non-default visibility for Criterion targets that exercise private cluster data-plane paths.
@@ -63,9 +68,9 @@ process-remote = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:windows-sys"
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.32.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.32.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.32.0", default-features = false }
+laminar-core = { path = "../laminar-core", version = "0.33.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.33.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.33.0", default-features = false }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 quick_cache = { workspace = true }
@@ -163,8 +168,8 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-derive = { path = "../laminar-derive", version = "0.32.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.32.0", default-features = false, features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.33.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.33.0", default-features = false, features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -176,6 +181,8 @@ futures-util = { version = "0.3" }
 # MongoDB CDC end-to-end tests read the source and every target directly.
 mongodb = "3"
 tokio-postgres = "0.7"
+# RabbitMQ end-to-end tests publish inputs and read outputs directly.
+lapin = { version = "4.12.2", default-features = false, features = ["tokio", "rustls--aws_lc_rs", "rustls-webpki-roots-certs"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # S3-compatible object store client used by the MinIO-backed integration
 # test. Workspace feature set + aws for the AmazonS3 builder.
@@ -230,6 +237,16 @@ required-features = ["process-remote"]
 name = "cluster_subscription_bench"
 harness = false
 required-features = ["benchmark-internals"]
+
+[[test]]
+name = "ibmmq_e2e"
+path = "tests/ibmmq_e2e.rs"
+required-features = ["ibmmq"]
+
+[[test]]
+name = "rabbitmq_e2e"
+path = "tests/rabbitmq_e2e.rs"
+required-features = ["rabbitmq"]
 
 [[test]]
 name = "kafka_docker_scenarios"

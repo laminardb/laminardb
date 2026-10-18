@@ -216,7 +216,7 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
     ];
     keys.extend(kafka_source_consumer_config_keys());
     #[cfg(feature = "fpml")]
-    keys.extend(source::fpml::config_keys());
+    keys.extend(crate::fpml::message::config_keys());
     keys.extend([
         // Schema Registry
         ConfigKeySpec::optional(

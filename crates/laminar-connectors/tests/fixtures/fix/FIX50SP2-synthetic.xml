@@ -3,8 +3,9 @@
   SYNTHETIC test dictionary. Not a venue dictionary and not venue-certified.
 
   A FIX 5.0 SP2 application subset for FIXT.1.1 sessions (transport: FIXT11-synthetic.xml): the
-  same ExecutionReport, custom fields, and custom message type as FIX44-synthetic.xml. As in
-  FIX 5.0 application dictionaries, the header and trailer are empty.
+  same ExecutionReport, custom fields, and custom message type as FIX44-synthetic.xml, plus the
+  SecurityXML fields (1184-1186) that FIX 5.0 SP1 added to the Instrument component. As in FIX 5.0
+  application dictionaries, the header and trailer are empty.
 -->
 <fix type="FIX" major="5" minor="0" servicepack="2">
   <header/>
@@ -49,6 +50,9 @@
       </group>
       <field name="VenueSeq" required="N"/>
       <field name="VenueTag" required="N"/>
+      <field name="SecurityXMLLen" required="N"/>
+      <field name="SecurityXML" required="N"/>
+      <field name="SecurityXMLSchema" required="N"/>
     </message>
     <message name="VenueStatus" msgtype="U1" msgcat="app">
       <field name="VenueStatusCode" required="Y"/>
@@ -90,6 +94,9 @@
     <field number="523" name="PartySubID" type="STRING"/>
     <field number="802" name="NoPartySubIDs" type="NUMINGROUP"/>
     <field number="803" name="PartySubIDType" type="INT"/>
+    <field number="1184" name="SecurityXMLLen" type="LENGTH"/>
+    <field number="1185" name="SecurityXML" type="DATA"/>
+    <field number="1186" name="SecurityXMLSchema" type="STRING"/>
     <field number="5001" name="VenueSeq" type="INT"/>
     <field number="5002" name="VenueTag" type="STRING"/>
     <field number="5003" name="VenueStatusCode" type="INT"/>
