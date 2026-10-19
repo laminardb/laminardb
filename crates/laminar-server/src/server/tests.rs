@@ -1473,3 +1473,33 @@ fn test_toml_value_to_sql_escapes_single_quotes() {
         "a''''b"
     );
 }
+
+#[test]
+fn test_lookup_to_ddl_cache_ttl_passes_sql_validation() {
+    use laminar_sql::parser::lookup_table::validate_properties;
+
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+primary_key = ["symbol"]
+
+[lookup.cache]
+ttl = "2m"
+
+[[lookup.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    let ddl = lookup_to_ddl(&config.lookups[0]).unwrap();
+    assert!(ddl.contains("'cache.ttl' = '120'"), "{ddl}");
+    let statements = laminar_sql::parse_streaming_sql(&ddl).unwrap();
+    let laminar_sql::StreamingStatement::CreateLookupTable(create) = &statements[0] else {
+        panic!("expected CREATE LOOKUP TABLE, got {statements:?}");
+    };
+    let properties = validate_properties(&create.with_options).unwrap();
+    assert_eq!(properties.cache_ttl, Some(120));
+}

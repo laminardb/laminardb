@@ -2001,3 +2001,47 @@ function = "handle"
         .to_string()
         .contains("max_in_flight"));
 }
+
+#[test]
+fn test_lookup_cache_ttl_rejects_fractional_seconds() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+
+[lookup.cache]
+ttl = "1500ms"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err() else {
+        panic!("expected validation errors");
+    };
+    assert!(
+        errors.contains(
+            &"lookup 'instruments': cache.ttl must be a whole number of seconds, got 1.5s"
+                .to_string()
+        ),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn test_lookup_cache_ttl_accepts_whole_seconds() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+
+[lookup.cache]
+ttl = "2m"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    if let Err(ConfigError::ValidationErrors { errors }) = validate_config(&config) {
+        assert!(
+            !errors.iter().any(|e| e.contains("cache.ttl")),
+            "{errors:?}"
+        );
+    }
+}

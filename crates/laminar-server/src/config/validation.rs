@@ -108,6 +108,7 @@ pub(super) fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> 
     let mut errors = Vec::new();
 
     collect_connector_graph_errors(config, &mut errors);
+    collect_lookup_cache_errors(config, &mut errors);
     collect_process_function_errors(config, &mut errors);
     collect_http_auth_errors(config, &mut errors);
     collect_pgwire_errors(config, &mut errors);
@@ -261,6 +262,18 @@ fn collect_connector_graph_errors(config: &ServerConfig, errors: &mut Vec<String
         config.lookups.iter().map(|lookup| lookup.name.as_str()),
         errors,
     );
+}
+
+// WHY: lookup DDL carries cache.ttl in whole seconds, so a finer TTL would be silently truncated.
+fn collect_lookup_cache_errors(config: &ServerConfig, errors: &mut Vec<String>) {
+    for lookup in &config.lookups {
+        if lookup.cache.ttl.subsec_nanos() != 0 {
+            errors.push(format!(
+                "lookup '{}': cache.ttl must be a whole number of seconds, got {:?}",
+                lookup.name, lookup.cache.ttl
+            ));
+        }
+    }
 }
 
 fn collect_duplicate_names<'a>(
