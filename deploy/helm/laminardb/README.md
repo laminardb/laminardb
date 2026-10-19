@@ -1,6 +1,6 @@
 # LaminarDB Helm Chart
 
-A Helm chart for deploying [LaminarDB](https://laminardb.dev) (Embedded Streaming SQL Database) on Kubernetes.
+A Helm chart for deploying [LaminarDB](https://laminardb.io) (Embedded Streaming SQL Database) on Kubernetes.
 
 ## 🚀 Quick Start (Standalone / Standalone-Durable)
 
