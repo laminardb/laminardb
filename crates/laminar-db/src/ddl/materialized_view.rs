@@ -136,6 +136,13 @@ impl LaminarDB {
         let planned = self
             .plan_streaming_query(name, query, emit_clause, query_sql)
             .await?;
+        self.reject_stateful_consumer_of_running_state(
+            "materialized view",
+            &name_str,
+            query_sql,
+            &planned,
+        )
+        .await?;
         if !self.is_cluster_runtime()
             && (planned.window_config.is_some() || planned.join_config.is_none())
             && query_inputs_registered(&self.ctx, query_sql)

@@ -7,6 +7,7 @@
 //! - `stream` — continuous-query planning and `CREATE STREAM`;
 //! - `cluster_checks` — temporal/interval topology and cluster query-shape admission;
 //! - `materialized_view` — MV create/drop and incremental-emit admission;
+//! - `running_state_inputs` — stateful consumers must read a changelog;
 //! - `drop` — drop planning, control acknowledgement, teardown;
 //! - `control` — `SET` statements and control-ack resolution.
 #![allow(clippy::disallowed_types)] // cold path
@@ -17,6 +18,7 @@ mod control;
 mod drop;
 pub(crate) mod lookup_schema;
 mod materialized_view;
+mod running_state_inputs;
 mod schema_creation;
 mod schema_journal;
 pub(crate) mod schema_resolution;
