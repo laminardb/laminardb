@@ -24,6 +24,7 @@ use crate::schema::types::RawRecord;
 
 use super::config::{local_files_path, FileFormat, FileSourceConfig};
 use super::discovery::{DiscoveredFile, DiscoveryConfig, FileDiscoveryEngine};
+use super::json_documents::JsonDocumentsDecoder;
 use super::manifest::FileIngestionManifest;
 use super::text_decoder::TextLineDecoder;
 
@@ -670,7 +671,7 @@ fn build_decoder_and_schema(
             });
             let json_config = crate::schema::JsonDecoderConfig::default();
             let decoder = crate::schema::JsonDecoder::with_config(schema.clone(), json_config);
-            Ok((Arc::new(decoder), schema))
+            Ok((Arc::new(JsonDocumentsDecoder::new(decoder)), schema))
         }
         FileFormat::Text => {
             let decoder = TextLineDecoder::new();
@@ -1029,6 +1030,27 @@ mod tests {
             },
             resume: None,
         }
+    }
+
+    #[test]
+    fn json_file_decoder_reads_one_row_per_line() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut config = ConnectorConfig::new("files");
+        config.set("path", "/data/in");
+        config.set("format", "json");
+        config.set(
+            "_arrow_schema",
+            crate::config::encode_arrow_schema_ipc(&schema),
+        );
+        let src_config = FileSourceConfig::from_connector_config(&config).unwrap();
+        let (decoder, _) =
+            build_decoder_and_schema(FileFormat::Json, &src_config, &config).unwrap();
+
+        let batch = decoder
+            .decode_batch(&[RawRecord::new(b"{\"id\":1}\n{\"id\":2}\n".to_vec())])
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 2);
     }
 
     #[test]
