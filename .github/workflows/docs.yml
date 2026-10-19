@@ -13,6 +13,11 @@ on:
       - '.github/workflows/docs.yml'
   release:
     types: [published]
+  # A release is published before its image is pushed; rebuild once the image exists so the
+  # chart for that release is added (see "Publish Helm chart repository").
+  workflow_run:
+    workflows: ["Docker Build & Publish"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -27,6 +32,11 @@ concurrency:
 jobs:
   build:
     name: Build Documentation
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -80,16 +90,43 @@ jobs:
 
       - name: Publish Helm chart repository
         # Classic Helm repo served from Pages at https://laminardb.io/charts.
-        # Runs every build so the chart stays in the freshly-rebuilt artifact.
+        # Runs every build so the charts stay in the freshly rebuilt artifact. Each chart
+        # version is a released engine version, packaged from that release's tag once its
+        # image is on Docker Hub, so the chart's default image tag exists. Published chart
+        # versions are immutable and carried forward from the live index.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          APP_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          # Chart version must change per publish or clients never see updates.
-          sed -i "s/^version:.*/version: ${APP_VERSION}/" deploy/helm/laminardb/Chart.yaml
-          sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" deploy/helm/laminardb/Chart.yaml
+          CHARTS_URL=https://laminardb.io/charts
+          TAG="${RELEASE_TAG:-$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)}"
+          case "$TAG" in
+            v[0-9]*) VERSION="${TAG#v}" ;;
+            *) echo "::error::release tag '$TAG' does not start with v<digit>"; exit 1 ;;
+          esac
           mkdir -p _site/charts
-          helm package deploy/helm/laminardb -d _site/charts
-          helm repo index _site/charts --url https://laminardb.io/charts
+          MERGE=()
+          if curl -fsSL "$CHARTS_URL/index.yaml" -o "$RUNNER_TEMP/published-index.yaml"; then
+            for chart in $(grep -oE "$CHARTS_URL/laminardb-[0-9][^\" ]*\.tgz" "$RUNNER_TEMP/published-index.yaml" | sort -u); do
+              curl -fsSL "$chart" -o "_site/charts/${chart##*/}"
+            done
+            MERGE=(--merge "$RUNNER_TEMP/published-index.yaml")
+          fi
+          if [ -f "_site/charts/laminardb-${VERSION}.tgz" ]; then
+            :
+          elif ! curl -fsS -o /dev/null "https://hub.docker.com/v2/repositories/laminardb/laminardb-server/tags/${VERSION}"; then
+            echo "::warning::laminardb/laminardb-server:${VERSION} is not on Docker Hub yet; its chart is added when the image build finishes"
+          else
+            git fetch --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}"
+            mkdir -p "$RUNNER_TEMP/chart-src"
+            git archive "$TAG" deploy/helm/laminardb | tar -x -C "$RUNNER_TEMP/chart-src"
+            CHART="$RUNNER_TEMP/chart-src/deploy/helm/laminardb"
+            sed -i "s/^version:.*/version: ${VERSION}/" "$CHART/Chart.yaml"
+            sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" "$CHART/Chart.yaml"
+            helm package "$CHART" -d _site/charts
+          fi
+          helm repo index _site/charts --url "$CHARTS_URL" "${MERGE[@]}"
           ls -la _site/charts
 
       - name: Upload Pages artifact
