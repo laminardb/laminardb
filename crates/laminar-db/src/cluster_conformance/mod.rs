@@ -126,7 +126,8 @@ impl Case {
             Err(error) => Err(error),
         };
         let _ = tokio::time::timeout(DEADLINE, db.shutdown()).await;
-        Ok(Ok(oracle::consolidate(&output?, self.form)))
+        Ok(Ok(oracle::consolidate(&output?, self.form)
+            .map_err(|e| format!("{}: embedded {e}", self.name))?))
     }
 
     async fn observe_cluster(&self, cluster: &Cluster) -> Result<Consolidated, String> {
@@ -155,7 +156,7 @@ impl Case {
         {
             return Err(format!("{}: node {} read no input", self.name, idle + 1));
         }
-        Ok(oracle::consolidate(&output, self.form))
+        oracle::consolidate(&output, self.form).map_err(|e| format!("{}: cluster {e}", self.name))
     }
 
     /// Owner-local observation of the stream log, attached before start so no output is missed;

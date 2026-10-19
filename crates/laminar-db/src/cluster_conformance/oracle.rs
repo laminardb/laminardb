@@ -52,11 +52,23 @@ fn value_columns(batch: &RecordBatch) -> Vec<usize> {
         .collect()
 }
 
-/// Fold observed output batches into a consolidated multiset.
-pub(super) fn consolidate(batches: &[RecordBatch], form: OutputForm) -> Consolidated {
+/// Fold observed output batches into a consolidated multiset. A `Rows` case fails on a
+/// `__weight` column so it cannot silently ignore retractions.
+pub(super) fn consolidate(
+    batches: &[RecordBatch],
+    form: OutputForm,
+) -> Result<Consolidated, String> {
     let mut out = Consolidated::new();
     match form {
         OutputForm::Rows => {
+            if batches
+                .iter()
+                .any(|batch| batch.column_by_name(WEIGHT).is_some())
+            {
+                return Err(format!(
+                    "row output carries '{WEIGHT}'; compare it as a changelog"
+                ));
+            }
             for batch in batches {
                 let columns = value_columns(batch);
                 for row in 0..batch.num_rows() {
@@ -90,7 +102,7 @@ pub(super) fn consolidate(batches: &[RecordBatch], form: OutputForm) -> Consolid
         }
     }
     out.retain(|_, multiplicity| *multiplicity != 0);
-    out
+    Ok(out)
 }
 
 /// Evaluate `sql` as one batch query over every fixture source's complete input.
@@ -113,7 +125,7 @@ pub(super) async fn ground_truth(
         .collect()
         .await
         .map_err(|e| e.to_string())?;
-    Ok(consolidate(&batches, OutputForm::Rows))
+    consolidate(&batches, OutputForm::Rows)
 }
 
 /// Human-readable symmetric difference, bounded to keep failures legible.

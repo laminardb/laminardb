@@ -401,3 +401,33 @@ async fn join_over_stream_is_unsupported_everywhere() {
         Verdict::UnsupportedEverywhere(reason) if reason.contains("directly watermarked source")
     ));
 }
+
+/// Join kinds whose output distribution differs (null-extended rows are placed by the side that
+/// is present). Differential only: unmatched rows near the final watermark stay open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outer_semi_and_anti_joins_are_equal() {
+    for (name, keyword, projection) in [
+        ("left_outer", "LEFT JOIN", "o.k AS ok, o.v AS ov, p.v AS pv"),
+        (
+            "right_outer",
+            "RIGHT JOIN",
+            "p.k AS pk, o.v AS ov, p.v AS pv",
+        ),
+        (
+            "full_outer",
+            "FULL JOIN",
+            "o.k AS ok, p.k AS pk, o.v AS ov, p.v AS pv",
+        ),
+        ("left_semi", "LEFT SEMI JOIN", "o.k AS ok, o.v AS ov"),
+        ("left_anti", "LEFT ANTI JOIN", "o.k AS ok, o.v AS ov"),
+        ("right_semi", "RIGHT SEMI JOIN", "p.k AS pk, p.v AS pv"),
+        ("right_anti", "RIGHT ANTI JOIN", "p.k AS pk, p.v AS pv"),
+    ] {
+        let sql = format!(
+            "CREATE STREAM out AS SELECT {projection} FROM orders o {keyword} payments p \
+             ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
+        );
+        let case = join_case(name, vec![sql], OutputForm::Rows);
+        assert_eq!(verdict(case).await, Verdict::Equal, "{name}");
+    }
+}
