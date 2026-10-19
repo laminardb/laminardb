@@ -1,37 +1,22 @@
 # LaminarDB
 
-> LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. It can be embedded in Rust or Python applications or run as a standalone server. Licensed Apache 2.0. Current version: 0.25.0.
+> LaminarDB is an open-source streaming SQL engine written in Rust (Apache-2.0). It reads events from sources such as Kafka, runs SQL continuously over them, and writes results to sinks or keeps them as queryable materialized views. It can be embedded in a Rust program (crate `laminar-db`) or run as a server (`laminardb` binary, Docker image `laminardb/laminardb-server`). The current packaged release is v0.33.0. LaminarDB is pre-1.0.
 
-LaminarDB evaluates SQL queries continuously as events arrive. It supports tumbling, sliding, hopping, and session windows; bounded interval, temporal, and lookup joins; EMIT clauses (ON WATERMARK, ON WINDOW CLOSE, PERIODICALLY, CHANGES, FINAL); watermarks with ALLOW LATENESS; and late data routing via LATE DATA TO.
+Key facts:
 
-The engine runs on a dedicated single-threaded tokio runtime called the StreamingCoordinator, fed by crossfire MPSC channels from source tasks. Bounded batches, managed state accounting, and lock-free channels reduce record-path overhead; checkpoint I/O stays off that path. Exactly-once is connector-gated. The current cluster candidate is Kafka input to direct S3/S3A append-mode Delta Lake. Cluster execution admits supported keyed aggregates, managed direct-source windows and temporal ASOF queries, and one bounded watermarked interval-join stage; unsupported compositions fail closed.
-
-AI Functions call AI models inline in streaming SQL. Each function names a model resolved from a registry; the backend is chosen per call by model name and hidden behind the function — either a remote LLM over HTTP (OpenAI-compatible, Anthropic) or a local ONNX encoder run in-process via ONNX Runtime (loaded dynamically; install ONNX Runtime >= 1.24 and set ORT_DYLIB_PATH or put it on the search path). Functions: ai_classify, ai_sentiment, ai_embed (remote or local; local models are encoder-only BERT/DistilBERT/MiniLM for classify, sentiment, embed), and ai_complete, ai_summarize, ai_translate, ai_gen, ai_extract (remote only). Calls run off the hot path: the operator serves cache hits inline and hands misses to a background worker, with enriched rows emitted in a later cycle; in-flight rows survive checkpoint/restore and the watermark is held so async-enriched rows are not dropped as late. Results are cached by (content, model, params) with a byte-bounded cache. Config lives under [ai.providers.*], [models.*], and [ai.defaults]; API keys are referenced by env-var name, never stored in config. Catalog views laminar.models and laminar.ai_calls are SELECT-able.
-
-LaminarDB is pre-1.0. The strict three-node cluster at-least-once fault profile passed on 2026-08-15; single-node and exactly-once release profiles require separate current-tree certification.
+- SQL: `CREATE SOURCE`, `CREATE STREAM`, `CREATE MATERIALIZED VIEW`, `CREATE SINK`. Event-time windows with `tumble`, `hop` and `session`; watermarks are declared on sources with `WATERMARK FOR ts AS ts - INTERVAL ...`; emit clauses include `EMIT ON WINDOW CLOSE` and `EMIT CHANGES`. Bounded interval joins, temporal joins and lookup tables are supported.
+- Connectors in the default server build: Kafka (source and sink), PostgreSQL logical replication (source) and PostgreSQL (sink), MongoDB change streams (source) and MongoDB (sink), Delta Lake and Apache Iceberg (source and sink), NATS (source and sink), local files (source and sink), WebSocket and OpenTelemetry (best-effort only), and a built-in `generator` source. RabbitMQ, IBM MQ, FIX and FpML are optional build features: none is in the Docker image; the v0.33.0 x86_64 Linux (glibc) binary includes all four, the x86_64 Linux (musl) binary none, and the other binaries FIX and FpML.
+- Delivery: at-least-once is the server default. Exactly-once needs a replayable source and a sink that commits with the checkpoint (for example Kafka input with Kafka, Delta Lake or Iceberg output in embedded and single-node mode). Single-node replayable delivery needs a local `file://` checkpoint.
+- Deployment modes: embedded, single-node server, cluster. Cluster mode needs shared object-store checkpoints (S3, Google Cloud Storage or Azure), accepts Kafka sources only, and rejects materialized views and AI functions.
+- Server API: SQL over HTTP (`POST /api/v1/sql`, bearer `console_token`), WebSocket subscriptions (`/ws/{name}`), Prometheus metrics (`/metrics`), health probes (`/health`, `/ready`), optional PostgreSQL wire protocol (`pgwire_bind`).
+- LaminarDB Console: a separate browser app (github.com/laminardb/laminardb-console-ui) for a server you run.
 
 ## Documentation
 
-- [README](https://raw.githubusercontent.com/laminardb/laminardb/main/README.md): Project overview, install, and quick start
-- [SQL Reference](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/SQL_REFERENCE.md): Streaming SQL syntax reference
-- [Contributing](https://raw.githubusercontent.com/laminardb/laminardb/main/CONTRIBUTING.md): Contribution guide and hot-path constraints
-- [Changelog](https://raw.githubusercontent.com/laminardb/laminardb/main/CHANGELOG.md): Release history
-
-## Connectors
-
-- [Connectors overview](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-connectors/README.md): Kafka, CDC (PostgreSQL, MongoDB), Delta Lake, Iceberg, OpenTelemetry, WebSocket, files, lookups
-
-## Crates
-
-- [laminar-core](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-core/README.md): Operators, windows, streaming channels, checkpoint barriers, storage/checkpoint stores
-- [laminar-sql](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-sql/README.md): SQL parser, planner, DataFusion integration
-- [laminar-db](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-db/README.md): Unified facade, StreamingCoordinator, recovery, checkpoint coordinator
-- [laminar-server](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-server/README.md): HTTP and WebSocket server binary
-- [laminar-derive](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-derive/README.md): Procedural macros for typed records
-
-## Optional
-
-- [GitHub repository](https://github.com/laminardb/laminardb): Source code
-- [Crates.io: laminar-db](https://crates.io/crates/laminar-db): Rust crate
-- [Website](https://laminardb.io): Landing page
-- [Configuration reference](https://laminardb.io/docs/): Server and connector configuration
+- [README](https://github.com/laminardb/laminardb/blob/main/README.md): overview, quick start and examples
+- [SQL reference](https://github.com/laminardb/laminardb/blob/main/docs/SQL_REFERENCE.md): streaming SQL syntax and mode-specific limits
+- [Server configuration](https://laminardb.io/docs/): TOML keys, HTTP API and connector options
+- [Connector guide](https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/README.md): per-connector options and guarantees
+- [Rust API](https://laminardb.io/api/laminar_db/): rustdoc for the crates on the main branch
+- [Changelog](https://github.com/laminardb/laminardb/blob/main/CHANGELOG.md)
+- [Releases](https://github.com/laminardb/laminardb/releases)

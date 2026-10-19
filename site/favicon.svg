@@ -1,14 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
-  <defs>
-    <linearGradient id="fg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#06b6d4"/>
-      <stop offset="100%" stop-color="#8b5cf6"/>
-    </linearGradient>
-  </defs>
-  <rect width="32" height="32" rx="7" fill="#080d1e"/>
-  <!-- Laminar flow streams -->
-  <path d="M5 9 C10 9, 12 7, 17 7 C22 7, 24 10, 27 10" stroke="url(#fg)" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.5"/>
-  <path d="M4 14 C9 14, 12 12, 17 12 C22 12, 24 15, 28 15" stroke="url(#fg)" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.7"/>
-  <path d="M3 19 C8 19, 12 17, 17 17 C22 17, 24 20, 29 20" stroke="url(#fg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="1"/>
-  <path d="M4 24 C9 24, 12 22, 17 22 C22 22, 24 25, 28 25" stroke="url(#fg)" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.5"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><title>LaminarDB</title><rect width="64" height="64" rx="12" fill="#162C29"/><g transform="translate(11.023 12.266) scale(0.31077)"><path fill="#F7F8F5" d="M0 0H20V71A36 36 0 0 0 56 107H135V127H56A56 56 0 0 1 0 71Z"/><path fill="#74B09D" d="M36 0H56V63A8 8 0 0 0 64 71H135V91H64A28 28 0 0 1 36 63Z"/><path fill="#F7F8F5" d="M72 0H92V35H135V55H86A14 14 0 0 1 72 41Z"/></g></svg>
