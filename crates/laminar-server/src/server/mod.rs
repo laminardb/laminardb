@@ -644,10 +644,11 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
 
     // Watermark clause
     if let Some(wm) = &source.watermark {
-        let secs = wm.max_out_of_orderness.as_secs();
+        // Event time is tracked in milliseconds; whole seconds would drop sub-second delays.
+        let millis = wm.max_out_of_orderness.as_millis();
         col_defs.push(format!(
-            "WATERMARK FOR {} AS {} - INTERVAL '{}' SECOND",
-            wm.column, wm.column, secs
+            "WATERMARK FOR {} AS {} - INTERVAL '{}' MILLISECOND",
+            wm.column, wm.column, millis
         ));
     }
 
