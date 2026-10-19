@@ -306,6 +306,18 @@ impl WindowRewriter {
     pub fn parse_interval_to_duration(expr: &Expr) -> Result<std::time::Duration, ParseError> {
         match expr {
             Expr::Interval(interval) => {
+                // WHY: `INTERVAL '5 minutes'` carries its unit in the string, not the leading field.
+                if let (
+                    None,
+                    Expr::Value(sqlparser::ast::ValueWithSpan {
+                        value: sqlparser::ast::Value::SingleQuotedString(s),
+                        ..
+                    }),
+                ) = (&interval.leading_field, interval.value.as_ref())
+                {
+                    return Self::parse_interval_string(s);
+                }
+
                 // Extract the value
                 let value = Self::extract_interval_value(&interval.value)?;
 
