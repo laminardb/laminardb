@@ -1628,6 +1628,43 @@ fn test_lookup_cache_defaults() {
 }
 
 #[test]
+fn test_lookup_strategy_defaults_to_replicated() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    assert_eq!(config.lookups[0].strategy, LookupStrategy::Replicated);
+}
+
+#[test]
+fn test_lookup_strategy_parses_on_demand() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    assert_eq!(config.lookups[0].strategy, LookupStrategy::OnDemand);
+}
+
+#[test]
+fn test_lookup_strategy_rejects_unknown_value() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "poll"
+"#;
+    let error = toml::from_str::<ServerConfig>(toml).expect_err("poll is not a lookup strategy");
+    let message = error.to_string();
+    assert!(message.contains("strategy"), "{message}");
+    assert!(message.contains("replicated"), "{message}");
+}
+
+#[test]
 fn test_cluster_mode_requires_discovery() {
     let toml = r#"
 [server]

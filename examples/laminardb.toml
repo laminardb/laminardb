@@ -49,7 +49,7 @@ max_out_of_orderness = "5s"
 [[lookup]]
 name = "instruments"
 connector = "postgres"
-strategy = "poll"
+strategy = "replicated"
 pushdown = true
 [lookup.properties]
 connection_string = "${POSTGRES_URL:-postgres://localhost/market_data}"
