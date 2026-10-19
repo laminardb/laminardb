@@ -1271,7 +1271,7 @@ fn test_source_to_ddl_keeps_subsecond_watermark_delay() {
     });
     source.watermark = Some(WatermarkConfig {
         column: "ts".to_string(),
-        max_out_of_orderness: Duration::from_millis(1500),
+        max_out_of_orderness: std::time::Duration::from_millis(1500),
     });
     let ddl = source_to_ddl(&source);
     assert!(
@@ -1291,7 +1291,7 @@ fn test_source_to_ddl_keeps_subsecond_watermark_delay() {
         laminar_sql::translator::streaming_ddl::translate_create_source(*create).unwrap();
     assert_eq!(
         definition.watermark.unwrap().max_out_of_orderness,
-        Duration::from_millis(1500)
+        std::time::Duration::from_millis(1500)
     );
 }
 
