@@ -666,6 +666,25 @@ order_source.watermark(ts + 10_000);
 An inner match can emit before either watermark advances. Both sources must still define and
 advance watermarks for bounded state cleanup and for outer or anti unmatched-row finalization.
 
+### 6. Chained aggregates need `EMIT CHANGES` upstream
+
+Without an `EMIT` clause, an aggregate stream re-emits each updated group on every cycle and never
+retracts the earlier value. A downstream aggregate, window or join would count every one of those
+snapshots, so `CREATE STREAM` and `CREATE MATERIALIZED VIEW` reject that input. This applies
+whether the consumer reads the aggregate stream directly or through projection/filter streams.
+
+```sql
+-- WRONG: rejected, per_key re-emits running state
+CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k;
+
+-- CORRECT: per_key emits a retracting changelog
+CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k EMIT CHANGES;
+CREATE STREAM histogram AS SELECT n, COUNT(*) AS keys FROM per_key GROUP BY n;
+```
+
+A server configuration or sealed cluster catalog containing this chain is rejected when it is
+replayed at startup.
+
 ---
 
 ## Tested Combinations
