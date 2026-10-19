@@ -1392,7 +1392,7 @@ fn test_lookup_to_ddl() {
     let lookup = LookupConfig {
         name: "instruments".to_string(),
         connector: "postgres".to_string(),
-        strategy: "poll".to_string(),
+        strategy: LookupStrategy::OnDemand,
         cache: LookupCacheConfig::default(),
         properties: {
             let mut t = toml::Table::new();
@@ -1414,7 +1414,7 @@ fn test_lookup_to_ddl() {
     assert!(ddl.contains("symbol VARCHAR NOT NULL"));
     assert!(ddl.contains("PRIMARY KEY (symbol)"));
     assert!(ddl.contains("'connector' = 'postgres'"));
-    assert!(ddl.contains("'strategy' = 'poll'"));
+    assert!(ddl.contains("'strategy' = 'on-demand'"));
     assert!(ddl.contains("'connection' = 'postgresql://localhost/db'"));
 }
 
@@ -1423,7 +1423,7 @@ fn test_lookup_to_ddl_no_primary_key() {
     let lookup = LookupConfig {
         name: "t".to_string(),
         connector: "postgres".to_string(),
-        strategy: "poll".to_string(),
+        strategy: LookupStrategy::Replicated,
         cache: LookupCacheConfig::default(),
         properties: toml::Table::new(),
         primary_key: vec![],
@@ -1442,13 +1442,44 @@ fn test_lookup_to_ddl_empty_schema_rejected() {
     let lookup = LookupConfig {
         name: "bad".to_string(),
         connector: "postgres".to_string(),
-        strategy: "poll".to_string(),
+        strategy: LookupStrategy::Replicated,
         cache: LookupCacheConfig::default(),
         properties: toml::Table::new(),
         primary_key: vec![],
         schema: vec![],
     };
     assert!(lookup_to_ddl(&lookup).is_err());
+}
+
+#[test]
+fn test_lookup_to_ddl_strategies_pass_sql_validation() {
+    use laminar_sql::parser::lookup_table::{validate_properties, LookupStrategy as SqlStrategy};
+
+    for (strategy, expected) in [
+        (LookupStrategy::default(), SqlStrategy::Replicated),
+        (LookupStrategy::OnDemand, SqlStrategy::OnDemand),
+    ] {
+        let lookup = LookupConfig {
+            name: "instruments".to_string(),
+            connector: "postgres".to_string(),
+            strategy,
+            cache: LookupCacheConfig::default(),
+            properties: toml::Table::new(),
+            primary_key: vec!["symbol".to_string()],
+            schema: vec![ColumnDef {
+                name: "symbol".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+            }],
+        };
+        let ddl = lookup_to_ddl(&lookup).unwrap();
+        let statements = laminar_sql::parse_streaming_sql(&ddl).unwrap();
+        let laminar_sql::StreamingStatement::CreateLookupTable(create) = &statements[0] else {
+            panic!("expected CREATE LOOKUP TABLE, got {statements:?}");
+        };
+        let properties = validate_properties(&create.with_options).unwrap();
+        assert_eq!(properties.strategy, expected);
+    }
 }
 
 #[test]

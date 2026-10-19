@@ -752,7 +752,7 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
     // WITH clause
     let mut opts = Vec::new();
     opts.push(format!("'connector' = '{}'", lookup.connector));
-    opts.push(format!("'strategy' = '{}'", lookup.strategy));
+    opts.push(format!("'strategy' = '{}'", lookup.strategy.as_sql()));
     // Note: the lookup-table parser keys cache options on the dotted form
     // (`cache.memory` / `cache.ttl`); emitting `cache_memory` / `cache_ttl`
     // here would be silently ignored by validate_properties.

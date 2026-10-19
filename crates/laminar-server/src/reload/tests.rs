@@ -52,7 +52,7 @@ fn make_lookup(name: &str) -> LookupConfig {
     LookupConfig {
         name: name.to_string(),
         connector: "postgres".to_string(),
-        strategy: "poll".to_string(),
+        strategy: LookupStrategy::Replicated,
         cache: LookupCacheConfig::default(),
         properties: toml::Table::new(),
         primary_key: vec![],
@@ -240,7 +240,7 @@ fn test_diff_lookup_changed() {
     old.lookups.push(make_lookup("lk1"));
     let mut new = empty_config();
     let mut changed = make_lookup("lk1");
-    changed.strategy = "cdc".to_string();
+    changed.strategy = LookupStrategy::OnDemand;
     new.lookups.push(changed);
     let diff = diff_configs(&old, &new);
     assert_eq!(diff.lookups_changed.len(), 1);

@@ -750,8 +750,8 @@ pub struct LookupConfig {
     pub name: String,
     /// Connector type: "postgres", "redis", "csv".
     pub connector: String,
-    #[serde(default = "default_lookup_strategy")]
-    pub strategy: String,
+    #[serde(default)]
+    pub strategy: LookupStrategy,
     #[serde(default)]
     pub cache: LookupCacheConfig,
     #[serde(default)]
@@ -760,6 +760,28 @@ pub struct LookupConfig {
     pub primary_key: Vec<String>,
     #[serde(default)]
     pub schema: Vec<ColumnDef>,
+}
+
+/// How a `[[lookup]]` table is loaded, emitted as the SQL `strategy` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LookupStrategy {
+    /// Load the whole table and keep it in memory.
+    #[default]
+    Replicated,
+    /// Fetch keys from the connector through a bounded cache.
+    OnDemand,
+}
+
+impl LookupStrategy {
+    /// The value of the SQL `strategy` option.
+    #[must_use]
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::Replicated => "replicated",
+            Self::OnDemand => "on-demand",
+        }
+    }
 }
 
 /// Cache configuration for lookup tables.
@@ -904,9 +926,6 @@ fn default_checkpoint_timeout() -> Duration {
 }
 fn default_max_ooo() -> Duration {
     Duration::from_secs(5)
-}
-fn default_lookup_strategy() -> String {
-    "poll".to_string()
 }
 fn default_true() -> bool {
     true
