@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 595 290" class="ldb-flow" aria-hidden="true">
+  <!-- Conceptual data flow: a vector reconstruction of references/hero-flow-detail.png (handoff v2).
+       Illustrative only; it does not depict a real pipeline, topology or the Console. -->
+  <style>
+    .ldb-flow .grid { fill: none; stroke: #F0F3EF; stroke-width: 1; }
+    .ldb-flow .path { fill: none; stroke: #ABC2B8; stroke-width: 1.5; }
+    .ldb-flow .event { fill: #2D695E; }
+    .ldb-flow .result { fill: #162C29; }
+    .ldb-flow .engine { fill: #162C29; }
+    .ldb-flow .channel { fill: none; stroke: #A7D0C1; stroke-width: 1.5; }
+  </style>
+  <g class="grid">
+    <path d="M24.5 23V281M46.1 23V281M67.7 23V281M89.3 23V281M110.9 23V281M132.5 23V281M154.1 23V281M175.7 23V281M197.3 23V281M218.9 23V281M240.5 23V281M262.1 23V281M283.7 23V281M305.3 23V281M326.9 23V281M348.5 23V281M370.1 23V281M391.7 23V281M413.3 23V281M434.9 23V281M456.5 23V281M478.1 23V281M499.7 23V281M521.3 23V281M542.9 23V281M564.5 23V281M584.5 23V281"/>
+    <path d="M24 23.5H585M24 45.1H585M24 66.7H585M24 88.3H585M24 109.9H585M24 131.5H585M24 153.1H585M24 174.7H585M24 196.3H585M24 217.9H585M24 239.5H585M24 261.1H585M24 280.5H585"/>
+  </g>
+  <g class="path">
+    <path d="M20 69H110C170 69 170 135 230 135H268"/>
+    <path d="M20 100H110C170 100 170 149 230 149H268"/>
+    <path d="M20 132H130C180 132 180 162 230 162H268"/>
+    <path d="M20 226H110C170 226 170 176 230 176H268"/>
+    <path d="M20 258H110C170 258 170 189 230 189H268"/>
+    <path d="M339 162H385C430 162 430 94 475 94H573"/>
+    <path d="M339 177H400C442 177 442 220 485 220H573"/>
+  </g>
+  <g class="event">
+    <rect x="51" y="65" width="14" height="7"/>
+    <rect x="83" y="97" width="14" height="7"/>
+    <rect x="35" y="128.5" width="14" height="7"/>
+    <rect x="57" y="222.5" width="14" height="7"/>
+    <rect x="102" y="254.5" width="14" height="7"/>
+  </g>
+  <g class="result">
+    <rect x="516" y="88" width="32" height="12"/>
+    <rect x="529" y="213.5" width="32" height="12"/>
+  </g>
+  <rect class="engine" x="268" y="118" width="71" height="94"/>
+  <g class="channel">
+    <path d="M285 134V180A13 13 0 0 0 298 193H323"/>
+    <path d="M298 134V171A10 10 0 0 0 308 181H323"/>
+    <path d="M311 134V162.5A6.5 6.5 0 0 0 317.5 169H323"/>
+  </g>
+</svg>

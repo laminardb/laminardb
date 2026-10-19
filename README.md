@@ -1,4 +1,10 @@
-[![Website](https://img.shields.io/badge/website-laminardb.io-blue)](https://laminardb.io)
+<p>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/exports/svg/laminardb-logo-on-dark.svg">
+    <img src="brand/exports/svg/laminardb-logo.svg" alt="LaminarDB" width="250">
+  </picture>
+</p>
+
 [![Crates.io](https://img.shields.io/crates/v/laminar-db.svg)](https://crates.io/crates/laminar-db)
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![Docker Hub](https://img.shields.io/badge/docker-laminardb%2Flaminardb--server-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/laminardb/laminardb-server)
@@ -6,13 +12,200 @@
 
 # LaminarDB
 
-LaminarDB turns live data into continuously updated results with SQL. For example, it can read
-trades from Kafka, calculate totals every minute, and send the results to a table or application.
-Use it inside a Rust, Python, Node.js, or Java application, or run it as a standalone server.
-You can start with one process; a cluster is optional.
+LaminarDB is a streaming SQL engine written in Rust. It reads events from sources such as Kafka
+or PostgreSQL change data capture, keeps the results of your SQL current as events arrive, and
+writes them to a sink, pushes them to subscribers, or holds them for queries. Run it inside a
+Rust program or as a server; a cluster is optional.
 
 The basic flow is **source → SQL query → result**. A source brings in data, a stream updates the
 query result as new data arrives, and a sink or subscription delivers that result.
+
+LaminarDB is pre-1.0. The current packaged release is
+[v0.33.0](https://github.com/laminardb/laminardb/releases/tag/v0.33.0); this README describes the
+`main` branch, and features added since v0.33.0 say so where they appear. Website:
+[laminardb.io](https://laminardb.io).
+
+## Quick start
+
+You need Docker. This runs the v0.33.0 server with a built-in `generator` source, so nothing else
+has to be running, and keeps a running total in a materialized view.
+
+Save this as `laminardb.toml`:
+
+```toml
+sql = '''
+CREATE SOURCE ticks FROM GENERATOR ('rows.per.second' = '10');
+
+CREATE MATERIALIZED VIEW tick_totals AS
+    SELECT COUNT(*) AS rows_seen, MAX(seq) AS last_seq
+    FROM ticks;
+'''
+
+[server]
+mode = "single"
+bind = "0.0.0.0:8080"
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
+
+[checkpoint]
+url = "file:///var/lib/laminardb/checkpoints"
+interval = "10s"
+```
+
+Start the server (commands shown for a Bash-compatible shell):
+
+```bash
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+docker run --rm -d --name laminardb -p 127.0.0.1:8080:8080 \
+  -e LAMINAR_CONSOLE_TOKEN \
+  -v "$PWD/laminardb.toml:/etc/laminardb/laminardb.toml:ro" \
+  laminardb/laminardb-server:0.33.0
+```
+
+Query the view, wait a few seconds, and query it again:
+
+```bash
+curl -s http://localhost:8080/api/v1/sql \
+  -H "Authorization: Bearer $LAMINAR_CONSOLE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"sql": "SELECT * FROM tick_totals"}'
+```
+
+```json
+{"result_type":"query","data":[{"rows_seen":"46","last_seq":"45"}]}
+```
+
+The numbers grow between queries because the view is maintained as rows arrive; yours will differ.
+The generator emits rows `(seq, ts_ms, value)` at a fixed rate and can replay them from a
+checkpoint, which is why the server's default at-least-once delivery accepts it. Counts are
+returned as strings so that 64-bit integers survive JSON parsing in JavaScript. Stop the server
+with `docker stop laminardb`.
+
+## Example: per-minute volume from Kafka
+
+This pipeline reads trades from a Kafka topic, totals each symbol's volume per minute of event
+time, and writes each finished minute to another topic. You need Docker; the steps start Apache
+Kafka and LaminarDB v0.33.0 on a private Docker network.
+
+1. Start Kafka and create the two topics:
+
+   ```bash
+   docker network create laminardb-example
+   docker run -d --rm --name kafka --network laminardb-example \
+     -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES=broker,controller \
+     -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
+     -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
+     -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT \
+     -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+     -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+     -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+     apache/kafka:4.1.1
+   sleep 15
+   docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic trades
+   docker exec kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --topic minute-volume
+   ```
+
+2. Save this as `laminardb.toml`:
+
+   ```toml
+   sql = '''
+   CREATE SOURCE trades (
+       symbol VARCHAR NOT NULL,
+       price  DOUBLE NOT NULL,
+       volume BIGINT NOT NULL,
+       ts     TIMESTAMP NOT NULL,
+       WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+   ) FROM KAFKA (
+       'bootstrap.servers' = 'kafka:9092',
+       'topic' = 'trades',
+       'group.id' = 'minute-volume',
+       'startup.mode' = 'earliest'
+   ) FORMAT JSON;
+
+   CREATE STREAM minute_volume AS
+       SELECT symbol,
+              tumble(ts, INTERVAL '1' MINUTE) AS minute,
+              SUM(volume) AS volume,
+              MAX(price) AS high
+       FROM trades
+       GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+       EMIT ON WINDOW CLOSE;
+
+   CREATE SINK minute_volume_out FROM minute_volume
+       INTO KAFKA ('bootstrap.servers' = 'kafka:9092', 'topic' = 'minute-volume')
+       FORMAT JSON;
+   '''
+
+   [server]
+   mode = "single"
+   bind = "0.0.0.0:8080"
+   console_token = "${LAMINAR_CONSOLE_TOKEN}"
+
+   [checkpoint]
+   url = "file:///var/lib/laminardb/checkpoints"
+   interval = "5s"
+   ```
+
+   The watermark tells LaminarDB to wait five seconds of event time for late trades before a
+   minute is final. With the default at-least-once delivery, a Kafka source must start from
+   `earliest` or explicit offsets rather than the consumer group's committed offsets.
+
+3. Start LaminarDB:
+
+   ```bash
+   export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+   docker run -d --rm --name laminardb --network laminardb-example -p 127.0.0.1:8080:8080 \
+     -e LAMINAR_CONSOLE_TOKEN \
+     -v "$PWD/laminardb.toml:/etc/laminardb/laminardb.toml:ro" \
+     laminardb/laminardb-server:0.33.0
+   ```
+
+4. Send five trades, then read the output topic:
+
+   ```bash
+   docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh \
+     --bootstrap-server kafka:9092 --topic trades <<'EOF'
+   {"symbol": "AAPL", "price": 189.50, "volume": 100, "ts": "2026-10-18T09:30:05Z"}
+   {"symbol": "AAPL", "price": 189.70, "volume": 50, "ts": "2026-10-18T09:30:40Z"}
+   {"symbol": "MSFT", "price": 411.20, "volume": 30, "ts": "2026-10-18T09:30:41Z"}
+   {"symbol": "AAPL", "price": 189.60, "volume": 70, "ts": "2026-10-18T09:31:10Z"}
+   {"symbol": "MSFT", "price": 411.90, "volume": 20, "ts": "2026-10-18T09:32:30Z"}
+   EOF
+   sleep 10
+   docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+     --topic minute-volume --from-beginning --timeout-ms 10000
+   ```
+
+   The consumer exits after ten seconds without new messages and logs a `TimeoutException` as it
+   does so; that is expected. Before it exits you should see three rows, one per finished minute
+   and symbol:
+
+   ```json
+   {"symbol":"AAPL","minute":"2026-10-18T09:30:00","volume":150,"high":189.7}
+   {"symbol":"AAPL","minute":"2026-10-18T09:31:00","volume":70,"high":189.6}
+   {"symbol":"MSFT","minute":"2026-10-18T09:30:00","volume":30,"high":411.2}
+   ```
+
+   MSFT's 09:32 minute is missing on purpose: the newest trade is 09:32:30, so the watermark is at
+   09:32:25 and that minute stays open until a trade at 09:33:05 or later arrives.
+
+5. Clean up with `docker stop laminardb kafka` and `docker network rm laminardb-example`.
+
+## Modes
+
+| Mode | When to use it |
+|---|---|
+| Embedded | Run LaminarDB inside a Rust program with the `laminar-db` crate. Checkpoints go to a local directory. |
+| Single-node server | Run one server with HTTP, WebSocket subscriptions, optional Postgres-compatible connections, and local checkpoints. |
+| Cluster | Run multiple servers with a shared checkpoint store. Sources must be Kafka, materialized views and AI functions are rejected, and cluster SQL is narrower than single-node SQL. |
+
+Client libraries are released separately from the engine and lag behind it:
+
+| Language | Package | Notes |
+|---|---|---|
+| Rust | `cargo add laminar-db` · [API docs](https://docs.rs/laminar-db) | 0.33.0 on crates.io, the same version as the server release. |
+| Python | `pip install laminardb` · [repository](https://github.com/laminardb/laminardb-python) | PyPI has 0.17.0, built against a March 2026 engine. Newer bindings build from the repository. |
+| Node.js / TypeScript | `npm install @laminardb/node` · [repository](https://github.com/laminardb/laminardb-nodejs) | 0.30.0-alpha.4, built against engine v0.30.0 without connectors. |
+| Java | `io.laminardb:laminardb:0.30.0-alpha` · [repository](https://github.com/laminardb/laminardb-java) | Alpha, built against engine v0.30.0 without connectors. |
 
 ## Configuration
 
@@ -30,45 +223,12 @@ url = "file:///var/lib/laminardb/checkpoints"
 interval = "30s"
 ```
 
-The Docker image includes a configuration like this one. Mount persistent storage at
-`/var/lib/laminardb` if you want checkpoints to survive container replacement. See the
+The Docker image includes this configuration, which defines no pipeline; mount your own file at
+`/etc/laminardb/laminardb.toml` as in the quick start. The container exits at startup if
+`LAMINAR_CONSOLE_TOKEN` is not set. Mount persistent storage at `/var/lib/laminardb` if you want
+checkpoints to survive container replacement. See the
 [configuration reference](https://laminardb.io/docs/) for all settings and
 [example configuration](examples/laminardb.toml) for sources, streams, and sinks.
-
-## Quick start
-
-Start the server with Docker (commands shown for a Bash-compatible shell):
-
-```bash
-export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
-docker run --rm -p 8080:8080 \
-  -e LAMINAR_CONSOLE_TOKEN \
-  -v laminardb-data:/var/lib/laminardb \
-  laminardb/laminardb-server:latest
-```
-
-In another terminal, check that it is running:
-
-```bash
-curl http://localhost:8080/health
-```
-
-To use LaminarDB inside an application, choose a client library:
-
-| Language | Get started |
-|---|---|
-| Rust | `cargo add laminar-db` · [API docs](https://docs.rs/laminar-db) |
-| Python | `pip install laminardb` · [examples](https://github.com/laminardb/laminardb-python) |
-| Node.js / TypeScript | `npm install @laminardb/node` · [examples](https://github.com/laminardb/laminardb-nodejs) |
-| Java | [Maven setup and examples](https://github.com/laminardb/laminardb-java) |
-
-## Modes
-
-| Mode | When to use it |
-|---|---|
-| Embedded | Run LaminarDB inside a Rust, Python, Node.js, or Java application. |
-| Single-node server | Run one server with HTTP, optional Postgres-compatible connections, and local checkpoints. |
-| Cluster | Run multiple servers with a shared checkpoint store. Cluster SQL and connector support are narrower than single-node support. |
 
 ## Cluster configuration
 
@@ -94,7 +254,8 @@ url = "s3://my-bucket/laminardb/checkpoints"
 ```
 
 Change `node_id` and `advertise_host` for each node. Use a shared S3, GCS, or Azure checkpoint
-location. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip. With
+location; cluster mode rejects `file://` checkpoints. Cluster sources must be Kafka, because it is
+the only source that can be split across nodes. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip. With
 `strategy = "gossip"`, keep gossip traffic on a trusted or isolated network. See the
 [cluster setup guide](crates/laminar-server/README.md#cluster-control-plane-tls-mtls),
 [Helm chart](deploy/helm/laminardb/README.md), and
@@ -132,7 +293,7 @@ and allocator settings in detail.
 | `CREATE STREAM` | Runs a continuous SQL query over incoming data. |
 | `CREATE MATERIALIZED VIEW` | Keeps a queryable result in embedded or single-node mode. |
 | `CREATE SINK` | Sends a stream to an external system. |
-| `SUBSCRIBE` | Sends live results to a connected client. |
+| `SUBSCRIBE` | Sends live results of a stream or materialized view over WebSocket (`/ws/{name}`), or through a Postgres-protocol cursor or bounded portal. HTTP SQL rejects it. |
 
 For a `trades` source with a timestamp and watermark, this query calculates volume in one-minute
 windows as events arrive:
@@ -148,23 +309,29 @@ EMIT ON WINDOW CLOSE;
 LaminarDB also supports filters, keyed aggregates, bounded joins, and event-time windows. The
 [SQL reference](docs/SQL_REFERENCE.md) has complete syntax and mode-specific limits. The server
 accepts SQL through its HTTP API and can expose a Postgres-compatible connection for queries and
-subscriptions.
+cursor-based subscriptions.
 
 ## Connectors
 
 | Use | Available connectors |
 |---|---|
-| Sources | Kafka, NATS, RabbitMQ, IBM MQ, PostgreSQL logical replication, MongoDB change streams, local files, WebSockets, OpenTelemetry, and supported Iceberg reads. |
-| Sinks | Kafka, NATS, RabbitMQ, IBM MQ, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. |
+| Sources | Kafka, NATS, PostgreSQL logical replication, MongoDB change streams, Delta Lake change data feed, supported Iceberg reads, local files, WebSockets, OpenTelemetry, and the built-in `generator`. RabbitMQ, IBM MQ, and FIX need optional build features; see below. |
+| Sinks | Kafka, NATS, PostgreSQL, MongoDB, local files, WebSockets, Delta Lake, and Iceberg. RabbitMQ and IBM MQ need optional build features; see below. |
 | Lookups | PostgreSQL, MongoDB, Delta Lake, and Iceberg. |
+
+WebSocket and OpenTelemetry sources are best-effort only, so the server's default at-least-once
+delivery rejects them; set `delivery = "best_effort"` to use them.
 
 PostgreSQL tables and MongoDB collections can feed sinks and SQL directly. See
 [PostgreSQL change data capture](#postgresql-change-data-capture) and
 [MongoDB change data capture](#mongodb-change-data-capture) to get started. FpML trade
 confirmations can come in from files, Kafka, RabbitMQ, IBM MQ, or a FIX field such as SecurityXML;
 see
-[FpML trade confirmations](#fpml-trade-confirmations). RabbitMQ and IBM MQ are optional build
-features (`rabbitmq`, `ibmmq`); see [RabbitMQ](docs/RABBITMQ.md) and [IBM MQ](docs/IBMMQ.md).
+[FpML trade confirmations](#fpml-trade-confirmations). RabbitMQ, IBM MQ, FIX and FpML are
+optional build features (`rabbitmq`, `ibmmq`, `fix`, `fpml`) and are not in the Docker image.
+Among the v0.33.0 release binaries, x86_64 Linux (glibc) includes all four, x86_64 Linux (musl)
+includes none, and the others include FIX and FpML. See [RabbitMQ](docs/RABBITMQ.md) and
+[IBM MQ](docs/IBMMQ.md).
 Connector options and delivery guarantees depend on the source, sink, storage, and deployment
 mode. See the [connector guide](crates/laminar-connectors/README.md) for those details.
 
@@ -442,6 +609,9 @@ A profile decides what a row is. The fourteen bundled profiles cover every produ
 confirmations, with one row per trade (with or without the product's economics), per message, or
 per loan event or facility.
 
+FpML is in the v0.33.0 release binaries except x86_64 Linux (musl), and not in the Docker image.
+The steps below build the server from this repository.
+
 #### Try it locally
 
 You need a Rust toolchain, CMake, a C compiler, and a checkout of this repository. These steps
@@ -607,14 +777,23 @@ SELECT headline, ai_sentiment(headline, model => 'finbert') AS sentiment
 FROM news;
 ```
 
-Models can use a remote provider or a local encoder, depending on the function. See the
+The functions are `ai_classify`, `ai_sentiment`, `ai_embed`, `ai_extract`, `ai_complete`,
+`ai_summarize`, `ai_translate`, and `ai_gen`. Models use a remote provider (OpenAI-compatible or
+Anthropic) or, for classification, sentiment and embeddings, a local ONNX encoder; local models
+need ONNX Runtime 1.24 or newer on the host, which the Docker image does not include. A query may
+contain one aliased AI call over one table, and cluster mode rejects AI functions. See the
 [AI setup guide](crates/laminar-server/README.md#ai-functions).
 
 ## Console UI
 
-The [web console](https://laminardb.github.io/laminardb-console-ui/) connects to a LaminarDB
-server. Use it to write SQL, inspect streams and sinks, and view pipeline activity. You can also
-use the HTTP API directly; non-local HTTP access requires a console token.
+The [LaminarDB Console](https://github.com/laminardb/laminardb-console-ui) is a browser app for a
+server you run: browse the catalog, execute SQL, and follow checkpoints, metrics and lineage. A
+[hosted build](https://laminardb.github.io/laminardb-console-ui/) connects from your browser to
+your server's HTTP API; nothing is hosted for you. A server that binds to a non-loopback address
+must set `console_token`. If you restrict browser origins with `console_cors_allowed_origins`,
+include the Console's origin. You can also use the HTTP API directly. The Console's protocol
+contract was last reviewed against v0.32.0; it connects to a v0.33.0 server but shows a notice that
+compatibility with that version is not guaranteed.
 
 ## Monitoring
 
@@ -626,10 +805,16 @@ Monitor input, output, checkpoint success, latency, and process memory. The repo
 
 Choose the packaging that fits your environment:
 
-- [Prebuilt binaries](https://github.com/laminardb/laminardb/releases/latest) for Linux, macOS, and Windows.
-- [Docker Hub](https://hub.docker.com/r/laminardb/laminardb-server) or [GitHub Container Registry](https://github.com/laminardb/laminardb/pkgs/container/laminardb-server) images.
+- [Prebuilt v0.33.0 binaries](https://github.com/laminardb/laminardb/releases/tag/v0.33.0) for
+  Linux (x86_64 and aarch64, glibc; x86_64 musl), macOS (x86_64 and Apple silicon), and Windows
+  (x86_64), with `SHA256SUMS`.
+- [Docker Hub](https://hub.docker.com/r/laminardb/laminardb-server) or
+  [GitHub Container Registry](https://github.com/laminardb/laminardb/pkgs/container/laminardb-server)
+  images. Use a version tag such as `0.33.0`; `latest` and `main` are rebuilt from the `main`
+  branch and are not releases.
 - [Docker Compose](docker-compose.yml) for a local stack.
-- [Helm chart](deploy/helm/laminardb/README.md) for Kubernetes.
+- [Helm chart](deploy/helm/laminardb/README.md) for Kubernetes. The chart's image tag defaults to
+  its `appVersion`; set `image.tag` to a published image version such as `0.33.0`.
 
 See the [deployment guide](deploy/README.md) for setup and operational details.
 
@@ -654,8 +839,9 @@ support@laminardb.io.
 
 Apache License 2.0. See [LICENSE](LICENSE).
 
-Builds with the `fix` or `fpml` feature, including the prebuilt server binaries, also contain
-third-party software under its own licence; release archives carry the notices in `licenses/`.
+Builds with the `fix` or `fpml` feature, including the v0.33.0 release binaries other than
+x86_64 Linux (musl), also contain third-party software under its own licence; release archives
+carry the notices in `licenses/`.
 This product includes software developed by quickfixengine.org (http://www.quickfixengine.org/).
 libxml2 is under the MIT License, and the bundled FpML schemas are FpML Specifications under the
 FpML Public License (Licensor: International Swaps and Derivatives Association, Inc.).
