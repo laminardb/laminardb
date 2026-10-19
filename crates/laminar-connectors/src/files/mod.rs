@@ -8,6 +8,7 @@ use crate::registry::ConnectorRegistry;
 pub mod arrow_ipc_codec;
 pub mod config;
 pub mod discovery;
+mod json_documents;
 pub mod manifest;
 mod output_directory;
 mod schema_resolution;
