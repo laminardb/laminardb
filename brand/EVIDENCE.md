@@ -111,7 +111,7 @@ product screenshots. Verification captures are kept outside the repositories in
 | Console `npm test` / `npm run lint` / `npm run build` | 51/51 tests pass; ESLint clean; type-checked build succeeds |
 | Console build with `GITHUB_ACTIONS=1` served under `/laminardb-console-ui/` | all assets, favicons and touch icon return 200 |
 | axe-core (WCAG 2.0–2.2 A/AA) on 10 Console states, live 0.32.0 server, 1440 px | 0 violations (before: 7 states with violations) |
-| axe at 1024 px | 0; at 390 px: pre-existing `scrollable-region-focusable` on table/chart wrappers (open issue) |
+| axe at 1024 px | 0; at 390 px the pre-existing `scrollable-region-focusable` on table, chart and tab-bar wrappers (19 elements) is fixed on the Console branch: 0 violations in all ten states at 390 and 1440 px |
 | axe (WCAG + best practices) on home, docs, 404, light and dark, 1440 and 390 | 0 violations |
 | Keyboard order on home | skip link → logo → nav → theme → GitHub → buttons → rows → code; 2 px focus ring on every stop |
 | Horizontal overflow at 390/768/1024/1440 | none (old site overflowed at 1440 home and 390 docs) |
@@ -152,19 +152,26 @@ on localhost is not meaningful and engine performance is not implied.
 4. **Server config (v0.33.0):** `[[lookup]]` without `strategy` defaults to `"poll"`, which the SQL
    parser rejects (the shipped `examples/laminardb.toml` sets it explicitly); fixed on
    `fix/lookup-default-strategy`. TOML watermark `max_out_of_orderness` is truncated to whole
-   seconds; fixed on `fix/watermark-subsecond-delay`. `[[lookup]].cache.ttl` is still truncated to
-   whole seconds.
-5. **Stale docs not edited here:** `crates/laminar-server/README.md` still shows
-   `cargo install laminar-server`, lacks `--pgwire-bind`, and its Kafka example omits
-   `startup.mode` (fails under at-least-once); it and `SQL_REFERENCE.md` describe `psql`
-   `SUBSCRIBE` that pgwire rejects; `SQL_REFERENCE.md` footer says DataFusion 52 / Arrow 57 /
+   seconds; fixed on `fix/watermark-subsecond-delay`. `[[lookup]].cache.ttl` finer than whole
+   seconds was truncated (`500ms` became 0); it is rejected at validation on
+   `fix/lookup-cache-ttl-whole-seconds`. SQL intervals with the unit inside the string
+   (`INTERVAL '5 minutes'`) were read as that many seconds by the parser that sizes windows, join
+   bounds and watermarks, and an unreadable watermark delay silently became 1 s; both are fixed on
+   local branch `fix/sql-interval-units`, which rejects unknown units and unsupported watermark
+   forms. Its laminar-sql tests and clippy pass; laminar-db and server tests have not run yet, so
+   it is not pushed.
+5. **Stale docs:** `docs/server-readme-corrections` removes `cargo install laminar-server` from
+   `crates/laminar-server/README.md`, shows the v0.33.0 `--help` (with `--pgwire-bind`), adds
+   `startup.mode` to its Kafka example, and points it and `deploy/README.md` at the Docker Hub
+   image (GHCR returns 403 to anonymous pulls). Still open: that README and `SQL_REFERENCE.md`
+   describe `psql` `SUBSCRIBE` that pgwire rejects; `SQL_REFERENCE.md` says it tracks
    LaminarDB 0.22 and documents `slide(ts, size, slide)` while the parser treats `SLIDE` like `HOP`.
 6. **Docs page:** PostgreSQL and MongoDB CDC sections were not re-audited; other sections were
    checked against code but not executed.
 7. **Python bindings:** PyPI is at 0.17.0; release runs for later versions failed.
-8. **Console:** the GHCR image is not anonymously pullable; at 390 px several scrolling table and
-   chart wrappers are not keyboard-focusable (pre-existing); the hosted build will show the new
-   branding only after `main` is deployed.
+8. **Console:** the GHCR image is not anonymously pullable; the hosted build will show the new
+   branding only after `main` is deployed. The 390 px keyboard-focus issue is fixed on the
+   Console branch.
 9. **Docs assistant:** the site's chat widget posts to an external worker whose answers were not
    evaluated; the widget now says answers can be wrong.
 10. **Windows checkpoint paths (v0.33.0 binary):** with a 169-character `file:///` checkpoint
