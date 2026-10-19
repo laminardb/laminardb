@@ -644,10 +644,11 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
 
     // Watermark clause
     if let Some(wm) = &source.watermark {
-        let secs = wm.max_out_of_orderness.as_secs();
+        // Event time is tracked in milliseconds; whole seconds would drop sub-second delays.
+        let millis = wm.max_out_of_orderness.as_millis();
         col_defs.push(format!(
-            "WATERMARK FOR {} AS {} - INTERVAL '{}' SECOND",
-            wm.column, wm.column, secs
+            "WATERMARK FOR {} AS {} - INTERVAL '{}' MILLISECOND",
+            wm.column, wm.column, millis
         ));
     }
 
@@ -752,7 +753,7 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
     // WITH clause
     let mut opts = Vec::new();
     opts.push(format!("'connector' = '{}'", lookup.connector));
-    opts.push(format!("'strategy' = '{}'", lookup.strategy));
+    opts.push(format!("'strategy' = '{}'", lookup.strategy.as_sql()));
     // Note: the lookup-table parser keys cache options on the dotted form
     // (`cache.memory` / `cache.ttl`); emitting `cache_memory` / `cache_ttl`
     // here would be silently ignored by validate_properties.

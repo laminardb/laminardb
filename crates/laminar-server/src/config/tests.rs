@@ -1628,6 +1628,43 @@ fn test_lookup_cache_defaults() {
 }
 
 #[test]
+fn test_lookup_strategy_defaults_to_replicated() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    assert_eq!(config.lookups[0].strategy, LookupStrategy::Replicated);
+}
+
+#[test]
+fn test_lookup_strategy_parses_on_demand() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    assert_eq!(config.lookups[0].strategy, LookupStrategy::OnDemand);
+}
+
+#[test]
+fn test_lookup_strategy_rejects_unknown_value() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "poll"
+"#;
+    let error = toml::from_str::<ServerConfig>(toml).expect_err("poll is not a lookup strategy");
+    let message = error.to_string();
+    assert!(message.contains("strategy"), "{message}");
+    assert!(message.contains("replicated"), "{message}");
+}
+
+#[test]
 fn test_cluster_mode_requires_discovery() {
     let toml = r#"
 [server]
@@ -2000,4 +2037,48 @@ function = "handle"
         .unwrap_err()
         .to_string()
         .contains("max_in_flight"));
+}
+
+#[test]
+fn test_lookup_cache_ttl_rejects_fractional_seconds() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+
+[lookup.cache]
+ttl = "1500ms"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err() else {
+        panic!("expected validation errors");
+    };
+    assert!(
+        errors.contains(
+            &"lookup 'instruments': cache.ttl must be a whole number of seconds, got 1.5s"
+                .to_string()
+        ),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn test_lookup_cache_ttl_accepts_whole_seconds() {
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+
+[lookup.cache]
+ttl = "2m"
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    if let Err(ConfigError::ValidationErrors { errors }) = validate_config(&config) {
+        assert!(
+            !errors.iter().any(|e| e.contains("cache.ttl")),
+            "{errors:?}"
+        );
+    }
 }

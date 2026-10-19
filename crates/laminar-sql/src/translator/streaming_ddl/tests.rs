@@ -396,3 +396,63 @@ fn hand_declared_map_column_errors_actionably() {
         "expected actionable error for hand-declared MAP, got: {msg}"
     );
 }
+
+#[test]
+fn test_watermark_unit_inside_interval_string() {
+    let def = parse_and_translate(
+        "CREATE SOURCE events (
+                ts TIMESTAMP,
+                WATERMARK FOR ts AS ts - INTERVAL '5 minutes'
+            )",
+    )
+    .unwrap();
+
+    let wm = def.watermark.unwrap();
+    assert_eq!(wm.max_out_of_orderness, Duration::from_secs(300));
+}
+
+#[test]
+fn test_watermark_parenthesized_expression() {
+    let def = parse_and_translate(
+        "CREATE SOURCE events (
+                ts TIMESTAMP,
+                WATERMARK FOR ts AS (ts - INTERVAL '5' SECOND)
+            )",
+    )
+    .unwrap();
+
+    let wm = def.watermark.unwrap();
+    assert_eq!(wm.max_out_of_orderness, Duration::from_secs(5));
+}
+
+#[test]
+fn test_watermark_unreadable_delay_rejected() {
+    let error = parse_and_translate(
+        "CREATE SOURCE events (
+                ts TIMESTAMP,
+                WATERMARK FOR ts AS ts - INTERVAL '1.5' SECOND
+            )",
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("invalid watermark delay"), "{error}");
+    assert!(error.contains("1.5"), "{error}");
+}
+
+#[test]
+fn test_watermark_unsupported_expression_rejected() {
+    let error = parse_and_translate(
+        "CREATE SOURCE events (
+                ts TIMESTAMP,
+                WATERMARK FOR ts AS ts + INTERVAL '5' SECOND
+            )",
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("unsupported watermark expression"),
+        "{error}"
+    );
+}

@@ -329,10 +329,17 @@ async fn undecodable_message_fails_closed_and_is_redelivered() {
     let mut source = started_source(&url, &queue, ids_schema(), &[])
         .await
         .unwrap();
+    // Deliveries reach the source asynchronously, so the valid message may be handed off on
+    // its own before the undecodable one arrives. No batch may contain the undecodable message,
+    // and nothing is acknowledged without a checkpoint.
     let error = loop {
         match source.poll_batch(10).await {
             Err(error) => break error,
-            Ok(Some(_)) => panic!("a batch containing an undecodable message was handed off"),
+            Ok(Some(batch)) => assert_eq!(
+                ids(std::slice::from_ref(&batch.records)),
+                vec![1],
+                "only the decodable message may be handed off"
+            ),
             Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
         }
     };

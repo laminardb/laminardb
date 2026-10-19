@@ -464,3 +464,37 @@ fn test_parse_hop_with_offset() {
         }
     }
 }
+
+#[test]
+fn test_parse_interval_with_unit_inside_string() {
+    let dialect = GenericDialect {};
+    for (sql, expected) in [
+        ("INTERVAL '5 minutes'", std::time::Duration::from_secs(300)),
+        ("INTERVAL '2 HOURS'", std::time::Duration::from_secs(7200)),
+        ("INTERVAL '250 ms'", std::time::Duration::from_millis(250)),
+        ("INTERVAL '10'", std::time::Duration::from_secs(10)),
+    ] {
+        let expr = Parser::new(&dialect)
+            .try_with_sql(sql)
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+        assert_eq!(
+            WindowRewriter::parse_interval_to_duration(&expr).unwrap(),
+            expected,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_interval_rejects_unknown_unit_inside_string() {
+    let dialect = GenericDialect {};
+    let expr = Parser::new(&dialect)
+        .try_with_sql("INTERVAL '5 fortnights'")
+        .unwrap()
+        .parse_expr()
+        .unwrap();
+    let error = WindowRewriter::parse_interval_to_duration(&expr).unwrap_err();
+    assert!(error.to_string().contains("FORTNIGHTS"), "{error}");
+}

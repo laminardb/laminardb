@@ -35,14 +35,11 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 ## 2. Docker
 
-Images are published to both GHCR and Docker Hub on every push to `main` and tagged releases.
+Images are published to Docker Hub on every push to `main` and on tagged releases. GHCR receives
+the same images, but pulling them currently requires authentication.
 
 ```bash
-# Pull from GHCR
-docker pull ghcr.io/laminardb/laminardb-server:latest
-
-# Or from Docker Hub
-docker pull laminardb/laminardb-server:latest
+docker pull laminardb/laminardb-server:0.33.0
 
 # Run with default config
 export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
@@ -50,16 +47,16 @@ docker run -d --name laminardb \
   -p 8080:8080 \
   -e LAMINAR_CONSOLE_TOKEN \
   -v laminardb-data:/var/lib/laminardb \
-  ghcr.io/laminardb/laminardb-server:latest
+  laminardb/laminardb-server:0.33.0
 
 # Check health
 curl http://localhost:8080/health
 ```
 
 Available tags:
-- `latest` - latest build from `main`
-- `0.20.2` - specific version
-- `0.20` - latest patch for minor version
+- `latest` - latest build from `main`, not a release
+- `0.33.0` - specific version
+- `0.33` - latest patch for minor version
 - `sha-abc1234` - specific commit
 
 Multi-arch support: `linux/amd64` and `linux/arm64`.

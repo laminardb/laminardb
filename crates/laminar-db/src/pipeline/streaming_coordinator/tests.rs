@@ -11391,3 +11391,83 @@ async fn test_drain_skip_under_backpressure() {
         );
     }
 }
+
+#[tokio::test]
+async fn durable_commit_published_as_shutdown_starts_is_acknowledged_before_close() {
+    let state = Arc::new(CancellationSafePollState::default());
+    let source = SourceRegistration {
+        name: "commit-at-shutdown-source".into(),
+        connector: Box::new(CancellationSafePollSource {
+            state: Arc::clone(&state),
+        }),
+        config: laminar_connectors::config::ConnectorConfig::new("commit-at-shutdown-test"),
+        assignment_scoped: false,
+        position: SourcePosition::Initial,
+    };
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let config = PipelineConfig {
+        delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+        checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
+        fallback_poll_interval: Duration::from_millis(1),
+        ..PipelineConfig::default()
+    };
+    let coordinator = StreamingCoordinator::new(
+        &StreamingCoordinatorRuntime::new(),
+        vec![source],
+        config,
+        Arc::clone(&shutdown),
+        control_rx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+    let epoch_committed_tx = coordinator.source_handles[0].epoch_committed_tx.clone();
+    let run = tokio::spawn(async move { coordinator.run(MockCallback::new()).await });
+
+    tokio::time::timeout(Duration::from_secs(2), state.first_poll_started.notified())
+        .await
+        .expect("source never entered its first poll");
+    // The in-flight poll keeps the source from seeing this commit before the coordinator
+    // shuts down and closes the watch.
+    epoch_committed_tx
+        .send(Some((17, SourceCheckpoint::new())))
+        .unwrap();
+    drop(epoch_committed_tx);
+    shutdown.notify_one();
+
+    let exit = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("coordinator must stop after shutdown")
+        .unwrap();
+    assert!(matches!(exit, ExitReason::Shutdown));
+    assert_eq!(
+        state.commit_notification_calls.load(Ordering::SeqCst),
+        1,
+        "a commit published before the watch closed must be acknowledged"
+    );
+    assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn shutdown_requested_before_a_poll_starts_does_not_cancel_it() {
+    let state = Arc::new(CancellationSafePollState::default());
+    let mut connector = CancellationSafePollSource {
+        state: Arc::clone(&state),
+    };
+    let shutdown = tokio::sync::Notify::new();
+    shutdown.notify_one();
+
+    let outcome = poll_source_once(
+        &mut connector,
+        1,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        &shutdown,
+        #[cfg(feature = "cluster")]
+        None,
+    )
+    .await;
+
+    assert!(matches!(outcome, SourcePollOutcome::ShutdownBeforePoll));
+    assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
+}

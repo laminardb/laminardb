@@ -1258,7 +1258,41 @@ fn test_source_to_ddl_with_watermark() {
         max_out_of_orderness: std::time::Duration::from_secs(5),
     });
     let ddl = source_to_ddl(&source);
-    assert!(ddl.contains("WATERMARK FOR ts AS ts - INTERVAL '5' SECOND"));
+    assert!(ddl.contains("WATERMARK FOR ts AS ts - INTERVAL '5000' MILLISECOND"));
+}
+
+#[test]
+fn test_source_to_ddl_keeps_subsecond_watermark_delay() {
+    let mut source = make_source("events", "kafka");
+    source.schema.push(ColumnDef {
+        name: "ts".to_string(),
+        data_type: "TIMESTAMP".to_string(),
+        nullable: false,
+    });
+    source.watermark = Some(WatermarkConfig {
+        column: "ts".to_string(),
+        max_out_of_orderness: std::time::Duration::from_millis(1500),
+    });
+    let ddl = source_to_ddl(&source);
+    assert!(
+        ddl.contains("WATERMARK FOR ts AS ts - INTERVAL '1500' MILLISECOND"),
+        "{ddl}"
+    );
+
+    let statement = laminar_sql::parse_streaming_sql(&ddl)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let laminar_sql::StreamingStatement::CreateSource(create) = statement else {
+        panic!("expected CREATE SOURCE, got {statement:?}");
+    };
+    let definition =
+        laminar_sql::translator::streaming_ddl::translate_create_source(*create).unwrap();
+    assert_eq!(
+        definition.watermark.unwrap().max_out_of_orderness,
+        std::time::Duration::from_millis(1500)
+    );
 }
 
 #[test]
@@ -1392,7 +1426,7 @@ fn test_lookup_to_ddl() {
     let lookup = LookupConfig {
         name: "instruments".to_string(),
         connector: "postgres".to_string(),
-        strategy: "poll".to_string(),
+        strategy: LookupStrategy::OnDemand,
         cache: LookupCacheConfig::default(),
         properties: {
             let mut t = toml::Table::new();
@@ -1414,7 +1448,7 @@ fn test_lookup_to_ddl() {
     assert!(ddl.contains("symbol VARCHAR NOT NULL"));
     assert!(ddl.contains("PRIMARY KEY (symbol)"));
     assert!(ddl.contains("'connector' = 'postgres'"));
-    assert!(ddl.contains("'strategy' = 'poll'"));
+    assert!(ddl.contains("'strategy' = 'on-demand'"));
     assert!(ddl.contains("'connection' = 'postgresql://localhost/db'"));
 }
 
@@ -1423,7 +1457,7 @@ fn test_lookup_to_ddl_no_primary_key() {
     let lookup = LookupConfig {
         name: "t".to_string(),
         connector: "postgres".to_string(),
-        strategy: "poll".to_string(),
+        strategy: LookupStrategy::Replicated,
         cache: LookupCacheConfig::default(),
         properties: toml::Table::new(),
         primary_key: vec![],
@@ -1442,13 +1476,44 @@ fn test_lookup_to_ddl_empty_schema_rejected() {
     let lookup = LookupConfig {
         name: "bad".to_string(),
         connector: "postgres".to_string(),
-        strategy: "poll".to_string(),
+        strategy: LookupStrategy::Replicated,
         cache: LookupCacheConfig::default(),
         properties: toml::Table::new(),
         primary_key: vec![],
         schema: vec![],
     };
     assert!(lookup_to_ddl(&lookup).is_err());
+}
+
+#[test]
+fn test_lookup_to_ddl_strategies_pass_sql_validation() {
+    use laminar_sql::parser::lookup_table::{validate_properties, LookupStrategy as SqlStrategy};
+
+    for (strategy, expected) in [
+        (LookupStrategy::default(), SqlStrategy::Replicated),
+        (LookupStrategy::OnDemand, SqlStrategy::OnDemand),
+    ] {
+        let lookup = LookupConfig {
+            name: "instruments".to_string(),
+            connector: "postgres".to_string(),
+            strategy,
+            cache: LookupCacheConfig::default(),
+            properties: toml::Table::new(),
+            primary_key: vec!["symbol".to_string()],
+            schema: vec![ColumnDef {
+                name: "symbol".to_string(),
+                data_type: "VARCHAR".to_string(),
+                nullable: false,
+            }],
+        };
+        let ddl = lookup_to_ddl(&lookup).unwrap();
+        let statements = laminar_sql::parse_streaming_sql(&ddl).unwrap();
+        let laminar_sql::StreamingStatement::CreateLookupTable(create) = &statements[0] else {
+            panic!("expected CREATE LOOKUP TABLE, got {statements:?}");
+        };
+        let properties = validate_properties(&create.with_options).unwrap();
+        assert_eq!(properties.strategy, expected);
+    }
 }
 
 #[test]
@@ -1472,4 +1537,34 @@ fn test_toml_value_to_sql_escapes_single_quotes() {
         toml_value_to_sql(&toml::Value::String("a''b".to_string())),
         "a''''b"
     );
+}
+
+#[test]
+fn test_lookup_to_ddl_cache_ttl_passes_sql_validation() {
+    use laminar_sql::parser::lookup_table::validate_properties;
+
+    let toml = r#"
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "on-demand"
+primary_key = ["symbol"]
+
+[lookup.cache]
+ttl = "2m"
+
+[[lookup.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    let ddl = lookup_to_ddl(&config.lookups[0]).unwrap();
+    assert!(ddl.contains("'cache.ttl' = '120'"), "{ddl}");
+    let statements = laminar_sql::parse_streaming_sql(&ddl).unwrap();
+    let laminar_sql::StreamingStatement::CreateLookupTable(create) = &statements[0] else {
+        panic!("expected CREATE LOOKUP TABLE, got {statements:?}");
+    };
+    let properties = validate_properties(&create.with_options).unwrap();
+    assert_eq!(properties.cache_ttl, Some(120));
 }
