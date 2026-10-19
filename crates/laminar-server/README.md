@@ -18,11 +18,12 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 laminardb [OPTIONS]
 
 Options:
-  --config <FILE>         Configuration file [default: laminardb.toml]
-  --log-level <LEVEL>     Logging level: trace, debug, info, warn, error [default: info]
-  --admin-bind <ADDR>     Override HTTP bind address from config
-  -h, --help              Print help
-  -V, --version           Print version
+  -c, --config <CONFIG>            [default: laminardb.toml]
+      --log-level <LOG_LEVEL>      [default: info]
+      --admin-bind <ADMIN_BIND>
+      --pgwire-bind <PGWIRE_BIND>  Postgres wire bind address (e.g. `127.0.0.1:5433`). Wildcard binds rejected
+  -h, --help                       Print help
+  -V, --version                    Print version
 ```
 
 ## Quick Start
@@ -34,15 +35,11 @@ cargo build --release --bin laminardb
 # Run with a config file
 ./target/release/laminardb --config laminardb.toml
 
-# Or install and run
-cargo install laminar-server
-laminardb --config laminardb.toml
-
 # Docker
 export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
 docker run -d -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN \
   -v laminardb-data:/var/lib/laminardb \
-  ghcr.io/laminardb/laminardb-server:latest
+  laminardb/laminardb-server:0.33.0
 
 # Check health
 curl http://localhost:8080/health
@@ -113,6 +110,7 @@ format = "json"
 "bootstrap.servers" = "localhost:9092"
 topic = "market-trades"
 "group.id" = "laminar"
+"startup.mode" = "earliest" # at-least-once delivery cannot start from committed group offsets
 [[source.schema]]
 name = "symbol"
 type = "VARCHAR"
