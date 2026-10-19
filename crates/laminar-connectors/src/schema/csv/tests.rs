@@ -463,6 +463,123 @@ fn test_decode_timestamp_iso8601_fallback() {
     assert!(!batch.column(0).is_null(0));
 }
 
+#[test]
+fn test_decode_timestamp_into_declared_unit() {
+    for unit in [
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+        TimeUnit::Nanosecond,
+    ] {
+        let data_type = DataType::Timestamp(unit, None);
+        let schema = make_schema(vec![("ts", data_type.clone(), false)]);
+        CsvDecoder::validate_schema(&schema).unwrap();
+        let decoder = CsvDecoder::new(schema);
+        let batch = decoder
+            .decode_batch(&[csv_block("ts\n2025-01-15 10:30:00.123456")])
+            .unwrap();
+
+        assert_eq!(batch.column(0).data_type(), &data_type);
+        let expected = match unit {
+            TimeUnit::Second => 1_736_937_000,
+            TimeUnit::Millisecond => 1_736_937_000_123,
+            TimeUnit::Microsecond => 1_736_937_000_123_456,
+            TimeUnit::Nanosecond => 1_736_937_000_123_456_000,
+        };
+        let column = arrow_cast::cast(batch.column(0), &DataType::Int64).unwrap();
+        assert_eq!(
+            column
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            expected
+        );
+    }
+}
+
+#[test]
+fn test_decode_keeps_timestamp_timezone() {
+    let data_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let schema = make_schema(vec![("ts", data_type.clone(), false)]);
+    let decoder = CsvDecoder::new(schema);
+    let batch = decoder
+        .decode_batch(&[csv_block("ts\n2025-01-15T10:30:00Z")])
+        .unwrap();
+
+    assert_eq!(batch.column(0).data_type(), &data_type);
+}
+
+#[test]
+fn test_decode_narrow_numeric_and_date_columns() {
+    let schema = make_schema(vec![
+        ("small", DataType::Int16, false),
+        ("count", DataType::Int32, false),
+        ("ratio", DataType::Float32, false),
+        ("day", DataType::Date64, false),
+    ]);
+    CsvDecoder::validate_schema(&schema).unwrap();
+    let decoder = CsvDecoder::new(schema.clone());
+    let batch = decoder
+        .decode_batch(&[csv_block("small,count,ratio,day\n-7,42,0.5,2025-01-15")])
+        .unwrap();
+
+    assert_eq!(batch.schema(), schema);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int16Type>()
+            .value(0),
+        -7
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(0),
+        42
+    );
+    assert!(
+        (batch
+            .column(2)
+            .as_primitive::<arrow_array::types::Float32Type>()
+            .value(0)
+            - 0.5)
+            .abs()
+            < f32::EPSILON
+    );
+    assert_eq!(
+        batch
+            .column(3)
+            .as_primitive::<arrow_array::types::Date64Type>()
+            .value(0),
+        1_736_899_200_000
+    );
+}
+
+#[test]
+fn test_decode_out_of_range_integer_is_parse_error() {
+    let schema = make_schema(vec![("count", DataType::Int32, true)]);
+    let decoder = CsvDecoder::new(schema);
+    let batch = decoder
+        .decode_batch(&[csv_block("count\n3000000000\n12")])
+        .unwrap();
+
+    assert!(batch.column(0).is_null(0));
+    assert_eq!(
+        batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .value(1),
+        12
+    );
+    assert_eq!(decoder.parse_error_count(), 1);
+}
+
+#[test]
+fn test_validate_schema_still_rejects_text_only_types() {
+    let schema = make_schema(vec![("price", DataType::Decimal128(10, 2), false)]);
+    assert!(CsvDecoder::validate_schema(&schema).is_err());
+}
+
 // ── Date parsing ──────────────────────────────────────────
 
 #[test]
