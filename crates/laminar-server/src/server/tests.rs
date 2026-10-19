@@ -1258,7 +1258,41 @@ fn test_source_to_ddl_with_watermark() {
         max_out_of_orderness: std::time::Duration::from_secs(5),
     });
     let ddl = source_to_ddl(&source);
-    assert!(ddl.contains("WATERMARK FOR ts AS ts - INTERVAL '5' SECOND"));
+    assert!(ddl.contains("WATERMARK FOR ts AS ts - INTERVAL '5000' MILLISECOND"));
+}
+
+#[test]
+fn test_source_to_ddl_keeps_subsecond_watermark_delay() {
+    let mut source = make_source("events", "kafka");
+    source.schema.push(ColumnDef {
+        name: "ts".to_string(),
+        data_type: "TIMESTAMP".to_string(),
+        nullable: false,
+    });
+    source.watermark = Some(WatermarkConfig {
+        column: "ts".to_string(),
+        max_out_of_orderness: Duration::from_millis(1500),
+    });
+    let ddl = source_to_ddl(&source);
+    assert!(
+        ddl.contains("WATERMARK FOR ts AS ts - INTERVAL '1500' MILLISECOND"),
+        "{ddl}"
+    );
+
+    let statement = laminar_sql::parse_streaming_sql(&ddl)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let laminar_sql::StreamingStatement::CreateSource(create) = statement else {
+        panic!("expected CREATE SOURCE, got {statement:?}");
+    };
+    let definition =
+        laminar_sql::translator::streaming_ddl::translate_create_source(*create).unwrap();
+    assert_eq!(
+        definition.watermark.unwrap().max_out_of_orderness,
+        Duration::from_millis(1500)
+    );
 }
 
 #[test]
