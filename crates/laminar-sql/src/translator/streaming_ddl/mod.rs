@@ -11,7 +11,7 @@ use sqlparser::ast::{ColumnDef, DataType as SqlDataType};
 use laminar_core::streaming::config::{DEFAULT_BUFFER_SIZE, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE};
 
 use crate::parser::ParseError;
-use crate::parser::{CreateSourceStatement, WatermarkDef};
+use crate::parser::{CreateSourceStatement, WatermarkDef, WindowRewriter};
 
 /// Watermark specification for a source.
 #[derive(Debug, Clone)]
@@ -470,7 +470,7 @@ fn parse_watermark(
     // Parse the watermark expression to extract out-of-orderness.
     // When expression is None (WATERMARK FOR col without AS), use zero delay.
     let max_out_of_orderness = match &wm.expression {
-        Some(expr) => parse_watermark_expression(expr),
+        Some(expr) => parse_watermark_expression(expr)?,
         None => Duration::ZERO,
     };
 
@@ -481,65 +481,31 @@ fn parse_watermark(
     })
 }
 
-/// Parses watermark expression to extract the bounded out-of-orderness.
-fn parse_watermark_expression(expr: &sqlparser::ast::Expr) -> Duration {
-    use sqlparser::ast::Expr;
+/// Parses a watermark expression to extract the bounded out-of-orderness.
+///
+/// Only `col` and `col - INTERVAL ...` are understood; any other form is rejected instead of
+/// being given a guessed delay.
+fn parse_watermark_expression(expr: &sqlparser::ast::Expr) -> Result<Duration, ParseError> {
+    use sqlparser::ast::{BinaryOperator, Expr};
 
     match expr {
-        Expr::BinaryOp { op, right, .. } => match op {
-            sqlparser::ast::BinaryOperator::Minus => parse_interval_expr(right),
-            _ => Duration::ZERO,
-        },
-        // If just the column name, assume zero lateness
-        Expr::Identifier(_) => Duration::ZERO,
-        // Default to 1 second for complex expressions
-        _ => Duration::from_secs(1),
-    }
-}
-
-/// Parses an interval expression to a Duration.
-fn parse_interval_expr(expr: &sqlparser::ast::Expr) -> Duration {
-    use sqlparser::ast::Expr;
-
-    let Expr::Interval(interval) = expr else {
-        return Duration::from_secs(1);
-    };
-
-    // Extract value and unit from interval
-    let value_str = match interval.value.as_ref() {
-        Expr::Value(v) => {
-            // v is ValueWithSpan, access the inner value
-            match &v.value {
-                sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
-                sqlparser::ast::Value::Number(n, _) => n.clone(),
-                _ => return Duration::from_secs(1),
-            }
-        }
-        _ => return Duration::from_secs(1),
-    };
-
-    let value: u64 = value_str.parse().unwrap_or(1);
-
-    // Determine unit
-    let unit = interval
-        .leading_field
-        .as_ref()
-        .map_or("second", |u| match u {
-            sqlparser::ast::DateTimeField::Microsecond => "microsecond",
-            sqlparser::ast::DateTimeField::Millisecond => "millisecond",
-            sqlparser::ast::DateTimeField::Minute => "minute",
-            sqlparser::ast::DateTimeField::Hour => "hour",
-            sqlparser::ast::DateTimeField::Day => "day",
-            _ => "second",
-        });
-
-    match unit {
-        "microsecond" | "microseconds" => Duration::from_micros(value),
-        "millisecond" | "milliseconds" => Duration::from_millis(value),
-        "minute" | "minutes" => Duration::from_secs(value * 60),
-        "hour" | "hours" => Duration::from_secs(value * 3600),
-        "day" | "days" => Duration::from_secs(value * 86400),
-        _ => Duration::from_secs(value),
+        Expr::BinaryOp {
+            op: BinaryOperator::Minus,
+            right,
+            ..
+        } => WindowRewriter::parse_interval_to_duration(right).map_err(|error| {
+            let reason = match error {
+                ParseError::WindowError(reason) => reason,
+                other => other.to_string(),
+            };
+            ParseError::ValidationError(format!("invalid watermark delay '{right}': {reason}"))
+        }),
+        Expr::Nested(inner) => parse_watermark_expression(inner),
+        // A bare column means zero lateness.
+        Expr::Identifier(_) => Ok(Duration::ZERO),
+        _ => Err(ParseError::ValidationError(format!(
+            "unsupported watermark expression '{expr}'; use <column> - INTERVAL '<n>' <unit>"
+        ))),
     }
 }
 
