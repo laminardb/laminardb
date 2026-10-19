@@ -17,7 +17,7 @@ use arrow_array::builder::{
     TimestampNanosecondBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, SchemaRef, TimeUnit};
 
 use crate::schema::error::{SchemaError, SchemaResult};
 use crate::schema::traits::{FormatDecoder, FormatEncoder};
@@ -155,7 +155,7 @@ impl CsvDecoder {
     /// Rejects types the current CSV decoder cannot represent without a lossy conversion.
     pub fn validate_schema(schema: &SchemaRef) -> SchemaResult<()> {
         for (field, mut builder) in schema.fields().iter().zip(create_builders(schema, 0)) {
-            if builder.finish().data_type() != field.data_type() {
+            if !narrows_to(builder.finish().data_type(), field.data_type()) {
                 return Err(SchemaError::Incompatible(format!(
                     "CSV reader field '{}' cannot decode {}; use a supported type or another format",
                     field.name(), field.data_type()
@@ -356,15 +356,56 @@ impl CsvDecoder {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
 
-        // Finish all builders into arrays.
-        let columns: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
+        let columns = builders
+            .into_iter()
+            .zip(self.schema.fields().iter())
+            .map(|(mut builder, field)| self.narrow_column(builder.finish(), field))
+            .collect::<SchemaResult<Vec<ArrayRef>>>()?;
 
         RecordBatch::try_new(self.schema.clone(), columns)
             .map_err(|e| SchemaError::DecodeError(format!("RecordBatch construction: {e}")))
     }
+
+    /// Casts a finished column to its declared type. Values outside the declared range
+    /// become nulls and count as parse errors, like values that do not parse.
+    fn narrow_column(&self, column: ArrayRef, field: &Field) -> SchemaResult<ArrayRef> {
+        if column.data_type() == field.data_type() {
+            return Ok(column);
+        }
+        let narrowed = arrow_cast::cast(&column, field.data_type()).map_err(|error| {
+            SchemaError::DecodeError(format!(
+                "CSV column '{}' cannot be read as {}: {error}",
+                field.name(),
+                field.data_type()
+            ))
+        })?;
+        let rejected = narrowed.null_count().saturating_sub(column.null_count());
+        if rejected > 0 {
+            self.parse_error_count.fetch_add(
+                u64::try_from(rejected).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        Ok(narrowed)
+    }
 }
 
 // ── Builder helpers ────────────────────────────────────────────────
+
+/// Builders parse into one wide type per value family; these are the declared types each
+/// can be cast to without changing what a valid value means.
+fn narrows_to(built: &DataType, declared: &DataType) -> bool {
+    built == declared
+        || match (built, declared) {
+            (DataType::Int64, declared) => declared.is_integer(),
+            (DataType::Float64, declared) => declared.is_floating(),
+            (DataType::Timestamp(TimeUnit::Nanosecond, built_tz), DataType::Timestamp(_, tz)) => {
+                built_tz == tz
+            }
+            (DataType::Date32, DataType::Date64) => true,
+            _ => false,
+        }
+}
 
 /// Trait-object wrapper so we can store heterogeneous builders in a `Vec`.
 trait ColumnBuilder: Send {
@@ -418,7 +459,7 @@ fn create_builder(data_type: &DataType, capacity: usize) -> Box<dyn ColumnBuilde
         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
             Box::new(Float64Builder::with_capacity(capacity))
         }
-        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+        DataType::Timestamp(_, tz) => {
             let builder =
                 TimestampNanosecondBuilder::with_capacity(capacity).with_timezone_opt(tz.clone());
             Box::new(builder)
