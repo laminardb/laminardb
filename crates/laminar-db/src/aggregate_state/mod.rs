@@ -23,6 +23,8 @@ use crate::error::DbError;
 use crate::operator::create_cached_physical_plan;
 
 mod accounting;
+#[cfg(feature = "benchmark-internals")]
+pub(crate) mod benchmark;
 mod checkpoints;
 mod compile;
 mod concrete;

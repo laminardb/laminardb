@@ -218,6 +218,11 @@ harness = false
 name = "process_function_bench"
 harness = false
 
+[[bench]]
+name = "aggregate_bench"
+harness = false
+required-features = ["benchmark-internals"]
+
 [[example]]
 name = "fix_local"
 path = "examples/fix_local.rs"

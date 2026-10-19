@@ -132,3 +132,7 @@ harness = false
 name = "shuffle_bench"
 harness = false
 required-features = ["cluster"]
+
+[[bench]]
+name = "routing_bench"
+harness = false
