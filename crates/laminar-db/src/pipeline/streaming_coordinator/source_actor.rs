@@ -288,10 +288,9 @@ impl SourceActorSpawner<'_> {
                         continue;
                     }
                     Ok(false) => {}
-                    Err(_) => {
-                        lifecycle.fault_data_plane();
-                        break;
-                    }
+                    // The coordinator closes the watch to release this task at shutdown; the
+                    // drain before close still acknowledges a commit published just before.
+                    Err(_) => break,
                 }
 
                 let control_deadline = tokio::time::Instant::now() + source_operation_timeout;
@@ -714,6 +713,7 @@ impl SourceActorSpawner<'_> {
                         });
                         break;
                     }
+                    SourcePollOutcome::ShutdownBeforePoll => break,
                     SourcePollOutcome::Shutdown => {
                         lifecycle.cancelled(cancellation_policy);
                         break;
@@ -1132,9 +1132,11 @@ impl SourceActorSpawner<'_> {
 
             if lifecycle.may_poll_or_ack() {
                 // Drain EpochCommitted broadcasts before close so a durable tail settled
-                // during shutdown is acknowledged upstream. The watch retains the newest
-                // value; waiting for another change here would consume the close budget.
-                while matches!(epoch_committed_rx.has_changed(), Ok(true)) {
+                // during shutdown is acknowledged upstream. The coordinator may already have
+                // closed the watch, which makes `has_changed` hide an unseen value, so ask the
+                // retained value instead. Waiting for another change would consume the close
+                // budget.
+                while epoch_committed_rx.borrow().has_changed() {
                     if !acknowledge_latest_source_commit(
                         connector.as_mut(),
                         &mut epoch_committed_rx,

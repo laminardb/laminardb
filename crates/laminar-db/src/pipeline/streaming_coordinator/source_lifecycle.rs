@@ -18,6 +18,8 @@ pub(super) enum SourcePollOutcome {
     Completed(Result<Option<SourceBatch>, ConnectorError>),
     Deadline,
     Shutdown,
+    /// Shutdown was already requested, so the poll never started and nothing was cancelled.
+    ShutdownBeforePoll,
     #[cfg(feature = "cluster")]
     ProcessAuthorityLost,
 }
@@ -261,6 +263,9 @@ pub(super) async fn poll_source_once(
     }
     if tokio::time::Instant::now() >= deadline {
         return SourcePollOutcome::Deadline;
+    }
+    if std::pin::pin!(shutdown.notified()).enable() {
+        return SourcePollOutcome::ShutdownBeforePoll;
     }
     let mut poll = std::pin::pin!(connector.poll_batch(max_records));
     #[cfg(feature = "cluster")]
