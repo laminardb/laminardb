@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 135 127" width="135" height="127">
+  <title>LaminarDB mark</title>
+  <!--
+    Canonical channel mark: a vector reconstruction of the raster reference
+    references/channel-mark-detail.png (handoff v2), not a recovered original.
+    Unit grid: 1 unit = 1.125 px of references/wordmark-check.png.
+    Stroke 14, gap 22. Each channel turns on concentric arcs; outer radii 14, 28, 56.
+  -->
+  <path id="outer" fill="#162C29" d="M0 0H14V71A42 42 0 0 0 56 113H135V127H56A56 56 0 0 1 0 71Z"/>
+  <path id="middle" fill="#2D695E" d="M36 0H50V63A14 14 0 0 0 64 77H135V91H64A28 28 0 0 1 36 63Z"/>
+  <path id="inner" fill="#162C29" d="M72 0H86V41H135V55H86A14 14 0 0 1 72 41Z"/>
+</svg>
