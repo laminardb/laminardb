@@ -170,5 +170,5 @@ on localhost is not meaningful and engine performance is not implied.
 10. **Windows checkpoint paths (v0.33.0 binary):** with a 169-character `file:///` checkpoint
     directory the first checkpoint failed (`os error 3`) and the pipeline stopped (LDB-3024). The
     same pipeline worked from a 55-character directory, where the longest checkpoint file path
-    was 208 characters, so the failure fits the 260-character Windows path limit. Not fixed and
-    not documented.
+    was 208 characters, so the failure fits the 260-character Windows path limit. The docs
+    page's `[checkpoint]` url row now says to keep the path short; the engine is not fixed.

@@ -853,7 +853,7 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td class="field-name">url</td>
             <td class="field-type">String</td>
             <td class="field-default">OS temp/laminardb</td>
-            <td>Checkpoint storage URL: absolute <code>file://</code>, <code>s3://</code>/<code>s3a://</code>, <code>gs://</code>/<code>gcs://</code>, or <code>az://</code>/<code>abfs[s]://</code>/<code>wasb[s]://</code>. R2 and MinIO use <code>s3://</code> with an endpoint option. Single-node <code>at_least_once</code> and <code>exactly_once</code> need a local <code>file://</code> directory; an object-store URL there is rejected with <code>[LDB-0014]</code>. Cluster mode needs an object-store URL. Use an explicit durable location in production.</td>
+            <td>Checkpoint storage URL: absolute <code>file://</code>, <code>s3://</code>/<code>s3a://</code>, <code>gs://</code>/<code>gcs://</code>, or <code>az://</code>/<code>abfs[s]://</code>/<code>wasb[s]://</code>. R2 and MinIO use <code>s3://</code> with an endpoint option. Single-node <code>at_least_once</code> and <code>exactly_once</code> need a local <code>file://</code> directory; an object-store URL there is rejected with <code>[LDB-0014]</code>. Cluster mode needs an object-store URL. Use an explicit durable location in production. On Windows, keep a <code>file://</code> directory's path short (for example <code>file:///C:/laminardb/checkpoints</code>): checkpoint files sit several levels below it, and a path over the 260-character Windows limit stops the pipeline at its first checkpoint.</td>
           </tr>
           <tr>
             <td class="field-name">interval</td>
