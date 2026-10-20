@@ -182,10 +182,15 @@ impl LaminarDB {
         Ok(())
     }
 
+    /// Admit a prepared image for startup: held installation, exact installation or recovery
+    /// authority, and a live catalog whose definitions resolve to the image's target pipeline.
     pub(crate) async fn validate_topology_runtime_image(
         &self,
         image: &mut PreparedTopologyRestore,
     ) -> Result<(), DbError> {
+        if image.recovery_input().is_none() {
+            self.ensure_topology_installation_held()?;
+        }
         if let Some(start) = image.recovery_start.as_ref() {
             if !image.belongs_to_recovery(self, start) {
                 return Err(TopologyError::Fenced.into());
@@ -195,10 +200,18 @@ impl LaminarDB {
                 image.recovery_input().ok_or(TopologyError::Fenced)?,
                 start,
             )
-            .await
+            .await?;
         } else {
-            self.validate_topology_installation(&image.input).await
+            self.validate_topology_installation(&image.input).await?;
         }
+        let identities = self.topology_definition_identities().await?;
+        if self.catalog_manifest_inventory()? != image.input.target().entries
+            || identities.pipeline != image.input.descriptor().target_pipeline
+            || identities.environment_sha256 != image.input.descriptor().environment_sha256
+        {
+            return Err(TopologyError::Fenced.into());
+        }
+        Ok(())
     }
 
     pub(crate) async fn validate_topology_runtime_metadata(

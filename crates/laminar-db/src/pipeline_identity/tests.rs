@@ -1,4 +1,8 @@
 use super::*;
+use crate::exchange_plan::{
+    ChangelogKind, Distribution, InputPort, KeyColumn, PartitionKey, PortExchange, StreamPlan,
+    StreamProperties,
+};
 
 fn canonical_source_digest(
     input_mode: SourceInputMode,
@@ -294,11 +298,22 @@ fn temporal_retention_changes_only_temporal_stream_identity() {
             std::iter::once(registration),
             std::iter::empty::<&TableRegistration>(),
         );
+        let exchange_plan = ExchangePlan::from_streams([(
+            registration.name.clone(),
+            StreamPlan {
+                inputs: std::collections::BTreeMap::new(),
+                output: StreamProperties {
+                    distribution: Distribution::Arbitrary,
+                    changelog: ChangelogKind::AppendOnly,
+                },
+            },
+        )]);
         compute(&PipelineIdentityContext::new(
             &config,
             &catalog,
             &connector_registry,
             registrations,
+            &exchange_plan,
             1,
         ))
         .unwrap()
@@ -311,6 +326,60 @@ fn temporal_retention_changes_only_temporal_stream_identity() {
     assert_eq!(
         identity_for(&ordinary, std::time::Duration::from_secs(60)),
         identity_for(&ordinary, std::time::Duration::from_secs(120))
+    );
+}
+
+#[test]
+fn stream_identity_binds_its_exchange_plan() {
+    let registration = StreamRegistration {
+        name: "per_key".into(),
+        query_sql: "SELECT k, COUNT(*) AS n FROM joined GROUP BY k".into(),
+        emit_clause: None,
+        window_config: None,
+        order_config: None,
+        join_config: None,
+        has_analytic: false,
+        has_frame: false,
+        incremental: false,
+        subscription_output: None,
+        subscription_retention_bytes: 0,
+        catalog_generation: 1,
+        subscription_certificate: None,
+    };
+    let identity_for = |exchange: PortExchange| {
+        let exchange_plan = ExchangePlan::from_streams([(
+            registration.name.clone(),
+            StreamPlan {
+                inputs: [(InputPort::Input("joined".into()), exchange)].into(),
+                output: StreamProperties {
+                    distribution: Distribution::Arbitrary,
+                    changelog: ChangelogKind::RunningState,
+                },
+            },
+        )]);
+        compute(&PipelineIdentityContext::new(
+            &LaminarConfig::default(),
+            &SourceCatalog::new(8, laminar_core::streaming::BackpressureStrategy::Block),
+            &ConnectorRegistry::new(),
+            PipelineRegistrations::new(
+                std::iter::empty::<&SourceRegistration>(),
+                std::iter::empty::<&SinkRegistration>(),
+                std::iter::once(&registration),
+                std::iter::empty::<&TableRegistration>(),
+            ),
+            &exchange_plan,
+            1,
+        ))
+        .unwrap()
+    };
+    let key = PartitionKey(vec![KeyColumn::Column {
+        name: "k".into(),
+        data_type: arrow_schema::DataType::Int64,
+    }]);
+
+    assert_ne!(
+        identity_for(PortExchange::Repartition(key.clone())),
+        identity_for(PortExchange::Colocated(key))
     );
 }
 
@@ -403,6 +472,7 @@ async fn source_primary_key_order_changes_pipeline_identity() {
             &catalog,
             &connector_registry,
             registrations,
+            &ExchangePlan::default(),
             1,
         ))
         .unwrap()

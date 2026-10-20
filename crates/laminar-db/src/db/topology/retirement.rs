@@ -73,7 +73,8 @@ impl LaminarDB {
         self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline)
             .await?;
         if self.catalog_manifest_inventory()? != input.parent().entries
-            || self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline
+            || self.topology_definition_identities().await?.pipeline
+                != input.descriptor().parent_pipeline
         {
             return Err(TopologyError::Fenced.into());
         }

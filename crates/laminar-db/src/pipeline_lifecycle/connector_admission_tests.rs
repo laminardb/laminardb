@@ -875,6 +875,7 @@ async fn cluster_without_checkpoint_config_still_derives_graph_identity() {
                 std::iter::empty(),
                 std::iter::empty(),
             ),
+            &crate::exchange_plan::ExchangePlan::default(),
             RuntimeMode::Cluster,
             db.cluster_checkpoint_object_store(),
             None,

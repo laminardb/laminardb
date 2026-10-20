@@ -1050,7 +1050,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         target_manifest: target.reference().unwrap(),
         parent_pipeline: PipelineIdentity::empty(),
         target_pipeline: PipelineIdentity {
-            canonical_version: 7,
+            canonical_version: 8,
             sha256: "2".repeat(64),
         },
         environment_sha256: "3".repeat(64),

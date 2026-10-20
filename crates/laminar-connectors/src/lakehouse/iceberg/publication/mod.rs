@@ -890,7 +890,7 @@ mod tests {
             first,
             deterministic_idempotency_key(&batch, logical).unwrap()
         );
-        assert_eq!(first.to_string(), "018f0000-0000-7bf4-981a-787a2ee3f5dd");
+        assert_eq!(first.to_string(), "018f0000-0000-7bb6-b0f4-e639c8fa2c80");
         assert_eq!(first.get_version_num(), 7);
         let deployment = uuid::Uuid::parse_str(&batch.namespace.deployment_id).unwrap();
         assert_eq!(&first.as_bytes()[..6], &deployment.as_bytes()[..6]);

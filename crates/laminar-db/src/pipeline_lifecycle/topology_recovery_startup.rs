@@ -76,7 +76,7 @@ impl LaminarDB {
             // Cold catalog bootstrap may replay the committed inventory, but runtime migration
             // never uses bootstrap mutation authority. The following round still owns all actors.
             self.restore_catalog_from_manifest().await?;
-            let identities = self.topology_definition_identities()?;
+            let identities = self.topology_definition_identities().await?;
             if self.catalog_manifest_inventory()? != target.entries
                 || identities.pipeline != descriptor.target_pipeline
                 || identities.environment_sha256 != descriptor.environment_sha256
@@ -93,6 +93,7 @@ impl LaminarDB {
                 )
             };
             let backing = self.validate_startup_durability(RuntimeMode::Cluster)?;
+            let exchange_plan = self.cluster_exchange_plan().await?;
             let _assignment = self.assignment_adoption_lock.lock().await;
             let pipeline = self
                 .initialize_checkpointing(
@@ -102,6 +103,7 @@ impl LaminarDB {
                         streams.values(),
                         tables.values(),
                     ),
+                    &exchange_plan,
                     RuntimeMode::Cluster,
                     backing,
                     Some(&descriptor.deployment_id),

@@ -37,6 +37,13 @@ pub(crate) struct ExchangePlan {
 }
 
 impl ExchangePlan {
+    #[cfg(test)]
+    pub(crate) fn from_streams(streams: impl IntoIterator<Item = (String, StreamPlan)>) -> Self {
+        Self {
+            streams: streams.into_iter().collect(),
+        }
+    }
+
     pub(crate) fn stream(&self, name: &str) -> Option<&StreamPlan> {
         self.streams.get(name)
     }

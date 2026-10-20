@@ -42,7 +42,7 @@ async fn committed_fixture_with_additions(
 #[tokio::test]
 async fn topology_removal_cold_bootstrap_asserts_original_config_without_recreating_objects() {
     for drop_count in 1..=3 {
-        assert_removal_cold_bootstrap(drop_count).await;
+        Box::pin(assert_removal_cold_bootstrap(drop_count)).await;
     }
 }
 

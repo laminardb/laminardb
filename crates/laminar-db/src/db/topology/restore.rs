@@ -340,7 +340,7 @@ impl LaminarDB {
                         "restore requires the exact live parent inventory".into(),
                     ).into());
                 }
-                if !committed && self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline {
+                if !committed && self.topology_definition_identities().await?.pipeline != input.descriptor().parent_pipeline {
                     return Err(TopologyError::Conflict(
                         "live parent differs from the certified restore parent".into(),
                     ).into());
@@ -354,7 +354,7 @@ impl LaminarDB {
                         "restore candidate changed its exact incarnations".into(),
                     ).into());
                 }
-                let identities = candidate.topology_definition_identities()?;
+                let identities = candidate.topology_definition_identities().await?;
                 if identities.pipeline != input.descriptor().target_pipeline
                     || identities.environment_sha256 != input.descriptor().environment_sha256
                 {
@@ -458,7 +458,7 @@ impl LaminarDB {
                 if self.catalog_manifest_inventory()? != local { return Err(TopologyError::Fenced.into()); }
                 if !committed {
                     self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline).await?;
-                    if self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline {
+                    if self.topology_definition_identities().await?.pipeline != input.descriptor().parent_pipeline {
                         return Err(TopologyError::Fenced.into());
                     }
                 }

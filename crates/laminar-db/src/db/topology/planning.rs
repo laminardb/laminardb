@@ -12,6 +12,7 @@ use laminar_core::cluster::control::{
 
 use crate::db::{DbState, LaminarDB, RuntimeMode};
 use crate::error::DbError;
+use crate::exchange_plan::ExchangePlan;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::pipeline_identity::{
     compatibility_digest, compatibility_identities, PipelineCompatibilityIdentities,
@@ -132,7 +133,7 @@ impl LaminarDB {
         if active_inventory != parent.entries {
             return Err(TopologyError::Conflict("local catalog is not the exact committed parent inventory; complete catalog replay before validation".into()).into());
         }
-        let active_identities = self.topology_definition_identities()?;
+        let active_identities = self.topology_definition_identities().await?;
         self.validate_bound_parent_pipeline(&active_identities.pipeline)
             .await?;
         let candidate = self.isolated_topology_catalog()?;
@@ -145,7 +146,7 @@ impl LaminarDB {
             )
             .into());
         }
-        let parent_identities = candidate.topology_definition_identities()?;
+        let parent_identities = candidate.topology_definition_identities().await?;
         if parent_identities != active_identities {
             return Err(TopologyError::Conflict("resolved parent definitions differ from the live catalog; check non-secret environment/config references and connector contracts".into()).into());
         }
@@ -163,7 +164,7 @@ impl LaminarDB {
             &candidate, &parent, statements, &retired,
         )
         .await?;
-        let target_identities = candidate.topology_definition_identities()?;
+        let target_identities = candidate.topology_definition_identities().await?;
         let target_graph = candidate.plan_topology_graph().await?;
         super::catalog_changes::validate_prepared_targets(&candidate, &target)?;
         let objects = describe_catalog(
@@ -183,7 +184,7 @@ impl LaminarDB {
         // No stale response can masquerade as validation against a newer parent. Normal lease
         // renewals/checkpoints do not invalidate a read-only plan; the exact catalog must match.
         if store.topology_state().await? != state
-            || self.topology_definition_identities()? != active_identities
+            || self.topology_definition_identities().await? != active_identities
         {
             return Err(TopologyError::Conflict("parent authority or local definitions changed during validation; retry against the observed parent".into()).into());
         }
@@ -276,9 +277,10 @@ impl LaminarDB {
         Ok(candidate)
     }
 
-    pub(crate) fn topology_definition_identities(
+    pub(crate) async fn topology_definition_identities(
         &self,
     ) -> Result<PipelineCompatibilityIdentities, DbError> {
+        let exchange_plan = self.cluster_exchange_plan().await?;
         let vnode_count = self.checkpoint_key_groups().into();
         let manager = self.connector_manager.lock();
         compatibility_identities(&PipelineIdentityContext::new(
@@ -291,8 +293,39 @@ impl LaminarDB {
                 manager.streams().values(),
                 manager.tables().values(),
             ),
+            &exchange_plan,
             vnode_count,
         ))
+    }
+
+    /// The registered streams' exchange plan exactly as cluster startup resolves it: cluster
+    /// interval admissions and no changelog source.
+    pub(crate) async fn cluster_exchange_plan(&self) -> Result<ExchangePlan, DbError> {
+        let (sources, sinks, streams) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        let interval = self
+            .validate_persisted_interval_source_contracts(
+                &sources,
+                &sinks,
+                &streams,
+                RuntimeMode::Cluster,
+            )
+            .await?;
+        Ok(crate::pipeline_lifecycle::resolve_stream_output_schemas(
+            &self.ctx,
+            &streams,
+            &self.static_table_names(),
+            &interval.joins,
+            &rustc_hash::FxHashSet::default(),
+        )
+        .await?
+        .exchange_plan)
     }
 
     pub(super) async fn validate_bound_parent_pipeline(

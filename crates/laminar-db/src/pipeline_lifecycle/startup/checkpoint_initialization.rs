@@ -45,6 +45,7 @@ impl LaminarDB {
     pub(in crate::pipeline_lifecycle) async fn initialize_checkpointing(
         &self,
         identity_registrations: crate::pipeline_identity::PipelineRegistrations<'_>,
+        exchange_plan: &crate::exchange_plan::ExchangePlan,
         startup_runtime: RuntimeMode,
         injected_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
         expected_deployment: Option<&str>,
@@ -57,6 +58,7 @@ impl LaminarDB {
                     &self.catalog,
                     &self.connector_registry,
                     identity_registrations,
+                    exchange_plan,
                     self.checkpoint_key_groups().get(),
                 );
                 Some(crate::pipeline_identity::compute(&identity_context)?)

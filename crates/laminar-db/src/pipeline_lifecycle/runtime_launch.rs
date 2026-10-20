@@ -7,10 +7,10 @@ use super::{
     CLUSTER_COMPUTE_THREAD_STACK_BYTES,
 };
 use super::{
-    publish_runtime_fault_state, recovered_source_watermark, resolve_stream_output_schemas,
+    publish_runtime_fault_state, recovered_source_watermark,
     runtime_exit_is_covered_by_terminal_stop, spawn_supervised_restart, Arc, DbError, FxHashMap,
     HashMap, LaminarDB, OrderedIntervalAdmissions, PipelineRecoveryState, PipelineRuntimeSetup,
-    PreparedPipelineRuntime, TemporalSourceRole,
+    PreparedPipelineRuntime, ResolvedStreamOutputs, TemporalSourceRole,
 };
 
 impl LaminarDB {
@@ -507,6 +507,7 @@ impl LaminarDB {
         temporal_source_roles: FxHashMap<String, TemporalSourceRole>,
         ordered_interval_admissions: OrderedIntervalAdmissions,
         mutation_routes: super::direct_mutation_routes::MutationRoutes,
+        resolved_stream_outputs: ResolvedStreamOutputs,
         runtime_shutdown: tokio_util::sync::CancellationToken,
         #[cfg(feature = "cluster")] topology: Option<crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
@@ -523,9 +524,6 @@ impl LaminarDB {
         } else {
             None
         };
-
-        self.revalidate_persisted_cluster_query_shapes(&stream_regs)
-            .await?;
 
         let checkpoint_schedule =
             self.config
@@ -551,14 +549,6 @@ impl LaminarDB {
                 std::time::Duration::from_millis,
             );
 
-        let resolved_stream_outputs = resolve_stream_output_schemas(
-            &self.ctx,
-            &stream_regs,
-            &self.static_table_names(),
-            &ordered_interval_admissions.joins,
-            &mutation_routes.changelog,
-        )
-        .await?;
         let stream_output_schemas = &resolved_stream_outputs.schemas;
         self.install_stream_schemas(stream_output_schemas);
 
