@@ -4,6 +4,8 @@
 //! struct wiring. Declared via `#[cfg(test)] mod tests;` in `db.rs`.
 
 use super::*;
+use arrow::array::{Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 
 #[test]
 fn managed_state_budget_default_is_resolved_at_database_construction() {
