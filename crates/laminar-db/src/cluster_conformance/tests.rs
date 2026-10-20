@@ -264,6 +264,23 @@ async fn composite_key_min_max_avg_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn four_remote_exchanges_are_rejected_in_cluster() {
+    let case = case(
+        "four_remote_exchanges",
+        &[
+            "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k EMIT CHANGES",
+            "CREATE STREAM by_n AS SELECT n, COUNT(*) AS keys FROM per_key GROUP BY n EMIT CHANGES",
+            "CREATE STREAM by_keys AS SELECT keys, COUNT(*) AS ns FROM by_n \
+             GROUP BY keys EMIT CHANGES",
+            "CREATE STREAM out AS SELECT ns, COUNT(*) AS c FROM by_keys GROUP BY ns EMIT CHANGES",
+        ],
+        OutputForm::Changelog,
+        None,
+    );
+    assert_rejected(verdict(case).await, "4 remote exchanges");
+}
+
 /// Without `EMIT CHANGES` the upstream re-emits snapshots that a downstream aggregate would
 /// count as new rows; this matched ground truth only when every input landed in one cycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

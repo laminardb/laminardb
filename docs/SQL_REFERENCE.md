@@ -466,7 +466,9 @@ the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `
 aggregates. A cluster window reads a source, or an append-only stream that forwards the source's
 event-time column unchanged; it requires a bounded watermark on that column and `EMIT ON WINDOW
 CLOSE` or `EMIT FINAL`. A named join output may feed a separate keyed aggregate stream;
-fused join-and-aggregate and windowed-join statements remain rejected.
+fused join-and-aggregate and windowed-join statements remain rejected. A stream may sit at most
+three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
+which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
 
 Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
 retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,

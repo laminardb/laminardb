@@ -374,6 +374,9 @@ pub struct EngineMetrics {
     /// Cluster-shuffle pause after local capture while waiting for the global Aligned release.
     /// Embedded and single-node runtimes do not observe this metric.
     pub checkpoint_aligned_resume_wait: Histogram,
+    /// Waves the checkpoint's distributed shuffle flush ran before every participant was idle.
+    /// Embedded and single-node runtimes do not observe this metric.
+    pub checkpoint_shuffle_flush_waves: Histogram,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
     /// On-demand lookup cache hits (served without a source fetch). Label: `table`.
@@ -656,6 +659,14 @@ impl EngineMetrics {
                     "Cluster-shuffle pause waiting for the global Aligned release",
                 )
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
+            )
+            .unwrap()),
+            checkpoint_shuffle_flush_waves: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_shuffle_flush_waves",
+                    "Waves of the checkpoint's distributed shuffle flush",
+                )
+                .buckets(prometheus::linear_buckets(1.0, 1.0, 16).unwrap()),
             )
             .unwrap()),
             // The one attempt deadline defaults to 120s. 0.005 * 2^15 = 163.84s.

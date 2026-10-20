@@ -1136,6 +1136,8 @@ pub(crate) struct OperatorGraph {
     event_time_forwards: FxHashSet<String>,
     #[cfg(feature = "cluster")]
     event_time_roots: Vec<usize>,
+    #[cfg(feature = "cluster")]
+    remote_exchange_depth: u64,
     // One immutable assignment transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
@@ -1205,6 +1207,8 @@ impl OperatorGraph {
             event_time_forwards: FxHashSet::default(),
             #[cfg(feature = "cluster")]
             event_time_roots: Vec::new(),
+            #[cfg(feature = "cluster")]
+            remote_exchange_depth: 0,
             #[cfg(feature = "cluster")]
             pending_vnode_transition: None,
             #[cfg(feature = "cluster")]
@@ -2890,7 +2894,7 @@ impl OperatorGraph {
 
         self.compute_node_domains();
         #[cfg(feature = "cluster")]
-        self.compute_event_time_roots();
+        self.compute_cluster_routing();
 
         self.source_list.clear();
         self.source_list

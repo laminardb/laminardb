@@ -83,6 +83,37 @@ impl ExchangePlan {
             .collect()
     }
 
+    /// Longest chain of remote exchanges from a source to `stream`: one for each stream on the
+    /// chain that reads an input through any port other than `Forward`.
+    pub(crate) fn remote_depth(&self, stream: &str) -> usize {
+        fn depth<'a>(
+            plan: &'a ExchangePlan,
+            stream: &'a str,
+            memo: &mut FxHashMap<&'a str, usize>,
+        ) -> usize {
+            if let Some(&known) = memo.get(stream) {
+                return known;
+            }
+            let Some(stream_plan) = plan.streams.get(stream) else {
+                return 0;
+            };
+            let upstream = stream_plan
+                .inputs
+                .keys()
+                .map(|port| depth(plan, port.upstream(), memo))
+                .max()
+                .unwrap_or(0);
+            let exchanges = stream_plan
+                .inputs
+                .values()
+                .any(|exchange| !matches!(exchange, PortExchange::Forward));
+            let known = upstream + usize::from(exchanges);
+            memo.insert(stream, known);
+            known
+        }
+        depth(self, stream, &mut FxHashMap::default())
+    }
+
     /// What an input port reads from `upstream`: a planned stream's output, otherwise a source,
     /// which is a weighted changelog when `changelog` names it and carries its declared event time.
     pub(crate) fn upstream_properties(

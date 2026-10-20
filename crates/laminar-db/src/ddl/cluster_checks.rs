@@ -30,6 +30,9 @@ pub(super) enum ChangelogInputKind {
     StaticEnrich,
 }
 
+/// Deepest source-to-stream chain of remote exchanges whose cluster checkpoint flush is measured.
+const MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH: usize = 3;
+
 impl LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) fn has_cluster_query_ownership_scope(&self) -> bool {
@@ -290,6 +293,38 @@ impl LaminarDB {
             .and_then(|stream| stream.output.event_time.clone()))
     }
 
+    /// Reject a stream whose pipeline crosses more remote exchanges than cluster checkpoints are
+    /// measured for; every flush wave moves rows one remote hop while sources are held. A stream
+    /// that reads only sources crosses at most one.
+    async fn validate_cluster_exchange_depth(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        if !crate::sql_analysis::extract_table_references(query_sql)
+            .iter()
+            .any(|input| self.catalog.get_stream_entry(input).is_some())
+        {
+            return Ok(());
+        }
+        let resolved = self
+            .resolve_catalog_stream_outputs(Some(plan.candidate_registration(name, query_sql)))
+            .await?;
+        let depth = resolved.exchange_plan.remote_depth(name);
+        if depth > MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH {
+            return Err(Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                &format!(
+                    "its pipeline crosses {depth} remote exchanges from its sources; cluster checkpoints are measured for at most {MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn cluster_state_lifecycle_error(
         object_kind: &str,
         name: &str,
@@ -366,6 +401,8 @@ impl LaminarDB {
             return Ok(false);
         }
         self.validate_cluster_query_shape_before_plan(object_kind, name, query_sql)?;
+        self.validate_cluster_exchange_depth(object_kind, name, query_sql, plan)
+            .await?;
 
         if plan.has_analytic || plan.has_frame {
             return Err(Self::cluster_state_lifecycle_error(

@@ -434,3 +434,39 @@ fn dependency_order_puts_upstreams_first() {
         .collect();
     assert_eq!(order, ["z", "a", "m"]);
 }
+
+#[tokio::test]
+async fn remote_depth_counts_streams_that_exchange_rows() {
+    let db = db(&[
+        EVENTS,
+        ORDERS,
+        PAYMENTS,
+        "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k EMIT CHANGES",
+        "CREATE STREAM by_n AS SELECT n, COUNT(*) AS keys FROM per_key GROUP BY n EMIT CHANGES",
+        "CREATE STREAM projected AS SELECT n, keys FROM by_n",
+        "CREATE STREAM joined AS SELECT o.k AS k, o.v AS ov, p.v AS pv FROM orders o \
+         INNER JOIN payments p ON o.k = p.k \
+         AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+        "CREATE STREAM joined_per_key AS SELECT k, COUNT(*) AS n FROM joined \
+         GROUP BY k EMIT CHANGES",
+    ])
+    .await;
+    let plan = db
+        .resolve_catalog_stream_outputs(None)
+        .await
+        .unwrap()
+        .exchange_plan;
+    let depths: Vec<_> = [
+        "events",
+        "per_key",
+        "by_n",
+        "projected",
+        "joined",
+        "joined_per_key",
+    ]
+    .into_iter()
+    .map(|stream| plan.remote_depth(stream))
+    .collect();
+    // A colocated aggregate still counts: a fallback batch may cross the network.
+    assert_eq!(depths, [0, 1, 2, 2, 1, 2]);
+}

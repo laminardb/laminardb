@@ -7,6 +7,8 @@ mod checkpoint_tail;
 
 #[cfg(feature = "cluster")]
 mod admission;
+#[cfg(feature = "cluster")]
+mod shuffle_flush;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -3211,23 +3213,6 @@ impl ConnectorPipelineCallback {
             .await
     }
 
-    /// Reach a distributed fixed point while every source remains held at the admitted cut.
-    ///
-    /// Each wave first drains local retained work to handoff quiescence, then publishes an ordered
-    /// marker carrying whether that drain did any work. Wave zero is never terminal: it closes
-    /// transport backlog that was not represented by a preceding activity marker. For later
-    /// waves, every participant observes the same sender activity vector, so a completely idle
-    /// vector plus local post-alignment quiescence proves no pre-cut row remains in transit or in
-    /// operator channel state.
-    #[cfg(feature = "cluster")]
-    fn shuffle_flush_attempt_advanced(
-        wave: u64,
-        local_activity: bool,
-        aligned: crate::operator_graph::ShuffleFlushWaveOutcome,
-    ) -> bool {
-        wave != 0 || local_activity || aligned.graph_state_staged
-    }
-
     #[cfg(feature = "cluster")]
     fn log_checkpoint_barrier_phase_completed(
         attempt: CheckpointAttempt,
@@ -3243,101 +3228,6 @@ impl ConnectorPipelineCallback {
             elapsed = ?attempt_started.elapsed(),
             "checkpoint barrier phase completed"
         );
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn flush_cluster_shuffle_until(
-        &mut self,
-        controller: &laminar_core::cluster::control::ClusterController,
-        attempt: CheckpointAttempt,
-        assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
-        deadline: tokio::time::Instant,
-    ) -> Result<ShuffleAlignmentOutcome, DbError> {
-        let flush_started_at = std::time::Instant::now();
-        let mut wave = 0_u64;
-        let mut saw_local_activity = false;
-        let mut saw_peer_activity = false;
-        let mut saw_graph_staging = false;
-        tracing::info!(
-            checkpoint_id = attempt.checkpoint_id,
-            epoch = attempt.epoch,
-            "checkpoint distributed shuffle fixed-point flush started"
-        );
-        loop {
-            let local_activity = self
-                .drain_handoff_edges_until_inner(deadline)
-                .await
-                .map_err(|error| match error {
-                    crate::pipeline::CycleError::Halt(reason) => DbError::PipelineTerminal(
-                        format!("shuffle flush wave {wave} graph drain halted: {reason}"),
-                    ),
-                    crate::pipeline::CycleError::Fatal(reason)
-                    | crate::pipeline::CycleError::Recovery(reason) => DbError::Checkpoint(
-                        format!("shuffle flush wave {wave} graph drain failed: {reason}"),
-                    ),
-                })?;
-            let watermark = self.effective_pipeline_watermark();
-            let aligned = self
-                .graph
-                .align_shuffle_flush_wave(
-                    attempt,
-                    wave,
-                    local_activity,
-                    watermark,
-                    assignment_fence,
-                    deadline,
-                    Some(controller),
-                )
-                .await?;
-            saw_local_activity |= local_activity;
-            saw_peer_activity |= aligned.peer_activity;
-            saw_graph_staging |= aligned.graph_state_staged;
-            tracing::debug!(
-                checkpoint_id = attempt.checkpoint_id,
-                epoch = attempt.epoch,
-                wave,
-                local_activity,
-                peer_activity = aligned.peer_activity,
-                graph_state_staged = aligned.graph_state_staged,
-                elapsed = ?flush_started_at.elapsed(),
-                "checkpoint distributed shuffle fixed-point wave settled"
-            );
-            if aligned.outcome != ShuffleAlignmentOutcome::Aligned {
-                if Self::shuffle_flush_attempt_advanced(wave, local_activity, aligned) {
-                    return Err(DbError::Checkpoint(format!(
-                        "shuffle flush observed {:?} after distributed replay had already advanced; coordinated recovery is required",
-                        aligned.outcome
-                    )));
-                }
-                return Ok(aligned.outcome);
-            }
-            if wave != 0 && !local_activity && !aligned.peer_activity {
-                if aligned.graph_state_staged || !self.graph.handoff_is_quiescent() {
-                    return Err(DbError::Checkpoint(format!(
-                        "shuffle flush wave {wave} received an all-idle activity vector but staged new replay; coordinated recovery is required"
-                    )));
-                }
-                tracing::info!(
-                    checkpoint_id = attempt.checkpoint_id,
-                    epoch = attempt.epoch,
-                    waves = wave + 1,
-                    saw_local_activity,
-                    saw_peer_activity,
-                    saw_graph_staging,
-                    elapsed = ?flush_started_at.elapsed(),
-                    "checkpoint distributed shuffle fixed-point flush completed"
-                );
-                return Ok(ShuffleAlignmentOutcome::Aligned);
-            }
-            wave = wave.checked_add(1).ok_or_else(|| {
-                DbError::Checkpoint("shuffle flush wave counter overflowed u64".into())
-            })?;
-            if wave > laminar_core::checkpoint::barrier::MAX_SHUFFLE_FLUSH_WAVE {
-                return Err(DbError::Checkpoint(
-                    "shuffle flush exhausted its reserved barrier wave field".into(),
-                ));
-            }
-        }
     }
 
     #[cfg(feature = "cluster")]
