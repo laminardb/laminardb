@@ -473,6 +473,8 @@ impl LiveSqlCache {
 }
 
 pub(crate) mod ai_inference;
+#[cfg(feature = "benchmark-internals")]
+pub(crate) mod benchmark;
 pub(crate) mod eowc_query;
 #[cfg(feature = "cluster")]
 pub(crate) mod frontier;

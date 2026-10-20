@@ -138,6 +138,10 @@ pub use aggregate_state::benchmark::AggregateBenchmark;
 
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]
+pub use operator::benchmark::IntervalJoinBenchmark;
+
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
 pub use mv_store::benchmark::{MaterializedViewBenchmark, MaterializedViewBenchmarkMode};
 #[cfg(all(test, feature = "cluster"))]
 mod cluster_conformance;
