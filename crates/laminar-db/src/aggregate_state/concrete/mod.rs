@@ -101,6 +101,38 @@ impl ConcreteAggregateState {
         }
     }
 
+    /// One batch's contribution in `checkpoint_state` form, independent of accumulated values.
+    /// `merge_checkpoint_state` applies it with the same checks `update_batch` makes, so a delta
+    /// may be negative where the state it merges into may not.
+    // PERF: deltas repeat `update_batch` arithmetic; routing `update_batch` through them cost the
+    // keyed update benchmark about 4%.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn batch_delta(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
+        match self {
+            Self::Count(state) => Ok(vec![ScalarValue::Int64(Some(state.batch_delta(values)?))]),
+            Self::Sum(state) => state.batch_delta(values),
+            Self::Avg(state) => state.batch_delta(values),
+            Self::Min(_) => {
+                let value = append_value(values)?;
+                let mut delta = MinAccumulator::try_new(value.data_type())
+                    .map_err(|error| aggregate_error("MIN delta creation", error))?;
+                delta
+                    .update_batch(std::slice::from_ref(value))
+                    .and_then(|()| delta.state())
+                    .map_err(|error| aggregate_error("MIN delta", error))
+            }
+            Self::Max(_) => {
+                let value = append_value(values)?;
+                let mut delta = MaxAccumulator::try_new(value.data_type())
+                    .map_err(|error| aggregate_error("MAX delta creation", error))?;
+                delta
+                    .update_batch(std::slice::from_ref(value))
+                    .and_then(|()| delta.state())
+                    .map_err(|error| aggregate_error("MAX delta", error))
+            }
+        }
+    }
+
     pub(crate) fn evaluate(&mut self) -> Result<ScalarValue, DbError> {
         match self {
             Self::Count(state) => Ok(ScalarValue::Int64(Some(state.count))),
@@ -443,6 +475,67 @@ impl AvgState {
                 self.sum = ScalarValue::Float64(Some(next_sum));
                 *non_null_weight = next_weight;
                 Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl CountState {
+    fn batch_delta(&self, values: &[ArrayRef]) -> Result<i64, DbError> {
+        if self.weighted {
+            let (value, weights) = weighted_values(values)?;
+            weights
+                .values()
+                .iter()
+                .enumerate()
+                .filter(|(row, _)| self.count_star || !value.is_null(*row))
+                .try_fold(0_i64, |total, (_, weight)| total.checked_add(*weight))
+                .ok_or_else(|| DbError::Pipeline("COUNT weight overflow".into()))
+        } else {
+            let value = append_value(values)?;
+            let rows = if self.count_star {
+                value.len()
+            } else {
+                value.len().checked_sub(value.null_count()).ok_or_else(|| {
+                    DbError::Pipeline("COUNT null count exceeds array length".into())
+                })?
+            };
+            i64::try_from(rows)
+                .map_err(|_| DbError::Pipeline("COUNT batch row count exceeds Int64".into()))
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl AvgState {
+    fn batch_delta(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
+        match self.mode {
+            AvgMode::AppendOnly { .. } => {
+                let value = append_value(values)?;
+                require_array_type(value, &self.input_type, "AVG")?;
+                let non_null = value.len().checked_sub(value.null_count()).ok_or_else(|| {
+                    DbError::Pipeline("AVG null count exceeds array length".into())
+                })?;
+                let count = u64::try_from(non_null)
+                    .map_err(|_| DbError::Pipeline("AVG batch count exceeds UInt64".into()))?;
+                Ok(vec![
+                    ScalarValue::UInt64(Some(count)),
+                    sum_array(value, &self.sum.data_type())?,
+                ])
+            }
+            AvgMode::Weighted { .. } => {
+                let (value, weights) = weighted_values(values)?;
+                require_array_type(value, &self.input_type, "weighted AVG")?;
+                let (sum, weight) = weighted_f64_delta(
+                    value.as_primitive::<Float64Type>(),
+                    weights,
+                    "weighted AVG",
+                )?;
+                Ok(vec![
+                    ScalarValue::Float64(Some(sum)),
+                    ScalarValue::Int64(Some(weight)),
+                ])
             }
         }
     }

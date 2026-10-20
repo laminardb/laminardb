@@ -127,9 +127,25 @@ async fn global_aggregate_gathers_to_the_global_vnode() {
         rows(&[
             (
                 "exchange.input.events",
-                "gather to vnode 0 from arbitrary, append-only"
+                "gather partials to vnode 0 from arbitrary, append-only"
             ),
             ("exchange.output", "singleton(vnode 0), weighted changelog"),
+        ])
+    );
+    assert_eq!(
+        exchange(
+            &db,
+            "CREATE STREAM windows AS SELECT tumble(ts, INTERVAL '100' MILLISECOND) AS w, \
+             COUNT(*) AS n FROM events GROUP BY tumble(ts, INTERVAL '100' MILLISECOND) \
+             EMIT ON WINDOW CLOSE"
+        )
+        .await,
+        rows(&[
+            (
+                "exchange.input.events",
+                "gather to vnode 0 from arbitrary, append-only"
+            ),
+            ("exchange.output", "singleton(vnode 0), append-only"),
         ])
     );
 }

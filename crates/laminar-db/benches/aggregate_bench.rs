@@ -4,6 +4,9 @@
 //! `global`: the same aggregates without GROUP BY (singleton vnode).
 //! `cluster_one_node`: the keyed `EMIT CHANGES` aggregate operator on a one-node cluster
 //! assignment, repartitioning every batch or applying it whole on a colocated input.
+//! `global_partial_merge`: one projected batch of the global aggregate on its way to a remote
+//! owner, shipped as rows (`ship_rows`, then `apply_rows` there) or folded into a partial row
+//! (`fold`, then `merge` there).
 //!
 //! Run with: `cargo bench -p laminar-db --features benchmark-internals --bench aggregate_bench`
 
@@ -13,6 +16,8 @@ use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use datafusion::datasource::MemTable;
+use laminar_core::shuffle::route_checkpointed_batch;
+use laminar_core::state::{NodeId, VnodeRegistry, DEFAULT_KEY_GROUP_COUNT};
 use laminar_db::{AggregateBenchmark, ClusterAggregateBenchmark};
 
 const ROWS: usize = 4096;
@@ -103,5 +108,59 @@ fn bench_cluster_routing(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_update, bench_cluster_routing);
+fn bench_global_partial_merge(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let batch = input();
+    let ctx = laminar_sql::create_session_context();
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).unwrap();
+    ctx.register_table("events", Arc::new(table)).unwrap();
+    let sql = "SELECT COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a FROM events";
+    let mut aggregate = rt.block_on(AggregateBenchmark::new(&ctx, sql)).unwrap();
+    let pre_aggregated = aggregate.pre_aggregate(&batch).unwrap();
+    let partial = aggregate
+        .fold_partial(std::slice::from_ref(&pre_aggregated))
+        .unwrap();
+    let vnodes = u32::from(DEFAULT_KEY_GROUP_COUNT.get());
+    let registry = VnodeRegistry::new(vnodes);
+    registry.set_assignment(
+        (0..vnodes)
+            .map(|vnode| NodeId(if vnode == 0 { 2 } else { 1 }))
+            .collect(),
+    );
+    let remote_owner = registry.versioned_snapshot();
+
+    let mut group = c.benchmark_group("agg/global_partial_merge");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("ship_rows", |b| {
+        b.iter(|| {
+            let row_vnodes = vec![0; pre_aggregated.num_rows()];
+            route_checkpointed_batch(&pre_aggregated, &row_vnodes, &remote_owner, NodeId(1))
+                .unwrap()
+        });
+    });
+    group.bench_function("apply_rows", |b| {
+        b.iter(|| aggregate.apply(&pre_aggregated).unwrap());
+    });
+    group.bench_function("fold", |b| {
+        b.iter(|| {
+            aggregate
+                .fold_partial(std::slice::from_ref(&pre_aggregated))
+                .unwrap()
+        });
+    });
+    group.bench_function("merge", |b| {
+        b.iter(|| aggregate.merge_partial(&partial).unwrap());
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_update,
+    bench_cluster_routing,
+    bench_global_partial_merge
+);
 criterion_main!(benches);

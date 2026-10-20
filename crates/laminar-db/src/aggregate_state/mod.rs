@@ -29,6 +29,7 @@ mod checkpoints;
 mod compile;
 mod concrete;
 mod emission;
+mod global;
 mod keys;
 #[cfg(feature = "cluster")]
 mod output_sequence;
@@ -1786,85 +1787,6 @@ impl IncrementalAggState {
                 vnode,
             );
         }
-        Ok(())
-    }
-
-    /// Fast path for global aggregates (no GROUP BY).
-    fn process_batch_no_groups(
-        &mut self,
-        batch: &RecordBatch,
-        watermark_ms: i64,
-    ) -> Result<(), DbError> {
-        let empty_key = global_aggregate_key();
-        let (current_input_weight, is_new) = self
-            .vnode_states
-            .get(0)
-            .and_then(|state| state.groups.get(&empty_key))
-            .map_or((0, true), |entry| (entry.input_weight, false));
-        let input_weight_delta = match Self::validated_input_weights(batch, self.weight_col_idx)? {
-            Some(weights) => weights.values().iter().try_fold(0_i64, |total, weight| {
-                total
-                    .checked_add(*weight)
-                    .ok_or_else(|| DbError::Pipeline("aggregate input weight overflow".into()))
-            })?,
-            None => i64::try_from(batch.num_rows())
-                .map_err(|_| DbError::Pipeline("aggregate row count exceeds Int64".into()))?,
-        };
-        let input_weight = Self::next_group_input_weight(current_input_weight, input_weight_delta)?;
-        #[allow(clippy::cast_possible_truncation)]
-        let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
-        if is_new {
-            let mut entry = GroupEntry::new(self.fresh_concrete_states(), 0, watermark_ms);
-            Self::update_concrete_accumulators(
-                &mut entry.accs,
-                batch,
-                &all_indices,
-                &self.agg_specs,
-                self.weight_col_idx,
-            )?;
-            entry.input_weight = input_weight;
-            entry.last_updated_ms = watermark_ms;
-            entry.refresh_accumulator_usage();
-
-            let vnode_state = self.vnode_states.get_or_insert(0);
-            vnode_state.insert_new_group(empty_key.clone(), entry);
-            if self.emit_changelog {
-                vnode_state.insert_emit_dirty_key(empty_key);
-            }
-            self.vnode_states.increment_resident_groups();
-            self.mark_checkpoint_vnode_dirty(0);
-            return Ok(());
-        }
-
-        let vnode_state = self
-            .vnode_states
-            .get_mut(0)
-            .expect("global aggregate vnode must remain resident");
-        let (update_result, previous_usage, current_usage) = {
-            let entry = vnode_state
-                .groups
-                .get_mut(&empty_key)
-                .expect("global aggregate group must remain resident");
-            let update_result = Self::update_concrete_accumulators(
-                &mut entry.accs,
-                batch,
-                &all_indices,
-                &self.agg_specs,
-                self.weight_col_idx,
-            );
-            if update_result.is_ok() {
-                entry.input_weight = input_weight;
-                entry.last_updated_ms = watermark_ms;
-            }
-            let (previous, current) = entry.refresh_accumulator_usage();
-            (update_result, previous, current)
-        };
-        vnode_state.reconcile_accumulator_usage(previous_usage, current_usage);
-        if update_result.is_ok() && self.emit_changelog {
-            vnode_state.insert_emit_dirty_key(empty_key);
-        }
-        update_result?;
-        self.mark_checkpoint_vnode_dirty(0);
         Ok(())
     }
 

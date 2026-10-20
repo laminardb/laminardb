@@ -288,7 +288,8 @@ fn forwarding(
 }
 
 /// A managed aggregate routes on its group expressions; a window excludes its boundary markers.
-/// Without a key it gathers to the global vnode. A keyed aggregate whose input is already hashed
+/// Without a key it gathers to the global vnode, as partials for an aggregate and as raw rows for
+/// a window. A keyed aggregate whose input is already hashed
 /// on exactly that key is colocated; only the aggregate operator honours that, so windows always
 /// repartition.
 fn keyed_aggregate(
@@ -306,6 +307,7 @@ fn keyed_aggregate(
         (
             PortExchange::Gather {
                 vnode: GLOBAL_VNODE,
+                partial: !window,
             },
             Distribution::Singleton {
                 vnode: GLOBAL_VNODE,

@@ -143,6 +143,39 @@ async fn global_aggregate_is_equal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_float_aggregate_is_equal() {
+    let case = case(
+        "global_float_aggregate",
+        &[
+            "CREATE STREAM out AS SELECT SUM(CAST(v AS DOUBLE) / 7) AS s, \
+           AVG(CAST(v AS DOUBLE) / 7) AS mean FROM events EMIT CHANGES",
+        ],
+        OutputForm::Changelog,
+        Some("SELECT SUM(CAST(v AS DOUBLE) / 7) AS s, AVG(CAST(v AS DOUBLE) / 7) AS mean FROM events"),
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_aggregate_over_changelog_stream_is_equal() {
+    let case = case(
+        "global_aggregate_over_changelog_stream",
+        &[
+            "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k \
+           EMIT CHANGES",
+            "CREATE STREAM out AS SELECT COUNT(*) AS keys, SUM(n) AS total_rows, SUM(s) AS total \
+           FROM per_key EMIT CHANGES",
+        ],
+        OutputForm::Changelog,
+        Some(
+            "SELECT COUNT(*) AS keys, SUM(n) AS total_rows, SUM(s) AS total FROM \
+             (SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k)",
+        ),
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aggregate_over_projection_stream_is_equal() {
     let case = case(
         "aggregate_over_projection_stream",

@@ -71,8 +71,9 @@ pub(crate) enum PortExchange {
     Colocated(PartitionKey),
     /// Rows move to the owner of the vnode of their key.
     Repartition(PartitionKey),
-    /// Rows move to the owner of one vnode.
-    Gather { vnode: u32 },
+    /// Rows move to the owner of one vnode. With `partial`, each other node first folds its rows
+    /// into one partial row per batch (cluster mode; the owner applies its own rows directly).
+    Gather { vnode: u32, partial: bool },
 }
 
 impl fmt::Display for KeyColumn {
@@ -138,7 +139,14 @@ impl fmt::Display for PortExchange {
             Self::Forward => f.write_str("forward"),
             Self::Colocated(key) => write!(f, "colocated on ({key})"),
             Self::Repartition(key) => write!(f, "repartition on ({key})"),
-            Self::Gather { vnode } => write!(f, "gather to vnode {vnode}"),
+            Self::Gather {
+                vnode,
+                partial: true,
+            } => write!(f, "gather partials to vnode {vnode}"),
+            Self::Gather {
+                vnode,
+                partial: false,
+            } => write!(f, "gather to vnode {vnode}"),
         }
     }
 }

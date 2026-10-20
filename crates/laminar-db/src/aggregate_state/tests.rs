@@ -450,6 +450,15 @@ fn sum_pre_agg_batch(names: &[&str], values: &[f64]) -> RecordBatch {
 
 #[cfg(feature = "cluster")]
 async fn setup_weighted_count_state(key_group_count: KeyGroupCount) -> IncrementalAggState {
+    setup_weighted_state(
+        "SELECT name, COUNT(*) AS total FROM events GROUP BY name",
+        key_group_count,
+    )
+    .await
+}
+
+#[cfg(feature = "cluster")]
+async fn setup_weighted_state(sql: &str, key_group_count: KeyGroupCount) -> IncrementalAggState {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -467,15 +476,10 @@ async fn setup_weighted_count_state(key_group_count: KeyGroupCount) -> Increment
     .unwrap();
     let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(table)).unwrap();
-    try_from_sql_for_key_groups(
-        &ctx,
-        "SELECT name, COUNT(*) AS total FROM events GROUP BY name",
-        true,
-        key_group_count,
-    )
-    .await
-    .unwrap()
-    .unwrap()
+    try_from_sql_for_key_groups(&ctx, sql, true, key_group_count)
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 #[cfg(feature = "cluster")]
@@ -933,6 +937,89 @@ async fn new_aggregate_state_is_retained_for_global_batches() {
         .downcast_ref::<arrow::array::Float64Array>()
         .unwrap();
     assert_eq!(totals.value(0), 3.0);
+}
+
+/// A global aggregate's pre-aggregate batch built from its compiled projection: every Float64
+/// column takes `values`, the weight takes `weights`, and other `COUNT(*)` markers are constant.
+#[cfg(feature = "cluster")]
+fn global_pre_aggregate(
+    state: &IncrementalAggState,
+    values: &[Option<f64>],
+    weights: &[i64],
+) -> RecordBatch {
+    let schema = Arc::clone(&state.compiled_projection().unwrap().output_schema);
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| -> ArrayRef {
+            match field.data_type() {
+                DataType::Float64 => Arc::new(arrow::array::Float64Array::from(values.to_vec())),
+                DataType::Boolean => {
+                    Arc::new(arrow::array::BooleanArray::from(vec![true; values.len()]))
+                }
+                DataType::Int64 if field.name() == WEIGHT_COLUMN => {
+                    Arc::new(arrow::array::Int64Array::from(weights.to_vec()))
+                }
+                DataType::Int64 => Arc::new(arrow::array::Int64Array::from(vec![1; values.len()])),
+                other => panic!("unexpected pre-aggregate column {other:?}"),
+            }
+        })
+        .collect();
+    RecordBatch::try_new(schema, columns).unwrap()
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn global_partials_merge_exactly_like_their_batches() {
+    let sql = "SELECT COUNT(*) AS n, COUNT(value) AS present, SUM(value) AS s, \
+               AVG(value) AS mean, MIN(value) AS lo, MAX(value) AS hi FROM events";
+    let (_, mut direct) = setup_agg_state_with_changelog(sql, true).await;
+    let (_, folder) = setup_agg_state_with_changelog(sql, true).await;
+    let (_, mut merged) = setup_agg_state_with_changelog(sql, true).await;
+    let batches = [
+        global_pre_aggregate(&direct, &[Some(1.5), None, Some(-4.0)], &[]),
+        global_pre_aggregate(&direct, &[Some(0.1)], &[]),
+    ];
+    for batch in &batches {
+        direct.process_batch(batch, 10).unwrap();
+    }
+    let partial = folder.global_partial_batch(&batches).unwrap();
+    assert_eq!(partial.num_rows(), batches.len());
+    assert_eq!(partial.schema(), folder.global_partial_schema().unwrap());
+    merged.merge_global_partials(&partial, 10).unwrap();
+
+    assert_eq!(checkpoint_bytes(&mut merged), checkpoint_bytes(&mut direct));
+    assert_eq!(merged.emit().unwrap(), direct.emit().unwrap());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn weighted_global_partials_may_be_negative_but_their_merge_may_not() {
+    let sql = "SELECT COUNT(*) AS n, SUM(value) AS s, AVG(value) AS mean FROM events";
+    let key_groups = laminar_core::state::DEFAULT_KEY_GROUP_COUNT;
+    let mut direct = setup_weighted_state(sql, key_groups).await;
+    let folder = setup_weighted_state(sql, key_groups).await;
+    let mut merged = setup_weighted_state(sql, key_groups).await;
+    let insert = global_pre_aggregate(&direct, &[Some(1.0), Some(2.0), Some(3.0)], &[1, 1, 1]);
+    let retract = global_pre_aggregate(&direct, &[Some(2.0)], &[-1]);
+    let retraction = folder
+        .global_partial_batch(std::slice::from_ref(&retract))
+        .unwrap();
+
+    let mut early_direct = setup_weighted_state(sql, key_groups).await;
+    let mut early_merged = setup_weighted_state(sql, key_groups).await;
+    assert!(early_direct.process_batch(&retract, 10).is_err());
+    assert!(early_merged.merge_global_partials(&retraction, 10).is_err());
+
+    direct.process_batch(&insert, 10).unwrap();
+    direct.process_batch(&retract, 10).unwrap();
+    merged
+        .merge_global_partials(&folder.global_partial_batch(&[insert]).unwrap(), 10)
+        .unwrap();
+    merged.merge_global_partials(&retraction, 10).unwrap();
+
+    assert_eq!(checkpoint_bytes(&mut merged), checkpoint_bytes(&mut direct));
+    assert_eq!(merged.emit().unwrap(), direct.emit().unwrap());
 }
 
 fn capture_all_vnodes(

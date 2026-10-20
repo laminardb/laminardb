@@ -1656,28 +1656,6 @@ impl SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn expected_pre_aggregate_schema(&self) -> Result<arrow::datatypes::SchemaRef, DbError> {
-        let QueryState::Agg(aggregate) = &self.state else {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' received shuffle data before initialization",
-                self.op_name
-            )));
-        };
-        if let Some(projection) = aggregate.compiled_projection() {
-            return Ok(Arc::clone(&projection.output_schema));
-        }
-        aggregate.cached_pre_agg_physical().map_or_else(
-            || {
-                Err(DbError::Pipeline(format!(
-                    "aggregate '{}' has no pre-aggregate schema",
-                    self.op_name
-                )))
-            },
-            |physical| Ok(physical.schema()),
-        )
-    }
-
-    #[cfg(feature = "cluster")]
     fn build_queued_batch(
         &self,
         retained: crate::operator::RetainedBatch,
@@ -1717,9 +1695,9 @@ impl SqlQueryOperator {
                 self.op_name
             )));
         }
-        if batch.schema().as_ref() != self.expected_pre_aggregate_schema()?.as_ref() {
+        if batch.schema().as_ref() != self.expected_shuffle_schema()?.as_ref() {
             return Err(DbError::ShuffleTerminal(format!(
-                "aggregate '{}' shuffle schema does not match its pre-aggregate schema",
+                "aggregate '{}' shuffle schema does not match its expected schema",
                 self.op_name
             )));
         }
@@ -1965,7 +1943,7 @@ impl SqlQueryOperator {
         let output = if local_batches.is_empty() {
             Vec::new()
         } else {
-            self.apply_routed_aggregate(&local_batches, Self::frontier_watermark(effective))
+            self.apply_remote_aggregate(&local_batches, Self::frontier_watermark(effective))
                 .map_err(|error| self.remote_replay_error(error))?
         };
         let released = event.payload_bytes();

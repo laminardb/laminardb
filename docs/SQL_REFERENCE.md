@@ -588,7 +588,9 @@ EXPLAIN CREATE STREAM per_symbol AS
 
 An input is `forward` (rows stay where they are), `repartition on (...)` (rows move to the
 owner of their key), `colocated on (...)` (an aggregate whose input is already hashed on its
-group key, so no rows move), or `gather to vnode N` (a global aggregate). Join inputs are named
+group key, so no rows move), `gather partials to vnode N` (a global aggregate: in cluster mode
+each other node sends one partial row per input batch instead of its rows), or `gather to vnode N`
+(a window without a group key). Join inputs are named
 `left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
 `arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
 (an aggregate without `EMIT CHANGES`).

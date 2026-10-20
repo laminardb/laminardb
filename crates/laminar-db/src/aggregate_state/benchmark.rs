@@ -33,13 +33,46 @@ impl AggregateBenchmark {
     /// # Errors
     /// Returns projection or accumulator errors.
     pub fn update(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
-        let projection = self
-            .0
-            .compiled_projection()
-            .ok_or_else(|| DbError::Pipeline("compiled pre-aggregation missing".into()))?;
-        let pre_aggregated = projection.evaluate(batch)?;
+        let pre_aggregated = self.pre_aggregate(batch)?;
+        self.apply(&pre_aggregated)
+    }
+
+    /// Project one raw input batch through the compiled pre-aggregation.
+    ///
+    /// # Errors
+    /// Returns projection errors.
+    pub fn pre_aggregate(&self, batch: &RecordBatch) -> Result<RecordBatch, DbError> {
         self.0
-            .process_batch_for_vnode(&pre_aggregated, i64::MIN, None)
+            .compiled_projection()
+            .ok_or_else(|| DbError::Pipeline("compiled pre-aggregation missing".into()))?
+            .evaluate(batch)
+    }
+
+    /// Fold a projected batch into the accumulators, as the global owner does with rows a peer
+    /// shuffled to it.
+    ///
+    /// # Errors
+    /// Returns accumulator errors.
+    pub fn apply(&mut self, pre_aggregated: &RecordBatch) -> Result<(), DbError> {
+        self.0
+            .process_batch_for_vnode(pre_aggregated, i64::MIN, None)
+    }
+
+    /// Fold projected batches into one partial row each, as a node that does not own the global
+    /// vnode does before sending.
+    ///
+    /// # Errors
+    /// Returns accumulator errors.
+    pub fn fold_partial(&self, pre_aggregated: &[RecordBatch]) -> Result<RecordBatch, DbError> {
+        self.0.global_partial_batch(pre_aggregated)
+    }
+
+    /// Merge a peer's partial rows, as the global owner does.
+    ///
+    /// # Errors
+    /// Returns accumulator errors.
+    pub fn merge_partial(&mut self, partial: &RecordBatch) -> Result<(), DbError> {
+        self.0.merge_global_partials(partial, i64::MIN)
     }
 
     /// Emit the running state, as one cycle's default emission does.
