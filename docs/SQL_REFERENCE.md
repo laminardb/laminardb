@@ -738,7 +738,9 @@ advance watermarks for bounded state cleanup and for outer or anti unmatched-row
 Without an `EMIT` clause, an aggregate stream re-emits each updated group on every cycle and never
 retracts the earlier value. A downstream aggregate, window or join would count every one of those
 snapshots, so `CREATE STREAM` and `CREATE MATERIALIZED VIEW` reject that input. This applies
-whether the consumer reads the aggregate stream directly or through projection/filter streams.
+whether the consumer reads the aggregate stream directly or through projection/filter streams,
+including one declared with `EMIT CHANGES`: an emit clause changes what an aggregate emits, while a
+projection forwards whatever its input emits.
 
 ```sql
 -- WRONG: rejected, per_key re-emits running state

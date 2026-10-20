@@ -76,18 +76,21 @@ impl LaminarDB {
         let Some((incremental, emit_clause, query_sql)) = registration else {
             return UpstreamEmission::Consumable;
         };
-        let emits_changelog_or_closed_windows = incremental
-            || matches!(
-                emit_clause,
-                Some(EmitClause::Changes | EmitClause::OnWindowClose | EmitClause::Final)
-            );
-        if emits_changelog_or_closed_windows {
+        if incremental {
             return UpstreamEmission::Consumable;
         }
-        if self.query_aggregates(&query_sql).await {
-            UpstreamEmission::RunningState
-        } else {
-            UpstreamEmission::Forwarding(query_sql)
+        // An emit clause changes only what an aggregate emits; a projection forwards its input.
+        let emits_changelog_or_closed_windows = matches!(
+            emit_clause,
+            Some(EmitClause::Changes | EmitClause::OnWindowClose | EmitClause::Final)
+        );
+        match (
+            self.query_aggregates(&query_sql).await,
+            emits_changelog_or_closed_windows,
+        ) {
+            (true, true) => UpstreamEmission::Consumable,
+            (true, false) => UpstreamEmission::RunningState,
+            (false, _) => UpstreamEmission::Forwarding(query_sql),
         }
     }
 
@@ -101,6 +104,7 @@ impl LaminarDB {
 
 #[cfg(test)]
 mod tests {
+    use crate::exchange_plan::ChangelogKind;
     use crate::LaminarDB;
 
     async fn db_with_running_state_upstream() -> std::sync::Arc<LaminarDB> {
@@ -136,6 +140,54 @@ mod tests {
             assert!(
                 error.contains("'per_key', a running-state aggregate"),
                 "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_changes_projection_forwards_running_state() {
+        let db = db_with_running_state_upstream().await;
+        db.execute("CREATE STREAM relabeled AS SELECT k, n FROM per_key EMIT CHANGES")
+            .await
+            .unwrap();
+        let error = db
+            .execute(
+                "CREATE STREAM over_relabeled AS SELECT n, COUNT(*) AS keys FROM relabeled \
+                 GROUP BY n",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("'per_key', a running-state aggregate"),
+            "{error}"
+        );
+    }
+
+    /// The exchange plan derives the same rule; EXPLAIN and identity read it.
+    #[tokio::test]
+    async fn exchange_plan_marks_the_same_streams_running_state() {
+        let db = db_with_running_state_upstream().await;
+        db.execute("CREATE STREAM relabeled AS SELECT k, n FROM per_key EMIT CHANGES")
+            .await
+            .unwrap();
+        let resolved = db.resolve_catalog_stream_outputs(None).await.unwrap();
+        for (stream, running_state) in [
+            ("per_key", true),
+            ("forwarded", true),
+            ("relabeled", true),
+            ("changes", false),
+        ] {
+            let changelog = resolved
+                .exchange_plan
+                .stream(stream)
+                .unwrap()
+                .output
+                .changelog;
+            assert_eq!(
+                changelog == ChangelogKind::RunningState,
+                running_state,
+                "{stream}: {changelog:?}"
             );
         }
     }
