@@ -44,6 +44,7 @@ pub(crate) use join::{
 pub(crate) use lookup::{compute_lookup_projection, detect_lookup_enrich_query};
 pub(crate) use plan::{
     apply_topk_filter, extract_projection_filter, planned_functions_are_immutable,
+    ProjectionFilterInfo,
 };
 pub(crate) use table_refs::{extract_table_references, single_source_table};
 pub(crate) use temporal::{

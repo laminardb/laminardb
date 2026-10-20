@@ -423,7 +423,7 @@ fn handoff_quiescence_includes_checkpoint_aligned_replay() {
             checkpoint_drain: Arc::clone(&drain_pending),
         }),
     );
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
 
     assert!(graph.checkpoint_is_quiescent());
     assert!(!graph.handoff_is_quiescent());
@@ -484,7 +484,7 @@ async fn snapshotable_operator_work_keeps_idle_cycles_live() {
         Box::new(BoundedDrainProbe(Arc::clone(&remaining))),
     );
     graph.set_query_budget_ns(0);
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
 
     assert!(graph.has_deferred_work());
     assert!(graph.checkpoint_is_quiescent());
@@ -3122,7 +3122,7 @@ async fn source_views_share_payloads_but_hide_positions_from_ordinary_queries() 
     drop(ordinary_batches);
     drop(positioned_batches);
     graph.set_shared_source_isolation(true, usize::MAX);
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
     assert_ne!(
         graph.node_domain[ordinary_node],
         graph.node_domain[positioned_node]
@@ -3436,7 +3436,7 @@ fn test_topo_order() {
         false,
     );
 
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
 
     // Find positions in topo order
     let q1_pos = graph
@@ -4860,7 +4860,7 @@ fn test_node_domains_disjoint_queries_separate() {
         None,
         false,
     );
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
 
     assert_eq!(
         graph.domain_count, 2,
@@ -4893,7 +4893,7 @@ fn test_node_domains_shared_source_joined() {
         None,
         false,
     );
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
 
     assert_eq!(
         graph.domain_count, 1,
@@ -4924,7 +4924,7 @@ fn test_node_domains_shared_source_isolated() {
         None,
         false,
     );
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
 
     assert_eq!(
         graph.domain_count, 2,
@@ -6471,7 +6471,7 @@ fn output_admission_rejects_near_full_fanout_before_any_publication() {
     graph.add_edge(producer, first, 0);
     graph.add_edge(producer, second, 0);
     graph.output_map.insert(Arc::from("producer"), producer);
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
     let batch = test_batch();
     let bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
     graph.set_max_input_buf_bytes(Some(bytes * 2 - 1));
@@ -6773,7 +6773,7 @@ async fn graph_empty_port_clears_another_branches_accepted_provider_input() {
         );
     }
     graph.take_build_errors().unwrap();
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
     let first = graph.output_map["first"];
     let second = graph.output_map["second"];
     let right = graph.source_map["right_input"];
@@ -7304,7 +7304,7 @@ async fn interval_aggregate_admission_graph(
         graph.output_map.insert(Arc::from(name.as_str()), consumer);
         consumers.push(consumer);
     }
-    graph.compute_topo_order();
+    graph.compute_topo_order().unwrap();
     (
         graph.initialize_managed_state().await.unwrap(),
         producer,

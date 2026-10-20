@@ -95,6 +95,7 @@ pub mod api;
 mod ddl;
 mod direct_mutation;
 mod error;
+mod exchange_plan;
 mod filter_compile;
 mod handle;
 mod interval_join;

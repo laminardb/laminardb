@@ -2820,7 +2820,7 @@ impl OperatorGraph {
         self.nodes.len()
     }
 
-    fn compute_topo_order(&mut self) {
+    fn compute_topo_order(&mut self) -> Result<(), DbError> {
         let n = self.nodes.len();
         let mut in_degree = vec![0usize; n];
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -2862,21 +2862,14 @@ impl OperatorGraph {
             }
         }
 
-        // Cycle detected: fall back to insertion order for remaining nodes.
+        // Catalog planning rejects stream cycles before a graph is built, so a cycle here is a
+        // broken graph invariant.
         let active_count = self.nodes.iter().filter(|n| !n.removed).count();
         if self.topo_order.len() < active_count {
-            tracing::warn!(
-                ordered = self.topo_order.len(),
-                total = active_count,
-                "circular dependency in operator graph, \
-                 falling back to insertion order for remaining nodes"
-            );
-            let in_order: FxHashSet<usize> = self.topo_order.iter().copied().collect();
-            for i in 0..n {
-                if !in_order.contains(&i) && !self.nodes[i].removed {
-                    self.topo_order.push(i);
-                }
-            }
+            return Err(DbError::PipelineTerminal(format!(
+                "operator graph has a cycle: {} of {active_count} nodes cannot be ordered",
+                active_count - self.topo_order.len()
+            )));
         }
 
         self.compute_node_domains();
@@ -2904,6 +2897,7 @@ impl OperatorGraph {
             .extend(self.output_map.values().copied());
 
         self.topo_dirty = false;
+        Ok(())
     }
 
     /// Partition into failure domains (connected components) via union-find over undirected
@@ -3380,7 +3374,7 @@ impl OperatorGraph {
         }
 
         if self.topo_dirty {
-            self.compute_topo_order();
+            self.compute_topo_order()?;
         }
 
         #[cfg(feature = "cluster")]

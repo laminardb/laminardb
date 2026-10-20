@@ -574,6 +574,24 @@ SHOW CREATE SOURCE trades;
 SHOW CREATE SINK my_sink;
 ```
 
+### EXPLAIN
+
+`EXPLAIN CREATE STREAM` also reports how each input reaches the stream and what the stream
+provides downstream, without creating it:
+
+```sql
+EXPLAIN CREATE STREAM per_symbol AS
+  SELECT symbol, COUNT(*) AS n FROM trades GROUP BY symbol EMIT CHANGES;
+-- exchange.input.trades  repartition on (symbol Utf8) from arbitrary, append-only
+-- exchange.output        hash(symbol Utf8), weighted changelog
+```
+
+An input is `forward` (rows stay where they are), `repartition on (...)` (rows move to the
+owner of their key), or `gather to vnode N` (a global aggregate). Join inputs are named
+`left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
+`arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
+(an aggregate without `EMIT CHANGES`).
+
 ### EXPLAIN ANALYZE
 
 Execute a query and report execution metrics:

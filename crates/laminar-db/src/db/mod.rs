@@ -4499,7 +4499,7 @@ impl LaminarDB {
                 if *analyze {
                     self.handle_explain_analyze(statement, sql).await
                 } else {
-                    self.handle_explain(statement)
+                    self.handle_explain(statement).await
                 }
             }
             StreamingStatement::CreateMaterializedView {

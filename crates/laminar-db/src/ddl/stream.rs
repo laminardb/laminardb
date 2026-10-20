@@ -76,7 +76,7 @@ pub(crate) struct PlannedStreamingQuery {
 }
 
 impl PlannedStreamingQuery {
-    pub(super) fn candidate_registration(
+    pub(crate) fn candidate_registration(
         &self,
         name: &str,
         query_sql: &str,
@@ -415,7 +415,44 @@ impl LaminarDB {
         reservation.commit();
         Ok(())
     }
-    pub(super) async fn plan_streaming_query(
+    /// Resolve every registered stream's output, plus `candidate` when given, against the
+    /// current catalog.
+    pub(crate) async fn resolve_catalog_stream_outputs(
+        &self,
+        candidate: Option<crate::connector_manager::StreamRegistration>,
+    ) -> Result<crate::pipeline_lifecycle::ResolvedStreamOutputs, DbError> {
+        let (source_regs, sink_regs, mut stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        let ordered = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                self.runtime_mode(),
+            )
+            .await?;
+        let changelog_sources =
+            self.validate_changelog_source_routes(&source_regs, &ordered, self.runtime_mode())?;
+        if let Some(candidate) = candidate {
+            stream_regs.insert(candidate.name.clone(), candidate);
+        }
+        crate::pipeline_lifecycle::resolve_stream_output_schemas(
+            &self.ctx,
+            &stream_regs,
+            &self.static_table_names(),
+            &ordered.joins,
+            &changelog_sources,
+        )
+        .await
+    }
+
+    pub(crate) async fn plan_streaming_query(
         &self,
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
@@ -423,37 +460,11 @@ impl LaminarDB {
         query_sql: &str,
     ) -> Result<PlannedStreamingQuery, DbError> {
         let admission = if crate::sql_analysis::has_join_clause(query_sql) {
-            let (source_regs, sink_regs, stream_regs) = {
-                let manager = self.connector_manager.lock();
-                (
-                    manager.sources().clone(),
-                    manager.sinks().clone(),
-                    manager.streams().clone(),
-                )
-            };
-            let ordered = self
-                .validate_persisted_interval_source_contracts(
-                    &source_regs,
-                    &sink_regs,
-                    &stream_regs,
-                    self.runtime_mode(),
-                )
-                .await?;
-            let static_tables = self.static_table_names();
-            let changelog_sources =
-                self.validate_changelog_source_routes(&source_regs, &ordered, self.runtime_mode())?;
-            let current = crate::pipeline_lifecycle::resolve_stream_output_schemas(
-                &self.ctx,
-                &stream_regs,
-                &static_tables,
-                &ordered.joins,
-                &changelog_sources,
-            )
-            .await?;
+            let current = self.resolve_catalog_stream_outputs(None).await?;
             if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
                 &current.changelog_carrying,
-                &static_tables,
+                &self.static_table_names(),
             ) {
                 Some(
                     laminar_sql::planner::ChangelogEnrichAdmission::try_new(

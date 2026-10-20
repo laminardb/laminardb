@@ -1,5 +1,5 @@
-//! `EXPLAIN [ANALYZE]`: planner metadata and optional execution metrics, as
-//! `plan_key`/`plan_value` rows.
+//! `EXPLAIN [ANALYZE]`: planner metadata, the exchange plan of a `CREATE STREAM`, and optional
+//! execution metrics, as `plan_key`/`plan_value` rows.
 
 use std::sync::Arc;
 
@@ -13,11 +13,13 @@ use crate::error::DbError;
 use crate::handle::ExecuteResult;
 
 impl LaminarDB {
-    pub(super) fn handle_explain(
+    pub(super) async fn handle_explain(
         &self,
         statement: &StreamingStatement,
     ) -> Result<ExecuteResult, DbError> {
-        metadata(&self.planner_rows(statement), "explain metadata")
+        let mut rows = self.planner_rows(statement);
+        rows.extend(self.exchange_rows(statement).await);
+        metadata(&rows, "explain metadata")
     }
 
     pub(super) async fn handle_explain_analyze(
@@ -25,7 +27,7 @@ impl LaminarDB {
         statement: &StreamingStatement,
         original_sql: &str,
     ) -> Result<ExecuteResult, DbError> {
-        let explain_result = self.handle_explain(statement)?;
+        let explain_result = self.handle_explain(statement).await?;
         let mut rows: Vec<(String, String)> = Vec::new();
 
         if let ExecuteResult::Metadata(explain_batch) = &explain_result {
@@ -142,6 +144,54 @@ impl LaminarDB {
             }
         }
         rows
+    }
+
+    /// One `exchange.input.<port>` row per input port and one `exchange.output` row, derived
+    /// against the current catalog exactly as admission would derive the stream.
+    async fn exchange_rows(&self, statement: &StreamingStatement) -> Vec<(String, String)> {
+        let StreamingStatement::CreateStream {
+            name,
+            query,
+            emit_clause,
+            query_sql,
+            ..
+        } = statement
+        else {
+            return Vec::new();
+        };
+        let result = async {
+            let stream = super::canonical_object_name(name)?;
+            let planned = self
+                .plan_streaming_query(name, query, emit_clause.clone(), query_sql)
+                .await?;
+            let resolved = self
+                .resolve_catalog_stream_outputs(Some(
+                    planned.candidate_registration(&stream, query_sql),
+                ))
+                .await?;
+            let plan = resolved
+                .exchange_plan
+                .stream(&stream)
+                .ok_or_else(|| DbError::Pipeline(format!("stream '{stream}' was not planned")))?;
+            let mut rows: Vec<(String, String)> = plan
+                .inputs
+                .iter()
+                .map(|(port, exchange)| {
+                    let upstream = resolved
+                        .exchange_plan
+                        .upstream_properties(port.upstream(), &resolved.changelog_carrying);
+                    (
+                        format!("exchange.input.{port}"),
+                        format!("{exchange} from {upstream}"),
+                    )
+                })
+                .collect();
+            rows.push(("exchange.output".into(), plan.output.to_string()));
+            Ok::<_, DbError>(rows)
+        };
+        result
+            .await
+            .unwrap_or_else(|error| vec![("exchange_error".into(), error.to_string())])
     }
 }
 
