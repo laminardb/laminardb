@@ -99,6 +99,7 @@ impl LaminarDB {
             &self.static_table_names(),
             &interval.joins,
             &rustc_hash::FxHashSet::default(),
+            &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await?;
         for registration in self.connector_manager.lock().process_functions().values() {
@@ -198,8 +199,7 @@ impl LaminarDB {
             self.build_topology_restore_operator_graph(
                 &streams,
                 &tables,
-                &resolved.changelog_carrying,
-                &resolved.exchange_plan,
+                &resolved,
                 &interval.joins,
                 &input.descriptor().target_pipeline,
                 scope,
@@ -208,20 +208,13 @@ impl LaminarDB {
             self.build_connector_operator_graph(
                 &streams,
                 &tables,
-                &resolved.changelog_carrying,
-                &resolved.exchange_plan,
+                &resolved,
                 &interval.joins,
                 None,
             )?
         };
-        self.initialize_topology_graph(
-            graph,
-            &resolved.schemas,
-            schemas,
-            connector_sha256,
-            source_input_modes,
-        )
-        .await
+        self.initialize_topology_graph(graph, schemas, connector_sha256, source_input_modes)
+            .await
     }
 
     async fn plan_topology_sinks(
@@ -320,14 +313,10 @@ impl LaminarDB {
     async fn initialize_topology_graph(
         &self,
         mut graph: crate::operator_graph::OperatorGraph,
-        stream_schemas: &std::collections::HashMap<String, arrow_schema::SchemaRef>,
         schemas: BTreeMap<String, arrow_schema::SchemaRef>,
         connector_sha256: BTreeMap<String, String>,
         source_input_modes: BTreeMap<String, SourceInputMode>,
     ) -> Result<(PlannedTopologyGraph, crate::operator_graph::OperatorGraph), DbError> {
-        for (name, schema) in stream_schemas {
-            graph.register_intermediate_schema(name, schema);
-        }
         let budget = self
             .config
             .pipeline_max_managed_state_bytes

@@ -61,7 +61,7 @@ async fn keyed_aggregate_repartitions_and_projections_keep_or_lose_its_key() {
         rows(&[
             (
                 "exchange.input.events",
-                "repartition on (k Int64) from arbitrary, append-only"
+                "repartition on (k Int64) from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "hash(k Int64), running state"),
         ])
@@ -127,7 +127,7 @@ async fn global_aggregate_gathers_to_the_global_vnode() {
         rows(&[
             (
                 "exchange.input.events",
-                "gather partials to vnode 0 from arbitrary, append-only"
+                "gather partials to vnode 0 from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "singleton(vnode 0), weighted changelog"),
         ])
@@ -143,7 +143,7 @@ async fn global_aggregate_gathers_to_the_global_vnode() {
         rows(&[
             (
                 "exchange.input.events",
-                "gather to vnode 0 from arbitrary, append-only"
+                "gather to vnode 0 from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "singleton(vnode 0), append-only"),
         ])
@@ -162,7 +162,7 @@ async fn computed_group_key_and_window_markers() {
         rows(&[
             (
                 "exchange.input.events",
-                "repartition on ((events.k % Int64(4)) Int64) from arbitrary, append-only"
+                "repartition on ((events.k % Int64(4)) Int64) from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "hash(g Int64), running state"),
         ])
@@ -178,7 +178,7 @@ async fn computed_group_key_and_window_markers() {
         rows(&[
             (
                 "exchange.input.events",
-                "repartition on (k Int64) from arbitrary, append-only"
+                "repartition on (k Int64) from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "hash(k Int64), append-only"),
         ])
@@ -199,11 +199,11 @@ async fn interval_join_repartitions_each_side_and_union_forwards() {
         rows(&[
             (
                 "exchange.input.left:orders",
-                "repartition on (k Int64) from arbitrary, append-only"
+                "repartition on (k Int64) from arbitrary, append-only, event time ts"
             ),
             (
                 "exchange.input.right:payments",
-                "repartition on (k Int64) from arbitrary, append-only"
+                "repartition on (k Int64) from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "hash(k Int64), append-only"),
         ])
@@ -217,11 +217,11 @@ async fn interval_join_repartitions_each_side_and_union_forwards() {
         rows(&[
             (
                 "exchange.input.orders",
-                "forward from arbitrary, append-only"
+                "forward from arbitrary, append-only, event time ts"
             ),
             (
                 "exchange.input.payments",
-                "forward from arbitrary, append-only"
+                "forward from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "arbitrary, append-only"),
         ])
@@ -345,7 +345,7 @@ async fn lookup_join_forwards_the_stream_and_gives_the_table_no_port() {
         rows(&[
             (
                 "exchange.input.orders",
-                "forward from arbitrary, append-only"
+                "forward from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "arbitrary, append-only"),
         ])
@@ -369,7 +369,7 @@ async fn sql_reference_example() {
         rows(&[
             (
                 "exchange.input.trades",
-                "repartition on (symbol Utf8) from arbitrary, append-only"
+                "repartition on (symbol Utf8) from arbitrary, append-only, event time ts"
             ),
             ("exchange.output", "hash(symbol Utf8), weighted changelog"),
         ])

@@ -2617,6 +2617,7 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
             &Default::default(),
             &Default::default(),
             &Default::default(),
+            &Default::default(),
         )
         .await?;
         Ok(())

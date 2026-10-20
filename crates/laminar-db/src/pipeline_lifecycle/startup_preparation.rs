@@ -97,6 +97,7 @@ impl LaminarDB {
             &self.static_table_names(),
             &ordered_interval_admissions.joins,
             &mutation_routes.changelog,
+            &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await?;
 

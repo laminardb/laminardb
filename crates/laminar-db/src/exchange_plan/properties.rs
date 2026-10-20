@@ -1,6 +1,7 @@
 //! Stream distribution, changelog kind, and the exchange each consumer input port uses.
 
 use std::fmt;
+use std::time::Duration;
 
 use arrow::datatypes::DataType;
 
@@ -39,10 +40,19 @@ pub(crate) enum ChangelogKind {
     RunningState,
 }
 
+/// The column whose source watermark orders a stream's rows: a source's declared event-time
+/// column, forwarded unchanged through stateless projections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EventTime {
+    pub(crate) column: String,
+    pub(crate) max_out_of_orderness: Option<Duration>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StreamProperties {
     pub(crate) distribution: Distribution,
     pub(crate) changelog: ChangelogKind,
+    pub(crate) event_time: Option<EventTime>,
 }
 
 /// A consumer input port, named by its upstream. Join sides are distinct ports even when both
@@ -119,7 +129,11 @@ impl fmt::Display for ChangelogKind {
 
 impl fmt::Display for StreamProperties {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}, {}", self.distribution, self.changelog)
+        write!(f, "{}, {}", self.distribution, self.changelog)?;
+        match &self.event_time {
+            Some(event_time) => write!(f, ", event time {}", event_time.column),
+            None => Ok(()),
+        }
     }
 }
 

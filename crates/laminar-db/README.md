@@ -34,8 +34,8 @@ This model applies to embedded, single-node and cluster execution.
 
 See the [cluster SQL boundary](../../docs/SQL_REFERENCE.md#cluster-sql-boundary) for
 mode-specific admission. Cluster plans deliberately reject local materialized views and
-reference-table enrichment; managed direct-source final windows and
-certified interval/temporal joins have their own admitted paths. Feature flags and checkpoints
+reference-table enrichment; managed final windows and certified interval/temporal joins
+have their own admitted paths. Feature flags and checkpoints
 alone do not imply exactly-once delivery.
 
 ## Stateful process functions

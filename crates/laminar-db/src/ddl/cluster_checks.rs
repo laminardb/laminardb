@@ -145,7 +145,7 @@ impl LaminarDB {
             &right_schema,
             &field,
         )?;
-        Self::validate_interval_join_watermarks(self, config)
+        self.validate_interval_join_watermarks(config).await
     }
 
     /// Certify one interval join's equality keys and internal output-name
@@ -241,13 +241,12 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Certify that both interval-join inputs are directly watermarked,
-    /// event-time sources.
-    fn validate_interval_join_watermarks(
-        db: &LaminarDB,
+    /// Certify that both interval-join inputs carry an event-time watermark on their time column.
+    async fn validate_interval_join_watermarks(
+        &self,
         config: &laminar_sql::translator::StreamJoinConfig,
     ) -> Result<(), DbError> {
-        for (side, source_name, time_column) in [
+        for (side, input, time_column) in [
             (
                 "left",
                 config.left_table.as_str(),
@@ -259,22 +258,36 @@ impl LaminarDB {
                 config.right_time_column.as_str(),
             ),
         ] {
-            let Some(source) = db.catalog.get_source(source_name) else {
-                return Err(DbError::InvalidOperation(format!(
-                    "{side} interval join input '{source_name}' must be a directly watermarked source"
-                )));
-            };
-            if source.watermark_column.as_deref() != Some(time_column)
-                || source
-                    .is_processing_time
-                    .load(std::sync::atomic::Ordering::Acquire)
+            if self
+                .input_event_time(input)
+                .await?
+                .is_none_or(|event_time| event_time.column != time_column)
             {
                 return Err(DbError::InvalidOperation(format!(
-                    "{side} interval join input '{source_name}' must define an event-time watermark on '{time_column}'"
+                    "{side} interval join input '{input}' must carry an event-time watermark on '{time_column}': a source that declares it, or an append-only stream that forwards it unchanged"
                 )));
             }
         }
         Ok(())
+    }
+
+    /// The event time an input carries for a consumer that orders by it: a source's declared
+    /// watermark, or the forwarded watermark of an append-only stream.
+    async fn input_event_time(
+        &self,
+        input: &str,
+    ) -> Result<Option<crate::exchange_plan::EventTime>, DbError> {
+        if let Some(source) = self.catalog.get_source(input) {
+            return Ok(crate::exchange_plan::source_event_time(&source));
+        }
+        let resolved = self.resolve_catalog_stream_outputs(None).await?;
+        Ok(resolved
+            .exchange_plan
+            .stream(input)
+            .filter(|stream| {
+                stream.output.changelog == crate::exchange_plan::ChangelogKind::AppendOnly
+            })
+            .and_then(|stream| stream.output.event_time.clone()))
     }
 
     pub(super) fn cluster_state_lifecycle_error(
@@ -434,23 +447,21 @@ impl LaminarDB {
                 "a windowed join requires a planner-certified combined join/window vnode lifecycle",
             ));
         }
-        let source_name = crate::sql_analysis::managed_core_window_source(query_sql, window)
+        let input = crate::sql_analysis::managed_core_window_source(query_sql, window)
             .ok_or_else(|| {
                 reject(
-                    "managed CoreWindow execution requires one direct source, an unqualified event-time column, and no nested or row-expanding query shape",
+                    "managed CoreWindow execution requires one input, an unqualified event-time column, and no nested or row-expanding query shape",
                 )
             })?;
-        let source = self.catalog.get_source(&source_name).ok_or_else(|| {
-            reject("managed CoreWindow execution requires exactly one direct source")
-        })?;
-        if source
-            .is_processing_time
-            .load(std::sync::atomic::Ordering::Acquire)
-            || source.watermark_column.as_deref() != Some(window.time_column.as_str())
-            || source.max_out_of_orderness.is_none()
+        if self
+            .input_event_time(&input)
+            .await?
+            .is_none_or(|event_time| {
+                event_time.column != window.time_column || event_time.max_out_of_orderness.is_none()
+            })
         {
             return Err(reject(
-                "managed CoreWindow execution requires an event-time watermark on its window time column",
+                "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that forwards it unchanged",
             ));
         }
         let managed = crate::core_window_state::CoreWindowState::try_from_sql(
@@ -472,7 +483,7 @@ impl LaminarDB {
         }
         if managed.compiled_projection().is_none() {
             return Err(reject(
-                "managed CoreWindow execution requires compiled pre-aggregation over its direct source",
+                "managed CoreWindow execution requires compiled pre-aggregation over its input",
             ));
         }
         #[cfg(feature = "cluster")]

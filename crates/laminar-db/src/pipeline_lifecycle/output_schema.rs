@@ -63,6 +63,7 @@ pub(crate) async fn resolve_stream_output_schemas(
         [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
     >,
     changelog_sources: &rustc_hash::FxHashSet<String>,
+    source_event_time: &FxHashMap<String, crate::exchange_plan::EventTime>,
 ) -> Result<ResolvedStreamOutputs, DbError> {
     use datafusion::datasource::empty::EmptyTable;
 
@@ -384,6 +385,7 @@ pub(crate) async fn resolve_stream_output_schemas(
             &plans,
             reference_tables,
             &changelog_carrying,
+            source_event_time,
         )
         .await?;
         Ok(ResolvedStreamOutputs {
@@ -401,7 +403,7 @@ pub(crate) async fn resolve_stream_output_schemas(
     result
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ResolvedStreamOutputs {
     pub(crate) schemas: HashMap<String, arrow_schema::SchemaRef>,
     pub(crate) changelog_carrying: rustc_hash::FxHashSet<String>,

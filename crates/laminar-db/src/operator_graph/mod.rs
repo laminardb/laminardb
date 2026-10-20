@@ -1132,6 +1132,10 @@ pub(crate) struct OperatorGraph {
         FxHashMap<String, Arc<laminar_core::checkpoint::OutputDistributionCertificate>>,
     #[cfg(feature = "cluster")]
     colocated_aggregates: FxHashSet<String>,
+    #[cfg(feature = "cluster")]
+    event_time_forwards: FxHashSet<String>,
+    #[cfg(feature = "cluster")]
+    event_time_roots: Vec<usize>,
     // One immutable assignment transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
@@ -1197,6 +1201,10 @@ impl OperatorGraph {
             subscription_certificates: FxHashMap::default(),
             #[cfg(feature = "cluster")]
             colocated_aggregates: FxHashSet::default(),
+            #[cfg(feature = "cluster")]
+            event_time_forwards: FxHashSet::default(),
+            #[cfg(feature = "cluster")]
+            event_time_roots: Vec::new(),
             #[cfg(feature = "cluster")]
             pending_vnode_transition: None,
             #[cfg(feature = "cluster")]
@@ -2637,8 +2645,8 @@ impl OperatorGraph {
                 self.ctx.clone(),
                 self.key_group_count,
             );
-            let left_schema = self.source_schemas.get(&cfg.left_table);
-            let right_schema = self.source_schemas.get(&cfg.right_table);
+            let left_schema = self.input_schema(&cfg.left_table);
+            let right_schema = self.input_schema(&cfg.right_table);
             if let Some(modes) = self.ordered_interval_joins.get(name) {
                 let left_schema = left_schema.ok_or_else(|| {
                     DbError::Config(format!(
@@ -2808,6 +2816,8 @@ impl OperatorGraph {
         self.subscription_certificates.remove(name);
         #[cfg(feature = "cluster")]
         self.colocated_aggregates.remove(name);
+        #[cfg(feature = "cluster")]
+        self.event_time_forwards.remove(name);
         self.changelog_tables.remove(name);
         self.live_handles.remove(name);
         self.intermediate_schemas.remove(name);
@@ -2879,6 +2889,8 @@ impl OperatorGraph {
         }
 
         self.compute_node_domains();
+        #[cfg(feature = "cluster")]
+        self.compute_event_time_roots();
 
         self.source_list.clear();
         self.source_list

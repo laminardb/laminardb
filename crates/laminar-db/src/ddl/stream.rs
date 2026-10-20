@@ -448,6 +448,7 @@ impl LaminarDB {
             &self.static_table_names(),
             &ordered.joins,
             &changelog_sources,
+            &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await
     }

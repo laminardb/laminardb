@@ -217,9 +217,10 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
 
 **Key points:**
 
-- Both inputs must be direct sources with watermarks on `TIMESTAMP NOT NULL` event-time columns.
-  Append-only pairs use the ordinary path. If either connector is mutable, both connectors must
-  expose ordered deterministic row positions and a replayable recovery contract.
+- Each input must carry a watermark on its `TIMESTAMP NOT NULL` event-time column: a source that
+  declares it, or an append-only stream that forwards that column unchanged through a projection
+  or filter. Append-only pairs use the ordinary path. If either input is a mutable connector, both
+  connectors must expose ordered deterministic row positions and a replayable recovery contract.
 - Append-only bounded intervals retain live hot-add support in a running local checkpoint-disabled
   pipeline; their post-projection is initialized before the first cycle can route or retain input.
   Mutable bounded intervals and consumers of their changelog are fixed startup topology and must be
@@ -461,9 +462,10 @@ boundaries, poison-message handling, and tested behaviour.
 ### Cluster SQL boundary
 
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
-the eight bounded join kinds described above, and managed direct-source `TUMBLE`, `HOP`, and
-`SESSION` aggregates. Cluster windows require a watermark on the event-time column and `EMIT ON
-WINDOW CLOSE` or `EMIT FINAL`. A named join output may feed a separate keyed aggregate stream;
+the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION`
+aggregates. A cluster window reads a source, or an append-only stream that forwards the source's
+event-time column unchanged; it requires a bounded watermark on that column and `EMIT ON WINDOW
+CLOSE` or `EMIT FINAL`. A named join output may feed a separate keyed aggregate stream;
 fused join-and-aggregate and windowed-join statements remain rejected.
 
 Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
@@ -582,7 +584,7 @@ provides downstream, without creating it:
 ```sql
 EXPLAIN CREATE STREAM per_symbol AS
   SELECT symbol, COUNT(*) AS n FROM trades GROUP BY symbol EMIT CHANGES;
--- exchange.input.trades  repartition on (symbol Utf8) from arbitrary, append-only
+-- exchange.input.trades  repartition on (symbol Utf8) from arbitrary, append-only, event time ts
 -- exchange.output        hash(symbol Utf8), weighted changelog
 ```
 
@@ -593,7 +595,8 @@ each other node sends one partial row per input batch instead of its rows), or `
 (a window without a group key). Join inputs are named
 `left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
 `arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
-(an aggregate without `EMIT CHANGES`).
+(an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry a source
+watermark on that column (a source's own, or one a projection forwards unchanged).
 
 ### EXPLAIN ANALYZE
 

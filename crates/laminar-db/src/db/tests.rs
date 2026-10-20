@@ -9950,7 +9950,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                 assert!(
                     message.contains("managed SQL windows require one aggregate stage")
                         || message.contains(
-                            "managed CoreWindow execution requires one direct source",
+                            "managed CoreWindow execution requires one input",
                         ),
                     "unexpected rejection for {name}: {error}"
                 );

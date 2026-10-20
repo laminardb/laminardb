@@ -191,6 +191,7 @@ impl LaminarDB {
             &reference_tables,
             &admissions.joins,
             &routes.changelog,
+            &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await?;
         let consumes_ordered_changelog = query_references

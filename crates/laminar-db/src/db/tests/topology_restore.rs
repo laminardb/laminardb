@@ -115,8 +115,10 @@ async fn restorable_fixture_with_statements(
         .build_topology_restore_operator_graph(
             &streams,
             &HashMap::new(),
-            &rustc_hash::FxHashSet::from_iter(["totals".into()]),
-            &crate::exchange_plan::ExchangePlan::default(),
+            &crate::pipeline_lifecycle::ResolvedStreamOutputs {
+                changelog_carrying: rustc_hash::FxHashSet::from_iter(["totals".into()]),
+                ..Default::default()
+            },
             &rustc_hash::FxHashMap::default(),
             &descriptor.parent_pipeline,
             crate::operator::sql_query::ClusterShuffleConfig {

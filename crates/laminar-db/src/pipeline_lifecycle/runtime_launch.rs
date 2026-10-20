@@ -566,8 +566,7 @@ impl LaminarDB {
             None => self.build_connector_operator_graph(
                 &stream_regs,
                 &table_regs,
-                &resolved_stream_outputs.changelog_carrying,
-                &resolved_stream_outputs.exchange_plan,
+                &resolved_stream_outputs,
                 &ordered_interval_admissions.joins,
                 pipeline_identity.as_ref(),
             )?,
@@ -576,15 +575,11 @@ impl LaminarDB {
         let graph = self.build_connector_operator_graph(
             &stream_regs,
             &table_regs,
-            &resolved_stream_outputs.changelog_carrying,
-            &resolved_stream_outputs.exchange_plan,
+            &resolved_stream_outputs,
             &ordered_interval_admissions.joins,
             pipeline_identity.as_ref(),
         )?;
         let mut graph = graph;
-        for (name, schema) in stream_output_schemas {
-            graph.register_intermediate_schema(name, schema);
-        }
         graph.set_max_managed_state_bytes(
             self.config
                 .pipeline_max_managed_state_bytes

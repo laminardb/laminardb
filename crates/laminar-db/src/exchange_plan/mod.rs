@@ -13,11 +13,11 @@ mod tests;
 
 use std::collections::BTreeMap;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(crate) use derivation::derive;
 pub(crate) use properties::{
-    ChangelogKind, Distribution, InputPort, KeyColumn, PartitionKey, PortExchange,
+    ChangelogKind, Distribution, EventTime, InputPort, KeyColumn, PartitionKey, PortExchange,
     StreamProperties, GLOBAL_VNODE,
 };
 
@@ -30,10 +30,12 @@ pub(crate) struct StreamPlan {
     pub(crate) output: StreamProperties,
 }
 
-/// Plans for every stream of one catalog, by stream name.
+/// Plans for every stream of one catalog, by stream name, with the event time each source
+/// declares.
 #[derive(Debug, Default)]
 pub(crate) struct ExchangePlan {
     streams: BTreeMap<String, StreamPlan>,
+    sources: FxHashMap<String, EventTime>,
 }
 
 impl ExchangePlan {
@@ -41,6 +43,7 @@ impl ExchangePlan {
     pub(crate) fn from_streams(streams: impl IntoIterator<Item = (String, StreamPlan)>) -> Self {
         Self {
             streams: streams.into_iter().collect(),
+            sources: FxHashMap::default(),
         }
     }
 
@@ -62,8 +65,26 @@ impl ExchangePlan {
             .collect()
     }
 
+    /// Streams that keep one input's rows and event time unchanged (a stateless projection that
+    /// forwards the event-time column), so a managed consumer may take that input's frontier.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn event_time_forwards(&self) -> FxHashSet<String> {
+        self.streams
+            .iter()
+            .filter(|(_, plan)| {
+                plan.output.event_time.is_some()
+                    && plan.inputs.len() == 1
+                    && plan
+                        .inputs
+                        .values()
+                        .all(|exchange| matches!(exchange, PortExchange::Forward))
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// What an input port reads from `upstream`: a planned stream's output, otherwise a source,
-    /// which is a weighted changelog when `changelog` names it.
+    /// which is a weighted changelog when `changelog` names it and carries its declared event time.
     pub(crate) fn upstream_properties(
         &self,
         upstream: &str,
@@ -77,10 +98,39 @@ impl ExchangePlan {
                 } else {
                     ChangelogKind::AppendOnly
                 },
+                event_time: self.sources.get(upstream).cloned(),
             },
             |stream| stream.output.clone(),
         )
     }
+}
+
+/// Each catalog source's event time.
+pub(crate) fn source_event_times(
+    catalog: &crate::catalog::SourceCatalog,
+) -> FxHashMap<String, EventTime> {
+    catalog
+        .list_sources()
+        .into_iter()
+        .filter_map(|name| {
+            let event_time = source_event_time(&*catalog.get_source(&name)?)?;
+            Some((name, event_time))
+        })
+        .collect()
+}
+
+/// A source's watermark column, unless it orders by processing time.
+pub(crate) fn source_event_time(source: &crate::catalog::SourceEntry) -> Option<EventTime> {
+    if source
+        .is_processing_time
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return None;
+    }
+    Some(EventTime {
+        column: source.watermark_column.clone()?,
+        max_out_of_orderness: source.max_out_of_orderness,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]

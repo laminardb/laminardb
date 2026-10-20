@@ -323,6 +323,7 @@ impl LaminarDB {
             &self.static_table_names(),
             &interval.joins,
             &rustc_hash::FxHashSet::default(),
+            &crate::exchange_plan::source_event_times(&self.catalog),
         )
         .await?
         .exchange_plan)

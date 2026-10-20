@@ -331,7 +331,7 @@ async fn hop_and_session_windows_are_equal() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn window_over_stream_is_rejected_in_cluster() {
+async fn window_over_append_only_stream_is_equal() {
     let case = case(
         "window_over_stream",
         &[
@@ -341,9 +341,13 @@ async fn window_over_stream_is_rejected_in_cluster() {
              GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND) EMIT ON WINDOW CLOSE",
         ],
         OutputForm::Rows,
-        None,
+        Some(
+            "SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, COUNT(*) AS n \
+             FROM events WHERE v > 10 AND ts < CAST(1400000 AS TIMESTAMP(6)) \
+             GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND)",
+        ),
     );
-    assert_rejected(verdict(case).await, "direct source");
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 const INTERVAL_JOIN: &str = "SELECT o.k AS k, o.v AS ov, p.v AS pv FROM orders o \
@@ -397,6 +401,36 @@ async fn join_then_aggregate_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// Three exchanges: both join inputs repartition on `k`, the keyed aggregate is colocated with
+/// the join output, and the aggregate over it repartitions on `n`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_then_chained_aggregates_is_equal() {
+    let case = Case {
+        ground_truth: Some(
+            "SELECT n, COUNT(*) AS keys FROM \
+             (SELECT k, COUNT(*) AS n FROM \
+              (SELECT o.k AS k, o.v AS ov, p.v AS pv FROM orders o \
+               INNER JOIN payments p ON o.k = p.k \
+               AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND) GROUP BY k) \
+             GROUP BY n",
+        ),
+        ..join_case(
+            "join_then_chained_aggregates",
+            vec![
+                format!("CREATE STREAM joined AS {INTERVAL_JOIN}"),
+                "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM joined \
+                 GROUP BY k EMIT CHANGES"
+                    .into(),
+                "CREATE STREAM out AS SELECT n, COUNT(*) AS keys FROM per_key \
+                 GROUP BY n EMIT CHANGES"
+                    .into(),
+            ],
+            OutputForm::Changelog,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fused_join_aggregate_is_unsupported_everywhere() {
     let case = join_case(
@@ -417,22 +451,29 @@ async fn fused_join_aggregate_is_unsupported_everywhere() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_over_stream_is_unsupported_everywhere() {
-    let case = join_case(
-        "join_over_stream",
-        vec![
-            "CREATE STREAM big_orders AS SELECT k, v, ts FROM orders WHERE v > 10".into(),
-            "CREATE STREAM out AS SELECT o.k AS k, o.v AS ov, p.v AS pv FROM big_orders o \
+async fn interval_join_over_append_only_streams_is_equal() {
+    let case = Case {
+        ground_truth: Some(
+            "SELECT o.k AS k, o.v AS ov, p.v AS pv FROM orders o \
              INNER JOIN payments p ON o.k = p.k \
-             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
-                .into(),
-        ],
-        OutputForm::Rows,
-    );
-    assert!(matches!(
-        verdict(case).await,
-        Verdict::UnsupportedEverywhere(reason) if reason.contains("directly watermarked source")
-    ));
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+             WHERE o.v > 10 AND p.v % 2 = 0",
+        ),
+        ..join_case(
+            "join_over_streams",
+            vec![
+                "CREATE STREAM big_orders AS SELECT k, v, ts FROM orders WHERE v > 10".into(),
+                "CREATE STREAM even_payments AS SELECT k, v, ts FROM payments WHERE v % 2 = 0"
+                    .into(),
+                "CREATE STREAM out AS SELECT o.k AS k, o.v AS ov, p.v AS pv FROM big_orders o \
+                 INNER JOIN even_payments p ON o.k = p.k \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
+                    .into(),
+            ],
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 /// Join kinds whose output distribution differs (null-extended rows are placed by the side that

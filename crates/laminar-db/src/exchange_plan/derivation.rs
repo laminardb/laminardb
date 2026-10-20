@@ -9,10 +9,10 @@ use datafusion::prelude::SessionContext;
 use datafusion_expr::{Expr, LogicalPlan, Projection};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    ChangelogKind, Distribution, ExchangePlan, ExchangePlanError, InputPort, KeyColumn,
+    ChangelogKind, Distribution, EventTime, ExchangePlan, ExchangePlanError, InputPort, KeyColumn,
     PartitionKey, PortExchange, StreamPlan, StreamProperties, GLOBAL_VNODE,
 };
 use crate::connector_manager::StreamRegistration;
@@ -31,8 +31,12 @@ pub(crate) async fn derive(
     logical_plans: &HashMap<String, LogicalPlan>,
     reference_tables: &FxHashSet<String>,
     changelog: &FxHashSet<String>,
+    source_event_time: &FxHashMap<String, EventTime>,
 ) -> Result<ExchangePlan, ExchangePlanError> {
-    let mut plan = ExchangePlan::default();
+    let mut plan = ExchangePlan {
+        streams: BTreeMap::new(),
+        sources: source_event_time.clone(),
+    };
     for registration in dependency_order(streams)? {
         let logical = logical_plans.get(&registration.name);
         let stream = plan_stream(
@@ -142,6 +146,7 @@ async fn plan_stream(
                 } else {
                     ChangelogKind::AppendOnly
                 },
+                event_time: None,
             },
         });
     }
@@ -176,7 +181,12 @@ async fn plan_stream(
                 changelog,
             ));
         }
-        return Ok(forwarding(&inputs, Distribution::Arbitrary, changelog));
+        return Ok(forwarding(
+            &inputs,
+            Distribution::Arbitrary,
+            changelog,
+            None,
+        ));
     }
 
     let changelog = if weighted {
@@ -189,16 +199,31 @@ async fn plan_stream(
     } else {
         ChangelogKind::AppendOnly
     };
-    let distribution = match (
+    let forwarded = match (
         &*inputs,
         crate::sql_analysis::extract_projection_filter(logical),
     ) {
-        ([input], Some(projection)) => {
-            forwarded_distribution(&input_properties(input).distribution, &projection)
-        }
-        _ => Distribution::Arbitrary,
+        ([input], Some(projection)) => stateless_output(input_properties(input), &projection),
+        _ => (Distribution::Arbitrary, None),
     };
-    Ok(forwarding(&inputs, distribution, changelog))
+    Ok(forwarding(&inputs, forwarded.0, changelog, forwarded.1))
+}
+
+/// What a stateless projection keeps of its input: the hash key and the event-time column, when
+/// each is forwarded unchanged.
+fn stateless_output(
+    input: StreamProperties,
+    projection: &ProjectionFilterInfo,
+) -> (Distribution, Option<EventTime>) {
+    (
+        forwarded_distribution(&input.distribution, projection),
+        input.event_time.and_then(|event_time| {
+            Some(EventTime {
+                column: forwarded_name(&event_time.column, projection)?,
+                ..event_time
+            })
+        }),
+    )
 }
 
 const fn closes_windows(emit: Option<&EmitClause>) -> bool {
@@ -274,6 +299,7 @@ fn forwarding(
     inputs: &[String],
     distribution: Distribution,
     changelog: ChangelogKind,
+    event_time: Option<EventTime>,
 ) -> StreamPlan {
     StreamPlan {
         inputs: inputs
@@ -283,6 +309,7 @@ fn forwarding(
         output: StreamProperties {
             distribution,
             changelog,
+            event_time,
         },
     }
 }
@@ -336,6 +363,7 @@ fn keyed_aggregate(
         output: StreamProperties {
             distribution,
             changelog,
+            event_time: None,
         },
     }
 }
@@ -475,6 +503,14 @@ fn forwarded_column(column: &KeyColumn, projection: &ProjectionFilterInfo) -> Op
     let KeyColumn::Column { name, data_type } = column else {
         return None;
     };
+    Some(KeyColumn::Column {
+        name: forwarded_name(name, projection)?,
+        data_type: data_type.clone(),
+    })
+}
+
+/// The output name under which a stateless projection forwards input column `name` unchanged.
+fn forwarded_name(name: &str, projection: &ProjectionFilterInfo) -> Option<String> {
     let source = projection
         .input_df_schema
         .index_of_column_by_name(None, name)?;
@@ -487,11 +523,7 @@ fn forwarded_column(column: &KeyColumn, projection: &ProjectionFilterInfo) -> Op
         let Expr::Column(forwarded) = unaliased(expr) else {
             return None;
         };
-        (projection.input_df_schema.index_of_column(forwarded).ok() == Some(source)).then(|| {
-            KeyColumn::Column {
-                name: output.clone(),
-                data_type: data_type.clone(),
-            }
-        })
+        (projection.input_df_schema.index_of_column(forwarded).ok() == Some(source))
+            .then(|| output.clone())
     })
 }

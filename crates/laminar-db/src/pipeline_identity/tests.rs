@@ -305,6 +305,7 @@ fn temporal_retention_changes_only_temporal_stream_identity() {
                 output: StreamProperties {
                     distribution: Distribution::Arbitrary,
                     changelog: ChangelogKind::AppendOnly,
+                    event_time: None,
                 },
             },
         )]);
@@ -354,6 +355,7 @@ fn stream_identity_binds_its_exchange_plan() {
                 output: StreamProperties {
                     distribution: Distribution::Arbitrary,
                     changelog: ChangelogKind::RunningState,
+                    event_time: None,
                 },
             },
         )]);

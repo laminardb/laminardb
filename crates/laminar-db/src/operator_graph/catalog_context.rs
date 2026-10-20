@@ -77,6 +77,13 @@ impl OperatorGraph {
         self.subscription_certificates = certificates;
     }
 
+    /// A source's or an upstream stream's registered schema.
+    pub(super) fn input_schema(&self, table: &str) -> Option<&arrow::datatypes::SchemaRef> {
+        self.source_schemas
+            .get(table)
+            .or_else(|| self.intermediate_schemas.get(table))
+    }
+
     /// Install the aggregates whose input the exchange plan colocates, before they are built.
     #[cfg(feature = "cluster")]
     pub(crate) fn set_colocated_aggregates(&mut self, streams: FxHashSet<String>) {
@@ -87,6 +94,19 @@ impl OperatorGraph {
             return;
         }
         self.colocated_aggregates = streams;
+    }
+
+    /// Install the streams that forward their input's rows and event time unchanged, before
+    /// they are built.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_event_time_forwards(&mut self, streams: FxHashSet<String>) {
+        if !self.nodes.is_empty() {
+            self.build_errors.push(DbError::Config(
+                "event-time forwards must be installed before graph operators".into(),
+            ));
+            return;
+        }
+        self.event_time_forwards = streams;
     }
 
     #[cfg(feature = "cluster")]
