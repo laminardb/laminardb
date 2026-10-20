@@ -409,15 +409,8 @@ pub(super) fn describe_catalog(
         let dependency_evidence: Vec<_> = dependencies.iter().map(|dependency| {
             objects.get(dependency).map(|object| (&object.name, object.catalog_generation, &object.compatibility_sha256)).ok_or_else(|| TopologyError::Invalid(format!("'{name}' depends on '{dependency}' outside dependency-safe creation order")))
         }).collect::<Result<_, _>>()?;
-        let definition_sha256 = identities
-            .objects
-            .get(name)
-            .ok_or_else(|| {
-                TopologyError::Invalid(format!(
-                    "'{name}' is absent from canonical pipeline identity"
-                ))
-            })?
-            .clone();
+        let stages = crate::sql_analysis::owned_stages(name, manager.streams().keys());
+        let definition_sha256 = object_definition(identities, graph, name, &stages)?;
         let schema_sha256 = graph
             .schemas
             .get(name)
@@ -427,17 +420,32 @@ pub(super) fn describe_catalog(
             })
             .transpose()?;
         let operator = graph.operators.get(name);
-        if entry.kind == CatalogObjectKind::Stream && operator.is_none() {
-            return Err(TopologyError::Invalid(format!(
-                "stream '{name}' is absent from the physical candidate graph"
-            ))
-            .into());
+        let operators: Vec<_> = std::iter::once(name)
+            .chain(&stages)
+            .map(|operator| (operator, graph.operators.get(operator)))
+            .collect();
+        if let Some((missing, _)) = operators.iter().find(|(_, operator)| operator.is_none()) {
+            if entry.kind == CatalogObjectKind::Stream {
+                return Err(TopologyError::Invalid(format!(
+                    "stream '{missing}' is absent from the physical candidate graph"
+                ))
+                .into());
+            }
         }
-        let state_contract = operator
-            .and_then(|capability| capability.managed_state)
+        let state_contract = operators
+            .iter()
+            .find_map(|(_, operator)| operator.and_then(|capability| capability.managed_state))
             .map(state_contract_name);
         if !preserved {
-            validate_future_state_inputs(name, operator, &dependencies, &objects, graph)?;
+            for (operator_name, operator) in &operators {
+                validate_future_state_inputs(
+                    operator_name,
+                    *operator,
+                    &dependencies,
+                    &objects,
+                    graph,
+                )?;
+            }
         }
         let identity = compatibility_digest(&(
             "laminardb-topology-object-mapping-v1",
@@ -496,25 +504,19 @@ fn catalog_dependencies(
             .input
             .clone()],
         CatalogObjectKind::Stream => {
-            let stream = manager.streams().get(name).ok_or_else(|| {
-                TopologyError::Invalid(format!("stream '{name}' has no registration"))
-            })?;
-            let mut references = crate::sql_analysis::extract_table_references(&stream.query_sql);
-            for join in stream.join_config.iter().flatten() {
-                match join {
-                    laminar_sql::translator::JoinOperatorConfig::StreamStream(config) => {
-                        references.insert(config.left_table.clone());
-                        references.insert(config.right_table.clone());
-                    }
-                    laminar_sql::translator::JoinOperatorConfig::Temporal(config) => {
-                        references.insert(config.left_table.clone());
-                        references.insert(config.right_table.clone());
-                    }
-                    laminar_sql::translator::JoinOperatorConfig::Lookup(_) => {
-                        return Err(TopologyError::Unsupported(format!(
-                            "stream '{name}' has an unmapped join dependency contract"
-                        ))
-                        .into())
+            // A split stream's inputs are those of its stages.
+            let mut references = std::collections::BTreeSet::new();
+            let mut pending = vec![name.clone()];
+            let mut visited = std::collections::BTreeSet::new();
+            while let Some(stream) = pending.pop() {
+                if !visited.insert(stream.clone()) {
+                    continue;
+                }
+                for reference in stream_references(manager, &stream)? {
+                    if crate::sql_analysis::stage_owner(&reference) == Some(name.as_str()) {
+                        pending.push(reference);
+                    } else {
+                        references.insert(reference);
                     }
                 }
             }
@@ -535,6 +537,61 @@ fn catalog_dependencies(
     };
     dependencies.sort_unstable();
     Ok(dependencies)
+}
+
+fn stream_references(
+    manager: &crate::connector_manager::ConnectorManager,
+    name: &str,
+) -> Result<rustc_hash::FxHashSet<String>, DbError> {
+    let stream = manager
+        .streams()
+        .get(name)
+        .ok_or_else(|| TopologyError::Invalid(format!("stream '{name}' has no registration")))?;
+    let mut references = crate::sql_analysis::extract_table_references(&stream.query_sql);
+    for join in stream.join_config.iter().flatten() {
+        match join {
+            laminar_sql::translator::JoinOperatorConfig::StreamStream(config) => {
+                references.insert(config.left_table.clone());
+                references.insert(config.right_table.clone());
+            }
+            laminar_sql::translator::JoinOperatorConfig::Temporal(config) => {
+                references.insert(config.left_table.clone());
+                references.insert(config.right_table.clone());
+            }
+            laminar_sql::translator::JoinOperatorConfig::Lookup(_) => {
+                return Err(TopologyError::Unsupported(format!(
+                    "stream '{name}' has an unmapped join dependency contract"
+                ))
+                .into())
+            }
+        }
+    }
+    Ok(references)
+}
+
+/// A split stream's stages initialize, preserve and retire with it, so its definition binds theirs.
+fn object_definition(
+    identities: &PipelineCompatibilityIdentities,
+    graph: &PlannedTopologyGraph,
+    name: &str,
+    stages: &[String],
+) -> Result<String, DbError> {
+    let definition = |object: &str| {
+        identities.objects.get(object).ok_or_else(|| {
+            TopologyError::Invalid(format!(
+                "'{object}' is absent from canonical pipeline identity"
+            ))
+        })
+    };
+    let owner = definition(name)?;
+    if stages.is_empty() {
+        return Ok(owner.clone());
+    }
+    let stages = stages
+        .iter()
+        .map(|stage| Ok((stage, definition(stage)?, graph.operators.get(stage))))
+        .collect::<Result<Vec<_>, DbError>>()?;
+    compatibility_digest(&("laminardb-split-stream-definition-v1", owner, stages))
 }
 
 fn classify_object_transitions(

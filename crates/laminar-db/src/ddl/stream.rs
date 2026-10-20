@@ -564,12 +564,18 @@ impl LaminarDB {
                 "planner did not produce a streaming query for '{name}'"
             )));
         };
-        let subscription_output = crate::subscription::distribution::plan(
-            query_sql,
-            plan.emit_clause.as_ref(),
-            &self.ctx,
-            self.checkpoint_key_groups(),
-        )?;
+        // Nothing subscribes to a stage, so it keeps no output distribution or log.
+        let subscription_output =
+            if crate::sql_analysis::stage_owner(&canonical_object_name(name)?).is_some() {
+                None
+            } else {
+                crate::subscription::distribution::plan(
+                    query_sql,
+                    plan.emit_clause.as_ref(),
+                    &self.ctx,
+                    self.checkpoint_key_groups(),
+                )?
+            };
         Ok(PlannedStreamingQuery {
             emit_clause: plan.emit_clause,
             window_config: plan.window_config,

@@ -435,6 +435,11 @@ impl ConnectorManager {
                 ))
             })?;
             *generation = entry.catalog_generation;
+            for stage in self.streams.values_mut().filter(|stream| {
+                crate::sql_analysis::stage_owner(&stream.name) == Some(&entry.canonical_name)
+            }) {
+                stage.catalog_generation = entry.catalog_generation;
+            }
         }
         self.ddl_order = entries
             .iter()

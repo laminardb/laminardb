@@ -33,9 +33,6 @@ impl OperatorGraph {
         input: &laminar_core::cluster::control::TopologyRestoreInput,
     ) -> Result<(Self, usize), DbError> {
         use laminar_core::checkpoint::StateFrameKey;
-        use laminar_core::cluster::control::topology::{
-            ClusterTopologyObjectTransition, TopologyInitialization,
-        };
 
         if self.pipeline_identity.as_ref() != Some(&input.descriptor().target_pipeline)
             || self.cluster_shuffle.as_ref().is_none_or(|scope| {
@@ -50,31 +47,8 @@ impl OperatorGraph {
             ));
         }
         recovered.validate_topology_assignment(input)?;
-        let empty_at_cut = if recovered.committed.pipeline_identity
-            == input.descriptor().parent_pipeline
-        {
-            input
-                .descriptor()
-                .objects
-                .iter()
-                .filter(|object| {
-                    object.transition == ClusterTopologyObjectTransition::AddFutureOnly
-                        && object.initialization == TopologyInitialization::EmptyManagedStateAtCut
-                        && input
-                            .root()
-                            .future_only_objects
-                            .binary_search(&object.name)
-                            .is_ok()
-                })
-                .map(|object| object.name.as_str())
-                .collect::<Vec<_>>()
-        } else if recovered.committed.pipeline_identity == input.descriptor().target_pipeline {
-            Vec::new()
-        } else {
-            return Err(DbError::Checkpoint(
-                "topology restore has a foreign checkpoint identity".into(),
-            ));
-        };
+        let empty_at_cut = self.empty_state_at_cut(recovered, input)?;
+        let empty_at_cut: Vec<&str> = empty_at_cut.iter().map(String::as_str).collect();
         let frames = select_topology_state_frames(recovered, input)?;
         let mut whole = Vec::new();
         let mut vnodes = Vec::new();
@@ -138,6 +112,54 @@ impl OperatorGraph {
             input.owned_vnodes(),
             &empty_at_cut,
         )
+    }
+
+    /// Operators that start empty at the cut: managed objects added by the migration, with each
+    /// split stream's stages, when restoring the parent's checkpoint; none at a target checkpoint.
+    #[cfg(feature = "cluster")]
+    fn empty_state_at_cut(
+        &self,
+        recovered: &crate::recovery_manager::RecoveredState,
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+    ) -> Result<Vec<String>, DbError> {
+        use laminar_core::cluster::control::topology::{
+            ClusterTopologyObjectTransition, TopologyInitialization,
+        };
+
+        let descriptor = input.descriptor();
+        if recovered.committed.pipeline_identity != descriptor.parent_pipeline {
+            if recovered.committed.pipeline_identity == descriptor.target_pipeline {
+                return Ok(Vec::new());
+            }
+            return Err(DbError::Checkpoint(
+                "topology restore has a foreign checkpoint identity".into(),
+            ));
+        }
+        let mut empty: Vec<String> = descriptor
+            .objects
+            .iter()
+            .filter(|object| {
+                object.transition == ClusterTopologyObjectTransition::AddFutureOnly
+                    && object.initialization == TopologyInitialization::EmptyManagedStateAtCut
+                    && input
+                        .root()
+                        .future_only_objects
+                        .binary_search(&object.name)
+                        .is_ok()
+            })
+            .map(|object| object.name.clone())
+            .collect();
+        let stages: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|node| {
+                crate::sql_analysis::stage_owner(&node.name)
+                    .is_some_and(|owner| empty.iter().any(|object| object == owner))
+            })
+            .map(|node| node.name.to_string())
+            .collect();
+        empty.extend(stages);
+        Ok(empty)
     }
 
     fn validate_restore_frame_roster(

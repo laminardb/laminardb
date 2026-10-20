@@ -686,9 +686,14 @@ impl LaminarDB {
                     )));
                 }
             };
-            let certified = plan.subscription_output.as_ref().is_some_and(|output| {
-                output.matches_aggregate_grouping(aggregate.num_group_cols())
-            });
+            // A stage feeds only its owner and is never subscribed to.
+            let certified = if crate::sql_analysis::stage_owner(name).is_some() {
+                plan.subscription_output.is_none()
+            } else {
+                plan.subscription_output.as_ref().is_some_and(|output| {
+                    output.matches_aggregate_grouping(aggregate.num_group_cols())
+                })
+            };
             if !certified {
                 return Err(reject(
                     "aggregate final output has no matching planner-owned subscription distribution certificate",
