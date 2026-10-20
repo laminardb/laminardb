@@ -31,6 +31,9 @@ struct Case {
     form: OutputForm,
     /// Batch SQL over the complete input whose rows equal the consolidated stream output.
     ground_truth: Option<&'static str>,
+    /// Checkpoint repeatedly while the sources deliver; in cluster mode some checkpoint flush
+    /// must move rows across an exchange.
+    checkpoint_under_load: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -149,6 +152,12 @@ impl Case {
         let output = self
             .drain(&cluster.dbs, &mut portals, &cluster.polled)
             .await?;
+        if self.checkpoint_under_load && !cluster.dbs.iter().any(|db| flush_crossed_exchange(db)) {
+            return Err(format!(
+                "{}: no checkpoint flush ran past its first wave and idle confirmation",
+                self.name
+            ));
+        }
         if let Some(idle) = cluster
             .polled
             .iter()
@@ -189,6 +198,19 @@ impl Case {
     ) -> Result<Vec<RecordBatch>, String> {
         let total = self.batch_count();
         let delivered = || -> u64 { polled.iter().map(|p| p.load(Ordering::Acquire)).sum() };
+        if self.checkpoint_under_load {
+            let under_load = async {
+                while delivered() < total {
+                    self.checkpoint(dbs).await?;
+                }
+                Ok::<_, String>(())
+            };
+            tokio::time::timeout(DEADLINE, under_load)
+                .await
+                .map_err(|_| {
+                    format!("{}: sources did not finish under checkpoints", self.name)
+                })??;
+        }
         wait_until(DEADLINE, || delivered() >= total)
             .await
             .map_err(|()| {
@@ -198,6 +220,16 @@ impl Case {
                     delivered()
                 )
             })?;
+        self.checkpoint(dbs).await?;
+        let mut batches = Vec::new();
+        for portal in portals.iter_mut() {
+            read_published(portal, &mut batches).map_err(|e| format!("{}: {e}", self.name))?;
+        }
+        Ok(batches)
+    }
+
+    /// Commit a checkpoint from the first (leader) node.
+    async fn checkpoint(&self, dbs: &[Arc<LaminarDB>]) -> Result<(), String> {
         let checkpoint = dbs[0]
             .checkpoint_with_timeout(DEADLINE)
             .await
@@ -205,12 +237,24 @@ impl Case {
         if !checkpoint.success {
             return Err(format!("{}: checkpoint failed: {checkpoint:?}", self.name));
         }
-        let mut batches = Vec::new();
-        for portal in portals.iter_mut() {
-            read_published(portal, &mut batches).map_err(|e| format!("{}: {e}", self.name))?;
-        }
-        Ok(batches)
+        Ok(())
     }
+}
+
+/// Whether a checkpoint flush on `db` ran past its first wave and idle confirmation, i.e. moved
+/// rows across a remote exchange while the sources were held.
+fn flush_crossed_exchange(db: &LaminarDB) -> bool {
+    let Some(metrics) = db.engine_metrics() else {
+        return false;
+    };
+    let families = prometheus::core::Collector::collect(&metrics.checkpoint_shuffle_flush_waves);
+    let histogram = families[0].get_metric()[0].get_histogram();
+    let within_two_waves = histogram
+        .get_bucket()
+        .iter()
+        .find(|bucket| bucket.upper_bound() >= 2.0)
+        .map_or(0, prometheus::proto::Bucket::cumulative_count);
+    within_two_waves < histogram.get_sample_count()
 }
 
 async fn wait_until(deadline: Duration, mut done: impl FnMut() -> bool) -> Result<(), ()> {

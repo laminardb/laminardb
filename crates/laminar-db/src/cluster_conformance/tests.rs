@@ -45,9 +45,13 @@ fn event_batch(rows: impl Iterator<Item = (i64, i64, i64)>) -> RecordBatch {
 
 /// Deterministic input spread over every partition; `seed` decorrelates two sources.
 fn events(name: &'static str, seed: i64) -> FixtureSource {
+    events_with(name, seed, BATCHES_PER_PARTITION)
+}
+
+fn events_with(name: &'static str, seed: i64, batches: i64) -> FixtureSource {
     let partitions = (0..PARTITIONS)
         .map(|partition| {
-            (0..BATCHES_PER_PARTITION)
+            (0..batches)
                 .map(|batch| {
                     event_batch((0..ROWS_PER_BATCH).map(|row| {
                         let n = (partition * 1_000 + batch * 100 + row) * 7 + seed;
@@ -78,6 +82,7 @@ fn case(
         observe: "out",
         form,
         ground_truth,
+        checkpoint_under_load: false,
     }
 }
 
@@ -233,6 +238,7 @@ async fn union_all_is_rejected_in_cluster() {
         observe: "out",
         form: OutputForm::Rows,
         ground_truth: Some("SELECT k, v FROM left_events UNION ALL SELECT k, v FROM right_events"),
+        checkpoint_under_load: false,
     };
     assert_rejected(verdict(case).await, "single input frontier");
 }
@@ -380,6 +386,7 @@ fn join_case(name: &'static str, streams: Vec<String>, form: OutputForm) -> Case
         observe: "out",
         form,
         ground_truth: None,
+        checkpoint_under_load: false,
     }
 }
 
@@ -421,9 +428,8 @@ async fn join_then_aggregate_is_equal() {
 
 /// Three exchanges: both join inputs repartition on `k`, the keyed aggregate is colocated with
 /// the join output, and the aggregate over it repartitions on `n`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn join_then_chained_aggregates_is_equal() {
-    let case = Case {
+fn chained_aggregates_case(name: &'static str) -> Case {
+    Case {
         ground_truth: Some(
             "SELECT n, COUNT(*) AS keys FROM \
              (SELECT k, COUNT(*) AS n FROM \
@@ -433,7 +439,7 @@ async fn join_then_chained_aggregates_is_equal() {
              GROUP BY n",
         ),
         ..join_case(
-            "join_then_chained_aggregates",
+            name,
             vec![
                 format!("CREATE STREAM joined AS {INTERVAL_JOIN}"),
                 "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM joined \
@@ -445,6 +451,27 @@ async fn join_then_chained_aggregates_is_equal() {
             ],
             OutputForm::Changelog,
         )
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_then_chained_aggregates_is_equal() {
+    let case = chained_aggregates_case("join_then_chained_aggregates");
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Checkpoints taken while rows still cross all three exchanges need more flush waves than an
+/// idle pipeline and must still settle within the depth bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loaded_three_exchange_checkpoints_are_equal() {
+    const BATCHES: i64 = 200;
+    let case = Case {
+        sources: vec![
+            events_with("orders", 0, BATCHES),
+            events_with("payments", 3, BATCHES),
+        ],
+        checkpoint_under_load: true,
+        ..chained_aggregates_case("loaded_three_exchange_checkpoints")
     };
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
