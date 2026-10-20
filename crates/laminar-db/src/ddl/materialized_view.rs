@@ -356,7 +356,7 @@ impl LaminarDB {
     }
 
     /// Static (reference/dimension) table names — valid right sides for a changelog enrich join.
-    pub(super) fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
+    pub(crate) fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
         let on_demand: rustc_hash::FxHashSet<String> = self
             .connector_manager
             .lock()

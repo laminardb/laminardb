@@ -92,10 +92,11 @@ impl LaminarDB {
             .await?;
         self.revalidate_persisted_cluster_query_shapes(&streams)
             .await?;
+        // Cluster mode admits no changelog source.
         let mut resolved = super::resolve_stream_output_schemas(
             &self.ctx,
             &streams,
-            &rustc_hash::FxHashSet::default(),
+            &self.static_table_names(),
             &interval.joins,
             &rustc_hash::FxHashSet::default(),
         )

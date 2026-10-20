@@ -23,7 +23,10 @@ pub(super) async fn assert_runtime_routing(
         .inputs
         .iter()
         .find_map(|(port, exchange)| match (port, exchange) {
-            (InputPort::Input(_), PortExchange::Repartition(key)) => Some(key.0.as_slice()),
+            (
+                InputPort::Input(_),
+                PortExchange::Colocated(key) | PortExchange::Repartition(key),
+            ) => Some(key.0.as_slice()),
             (InputPort::Input(_), PortExchange::Gather { .. }) => Some(&[][..]),
             _ => None,
         });

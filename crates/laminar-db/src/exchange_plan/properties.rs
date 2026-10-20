@@ -67,6 +67,8 @@ impl InputPort {
 pub(crate) enum PortExchange {
     /// Rows stay on the node that produced them.
     Forward,
+    /// Rows already sit on the owner of the vnode of this key, so none move.
+    Colocated(PartitionKey),
     /// Rows move to the owner of the vnode of their key.
     Repartition(PartitionKey),
     /// Rows move to the owner of one vnode.
@@ -134,6 +136,7 @@ impl fmt::Display for PortExchange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Forward => f.write_str("forward"),
+            Self::Colocated(key) => write!(f, "colocated on ({key})"),
             Self::Repartition(key) => write!(f, "repartition on ({key})"),
             Self::Gather { vnode } => write!(f, "gather to vnode {vnode}"),
         }

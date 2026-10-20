@@ -551,21 +551,10 @@ impl LaminarDB {
                 std::time::Duration::from_millis,
             );
 
-        let reference_tables: rustc_hash::FxHashSet<String> = self
-            .table_store
-            .read()
-            .table_names()
-            .into_iter()
-            .filter(|name| {
-                !table_regs
-                    .get(name)
-                    .is_some_and(|registration| registration.on_demand)
-            })
-            .collect();
         let resolved_stream_outputs = resolve_stream_output_schemas(
             &self.ctx,
             &stream_regs,
-            &reference_tables,
+            &self.static_table_names(),
             &ordered_interval_admissions.joins,
             &mutation_routes.changelog,
         )

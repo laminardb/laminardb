@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arrow::datatypes::{Field, Schema};
+use datafusion::common::Column;
 use datafusion::prelude::SessionContext;
-use datafusion_expr::{Expr, LogicalPlan};
+use datafusion_expr::{Expr, LogicalPlan, Projection};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig};
 use rustc_hash::FxHashSet;
@@ -107,31 +108,35 @@ async fn plan_stream(
         && crate::sql_analysis::detect_changelog_enrich_query(sql, changelog, reference_tables)
             .is_some();
     let join = if let Some(config) = temporal_join(registration) {
-        Some(
+        Some((
             join_ports(
                 ctx,
                 (&config.left_table, &config.left_key_columns),
                 (&config.right_table, &config.right_key_columns),
             )
             .await,
-        )
+            Distribution::Arbitrary,
+        ))
     } else if let Some(config) = interval_join(registration, enrich) {
-        Some(
+        Some((
             join_ports(
                 ctx,
                 (&config.left_table, &config.left_keys),
                 (&config.right_table, &config.right_keys),
             )
             .await,
-        )
+            logical.map_or(Distribution::Arbitrary, |logical| {
+                interval_join_output(logical, &config)
+            }),
+        ))
     } else {
         None
     };
-    if let Some(inputs) = join {
+    if let Some((inputs, distribution)) = join {
         return Ok(StreamPlan {
             inputs: inputs.map_err(unplannable)?,
             output: StreamProperties {
-                distribution: Distribution::Arbitrary,
+                distribution,
                 changelog: if weighted {
                     ChangelogKind::Weighted
                 } else {
@@ -166,7 +171,7 @@ async fn plan_stream(
                 logical,
                 &aggregate.group_exprs,
                 &aggregate.schema,
-                input,
+                (input, &input_properties(input).distribution),
                 closes_windows,
                 changelog,
             ));
@@ -283,12 +288,14 @@ fn forwarding(
 }
 
 /// A managed aggregate routes on its group expressions; a window excludes its boundary markers.
-/// Without a key it gathers to the global vnode.
+/// Without a key it gathers to the global vnode. A keyed aggregate whose input is already hashed
+/// on exactly that key is colocated; only the aggregate operator honours that, so windows always
+/// repartition.
 fn keyed_aggregate(
     logical: &LogicalPlan,
     group_exprs: &[Expr],
     schema: &Schema,
-    input: &str,
+    (input, upstream): (&str, &Distribution),
     window: bool,
     changelog: ChangelogKind,
 ) -> StreamPlan {
@@ -305,12 +312,19 @@ fn keyed_aggregate(
             },
         )
     } else {
-        let key = groups
-            .iter()
-            .map(|&group| group_key(&group_exprs[group], schema.field(group)))
-            .collect();
+        let key = PartitionKey(
+            groups
+                .iter()
+                .map(|&group| group_key(&group_exprs[group], schema.field(group)))
+                .collect(),
+        );
+        let colocated = !window && matches!(upstream, Distribution::Hash(hashed) if *hashed == key);
         (
-            PortExchange::Repartition(PartitionKey(key)),
+            if colocated {
+                PortExchange::Colocated(key)
+            } else {
+                PortExchange::Repartition(key)
+            },
             aggregate_output_key(logical, &groups)
                 .map_or(Distribution::Arbitrary, Distribution::Hash),
         )
@@ -357,28 +371,87 @@ fn group_key(expr: &Expr, field: &Field) -> KeyColumn {
 /// projected as a bare column.
 fn aggregate_output_key(logical: &LogicalPlan, groups: &[usize]) -> Option<PartitionKey> {
     let projection = crate::aggregate_state::find_post_aggregate_projection(logical).ok()?;
-    let output = logical.schema();
     let columns = groups
         .iter()
         .map(|&group| {
             let index = match projection {
                 None => group,
-                Some(projection) => projection.expr.iter().position(|expr| {
-                    matches!(
-                        unaliased(expr),
-                        Expr::Column(column)
-                            if projection.input.schema().index_of_column(column).ok() == Some(group)
-                    )
-                })?,
+                Some(projection) => forwarding_output(projection, group)?,
             };
-            let field = output.field(index);
-            Some(KeyColumn::Column {
-                name: field.name().clone(),
-                data_type: field.data_type().clone(),
-            })
+            Some(output_column(logical, index))
         })
         .collect::<Option<Vec<_>>>()?;
     Some(PartitionKey(columns))
+}
+
+/// An interval join emits every row on the owner of the key of a side the row always carries:
+/// either side for inner matches, the preserved side for outer, semi and anti joins. A full outer
+/// join's unmatched rows carry only one side, so its output has no key.
+fn interval_join_output(logical: &LogicalPlan, config: &StreamJoinConfig) -> Distribution {
+    use laminar_sql::parser::join_parser::JoinType;
+
+    let left = (true, config.left_keys.as_slice());
+    let right = (false, config.right_keys.as_slice());
+    let sides: &[(bool, &[String])] = match config.join_type {
+        JoinType::Inner => &[left, right],
+        JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => &[left],
+        JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => &[right],
+        JoinType::Full => &[],
+    };
+    let LogicalPlan::Projection(projection) = logical else {
+        return Distribution::Arbitrary;
+    };
+    let mut below = projection.input.as_ref();
+    while let LogicalPlan::Filter(filter) = below {
+        below = filter.input.as_ref();
+    }
+    let LogicalPlan::Join(join) = below else {
+        return Distribution::Arbitrary;
+    };
+    sides
+        .iter()
+        .find_map(|&(is_left, keys)| {
+            let side = if is_left { &join.left } else { &join.right };
+            keys.iter()
+                .map(|name| {
+                    let (qualifier, _) = side
+                        .schema()
+                        .qualified_field_with_unqualified_name(name)
+                        .ok()?;
+                    let input = projection
+                        .input
+                        .schema()
+                        .index_of_column(&Column::new(qualifier.cloned(), name))
+                        .ok()?;
+                    Some(output_column(
+                        logical,
+                        forwarding_output(projection, input)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .map_or(Distribution::Arbitrary, |key| {
+            Distribution::Hash(PartitionKey(key))
+        })
+}
+
+/// The output position that forwards input column `input` of `projection` unchanged.
+fn forwarding_output(projection: &Projection, input: usize) -> Option<usize> {
+    projection.expr.iter().position(|expr| {
+        matches!(
+            unaliased(expr),
+            Expr::Column(column)
+                if projection.input.schema().index_of_column(column).ok() == Some(input)
+        )
+    })
+}
+
+fn output_column(logical: &LogicalPlan, index: usize) -> KeyColumn {
+    let field = logical.schema().field(index);
+    KeyColumn::Column {
+        name: field.name().clone(),
+        data_type: field.data_type().clone(),
+    }
 }
 
 /// A stateless projection keeps its input's hash key when every key column is forwarded as a bare

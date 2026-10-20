@@ -189,7 +189,7 @@ async fn interval_join_repartitions_each_side_and_union_forwards() {
                 "exchange.input.right:payments",
                 "repartition on (k Int64) from arbitrary, append-only"
             ),
-            ("exchange.output", "arbitrary, append-only"),
+            ("exchange.output", "hash(k Int64), append-only"),
         ])
     );
     assert_eq!(
@@ -209,6 +209,106 @@ async fn interval_join_repartitions_each_side_and_union_forwards() {
             ),
             ("exchange.output", "arbitrary, append-only"),
         ])
+    );
+}
+
+const JOIN_BOUND: &str = "ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND";
+
+#[tokio::test]
+async fn interval_join_output_is_hashed_on_the_side_every_row_carries() {
+    let db = db(&[ORDERS, PAYMENTS]).await;
+    for (join, projection, output) in [
+        (
+            "INNER",
+            "p.k AS pk, o.v AS ov",
+            "hash(pk Int64), append-only",
+        ),
+        (
+            "LEFT",
+            "o.k AS ok, p.k AS pk",
+            "hash(ok Int64), append-only",
+        ),
+        (
+            "RIGHT",
+            "o.k AS ok, p.k AS pk",
+            "hash(pk Int64), append-only",
+        ),
+        ("FULL", "o.k AS ok, p.k AS pk", "arbitrary, append-only"),
+        (
+            "INNER",
+            "o.k + 1 AS k1, o.v AS ov",
+            "arbitrary, append-only",
+        ),
+    ] {
+        let rows = exchange(
+            &db,
+            &format!(
+                "CREATE STREAM joined AS SELECT {projection} FROM orders o \
+                 {join} JOIN payments p {JOIN_BOUND}"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows.last(),
+            Some(&("exchange.output".to_string(), output.to_string())),
+            "{join} JOIN {projection}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn aggregate_on_its_input_hash_key_is_colocated() {
+    let db = db(&[
+        ORDERS,
+        PAYMENTS,
+        &format!(
+            "CREATE STREAM joined AS SELECT o.k AS k, o.v AS ov, p.v AS pv FROM orders o \
+             INNER JOIN payments p {JOIN_BOUND}"
+        ),
+        "CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM orders GROUP BY k EMIT CHANGES",
+    ])
+    .await;
+    assert_eq!(
+        exchange(
+            &db,
+            "CREATE STREAM per_join_key AS SELECT k, SUM(pv) AS total FROM joined GROUP BY k \
+             EMIT CHANGES"
+        )
+        .await,
+        rows(&[
+            (
+                "exchange.input.joined",
+                "colocated on (k Int64) from hash(k Int64), append-only"
+            ),
+            ("exchange.output", "hash(k Int64), weighted changelog"),
+        ])
+    );
+    assert_eq!(
+        exchange(
+            &db,
+            "CREATE STREAM chained AS SELECT k, SUM(n) AS total FROM per_key GROUP BY k \
+             EMIT CHANGES"
+        )
+        .await,
+        rows(&[
+            (
+                "exchange.input.per_key",
+                "colocated on (k Int64) from hash(k Int64), weighted changelog"
+            ),
+            ("exchange.output", "hash(k Int64), weighted changelog"),
+        ])
+    );
+    assert_eq!(
+        exchange(
+            &db,
+            "CREATE STREAM by_value AS SELECT ov, COUNT(*) AS n FROM joined GROUP BY ov \
+             EMIT CHANGES"
+        )
+        .await[0],
+        (
+            "exchange.input.joined".to_string(),
+            "repartition on (ov Int64) from hash(k Int64), append-only".to_string()
+        )
     );
 }
 
