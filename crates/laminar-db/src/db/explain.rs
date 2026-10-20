@@ -11,6 +11,7 @@ use laminar_sql::planner::StreamingPlan;
 use super::LaminarDB;
 use crate::error::DbError;
 use crate::handle::ExecuteResult;
+use crate::pipeline_lifecycle::ResolvedStreamOutputs;
 
 impl LaminarDB {
     pub(super) async fn handle_explain(
@@ -147,7 +148,8 @@ impl LaminarDB {
     }
 
     /// One `exchange.input.<port>` row per input port and one `exchange.output` row, derived
-    /// against the current catalog exactly as admission would derive the stream.
+    /// against the current catalog exactly as admission would derive the stream. A split
+    /// statement lists each stage's SQL as `stage.<name>`, followed by that stage's rows.
     async fn exchange_rows(&self, statement: &StreamingStatement) -> Vec<(String, String)> {
         let StreamingStatement::CreateStream {
             name,
@@ -162,7 +164,11 @@ impl LaminarDB {
         let result = async {
             let stream = super::canonical_object_name(name)?;
             if let Some(split) = self.split_stream_query(&stream, query_sql)? {
-                return Ok(split_rows(&stream, &split));
+                let candidates = self
+                    .split_stream_candidates(&stream, &split, emit_clause.as_ref())
+                    .await?;
+                let resolved = self.resolve_catalog_stream_outputs(candidates).await?;
+                return split_rows(&resolved, &stream, &split);
             }
             let planned = self
                 .plan_streaming_query(name, query, emit_clause.clone(), query_sql)
@@ -172,25 +178,7 @@ impl LaminarDB {
                     planned.candidate_registration(&stream, query_sql),
                 ))
                 .await?;
-            let plan = resolved
-                .exchange_plan
-                .stream(&stream)
-                .ok_or_else(|| DbError::Pipeline(format!("stream '{stream}' was not planned")))?;
-            let mut rows: Vec<(String, String)> = plan
-                .inputs
-                .iter()
-                .map(|(port, exchange)| {
-                    let upstream = resolved
-                        .exchange_plan
-                        .upstream_properties(port.upstream(), &resolved.changelog_carrying);
-                    (
-                        format!("exchange.input.{port}"),
-                        format!("{exchange} from {upstream}"),
-                    )
-                })
-                .collect();
-            rows.push(("exchange.output".into(), plan.output.to_string()));
-            Ok::<_, DbError>(rows)
+            stream_rows(&resolved, &stream, "")
         };
         result
             .await
@@ -198,23 +186,49 @@ impl LaminarDB {
     }
 }
 
-/// Later stages read earlier ones, so their exchanges are derived only when CREATE registers them.
-fn split_rows(owner: &str, split: &crate::sql_analysis::SplitQuery) -> Vec<(String, String)> {
-    split
-        .stages
+fn split_rows(
+    resolved: &ResolvedStreamOutputs,
+    owner: &str,
+    split: &crate::sql_analysis::SplitQuery,
+) -> Result<Vec<(String, String)>, DbError> {
+    let stages = split.stages.iter().map(|stage| {
+        let emit = if stage.changelog { " EMIT CHANGES" } else { "" };
+        (stage.name.as_str(), format!("{}{emit}", stage.sql))
+    });
+    let mut rows = Vec::new();
+    for (stage, sql) in stages.chain(std::iter::once((owner, split.query_sql.clone()))) {
+        let prefix = format!("stage.{stage}");
+        let exchanges = stream_rows(resolved, stage, &format!("{prefix}."))?;
+        rows.push((prefix, sql));
+        rows.extend(exchanges);
+    }
+    Ok(rows)
+}
+
+fn stream_rows(
+    resolved: &ResolvedStreamOutputs,
+    stream: &str,
+    prefix: &str,
+) -> Result<Vec<(String, String)>, DbError> {
+    let plan = resolved
+        .exchange_plan
+        .stream(stream)
+        .ok_or_else(|| DbError::Pipeline(format!("stream '{stream}' was not planned")))?;
+    let mut rows: Vec<(String, String)> = plan
+        .inputs
         .iter()
-        .map(|stage| {
-            let emit = if stage.changelog { " EMIT CHANGES" } else { "" };
+        .map(|(port, exchange)| {
+            let upstream = resolved
+                .exchange_plan
+                .upstream_properties(port.upstream(), &resolved.changelog_carrying);
             (
-                format!("stage.{}", stage.name),
-                format!("{}{emit}", stage.sql),
+                format!("{prefix}exchange.input.{port}"),
+                format!("{exchange} from {upstream}"),
             )
         })
-        .chain(std::iter::once((
-            format!("stage.{owner}"),
-            split.query_sql.clone(),
-        )))
-        .collect()
+        .collect();
+    rows.push((format!("{prefix}exchange.output"), plan.output.to_string()));
+    Ok(rows)
 }
 
 fn metadata(rows: &[(String, String)], context: &str) -> Result<ExecuteResult, DbError> {

@@ -470,11 +470,11 @@ impl LaminarDB {
         reservation.commit();
         Ok(())
     }
-    /// Resolve every registered stream's output, plus `candidate` when given, against the
-    /// current catalog.
+    /// Resolve every registered stream's output, plus each of `candidates`, against the current
+    /// catalog.
     pub(crate) async fn resolve_catalog_stream_outputs(
         &self,
-        candidate: Option<crate::connector_manager::StreamRegistration>,
+        candidates: impl IntoIterator<Item = crate::connector_manager::StreamRegistration>,
     ) -> Result<crate::pipeline_lifecycle::ResolvedStreamOutputs, DbError> {
         let (source_regs, sink_regs, mut stream_regs) = {
             let manager = self.connector_manager.lock();
@@ -494,7 +494,7 @@ impl LaminarDB {
             .await?;
         let changelog_sources =
             self.validate_changelog_source_routes(&source_regs, &ordered, self.runtime_mode())?;
-        if let Some(candidate) = candidate {
+        for candidate in candidates {
             stream_regs.insert(candidate.name.clone(), candidate);
         }
         crate::pipeline_lifecycle::resolve_stream_output_schemas(

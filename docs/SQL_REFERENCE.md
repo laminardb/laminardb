@@ -638,8 +638,9 @@ each other node sends one partial row per input batch instead of its rows), or `
 watermark on that column (a source's own, or one a projection forwards unchanged).
 
 For a statement that is split into stages, `EXPLAIN` lists each stage's SQL as a
-`stage.<name>` row instead. Later stages read earlier ones, so their exchanges are derived when
-`CREATE` registers them.
+`stage.<name>` row, followed by that stage's `stage.<name>.exchange.*` rows. An aggregate that
+groups by exactly the key its join stage is hashed on (that stage's `exchange.output` row) reads
+the stage `colocated`, so no rows move between them.
 
 ### EXPLAIN ANALYZE
 

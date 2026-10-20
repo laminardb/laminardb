@@ -8,6 +8,7 @@ use laminar_core::catalog::CatalogObjectKind;
 use laminar_sql::parser::{EmitClause, StreamingStatement};
 use sqlparser::ast::Ident;
 
+use crate::connector_manager::StreamRegistration;
 use crate::db::LaminarDB;
 use crate::error::DbError;
 use crate::sql_analysis::SplitQuery;
@@ -96,6 +97,40 @@ impl LaminarDB {
             ..owner
         };
         self.create_stream_object(definition, reservation).await
+    }
+
+    /// The registrations CREATE would give each stage and then the owner, for planning a split
+    /// statement without creating it.
+    pub(crate) async fn split_stream_candidates(
+        &self,
+        owner: &str,
+        split: &SplitQuery,
+        owner_emit: Option<&EmitClause>,
+    ) -> Result<Vec<StreamRegistration>, DbError> {
+        let stages = split.stages.iter().map(|stage| {
+            let emit = stage.changelog.then_some(EmitClause::Changes);
+            (stage.name.as_str(), stage.sql.as_str(), emit)
+        });
+        let owner = (owner, split.query_sql.as_str(), owner_emit.cloned());
+        let mut candidates = Vec::with_capacity(split.stages.len() + 1);
+        for (name, sql, emit) in stages.chain(std::iter::once(owner)) {
+            let statement = parse_stage(name, sql, emit.as_ref())?;
+            let StreamingStatement::CreateStream {
+                name: object,
+                query,
+                emit_clause,
+                query_sql,
+                ..
+            } = &statement
+            else {
+                return Err(stage_parse_error(name));
+            };
+            let planned = self
+                .plan_streaming_query(object, query, emit_clause.clone(), query_sql)
+                .await?;
+            candidates.push(planned.candidate_registration(name, query_sql));
+        }
+        Ok(candidates)
     }
 
     async fn drop_stream_stages(&self, owner: &str) -> Result<(), DbError> {
@@ -385,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explain_lists_each_stage() {
+    async fn explain_lists_each_stage_with_its_exchanges() {
         let db = db(&[]).await;
         let explained = metadata(db.execute(&format!("EXPLAIN {FUSED}")).await.unwrap());
         let stages: Vec<_> = explained
@@ -402,10 +437,34 @@ mod tests {
                      AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
                 ),
                 (
+                    "stage.out$stage1.exchange.input.left:orders",
+                    "repartition on (k Int64) from arbitrary, append-only, event time ts"
+                ),
+                (
+                    "stage.out$stage1.exchange.input.right:payments",
+                    "repartition on (k Int64) from arbitrary, append-only, event time ts"
+                ),
+                (
+                    "stage.out$stage1.exchange.output",
+                    "hash(o_k Int64), append-only"
+                ),
+                (
                     "stage.out",
                     "SELECT \"o_k\" AS k, COUNT(*) AS n FROM \"out$stage1\" GROUP BY \"o_k\""
                 ),
+                (
+                    "stage.out.exchange.input.out$stage1",
+                    "colocated on (o_k Int64) from hash(o_k Int64), append-only"
+                ),
+                (
+                    "stage.out.exchange.output",
+                    "hash(k Int64), weighted changelog"
+                ),
             ]
         );
+        assert!(!db
+            .ctx
+            .table_exist(exact_table_reference("out$stage1"))
+            .unwrap());
     }
 }
