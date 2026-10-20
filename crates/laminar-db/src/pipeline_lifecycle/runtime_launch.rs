@@ -577,6 +577,7 @@ impl LaminarDB {
                 &stream_regs,
                 &table_regs,
                 &resolved_stream_outputs.changelog_carrying,
+                &resolved_stream_outputs.exchange_plan,
                 &ordered_interval_admissions.joins,
                 pipeline_identity.as_ref(),
             )?,
@@ -586,6 +587,7 @@ impl LaminarDB {
             &stream_regs,
             &table_regs,
             &resolved_stream_outputs.changelog_carrying,
+            &resolved_stream_outputs.exchange_plan,
             &ordered_interval_admissions.joins,
             pipeline_identity.as_ref(),
         )?;

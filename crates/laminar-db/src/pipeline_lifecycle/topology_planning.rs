@@ -199,6 +199,7 @@ impl LaminarDB {
                 &streams,
                 &tables,
                 &resolved.changelog_carrying,
+                &resolved.exchange_plan,
                 &interval.joins,
                 &input.descriptor().target_pipeline,
                 scope,
@@ -208,6 +209,7 @@ impl LaminarDB {
                 &streams,
                 &tables,
                 &resolved.changelog_carrying,
+                &resolved.exchange_plan,
                 &interval.joins,
                 None,
             )?

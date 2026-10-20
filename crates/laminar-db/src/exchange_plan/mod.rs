@@ -41,6 +41,20 @@ impl ExchangePlan {
         self.streams.get(name)
     }
 
+    /// Streams whose aggregate input is colocated with its upstream.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn colocated_aggregates(&self) -> FxHashSet<String> {
+        self.streams
+            .iter()
+            .filter(|(_, plan)| {
+                plan.inputs
+                    .values()
+                    .any(|exchange| matches!(exchange, PortExchange::Colocated(_)))
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// What an input port reads from `upstream`: a planned stream's output, otherwise a source,
     /// which is a weighted changelog when `changelog` names it.
     pub(crate) fn upstream_properties(

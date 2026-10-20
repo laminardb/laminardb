@@ -13,6 +13,7 @@ impl LaminarDB {
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
         changelog_carrying: &rustc_hash::FxHashSet<String>,
+        exchange_plan: &crate::exchange_plan::ExchangePlan,
         ordered_interval_joins: &FxHashMap<
             String,
             [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
@@ -23,6 +24,7 @@ impl LaminarDB {
             stream_regs,
             table_regs,
             changelog_carrying,
+            exchange_plan,
             ordered_interval_joins,
             pipeline_identity,
             None,
@@ -36,6 +38,7 @@ impl LaminarDB {
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
         changelog_carrying: &rustc_hash::FxHashSet<String>,
+        exchange_plan: &crate::exchange_plan::ExchangePlan,
         ordered_interval_joins: &FxHashMap<
             String,
             [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
@@ -47,6 +50,7 @@ impl LaminarDB {
             stream_regs,
             table_regs,
             changelog_carrying,
+            exchange_plan,
             ordered_interval_joins,
             Some(pipeline_identity),
             Some(scope),
@@ -59,6 +63,7 @@ impl LaminarDB {
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
         changelog_carrying: &rustc_hash::FxHashSet<String>,
+        exchange_plan: &crate::exchange_plan::ExchangePlan,
         ordered_interval_joins: &FxHashMap<
             String,
             [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
@@ -190,6 +195,10 @@ impl LaminarDB {
 
         // Seed changelog producers up front so consumer admission is independent of build order.
         graph.set_changelog_tables(changelog_carrying.clone());
+        #[cfg(feature = "cluster")]
+        graph.set_colocated_aggregates(exchange_plan.colocated_aggregates());
+        #[cfg(not(feature = "cluster"))]
+        let _ = exchange_plan;
 
         self.install_registered_operators(&mut graph, stream_regs)?;
 
@@ -502,6 +511,7 @@ mod tests {
                 &streams,
                 &HashMap::new(),
                 &rustc_hash::FxHashSet::default(),
+                &crate::exchange_plan::ExchangePlan::default(),
                 &FxHashMap::default(),
                 None,
             )

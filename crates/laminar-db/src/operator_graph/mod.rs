@@ -1130,6 +1130,8 @@ pub(crate) struct OperatorGraph {
     #[cfg(feature = "cluster")]
     subscription_certificates:
         FxHashMap<String, Arc<laminar_core::checkpoint::OutputDistributionCertificate>>,
+    #[cfg(feature = "cluster")]
+    colocated_aggregates: FxHashSet<String>,
     // One immutable assignment transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
@@ -1193,6 +1195,8 @@ impl OperatorGraph {
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
             subscription_certificates: FxHashMap::default(),
+            #[cfg(feature = "cluster")]
+            colocated_aggregates: FxHashSet::default(),
             #[cfg(feature = "cluster")]
             pending_vnode_transition: None,
             #[cfg(feature = "cluster")]
@@ -2802,6 +2806,8 @@ impl OperatorGraph {
         self.output_map.remove(name);
         #[cfg(feature = "cluster")]
         self.subscription_certificates.remove(name);
+        #[cfg(feature = "cluster")]
+        self.colocated_aggregates.remove(name);
         self.changelog_tables.remove(name);
         self.live_handles.remove(name);
         self.intermediate_schemas.remove(name);

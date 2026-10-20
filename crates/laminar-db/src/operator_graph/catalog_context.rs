@@ -77,6 +77,18 @@ impl OperatorGraph {
         self.subscription_certificates = certificates;
     }
 
+    /// Install the aggregates whose input the exchange plan colocates, before they are built.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_colocated_aggregates(&mut self, streams: FxHashSet<String>) {
+        if !self.nodes.is_empty() {
+            self.build_errors.push(DbError::Config(
+                "colocated aggregates must be installed before graph operators".into(),
+            ));
+            return;
+        }
+        self.colocated_aggregates = streams;
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) fn subscription_certificates(
         &self,
@@ -102,6 +114,9 @@ impl OperatorGraph {
                 u32::from(self.key_group_count)
             );
             operator.attach_cluster_shuffle(config.clone());
+            if self.colocated_aggregates.contains(name) {
+                operator.colocate_input();
+            }
         }
         if let Some(certificate) = self.subscription_certificates.get(name) {
             operator.attach_subscription_certificate(Arc::clone(certificate))?;

@@ -2,6 +2,8 @@
 //!
 //! `keyed`: 1,024 distinct `BIGINT` groups with COUNT/SUM/AVG.
 //! `global`: the same aggregates without GROUP BY (singleton vnode).
+//! `cluster_one_node`: the keyed `EMIT CHANGES` aggregate operator on a one-node cluster
+//! assignment, repartitioning every batch or applying it whole on a colocated input.
 //!
 //! Run with: `cargo bench -p laminar-db --features benchmark-internals --bench aggregate_bench`
 
@@ -11,7 +13,7 @@ use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use datafusion::datasource::MemTable;
-use laminar_db::AggregateBenchmark;
+use laminar_db::{AggregateBenchmark, ClusterAggregateBenchmark};
 
 const ROWS: usize = 4096;
 const DISTINCT_KEYS: i64 = 1024;
@@ -75,5 +77,31 @@ fn bench_update(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_update);
+fn bench_cluster_routing(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let batch = input();
+    let mut group = c.benchmark_group("agg/cluster_one_node");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    for (name, colocated) in [("repartition", false), ("colocated", true)] {
+        let ctx = laminar_sql::create_session_context();
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).unwrap();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+        let mut aggregate = rt
+            .block_on(ClusterAggregateBenchmark::new(
+                ctx,
+                "SELECT k, COUNT(*) AS n, SUM(v) AS s, AVG(p) AS a FROM events GROUP BY k",
+                colocated,
+            ))
+            .unwrap();
+        group.bench_function(BenchmarkId::from_parameter(name), |b| {
+            b.iter(|| rt.block_on(aggregate.process(&batch)).unwrap());
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_update, bench_cluster_routing);
 criterion_main!(benches);

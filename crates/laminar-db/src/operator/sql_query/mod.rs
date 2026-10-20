@@ -53,12 +53,16 @@ use crate::sql_analysis::{
 mod apply_failure;
 mod batch_coalescing;
 #[cfg(feature = "cluster")]
+mod routing;
+#[cfg(feature = "cluster")]
 mod subscription_output;
 
 use apply_failure::stateful_apply_outcome_unknown;
 pub(crate) use batch_coalescing::{coalesce_aggregate_batches, AggregateBatchCoalescing};
 #[cfg(test)]
 use batch_coalescing::{LOCAL_AGG_COALESCE_MAX_BATCH_ROWS, LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES};
+#[cfg(feature = "cluster")]
+pub(crate) use routing::{hash_rows_to_vnodes, AggregateInputRoute};
 
 // Resolved on first `process()` call by introspecting the SQL.
 enum QueryState {
@@ -758,6 +762,8 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
+    input_route: AggregateInputRoute,
+    #[cfg(feature = "cluster")]
     cluster_assignment: Option<VnodeAssignmentSnapshot>,
     #[cfg(feature = "cluster")]
     cluster_assignment_digest: Option<[u8; 32]>,
@@ -837,6 +843,8 @@ impl SqlQueryOperator {
             cached_local_aggregate_output: None,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster")]
+            input_route: AggregateInputRoute::Repartition,
             #[cfg(feature = "cluster")]
             cluster_assignment: None,
             #[cfg(feature = "cluster")]
@@ -1848,105 +1856,6 @@ impl SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn plan_cluster_batches(
-        &self,
-        batches: Vec<RecordBatch>,
-        local_frontier: InputFrontier,
-        config: &ClusterShuffleConfig,
-        assignment: &VnodeAssignmentSnapshot,
-        peers: &[u64],
-    ) -> Result<AggClusterInputPlan, DbError> {
-        let QueryState::Agg(aggregate) = &self.state else {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' is not initialized",
-                self.op_name
-            )));
-        };
-        let mut local_batches = Vec::new();
-        let mut remote_data = BTreeMap::<u64, Vec<ShuffleMessage>>::new();
-        for batch in batches.into_iter().filter(|batch| batch.num_rows() != 0) {
-            let row_vnodes = hash_rows_to_vnodes(
-                &batch,
-                aggregate.num_group_cols(),
-                u32::from(self.key_group_count),
-            )
-            .map_err(|error| {
-                crate::operator::shuffle_routing_error(
-                    &format!("aggregate [{}] routing", self.op_name),
-                    &error,
-                )
-            })?;
-            let plan = laminar_core::shuffle::route_checkpointed_batch(
-                &batch,
-                &row_vnodes,
-                assignment,
-                config.self_id,
-            )
-            .map_err(|error| {
-                crate::operator::shuffle_routing_error(
-                    &format!("aggregate [{}] routing", self.op_name),
-                    &error,
-                )
-            })?;
-            local_batches.extend(
-                plan.local
-                    .into_iter()
-                    .map(|route| (route.batch, Some(route.vnode))),
-            );
-            for route in plan.remote {
-                remote_data.entry(route.owner.0).or_default().push(
-                    ShuffleMessage::checkpointed_routed(
-                        self.op_name.to_string(),
-                        route.routed_vnodes,
-                        route.batch,
-                    ),
-                );
-            }
-        }
-        let mut outbound = Vec::new();
-        for &peer in peers {
-            let data = remote_data.remove(&peer);
-            let has_data = data.as_ref().is_some_and(|messages| !messages.is_empty());
-            if has_data && self.last_broadcast.idle && !local_frontier.idle {
-                outbound.push((
-                    peer,
-                    ShuffleMessage::Frontier {
-                        stage: self.op_name.to_string(),
-                        watermark: self.last_broadcast.watermark,
-                        idle: false,
-                    },
-                ));
-            }
-            if let Some(messages) = data {
-                outbound.extend(messages.into_iter().map(|message| (peer, message)));
-            }
-            if has_data || self.last_broadcast != local_frontier {
-                outbound.push((
-                    peer,
-                    ShuffleMessage::Frontier {
-                        stage: self.op_name.to_string(),
-                        watermark: local_frontier.watermark,
-                        idle: local_frontier.idle,
-                    },
-                ));
-            }
-        }
-        if !remote_data.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' routed data outside its peer roster",
-                self.op_name
-            )));
-        }
-        let effective_frontier = self.effective_cluster_frontier(local_frontier, None)?;
-        Ok(AggClusterInputPlan {
-            local_batches,
-            outbound,
-            local_frontier,
-            effective_frontier,
-        })
-    }
-
-    #[cfg(feature = "cluster")]
     fn next_remote_peer(&self) -> Option<u64> {
         if self.cluster_peers.is_empty() {
             return None;
@@ -2600,19 +2509,6 @@ impl SqlQueryOperator {
 
         Ok(batches)
     }
-}
-
-#[cfg(feature = "cluster")]
-pub(crate) fn hash_rows_to_vnodes(
-    batch: &RecordBatch,
-    num_group_cols: usize,
-    vnode_count: u32,
-) -> Result<Vec<u32>, laminar_core::shuffle::ShuffleRoutingError> {
-    if num_group_cols == 0 || batch.num_rows() == 0 {
-        return Ok(vec![0; batch.num_rows()]);
-    }
-    let columns: Vec<usize> = (0..num_group_cols).collect();
-    laminar_core::shuffle::row_vnodes(batch, &columns, vnode_count)
 }
 
 #[async_trait]

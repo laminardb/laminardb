@@ -116,6 +116,7 @@ async fn restorable_fixture_with_statements(
             &streams,
             &HashMap::new(),
             &rustc_hash::FxHashSet::from_iter(["totals".into()]),
+            &crate::exchange_plan::ExchangePlan::default(),
             &rustc_hash::FxHashMap::default(),
             &descriptor.parent_pipeline,
             crate::operator::sql_query::ClusterShuffleConfig {

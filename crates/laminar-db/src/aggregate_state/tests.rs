@@ -527,6 +527,52 @@ fn frame_signature(
         .collect()
 }
 
+/// A colocated aggregate applies whole batches and derives each group's vnode itself, so that
+/// vnode must equal the shuffle's per-row vnode for every key type, nulls included.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn group_vnode_matches_shuffle_row_vnode() {
+    let key_groups = KeyGroupCount::try_from(64_u16).unwrap();
+    let (_, state) = setup_agg_state_for_key_groups(
+        "SELECT name, CAST(value AS BIGINT) AS k, COUNT(*) AS n FROM events \
+         GROUP BY name, CAST(value AS BIGINT)",
+        true,
+        key_groups,
+    )
+    .await;
+    let keys = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("k", DataType::Int64, true),
+        ])),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec![
+                Some("a"),
+                None,
+                Some(""),
+                Some("long key value"),
+                None,
+            ])),
+            Arc::new(arrow::array::Int64Array::from(vec![
+                Some(1),
+                Some(-7),
+                None,
+                Some(i64::MAX),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let vnode_count = NonZeroU32::new(u32::from(key_groups.get())).unwrap();
+    let rows = state.row_converter.convert_columns(keys.columns()).unwrap();
+    let group_vnodes: Vec<u32> = (0..keys.num_rows())
+        .map(|row| IncrementalAggState::vnode_for_group_key(2, &rows.row(row).owned(), vnode_count))
+        .collect();
+    let routed =
+        crate::operator::sql_query::hash_rows_to_vnodes(&keys, 2, vnode_count.get()).unwrap();
+    assert_eq!(group_vnodes, routed);
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn partitioned_changelog_is_canonical_and_sequence_commit_is_transactional() {

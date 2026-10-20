@@ -399,6 +399,9 @@ pub struct EngineMetrics {
     pub coordinated_recovery_failures_total: IntCounter,
     /// Shuffle delivery-loss incidents; each one fences an epoch and forces replay.
     pub shuffle_delivery_loss_incidents_total: IntCounter,
+    /// Batches on a colocated aggregate input that held rows owned elsewhere and were
+    /// repartitioned; only expected around a vnode transition.
+    pub colocated_routing_fallbacks_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -718,6 +721,11 @@ impl EngineMetrics {
             shuffle_delivery_loss_incidents_total: reg!(IntCounter::new(
                 "shuffle_delivery_loss_incidents_total",
                 "Cross-node shuffle delivery-loss incidents (fences the epoch, forces replay)"
+            )
+            .unwrap()),
+            colocated_routing_fallbacks_total: reg!(IntCounter::new(
+                "colocated_routing_fallbacks_total",
+                "Colocated aggregate input batches repartitioned because rows were owned elsewhere"
             )
             .unwrap()),
         }

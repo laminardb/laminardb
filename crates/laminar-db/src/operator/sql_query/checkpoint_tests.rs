@@ -1071,6 +1071,61 @@ async fn checkpointed_remote_frontiers_compare_in_receiver_domain() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn colocated_input_applies_owned_batches_whole_and_repartitions_the_rest() {
+    let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+    let (context, _) = context_and_batch();
+    let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        Some(Arc::clone(&metrics)),
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    operator.colocate_input();
+    let (_, vnode_zero) = projected_batch_for_vnode(&operator, 0, 1);
+    let (_, vnode_two) = projected_batch_for_vnode(&operator, 2, 2);
+    let (_, remote) = projected_batch_for_vnode(&operator, 1, 3);
+    let concat = |batches: &[&RecordBatch]| {
+        arrow::compute::concat_batches(&batches[0].schema(), batches.iter().copied()).unwrap()
+    };
+    let owned = concat(&[&vnode_zero, &vnode_two]);
+    let assignment = scope.registry.versioned_snapshot();
+    let frontier = InputFrontier {
+        watermark: Some(10),
+        idle: false,
+    };
+    let is_data = |message: &ShuffleMessage| !matches!(message, ShuffleMessage::Frontier { .. });
+
+    let plan = operator
+        .plan_cluster_batches(vec![owned.clone()], frontier, &scope, &assignment, &[2])
+        .unwrap();
+    assert_eq!(plan.local_batches, [(owned, None)]);
+    assert!(!plan.outbound.iter().any(|(_, message)| is_data(message)));
+    assert_eq!(metrics.colocated_routing_fallbacks_total.get(), 0);
+
+    let plan = operator
+        .plan_cluster_batches(
+            vec![concat(&[&vnode_zero, &remote])],
+            frontier,
+            &scope,
+            &assignment,
+            &[2],
+        )
+        .unwrap();
+    assert_eq!(plan.local_batches, [(vnode_zero, Some(0))]);
+    assert!(plan
+        .outbound
+        .iter()
+        .any(|(peer, message)| *peer == 2 && is_data(message)));
+    assert_eq!(metrics.colocated_routing_fallbacks_total.get(), 1);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
     let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
     let (context, _) = context_and_batch();
