@@ -92,7 +92,7 @@ impl ConnectorPipelineCallback {
                         "shuffle flush wave {wave} received an all-idle activity vector but staged new replay; coordinated recovery is required"
                     )));
                 }
-                #[allow(clippy::cast_precision_loss)] // bounded by MAX_SHUFFLE_FLUSH_WAVE
+                #[allow(clippy::cast_precision_loss)] // below depth + FLUSH_WAVE_SLACK
                 self.prom
                     .checkpoint_shuffle_flush_waves
                     .observe((wave + 1) as f64);
@@ -109,20 +109,13 @@ impl ConnectorPipelineCallback {
                 );
                 return Ok(ShuffleAlignmentOutcome::Aligned);
             }
-            wave = wave.checked_add(1).ok_or_else(|| {
-                DbError::Checkpoint("shuffle flush wave counter overflowed u64".into())
-            })?;
+            wave += 1;
             let depth = self.graph.remote_exchange_depth();
             if wave >= depth.saturating_add(FLUSH_WAVE_SLACK) {
                 return Err(DbError::Checkpoint(format!(
                     "shuffle flush did not settle within {} waves for remote exchange depth {depth}; coordinated recovery is required",
                     depth.saturating_add(FLUSH_WAVE_SLACK)
                 )));
-            }
-            if wave > laminar_core::checkpoint::barrier::MAX_SHUFFLE_FLUSH_WAVE {
-                return Err(DbError::Checkpoint(
-                    "shuffle flush exhausted its reserved barrier wave field".into(),
-                ));
             }
         }
     }

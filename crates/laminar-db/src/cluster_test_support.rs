@@ -14,7 +14,7 @@ use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
 use tokio::sync::watch;
 
-pub(crate) const LEASE_TTL: Duration = Duration::from_secs(120);
+const LEASE_TTL: Duration = Duration::from_secs(120);
 
 struct PeerKv {
     node: NodeId,

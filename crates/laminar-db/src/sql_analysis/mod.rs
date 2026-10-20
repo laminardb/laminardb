@@ -37,7 +37,7 @@ pub(crate) use changelog::{
     ChangelogEnrichConfig, CHANGELOG_ENRICH_TMP,
 };
 pub(crate) use frame::{plan_frame_query, FrameQueryPlan, FRAME_TMP_TABLE};
-pub(crate) use hazards::{cluster_query_hazards, managed_core_window_source};
+pub(crate) use hazards::{cluster_query_hazards, managed_core_window_input};
 pub(crate) use join::{
     detect_stream_join_query, detect_unbounded_join_steps, has_join_clause,
     has_unaliased_projection, has_unqualified_interval_output_column, join_clause_count,

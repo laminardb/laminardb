@@ -78,13 +78,15 @@ pub(super) fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
 
 /// Stages are an implementation of their owner's statement, so nothing else may read them.
 pub(super) fn reject_stage_reads(query_sql: &str) -> Result<(), DbError> {
-    let references = crate::sql_analysis::extract_table_references(query_sql);
-    match references
+    crate::sql_analysis::extract_table_references(query_sql)
         .iter()
-        .find_map(|name| Some((name, crate::sql_analysis::stage_owner(name)?)))
-    {
-        Some((stage, owner)) => Err(DbError::InvalidOperation(format!(
-            "'{stage}' is an internal stage of stream '{owner}'; read '{owner}' instead"
+        .try_for_each(|input| reject_stage_read(input))
+}
+
+pub(super) fn reject_stage_read(input: &str) -> Result<(), DbError> {
+    match crate::sql_analysis::stage_owner(input) {
+        Some(owner) => Err(DbError::InvalidOperation(format!(
+            "'{input}' is an internal stage of stream '{owner}'; read '{owner}' instead"
         ))),
         None => Ok(()),
     }

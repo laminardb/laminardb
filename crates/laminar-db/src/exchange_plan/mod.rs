@@ -1,8 +1,9 @@
 //! Plan-time exchange plan: the distribution and changelog kind every stream provides, and how
 //! each consumer input port receives rows.
 //!
-//! The same plan is derived in every mode. It records what the operators do: every keyed port
-//! repartitions, and a global aggregate gathers to one vnode.
+//! The same plan is derived in every mode. It records what the operators do: a keyed port
+//! repartitions unless its input is already hashed on its key, and a global aggregate gathers to
+//! one vnode (partial rows in cluster mode).
 
 mod derivation;
 mod properties;

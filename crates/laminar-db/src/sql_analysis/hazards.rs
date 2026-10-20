@@ -185,9 +185,9 @@ pub(crate) fn cluster_query_hazards(sql: &str) -> Option<ClusterQueryHazards> {
     Some(visitor.hazards)
 }
 
-/// The single managed source relation of a certified managed window query, if the query
-/// shape is exactly the managed `TUMBLE`/`HOP`/`SESSION` aggregate form.
-pub(crate) fn managed_core_window_source(
+/// The single input relation (a source or a stream) of a certified managed window query, if the
+/// query shape is exactly the managed `TUMBLE`/`HOP`/`SESSION` aggregate form.
+pub(crate) fn managed_core_window_input(
     sql: &str,
     window: &WindowOperatorConfig,
 ) -> Option<String> {

@@ -459,11 +459,7 @@ impl LaminarDB {
         let (input, query_inputs) = match &create.from {
             laminar_sql::parser::SinkFrom::Table(table) => {
                 let input = canonical_object_name(table)?;
-                if let Some(owner) = crate::sql_analysis::stage_owner(&input) {
-                    return Err(DbError::InvalidOperation(format!(
-                        "'{input}' is an internal stage of stream '{owner}'; read '{owner}' instead"
-                    )));
-                }
+                super::catalog::reject_stage_read(&input)?;
                 (input, Vec::new())
             }
             laminar_sql::parser::SinkFrom::Query(_) => {

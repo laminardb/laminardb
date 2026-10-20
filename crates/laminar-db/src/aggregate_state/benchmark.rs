@@ -48,8 +48,7 @@ impl AggregateBenchmark {
             .evaluate(batch)
     }
 
-    /// Fold a projected batch into the accumulators, as the global owner does with rows a peer
-    /// shuffled to it.
+    /// Fold a projected batch into the accumulators, as the global owner does with its own rows.
     ///
     /// # Errors
     /// Returns accumulator errors.

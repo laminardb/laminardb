@@ -484,7 +484,7 @@ impl LaminarDB {
                 "a windowed join requires a planner-certified combined join/window vnode lifecycle",
             ));
         }
-        let input = crate::sql_analysis::managed_core_window_source(query_sql, window)
+        let input = crate::sql_analysis::managed_core_window_input(query_sql, window)
             .ok_or_else(|| {
                 reject(
                     "managed CoreWindow execution requires one input, an unqualified event-time column, and no nested or row-expanding query shape",
@@ -584,7 +584,7 @@ impl LaminarDB {
         };
         if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err() {
             return Err(reject(
-                "the distributed join supports only certified direct-source bounded equality joins with a positive finite event-time bound",
+                "the distributed join supports only bounded equality joins with a positive finite event-time bound",
             ));
         }
         let detected =
