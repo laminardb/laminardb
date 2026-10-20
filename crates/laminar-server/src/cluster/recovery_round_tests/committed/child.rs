@@ -255,7 +255,8 @@ impl DatabasePeer {
                 }
                 let ddl = [
                     "CREATE SOURCE recovery_input (account BIGINT, amount BIGINT, ts TIMESTAMP, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) FROM \"recovery-cut-probe\" ('fixture' = 'bounded-replay-v1')".into(),
-                    "CREATE STREAM recovery_output AS SELECT account, SUM(amount) AS total FROM recovery_input GROUP BY account".into(),
+                    // Split into a stage and an owner, so both take over the lost vnodes.
+                    "CREATE STREAM recovery_output AS SELECT account, SUM(total) AS total FROM (SELECT account, SUM(amount) AS total FROM recovery_input GROUP BY account) per_account GROUP BY account".into(),
                     "CREATE SINK recovery_probe FROM recovery_output INTO \"recovery-output-probe\" ('fixture' = 'bounded-replay-v1')".into(),
                 ];
                 self.db()?.execute_cluster_bootstrap_batch(&ddl).await?;
