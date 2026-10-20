@@ -199,7 +199,12 @@ impl LaminarDB {
 
     /// Build a SHOW STREAMS metadata result with SQL definitions.
     pub(crate) fn build_show_streams(&self) -> RecordBatch {
-        let streams = self.catalog.list_streams();
+        let streams: Vec<String> = self
+            .catalog
+            .list_streams()
+            .into_iter()
+            .filter(|name| crate::sql_analysis::stage_owner(name).is_none())
+            .collect();
         let mgr = self.connector_manager.lock();
         let regs = mgr.streams();
 

@@ -1663,10 +1663,14 @@ async fn full_changelog_source_and_interval_admission_are_contract_gated() {
             error.to_string().contains("row-set modifiers")
                 || error
                     .to_string()
-                    .contains("cannot contain an aggregate stage"),
+                    .contains("cannot safely consume a changelog"),
             "{error}"
         );
         assert!(!db.catalog_namespace.lock().contains_key(name));
+        assert!(!db
+            .catalog_namespace
+            .lock()
+            .contains_key(&format!("{name}$stage1")));
     }
 
     let (sources, sinks, streams) = {

@@ -206,19 +206,20 @@ async fn aggregate_over_aggregate_stream_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// Split into an `EMIT CHANGES` stage for the inner aggregate and the outer aggregate over it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn nested_aggregate_is_unsupported_everywhere() {
+async fn nested_aggregate_is_equal() {
     let case = case(
         "nested_aggregate",
         &["CREATE STREAM out AS SELECT n, COUNT(*) AS keys FROM \
            (SELECT k, COUNT(*) AS n FROM events GROUP BY k) GROUP BY n EMIT CHANGES"],
         OutputForm::Changelog,
-        None,
+        Some(
+            "SELECT n, COUNT(*) AS keys FROM \
+             (SELECT k, COUNT(*) AS n FROM events GROUP BY k) GROUP BY n",
+        ),
     );
-    assert!(matches!(
-        verdict(case).await,
-        Verdict::UnsupportedEverywhere(_)
-    ));
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -448,23 +449,28 @@ async fn join_then_chained_aggregates_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// Split into a join stage and an aggregate stage colocated with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fused_join_aggregate_is_unsupported_everywhere() {
-    let case = join_case(
-        "fused_join_aggregate",
-        vec![
-            "CREATE STREAM out AS SELECT o.k AS k, COUNT(*) AS n FROM orders o \
-              INNER JOIN payments p ON o.k = p.k \
-              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
-              GROUP BY o.k EMIT CHANGES"
-                .into(),
-        ],
-        OutputForm::Changelog,
-    );
-    assert!(matches!(
-        verdict(case).await,
-        Verdict::UnsupportedEverywhere(_)
-    ));
+async fn fused_join_aggregate_is_equal() {
+    let case = Case {
+        ground_truth: Some(
+            "SELECT o.k AS k, COUNT(*) AS n, SUM(p.v) AS s FROM orders o \
+             INNER JOIN payments p ON o.k = p.k \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND GROUP BY o.k",
+        ),
+        ..join_case(
+            "fused_join_aggregate",
+            vec![
+                "CREATE STREAM out AS SELECT o.k AS k, COUNT(*) AS n, SUM(p.v) AS s \
+                 FROM orders o INNER JOIN payments p ON o.k = p.k \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+                 GROUP BY o.k EMIT CHANGES"
+                    .into(),
+            ],
+            OutputForm::Changelog,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -521,4 +527,23 @@ async fn outer_semi_and_anti_joins_are_equal() {
         let case = join_case(name, vec![sql], OutputForm::Rows);
         assert_eq!(verdict(case).await, Verdict::Equal, "{name}");
     }
+}
+
+/// The inner window stage emits changes, which cluster windows do not support.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_window_aggregate_is_rejected_in_cluster() {
+    let case = case(
+        "nested_window_aggregate",
+        &["CREATE STREAM out AS SELECT n, COUNT(*) AS c FROM \
+           (SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, COUNT(*) AS n \
+            FROM events GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND)) \
+           GROUP BY n EMIT CHANGES"],
+        OutputForm::Changelog,
+        Some(
+            "SELECT n, COUNT(*) AS c FROM \
+             (SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, COUNT(*) AS n \
+              FROM events GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND)) GROUP BY n",
+        ),
+    );
+    assert_rejected(verdict(case).await, "EMIT ON WINDOW CLOSE");
 }

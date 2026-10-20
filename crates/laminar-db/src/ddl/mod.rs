@@ -5,6 +5,7 @@
 //! - `source_sink` — source/sink statements and connector resolution;
 //! - `table` — reference/lookup `CREATE TABLE` shape and orchestration;
 //! - `stream` — continuous-query planning and `CREATE STREAM`;
+//! - `stream_stages` — creating and dropping a split stream's internal stages;
 //! - `cluster_checks` — temporal/interval topology and cluster query-shape admission;
 //! - `materialized_view` — MV create/drop and incremental-emit admission;
 //! - `running_state_inputs` — stateful consumers must read a changelog;
@@ -24,6 +25,7 @@ mod schema_journal;
 pub(crate) mod schema_resolution;
 mod source_sink;
 mod stream;
+mod stream_stages;
 mod table;
 mod table_schema;
 mod topology;

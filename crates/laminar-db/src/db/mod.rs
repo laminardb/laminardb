@@ -4671,6 +4671,9 @@ impl LaminarDB {
     /// resolved. Bare sources and unresolved streams are not subscribable.
     #[must_use]
     pub fn lookup_subscription_schema(&self, name: &str) -> Option<arrow_schema::SchemaRef> {
+        if crate::sql_analysis::stage_owner(name).is_some() {
+            return None;
+        }
         if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
             return Some(mv.schema);
         }
@@ -4998,6 +5001,7 @@ impl LaminarDB {
         let mut streams = mgr
             .streams()
             .iter()
+            .filter(|(name, _)| crate::sql_analysis::stage_owner(name).is_none())
             .map(|(name, reg)| crate::handle::StreamInfo {
                 name: name.clone(),
                 sql: Some(reg.query_sql.clone()),

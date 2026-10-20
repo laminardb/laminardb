@@ -13,7 +13,7 @@ use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 use crate::pipeline::{ControlMutation, ControlMutationState};
 
-use super::catalog::{reject_reserved_namespace, CatalogNameReservation};
+use super::catalog::{reject_reserved_namespace, reject_stage_reads, CatalogNameReservation};
 use super::control::resolve_control_ack;
 
 struct StreamCreateGuard<'a> {
@@ -99,6 +99,16 @@ impl PlannedStreamingQuery {
     }
 }
 
+/// One stream's statement parts. Only a stage has no DDL: it replays from its owner's.
+pub(super) struct StreamDefinition<'a> {
+    pub(super) ddl: Option<&'a str>,
+    pub(super) name: &'a sqlparser::ast::ObjectName,
+    pub(super) query: &'a StreamingStatement,
+    pub(super) emit_clause: Option<&'a laminar_sql::parser::EmitClause>,
+    pub(super) query_sql: &'a str,
+    pub(super) retention_bytes: Option<u64>,
+}
+
 pub(crate) async fn validate_managed_aggregate_admission(
     ctx: &datafusion::prelude::SessionContext,
     query_sql: &str,
@@ -161,13 +171,14 @@ impl LaminarDB {
         self.ensure_topology_ddl_allowed("CREATE STREAM")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
+        reject_stage_reads(query_sql)?;
         if let Some(result) = self.create_bound_process_stream(sql, &name_str)? {
             return Ok(result);
         }
-        if crate::sql_analysis::has_temporal_query(query_sql) {
-            self.ensure_temporal_stream_offline(&name_str)?;
+        let split = self.split_stream_query(&name_str, query_sql)?;
+        if split.is_none() {
+            self.validate_stream_query_text(&name_str, query_sql)?;
         }
-        Self::reject_interval_output_subquery(&name_str, query_sql)?;
         let Some(reservation) =
             self.reserve_catalog_name(&name_str, CatalogObjectKind::Stream, if_not_exists)?
         else {
@@ -179,7 +190,57 @@ impl LaminarDB {
                 applied: false,
             }));
         };
+        let definition = StreamDefinition {
+            ddl: Some(sql),
+            name,
+            query,
+            emit_clause,
+            query_sql,
+            retention_bytes,
+        };
+        match split {
+            None => self.create_stream_object(definition, reservation).await?,
+            Some(split) => {
+                self.create_split_stream(definition, &split, reservation)
+                    .await?;
+            }
+        }
 
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "CREATE STREAM".to_string(),
+            object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
+            applied: true,
+        }))
+    }
+
+    pub(super) fn validate_stream_query_text(
+        &self,
+        name: &str,
+        query_sql: &str,
+    ) -> Result<(), DbError> {
+        if crate::sql_analysis::has_temporal_query(query_sql) {
+            self.ensure_temporal_stream_offline(name)?;
+        }
+        Self::reject_interval_output_subquery(name, query_sql)
+    }
+
+    /// Admits and registers one stream under a held name reservation.
+    pub(super) async fn create_stream_object(
+        &self,
+        definition: StreamDefinition<'_>,
+        reservation: CatalogNameReservation<'_>,
+    ) -> Result<(), DbError> {
+        let StreamDefinition {
+            ddl,
+            name,
+            query,
+            emit_clause,
+            query_sql,
+            retention_bytes,
+        } = definition;
+        let name_str = canonical_object_name(name)?;
         let (planned, temporal_output_schema) = self
             .validate_stream_admission("stream", name, query, emit_clause, query_sql)
             .await?;
@@ -199,7 +260,7 @@ impl LaminarDB {
             );
         }
         self.register_and_admit_stream(
-            sql,
+            ddl,
             &name_str,
             reservation,
             planned,
@@ -207,15 +268,7 @@ impl LaminarDB {
             query_sql,
             retention_bytes,
         )
-        .await?;
-
-        Ok(ExecuteResult::Ddl(DdlInfo {
-            statement_type: "CREATE STREAM".to_string(),
-            object_name: name_str,
-            #[cfg(feature = "cluster")]
-            topology_operation: None,
-            applied: true,
-        }))
+        .await
     }
 
     /// Every pre-mutation stream admission check, returning the planned query and the output
@@ -291,7 +344,7 @@ impl LaminarDB {
     /// admission acknowledgement resolves.
     async fn register_and_admit_stream(
         &self,
-        sql: &str,
+        ddl: Option<&str>,
         name_str: &str,
         mut reservation: CatalogNameReservation<'_>,
         planned: PlannedStreamingQuery,
@@ -358,7 +411,9 @@ impl LaminarDB {
             // Local replay identity participates in the same cancellation guard as
             // graph/catalog admission. Once the coordinator CAS is Applied, caller
             // cancellation must not leave an unreplayable live topology.
-            mgr.store_ddl(name_str, sql);
+            if let Some(ddl) = ddl {
+                mgr.store_ddl(name_str, ddl);
+            }
         }
 
         // Register as a DataFusion placeholder for plan-time name resolution by downstream MVs.

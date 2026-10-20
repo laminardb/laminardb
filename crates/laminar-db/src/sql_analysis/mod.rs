@@ -11,6 +11,7 @@
 //! - `temporal_filter` — retracting `now()`-based temporal-filter recognition;
 //! - `hazards` — cluster query-hazard scanning and managed window-source certification;
 //! - `plan` — `DataFusion` plan inspection and result-batch shaping;
+//! - `statement_split` — rewriting join and nested aggregates into internal named stages;
 //! - `ai`, `frame` — managed AI-call and window-frame query routing;
 //! - `ast`, `expr_sql` — parsing predicates and expression rendering shared by the above.
 
@@ -23,6 +24,7 @@ mod hazards;
 mod join;
 mod lookup;
 mod plan;
+mod statement_split;
 mod table_refs;
 mod temporal;
 mod temporal_filter;
@@ -46,6 +48,7 @@ pub(crate) use plan::{
     apply_topk_filter, extract_projection_filter, planned_functions_are_immutable,
     ProjectionFilterInfo,
 };
+pub(crate) use statement_split::{owned_stages, split_stream_query, stage_owner, SplitQuery};
 pub(crate) use table_refs::{extract_table_references, single_source_table};
 pub(crate) use temporal::{
     has_temporal_query, temporal_projection_sql, temporal_projection_sql_for_input,

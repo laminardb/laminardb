@@ -13,7 +13,7 @@ use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 use crate::pipeline::{ControlMutation, ControlMutationState};
 
-use super::catalog::{reject_reserved_namespace, CatalogNameReservation};
+use super::catalog::{reject_reserved_namespace, reject_stage_reads, CatalogNameReservation};
 use super::cluster_checks::{ChangelogInputKind, IntervalTopologyCandidate};
 use super::control::resolve_control_ack;
 use super::stream::{
@@ -72,6 +72,7 @@ impl LaminarDB {
         self.ensure_topology_ddl_allowed("CREATE MATERIALIZED VIEW")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
+        reject_stage_reads(query_sql)?;
         if or_replace {
             return Err(DbError::InvalidOperation(
                 "CREATE OR REPLACE MATERIALIZED VIEW is not atomic; use DROP MATERIALIZED VIEW followed by CREATE MATERIALIZED VIEW"

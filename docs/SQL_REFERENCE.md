@@ -268,9 +268,10 @@ FROM matched
 GROUP BY account_id;
 ```
 
-Fusing the join and `GROUP BY` in one statement is unsupported. A cycle that would exceed 262,144
-output rows or 64 MiB causes a terminal controlled failure; operators cannot resume or spill that
-fanout.
+The same aggregate may be written over the join in one statement; it is split into the same two
+stages (see [Nested aggregates and aggregates over a join](#nested-aggregates-and-aggregates-over-a-join)).
+A cycle that would exceed 262,144 output rows or 64 MiB causes a terminal controlled failure;
+operators cannot resume or spill that fanout.
 
 ### Temporal ASOF join
 
@@ -339,6 +340,42 @@ named-aggregate path. `DISTINCT` aggregates and `MIN`/`MAX` over changelog input
 because bounded retractable extrema state is not supported. Mutable bounded-join output can feed
 `COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join output keeps
 the ordinary row stream.
+
+### Nested aggregates and aggregates over a join
+
+A statement that no single operator can run is split into internal stages named
+`<stream>$stage<n>`, each admitted by the rules for its own shape in every mode:
+
+```sql
+-- A join stage, then a keyed aggregate over it.
+CREATE STREAM matched_totals AS
+SELECT t.account_id AS account_id, SUM(t.volume) AS total_volume
+FROM trades t
+INNER JOIN orders o
+ON t.account_id = o.account_id
+AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND
+GROUP BY t.account_id;
+
+-- An aggregate stage that emits changes, then an aggregate over its changelog.
+CREATE STREAM accounts_by_trade_count AS
+SELECT trade_count, COUNT(*) AS accounts
+FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
+GROUP BY trade_count
+EMIT CHANGES;
+```
+
+- An aggregate over one two-way join reads a join stage that projects each input column the
+  aggregate uses as `<qualifier>_<column>` (`t.volume` becomes `t_volume`). Every column the
+  aggregate reads must carry its input qualifier, and `WHERE` filters the join stage.
+- An aggregate over a subquery in `FROM` that aggregates or joins reads that subquery as a stage.
+  An aggregating subquery emits changes, so the outer aggregate supports `COUNT`, `SUM` and `AVG`
+  but not `MIN` or `MAX`. In cluster mode a windowed subquery is rejected, because cluster windows
+  emit only closed windows.
+- Stages belong to their stream. `SHOW STREAMS`, `SHOW CREATE STREAM` and `SUBSCRIBE` see only the
+  stream, `DROP STREAM` removes its stages, and no other statement may read, drop or create a
+  `$stage` name. A failed `CREATE` removes the stages it created.
+- A join of three or more inputs still needs named two-way stages: a join's output carries no
+  event time, so an interval join cannot read it.
 
 ### Streaming UDFs
 
@@ -465,8 +502,8 @@ Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-window
 the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION`
 aggregates. A cluster window reads a source, or an append-only stream that forwards the source's
 event-time column unchanged; it requires a bounded watermark on that column and `EMIT ON WINDOW
-CLOSE` or `EMIT FINAL`. A named join output may feed a separate keyed aggregate stream;
-fused join-and-aggregate and windowed-join statements remain rejected. A stream may sit at most
+CLOSE` or `EMIT FINAL`. A join output may feed a keyed aggregate, either as a named stream or in
+one statement that is split into stages; windowed joins remain rejected. A stream may sit at most
 three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
 which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
 
@@ -599,6 +636,10 @@ each other node sends one partial row per input batch instead of its rows), or `
 `arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
 (an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry a source
 watermark on that column (a source's own, or one a projection forwards unchanged).
+
+For a statement that is split into stages, `EXPLAIN` lists each stage's SQL as a
+`stage.<name>` row instead. Later stages read earlier ones, so their exchanges are derived when
+`CREATE` registers them.
 
 ### EXPLAIN ANALYZE
 

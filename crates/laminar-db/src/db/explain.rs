@@ -161,6 +161,9 @@ impl LaminarDB {
         };
         let result = async {
             let stream = super::canonical_object_name(name)?;
+            if let Some(split) = self.split_stream_query(&stream, query_sql)? {
+                return Ok(split_rows(&stream, &split));
+            }
             let planned = self
                 .plan_streaming_query(name, query, emit_clause.clone(), query_sql)
                 .await?;
@@ -193,6 +196,25 @@ impl LaminarDB {
             .await
             .unwrap_or_else(|error| vec![("exchange_error".into(), error.to_string())])
     }
+}
+
+/// Later stages read earlier ones, so their exchanges are derived only when CREATE registers them.
+fn split_rows(owner: &str, split: &crate::sql_analysis::SplitQuery) -> Vec<(String, String)> {
+    split
+        .stages
+        .iter()
+        .map(|stage| {
+            let emit = if stage.changelog { " EMIT CHANGES" } else { "" };
+            (
+                format!("stage.{}", stage.name),
+                format!("{}{emit}", stage.sql),
+            )
+        })
+        .chain(std::iter::once((
+            format!("stage.{owner}"),
+            split.query_sql.clone(),
+        )))
+        .collect()
 }
 
 fn metadata(rows: &[(String, String)], context: &str) -> Result<ExecuteResult, DbError> {
