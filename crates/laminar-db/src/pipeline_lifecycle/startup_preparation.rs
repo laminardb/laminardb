@@ -197,6 +197,9 @@ impl LaminarDB {
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
         topology: Option<&crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
+        if let Some(identity) = pipeline_identity {
+            self.bind_shuffle_pipeline_identity(identity)?;
+        }
         if let Some(image) = topology {
             // The restored graph already binds the preserved incarnations and sequences.
             // Fresh definition binding would overwrite their public catalog certificates.

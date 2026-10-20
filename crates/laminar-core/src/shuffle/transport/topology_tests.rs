@@ -450,6 +450,7 @@ async fn topology_transport_old_handshake_token_cannot_open_a_target_stream() {
             assignment_certificate_digest: assignment.digest().to_vec(),
             topology_version: 0,
             topology_manifest_sha256: Vec::new(),
+            pipeline_identity_sha256: Vec::new(),
         }))
         .await
         .unwrap()

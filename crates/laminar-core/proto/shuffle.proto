@@ -47,6 +47,9 @@ message HandshakeRequest {
   bytes assignment_certificate_digest = 6;
   uint64 topology_version = 7;
   bytes topology_manifest_sha256 = 8;
+  // SHA-256 pipeline identity the sender is bound to; empty before it is bound. The receiver
+  // refuses any value other than its own.
+  bytes pipeline_identity_sha256 = 9;
 }
 
 message HandshakeResponse {

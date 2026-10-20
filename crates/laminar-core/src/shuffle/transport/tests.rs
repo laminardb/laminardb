@@ -222,6 +222,7 @@ async fn receiver_process_lease_expiry_rejects_handshake_without_assignment_inva
             recovery_gen: 0,
             topology_version: 0,
             topology_manifest_sha256: Vec::new(),
+            pipeline_identity_sha256: Vec::new(),
             assignment_certificate_digest: fence.digest().to_vec(),
         }))
         .await
@@ -1050,6 +1051,7 @@ async fn inbound_wire_rejects_noncanonical_barrier_before_publication() {
             recovery_gen: 0,
             topology_version: 0,
             topology_manifest_sha256: Vec::new(),
+            pipeline_identity_sha256: Vec::new(),
             assignment_certificate_digest: fence.digest().to_vec(),
         }))
         .await
@@ -1124,6 +1126,7 @@ async fn uncertified_network_handshakes_are_rejected_without_reporting_data_loss
             recovery_gen: 0,
             topology_version: 0,
             topology_manifest_sha256: Vec::new(),
+            pipeline_identity_sha256: Vec::new(),
             assignment_certificate_digest: fence.digest().to_vec(),
         }))
         .await
@@ -1140,6 +1143,7 @@ async fn uncertified_network_handshakes_are_rejected_without_reporting_data_loss
             recovery_gen: 0,
             topology_version: 0,
             topology_manifest_sha256: Vec::new(),
+            pipeline_identity_sha256: Vec::new(),
             assignment_certificate_digest: [9; 32].to_vec(),
         }))
         .await
@@ -2417,5 +2421,95 @@ async fn send_discovers_peer_address_from_kv() {
     assert_eq!(
         received.message(),
         &ShuffleMessage::Barrier(CheckpointBarrier::new(7, 7))
+    );
+}
+
+fn pipeline_identity(fill: char) -> crate::checkpoint::PipelineIdentity {
+    crate::checkpoint::PipelineIdentity {
+        canonical_version: crate::checkpoint::checkpoint_manifest::PIPELINE_IDENTITY_VERSION,
+        sha256: std::iter::repeat_n(fill, 64).collect(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_refuses_handshakes_bound_to_another_pipeline_identity() {
+    use super::shuffle_v1::shuffle_transport_client::ShuffleTransportClient;
+    use super::shuffle_v1::HandshakeRequest;
+
+    let receiver = bind_on_loopback(2).await;
+    let own_sender = ShuffleSender::new(2, Uuid::from_u128(3));
+    let identity = pipeline_identity('a');
+    assert!(own_sender
+        .install_pipeline_identity_pair(&receiver, &identity)
+        .unwrap());
+    assert!(!own_sender
+        .install_pipeline_identity_pair(&receiver, &identity)
+        .unwrap());
+    assert!(ShuffleSender::new(2, Uuid::from_u128(9))
+        .install_pipeline_identity_pair(&receiver, &identity)
+        .is_err());
+
+    let fence = assignment_fence(1, &[1, 2]);
+    let endpoint =
+        crate::cluster::control::tls::client_endpoint(&receiver.local_addr().to_string()).unwrap();
+    let mut client = ShuffleTransportClient::new(endpoint.connect().await.unwrap());
+    let request = |pipeline_identity_sha256: Vec<u8>| {
+        tonic::Request::new(HandshakeRequest {
+            sender_node_id: 1,
+            sender_incarnation: Uuid::from_u128(2).as_bytes().to_vec(),
+            stream_id: Uuid::new_v4().as_bytes().to_vec(),
+            assignment_version: fence.assignment_version,
+            recovery_gen: 0,
+            topology_version: 0,
+            topology_manifest_sha256: Vec::new(),
+            pipeline_identity_sha256,
+            assignment_certificate_digest: fence.digest().to_vec(),
+        })
+    };
+    for other in [Vec::new(), [0xbb; 32].to_vec()] {
+        let error = client.handshake(request(other)).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            "shuffle peers are not bound to the same pipeline identity"
+        );
+    }
+    client
+        .handshake(request([0xaa; 32].to_vec()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frames_cross_only_between_processes_bound_to_one_pipeline_identity() {
+    let local_receiver = bind_on_loopback(1).await;
+    let local_sender = sender(1);
+    let peer_receiver = bind_on_loopback(2).await;
+    let peer_sender = ShuffleSender::new(2, Uuid::from_u128(3));
+    local_sender.register_peer(2, peer_receiver.local_addr());
+    let send = || {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_barrier(&local_sender, &[2], CheckpointBarrier::new(1, 1)),
+        )
+    };
+
+    local_sender
+        .install_pipeline_identity_pair(&local_receiver, &pipeline_identity('a'))
+        .unwrap();
+    assert!(send().await.unwrap().is_err(), "peer has no identity yet");
+    peer_sender
+        .install_pipeline_identity_pair(&peer_receiver, &pipeline_identity('b'))
+        .unwrap();
+    assert!(send().await.unwrap().is_err(), "peer runs another identity");
+
+    peer_sender
+        .install_pipeline_identity_pair(&peer_receiver, &pipeline_identity('a'))
+        .unwrap();
+    send().await.unwrap().unwrap();
+    let received = peer_receiver.recv().await.unwrap();
+    assert_eq!(
+        received.message(),
+        &ShuffleMessage::Barrier(CheckpointBarrier::new(1, 1))
     );
 }
