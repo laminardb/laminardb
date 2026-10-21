@@ -5,7 +5,7 @@ declarations before startup. Sinks bind their query schema before opening. See
 [schema resolution](../../docs/SCHEMA_RESOLUTION.md) for the direction/format matrix,
 bounded sampling, separate preparation policies and durable reader/writer contracts.
 
-External system connectors for LaminarDB. Exactly-once admission requires an exact-certified source and a checkpoint-committable sink with coordinated external publication.
+External system connectors for LaminarDB. Exactly-once admission requires an exact-certified source and a checkpoint-committable sink with coordinated external publication. The [delivery guarantee matrix](../../docs/DELIVERY_GUARANTEES.md) lists what every source and sink pair admits in each runtime mode.
 
 ## Connectors
 
