@@ -1067,6 +1067,9 @@ pub(crate) struct OperatorGraph {
     /// operators intentionally retain node-local progress for prompt output and reclamation.
     #[cfg(feature = "cluster")]
     temporal_source_frontiers: FxHashMap<usize, InputFrontier>,
+    /// Idle per-source frontiers for bounded interval joins, capped at the committed cut.
+    #[cfg(feature = "cluster")]
+    interval_idle_source_frontiers: FxHashMap<usize, InputFrontier>,
     max_input_buf_batches: usize,
     max_input_buf_bytes: Option<usize>,
     backpressure_policy: BackpressurePolicy,
@@ -1182,6 +1185,8 @@ impl OperatorGraph {
             local_source_frontiers: Vec::new(),
             #[cfg(feature = "cluster")]
             temporal_source_frontiers: FxHashMap::default(),
+            #[cfg(feature = "cluster")]
+            interval_idle_source_frontiers: FxHashMap::default(),
             max_input_buf_batches: 0,
             max_input_buf_bytes: None,
             backpressure_policy: BackpressurePolicy::default(),
@@ -1577,6 +1582,7 @@ impl OperatorGraph {
         frontiers: &FxHashMap<Arc<str>, InputFrontier>,
     ) {
         self.temporal_source_frontiers.clear();
+        self.interval_idle_source_frontiers.clear();
         for &node_id in &self.source_node_ids {
             self.local_source_frontiers[node_id] = InputFrontier::default();
         }
@@ -1587,20 +1593,34 @@ impl OperatorGraph {
         }
     }
 
-    /// Cap temporal-join inputs by the exact committed frontier for their own source.
+    /// Cap join inputs by the exact committed frontier for their own source.
     ///
     /// This is called immediately after [`Self::set_local_source_frontiers`]. Inserting an
     /// uninitialized frontier for a source with no committed decision is deliberate: before the
     /// first durable cut, a speculative local frontier must not close temporal history.
+    ///
+    /// A bounded interval join keeps active local progress, but an idle local shard closes only
+    /// to the committed cut. An idle source revives at that cut (rows below it fail source
+    /// admission), so closing on a higher speculative idle frontier would reject its on-time rows.
     #[cfg(feature = "cluster")]
-    pub(crate) fn cap_temporal_source_frontiers(
+    pub(crate) fn cap_join_source_frontiers(
         &mut self,
         mut committed_watermark: impl FnMut(&str) -> Option<i64>,
     ) {
         self.temporal_source_frontiers.clear();
+        self.interval_idle_source_frontiers.clear();
         for (name, &node_id) in self.source_map.iter().chain(&self.positioned_source_map) {
             let mut frontier = self.local_source_frontiers[node_id];
             let committed = committed_watermark(name);
+            if frontier.idle {
+                self.interval_idle_source_frontiers.insert(
+                    node_id,
+                    InputFrontier {
+                        watermark: committed,
+                        idle: true,
+                    },
+                );
+            }
             frontier.watermark = match (frontier.idle, frontier.watermark, committed) {
                 // The committed per-source cut already applies standard idleness semantics. An
                 // idle local shard must inherit that authoritative cut instead of becoming a

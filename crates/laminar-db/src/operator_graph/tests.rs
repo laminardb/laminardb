@@ -1293,7 +1293,7 @@ async fn alignment_harness() -> AlignmentHarness {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
+async fn join_shuffles_use_the_committed_source_frontier() {
     let mut harness = alignment_harness().await;
     let source = harness.graph.ensure_source_node("events");
     let ordinary_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1365,7 +1365,7 @@ async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
         watermark: Some(restored_temporal_watermark),
         idle: false,
     };
-    harness.graph.cap_temporal_source_frontiers(|name| {
+    harness.graph.cap_join_source_frontiers(|name| {
         (name == "events").then_some(restored_temporal_watermark)
     });
     harness
@@ -1375,16 +1375,20 @@ async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
         .unwrap();
 
     for (name, _, seen) in managed {
-        let expected = if name == "temporal_join" {
-            restored_temporal_frontier
-        } else {
-            local["events"]
+        let expected = match name {
+            "temporal_join" => restored_temporal_frontier,
+            // An idle interval-join input closes only to the committed cut.
+            "interval_join" => InputFrontier {
+                watermark: Some(restored_temporal_watermark),
+                idle: true,
+            },
+            _ => local["events"],
         };
         assert_eq!(*seen.lock(), [expected], "unexpected frontier for {name}");
     }
     assert_eq!(*ordinary_seen.lock(), [committed["events"]]);
 
-    harness.graph.cap_temporal_source_frontiers(|_| None);
+    harness.graph.cap_join_source_frontiers(|_| None);
     assert_eq!(
         harness.graph.temporal_source_frontiers[&source],
         InputFrontier {
@@ -1403,7 +1407,7 @@ async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
                 idle: true,
             },
         )]));
-    harness.graph.cap_temporal_source_frontiers(|name| {
+    harness.graph.cap_join_source_frontiers(|name| {
         (name == "events").then_some(restored_temporal_watermark)
     });
     assert_eq!(
@@ -1420,7 +1424,7 @@ async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
                 idle: true,
             },
         )]));
-    harness.graph.cap_temporal_source_frontiers(|name| {
+    harness.graph.cap_join_source_frontiers(|name| {
         (name == "events").then_some(restored_temporal_watermark)
     });
     assert_eq!(
@@ -1437,7 +1441,7 @@ async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
                 idle: false,
             },
         )]));
-    harness.graph.cap_temporal_source_frontiers(|name| {
+    harness.graph.cap_join_source_frontiers(|name| {
         (name == "events").then_some(restored_temporal_watermark)
     });
     assert_eq!(
@@ -1447,6 +1451,32 @@ async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
             idle: false,
         },
         "an active-uninitialized local source must hold below an initialized cluster cut"
+    );
+    assert!(
+        !harness
+            .graph
+            .interval_idle_source_frontiers
+            .contains_key(&source),
+        "an active local source keeps node-local interval-join progress"
+    );
+
+    harness
+        .graph
+        .set_local_source_frontiers(&FxHashMap::from_iter([(
+            Arc::from("events"),
+            InputFrontier {
+                watermark: Some(1_200),
+                idle: true,
+            },
+        )]));
+    harness.graph.cap_join_source_frontiers(|_| None);
+    assert_eq!(
+        harness.graph.interval_idle_source_frontiers[&source],
+        InputFrontier {
+            watermark: None,
+            idle: true,
+        },
+        "an idle interval-join input without a durable cut must not close on speculative progress"
     );
 }
 
@@ -1488,13 +1518,11 @@ async fn temporal_shuffle_keeps_the_lower_idle_source_cut_active() {
         ),
     ]);
     harness.graph.set_local_source_frontiers(&local);
-    harness
-        .graph
-        .cap_temporal_source_frontiers(|name| match name {
-            "left" => Some(900),
-            "right" => Some(700),
-            _ => None,
-        });
+    harness.graph.cap_join_source_frontiers(|name| match name {
+        "left" => Some(900),
+        "right" => Some(700),
+        _ => None,
+    });
     harness
         .graph
         .execute_cycle(&FxHashMap::default(), 100, None)

@@ -24,7 +24,20 @@ pub(crate) fn normalize_restored_local_frontier(
     }
 }
 
-fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
+/// Like [`normalize_restored_local_frontier`] for a channel whose peers merge idle frontiers by
+/// maximum. An idle observation delivers no rows, so it inherits only this node's own installed
+/// frontier: raising it to the cut applied from peers would echo another reader's frontier and let
+/// a peer close past rows that reader has not delivered yet.
+pub(crate) fn normalize_local_frontier_without_peer_echo(
+    input: InputFrontier,
+    installed: InputFrontier,
+    effective_floor: Option<i64>,
+) -> InputFrontier {
+    let effective_floor = if input.idle { None } else { effective_floor };
+    normalize_restored_local_frontier(input, installed, effective_floor)
+}
+
+pub(crate) fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
     match (current, floor) {
         (Some(current), Some(floor)) => Some(current.max(floor)),
         (None, floor) => floor,
@@ -52,6 +65,37 @@ mod tests {
             InputFrontier {
                 watermark: Some(100),
                 idle: true,
+            }
+        );
+    }
+
+    #[test]
+    fn idle_observation_without_peer_echo_keeps_its_own_installed_frontier() {
+        let installed = InputFrontier {
+            watermark: Some(80),
+            idle: true,
+        };
+        let idle = InputFrontier {
+            watermark: Some(60),
+            idle: true,
+        };
+        let active = InputFrontier {
+            watermark: Some(60),
+            idle: false,
+        };
+
+        assert_eq!(
+            normalize_local_frontier_without_peer_echo(idle, installed, Some(100)),
+            InputFrontier {
+                watermark: Some(80),
+                idle: true,
+            }
+        );
+        assert_eq!(
+            normalize_local_frontier_without_peer_echo(active, installed, Some(100)),
+            InputFrontier {
+                watermark: Some(100),
+                idle: false,
             }
         );
     }

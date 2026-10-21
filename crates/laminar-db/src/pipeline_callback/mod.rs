@@ -4720,7 +4720,7 @@ impl ConnectorPipelineCallback {
             .set_local_source_frontiers(&self.source_frontiers_buf);
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller.as_ref() {
-            self.graph.cap_temporal_source_frontiers(|source_name| {
+            self.graph.cap_join_source_frontiers(|source_name| {
                 self.committed_source_watermarks_snapshot
                     .get(source_name)
                     .copied()

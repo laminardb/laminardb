@@ -1303,15 +1303,6 @@ impl IntervalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
-        match (current, floor) {
-            (Some(current), Some(floor)) => Some(current.max(floor)),
-            (None, floor) => floor,
-            (current, None) => current,
-        }
-    }
-
-    #[cfg(feature = "cluster")]
     fn watermark_option(watermark: i64) -> Option<i64> {
         (watermark != i64::MIN).then_some(watermark)
     }
@@ -3622,14 +3613,22 @@ impl IntervalJoinOperator {
                     } else {
                         self.applied_right_watermark
                     };
-                    applied.watermark =
-                        Self::max_watermark(applied.watermark, Self::watermark_option(floor));
+                    applied.watermark = super::frontier::max_watermark(
+                        applied.watermark,
+                        Self::watermark_option(floor),
+                    );
                 }
                 applied
             });
-            let merged =
+            let mut merged =
                 merge_input_frontier_iter(std::iter::once(local[port]).chain(peers), i64::MIN);
             let previous = self.applied_frontiers()[port];
+            // Idle channels never echo the applied cut, so an all-idle merge can trail it; hold
+            // there instead of regressing.
+            if merged.idle {
+                merged.watermark =
+                    super::frontier::max_watermark(merged.watermark, previous.watermark);
+            }
             self.validate_frontier(
                 previous,
                 merged,
@@ -3692,7 +3691,7 @@ impl IntervalJoinOperator {
                 )));
             }
             let installed = self.local_frontiers[port];
-            local_frontiers[port] = super::frontier::normalize_restored_local_frontier(
+            local_frontiers[port] = super::frontier::normalize_local_frontier_without_peer_echo(
                 frontiers[port],
                 installed,
                 self.applied_frontiers()[port].watermark,
@@ -4792,7 +4791,7 @@ impl GraphOperator for IntervalJoinOperator {
                                     } else {
                                         checkpoint.applied_right_watermark
                                     };
-                                    applied.watermark = Self::max_watermark(
+                                    applied.watermark = super::frontier::max_watermark(
                                         applied.watermark,
                                         Self::watermark_option(floor),
                                     );
@@ -5064,7 +5063,8 @@ impl GraphOperator for IntervalJoinOperator {
         } else {
             self.applied_right_watermark
         };
-        frontier.watermark = Self::max_watermark(frontier.watermark, Self::watermark_option(floor));
+        frontier.watermark =
+            super::frontier::max_watermark(frontier.watermark, Self::watermark_option(floor));
         self.validate_frontier(previous, frontier, side)?;
         let (next_bytes, next_events) = self.reserve_remote_event_slot(side, peer, 0)?;
         self.queued_shuffle_bytes = next_bytes;
