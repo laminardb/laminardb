@@ -494,6 +494,10 @@ impl UntypedSourceHandle {
 
     /// Push a raw `RecordBatch` (sent to pipeline and buffered for snapshots).
     ///
+    /// Compatibility path: it keeps the source unmanaged and returns no admission
+    /// receipt. Use [`Self::push_arrow_receipted`] when the native admission
+    /// coordinate is required.
+    ///
     /// # Errors
     /// Returns `StreamingError` on invalid data, a closed queue, count/byte saturation,
     /// or a batch exceeding `LaminarConfig::push_source_max_bytes`.
@@ -502,6 +506,56 @@ impl UntypedSourceHandle {
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
         self.entry.push_and_buffer(batch)
+    }
+
+    /// Push a raw `RecordBatch` and return its native admission receipt.
+    ///
+    /// A receipt is produced only after the native source accepted the batch; a
+    /// rejected or backpressured enqueue returns `Err` and no receipt.
+    ///
+    /// This is the only implicit managed declaration point: the source is declared
+    /// managed atomically with, under the same admission lock as, the batch admission, so a
+    /// concurrent checkpoint barrier can never observe the source as unmanaged between those
+    /// operations and capture this batch as an unmanaged footprint whose receipt could not be
+    /// correlated. Ordinary `push_and_buffer`/`push_arrow` stay unmanaged.
+    ///
+    /// # Errors
+    /// Returns `StreamingError` if the pipeline is not running.
+    pub fn push_arrow_receipted(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<
+        crate::source_admission::SourceAdmissionReceipt,
+        laminar_core::streaming::StreamingError,
+    > {
+        // Declare and admit under the same admission lock, so a barrier holding that lock
+        // either sees the source as managed or runs before this batch was admitted; it can never
+        // persist a checkpoint that covers the batch without the managed metadata the receipt
+        // needs to correlate it.
+        let offset = self.entry.admit_arrow_managed(batch)?;
+        Ok(
+            crate::source_admission::SourceAdmissionReceipt::from_native_admission(
+                self.entry.source_instance().clone(),
+                offset,
+            ),
+        )
+    }
+
+    /// Native-issued identity of this source instance.
+    #[must_use]
+    pub fn source_instance(&self) -> &crate::source_admission::SourceInstance {
+        self.entry.source_instance()
+    }
+
+    /// Declare this source as a managed push source owned by a context layer.
+    ///
+    /// Calling [`Self::push_arrow_receipted`] declares the source automatically
+    /// before it admits the batch, so the returned receipt can always be correlated
+    /// with a committed checkpoint. An owner that must checkpoint an empty source
+    /// before its first push calls this explicitly so the exact native instance can
+    /// be captured. Declaring fabricates no progress.
+    pub fn declare_managed_source(&self) {
+        self.entry.declare_managed_push();
     }
 
     /// Emit a watermark.
