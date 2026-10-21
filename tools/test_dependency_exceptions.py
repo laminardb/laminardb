@@ -22,13 +22,13 @@ class DependencyExceptions(unittest.TestCase):
             shutil.copy2(source / name, self.root / name)
 
     def check(self):
-        validate(self.root, date(2026, 9, 21))
+        validate(self.root, date(2026, 10, 21))
 
     def test_current_and_expiration_boundary(self):
         self.check()
-        validate(self.root, date(2026, 10, 20))
+        validate(self.root, date(2026, 11, 19))
         with self.assertRaisesRegex(ValueError, "expired"):
-            validate(self.root, date(2026, 10, 21))
+            validate(self.root, date(2026, 11, 20))
 
     def test_scanner_disagreement(self):
         for config in (".cargo/audit.toml", "deny.toml"):
@@ -86,16 +86,16 @@ class DependencyExceptions(unittest.TestCase):
 
     def test_publication_requires_explicit_xml_risk_acceptance(self):
         self.check()
-        validate(self.root, date(2026, 10, 20), publication=True)
+        validate(self.root, date(2026, 11, 19), publication=True)
         with self.assertRaisesRegex(ValueError, "expired"):
-            validate(self.root, date(2026, 10, 21), publication=True)
+            validate(self.root, date(2026, 11, 20), publication=True)
         path = self.root / "security/dependency-exceptions.json"
         policy = json.loads(path.read_text())
         for acceptance in ({}, {"reason": "accepted", "advisories": ["RUSTSEC-2026-0194"]}):
             policy["publication"] = acceptance
             path.write_text(json.dumps(policy))
             with self.assertRaisesRegex(ValueError, "publication is blocked"):
-                validate(self.root, date(2026, 9, 21), publication=True)
+                validate(self.root, date(2026, 10, 21), publication=True)
 
 
 if __name__ == "__main__":

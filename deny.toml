@@ -17,7 +17,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
-# Valid only with tools/check_dependency_exceptions.py; expires 2026-10-21.
+# Valid only with tools/check_dependency_exceptions.py; expires 2026-11-20.
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2024-0384",
@@ -25,6 +25,7 @@ ignore = [
     "RUSTSEC-2026-0173",
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0381",
 ]
 
 [licenses]

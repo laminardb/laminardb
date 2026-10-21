@@ -1,7 +1,7 @@
 # Temporary dependency exceptions
 
-Status: approved 2026-09-21, expires at 2026-10-21 UTC (CI fails on that date).
-Owner: LaminarDB maintainers responsible for [PR #540](https://github.com/laminardb/laminardb/pull/540).
+Status: approved 2026-09-21, re-approved 2026-10-21, expires at 2026-11-20 UTC (CI fails on that date).
+Owner: LaminarDB maintainers responsible for [PR #600](https://github.com/laminardb/laminardb/pull/600).
 The four residual exceptions below were re-reviewed and accepted for this interval under S4.
 Machine-readable versions, sources, checksums and reasons are in `dependency-exceptions.json`.
 
@@ -11,6 +11,14 @@ Machine-readable versions, sources, checksums and reasons are in `dependency-exc
 | [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html) | paste 1.0.15 | Unmaintained compile-time dependency through DataFusion/Parquet/tokenizers. |
 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html) | proc-macro-error2 2.0.1 | Unmaintained compile-time dependency through validator_derive in Delta Lake. |
 | [RUSTSEC-2024-0384](https://rustsec.org/advisories/RUSTSEC-2024-0384.html) | instant 0.1.13 | Unmaintained dependency in the wider lockfile, including reqwest-retry/wasm-timer and old parking_lot. |
+
+[RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html) (webpki-roots 0.26.11)
+is excepted as a scanner match, not an accepted risk. That release bundles no certificates: it
+re-exports `TLS_SERVER_ROOTS` from webpki-roots 1.x, which the lockfile pins at the patched
+1.0.10 (both versions are pinned by checksum). Only async-nats reaches 0.26, through
+tokio-websockets 0.10; every async-nats release up to 0.50 still requires it, and building
+without its `websockets` feature would remove `ws://` NATS server URLs. Remove this exception
+when async-nats moves to tokio-websockets 0.12 or later.
 
 Two additional exceptions cover RUSTSEC-2026-0194 and RUSTSEC-2026-0195, with the same deadline.
 Workspace builds still require the verified quick-xml backport. Registry publication now has
@@ -53,4 +61,10 @@ records for [DataFusion](https://crates.io/api/v1/crates/datafusion/55.1.0/depen
 [Iceberg's adapter](https://crates.io/api/v1/crates/iceberg-storage-opendal/0.10.1/dependencies).
 paste, proc-macro-error2 and instant
 still have no maintained compatible release; RSA's next generation remains a release candidate.
-Keep these exceptions under review before **2026-10-21**, which remains the hard CI deadline.
+Re-review on 2026-10-21: rsa, paste, proc-macro-error2 and instant still have no new stable
+release (rsa 0.10 is at 0.10.0-rc.19). object_store 0.14.2 now accepts quick-xml `^0.41.0`, but
+current DataFusion 55.2.0 and Delta Lake 1.1.2 still require object_store `^0.13.2`, and
+iceberg-storage-opendal 0.10.1 still requires OpenDAL `^0.57` (latest 0.59.5), so the patch and
+XML exceptions remain until the analytical dependency migration. The backport's only change in
+this review is its due date, so its reviewed digest was recomputed.
+Keep these exceptions under review before **2026-11-20**, which is the hard CI deadline.

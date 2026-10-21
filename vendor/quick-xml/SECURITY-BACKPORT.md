@@ -1,6 +1,6 @@
 # quick-xml 0.39.4 security backport
 
-Maintained compatibility backport, 2026-09-21; review/removal due 2026-10-21.
+Maintained compatibility backport, 2026-09-21; re-reviewed 2026-10-21; review/removal due 2026-11-20.
 
 Base: the crates.io quick-xml 0.39.4 archive, SHA-256
 `cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e`.
