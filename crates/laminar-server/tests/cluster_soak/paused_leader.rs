@@ -5,12 +5,13 @@
 //! successor and commit through the same failover assertions as a kill, and only then resume it
 //! with `SIGCONT`. The stale leader must observe its lost identity lease and exit on its own
 //! before the node restarts; the soak's frozen-input oracle must still find every output row
-//! exactly once in Delta.
+//! exactly once in every exact sink.
 //!
 //! The committed-index gate holds a prepared, quorum-certified checkpoint before its committed
-//! index exists. The sink-commit gate holds a committed checkpoint after the leader read the
-//! sink's committed cursor and before its external commit, so a resumed leader carries a stale
-//! cursor. Unix only: the rounds signal processes with `kill`.
+//! index exists. Each sink-commit gate holds a committed checkpoint after the leader read that
+//! sink's committed cursor and before its external commit (Delta, and Iceberg when built with
+//! `iceberg`), so a resumed leader carries a stale cursor. Unix only: the rounds signal processes
+//! with `kill`.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::process::{Child, Command, ExitStatus};
@@ -19,7 +20,14 @@ use std::time::{Duration, Instant};
 use super::{remove_marker, wait_for, JoinDelivery, Node};
 
 const EXACT_SINK: &str = "soak_output";
+#[cfg(not(all(feature = "delta-lake-s3", feature = "iceberg")))]
 const EXACT_GATES: [PauseGate; 2] = [PauseGate::CommittedIndex, PauseGate::SinkCommit(EXACT_SINK)];
+#[cfg(all(feature = "delta-lake-s3", feature = "iceberg"))]
+const EXACT_GATES: [PauseGate; 3] = [
+    PauseGate::CommittedIndex,
+    PauseGate::SinkCommit(EXACT_SINK),
+    PauseGate::SinkCommit(super::iceberg_leg::ICEBERG_SINK),
+];
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_LOSS_MARKERS: [&str; 2] = [
     "node identity lease lost",

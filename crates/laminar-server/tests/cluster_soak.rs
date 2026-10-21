@@ -30,7 +30,7 @@
 //!   --test cluster_soak three_node_alo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,kafka \
 //!   --test cluster_soak single_node_alo_join_kill9_soak -- --ignored --nocapture
-//! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3 \
+//! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3,iceberg \
 //!   --test cluster_soak three_node_eo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,kafka,delta-lake-s3 \
 //!   --test cluster_soak single_node_eo_join_kill9_soak -- --ignored --nocapture
@@ -52,6 +52,8 @@
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
+//! - `LAMINAR_SOAK_ICEBERG_*`  Iceberg REST catalog and S3 storage for the three-node EO leg when
+//!   built with `iceberg` (see `iceberg_leg`)
 //! - Custom S3 endpoint EO runs use a bounded 60s checkpoint-operation timeout
 //! - `LAMINAR_SOAK_ALO_VISIBILITY_MS`  maximum Kafka output visibility latency (default 10000)
 //! - `LAMINAR_SOAK_EO_VISIBILITY_MS`  maximum frozen-input-to-Delta visibility latency (default 10000)
@@ -91,9 +93,16 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
+#[path = "cluster_soak/iceberg_leg.rs"]
+mod iceberg_leg;
 #[cfg(all(feature = "kafka", any(feature = "rabbitmq", feature = "ibmmq")))]
 #[path = "cluster_soak/messaging_sinks.rs"]
 mod messaging_sinks;
+// Shared with iceberg_cluster_soak, which uses every helper this soak does not.
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
+#[allow(dead_code)]
+mod iceberg_table;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/paused_leader.rs"]
 mod paused_leader;
@@ -13994,6 +14003,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
     let mut window_output_oracle;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_window_output_oracles = None;
+    #[cfg(all(feature = "delta-lake-s3", feature = "iceberg"))]
+    let iceberg_output = (delivery == JoinDelivery::ExactlyOnce)
+        .then(|| iceberg_leg::IcebergJoinOutput::create(&run_id));
     let (sink_config, matrix_sink_config) = match delivery {
         JoinDelivery::AtLeastOnce => {
             let (configured_oracles, sink_config) = JoinOutputOracles::kafka(
@@ -14027,6 +14039,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 let storage = DeltaSoakStorage::from_environment();
                 let (configured_oracles, sink_config) =
                     JoinOutputOracles::delta(&run_id, "cluster", &storage);
+                #[cfg(feature = "iceberg")]
+                let sink_config = format!(
+                    "{sink_config}{}",
+                    iceberg_output
+                        .as_ref()
+                        .expect("cluster EO Iceberg leg")
+                        .sink_config()
+                );
                 output_oracles = configured_oracles;
                 let matrix_uris = delta_matrix_output_table_uris(&run_id, "cluster");
                 let matrix_sinks = delta_matrix_output_sink_config(&matrix_uris, &storage);
@@ -15299,6 +15319,16 @@ fn run_three_node_join_kill9_soak_with_adoption(
                         .expect("cluster EO outputs completed before final cuts"),
                     recovery_ceiling,
                 );
+                #[cfg(feature = "iceberg")]
+                iceberg_output
+                    .as_ref()
+                    .expect("cluster EO Iceberg leg")
+                    .assert_exact(
+                        &mut nodes,
+                        &produced_prefix.expected_pairs,
+                        recovery_ceiling,
+                        "three-node EO bounded join",
+                    );
                 assert_delta_matrix_outputs(
                     &mut nodes,
                     delta_matrix_output_oracles
