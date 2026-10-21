@@ -1,6 +1,7 @@
 //! Stateful consumers must read a changelog, never a running-state aggregate stream.
 
 use laminar_sql::parser::EmitClause;
+use laminar_sql::translator::JoinOperatorConfig;
 use rustc_hash::FxHashSet;
 
 use crate::db::LaminarDB;
@@ -29,8 +30,14 @@ impl LaminarDB {
         query_sql: &str,
         planned: &PlannedStreamingQuery,
     ) -> Result<(), DbError> {
+        // A lookup join forwards each input row; only joins that retain input rows keep state.
+        let retains_join_rows = planned.join_config.as_deref().is_some_and(|joins| {
+            joins
+                .iter()
+                .any(|join| !matches!(join, JoinOperatorConfig::Lookup(_)))
+        });
         let stateful = planned.window_config.is_some()
-            || planned.join_config.is_some()
+            || retains_join_rows
             || self.query_aggregates(query_sql).await;
         if !stateful {
             return Ok(());
@@ -190,6 +197,33 @@ mod tests {
                 "{stream}: {changelog:?}"
             );
         }
+    }
+
+    /// A lookup join forwards each row with its table columns and keeps no per-row state.
+    #[tokio::test]
+    async fn lookup_join_forwards_running_state() {
+        let db = db_with_running_state_upstream().await;
+        db.execute(
+            "CREATE LOOKUP TABLE rates (k BIGINT NOT NULL, r DOUBLE NOT NULL, PRIMARY KEY (k)) \
+             WITH ('connector' = 'static')",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "CREATE STREAM enriched AS SELECT p.k, p.n, t.r FROM per_key p JOIN rates t \
+             ON p.k = t.k",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .execute("CREATE STREAM over_enriched AS SELECT n, COUNT(*) AS keys FROM enriched GROUP BY n")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("'per_key', a running-state aggregate"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
