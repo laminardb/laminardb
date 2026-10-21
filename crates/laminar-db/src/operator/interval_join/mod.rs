@@ -4,6 +4,8 @@
 //! `right_ts BETWEEN left_ts AND left_ts + time_bound`; evicts on watermark advance.
 
 mod checkpoint_validation;
+#[cfg(feature = "cluster")]
+mod cluster_frontiers;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -991,6 +993,10 @@ pub(crate) struct IntervalJoinOperator {
     peer_channels: [BTreeMap<u64, IntervalPeerChannel>; 2],
     #[cfg(feature = "cluster")]
     last_broadcasts: [InputFrontier; 2],
+    /// Highest cut an all-idle merge may close to: this node's idle graph input, which the graph
+    /// caps at the committed source cut. `None` while that input is active.
+    #[cfg(feature = "cluster")]
+    idle_close_ceilings: [Option<i64>; 2],
     #[cfg(feature = "cluster")]
     remote_side_cursor: u8,
     #[cfg(feature = "cluster")]
@@ -1065,6 +1071,8 @@ impl IntervalJoinOperator {
             peer_channels: [BTreeMap::new(), BTreeMap::new()],
             #[cfg(feature = "cluster")]
             last_broadcasts: [InputFrontier::default(); 2],
+            #[cfg(feature = "cluster")]
+            idle_close_ceilings: [Some(i64::MIN); 2],
             #[cfg(feature = "cluster")]
             remote_side_cursor: 0,
             #[cfg(feature = "cluster")]
@@ -3589,67 +3597,6 @@ impl IntervalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn effective_cluster_frontiers(
-        &self,
-        local: [InputFrontier; 2],
-        override_event: Option<(usize, u64, InputFrontier, usize)>,
-    ) -> Result<[InputFrontier; 2], DbError> {
-        let merge = |port: usize| -> Result<InputFrontier, DbError> {
-            let peers = self.peer_channels[port].iter().map(|(&peer, channel)| {
-                let mut applied = override_event
-                    .filter(|(event_port, event_peer, _, _)| {
-                        *event_port == port && *event_peer == peer
-                    })
-                    .map_or(channel.applied, |(_, _, frontier, _)| frontier);
-                let consumed = override_event
-                    .filter(|(event_port, event_peer, _, _)| {
-                        *event_port == port && *event_peer == peer
-                    })
-                    .map_or(0, |(_, _, _, consumed)| consumed);
-                if channel.events.len() > consumed {
-                    applied.idle = false;
-                    let floor = if port == 0 {
-                        self.applied_left_watermark
-                    } else {
-                        self.applied_right_watermark
-                    };
-                    applied.watermark = super::frontier::max_watermark(
-                        applied.watermark,
-                        Self::watermark_option(floor),
-                    );
-                }
-                applied
-            });
-            let mut merged =
-                merge_input_frontier_iter(std::iter::once(local[port]).chain(peers), i64::MIN);
-            let previous = self.applied_frontiers()[port];
-            // Idle channels never echo the applied cut, so an all-idle merge can trail it; hold
-            // there instead of regressing.
-            if merged.idle {
-                merged.watermark =
-                    super::frontier::max_watermark(merged.watermark, previous.watermark);
-            }
-            self.validate_frontier(
-                previous,
-                merged,
-                if port == 0 {
-                    JoinInputSide::Left
-                } else {
-                    JoinInputSide::Right
-                },
-            )?;
-            if self.pending_cluster_input.is_some() {
-                return Ok(InputFrontier {
-                    watermark: previous.watermark,
-                    idle: false,
-                });
-            }
-            Ok(merged)
-        };
-        Ok([merge(0)?, merge(1)?])
-    }
-
-    #[cfg(feature = "cluster")]
     fn plan_cluster_inputs(
         &self,
         inputs: &[Vec<RecordBatch>],
@@ -4165,6 +4112,11 @@ impl IntervalJoinOperator {
         left_frontier: InputFrontier,
         right_frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        self.idle_close_ceilings = [left_frontier, right_frontier].map(|frontier| {
+            frontier
+                .idle
+                .then(|| frontier.watermark.unwrap_or(i64::MIN))
+        });
         let scope = self.active_cluster_scope();
         let (config, assignment, peers) = match scope {
             Ok(scope) => scope,

@@ -2980,6 +2980,94 @@ async fn reviving_reader_row_is_admitted_after_idle_non_reader_frontier() {
     assert_eq!(operator.applied_left_watermark, 20_000);
 }
 
+/// Reader node 2 went idle at its own watermark `20_000` while the committed cut is `5_000`, which
+/// is this node's capped idle source frontier. An all-idle close must stop at the committed cut,
+/// so reader node 3, which revives at that cut, still has its row at `8_000` admitted.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn all_idle_close_stops_at_the_committed_cut_for_a_reviving_reader() {
+    let (scope, _peers) = three_owner_shuffle().await;
+    let mut operator = IntervalJoinOperator::new(
+        "idle_ceiling",
+        test_config(),
+        None,
+        laminar_sql::create_session_context(),
+    );
+    operator.set_input_schemas(
+        left_batch(&[], &[], &[]).schema(),
+        right_batch(&[], &[], &[]).schema(),
+    );
+    operator.attach_cluster_shuffle(scope.clone());
+    let idle = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    };
+    let active = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: false,
+    };
+    operator.applied_left_watermark = 1_000;
+    operator.applied_right_watermark = 1_000;
+    operator.applied_left_idle = true;
+    operator.applied_right_idle = true;
+    operator.local_frontiers = [idle(1_000); 2];
+    operator.last_broadcasts = [idle(1_000); 2];
+    for port in 0..2 {
+        for peer in [2_u64, 3] {
+            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            channel.applied = idle(1_000);
+            channel.accepted = idle(1_000);
+        }
+    }
+    let assignment = scope.registry.assignment_version();
+    let recovery = scope.receiver.recovery_gen();
+
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "idle_ceiling::left",
+            2,
+            idle(20_000),
+            assignment,
+            recovery,
+        )
+        .unwrap();
+    operator
+        .process_cluster(&[Vec::new(), Vec::new()], idle(5_000), idle(5_000))
+        .await
+        .unwrap();
+    assert_eq!(operator.applied_left_watermark, 5_000);
+
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "idle_ceiling::left",
+            3,
+            active(5_000),
+            assignment,
+            recovery,
+        )
+        .unwrap();
+    let key = key_for_vnode(0, 3);
+    operator
+        .stage_checkpointed_shuffle(
+            "idle_ceiling::left",
+            crate::operator::RetainedBatch::restored_channel(
+                left_batch(&[key.as_str()], &[8_000], &[1.0]),
+                3,
+                assignment,
+                recovery,
+                Arc::from([0_u32]),
+            ),
+            i64::MIN,
+        )
+        .unwrap();
+    for _ in 0..4 {
+        operator
+            .process_cluster(&[Vec::new(), Vec::new()], idle(5_000), idle(5_000))
+            .await
+            .expect("the reviving reader's row at the committed cut must be admitted");
+    }
+}
+
 /// Without the echo an all-idle merge can trail the cut this node already applied; it must hold
 /// there instead of failing as a regression.
 #[cfg(feature = "cluster")]
