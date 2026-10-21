@@ -14162,7 +14162,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
             fault_trigger_path: fault_role
                 .as_ref()
                 .map(|_| dir.path().join(format!("fault-node-{id}.trigger"))),
-            checkpoint_gate_path: (max_kills > 0 || migrate_topology)
+            checkpoint_gate_path: (max_kills > 0 || migrate_topology || !pause_gates.is_empty())
                 .then(|| dir.path().join(format!("checkpoint-node-{id}.arm"))),
             sink_commit_gate_path: (!pause_gates.is_empty())
                 .then(|| dir.path().join(format!("sink-commit-node-{id}.arm"))),
