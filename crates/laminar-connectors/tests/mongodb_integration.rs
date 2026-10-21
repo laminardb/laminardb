@@ -110,6 +110,9 @@ async fn start_mongo() -> (testcontainers::ContainerAsync<GenericImage>, String)
             "Waiting for connections",
         ))
         .with_exposed_port(27017.into())
+        // MongoDB 8.0's per-CPU allocator caches break on Linux 6.19 to 7.0.13, where mongod refuses
+        // to start; glibc's rseq registration keeps the caches off on every kernel.
+        .with_env_var("GLIBC_TUNABLES", "glibc.pthread.rseq=1")
         // Replica set required for change streams.
         .with_cmd([
             "mongod",

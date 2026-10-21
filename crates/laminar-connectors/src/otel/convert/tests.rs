@@ -18,6 +18,7 @@ fn make_kv(key: &str, val: &str) -> KeyValue {
         value: Some(ProtoAnyValue {
             value: Some(any_value::Value::StringValue(val.to_string())),
         }),
+        key_strindex: 0,
     }
 }
 
@@ -27,6 +28,7 @@ fn make_kv_int(key: &str, val: i64) -> KeyValue {
         value: Some(ProtoAnyValue {
             value: Some(any_value::Value::IntValue(val)),
         }),
+        key_strindex: 0,
     }
 }
 
@@ -263,6 +265,18 @@ fn test_int_attribute_to_string() {
     let kv = make_kv_int("retries", 3);
     let s = any_value_to_string(kv.value.as_ref());
     assert_eq!(s, Some("3".to_string()));
+}
+
+#[test]
+fn test_string_table_index_is_absent() {
+    let mut buf = String::new();
+    write_any_value_json(
+        &mut buf,
+        &ProtoAnyValue {
+            value: Some(any_value::Value::StringValueStrindex(7)),
+        },
+    );
+    assert_eq!(buf, "null");
 }
 
 #[test]

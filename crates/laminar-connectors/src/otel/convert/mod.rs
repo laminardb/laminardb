@@ -180,7 +180,8 @@ fn write_any_value_json_depth(buf: &mut String, v: &AnyValue, depth: usize) {
             buf.push_str(&base64::engine::general_purpose::STANDARD.encode(b));
             buf.push('"');
         }
-        None => buf.push_str("null"),
+        // OTLP defines string-table indexes only for profiles; other signals treat them as absent.
+        Some(Value::StringValueStrindex(_)) | None => buf.push_str("null"),
     }
 }
 

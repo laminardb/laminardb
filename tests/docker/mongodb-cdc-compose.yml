@@ -12,6 +12,10 @@ services:
     # Single-member replica set: change streams and snapshot reads.
     image: mongo:8.0
     container_name: laminardb-mongo-rs
+    # MongoDB 8.0's per-CPU allocator caches break on Linux 6.19 to 7.0.13, where mongod refuses
+    # to start; glibc's rseq registration keeps the caches off on every kernel.
+    environment:
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
     command: ["mongod", "--replSet", "rs0", "--port", "27117", "--bind_ip_all",
               "--setParameter", "enableTestCommands=1"]
     ports:
@@ -27,6 +31,8 @@ services:
     # Three-member replica set in one container, for election and failover tests.
     image: mongo:8.0
     container_name: laminardb-mongo-rs3
+    environment:
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
     # Three mongod processes; the container lives while any member runs, so a test may kill one.
     entrypoint:
       - bash

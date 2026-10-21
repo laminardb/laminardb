@@ -117,7 +117,7 @@ libmqm-default = { version = "0.10.2", optional = true, default-features = false
 dlopen2 = { version = "0.8", optional = true }
 
 # OpenTelemetry OTLP/gRPC receiver
-opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"], optional = true }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"], optional = true }
 tonic = { version = "0.14", optional = true }
 base64 = { workspace = true, optional = true }
 
