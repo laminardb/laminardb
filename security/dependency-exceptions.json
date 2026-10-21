@@ -1,7 +1,7 @@
 {
-  "owner": "LaminarDB maintainers responsible for PR #540",
-  "approved": "2026-09-21",
-  "expires": "2026-10-21",
+  "owner": "LaminarDB maintainers responsible for PR #600",
+  "approved": "2026-10-21",
+  "expires": "2026-11-20",
   "exceptions": [
     {
       "advisory": "RUSTSEC-2023-0071",
@@ -38,6 +38,12 @@
       "crate": "quick-xml",
       "version": "0.39.4",
       "reason": "Workspace backport is source-verified; registry publication separately accepts the unpatched namespace-allocation denial-of-service risk until expiry."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0381",
+      "crate": "webpki-roots",
+      "version": "0.26.11",
+      "reason": "Scanner match on a compatibility shim, not accepted residual risk: webpki-roots 0.26.11 bundles no certificates and re-exports TLS_SERVER_ROOTS from webpki-roots 1.x, locked at the patched 1.0.10. Only async-nats reaches it, through tokio-websockets 0.10, which every async-nats release up to 0.50 still requires."
     }
   ],
   "packages": [
@@ -74,14 +80,26 @@
       "version": "0.9.10",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
+    },
+    {
+      "name": "webpki-roots",
+      "version": "0.26.11",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+    },
+    {
+      "name": "webpki-roots",
+      "version": "1.0.10",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
     }
   ],
   "publication": {
     "advisories": ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"],
-    "reason": "Explicitly accepted on 2026-09-21 through the policy expiry: Cargo does not propagate the workspace XML patch to registry consumers. object_store 0.13.2 still requires quick-xml ^0.39.0; upgrading the analytical dependency generation is outside this repair. Unpatched registry consumers retain CPU and memory denial-of-service exposure when parsing hostile XML."
+    "reason": "Explicitly accepted on 2026-09-21 and re-accepted on 2026-10-21 through the policy expiry: Cargo does not propagate the workspace XML patch to registry consumers. object_store 0.13.2 still requires quick-xml ^0.39.0; upgrading the analytical dependency generation is outside this repair. Unpatched registry consumers retain CPU and memory denial-of-service exposure when parsing hostile XML."
   },
   "backport": {
     "path": "vendor/quick-xml",
-    "sha256": "cdf0eb6198ab867db45ba6230c8ebe176299488b13fc69744e34f86c243f19b0"
+    "sha256": "23298fbf98aa8264a6fcd8a87a64040f4e1c3ef086279e4300f5f7fa6d3e46ce"
   }
 }

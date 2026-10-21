@@ -70,6 +70,41 @@ impl SumState {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    pub(super) fn batch_delta(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
+        match self.mode {
+            SumMode::AppendOnly => {
+                let value = append_value(values)?;
+                require_array_type(value, &self.input_type, "SUM")?;
+                Ok(vec![sum_array(value, &self.output_type)?])
+            }
+            SumMode::Weighted { .. } => {
+                let (value, weights) = weighted_values(values)?;
+                require_array_type(value, &self.input_type, "weighted SUM")?;
+                let (sum, weight) = match &self.sum {
+                    ScalarValue::Decimal128(Some(_), 38, 0) => {
+                        let (sum, weight) = exact_weighted_sum_delta(value, weights)?;
+                        (ScalarValue::Decimal128(Some(sum), 38, 0), weight)
+                    }
+                    ScalarValue::Float64(Some(_)) => {
+                        let (sum, weight) = weighted_f64_delta(
+                            value.as_primitive::<Float64Type>(),
+                            weights,
+                            "weighted SUM",
+                        )?;
+                        (ScalarValue::Float64(Some(sum)), weight)
+                    }
+                    _ => {
+                        return Err(DbError::Pipeline(
+                            "weighted SUM has an invalid concrete state shape".into(),
+                        ))
+                    }
+                };
+                Ok(vec![sum, ScalarValue::Int64(Some(weight))])
+            }
+        }
+    }
+
     pub(super) fn evaluate(&self) -> Result<ScalarValue, DbError> {
         match self.mode {
             SumMode::AppendOnly => Ok(self.sum.clone()),
@@ -401,6 +436,30 @@ fn update_weighted_sum(
         _ => Err(DbError::Pipeline(
             "weighted SUM has an invalid concrete state shape".into(),
         )),
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn exact_weighted_sum_delta(
+    values: &ArrayRef,
+    weights: &arrow::array::Int64Array,
+) -> Result<(i128, i64), DbError> {
+    match values.data_type() {
+        DataType::Int64 => {
+            let values = values.as_primitive::<Int64Type>();
+            exact_weighted_delta(values, weights, |row| i128::from(values.value(row)))
+        }
+        DataType::UInt64 => {
+            let values = values.as_primitive::<UInt64Type>();
+            exact_weighted_delta(values, weights, |row| i128::from(values.value(row)))
+        }
+        DataType::Decimal128(_, _) => {
+            let values = values.as_primitive::<Decimal128Type>();
+            exact_weighted_delta(values, weights, |row| values.value(row))
+        }
+        other => Err(DbError::Pipeline(format!(
+            "weighted exact SUM does not support input type {other:?}"
+        ))),
     }
 }
 

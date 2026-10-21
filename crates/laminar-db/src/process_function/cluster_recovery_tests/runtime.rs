@@ -1,40 +1,16 @@
 use super::*;
-use async_trait::async_trait;
 use laminar_core::checkpoint::CheckpointParticipant;
-use laminar_core::cluster::control::{
-    CatalogManifestStore, ClusterKv, InMemoryKv, LeaderLease, LeaderLeaseOwner, LeaderLeaseStore,
-    LeaseDeadline, LeaseOutcome, ProcessLease, ProcessLeaseAuthority, ProcessLeaseOutcome,
-};
-use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
-use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+use laminar_core::cluster::control::{CatalogManifestStore, LeaderLease};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-struct PeerKv {
-    node: NodeId,
-    shared: Arc<InMemoryKv>,
-}
-
-#[async_trait]
-impl ClusterKv for PeerKv {
-    async fn write(&self, key: &str, value: String) {
-        self.shared.seed(self.node, key, value);
-    }
-    async fn read_from(&self, node: NodeId, key: &str) -> Option<String> {
-        self.shared.read_from(node, key).await
-    }
-    async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
-        self.shared.scan(key).await
-    }
-}
+use crate::cluster_test_support::{prepare_controls, ClusterControl};
 
 pub(super) struct Peer {
     pub db: Option<Arc<LaminarDB>>,
     pub controller: Arc<ClusterController>,
     pub probe: Arc<source::SourceProbe>,
-    sender: Arc<ShuffleSender>,
-    receiver: Arc<ShuffleReceiver>,
-    _membership: watch::Sender<Vec<NodeInfo>>,
+    control: ClusterControl,
 }
 
 pub(super) struct Rig {
@@ -87,138 +63,17 @@ impl Rig {
     }
 
     async fn prepare_peers(&mut self, objects: Arc<dyn object_store::ObjectStore>) {
-        let shared = Arc::new(InMemoryKv::new(NodeId(7)));
-        let authority =
-            Arc::new(ProcessLeaseAuthority::new(Arc::clone(&objects), LEASE_TTL).unwrap());
-        let leader = Arc::new(LeaderLeaseStore::new(objects, 120_000));
-        let members = self
-            .assignment
-            .participants
-            .iter()
-            .map(|participant| NodeInfo {
-                id: NodeId(participant.node_id),
-                name: format!("process-{}", participant.node_id),
-                rpc_address: String::new(),
-                state: NodeState::Active,
-                metadata: NodeMetadata::default(),
-                last_heartbeat_ms: 0,
-            })
-            .collect::<Vec<_>>();
-        for participant in &self.assignment.participants {
-            let node = NodeId(participant.node_id);
-            let (membership, membership_rx) = watch::channel(members.clone());
-            let kv: Arc<dyn ClusterKv> = Arc::new(PeerKv {
-                node,
-                shared: Arc::clone(&shared),
-            });
-            let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-                node,
-                Arc::clone(&kv),
-                kv,
-                None,
-                membership_rx,
-                participant.boot_incarnation,
-            ));
-            let ProcessLeaseOutcome::Acquired(lease) = authority
-                .store_for(node)
-                .try_acquire(participant.boot_incarnation, 0)
-                .await
-                .unwrap()
-            else {
-                panic!("fresh fixture process lease was not acquired");
-            };
-            controller
-                .set_process_lease_authority(Arc::clone(&authority))
-                .unwrap();
-            controller
-                .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(LEASE_TTL)))
-                .unwrap();
-            controller
-                .publish_leased_recovery_incarnation(&lease)
-                .await
-                .unwrap();
-            controller.install_local_leader_proof_provider();
-            controller.set_leader_lease_store(Arc::clone(&leader));
-            controller.set_active(true);
-            controller
-                .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &lease)
-                .await
-                .unwrap();
-            if node == NodeId(7) {
-                self._leader_watch =
-                    Some(Self::acquire_leadership(&controller, &lease, &leader).await);
-            }
-            let sender = Arc::new(ShuffleSender::new(node.0, participant.boot_incarnation));
-            let receiver = Arc::new(
-                ShuffleReceiver::bind(
-                    node.0,
-                    "127.0.0.1:0".parse().unwrap(),
-                    participant.boot_incarnation,
-                )
-                .await
-                .unwrap(),
-            );
-            sender
-                .bind_process_lease_deadline_pair(
-                    &receiver,
-                    controller.process_lease_deadline().unwrap(),
-                )
-                .unwrap();
-            let fence = self.assignment.assignment_fence().unwrap();
-            let owners = self
-                .assignment
-                .to_vnode_vec(2)
-                .unwrap()
-                .iter()
-                .map(|owner| owner.0)
-                .collect::<Vec<_>>();
-            sender.install_assignment_fence(&fence, &owners).unwrap();
-            receiver.install_assignment_fence(&fence, &owners).unwrap();
-            self.peers.push(Peer {
+        let (controls, leader_watch) = prepare_controls(&self.assignment, 2, objects).await;
+        self._leader_watch = Some(leader_watch);
+        self.peers = controls
+            .into_iter()
+            .map(|control| Peer {
                 db: None,
-                controller,
+                controller: Arc::clone(&control.controller),
                 probe: Arc::default(),
-                sender,
-                receiver,
-                _membership: membership,
-            });
-        }
-        for peer in &self.peers {
-            for other in &self.peers {
-                if peer.controller.instance_id() != other.controller.instance_id() {
-                    peer.sender.register_peer(
-                        other.controller.instance_id().0,
-                        other.receiver.local_addr(),
-                    );
-                }
-            }
-        }
-    }
-
-    async fn acquire_leadership(
-        controller: &ClusterController,
-        lease: &ProcessLease,
-        leader: &LeaderLeaseStore,
-    ) -> watch::Sender<Option<LeaderLease>> {
-        let node = controller.instance_id();
-        let boot = controller.recovery_incarnation();
-        let owner = LeaderLeaseOwner {
-            node,
-            boot,
-            process_term: lease.term,
-        };
-        let LeaseOutcome::Acquired(grant) = leader.begin_new_term(&owner, 0).await.unwrap() else {
-            panic!("fresh fixture leader lease was not acquired");
-        };
-        let (sender, receiver) = watch::channel(Some(grant));
-        controller
-            .set_leader_lease_watch(
-                receiver,
-                owner,
-                Arc::new(LeaseDeadline::live_for(LEASE_TTL)),
-            )
-            .unwrap();
-        sender
+                control,
+            })
+            .collect();
     }
 
     pub async fn setup(&mut self, remote: bool) {
@@ -256,8 +111,8 @@ impl Rig {
                 .assignment_snapshot_store(Arc::clone(&assignments))
                 .catalog_manifest_store(manifest)
                 .vnode_registry(registry)
-                .shuffle_sender(Arc::clone(&peer.sender))
-                .shuffle_receiver(Arc::clone(&peer.receiver))
+                .shuffle_sender(Arc::clone(&peer.control.sender))
+                .shuffle_receiver(Arc::clone(&peer.control.receiver))
                 .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
                 .buffer_size(if remote { 1 } else { 1024 })
                 .checkpoint(laminar_core::streaming::StreamCheckpointConfig {

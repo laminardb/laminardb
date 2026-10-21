@@ -306,7 +306,7 @@ use sink_admission::{admit_sink, open_prepared_sinks};
 mod output_schema;
 pub(crate) use output_schema::{
     advertise_changelog_schema, plan_output_schema, plan_temporal_output_schema,
-    resolve_stream_output_schemas,
+    resolve_stream_output_schemas, ResolvedStreamOutputs,
 };
 mod supervision;
 #[cfg(test)]

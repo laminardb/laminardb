@@ -12,7 +12,7 @@ impl LaminarDB {
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
-        changelog_carrying: &rustc_hash::FxHashSet<String>,
+        resolved: &super::ResolvedStreamOutputs,
         ordered_interval_joins: &FxHashMap<
             String,
             [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
@@ -22,7 +22,7 @@ impl LaminarDB {
         self.build_connector_operator_graph_inner(
             stream_regs,
             table_regs,
-            changelog_carrying,
+            resolved,
             ordered_interval_joins,
             pipeline_identity,
             None,
@@ -35,7 +35,7 @@ impl LaminarDB {
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
-        changelog_carrying: &rustc_hash::FxHashSet<String>,
+        resolved: &super::ResolvedStreamOutputs,
         ordered_interval_joins: &FxHashMap<
             String,
             [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
@@ -46,7 +46,7 @@ impl LaminarDB {
         self.build_connector_operator_graph_inner(
             stream_regs,
             table_regs,
-            changelog_carrying,
+            resolved,
             ordered_interval_joins,
             Some(pipeline_identity),
             Some(scope),
@@ -58,7 +58,7 @@ impl LaminarDB {
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
-        changelog_carrying: &rustc_hash::FxHashSet<String>,
+        resolved: &super::ResolvedStreamOutputs,
         ordered_interval_joins: &FxHashMap<
             String,
             [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
@@ -188,8 +188,16 @@ impl LaminarDB {
                 .unwrap_or_else(tokio::runtime::Handle::current),
         );
 
-        // Seed changelog producers up front so consumer admission is independent of build order.
-        graph.set_changelog_tables(changelog_carrying.clone());
+        // Seed changelog producers and stream schemas up front so consumer admission and
+        // stream-fed operators are independent of build order.
+        graph.set_changelog_tables(resolved.changelog_carrying.clone());
+        #[cfg(feature = "cluster")]
+        graph.set_colocated_aggregates(resolved.exchange_plan.colocated_aggregates());
+        #[cfg(feature = "cluster")]
+        graph.set_event_time_forwards(resolved.exchange_plan.event_time_forwards());
+        for (name, schema) in &resolved.schemas {
+            graph.register_intermediate_schema(name, schema);
+        }
 
         self.install_registered_operators(&mut graph, stream_regs)?;
 
@@ -501,7 +509,7 @@ mod tests {
             db.build_connector_operator_graph(
                 &streams,
                 &HashMap::new(),
-                &rustc_hash::FxHashSet::default(),
+                &crate::pipeline_lifecycle::ResolvedStreamOutputs::default(),
                 &FxHashMap::default(),
                 None,
             )

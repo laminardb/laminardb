@@ -1,4 +1,5 @@
-//! Exact committed generation on the process-owned shuffle fabric; runtime activation stays held.
+//! Exact committed generation and pipeline identity on the process-owned shuffle fabric; runtime
+//! activation stays held.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -47,6 +48,24 @@ impl LaminarDB {
         sender
             .install_topology_fence_pair(&receiver, None, target)
             .map_err(|error| TopologyError::Conflict(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Peers refuse shuffle handshakes from a process bound to another pipeline identity, so
+    /// processes built from different binaries or catalogs never exchange frames. Startup binds
+    /// the identity it computed before the graph sends.
+    pub(crate) fn bind_shuffle_pipeline_identity(
+        &self,
+        identity: &laminar_core::checkpoint::PipelineIdentity,
+    ) -> Result<(), DbError> {
+        let sender = self.shuffle_sender.lock().clone();
+        let receiver = self.shuffle_receiver.lock().clone();
+        let (Some(sender), Some(receiver)) = (sender, receiver) else {
+            return Ok(());
+        };
+        sender
+            .install_pipeline_identity_pair(&receiver, identity)
+            .map_err(|error| DbError::Pipeline(format!("shuffle pipeline identity: {error}")))?;
         Ok(())
     }
 

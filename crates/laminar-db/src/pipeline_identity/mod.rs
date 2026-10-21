@@ -20,6 +20,7 @@ use crate::connector_manager::{
     SourceRegistration, StreamRegistration, TableRegistration,
 };
 use crate::error::DbError;
+use crate::exchange_plan::ExchangePlan;
 use laminar_core::checkpoint::checkpoint_manifest::{PipelineIdentity, PIPELINE_IDENTITY_VERSION};
 
 /// Recovery-state serialization contract. Bump when persisted operator/vnode bytes become
@@ -29,6 +30,7 @@ const STATE_LAYOUT: &str = "vnode";
 
 #[cfg(feature = "cluster")]
 mod compatibility;
+mod exchange;
 #[cfg(feature = "cluster")]
 pub(crate) use compatibility::digest as compatibility_digest;
 #[cfg(feature = "cluster")]
@@ -86,6 +88,7 @@ struct CanonicalStream {
     incremental: bool,
     subscription_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
     subscription_retention_bytes: u64,
+    exchange: exchange::CanonicalExchange,
 }
 
 #[derive(Serialize)]
@@ -182,6 +185,7 @@ pub(crate) struct PipelineIdentityContext<'a> {
     catalog: &'a SourceCatalog,
     connector_registry: &'a ConnectorRegistry,
     registrations: PipelineRegistrations<'a>,
+    exchange_plan: &'a ExchangePlan,
     vnode_count: u16,
 }
 
@@ -192,6 +196,7 @@ impl<'a> PipelineIdentityContext<'a> {
         catalog: &'a SourceCatalog,
         connector_registry: &'a ConnectorRegistry,
         registrations: PipelineRegistrations<'a>,
+        exchange_plan: &'a ExchangePlan,
         vnode_count: u16,
     ) -> Self {
         Self {
@@ -199,6 +204,7 @@ impl<'a> PipelineIdentityContext<'a> {
             catalog,
             connector_registry,
             registrations,
+            exchange_plan,
             vnode_count,
         }
     }
@@ -230,7 +236,11 @@ fn canonical_pipeline(context: &PipelineIdentityContext<'_>) -> Result<Canonical
             context.connector_registry,
             &context.registrations,
         )?,
-        streams: canonical_streams(context.config, &context.registrations)?,
+        streams: canonical_streams(
+            context.config,
+            &context.registrations,
+            context.exchange_plan,
+        )?,
         process_functions: canonical_processes(&context.registrations)?,
         tables: canonical_tables(context.catalog, &context.registrations)?,
         sinks: canonical_sinks(context.config, &context.registrations)?,
@@ -344,6 +354,7 @@ fn canonical_source(
 fn canonical_streams(
     config: &LaminarConfig,
     registrations: &PipelineRegistrations<'_>,
+    exchange_plan: &ExchangePlan,
 ) -> Result<Vec<CanonicalStream>, DbError> {
     let mut streams: Vec<_> = registrations
         .streams
@@ -367,6 +378,9 @@ fn canonical_streams(
                     })
                 })
                 .transpose()?;
+            let plan = exchange_plan.stream(&reg.name).ok_or_else(|| {
+                DbError::Pipeline(format!("stream '{}' has no exchange plan", reg.name))
+            })?;
             Ok(CanonicalStream {
                 name: reg.name.clone(),
                 catalog_generation: reg.catalog_generation,
@@ -379,6 +393,7 @@ fn canonical_streams(
                 incremental: reg.incremental,
                 subscription_output: reg.subscription_output.clone(),
                 subscription_retention_bytes: reg.subscription_retention_bytes,
+                exchange: exchange::canonical_exchange(plan),
             })
         })
         .collect::<Result<_, DbError>>()?;

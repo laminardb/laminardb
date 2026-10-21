@@ -875,6 +875,7 @@ async fn cluster_without_checkpoint_config_still_derives_graph_identity() {
                 std::iter::empty(),
                 std::iter::empty(),
             ),
+            &crate::exchange_plan::ExchangePlan::default(),
             RuntimeMode::Cluster,
             db.cluster_checkpoint_object_store(),
             None,
@@ -1662,10 +1663,14 @@ async fn full_changelog_source_and_interval_admission_are_contract_gated() {
             error.to_string().contains("row-set modifiers")
                 || error
                     .to_string()
-                    .contains("cannot contain an aggregate stage"),
+                    .contains("cannot safely consume a changelog"),
             "{error}"
         );
         assert!(!db.catalog_namespace.lock().contains_key(name));
+        assert!(!db
+            .catalog_namespace
+            .lock()
+            .contains_key(&format!("{name}$stage1")));
     }
 
     let (sources, sinks, streams) = {
@@ -2613,6 +2618,7 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
         resolve_stream_output_schemas(
             &context,
             &streams,
+            &Default::default(),
             &Default::default(),
             &Default::default(),
             &Default::default(),

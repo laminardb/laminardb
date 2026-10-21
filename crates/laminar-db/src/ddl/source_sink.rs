@@ -458,7 +458,9 @@ impl LaminarDB {
         };
         let (input, query_inputs) = match &create.from {
             laminar_sql::parser::SinkFrom::Table(table) => {
-                (canonical_object_name(table)?, Vec::new())
+                let input = canonical_object_name(table)?;
+                super::catalog::reject_stage_read(&input)?;
+                (input, Vec::new())
             }
             laminar_sql::parser::SinkFrom::Query(_) => {
                 return Err(DbError::Unsupported(

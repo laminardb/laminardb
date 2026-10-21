@@ -374,6 +374,9 @@ pub struct EngineMetrics {
     /// Cluster-shuffle pause after local capture while waiting for the global Aligned release.
     /// Embedded and single-node runtimes do not observe this metric.
     pub checkpoint_aligned_resume_wait: Histogram,
+    /// Waves the checkpoint's distributed shuffle flush ran before every participant was idle.
+    /// Embedded and single-node runtimes do not observe this metric.
+    pub checkpoint_shuffle_flush_waves: Histogram,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
     /// On-demand lookup cache hits (served without a source fetch). Label: `table`.
@@ -399,6 +402,9 @@ pub struct EngineMetrics {
     pub coordinated_recovery_failures_total: IntCounter,
     /// Shuffle delivery-loss incidents; each one fences an epoch and forces replay.
     pub shuffle_delivery_loss_incidents_total: IntCounter,
+    /// Batches on a colocated aggregate input that held rows owned elsewhere and were
+    /// repartitioned; only expected around a vnode transition.
+    pub colocated_routing_fallbacks_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -655,6 +661,14 @@ impl EngineMetrics {
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
             )
             .unwrap()),
+            checkpoint_shuffle_flush_waves: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_shuffle_flush_waves",
+                    "Waves of the checkpoint's distributed shuffle flush",
+                )
+                .buckets(prometheus::linear_buckets(1.0, 1.0, 16).unwrap()),
+            )
+            .unwrap()),
             // The one attempt deadline defaults to 120s. 0.005 * 2^15 = 163.84s.
             sink_precommit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_precommit_duration_seconds", "Sink pre-commit latency")
@@ -718,6 +732,11 @@ impl EngineMetrics {
             shuffle_delivery_loss_incidents_total: reg!(IntCounter::new(
                 "shuffle_delivery_loss_incidents_total",
                 "Cross-node shuffle delivery-loss incidents (fences the epoch, forces replay)"
+            )
+            .unwrap()),
+            colocated_routing_fallbacks_total: reg!(IntCounter::new(
+                "colocated_routing_fallbacks_total",
+                "Colocated aggregate input batches repartitioned because rows were owned elsewhere"
             )
             .unwrap()),
         }

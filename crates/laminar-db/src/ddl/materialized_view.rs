@@ -13,7 +13,7 @@ use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 use crate::pipeline::{ControlMutation, ControlMutationState};
 
-use super::catalog::{reject_reserved_namespace, CatalogNameReservation};
+use super::catalog::{reject_reserved_namespace, reject_stage_reads, CatalogNameReservation};
 use super::cluster_checks::{ChangelogInputKind, IntervalTopologyCandidate};
 use super::control::resolve_control_ack;
 use super::stream::{
@@ -72,6 +72,7 @@ impl LaminarDB {
         self.ensure_topology_ddl_allowed("CREATE MATERIALIZED VIEW")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
+        reject_stage_reads(query_sql)?;
         if or_replace {
             return Err(DbError::InvalidOperation(
                 "CREATE OR REPLACE MATERIALIZED VIEW is not atomic; use DROP MATERIALIZED VIEW followed by CREATE MATERIALIZED VIEW"
@@ -136,6 +137,13 @@ impl LaminarDB {
         let planned = self
             .plan_streaming_query(name, query, emit_clause, query_sql)
             .await?;
+        self.reject_stateful_consumer_of_running_state(
+            "materialized view",
+            &name_str,
+            query_sql,
+            &planned,
+        )
+        .await?;
         if !self.is_cluster_runtime()
             && (planned.window_config.is_some() || planned.join_config.is_none())
             && query_inputs_registered(&self.ctx, query_sql)
@@ -349,7 +357,7 @@ impl LaminarDB {
     }
 
     /// Static (reference/dimension) table names — valid right sides for a changelog enrich join.
-    pub(super) fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
+    pub(crate) fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
         let on_demand: rustc_hash::FxHashSet<String> = self
             .connector_manager
             .lock()

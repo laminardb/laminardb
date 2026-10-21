@@ -10,6 +10,7 @@ mod checkpoint_namespace;
 mod cluster_subscription;
 #[cfg(test)]
 mod datafusion_memory_tests;
+mod explain;
 mod session;
 mod source_watermarks;
 pub(crate) use source_watermarks::{RecoveredInputChannelProgress, SourceWatermarkState};
@@ -36,8 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
 use laminar_core::catalog::CatalogObjectKind;
 use laminar_core::streaming;
@@ -4499,7 +4499,7 @@ impl LaminarDB {
                 if *analyze {
                     self.handle_explain_analyze(statement, sql).await
                 } else {
-                    self.handle_explain(statement)
+                    self.handle_explain(statement).await
                 }
             }
             StreamingStatement::CreateMaterializedView {
@@ -4671,6 +4671,9 @@ impl LaminarDB {
     /// resolved. Bare sources and unresolved streams are not subscribable.
     #[must_use]
     pub fn lookup_subscription_schema(&self, name: &str) -> Option<arrow_schema::SchemaRef> {
+        if crate::sql_analysis::stage_owner(name).is_some() {
+            return None;
+        }
         if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
             return Some(mv.schema);
         }
@@ -4774,175 +4777,6 @@ impl LaminarDB {
             ),
             None => crate::subscription::SubscriptionPortal::open(name, schema, reader),
         })
-    }
-
-    fn handle_explain(&self, statement: &StreamingStatement) -> Result<ExecuteResult, DbError> {
-        let mut planner = self.planner.lock();
-        let plan_result = planner.plan(statement);
-
-        let mut rows: Vec<(String, String)> = Vec::new();
-
-        match plan_result {
-            Ok(plan) => {
-                rows.push((
-                    "plan_type".into(),
-                    match &plan {
-                        laminar_sql::planner::StreamingPlan::Query(_) => "Query",
-                        laminar_sql::planner::StreamingPlan::RegisterSource(_) => "RegisterSource",
-                        laminar_sql::planner::StreamingPlan::RegisterSink(_) => "RegisterSink",
-                        laminar_sql::planner::StreamingPlan::Standard(_) => "Standard",
-                        laminar_sql::planner::StreamingPlan::RegisterLookupTable(_) => {
-                            "RegisterLookupTable"
-                        }
-                        laminar_sql::planner::StreamingPlan::DropLookupTable { .. } => {
-                            "DropLookupTable"
-                        }
-                    }
-                    .into(),
-                ));
-                match &plan {
-                    laminar_sql::planner::StreamingPlan::Query(qp) => {
-                        if let Some(name) = &qp.name {
-                            rows.push(("query_name".into(), name.clone()));
-                        }
-                        if let Some(wc) = &qp.window_config {
-                            rows.push(("window".into(), format!("{wc}")));
-                        }
-                        if let Some(jcs) = &qp.join_config {
-                            if jcs.len() == 1 {
-                                rows.push(("join".into(), format!("{}", jcs[0])));
-                            } else {
-                                for (i, jc) in jcs.iter().enumerate() {
-                                    rows.push((format!("join_step_{}", i + 1), format!("{jc}")));
-                                }
-                            }
-                        }
-                        if let Some(oc) = &qp.order_config {
-                            rows.push(("order_by".into(), format!("{oc:?}")));
-                        }
-                        if let Some(fc) = &qp.frame_config {
-                            rows.push((
-                                "frame_functions".into(),
-                                format!("{}", fc.functions.len()),
-                            ));
-                        }
-                        if let Some(ec) = &qp.emit_clause {
-                            rows.push(("emit".into(), format!("{ec}")));
-                        }
-                    }
-                    laminar_sql::planner::StreamingPlan::RegisterSource(info) => {
-                        rows.push(("source".into(), info.name.clone()));
-                    }
-                    laminar_sql::planner::StreamingPlan::RegisterSink(info) => {
-                        rows.push(("sink".into(), info.name.clone()));
-                    }
-                    laminar_sql::planner::StreamingPlan::Standard(_) => {
-                        rows.push(("execution".into(), "DataFusion pass-through".into()));
-                    }
-                    laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
-                        rows.push(("lookup_table".into(), info.name.clone()));
-                    }
-                    laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
-                        rows.push(("drop_lookup_table".into(), name.clone()));
-                    }
-                }
-            }
-            Err(e) => {
-                rows.push(("error".into(), format!("{e}")));
-                rows.push((
-                    "statement".into(),
-                    format!("{:?}", std::mem::discriminant(statement)),
-                ));
-            }
-        }
-
-        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
-        let values: Vec<&str> = rows.iter().map(|(_, v)| v.as_str()).collect();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("plan_key", DataType::Utf8, false),
-            Field::new("plan_value", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(keys)),
-                Arc::new(StringArray::from(values)),
-            ],
-        )
-        .map_err(|e| DbError::InvalidOperation(format!("explain metadata: {e}")))?;
-
-        Ok(ExecuteResult::Metadata(batch))
-    }
-
-    async fn handle_explain_analyze(
-        &self,
-        statement: &StreamingStatement,
-        original_sql: &str,
-    ) -> Result<ExecuteResult, DbError> {
-        let explain_result = self.handle_explain(statement)?;
-        let mut rows: Vec<(String, String)> = Vec::new();
-
-        if let ExecuteResult::Metadata(explain_batch) = &explain_result {
-            let keys_col = explain_batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>();
-            let vals_col = explain_batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>();
-            if let (Some(keys), Some(vals)) = (keys_col, vals_col) {
-                for i in 0..explain_batch.num_rows() {
-                    rows.push((keys.value(i).to_string(), vals.value(i).to_string()));
-                }
-            }
-        }
-
-        let upper = original_sql.to_uppercase();
-        let inner_start = upper.find("ANALYZE").map_or(0, |pos| pos + "ANALYZE".len());
-        let inner_sql = original_sql[inner_start..].trim();
-
-        let start = std::time::Instant::now();
-        match self.ctx.sql(inner_sql).await {
-            Ok(df) => match df.collect().await {
-                Ok(batches) => {
-                    let elapsed = start.elapsed();
-                    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                    rows.push(("rows_produced".into(), total_rows.to_string()));
-                    rows.push(("execution_time_ms".into(), elapsed.as_millis().to_string()));
-                    rows.push(("batches_processed".into(), batches.len().to_string()));
-                }
-                Err(e) => {
-                    let elapsed = start.elapsed();
-                    rows.push(("execution_time_ms".into(), elapsed.as_millis().to_string()));
-                    rows.push(("analyze_error".into(), format!("{e}")));
-                }
-            },
-            Err(e) => {
-                rows.push(("analyze_error".into(), format!("{e}")));
-            }
-        }
-
-        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
-        let values: Vec<&str> = rows.iter().map(|(_, v)| v.as_str()).collect();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("plan_key", DataType::Utf8, false),
-            Field::new("plan_value", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(keys)),
-                Arc::new(StringArray::from(values)),
-            ],
-        )
-        .map_err(|e| DbError::InvalidOperation(format!("explain analyze metadata: {e}")))?;
-
-        Ok(ExecuteResult::Metadata(batch))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5167,6 +5001,7 @@ impl LaminarDB {
         let mut streams = mgr
             .streams()
             .iter()
+            .filter(|(name, _)| crate::sql_analysis::stage_owner(name).is_none())
             .map(|(name, reg)| crate::handle::StreamInfo {
                 name: name.clone(),
                 sql: Some(reg.query_sql.clone()),

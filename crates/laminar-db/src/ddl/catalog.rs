@@ -68,7 +68,28 @@ pub(super) fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
              laminar.models / laminar.ai_calls live there)"
         )));
     }
+    if let Some(owner) = crate::sql_analysis::stage_owner(name) {
+        return Err(DbError::InvalidOperation(format!(
+            "'{name}' is reserved for an internal stage of stream '{owner}'"
+        )));
+    }
     Ok(())
+}
+
+/// Stages are an implementation of their owner's statement, so nothing else may read them.
+pub(super) fn reject_stage_reads(query_sql: &str) -> Result<(), DbError> {
+    crate::sql_analysis::extract_table_references(query_sql)
+        .iter()
+        .try_for_each(|input| reject_stage_read(input))
+}
+
+pub(super) fn reject_stage_read(input: &str) -> Result<(), DbError> {
+    match crate::sql_analysis::stage_owner(input) {
+        Some(owner) => Err(DbError::InvalidOperation(format!(
+            "'{input}' is an internal stage of stream '{owner}'; read '{owner}' instead"
+        ))),
+        None => Ok(()),
+    }
 }
 
 impl LaminarDB {
@@ -87,10 +108,14 @@ impl LaminarDB {
             })
             .collect::<std::collections::HashMap<_, _>>();
         let namespace = self.catalog_namespace.lock();
-        if ordered.len() != namespace.len() {
+        // A stage replays from its owner's DDL.
+        let objects = namespace
+            .keys()
+            .filter(|name| crate::sql_analysis::stage_owner(name).is_none())
+            .count();
+        if ordered.len() != objects {
             return Err(DbError::Pipeline(format!(
-                "typed catalog has {} objects but the durable DDL inventory has {}",
-                namespace.len(),
+                "typed catalog has {objects} objects but the durable DDL inventory has {}",
                 ordered.len()
             )));
         }
@@ -187,8 +212,26 @@ impl LaminarDB {
         kind: CatalogObjectKind,
         if_not_exists: bool,
     ) -> Result<Option<CatalogNameReservation<'_>>, DbError> {
-        self.ensure_catalog_cleanup_unfenced("catalog create")?;
         reject_reserved_namespace(name)?;
+        self.reserve_name(name, kind, if_not_exists)
+    }
+
+    /// Only the owner's statement creates its stages, under names users cannot reserve.
+    pub(super) fn reserve_stage_name(
+        &self,
+        name: &str,
+    ) -> Result<CatalogNameReservation<'_>, DbError> {
+        self.reserve_name(name, CatalogObjectKind::Stream, false)?
+            .ok_or_else(|| DbError::StreamAlreadyExists(name.to_string()))
+    }
+
+    fn reserve_name(
+        &self,
+        name: &str,
+        kind: CatalogObjectKind,
+        if_not_exists: bool,
+    ) -> Result<Option<CatalogNameReservation<'_>>, DbError> {
+        self.ensure_catalog_cleanup_unfenced("catalog create")?;
         let existing = self.catalog_namespace.lock().get(name).copied();
         if let Some(existing) = existing {
             if existing != kind {

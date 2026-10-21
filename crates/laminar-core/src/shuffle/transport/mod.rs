@@ -678,6 +678,8 @@ struct InboundReservation;
 #[cfg(feature = "cluster")]
 mod grpc {
     mod delivery_loss;
+    mod handshake;
+    mod pipeline_identity;
     mod topology;
     use std::collections::hash_map::Entry;
     use std::collections::VecDeque;
@@ -2080,6 +2082,7 @@ mod grpc {
         expected_receiver_incarnation: Uuid,
         recovery_gen: u64,
         topology: Option<ShuffleTopologyFence>,
+        pipeline_identity: Option<[u8; 32]>,
         current_assignment: Arc<AtomicU64>,
         current_recovery_gen: Arc<AtomicU64>,
         scope_cancel: CancellationToken,
@@ -2106,6 +2109,7 @@ mod grpc {
         /// Stamped onto every outbound data message; bumped by a coordinated rewind.
         recovery_gen: Arc<AtomicU64>,
         topology_version: Arc<AtomicU64>,
+        pipeline_identity: RwLock<Option<[u8; 32]>>,
         /// Ordered data/frontier frames enqueued per peer. Lives here, not on `PeerConn`, so it
         /// survives a reconnect that discards a queue and leaves a detectable gap.
         seqs: Mutex<FxHashMap<ShufflePeerId, u64>>,
@@ -2150,6 +2154,7 @@ mod grpc {
                 assignment_suspended: AtomicBool::new(false),
                 recovery_gen: Arc::new(AtomicU64::new(0)),
                 topology_version: Arc::new(AtomicU64::new(0)),
+                pipeline_identity: RwLock::new(None),
                 seqs: Mutex::new(FxHashMap::default()),
                 checkpointed_control_node_budget: Arc::new(Semaphore::new(
                     CHECKPOINTED_CONTROL_NODE_BUDGET_BYTES,
@@ -2960,6 +2965,7 @@ mod grpc {
                         format!("shuffle peer {peer} is absent from the assignment certificate"),
                     )
                 })?;
+            let pipeline_identity = *self.pipeline_identity.read();
             let conn = Arc::new(
                 open_call(OpenCall {
                     local_id: self.local_id,
@@ -2969,6 +2975,7 @@ mod grpc {
                     assignment_version,
                     assignment_certificate_digest: assignment.digest,
                     topology: assignment.topology,
+                    pipeline_identity,
                     expected_receiver_incarnation,
                     recovery_gen,
                     current_assignment: Arc::clone(&self.assignment_version),
@@ -3029,6 +3036,7 @@ mod grpc {
                 assignment_certificate_digest: call.assignment_certificate_digest.to_vec(),
                 topology_version: call.topology.map_or(0, ShuffleTopologyFence::version),
                 topology_manifest_sha256: call.topology.map_or_else(Vec::new, |t| t.manifest_sha256().to_vec()),
+                pipeline_identity_sha256: call.pipeline_identity.map_or_else(Vec::new, |d| d.to_vec()),
             })) => response.map_err(status_io)?.into_inner(),
         };
         let receiver_incarnation = parse_uuid(
@@ -3233,6 +3241,7 @@ mod grpc {
         /// Inbound data frames stamped below this are pre-rewind and discarded.
         recovery_gen: Arc<AtomicU64>,
         topology_version: Arc<AtomicU64>,
+        pipeline_identity: Arc<RwLock<Option<[u8; 32]>>>,
         recovery_transition: Mutex<()>,
         assignment: Arc<RwLock<Option<Arc<InstalledAssignment>>>>,
         assignment_version: Arc<AtomicU64>,
@@ -3289,6 +3298,7 @@ mod grpc {
 
             let recovery_gen = Arc::new(AtomicU64::new(0));
             let topology_version = Arc::new(AtomicU64::new(0));
+            let pipeline_identity = Arc::new(RwLock::new(None));
             let assignment = Arc::new(RwLock::new(None));
             let assignment_version = Arc::new(AtomicU64::new(0));
             let scope_cancel = Arc::new(RwLock::new(cancelled_token()));
@@ -3312,6 +3322,7 @@ mod grpc {
                 work_ready: Arc::clone(&work_ready),
                 recovery_gen: Arc::clone(&recovery_gen),
                 topology_version: Arc::clone(&topology_version),
+                pipeline_identity: Arc::clone(&pipeline_identity),
                 delivery: Arc::clone(&delivery),
                 barrier_arrivals: Arc::clone(&barrier_arrivals),
                 holdover: Arc::clone(&holdover),
@@ -3365,6 +3376,7 @@ mod grpc {
                 barrier_reconciled: AtomicU64::new(0),
                 recovery_gen,
                 topology_version,
+                pipeline_identity,
                 recovery_transition: Mutex::new(()),
                 assignment,
                 assignment_version,
@@ -4585,6 +4597,7 @@ mod grpc {
         work_ready: Arc<tokio::sync::Notify>,
         recovery_gen: Arc<AtomicU64>,
         topology_version: Arc<AtomicU64>,
+        pipeline_identity: Arc<RwLock<Option<[u8; 32]>>>,
         delivery: Arc<DeliveryTracker>,
         barrier_arrivals: Arc<AtomicU64>,
         holdover: Arc<Holdover>,
@@ -4625,62 +4638,7 @@ mod grpc {
             request: Request<HandshakeRequest>,
         ) -> Result<tonic::Response<HandshakeResponse>, tonic::Status> {
             let request = request.into_inner();
-            if request.sender_node_id == 0
-                || request.sender_node_id == self.local_id
-                || request.assignment_version == 0
-            {
-                return Err(tonic::Status::failed_precondition(
-                    "shuffle peers do not share an established assignment scope",
-                ));
-            }
-            let sender_incarnation = parse_uuid(&request.sender_incarnation, "sender incarnation")?;
-            let stream_id = parse_uuid(&request.stream_id, "stream id")?;
-            let requested_digest = parse_certificate_digest(
-                &request.assignment_certificate_digest,
-                "assignment certificate digest",
-            )?;
-            let scope = active_receiver_scope(
-                &self.assignment,
-                &self.assignment_version,
-                &self.recovery_gen,
-                &self.scope_cancel,
-                &self.process_lease,
-            )?;
-            if request.topology_version != self.topology_version.load(Ordering::Acquire)
-                || parse_topology_fence(
-                    request.topology_version,
-                    &request.topology_manifest_sha256,
-                )? != scope.assignment.topology
-            {
-                return Err(tonic::Status::failed_precondition(
-                    "shuffle peers do not share the exact topology",
-                ));
-            }
-            if request.recovery_gen != scope.recovery_gen {
-                return Err(tonic::Status::failed_precondition(
-                    "shuffle peers do not share a recovery generation",
-                ));
-            }
-            if request.assignment_version != scope.assignment.fence.assignment_version
-                || requested_digest != scope.assignment.digest
-                || !scope
-                    .assignment
-                    .certifies(request.sender_node_id, sender_incarnation)
-            {
-                return Err(tonic::Status::failed_precondition(
-                    "shuffle sender is not certified by the installed assignment",
-                ));
-            }
-            let fence = StreamFence {
-                sender_node_id: request.sender_node_id,
-                sender_incarnation,
-                receiver_incarnation: self.receiver_incarnation,
-                stream_id,
-                assignment_version: scope.assignment.fence.assignment_version,
-                assignment_certificate_digest: scope.assignment.digest,
-                recovery_gen: scope.recovery_gen,
-                topology: scope.assignment.topology,
-            };
+            let (fence, scope) = self.admit_handshake(&request)?;
             let now = std::time::Instant::now();
             let mut pending = self.pending_handshakes.0.lock();
             pending.retain(|_, handshake| {
@@ -4713,8 +4671,8 @@ mod grpc {
             Ok(tonic::Response::new(HandshakeResponse {
                 receiver_node_id: self.local_id,
                 receiver_incarnation: self.receiver_incarnation.as_bytes().to_vec(),
-                sender_incarnation: sender_incarnation.as_bytes().to_vec(),
-                stream_id: stream_id.as_bytes().to_vec(),
+                sender_incarnation: fence.sender_incarnation.as_bytes().to_vec(),
+                stream_id: fence.stream_id.as_bytes().to_vec(),
                 assignment_version: scope.assignment.fence.assignment_version,
                 recovery_gen: scope.recovery_gen,
                 assignment_certificate_digest: scope.assignment.digest.to_vec(),

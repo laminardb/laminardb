@@ -351,3 +351,71 @@ async fn topology_stateful_root_recovers_under_a_new_assignment_incarnation() {
     assert_eq!(total(&output["new_global"]), 15);
     fixture.db.shutdown().await.unwrap();
 }
+
+fn split_additions() -> Vec<laminar_core::cluster::control::CatalogManifestEntry> {
+    [
+        (
+            "split_total",
+            "CREATE STREAM split_total AS SELECT SUM(per_id) AS total FROM \
+             (SELECT id, SUM(value) AS per_id FROM trades GROUP BY id) EMIT CHANGES",
+        ),
+        (
+            "split_join",
+            "CREATE STREAM split_join AS SELECT l.id AS id, SUM(r.value) AS total FROM trades l \
+             JOIN added_source r ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND \
+             GROUP BY l.id EMIT CHANGES",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(name, ddl)| laminar_core::cluster::control::CatalogManifestEntry {
+            schema_binding: None,
+            canonical_name: name.into(),
+            kind: laminar_core::cluster::control::CatalogObjectKind::Stream,
+            catalog_generation: 1,
+            ddl: ddl.into(),
+        },
+    )
+    .collect()
+}
+
+#[tokio::test]
+async fn topology_stateful_split_streams_start_empty_with_their_stages() {
+    let (fixture, staged) = restorable_fixture_with_additions(split_additions()).await;
+    let mut image = fixture
+        .db
+        .prepare_cluster_topology_restore(staged.operation_id)
+        .await
+        .unwrap();
+    let subscribed: Vec<_> = image
+        .graph
+        .capture_subscription_frontiers()
+        .unwrap()
+        .into_iter()
+        .map(|capture| capture.certificate.stream_id.clone())
+        .collect();
+    assert!(subscribed
+        .iter()
+        .all(|stream| crate::sql_analysis::stage_owner(stream).is_none()));
+    fixture
+        .db
+        .commit_cluster_topology_target(&mut image)
+        .await
+        .unwrap();
+    drop(image);
+    let mut image = fixture
+        .db
+        .recover_committed_cluster_topology(staged.operation_id)
+        .await
+        .unwrap();
+    image.graph.set_query_budget_ns(u64::MAX);
+    let output = image
+        .graph
+        .execute_cycle(&future_input(5, 3, 200_000), i64::MIN, None)
+        .await
+        .unwrap();
+    assert_eq!(total(&output["totals"]), 45);
+    assert_eq!(total(&output["split_total"]), 15);
+    assert!(output.get("split_join").is_none_or(Vec::is_empty));
+    fixture.db.shutdown().await.unwrap();
+}

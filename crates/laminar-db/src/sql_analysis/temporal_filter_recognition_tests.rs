@@ -142,7 +142,7 @@ fn managed_core_window_requires_direct_event_time_provenance() {
     let valid = "SELECT TUMBLE(ts, INTERVAL '1' MINUTE), COUNT(*) FROM events \
                  GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
     assert_eq!(
-        managed_core_window_source(valid, &window).as_deref(),
+        managed_core_window_input(valid, &window).as_deref(),
         Some("events")
     );
     for sql in [
@@ -153,7 +153,7 @@ fn managed_core_window_requires_direct_event_time_provenance() {
         "SELECT TUMBLE(ts, INTERVAL '1' MINUTE), COUNT(*) FROM events \
          GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), UNNEST(tags)",
     ] {
-        assert!(managed_core_window_source(sql, &window).is_none(), "{sql}");
+        assert!(managed_core_window_input(sql, &window).is_none(), "{sql}");
     }
 }
 
@@ -185,7 +185,7 @@ fn managed_core_window_certifies_marker_config_and_group_shape() {
         ),
     ] {
         assert_eq!(
-            managed_core_window_source(sql, window).as_deref(),
+            managed_core_window_input(sql, window).as_deref(),
             Some("events"),
             "{sql}"
         );
@@ -244,7 +244,7 @@ fn managed_core_window_certifies_marker_config_and_group_shape() {
              CUMULATE(ts, INTERVAL '10' SECOND, INTERVAL '1' MINUTE)",
         ),
     ] {
-        assert!(managed_core_window_source(sql, window).is_none(), "{sql}");
+        assert!(managed_core_window_input(sql, window).is_none(), "{sql}");
     }
 }
 

@@ -644,10 +644,10 @@ impl EowcQueryOperator {
         })?;
         #[cfg(feature = "cluster")]
         if self.cluster_scope.is_some()
-            && crate::sql_analysis::managed_core_window_source(&self.sql, cfg).is_none()
+            && crate::sql_analysis::managed_core_window_input(&self.sql, cfg).is_none()
         {
             return Err(DbError::Unsupported(format!(
-                "[{}] EOWC query '{}' is outside the certified direct-source CoreWindow shape",
+                "[{}] EOWC query '{}' is outside the certified managed CoreWindow shape",
                 laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
                 self.op_name
             )));

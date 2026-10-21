@@ -13,7 +13,7 @@ use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 use crate::pipeline::{ControlMutation, ControlMutationState};
 
-use super::catalog::{reject_reserved_namespace, CatalogNameReservation};
+use super::catalog::{reject_reserved_namespace, reject_stage_reads, CatalogNameReservation};
 use super::control::resolve_control_ack;
 
 struct StreamCreateGuard<'a> {
@@ -76,7 +76,7 @@ pub(crate) struct PlannedStreamingQuery {
 }
 
 impl PlannedStreamingQuery {
-    pub(super) fn candidate_registration(
+    pub(crate) fn candidate_registration(
         &self,
         name: &str,
         query_sql: &str,
@@ -97,6 +97,16 @@ impl PlannedStreamingQuery {
             subscription_certificate: None,
         }
     }
+}
+
+/// One stream's statement parts. Only a stage has no DDL: it replays from its owner's.
+pub(super) struct StreamDefinition<'a> {
+    pub(super) ddl: Option<&'a str>,
+    pub(super) name: &'a sqlparser::ast::ObjectName,
+    pub(super) query: &'a StreamingStatement,
+    pub(super) emit_clause: Option<&'a laminar_sql::parser::EmitClause>,
+    pub(super) query_sql: &'a str,
+    pub(super) retention_bytes: Option<u64>,
 }
 
 pub(crate) async fn validate_managed_aggregate_admission(
@@ -161,13 +171,14 @@ impl LaminarDB {
         self.ensure_topology_ddl_allowed("CREATE STREAM")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
+        reject_stage_reads(query_sql)?;
         if let Some(result) = self.create_bound_process_stream(sql, &name_str)? {
             return Ok(result);
         }
-        if crate::sql_analysis::has_temporal_query(query_sql) {
-            self.ensure_temporal_stream_offline(&name_str)?;
+        let split = self.split_stream_query(&name_str, query_sql)?;
+        if split.is_none() {
+            self.validate_stream_query_text(&name_str, query_sql)?;
         }
-        Self::reject_interval_output_subquery(&name_str, query_sql)?;
         let Some(reservation) =
             self.reserve_catalog_name(&name_str, CatalogObjectKind::Stream, if_not_exists)?
         else {
@@ -179,7 +190,57 @@ impl LaminarDB {
                 applied: false,
             }));
         };
+        let definition = StreamDefinition {
+            ddl: Some(sql),
+            name,
+            query,
+            emit_clause,
+            query_sql,
+            retention_bytes,
+        };
+        match split {
+            None => self.create_stream_object(definition, reservation).await?,
+            Some(split) => {
+                self.create_split_stream(definition, &split, reservation)
+                    .await?;
+            }
+        }
 
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "CREATE STREAM".to_string(),
+            object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
+            applied: true,
+        }))
+    }
+
+    pub(super) fn validate_stream_query_text(
+        &self,
+        name: &str,
+        query_sql: &str,
+    ) -> Result<(), DbError> {
+        if crate::sql_analysis::has_temporal_query(query_sql) {
+            self.ensure_temporal_stream_offline(name)?;
+        }
+        Self::reject_interval_output_subquery(name, query_sql)
+    }
+
+    /// Admits and registers one stream under a held name reservation.
+    pub(super) async fn create_stream_object(
+        &self,
+        definition: StreamDefinition<'_>,
+        reservation: CatalogNameReservation<'_>,
+    ) -> Result<(), DbError> {
+        let StreamDefinition {
+            ddl,
+            name,
+            query,
+            emit_clause,
+            query_sql,
+            retention_bytes,
+        } = definition;
+        let name_str = canonical_object_name(name)?;
         let (planned, temporal_output_schema) = self
             .validate_stream_admission("stream", name, query, emit_clause, query_sql)
             .await?;
@@ -199,7 +260,7 @@ impl LaminarDB {
             );
         }
         self.register_and_admit_stream(
-            sql,
+            ddl,
             &name_str,
             reservation,
             planned,
@@ -207,15 +268,7 @@ impl LaminarDB {
             query_sql,
             retention_bytes,
         )
-        .await?;
-
-        Ok(ExecuteResult::Ddl(DdlInfo {
-            statement_type: "CREATE STREAM".to_string(),
-            object_name: name_str,
-            #[cfg(feature = "cluster")]
-            topology_operation: None,
-            applied: true,
-        }))
+        .await
     }
 
     /// Every pre-mutation stream admission check, returning the planned query and the output
@@ -234,6 +287,8 @@ impl LaminarDB {
         self.validate_cluster_query_shape_before_plan(kind, &name_str, query_sql)?;
         let planned = self
             .plan_streaming_query(name, query, emit_clause.cloned(), query_sql)
+            .await?;
+        self.reject_stateful_consumer_of_running_state(kind, &name_str, query_sql, &planned)
             .await?;
         if !self.is_cluster_runtime()
             && (planned.window_config.is_some() || planned.join_config.is_none())
@@ -289,7 +344,7 @@ impl LaminarDB {
     /// admission acknowledgement resolves.
     async fn register_and_admit_stream(
         &self,
-        sql: &str,
+        ddl: Option<&str>,
         name_str: &str,
         mut reservation: CatalogNameReservation<'_>,
         planned: PlannedStreamingQuery,
@@ -356,7 +411,9 @@ impl LaminarDB {
             // Local replay identity participates in the same cancellation guard as
             // graph/catalog admission. Once the coordinator CAS is Applied, caller
             // cancellation must not leave an unreplayable live topology.
-            mgr.store_ddl(name_str, sql);
+            if let Some(ddl) = ddl {
+                mgr.store_ddl(name_str, ddl);
+            }
         }
 
         // Register as a DataFusion placeholder for plan-time name resolution by downstream MVs.
@@ -413,7 +470,45 @@ impl LaminarDB {
         reservation.commit();
         Ok(())
     }
-    pub(super) async fn plan_streaming_query(
+    /// Resolve every registered stream's output, plus each of `candidates`, against the current
+    /// catalog.
+    pub(crate) async fn resolve_catalog_stream_outputs(
+        &self,
+        candidates: impl IntoIterator<Item = crate::connector_manager::StreamRegistration>,
+    ) -> Result<crate::pipeline_lifecycle::ResolvedStreamOutputs, DbError> {
+        let (source_regs, sink_regs, mut stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        let ordered = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                self.runtime_mode(),
+            )
+            .await?;
+        let changelog_sources =
+            self.validate_changelog_source_routes(&source_regs, &ordered, self.runtime_mode())?;
+        for candidate in candidates {
+            stream_regs.insert(candidate.name.clone(), candidate);
+        }
+        crate::pipeline_lifecycle::resolve_stream_output_schemas(
+            &self.ctx,
+            &stream_regs,
+            &self.static_table_names(),
+            &ordered.joins,
+            &changelog_sources,
+            &crate::exchange_plan::source_event_times(&self.catalog),
+        )
+        .await
+    }
+
+    pub(crate) async fn plan_streaming_query(
         &self,
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
@@ -421,37 +516,11 @@ impl LaminarDB {
         query_sql: &str,
     ) -> Result<PlannedStreamingQuery, DbError> {
         let admission = if crate::sql_analysis::has_join_clause(query_sql) {
-            let (source_regs, sink_regs, stream_regs) = {
-                let manager = self.connector_manager.lock();
-                (
-                    manager.sources().clone(),
-                    manager.sinks().clone(),
-                    manager.streams().clone(),
-                )
-            };
-            let ordered = self
-                .validate_persisted_interval_source_contracts(
-                    &source_regs,
-                    &sink_regs,
-                    &stream_regs,
-                    self.runtime_mode(),
-                )
-                .await?;
-            let static_tables = self.static_table_names();
-            let changelog_sources =
-                self.validate_changelog_source_routes(&source_regs, &ordered, self.runtime_mode())?;
-            let current = crate::pipeline_lifecycle::resolve_stream_output_schemas(
-                &self.ctx,
-                &stream_regs,
-                &static_tables,
-                &ordered.joins,
-                &changelog_sources,
-            )
-            .await?;
+            let current = self.resolve_catalog_stream_outputs(None).await?;
             if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
                 &current.changelog_carrying,
-                &static_tables,
+                &self.static_table_names(),
             ) {
                 Some(
                     laminar_sql::planner::ChangelogEnrichAdmission::try_new(
@@ -495,12 +564,18 @@ impl LaminarDB {
                 "planner did not produce a streaming query for '{name}'"
             )));
         };
-        let subscription_output = crate::subscription::distribution::plan(
-            query_sql,
-            plan.emit_clause.as_ref(),
-            &self.ctx,
-            self.checkpoint_key_groups(),
-        )?;
+        // Nothing subscribes to a stage, so it keeps no output distribution or log.
+        let subscription_output =
+            if crate::sql_analysis::stage_owner(&canonical_object_name(name)?).is_some() {
+                None
+            } else {
+                crate::subscription::distribution::plan(
+                    query_sql,
+                    plan.emit_clause.as_ref(),
+                    &self.ctx,
+                    self.checkpoint_key_groups(),
+                )?
+            };
         Ok(PlannedStreamingQuery {
             emit_clause: plan.emit_clause,
             window_config: plan.window_config,

@@ -114,6 +114,11 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         self.ensure_topology_ddl_allowed("DROP STREAM")?;
         let name_str = canonical_object_name(name)?;
+        if let Some(owner) = crate::sql_analysis::stage_owner(&name_str) {
+            return Err(DbError::InvalidOperation(format!(
+                "'{name_str}' is an internal stage of stream '{owner}'; drop '{owner}' instead"
+            )));
+        }
         if self
             .connector_manager
             .lock()
@@ -137,7 +142,24 @@ impl LaminarDB {
             }));
         }
         let targets = self.build_drop_plan(&name_str, CatalogObjectKind::Stream, cascade)?;
-        self.ensure_mutable_interval_drop_offline("DROP STREAM", &targets)
+        self.drop_stream_targets("DROP STREAM", targets).await?;
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "DROP STREAM".to_string(),
+            object_name: name_str,
+            #[cfg(feature = "cluster")]
+            topology_operation: None,
+            applied: true,
+        }))
+    }
+
+    /// Removes streams from the running graph and then from the catalog.
+    pub(super) async fn drop_stream_targets(
+        &self,
+        statement: &str,
+        targets: Vec<CatalogDropTarget>,
+    ) -> Result<(), DbError> {
+        self.ensure_mutable_interval_drop_offline(statement, &targets)
             .await?;
         let graph_names: Vec<String> = targets
             .iter()
@@ -157,17 +179,9 @@ impl LaminarDB {
             mutation: Arc::clone(&mutation),
             finished: false,
         };
-        self.acknowledge_runtime_drop("DROP STREAM", &graph_names, Arc::clone(&mutation))
+        self.acknowledge_runtime_drop(statement, &graph_names, Arc::clone(&mutation))
             .await?;
-        drop_guard.finish()?;
-
-        Ok(ExecuteResult::Ddl(DdlInfo {
-            statement_type: "DROP STREAM".to_string(),
-            object_name: name_str,
-            #[cfg(feature = "cluster")]
-            topology_operation: None,
-            applied: true,
-        }))
+        drop_guard.finish()
     }
 
     async fn acknowledge_runtime_drop(
@@ -286,7 +300,11 @@ impl LaminarDB {
         if !cascade && !direct.is_empty() {
             let names = direct
                 .iter()
-                .map(|target| target.name.as_str())
+                .map(|target| {
+                    crate::sql_analysis::stage_owner(&target.name).unwrap_or(&target.name)
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(DbError::InvalidOperation(format!(
@@ -306,6 +324,16 @@ impl LaminarDB {
             name: name.to_string(),
             kind: expected,
         });
+        let stages: Vec<_> = result
+            .iter()
+            .filter(|target| target.kind == CatalogObjectKind::Stream)
+            .flat_map(|target| self.stream_stage_targets(&target.name))
+            .collect();
+        result.extend(
+            stages
+                .into_iter()
+                .filter(|stage| seen.insert(stage.name.clone())),
+        );
 
         if DbState::load(&self.state) == DbState::Running
             && result

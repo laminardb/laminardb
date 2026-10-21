@@ -1,0 +1,250 @@
+//! `EXPLAIN [ANALYZE]`: planner metadata, the exchange plan of a `CREATE STREAM`, and optional
+//! execution metrics, as `plan_key`/`plan_value` rows.
+
+use std::sync::Arc;
+
+use arrow::array::{Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use laminar_sql::parser::StreamingStatement;
+use laminar_sql::planner::StreamingPlan;
+
+use super::LaminarDB;
+use crate::error::DbError;
+use crate::handle::ExecuteResult;
+use crate::pipeline_lifecycle::ResolvedStreamOutputs;
+
+impl LaminarDB {
+    pub(super) async fn handle_explain(
+        &self,
+        statement: &StreamingStatement,
+    ) -> Result<ExecuteResult, DbError> {
+        let mut rows = self.planner_rows(statement);
+        rows.extend(self.exchange_rows(statement).await);
+        metadata(&rows, "explain metadata")
+    }
+
+    pub(super) async fn handle_explain_analyze(
+        &self,
+        statement: &StreamingStatement,
+        original_sql: &str,
+    ) -> Result<ExecuteResult, DbError> {
+        let explain_result = self.handle_explain(statement).await?;
+        let mut rows: Vec<(String, String)> = Vec::new();
+
+        if let ExecuteResult::Metadata(explain_batch) = &explain_result {
+            let keys_col = explain_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>();
+            let vals_col = explain_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>();
+            if let (Some(keys), Some(vals)) = (keys_col, vals_col) {
+                for i in 0..explain_batch.num_rows() {
+                    rows.push((keys.value(i).to_string(), vals.value(i).to_string()));
+                }
+            }
+        }
+
+        let upper = original_sql.to_uppercase();
+        let inner_start = upper.find("ANALYZE").map_or(0, |pos| pos + "ANALYZE".len());
+        let inner_sql = original_sql[inner_start..].trim();
+
+        let start = std::time::Instant::now();
+        match self.ctx.sql(inner_sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) => {
+                    let elapsed = start.elapsed();
+                    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    rows.push(("rows_produced".into(), total_rows.to_string()));
+                    rows.push(("execution_time_ms".into(), elapsed.as_millis().to_string()));
+                    rows.push(("batches_processed".into(), batches.len().to_string()));
+                }
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    rows.push(("execution_time_ms".into(), elapsed.as_millis().to_string()));
+                    rows.push(("analyze_error".into(), format!("{e}")));
+                }
+            },
+            Err(e) => {
+                rows.push(("analyze_error".into(), format!("{e}")));
+            }
+        }
+
+        metadata(&rows, "explain analyze metadata")
+    }
+
+    fn planner_rows(&self, statement: &StreamingStatement) -> Vec<(String, String)> {
+        let mut planner = self.planner.lock();
+        let plan = match planner.plan(statement) {
+            Ok(plan) => plan,
+            Err(e) => {
+                return vec![
+                    ("error".into(), format!("{e}")),
+                    (
+                        "statement".into(),
+                        format!("{:?}", std::mem::discriminant(statement)),
+                    ),
+                ];
+            }
+        };
+        let mut rows: Vec<(String, String)> = vec![(
+            "plan_type".into(),
+            match &plan {
+                StreamingPlan::Query(_) => "Query",
+                StreamingPlan::RegisterSource(_) => "RegisterSource",
+                StreamingPlan::RegisterSink(_) => "RegisterSink",
+                StreamingPlan::Standard(_) => "Standard",
+                StreamingPlan::RegisterLookupTable(_) => "RegisterLookupTable",
+                StreamingPlan::DropLookupTable { .. } => "DropLookupTable",
+            }
+            .into(),
+        )];
+        match &plan {
+            StreamingPlan::Query(qp) => {
+                if let Some(name) = &qp.name {
+                    rows.push(("query_name".into(), name.clone()));
+                }
+                if let Some(wc) = &qp.window_config {
+                    rows.push(("window".into(), format!("{wc}")));
+                }
+                if let Some(jcs) = &qp.join_config {
+                    if jcs.len() == 1 {
+                        rows.push(("join".into(), format!("{}", jcs[0])));
+                    } else {
+                        for (i, jc) in jcs.iter().enumerate() {
+                            rows.push((format!("join_step_{}", i + 1), format!("{jc}")));
+                        }
+                    }
+                }
+                if let Some(oc) = &qp.order_config {
+                    rows.push(("order_by".into(), format!("{oc:?}")));
+                }
+                if let Some(fc) = &qp.frame_config {
+                    rows.push(("frame_functions".into(), format!("{}", fc.functions.len())));
+                }
+                if let Some(ec) = &qp.emit_clause {
+                    rows.push(("emit".into(), format!("{ec}")));
+                }
+            }
+            StreamingPlan::RegisterSource(info) => {
+                rows.push(("source".into(), info.name.clone()));
+            }
+            StreamingPlan::RegisterSink(info) => {
+                rows.push(("sink".into(), info.name.clone()));
+            }
+            StreamingPlan::Standard(_) => {
+                rows.push(("execution".into(), "DataFusion pass-through".into()));
+            }
+            StreamingPlan::RegisterLookupTable(info) => {
+                rows.push(("lookup_table".into(), info.name.clone()));
+            }
+            StreamingPlan::DropLookupTable { name } => {
+                rows.push(("drop_lookup_table".into(), name.clone()));
+            }
+        }
+        rows
+    }
+
+    /// One `exchange.input.<port>` row per input port and one `exchange.output` row, derived
+    /// against the current catalog exactly as admission would derive the stream. A split
+    /// statement lists each stage's SQL as `stage.<name>`, followed by that stage's rows.
+    async fn exchange_rows(&self, statement: &StreamingStatement) -> Vec<(String, String)> {
+        let StreamingStatement::CreateStream {
+            name,
+            query,
+            emit_clause,
+            query_sql,
+            ..
+        } = statement
+        else {
+            return Vec::new();
+        };
+        let result = async {
+            let stream = super::canonical_object_name(name)?;
+            if let Some(split) = self.split_stream_query(&stream, query_sql)? {
+                let candidates = self
+                    .split_stream_candidates(&stream, &split, emit_clause.as_ref())
+                    .await?;
+                let resolved = self.resolve_catalog_stream_outputs(candidates).await?;
+                return split_rows(&resolved, &stream, &split);
+            }
+            let planned = self
+                .plan_streaming_query(name, query, emit_clause.clone(), query_sql)
+                .await?;
+            let resolved = self
+                .resolve_catalog_stream_outputs(Some(
+                    planned.candidate_registration(&stream, query_sql),
+                ))
+                .await?;
+            stream_rows(&resolved, &stream, "")
+        };
+        result
+            .await
+            .unwrap_or_else(|error| vec![("exchange_error".into(), error.to_string())])
+    }
+}
+
+fn split_rows(
+    resolved: &ResolvedStreamOutputs,
+    owner: &str,
+    split: &crate::sql_analysis::SplitQuery,
+) -> Result<Vec<(String, String)>, DbError> {
+    let stages = split.stages.iter().map(|stage| {
+        let emit = if stage.changelog { " EMIT CHANGES" } else { "" };
+        (stage.name.as_str(), format!("{}{emit}", stage.sql))
+    });
+    let mut rows = Vec::new();
+    for (stage, sql) in stages.chain(std::iter::once((owner, split.query_sql.clone()))) {
+        let prefix = format!("stage.{stage}");
+        let exchanges = stream_rows(resolved, stage, &format!("{prefix}."))?;
+        rows.push((prefix, sql));
+        rows.extend(exchanges);
+    }
+    Ok(rows)
+}
+
+fn stream_rows(
+    resolved: &ResolvedStreamOutputs,
+    stream: &str,
+    prefix: &str,
+) -> Result<Vec<(String, String)>, DbError> {
+    let plan = resolved
+        .exchange_plan
+        .stream(stream)
+        .ok_or_else(|| DbError::Pipeline(format!("stream '{stream}' was not planned")))?;
+    let mut rows: Vec<(String, String)> = plan
+        .inputs
+        .iter()
+        .map(|(port, exchange)| {
+            let upstream = resolved
+                .exchange_plan
+                .upstream_properties(port.upstream(), &resolved.changelog_carrying);
+            (
+                format!("{prefix}exchange.input.{port}"),
+                format!("{exchange} from {upstream}"),
+            )
+        })
+        .collect();
+    rows.push((format!("{prefix}exchange.output"), plan.output.to_string()));
+    Ok(rows)
+}
+
+fn metadata(rows: &[(String, String)], context: &str) -> Result<ExecuteResult, DbError> {
+    let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    let values: Vec<&str> = rows.iter().map(|(_, v)| v.as_str()).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("plan_key", DataType::Utf8, false),
+        Field::new("plan_value", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(keys)),
+            Arc::new(StringArray::from(values)),
+        ],
+    )
+    .map_err(|e| DbError::InvalidOperation(format!("{context}: {e}")))?;
+    Ok(ExecuteResult::Metadata(batch))
+}

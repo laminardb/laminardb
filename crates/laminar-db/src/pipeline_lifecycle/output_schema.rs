@@ -63,12 +63,14 @@ pub(crate) async fn resolve_stream_output_schemas(
         [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
     >,
     changelog_sources: &rustc_hash::FxHashSet<String>,
+    source_event_time: &FxHashMap<String, crate::exchange_plan::EventTime>,
 ) -> Result<ResolvedStreamOutputs, DbError> {
     use datafusion::datasource::empty::EmptyTable;
 
     let mut schemas: HashMap<String, arrow_schema::SchemaRef> =
         HashMap::with_capacity(stream_regs.len());
     let mut shapes: HashMap<String, StreamOutputShape> = HashMap::with_capacity(stream_regs.len());
+    let mut plans = HashMap::with_capacity(stream_regs.len());
     let mut pending: Vec<&crate::connector_manager::StreamRegistration> =
         stream_regs.values().collect();
     let mut placeholders: Vec<String> = Vec::new();
@@ -128,7 +130,7 @@ pub(crate) async fn resolve_stream_output_schemas(
                         .iter()
                         .map(|field| (**field).clone())
                         .collect::<Vec<_>>();
-                    (
+                    let output = (
                         Arc::new(arrow_schema::Schema::new(fields)),
                         StreamOutputShape {
                             aggregate: crate::aggregate_state::find_aggregate(&plan).is_some(),
@@ -139,7 +141,9 @@ pub(crate) async fn resolve_stream_output_schemas(
                             planned_functions_immutable:
                                 crate::sql_analysis::planned_functions_are_immutable(&plan),
                         },
-                    )
+                    );
+                    plans.insert(reg.name.clone(), plan);
+                    output
                 };
                 shapes.insert(reg.name.clone(), shape);
 
@@ -375,9 +379,19 @@ pub(crate) async fn resolve_stream_output_schemas(
             }
         }
         advertise_changelog_outputs(&mut schemas, &changelog_carrying, changelog_sources)?;
+        let exchange_plan = crate::exchange_plan::derive(
+            ctx,
+            stream_regs,
+            &plans,
+            reference_tables,
+            &changelog_carrying,
+            source_event_time,
+        )
+        .await?;
         Ok(ResolvedStreamOutputs {
             schemas,
             changelog_carrying,
+            exchange_plan,
         })
     }
     .await;
@@ -389,10 +403,11 @@ pub(crate) async fn resolve_stream_output_schemas(
     result
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ResolvedStreamOutputs {
     pub(crate) schemas: HashMap<String, arrow_schema::SchemaRef>,
     pub(crate) changelog_carrying: rustc_hash::FxHashSet<String>,
+    pub(crate) exchange_plan: crate::exchange_plan::ExchangePlan,
 }
 
 pub(super) struct StreamOutputShape {

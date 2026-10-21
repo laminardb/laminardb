@@ -11,6 +11,7 @@
 //! - `temporal_filter` — retracting `now()`-based temporal-filter recognition;
 //! - `hazards` — cluster query-hazard scanning and managed window-source certification;
 //! - `plan` — `DataFusion` plan inspection and result-batch shaping;
+//! - `statement_split` — rewriting join and nested aggregates into internal named stages;
 //! - `ai`, `frame` — managed AI-call and window-frame query routing;
 //! - `ast`, `expr_sql` — parsing predicates and expression rendering shared by the above.
 
@@ -23,6 +24,7 @@ mod hazards;
 mod join;
 mod lookup;
 mod plan;
+mod statement_split;
 mod table_refs;
 mod temporal;
 mod temporal_filter;
@@ -35,7 +37,7 @@ pub(crate) use changelog::{
     ChangelogEnrichConfig, CHANGELOG_ENRICH_TMP,
 };
 pub(crate) use frame::{plan_frame_query, FrameQueryPlan, FRAME_TMP_TABLE};
-pub(crate) use hazards::{cluster_query_hazards, managed_core_window_source};
+pub(crate) use hazards::{cluster_query_hazards, managed_core_window_input};
 pub(crate) use join::{
     detect_stream_join_query, detect_unbounded_join_steps, has_join_clause,
     has_unaliased_projection, has_unqualified_interval_output_column, join_clause_count,
@@ -44,7 +46,9 @@ pub(crate) use join::{
 pub(crate) use lookup::{compute_lookup_projection, detect_lookup_enrich_query};
 pub(crate) use plan::{
     apply_topk_filter, extract_projection_filter, planned_functions_are_immutable,
+    ProjectionFilterInfo,
 };
+pub(crate) use statement_split::{owned_stages, split_stream_query, stage_owner, SplitQuery};
 pub(crate) use table_refs::{extract_table_references, single_source_table};
 pub(crate) use temporal::{
     has_temporal_query, temporal_projection_sql, temporal_projection_sql_for_input,

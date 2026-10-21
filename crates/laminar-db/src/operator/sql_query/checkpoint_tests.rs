@@ -1071,6 +1071,199 @@ async fn checkpointed_remote_frontiers_compare_in_receiver_domain() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn colocated_input_applies_owned_batches_whole_and_repartitions_the_rest() {
+    let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+    let (context, _) = context_and_batch();
+    let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        Some(Arc::clone(&metrics)),
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    operator.colocate_input();
+    let (_, vnode_zero) = projected_batch_for_vnode(&operator, 0, 1);
+    let (_, vnode_two) = projected_batch_for_vnode(&operator, 2, 2);
+    let (_, remote) = projected_batch_for_vnode(&operator, 1, 3);
+    let concat = |batches: &[&RecordBatch]| {
+        arrow::compute::concat_batches(&batches[0].schema(), batches.iter().copied()).unwrap()
+    };
+    let owned = concat(&[&vnode_zero, &vnode_two]);
+    let assignment = scope.registry.versioned_snapshot();
+    let frontier = InputFrontier {
+        watermark: Some(10),
+        idle: false,
+    };
+    let is_data = |message: &ShuffleMessage| !matches!(message, ShuffleMessage::Frontier { .. });
+
+    let plan = operator
+        .plan_cluster_batches(vec![owned.clone()], frontier, &scope, &assignment, &[2])
+        .unwrap();
+    assert_eq!(plan.local_batches, [(owned, None)]);
+    assert!(!plan.outbound.iter().any(|(_, message)| is_data(message)));
+    assert_eq!(metrics.colocated_routing_fallbacks_total.get(), 0);
+
+    let plan = operator
+        .plan_cluster_batches(
+            vec![concat(&[&vnode_zero, &remote])],
+            frontier,
+            &scope,
+            &assignment,
+            &[2],
+        )
+        .unwrap();
+    assert_eq!(plan.local_batches, [(vnode_zero, Some(0))]);
+    assert!(plan
+        .outbound
+        .iter()
+        .any(|(peer, message)| *peer == 2 && is_data(message)));
+    assert_eq!(metrics.colocated_routing_fallbacks_total.get(), 1);
+}
+
+#[cfg(feature = "cluster")]
+async fn global_operator(scope: &ClusterShuffleConfig) -> SqlQueryOperator {
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "total",
+        "SELECT COUNT(*) AS n, SUM(value) AS total FROM events",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    operator
+}
+
+#[cfg(feature = "cluster")]
+fn projected_values(operator: &SqlQueryOperator, values: &[i64]) -> RecordBatch {
+    let QueryState::Agg(aggregate) = &operator.state else {
+        panic!("aggregate must be initialized");
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let input = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["k"; values.len()])),
+            Arc::new(Int64Array::from(values.to_vec())),
+        ],
+    )
+    .unwrap();
+    aggregate
+        .compiled_projection()
+        .unwrap()
+        .evaluate(&input)
+        .unwrap()
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn global_aggregate_ships_partials_and_restores_queued_ones() {
+    let sender_scope = cluster_scope([2, 1, 1, 1, 1, 1, 1, 1]).await;
+    let sender = global_operator(&sender_scope).await;
+    let frontier = InputFrontier {
+        watermark: Some(10),
+        idle: false,
+    };
+    let rows = [
+        projected_values(&sender, &[1, 2, 3]),
+        projected_values(&sender, &[40]),
+    ];
+    let plan = sender
+        .plan_cluster_batches(
+            rows.to_vec(),
+            frontier,
+            &sender_scope,
+            &sender_scope.registry.versioned_snapshot(),
+            &[2],
+        )
+        .unwrap();
+    assert!(plan.local_batches.is_empty());
+    let partials = plan
+        .outbound
+        .iter()
+        .filter_map(|(peer, message)| match message {
+            ShuffleMessage::Data {
+                routed_vnodes,
+                batch,
+                ..
+            } => {
+                assert_eq!((*peer, routed_vnodes.as_ref()), (2, &[0][..]));
+                Some(batch.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [partial] = partials.as_slice() else {
+        panic!("expected one partial message, got {}", partials.len());
+    };
+    assert_eq!(partial.num_rows(), rows.len());
+
+    let receiver_scope = cluster_scope([1, 2, 2, 2, 2, 2, 2, 2]).await;
+    let mut receiver = global_operator(&receiver_scope).await;
+    let version = receiver_scope.registry.assignment_version();
+    let recovery = receiver_scope.receiver.recovery_gen();
+    let staged = |batch: RecordBatch| {
+        crate::operator::RetainedBatch::restored_channel(
+            batch,
+            2,
+            version,
+            recovery,
+            Arc::from([0_u32]),
+        )
+    };
+    assert!(matches!(
+        receiver.stage_checkpointed_shuffle("total", staged(rows[0].clone()), i64::MIN),
+        Err(DbError::ShuffleTerminal(_))
+    ));
+    receiver
+        .stage_checkpointed_shuffle("total", staged(partial.clone()), i64::MIN)
+        .unwrap();
+    receiver
+        .stage_checkpointed_shuffle_frontier("total", 2, frontier, version, recovery)
+        .unwrap();
+    let capture = receiver
+        .checkpoint_capture(1 << 20)
+        .unwrap()
+        .expect("cluster aggregate always captures its channel cut");
+    let mut staged_bytes = capture.retained_bytes();
+    let encoded = capture.materialize(&mut staged_bytes, 1 << 20).unwrap();
+
+    let mut restored = global_operator(&receiver_scope).await;
+    restored
+        .restore(OperatorCheckpoint {
+            data: encoded.to_vec(),
+        })
+        .unwrap();
+    assert_eq!(restored.queued_remote_events, 2);
+    let output = restored
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    let [output] = output.as_slice() else {
+        panic!("expected one output batch");
+    };
+    assert_eq!(
+        (
+            arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(output.column(0))
+                .value(0),
+            arrow::array::AsArray::as_primitive::<arrow::datatypes::Int64Type>(output.column(1))
+                .value(0),
+        ),
+        (4, 46)
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
     let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
     let (context, _) = context_and_batch();

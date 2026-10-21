@@ -332,7 +332,15 @@ impl Fixture {
         authority: TestCatalogAuthority,
         stream_generation: u64,
     ) -> Self {
-        let bootstrap = vec![
+        Self::with_bootstrap(authority, stream_generation, Vec::new()).await
+    }
+
+    async fn with_bootstrap(
+        authority: TestCatalogAuthority,
+        stream_generation: u64,
+        extra: Vec<String>,
+    ) -> Self {
+        let mut bootstrap = vec![
             source_ddl("trades", "'topic' = 'old'"),
             "CREATE STREAM totals AS SELECT id, SUM(value) AS total FROM trades GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
             "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')".into(),
@@ -456,6 +464,7 @@ impl Fixture {
             .build()
             .await
             .unwrap();
+        bootstrap.extend(extra);
         db.execute_cluster_bootstrap_batch(&bootstrap)
             .await
             .unwrap();
@@ -1725,4 +1734,81 @@ async fn cluster_planning_rejects_a_connector_sink_reading_a_source_directly() {
     );
     candidate.shutdown().await.unwrap();
     base.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn topology_validation_maps_split_stream_stages_to_their_owner() {
+    let fixture = Fixture::new().await;
+    fixture.adopt().await;
+    let mut statements = independent_pipeline();
+    statements.extend([
+        "CREATE STREAM key_counts AS SELECT n, COUNT(*) AS keys FROM \
+         (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) GROUP BY n EMIT CHANGES"
+            .to_string(),
+        "CREATE STREAM joined_total AS SELECT l.id AS id, SUM(r.value) AS total FROM trades l \
+         JOIN added_source r ON l.id = r.id AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND \
+         GROUP BY l.id EMIT CHANGES"
+            .to_string(),
+    ]);
+    let report = fixture.validate(&statements).await.unwrap();
+    for (name, dependencies, codec) in [
+        ("key_counts", vec!["trades"], "sql_aggregate_v1"),
+        (
+            "joined_total",
+            vec!["added_source", "trades"],
+            "sql_aggregate_v1",
+        ),
+    ] {
+        let object = report
+            .objects
+            .iter()
+            .find(|object| object.name == name)
+            .unwrap();
+        assert_eq!(object.dependencies, dependencies);
+        assert_eq!(
+            object.initialization,
+            TopologyInitialization::EmptyManagedStateAtCut
+        );
+        assert_eq!(object.managed_state_contract.as_deref(), Some(codec));
+    }
+    assert!(report
+        .objects
+        .iter()
+        .all(|object| crate::sql_analysis::stage_owner(&object.name).is_none()));
+    assert_eq!(report, fixture.validate(&statements).await.unwrap());
+    fixture.assert_no_effects();
+}
+
+#[tokio::test]
+async fn topology_validation_preserves_a_split_stream_with_its_stages() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let authority = test_catalog_authority_with_ttl(objects, 60_000).await;
+    let fixture = Fixture::with_bootstrap(
+        authority,
+        1,
+        vec![
+            "CREATE STREAM key_counts AS SELECT n, COUNT(*) AS keys FROM \
+              (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) GROUP BY n EMIT CHANGES"
+                .into(),
+        ],
+    )
+    .await;
+    fixture.adopt().await;
+    let report = fixture.validate(&independent_pipeline()).await.unwrap();
+    let object = report
+        .objects
+        .iter()
+        .find(|object| object.name == "key_counts")
+        .unwrap();
+    assert_eq!(object.transition, ClusterTopologyObjectTransition::Preserve);
+    assert_eq!(
+        object.initialization,
+        TopologyInitialization::PreserveExactCut
+    );
+    assert_eq!(object.dependencies, ["trades"]);
+    assert!(report
+        .objects
+        .iter()
+        .all(|object| crate::sql_analysis::stage_owner(&object.name).is_none()));
+    fixture.assert_no_effects();
 }

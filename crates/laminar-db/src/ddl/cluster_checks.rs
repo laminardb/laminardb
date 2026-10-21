@@ -30,6 +30,9 @@ pub(super) enum ChangelogInputKind {
     StaticEnrich,
 }
 
+/// Deepest source-to-stream chain of remote exchanges whose cluster checkpoint flush is measured.
+const MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH: usize = 3;
+
 impl LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) fn has_cluster_query_ownership_scope(&self) -> bool {
@@ -145,7 +148,7 @@ impl LaminarDB {
             &right_schema,
             &field,
         )?;
-        Self::validate_interval_join_watermarks(self, config)
+        self.validate_interval_join_watermarks(config).await
     }
 
     /// Certify one interval join's equality keys and internal output-name
@@ -241,13 +244,12 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Certify that both interval-join inputs are directly watermarked,
-    /// event-time sources.
-    fn validate_interval_join_watermarks(
-        db: &LaminarDB,
+    /// Certify that both interval-join inputs carry an event-time watermark on their time column.
+    async fn validate_interval_join_watermarks(
+        &self,
         config: &laminar_sql::translator::StreamJoinConfig,
     ) -> Result<(), DbError> {
-        for (side, source_name, time_column) in [
+        for (side, input, time_column) in [
             (
                 "left",
                 config.left_table.as_str(),
@@ -259,20 +261,66 @@ impl LaminarDB {
                 config.right_time_column.as_str(),
             ),
         ] {
-            let Some(source) = db.catalog.get_source(source_name) else {
-                return Err(DbError::InvalidOperation(format!(
-                    "{side} interval join input '{source_name}' must be a directly watermarked source"
-                )));
-            };
-            if source.watermark_column.as_deref() != Some(time_column)
-                || source
-                    .is_processing_time
-                    .load(std::sync::atomic::Ordering::Acquire)
+            if self
+                .input_event_time(input)
+                .await?
+                .is_none_or(|event_time| event_time.column != time_column)
             {
                 return Err(DbError::InvalidOperation(format!(
-                    "{side} interval join input '{source_name}' must define an event-time watermark on '{time_column}'"
+                    "{side} interval join input '{input}' must carry an event-time watermark on '{time_column}': a source that declares it, or an append-only stream that forwards it unchanged"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// The event time an input carries for a consumer that orders by it: a source's declared
+    /// watermark, or the forwarded watermark of an append-only stream.
+    async fn input_event_time(
+        &self,
+        input: &str,
+    ) -> Result<Option<crate::exchange_plan::EventTime>, DbError> {
+        if let Some(source) = self.catalog.get_source(input) {
+            return Ok(crate::exchange_plan::source_event_time(&source));
+        }
+        let resolved = self.resolve_catalog_stream_outputs(None).await?;
+        Ok(resolved
+            .exchange_plan
+            .stream(input)
+            .filter(|stream| {
+                stream.output.changelog == crate::exchange_plan::ChangelogKind::AppendOnly
+            })
+            .and_then(|stream| stream.output.event_time.clone()))
+    }
+
+    /// Reject a stream whose pipeline crosses more remote exchanges than cluster checkpoints are
+    /// measured for; every flush wave moves rows one remote hop while sources are held. A stream
+    /// that reads only sources crosses at most one.
+    async fn validate_cluster_exchange_depth(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        if !crate::sql_analysis::extract_table_references(query_sql)
+            .iter()
+            .any(|input| self.catalog.get_stream_entry(input).is_some())
+        {
+            return Ok(());
+        }
+        let resolved = self
+            .resolve_catalog_stream_outputs(Some(plan.candidate_registration(name, query_sql)))
+            .await?;
+        let depth = resolved.exchange_plan.remote_depth(name);
+        if depth > MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH {
+            return Err(Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                &format!(
+                    "its pipeline crosses {depth} remote exchanges from its sources; cluster checkpoints are measured for at most {MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH}"
+                ),
+            ));
         }
         Ok(())
     }
@@ -353,6 +401,8 @@ impl LaminarDB {
             return Ok(false);
         }
         self.validate_cluster_query_shape_before_plan(object_kind, name, query_sql)?;
+        self.validate_cluster_exchange_depth(object_kind, name, query_sql, plan)
+            .await?;
 
         if plan.has_analytic || plan.has_frame {
             return Err(Self::cluster_state_lifecycle_error(
@@ -434,23 +484,21 @@ impl LaminarDB {
                 "a windowed join requires a planner-certified combined join/window vnode lifecycle",
             ));
         }
-        let source_name = crate::sql_analysis::managed_core_window_source(query_sql, window)
+        let input = crate::sql_analysis::managed_core_window_input(query_sql, window)
             .ok_or_else(|| {
                 reject(
-                    "managed CoreWindow execution requires one direct source, an unqualified event-time column, and no nested or row-expanding query shape",
+                    "managed CoreWindow execution requires one input, an unqualified event-time column, and no nested or row-expanding query shape",
                 )
             })?;
-        let source = self.catalog.get_source(&source_name).ok_or_else(|| {
-            reject("managed CoreWindow execution requires exactly one direct source")
-        })?;
-        if source
-            .is_processing_time
-            .load(std::sync::atomic::Ordering::Acquire)
-            || source.watermark_column.as_deref() != Some(window.time_column.as_str())
-            || source.max_out_of_orderness.is_none()
+        if self
+            .input_event_time(&input)
+            .await?
+            .is_none_or(|event_time| {
+                event_time.column != window.time_column || event_time.max_out_of_orderness.is_none()
+            })
         {
             return Err(reject(
-                "managed CoreWindow execution requires an event-time watermark on its window time column",
+                "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that forwards it unchanged",
             ));
         }
         let managed = crate::core_window_state::CoreWindowState::try_from_sql(
@@ -472,7 +520,7 @@ impl LaminarDB {
         }
         if managed.compiled_projection().is_none() {
             return Err(reject(
-                "managed CoreWindow execution requires compiled pre-aggregation over its direct source",
+                "managed CoreWindow execution requires compiled pre-aggregation over its input",
             ));
         }
         #[cfg(feature = "cluster")]
@@ -536,7 +584,7 @@ impl LaminarDB {
         };
         if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err() {
             return Err(reject(
-                "the distributed join supports only certified direct-source bounded equality joins with a positive finite event-time bound",
+                "the distributed join supports only bounded equality joins with a positive finite event-time bound",
             ));
         }
         let detected =
@@ -638,9 +686,14 @@ impl LaminarDB {
                     )));
                 }
             };
-            let certified = plan.subscription_output.as_ref().is_some_and(|output| {
-                output.matches_aggregate_grouping(aggregate.num_group_cols())
-            });
+            // A stage feeds only its owner and is never subscribed to.
+            let certified = if crate::sql_analysis::stage_owner(name).is_some() {
+                plan.subscription_output.is_none()
+            } else {
+                plan.subscription_output.as_ref().is_some_and(|output| {
+                    output.matches_aggregate_grouping(aggregate.num_group_cols())
+                })
+            };
             if !certified {
                 return Err(reject(
                     "aggregate final output has no matching planner-owned subscription distribution certificate",

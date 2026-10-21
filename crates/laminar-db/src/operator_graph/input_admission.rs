@@ -347,20 +347,20 @@ impl OperatorGraph {
             .map(|port| {
                 let upstream = self.input_sources[node_id][port];
                 #[cfg(feature = "cluster")]
-                if use_local_source_frontier && self.source_node_ids.contains(&upstream) {
-                    if use_temporal_source_frontier {
-                        return self.hold_buffered_source_frontier(
-                            upstream,
-                            self.temporal_source_frontiers
-                                .get(&upstream)
-                                .copied()
-                                .unwrap_or(self.local_source_frontiers[upstream]),
-                        );
-                    }
-                    return self.hold_buffered_source_frontier(
-                        upstream,
-                        self.local_source_frontiers[upstream],
-                    );
+                if let Some(root) = use_local_source_frontier
+                    .then(|| self.event_time_roots.get(upstream).copied())
+                    .flatten()
+                    .filter(|&root| root != usize::MAX)
+                {
+                    let frontier = if use_temporal_source_frontier {
+                        self.temporal_source_frontiers
+                            .get(&root)
+                            .copied()
+                            .unwrap_or(self.local_source_frontiers[root])
+                    } else {
+                        self.local_source_frontiers[root]
+                    };
+                    return self.hold_buffered_chain_frontier(upstream, root, frontier);
                 }
                 if upstream < self.output_watermarks.len() {
                     InputFrontier {
@@ -375,17 +375,63 @@ impl OperatorGraph {
             .collect()
     }
 
+    /// A node-local source frontier passes to a managed port only once the source and every
+    /// stateless forward between them have delivered their buffered rows.
     #[cfg(feature = "cluster")]
-    fn hold_buffered_source_frontier(
+    fn hold_buffered_chain_frontier(
         &self,
         upstream: usize,
+        root: usize,
         frontier: InputFrontier,
     ) -> InputFrontier {
-        if self.node_has_buffered_input(upstream) {
-            frontier.held_at(Some(self.output_watermarks[upstream]))
-        } else {
-            frontier
+        let mut node = upstream;
+        for _ in 0..self.nodes.len() {
+            if self.node_has_buffered_input(node) {
+                return frontier.held_at(Some(self.output_watermarks[upstream]));
+            }
+            if node == root {
+                break;
+            }
+            node = self.input_sources[node][0];
         }
+        frontier
+    }
+
+    /// Longest chain of managed operators, each of which may route its input across the cluster.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn remote_exchange_depth(&self) -> u64 {
+        self.remote_exchange_depth
+    }
+
+    /// Per topology: for every node, the source whose node-local frontier it carries (the source
+    /// itself, or the root of the stateless event-time forward it reads; `usize::MAX` otherwise),
+    /// and the remote exchange depth.
+    #[cfg(feature = "cluster")]
+    pub(super) fn compute_cluster_routing(&mut self) {
+        let mut roots = vec![usize::MAX; self.nodes.len()];
+        let mut depths = vec![0_u64; self.nodes.len()];
+        for &node in &self.topo_order {
+            depths[node] = self.input_sources[node]
+                .iter()
+                .filter_map(|&upstream| depths.get(upstream).copied())
+                .max()
+                .unwrap_or(0)
+                + u64::from(self.nodes[node].capability.managed_state.is_some());
+            roots[node] = if self.source_node_ids.contains(&node) {
+                node
+            } else if self.nodes[node].input_port_count == 1
+                && self.event_time_forwards.contains(&*self.nodes[node].name)
+            {
+                self.input_sources[node]
+                    .first()
+                    .and_then(|&upstream| roots.get(upstream).copied())
+                    .unwrap_or(usize::MAX)
+            } else {
+                usize::MAX
+            };
+        }
+        self.event_time_roots = roots;
+        self.remote_exchange_depth = depths.into_iter().max().unwrap_or(0);
     }
 
     pub(super) fn bind_input_tables(&mut self, node: usize, inputs: &[Vec<RecordBatch>]) {

@@ -70,6 +70,7 @@ async fn windowed_stream_schema_matches_user_select() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -112,6 +113,7 @@ async fn windowed_stream_with_explicit_window_columns() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -150,6 +152,7 @@ async fn non_windowed_stream_has_no_prefix() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -183,6 +186,7 @@ async fn chained_streams_resolve_via_iterative_planning() {
     let out = resolve_stream_output_schemas(
         &ctx,
         &regs,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &Default::default(),
@@ -223,6 +227,7 @@ async fn case_distinct_chained_streams_resolve_exactly() {
     let out = resolve_stream_output_schemas(
         &ctx,
         &regs,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &Default::default(),
@@ -270,6 +275,7 @@ async fn changelog_schema_tracks_real_emitters_and_safe_projection() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -301,6 +307,7 @@ async fn plain_stream_cannot_spoof_engine_weight() {
     let error = resolve_stream_output_schemas(
         &ctx,
         &regs,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &Default::default(),
@@ -353,6 +360,7 @@ async fn ordered_changelog_enrich_uses_current_provenance_and_reserves_static_me
         &reference_tables,
         &ordered,
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap();
@@ -379,6 +387,7 @@ async fn ordered_changelog_enrich_uses_current_provenance_and_reserves_static_me
         &analytic_regs,
         &reference_tables,
         &ordered,
+        &Default::default(),
         &Default::default(),
     )
     .await
@@ -407,6 +416,7 @@ async fn ordered_changelog_enrich_uses_current_provenance_and_reserves_static_me
         &reference_tables,
         &ordered,
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap_err()
@@ -434,6 +444,7 @@ async fn ordered_changelog_enrich_uses_current_provenance_and_reserves_static_me
         &aggregate_enrich_regs,
         &reference_tables,
         &ordered,
+        &Default::default(),
         &Default::default(),
     )
     .await
@@ -470,6 +481,7 @@ async fn ordered_changelog_enrich_uses_current_provenance_and_reserves_static_me
         &bad_regs,
         &bad_reference_tables,
         &ordered,
+        &Default::default(),
         &Default::default(),
     )
     .await
@@ -511,6 +523,7 @@ async fn ambiguous_changelog_consumer_fails_closed() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap_err()
@@ -549,6 +562,7 @@ async fn volatile_changelog_consumer_fails_replay_admission() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap_err()
@@ -581,6 +595,7 @@ async fn wildcard_modifier_changelog_projection_fails_startup_admission() {
     let error = resolve_stream_output_schemas(
         &ctx,
         &regs,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &Default::default(),
@@ -627,6 +642,7 @@ async fn windowed_changelog_consumer_fails_closed() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap_err()
@@ -651,6 +667,7 @@ async fn windowed_changelog_consumer_fails_closed() {
         &Default::default(),
         &Default::default(),
         &Default::default(),
+        &Default::default(),
     )
     .await
     .unwrap_err()
@@ -669,6 +686,7 @@ async fn unresolvable_streams_surface_planner_error() {
     let err = resolve_stream_output_schemas(
         &ctx,
         &regs,
+        &Default::default(),
         &Default::default(),
         &Default::default(),
         &Default::default(),

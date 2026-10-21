@@ -22,7 +22,7 @@ pub use sink_artifacts::{
 pub const CHECKPOINT_MANIFEST_VERSION: u32 = 10;
 
 /// Canonical pipeline-identity payload version.
-pub const PIPELINE_IDENTITY_VERSION: u16 = 7;
+pub const PIPELINE_IDENTITY_VERSION: u16 = 8;
 
 /// Runtime envelope used for prepared sink descriptors.
 pub const PREPARED_SINK_DESCRIPTOR_VERSION: u16 = 1;

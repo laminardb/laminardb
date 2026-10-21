@@ -217,9 +217,10 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
 
 **Key points:**
 
-- Both inputs must be direct sources with watermarks on `TIMESTAMP NOT NULL` event-time columns.
-  Append-only pairs use the ordinary path. If either connector is mutable, both connectors must
-  expose ordered deterministic row positions and a replayable recovery contract.
+- Each input must carry a watermark on its `TIMESTAMP NOT NULL` event-time column: a source that
+  declares it, or an append-only stream that forwards that column unchanged through a projection
+  or filter. Append-only pairs use the ordinary path. If either input is a mutable connector, both
+  connectors must expose ordered deterministic row positions and a replayable recovery contract.
 - Append-only bounded intervals retain live hot-add support in a running local checkpoint-disabled
   pipeline; their post-projection is initialized before the first cycle can route or retain input.
   Mutable bounded intervals and consumers of their changelog are fixed startup topology and must be
@@ -267,9 +268,10 @@ FROM matched
 GROUP BY account_id;
 ```
 
-Fusing the join and `GROUP BY` in one statement is unsupported. A cycle that would exceed 262,144
-output rows or 64 MiB causes a terminal controlled failure; operators cannot resume or spill that
-fanout.
+The same aggregate may be written over the join in one statement; it is split into the same two
+stages (see [Nested aggregates and aggregates over a join](#nested-aggregates-and-aggregates-over-a-join)).
+A cycle that would exceed 262,144 output rows or 64 MiB causes a terminal controlled failure;
+operators cannot resume or spill that fanout.
 
 ### Temporal ASOF join
 
@@ -338,6 +340,42 @@ named-aggregate path. `DISTINCT` aggregates and `MIN`/`MAX` over changelog input
 because bounded retractable extrema state is not supported. Mutable bounded-join output can feed
 `COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join output keeps
 the ordinary row stream.
+
+### Nested aggregates and aggregates over a join
+
+A statement that no single operator can run is split into internal stages named
+`<stream>$stage<n>`, each admitted by the rules for its own shape in every mode:
+
+```sql
+-- A join stage, then a keyed aggregate over it.
+CREATE STREAM matched_totals AS
+SELECT t.account_id AS account_id, SUM(t.volume) AS total_volume
+FROM trades t
+INNER JOIN orders o
+ON t.account_id = o.account_id
+AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND
+GROUP BY t.account_id;
+
+-- An aggregate stage that emits changes, then an aggregate over its changelog.
+CREATE STREAM accounts_by_trade_count AS
+SELECT trade_count, COUNT(*) AS accounts
+FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
+GROUP BY trade_count
+EMIT CHANGES;
+```
+
+- An aggregate over one two-way join reads a join stage that projects each input column the
+  aggregate uses as `<qualifier>_<column>` (`t.volume` becomes `t_volume`). Every column the
+  aggregate reads must carry its input qualifier, and `WHERE` filters the join stage.
+- An aggregate over a subquery in `FROM` that aggregates or joins reads that subquery as a stage.
+  An aggregating subquery emits changes, so the outer aggregate supports `COUNT`, `SUM` and `AVG`
+  but not `MIN` or `MAX`. In cluster mode a windowed subquery is rejected, because cluster windows
+  emit only closed windows.
+- Stages belong to their stream. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
+  `DROP STREAM` removes its stages, and no other statement may read, drop or create a
+  `$stage` name. A failed `CREATE` removes the stages it created.
+- A join of three or more inputs still needs named two-way stages: a join's output carries no
+  event time, so an interval join cannot read it.
 
 ### Streaming UDFs
 
@@ -461,10 +499,13 @@ boundaries, poison-message handling, and tested behaviour.
 ### Cluster SQL boundary
 
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
-the eight bounded join kinds described above, and managed direct-source `TUMBLE`, `HOP`, and
-`SESSION` aggregates. Cluster windows require a watermark on the event-time column and `EMIT ON
-WINDOW CLOSE` or `EMIT FINAL`. A named join output may feed a separate keyed aggregate stream;
-fused join-and-aggregate and windowed-join statements remain rejected.
+the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION`
+aggregates. A cluster window reads a source, or an append-only stream that forwards the source's
+event-time column unchanged; it requires a bounded watermark on that column and `EMIT ON WINDOW
+CLOSE` or `EMIT FINAL`. A join output may feed a keyed aggregate, either as a named stream or in
+one statement that is split into stages; windowed joins remain rejected. A stream may sit at most
+three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
+which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
 
 Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
 retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
@@ -574,6 +615,33 @@ SHOW CREATE SOURCE trades;
 SHOW CREATE SINK my_sink;
 ```
 
+### EXPLAIN
+
+`EXPLAIN CREATE STREAM` also reports how each input reaches the stream and what the stream
+provides downstream, without creating it:
+
+```sql
+EXPLAIN CREATE STREAM per_symbol AS
+  SELECT symbol, COUNT(*) AS n FROM trades GROUP BY symbol EMIT CHANGES;
+-- exchange.input.trades  repartition on (symbol Utf8) from arbitrary, append-only, event time ts
+-- exchange.output        hash(symbol Utf8), weighted changelog
+```
+
+An input is `forward` (rows stay where they are), `repartition on (...)` (rows move to the
+owner of their key), `colocated on (...)` (an aggregate whose input is already hashed on its
+group key, so no rows move), `gather partials to vnode N` (a global aggregate: in cluster mode
+each other node sends one partial row per input batch instead of its rows), or `gather to vnode N`
+(a window without a group key). Join inputs are named
+`left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
+`arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
+(an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry a source
+watermark on that column (a source's own, or one a projection forwards unchanged).
+
+For a statement that is split into stages, `EXPLAIN` lists each stage's SQL as a
+`stage.<name>` row, followed by that stage's `stage.<name>.exchange.*` rows. An aggregate that
+groups by exactly the key its join stage is hashed on (that stage's `exchange.output` row) reads
+the stage `colocated`, so no rows move between them.
+
 ### EXPLAIN ANALYZE
 
 Execute a query and report execution metrics:
@@ -665,6 +733,28 @@ order_source.watermark(ts + 10_000);
 
 An inner match can emit before either watermark advances. Both sources must still define and
 advance watermarks for bounded state cleanup and for outer or anti unmatched-row finalization.
+
+### 6. Chained aggregates need `EMIT CHANGES` upstream
+
+Without an `EMIT` clause, an aggregate stream re-emits each updated group on every cycle and never
+retracts the earlier value. A downstream aggregate, window, or interval or temporal join would
+treat every one of those snapshots as new input, so `CREATE STREAM` and `CREATE MATERIALIZED VIEW`
+reject that input. This applies whether the consumer reads the aggregate stream directly or through
+projection/filter streams or lookup joins, including a projection declared with `EMIT CHANGES`: an
+emit clause changes what an aggregate emits, while a projection or lookup join forwards whatever
+its input emits.
+
+```sql
+-- WRONG: rejected, per_key re-emits running state
+CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k;
+
+-- CORRECT: per_key emits a retracting changelog
+CREATE STREAM per_key AS SELECT k, COUNT(*) AS n FROM events GROUP BY k EMIT CHANGES;
+CREATE STREAM histogram AS SELECT n, COUNT(*) AS keys FROM per_key GROUP BY n;
+```
+
+A server configuration or sealed cluster catalog containing this chain is rejected when it is
+replayed at startup.
 
 ---
 

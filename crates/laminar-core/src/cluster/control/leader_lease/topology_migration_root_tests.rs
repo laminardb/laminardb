@@ -180,7 +180,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         target_manifest: target.reference().unwrap(),
         parent_pipeline: PipelineIdentity::empty(),
         target_pipeline: PipelineIdentity {
-            canonical_version: 7,
+            canonical_version: 8,
             sha256: "2".repeat(64),
         },
         environment_sha256: "3".repeat(64),

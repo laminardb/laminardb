@@ -33,18 +33,7 @@ impl LaminarDB {
         }
         #[cfg(feature = "cluster")]
         if let Some(image) = topology.as_mut() {
-            if image.recovery_input().is_none() {
-                self.ensure_topology_installation_held()?;
-            }
             self.validate_topology_runtime_image(image).await?;
-            let input = &image.input;
-            let identities = self.topology_definition_identities()?;
-            if self.catalog_manifest_inventory()? != input.target().entries
-                || identities.pipeline != input.descriptor().target_pipeline
-                || identities.environment_sha256 != input.descriptor().environment_sha256
-            {
-                return Err(laminar_core::cluster::control::TopologyError::Fenced.into());
-            }
         }
 
         let (source_regs, sink_regs, stream_regs, table_regs, has_external, process_regs) = {
@@ -99,6 +88,19 @@ impl LaminarDB {
         let injected_cluster_checkpoint_store =
             self.validate_startup_durability(startup_runtime)?;
 
+        // Identity binds each stream's exchange plan, so resolve the plan before identity.
+        self.revalidate_persisted_cluster_query_shapes(&stream_regs)
+            .await?;
+        let resolved_stream_outputs = super::resolve_stream_output_schemas(
+            &self.ctx,
+            &stream_regs,
+            &self.static_table_names(),
+            &ordered_interval_admissions.joins,
+            &mutation_routes.changelog,
+            &crate::exchange_plan::source_event_times(&self.catalog),
+        )
+        .await?;
+
         // Freeze assignment publication before checkpoint initialization snapshots the registry.
         // The previous, narrower guard in `start_connector_pipeline` left a window where a watcher
         // could advance the registry after the coordinator captured its version but before runtime
@@ -119,6 +121,7 @@ impl LaminarDB {
                     table_regs.values(),
                 )
                 .with_process_functions(process_regs.iter()),
+                &resolved_stream_outputs.exchange_plan,
                 startup_runtime,
                 injected_cluster_checkpoint_store,
                 {
@@ -168,6 +171,7 @@ impl LaminarDB {
                 temporal_source_roles,
                 ordered_interval_admissions,
                 mutation_routes,
+                resolved_stream_outputs,
                 runtime_shutdown,
                 #[cfg(feature = "cluster")]
                 topology,
@@ -194,6 +198,9 @@ impl LaminarDB {
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
         topology: Option<&crate::db::PreparedTopologyRestore>,
     ) -> Result<(), DbError> {
+        if let Some(identity) = pipeline_identity {
+            self.bind_shuffle_pipeline_identity(identity)?;
+        }
         if let Some(image) = topology {
             // The restored graph already binds the preserved incarnations and sequences.
             // Fresh definition binding would overwrite their public catalog certificates.

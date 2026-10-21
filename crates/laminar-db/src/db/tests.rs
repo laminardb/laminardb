@@ -4,6 +4,8 @@
 //! struct wiring. Declared via `#[cfg(test)] mod tests;` in `db.rs`.
 
 use super::*;
+use arrow::array::{Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 
 #[test]
 fn managed_state_budget_default_is_resolved_at_database_construction() {
@@ -5223,18 +5225,18 @@ async fn interval_join_ddl_enforces_runtime_key_and_time_types() {
         .get_stream_entry("unwatermarked_interval")
         .is_none());
 
-    let error = db
-        .execute(
-            "CREATE STREAM aggregate_interval AS \
-             SELECT l.id AS id, COUNT(*) AS n FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
-             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND GROUP BY l.id",
-        )
-        .await
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("cannot contain an aggregate stage"));
-    assert!(db.catalog.get_stream_entry("aggregate_interval").is_none());
+    // Split into an interval-join stage and an aggregate over it.
+    db.execute(
+        "CREATE STREAM aggregate_interval AS \
+         SELECT l.id AS id, COUNT(*) AS n FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND GROUP BY l.id",
+    )
+    .await
+    .unwrap();
+    assert!(db
+        .catalog
+        .get_stream_entry("aggregate_interval$stage1")
+        .is_some());
 
     db.execute(
         "CREATE SOURCE nullable_time (id BIGINT, ts TIMESTAMP, \
@@ -9948,7 +9950,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                 assert!(
                     message.contains("managed SQL windows require one aggregate stage")
                         || message.contains(
-                            "managed CoreWindow execution requires one direct source",
+                            "managed CoreWindow execution requires one input",
                         ),
                     "unexpected rejection for {name}: {error}"
                 );
@@ -10101,15 +10103,19 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  SELECT SUM(value) / COUNT(value) AS ratio FROM left_events",
             )
             .await;
-            assert_cluster_rejection(
-                &db,
-                "rejected_nested_aggregate",
-                "CREATE STREAM rejected_nested_aggregate AS \
+            // Split into an `EMIT CHANGES` stage and an aggregate over its changelog.
+            db.execute(
+                "CREATE STREAM nested_aggregate AS \
                  SELECT SUM(inner_total) AS total FROM (\
                      SELECT SUM(value) AS inner_total FROM left_events\
                  ) nested",
             )
-            .await;
+            .await
+            .unwrap();
+            assert!(db
+                .catalog_namespace
+                .lock()
+                .contains_key("nested_aggregate$stage1"));
 
             assert_cluster_rejection(
                 &db,

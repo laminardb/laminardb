@@ -94,6 +94,7 @@ impl LaminarDB {
         // source actor or sink is installed, and no historical state/data payload is copied.
         let identities = candidate
             .topology_definition_identities()
+            .await
             .map_err(map_error)?;
         if identities.pipeline != descriptor.target_pipeline
             || identities.environment_sha256 != descriptor.environment_sha256

@@ -710,7 +710,7 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 6;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 7;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {
@@ -1130,6 +1130,14 @@ pub(crate) struct OperatorGraph {
     #[cfg(feature = "cluster")]
     subscription_certificates:
         FxHashMap<String, Arc<laminar_core::checkpoint::OutputDistributionCertificate>>,
+    #[cfg(feature = "cluster")]
+    colocated_aggregates: FxHashSet<String>,
+    #[cfg(feature = "cluster")]
+    event_time_forwards: FxHashSet<String>,
+    #[cfg(feature = "cluster")]
+    event_time_roots: Vec<usize>,
+    #[cfg(feature = "cluster")]
+    remote_exchange_depth: u64,
     // One immutable assignment transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
@@ -1193,6 +1201,14 @@ impl OperatorGraph {
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
             subscription_certificates: FxHashMap::default(),
+            #[cfg(feature = "cluster")]
+            colocated_aggregates: FxHashSet::default(),
+            #[cfg(feature = "cluster")]
+            event_time_forwards: FxHashSet::default(),
+            #[cfg(feature = "cluster")]
+            event_time_roots: Vec::new(),
+            #[cfg(feature = "cluster")]
+            remote_exchange_depth: 0,
             #[cfg(feature = "cluster")]
             pending_vnode_transition: None,
             #[cfg(feature = "cluster")]
@@ -2633,8 +2649,8 @@ impl OperatorGraph {
                 self.ctx.clone(),
                 self.key_group_count,
             );
-            let left_schema = self.source_schemas.get(&cfg.left_table);
-            let right_schema = self.source_schemas.get(&cfg.right_table);
+            let left_schema = self.input_schema(&cfg.left_table);
+            let right_schema = self.input_schema(&cfg.right_table);
             if let Some(modes) = self.ordered_interval_joins.get(name) {
                 let left_schema = left_schema.ok_or_else(|| {
                     DbError::Config(format!(
@@ -2802,6 +2818,10 @@ impl OperatorGraph {
         self.output_map.remove(name);
         #[cfg(feature = "cluster")]
         self.subscription_certificates.remove(name);
+        #[cfg(feature = "cluster")]
+        self.colocated_aggregates.remove(name);
+        #[cfg(feature = "cluster")]
+        self.event_time_forwards.remove(name);
         self.changelog_tables.remove(name);
         self.live_handles.remove(name);
         self.intermediate_schemas.remove(name);
@@ -2820,7 +2840,7 @@ impl OperatorGraph {
         self.nodes.len()
     }
 
-    fn compute_topo_order(&mut self) {
+    fn compute_topo_order(&mut self) -> Result<(), DbError> {
         let n = self.nodes.len();
         let mut in_degree = vec![0usize; n];
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -2862,24 +2882,19 @@ impl OperatorGraph {
             }
         }
 
-        // Cycle detected: fall back to insertion order for remaining nodes.
+        // Catalog planning rejects stream cycles before a graph is built, so a cycle here is a
+        // broken graph invariant.
         let active_count = self.nodes.iter().filter(|n| !n.removed).count();
         if self.topo_order.len() < active_count {
-            tracing::warn!(
-                ordered = self.topo_order.len(),
-                total = active_count,
-                "circular dependency in operator graph, \
-                 falling back to insertion order for remaining nodes"
-            );
-            let in_order: FxHashSet<usize> = self.topo_order.iter().copied().collect();
-            for i in 0..n {
-                if !in_order.contains(&i) && !self.nodes[i].removed {
-                    self.topo_order.push(i);
-                }
-            }
+            return Err(DbError::PipelineTerminal(format!(
+                "operator graph has a cycle: {} of {active_count} nodes cannot be ordered",
+                active_count - self.topo_order.len()
+            )));
         }
 
         self.compute_node_domains();
+        #[cfg(feature = "cluster")]
+        self.compute_cluster_routing();
 
         self.source_list.clear();
         self.source_list
@@ -2904,6 +2919,7 @@ impl OperatorGraph {
             .extend(self.output_map.values().copied());
 
         self.topo_dirty = false;
+        Ok(())
     }
 
     /// Partition into failure domains (connected components) via union-find over undirected
@@ -3380,7 +3396,7 @@ impl OperatorGraph {
         }
 
         if self.topo_dirty {
-            self.compute_topo_order();
+            self.compute_topo_order()?;
         }
 
         #[cfg(feature = "cluster")]

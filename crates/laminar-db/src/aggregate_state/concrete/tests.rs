@@ -198,3 +198,110 @@ fn extrema_are_append_only_and_use_datafusion_ordering() {
         ConcreteAggregateState::try_new(&min_spec, ConcreteInputMode::Weighted).unwrap_err();
     assert!(error.to_string().contains("append-only"));
 }
+
+#[cfg(feature = "cluster")]
+#[test]
+fn batch_delta_merges_like_update_batch() {
+    use ConcreteInputMode::{AppendOnly, Weighted};
+
+    let ints = |values: &[Option<i64>]| -> ArrayRef { Arc::new(Int64Array::from(values.to_vec())) };
+    let floats =
+        |values: &[Option<f64>]| -> ArrayRef { Arc::new(Float64Array::from(values.to_vec())) };
+    let weights = |weights: &[i64]| -> ArrayRef { Arc::new(Int64Array::from(weights.to_vec())) };
+    let decimals = |values: &[Option<i128>]| -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values.to_vec())
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        )
+    };
+    let int64 = DataType::Int64;
+    let float64 = DataType::Float64;
+    let cases = [
+        (
+            spec(Count::new(), int64.clone(), int64.clone(), false),
+            AppendOnly,
+            vec![vec![ints(&[Some(1), None])], vec![ints(&[None])]],
+        ),
+        (
+            spec(Count::new(), int64.clone(), int64.clone(), true),
+            Weighted,
+            vec![
+                vec![ints(&[Some(1), None]), weights(&[1, 1])],
+                vec![ints(&[None]), weights(&[-1])],
+            ],
+        ),
+        (
+            spec(Sum::new(), int64.clone(), int64.clone(), false),
+            AppendOnly,
+            vec![vec![ints(&[Some(5), Some(-9)])], vec![ints(&[None])]],
+        ),
+        (
+            spec(Sum::new(), int64.clone(), int64.clone(), false),
+            Weighted,
+            vec![
+                vec![ints(&[Some(10), Some(20)]), weights(&[1, 1])],
+                vec![ints(&[Some(20)]), weights(&[-1])],
+            ],
+        ),
+        (
+            spec(Sum::new(), float64.clone(), float64.clone(), false),
+            Weighted,
+            vec![
+                vec![floats(&[Some(0.5), None]), weights(&[2, 1])],
+                vec![floats(&[Some(0.5)]), weights(&[-1])],
+            ],
+        ),
+        (
+            spec(
+                Avg::new(),
+                DataType::Decimal128(10, 2),
+                DataType::Decimal128(14, 6),
+                false,
+            ),
+            AppendOnly,
+            vec![
+                vec![decimals(&[Some(150), None])],
+                vec![decimals(&[Some(-25)])],
+            ],
+        ),
+        (
+            spec(Avg::new(), float64.clone(), float64.clone(), false),
+            Weighted,
+            vec![
+                vec![floats(&[Some(1.0), Some(3.0)]), weights(&[1, 1])],
+                vec![floats(&[Some(3.0)]), weights(&[-1])],
+            ],
+        ),
+        (
+            spec(Min::new(), float64.clone(), float64.clone(), false),
+            AppendOnly,
+            vec![
+                vec![floats(&[Some(2.0), None])],
+                vec![floats(&[Some(-1.0)])],
+            ],
+        ),
+        (
+            spec(Max::new(), int64.clone(), int64, false),
+            AppendOnly,
+            vec![vec![ints(&[Some(2), None])], vec![ints(&[None])]],
+        ),
+    ];
+    for (spec, mode, batches) in cases {
+        let template = ConcreteAggregateState::try_new(&spec, mode).unwrap();
+        let mut updated = template.clone();
+        let mut merged = template.clone();
+        for values in &batches {
+            updated.update_batch(values).unwrap();
+            merged
+                .merge_checkpoint_state(&template.batch_delta(values).unwrap())
+                .unwrap();
+        }
+        assert_eq!(
+            merged.checkpoint_state().unwrap(),
+            updated.checkpoint_state().unwrap(),
+            "{} {mode:?}",
+            spec.udf.name()
+        );
+    }
+}

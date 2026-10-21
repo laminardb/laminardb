@@ -95,6 +95,7 @@ pub mod api;
 mod ddl;
 mod direct_mutation;
 mod error;
+mod exchange_plan;
 mod filter_compile;
 mod handle;
 mod interval_join;
@@ -134,7 +135,19 @@ pub use table_store::benchmark::ReferenceTableBenchmark;
 
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]
+pub use aggregate_state::benchmark::AggregateBenchmark;
+
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
+pub use operator::benchmark::{ClusterAggregateBenchmark, IntervalJoinBenchmark};
+
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
 pub use mv_store::benchmark::{MaterializedViewBenchmark, MaterializedViewBenchmarkMode};
+#[cfg(all(test, feature = "cluster"))]
+mod cluster_conformance;
+#[cfg(all(test, feature = "cluster"))]
+mod cluster_test_support;
 mod temporal_join_state;
 #[cfg(test)]
 mod temporal_test_source;

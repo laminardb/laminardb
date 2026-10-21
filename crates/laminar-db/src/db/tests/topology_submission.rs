@@ -299,6 +299,7 @@ async fn topology_public_atomic_then_sql_migration_preserves_actual_aggregate_an
     let parent_identity = fixture
         .db
         .topology_definition_identities()
+        .await
         .unwrap()
         .pipeline;
     probe.output.lock().clear();
@@ -426,7 +427,7 @@ async fn topology_public_atomic_then_sql_migration_preserves_actual_aggregate_an
 }
 
 /// This fixture certifies only public admission/retry; it deliberately has no runnable driver.
-fn metadata_coordinator(fixture: &Fixture) -> crate::db::ForceCheckpointRx {
+async fn metadata_coordinator(fixture: &Fixture) -> crate::db::ForceCheckpointRx {
     let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
         crate::checkpoint_coordinator::CheckpointConfig::default(),
         test_checkpoint_store(),
@@ -437,6 +438,7 @@ fn metadata_coordinator(fixture: &Fixture) -> crate::db::ForceCheckpointRx {
             fixture
                 .db
                 .topology_definition_identities()
+                .await
                 .unwrap()
                 .pipeline,
         )
@@ -465,7 +467,7 @@ async fn topology_public_admission_is_atomic_and_retries_terminal_payload_before
         .await
         .unwrap()
         .is_none());
-    let _receiver = metadata_coordinator(&fixture);
+    let _receiver = metadata_coordinator(&fixture).await;
     let inventory = fixture.db.catalog_manifest_inventory().unwrap();
     let admitted = Box::pin(fixture.db.submit_cluster_topology_change(&request))
         .await
@@ -507,7 +509,7 @@ async fn topology_public_submission_waits_for_definitive_checkpoint_cleanup() {
     use laminar_core::checkpoint_decision::{CheckpointArtifactInventory, CheckpointVerdict};
 
     let (fixture, assignments) = Box::pin(preparation_fixture()).await;
-    let _receiver = metadata_coordinator(&fixture);
+    let _receiver = metadata_coordinator(&fixture).await;
     let inventory = CheckpointArtifactInventory {
         deployment_id: CheckpointDecisionStore::new(Arc::clone(
             &fixture.authority.checkpoint_store,
@@ -519,6 +521,7 @@ async fn topology_public_submission_waits_for_definitive_checkpoint_cleanup() {
         pipeline_identity: fixture
             .db
             .topology_definition_identities()
+            .await
             .unwrap()
             .pipeline,
         attempt: CheckpointAttempt::canonical(1),
@@ -592,7 +595,7 @@ async fn topology_public_submission_waits_for_definitive_checkpoint_cleanup() {
 #[tokio::test]
 async fn topology_public_competing_requests_and_expired_forwarding_never_admit_two_parents() {
     let (fixture, _) = Box::pin(preparation_fixture()).await;
-    let _receiver = metadata_coordinator(&fixture);
+    let _receiver = metadata_coordinator(&fixture).await;
     let left = request(
         1303,
         vec!["CREATE STREAM left_future AS SELECT * FROM totals".into()],

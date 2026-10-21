@@ -30,7 +30,6 @@ mod runtime;
 pub(crate) mod source;
 
 const DEADLINE: Duration = Duration::from_secs(40);
-const LEASE_TTL: Duration = Duration::from_secs(120);
 type ActivityRow = (String, String, i64, bool, i64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
