@@ -1,9 +1,11 @@
 name: Checkpoint fault and soak
 
-# Process-death and coordinated-recovery soaks. Expensive and timing-sensitive, so they run weekly
-# (and on demand) rather than on the per-PR critical path. Cluster jobs use Redpanda plus SeaweedFS for
-# replayable partitions and cluster-shared durability; the RabbitMQ sink leg also starts RabbitMQ.
+# Process-death and coordinated-recovery soaks. Expensive and timing-sensitive, so they run weekly,
+# on demand, and as a release gate rather than on the per-PR critical path. Cluster jobs use
+# Redpanda plus SeaweedFS for replayable partitions and cluster-shared durability; the RabbitMQ sink
+# leg also starts RabbitMQ.
 on:
+  workflow_call:
   workflow_dispatch:
     inputs:
       kills:
