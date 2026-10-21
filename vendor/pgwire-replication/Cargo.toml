@@ -126,7 +126,7 @@ version = "0.7"
 version = "0.1"
 
 [dependencies.webpki-roots]
-version = "0.26"
+version = "1"
 optional = true
 
 [dev-dependencies.tempfile]
