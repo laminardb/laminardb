@@ -474,5 +474,6 @@ topic = {output:?}
         http_port: port,
         fault_trigger_path: None,
         checkpoint_gate_path: None,
+        sink_commit_gate_path: None,
     })
 }
