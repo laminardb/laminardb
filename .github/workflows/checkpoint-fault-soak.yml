@@ -352,7 +352,9 @@ jobs:
   cluster-coordinated-recovery:
     name: Coordinated recovery (${{ matrix.role }}, ${{ matrix.discovery }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The fault soak and the process-remote qualification are two cold feature builds; a
+    # cancelled job never saves its cache, so the budget must fit both from scratch.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
