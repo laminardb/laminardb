@@ -267,10 +267,10 @@ jobs:
         env:
           SOAK_SERVICES: ${{ matrix.services || 'minio redpanda' }}
         run: |
+          docker compose -f tests/docker/compose.yml build minio
           docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 $SOAK_SERVICES
-          docker run --rm --network host --entrypoint /bin/sh \
-            minio/mc:RELEASE.2024-10-08T09-37-26Z -c \
-            'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
+          docker compose -f tests/docker/compose.yml exec -T minio /bin/sh -c \
+            'mc alias set soak http://127.0.0.1:9000 laminar laminar-test-secret && mc mb --ignore-existing soak/laminardb-soak'
 
       - name: Verify Kafka global source handoff
         if: matrix.discovery == 'static' && matrix.delivery == 'alo'
@@ -393,10 +393,10 @@ jobs:
 
       - name: Start cluster-shared dependencies
         run: |
+          docker compose -f tests/docker/compose.yml build minio
           docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 minio redpanda
-          docker run --rm --network host --entrypoint /bin/sh \
-            minio/mc:RELEASE.2024-10-08T09-37-26Z -c \
-            'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
+          docker compose -f tests/docker/compose.yml exec -T minio /bin/sh -c \
+            'mc alias set soak http://127.0.0.1:9000 laminar laminar-test-secret && mc mb --ignore-existing soak/laminardb-soak'
 
       - name: Inject a fatal pipeline cycle fault on the ${{ matrix.role }}
         shell: bash
