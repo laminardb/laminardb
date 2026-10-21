@@ -6,7 +6,8 @@
 //! assignment, repartitioning every batch or applying it whole on a colocated input.
 //! `global_partial_merge`: one projected batch of the global aggregate, applied by its owner
 //! (`apply_rows`) or folded into a partial row on another node (`fold`) that the owner merges
-//! (`merge`).
+//! (`merge`). Throughput counts the batch's input rows in all three, so `merge` reports the input
+//! rows one partial absorbs.
 //!
 //! Run with: `cargo bench -p laminar-db --features benchmark-internals --bench aggregate_bench`
 

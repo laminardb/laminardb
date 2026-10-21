@@ -371,8 +371,8 @@ EMIT CHANGES;
   An aggregating subquery emits changes, so the outer aggregate supports `COUNT`, `SUM` and `AVG`
   but not `MIN` or `MAX`. In cluster mode a windowed subquery is rejected, because cluster windows
   emit only closed windows.
-- Stages belong to their stream. `SHOW STREAMS`, `SHOW CREATE STREAM` and `SUBSCRIBE` see only the
-  stream, `DROP STREAM` removes its stages, and no other statement may read, drop or create a
+- Stages belong to their stream. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
+  `DROP STREAM` removes its stages, and no other statement may read, drop or create a
   `$stage` name. A failed `CREATE` removes the stages it created.
 - A join of three or more inputs still needs named two-way stages: a join's output carries no
   event time, so an interval join cannot read it.
