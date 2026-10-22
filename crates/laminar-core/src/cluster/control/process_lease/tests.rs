@@ -953,6 +953,106 @@ async fn transient_renewal_io_failure_retries_before_the_normal_cadence() {
 }
 
 #[cfg(feature = "cluster")]
+async fn hung_renewal_manager(
+    node: NodeId,
+    owner: Uuid,
+    config: ProcessLeaseConfig,
+) -> (
+    Arc<PutBarrierStore>,
+    Arc<ProcessLeaseStore>,
+    ProcessLeaseManager,
+) {
+    let hung = Arc::new(PutBarrierStore {
+        inner: Arc::new(InMemory::new()),
+        path: lease_path(node, 2),
+        arrivals: None,
+        delay_response: true,
+        fail_once: AtomicBool::new(false),
+        failed_once: AtomicBool::new(false),
+        failure_observed: tokio::sync::Semaphore::new(0),
+        retry_observed: tokio::sync::Semaphore::new(0),
+        committed: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        conflict_as_precondition: false,
+    });
+    let object_store: Arc<dyn ObjectStore> = hung.clone();
+    let ttl_ms = i64::try_from(config.ttl.as_millis()).unwrap();
+    let store = Arc::new(ProcessLeaseStore::new(object_store, node, ttl_ms));
+    let acquisition_started_at = Instant::now();
+    let ProcessLeaseOutcome::Acquired(initial) = store.try_acquire(owner, 0).await.unwrap() else {
+        panic!("initial process lease must be acquired");
+    };
+    let manager = ProcessLeaseManager::new(
+        Arc::clone(&store),
+        owner,
+        config,
+        acquisition_started_at,
+        &initial,
+    )
+    .unwrap();
+    (hung, store, manager)
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn stalled_renewal_is_abandoned_and_retried_before_the_lease_expires() {
+    let node = NodeId(7);
+    let owner = Uuid::from_u128(1);
+    let config = ProcessLeaseConfig {
+        ttl: Duration::from_secs(10),
+        renew_interval: Duration::from_secs(2),
+    };
+    let (hung, store, manager) = hung_renewal_manager(node, owner, config).await;
+    let deadline = manager.deadline();
+    let live = manager.live_watch();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn(shutdown.clone());
+
+    // The first renewal's create lands, but its response never returns.
+    hung.committed.acquire().await.unwrap().forget();
+    let retried = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(lease) = store.load().await.unwrap().filter(|lease| lease.seq == 3) {
+                return lease;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a stalled renewal must be retried well before the lease deadline");
+
+    assert_eq!((retried.owner, retried.term), (owner, 1));
+    assert!(deadline.is_live());
+    assert!(*live.borrow());
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn renewal_still_pending_at_the_lease_deadline_fences() {
+    let node = NodeId(7);
+    let owner = Uuid::from_u128(1);
+    let config = ProcessLeaseConfig {
+        ttl: Duration::from_secs(10),
+        renew_interval: Duration::from_secs(6),
+    };
+    let (hung, _store, manager) = hung_renewal_manager(node, owner, config).await;
+    let deadline = manager.deadline();
+    let live = manager.live_watch();
+    let task = manager.spawn(tokio_util::sync::CancellationToken::new());
+
+    hung.committed.acquire().await.unwrap().forget();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("a renewal pending at the lease deadline must fence")
+        .unwrap();
+
+    assert!(!deadline.is_live());
+    assert!(!*live.borrow());
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn delayed_first_poll_cannot_renew_after_initial_deadline() {
     let store = Arc::new(ProcessLeaseStore::new(
