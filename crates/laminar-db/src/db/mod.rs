@@ -3922,7 +3922,7 @@ impl LaminarDB {
     }
 
     #[allow(unused_variables)]
-    fn register_builtin_connectors(
+    pub(crate) fn register_builtin_connectors(
         registry: &laminar_connectors::registry::ConnectorRegistry,
     ) -> Result<(), laminar_connectors::error::ConnectorError> {
         laminar_connectors::generator::register_generator_source(registry)?;

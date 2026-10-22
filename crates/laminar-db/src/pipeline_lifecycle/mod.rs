@@ -355,6 +355,24 @@ mod startup_failure_tests;
 #[cfg(test)]
 mod connector_admission_tests;
 
+#[cfg(all(
+    test,
+    feature = "kafka",
+    feature = "postgres-cdc",
+    feature = "postgres-sink",
+    feature = "delta-lake",
+    feature = "iceberg",
+    feature = "mongodb-cdc",
+    feature = "files",
+    feature = "websocket",
+    feature = "otel",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "ibmmq",
+    feature = "fix"
+))]
+mod delivery_matrix_tests;
+
 #[cfg(test)]
 mod resolver_tests;
 
