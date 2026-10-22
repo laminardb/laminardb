@@ -731,6 +731,7 @@ fn cluster_nodes(
                 http_port: BASE_PORT + id as u16,
                 fault_trigger_path: None,
                 checkpoint_gate_path: Some(dir.join(format!("checkpoint-node-{id}.arm"))),
+                sink_commit_gate_path: None,
             }
         })
         .collect()

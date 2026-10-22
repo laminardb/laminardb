@@ -18,8 +18,10 @@
 //! an independent snapshot oracle requires the main frozen output exactly once. All four join legs
 //! phase the matrix across faults and require connector-visible keyed aggregate results that combine
 //! pre-fault retained state with post-fault input. That phased source also closes direct TUMBLE,
-//! HOP, and SESSION state after recovery. The local exact leg separately validates finite-source
-//! and retained-state recovery.
+//! HOP, and SESSION state after recovery. After its kills, the three-node exact leg pauses the
+//! leader inside a checkpoint and resumes it once survivors fail over; the stale leader must fence
+//! itself without publishing (`paused_leader`). The local exact leg separately validates
+//! finite-source and retained-state recovery.
 //!
 //! Ignored by default — spawns processes and runs for minutes:
 //!
@@ -28,7 +30,7 @@
 //!   --test cluster_soak three_node_alo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,kafka \
 //!   --test cluster_soak single_node_alo_join_kill9_soak -- --ignored --nocapture
-//! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3 \
+//! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3,iceberg \
 //!   --test cluster_soak three_node_eo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,kafka,delta-lake-s3 \
 //!   --test cluster_soak single_node_eo_join_kill9_soak -- --ignored --nocapture
@@ -50,6 +52,8 @@
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
+//! - `LAMINAR_SOAK_ICEBERG_*`  Iceberg REST catalog and S3 storage for the three-node EO leg when
+//!   built with `iceberg` (see `iceberg_leg`)
 //! - Custom S3 endpoint EO runs use a bounded 60s checkpoint-operation timeout
 //! - `LAMINAR_SOAK_ALO_VISIBILITY_MS`  maximum Kafka output visibility latency (default 10000)
 //! - `LAMINAR_SOAK_EO_VISIBILITY_MS`  maximum frozen-input-to-Delta visibility latency (default 10000)
@@ -89,9 +93,19 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
+#[path = "cluster_soak/iceberg_leg.rs"]
+mod iceberg_leg;
 #[cfg(all(feature = "kafka", any(feature = "rabbitmq", feature = "ibmmq")))]
 #[path = "cluster_soak/messaging_sinks.rs"]
 mod messaging_sinks;
+// Shared with iceberg_cluster_soak, which uses every helper this soak does not.
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3", feature = "iceberg"))]
+#[allow(dead_code)]
+mod iceberg_table;
+#[cfg(feature = "kafka")]
+#[path = "cluster_soak/paused_leader.rs"]
+mod paused_leader;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology.rs"]
 mod topology_adoption;
@@ -1309,6 +1323,8 @@ struct Node {
     fault_trigger_path: Option<PathBuf>,
     /// Debug checkpoint handshake used to prove a hard kill landed inside an active phase.
     checkpoint_gate_path: Option<PathBuf>,
+    /// Debug external sink commit handshake used by paused-leader rounds.
+    sink_commit_gate_path: Option<PathBuf>,
 }
 
 struct VerifiedExecutable(Arc<ResolvedExecutable>);
@@ -2309,6 +2325,9 @@ impl Node {
             None => {
                 cmd.env_remove("LAMINAR_CHECKPOINT_KILL_GATE_FILE");
             }
+        }
+        if let Some(path) = &self.sink_commit_gate_path {
+            cmd.env("LAMINAR_EXTERNAL_SINK_COMMIT_GATE_FILE", path);
         }
         let child = cmd.spawn().unwrap_or_else(|error| {
             panic!(
@@ -12613,6 +12632,7 @@ fn local_exact_source_state_kill9_soak() {
         // makes the existing debug-only checkpoint gate available without adding a production
         // configuration dimension.
         checkpoint_gate_path: Some(dir.path().join("checkpoint-local-exact.arm")),
+        sink_commit_gate_path: None,
     };
     let initial_spawn = node.verify_executable_for_spawn();
     node.spawn(initial_spawn);
@@ -13136,6 +13156,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         http_port: SINGLE_JOIN_PORT,
         fault_trigger_path: None,
         checkpoint_gate_path: Some(dir.path().join("checkpoint-single-join.arm")),
+        sink_commit_gate_path: None,
     }];
     let mut latency_evidence = CheckpointLatencyEvidence::default();
     let mut live_state_high_water = None;
@@ -13873,6 +13894,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
     migrate_topology: bool,
 ) {
     let delivery_label = delivery.label();
+    let pause_gates = paused_leader::gates_for(delivery);
     let executable = Arc::new(
         ResolvedExecutable::from_environment()
             .unwrap_or_else(|error| panic!("invalid soak server executable: {error}")),
@@ -13981,6 +14003,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
     let mut window_output_oracle;
     #[cfg(feature = "delta-lake-s3")]
     let mut delta_window_output_oracles = None;
+    #[cfg(all(feature = "delta-lake-s3", feature = "iceberg"))]
+    let iceberg_output = (delivery == JoinDelivery::ExactlyOnce)
+        .then(|| iceberg_leg::IcebergJoinOutput::create(&run_id));
     let (sink_config, matrix_sink_config) = match delivery {
         JoinDelivery::AtLeastOnce => {
             let (configured_oracles, sink_config) = JoinOutputOracles::kafka(
@@ -14014,6 +14039,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 let storage = DeltaSoakStorage::from_environment();
                 let (configured_oracles, sink_config) =
                     JoinOutputOracles::delta(&run_id, "cluster", &storage);
+                #[cfg(feature = "iceberg")]
+                let sink_config = format!(
+                    "{sink_config}{}",
+                    iceberg_output
+                        .as_ref()
+                        .expect("cluster EO Iceberg leg")
+                        .sink_config()
+                );
                 output_oracles = configured_oracles;
                 let matrix_uris = delta_matrix_output_table_uris(&run_id, "cluster");
                 let matrix_sinks = delta_matrix_output_sink_config(&matrix_uris, &storage);
@@ -14149,8 +14182,10 @@ fn run_three_node_join_kill9_soak_with_adoption(
             fault_trigger_path: fault_role
                 .as_ref()
                 .map(|_| dir.path().join(format!("fault-node-{id}.trigger"))),
-            checkpoint_gate_path: (max_kills > 0 || migrate_topology)
+            checkpoint_gate_path: (max_kills > 0 || migrate_topology || !pause_gates.is_empty())
                 .then(|| dir.path().join(format!("checkpoint-node-{id}.arm"))),
+            sink_commit_gate_path: (!pause_gates.is_empty())
+                .then(|| dir.path().join(format!("sink-commit-node-{id}.arm"))),
         })
         .collect();
     let mut latency_evidence = CheckpointLatencyEvidence::default();
@@ -14455,10 +14490,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
     let mut leader_kills = 0u64;
     let mut follower_kills = 0u64;
     let mut killed_follower_nodes = BTreeSet::new();
-    while kills < max_kills {
+    let mut pauses = 0usize;
+    while kills < max_kills || pauses < pause_gates.len() {
         round += 1;
         let leader = wait_for_stable_leader(&mut nodes, &mut producer);
-        let (victim, victim_role) = if kills.is_multiple_of(NODES as u64) {
+        let pause_gate = (kills == max_kills).then(|| pause_gates[pauses]);
+        let (victim, victim_role) = if pause_gate.is_some() {
+            (leader, "leader")
+        } else if kills.is_multiple_of(NODES as u64) {
             leader_kills += 1;
             (leader, "leader")
         } else {
@@ -14494,7 +14533,11 @@ fn run_three_node_join_kill9_soak_with_adoption(
             "node{victim} process generation {} had no completed checkpoint stall observation before arming kill-{round}",
             nodes[victim].process_generation
         );
-        nodes[victim].arm_checkpoint_kill(victim_role);
+        let fault = pause_gate.map_or(
+            paused_leader::RoundFault::Kill9(victim_role),
+            paused_leader::RoundFault::PauseLeader,
+        );
+        fault.arm(&nodes[victim]);
         // Budget one in-flight spontaneous recovery: pipelines stopped for a round expose no
         // checkpoint to arm until it completes.
         wait_for(
@@ -14503,11 +14546,11 @@ fn run_three_node_join_kill9_soak_with_adoption(
             || {
                 assert_running_nodes(&mut nodes);
                 producer.assert_running();
-                nodes[victim].checkpoint_kill_ready(victim_role)
+                fault.held(&nodes[victim])
             },
         );
         eprintln!(
-            "soak round {round}: kill -9 observed {victim_role} node {victim} inside checkpoint"
+            "soak round {round}: {fault:?} observed {victim_role} node {victim} inside checkpoint"
         );
         exact_timing_evidence
             .finalize_node(
@@ -14526,13 +14569,17 @@ fn run_three_node_join_kill9_soak_with_adoption(
         let prior_release = migration_probe
             .as_ref()
             .and_then(topology_migration::MigrationProbe::recovery_release);
-        nodes[victim].kill9();
-        nodes[victim].disarm_checkpoint_kill();
-        if victim_role == "follower" {
-            killed_follower_nodes.insert(victim);
+        let paused = fault.deliver(&mut nodes[victim]);
+        if paused.is_some() {
+            pauses += 1;
+            eprintln!("soak round {round}: SIGSTOP delivered to {victim_role} node {victim}");
+        } else {
+            if victim_role == "follower" {
+                killed_follower_nodes.insert(victim);
+            }
+            kills += 1;
+            eprintln!("soak round {round}: kill -9 delivered to {victim_role} node {victim}");
         }
-        kills += 1;
-        eprintln!("soak round {round}: kill -9 delivered to {victim_role} node {victim}");
         latest_checkpoint = assert_progress(
             &mut nodes,
             Some(&mut producer),
@@ -14607,6 +14654,12 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 round,
                 prior_release.as_ref(),
                 remaining_progress_window(failover_deadline, "rescaled topology output"),
+            );
+        }
+        if let Some(paused) = paused {
+            let status = paused.resume_until_fenced_exit(recovery_ceiling);
+            eprintln!(
+                "soak round {round}: resumed stale leader node {victim} fenced itself and exited ({status})"
             );
         }
 
@@ -14729,6 +14782,11 @@ fn run_three_node_join_kill9_soak_with_adoption(
         kills, max_kills,
         "cluster soak did not complete every requested kill"
     );
+    assert_eq!(
+        pauses,
+        pause_gates.len(),
+        "cluster soak did not complete every paused-leader round"
+    );
     if max_kills >= NODES as u64 {
         assert!(
             leader_kills > 0,
@@ -14850,7 +14908,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
     producer.assert_running();
     eprintln!(
         "soak: completed {round} rounds ({kills} kills: {leader_kills} leader, \
-         {follower_kills} follower), final checkpoint {} epoch {}",
+         {follower_kills} follower; {pauses} paused leaders), final checkpoint {} epoch {}",
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
 
@@ -15261,6 +15319,16 @@ fn run_three_node_join_kill9_soak_with_adoption(
                         .expect("cluster EO outputs completed before final cuts"),
                     recovery_ceiling,
                 );
+                #[cfg(feature = "iceberg")]
+                iceberg_output
+                    .as_ref()
+                    .expect("cluster EO Iceberg leg")
+                    .assert_exact(
+                        &mut nodes,
+                        &produced_prefix.expected_pairs,
+                        recovery_ceiling,
+                        "three-node EO bounded join",
+                    );
                 assert_delta_matrix_outputs(
                     &mut nodes,
                     delta_matrix_output_oracles
@@ -18329,6 +18397,7 @@ fn exact_timing_completeness_covers_every_spawned_generation() {
             http_port: 0,
             fault_trigger_path: None,
             checkpoint_gate_path: None,
+            sink_commit_gate_path: None,
         },
         Node {
             id: 1,
@@ -18345,6 +18414,7 @@ fn exact_timing_completeness_covers_every_spawned_generation() {
             http_port: 0,
             fault_trigger_path: None,
             checkpoint_gate_path: None,
+            sink_commit_gate_path: None,
         },
     ];
     let expected = [
