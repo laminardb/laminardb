@@ -1,48 +1,40 @@
-# MinIO + Iceberg REST catalog for the Iceberg append integration test.
+# SeaweedFS + Iceberg REST catalog for the Iceberg append integration test.
 #
 #   docker compose -f tests/docker/iceberg-compose.yml up -d --wait
 #   cargo test -p laminar-connectors --test iceberg_append \
 #     --features iceberg -- --ignored
 #   docker compose -f tests/docker/iceberg-compose.yml down -v
 #
-# The sink reaches MinIO/REST via localhost:9000 / localhost:8181; the REST
-# catalog reaches MinIO via the docker network (minio:9000).
+# The sink reaches S3/REST via localhost:9000 / localhost:8181; the REST
+# catalog reaches S3 via the docker network (seaweedfs:8333).
 
 services:
-  minio:
-    build: &minio-build
-      context: .
-      dockerfile: minio.Dockerfile
-    image: laminardb-minio-test:2024-10-13
-    pull_policy: build
-    command: server /data --console-address :9001
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+  seaweedfs:
+    image: &seaweedfs-image chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    command: server -dir=/data -s3 -s3.config=/etc/seaweedfs/s3.json -volume.max=0 -master.volumeSizeLimitMB=1024
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:8333"
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
       interval: 3s
       timeout: 5s
       retries: 30
 
-  minio-init:
-    build: *minio-build
-    image: laminardb-minio-test:2024-10-13
-    pull_policy: build
+  seaweedfs-init:
+    image: *seaweedfs-image
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - mc alias set local http://minio:9000 minioadmin minioadmin && mc mb -p local/warehouse
+      - echo "s3.bucket.create -name warehouse" | weed shell -master=seaweedfs:9333
 
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.9.2
     depends_on:
-      minio-init:
+      seaweedfs-init:
         condition: service_completed_successfully
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
@@ -54,7 +46,7 @@ services:
       CATALOG_URI: jdbc:sqlite:file:/tmp/iceberg_rest.db
       CATALOG_WAREHOUSE: s3://warehouse/wh
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_ENDPOINT: http://seaweedfs:8333
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
     ports:
       - "8181:8181"

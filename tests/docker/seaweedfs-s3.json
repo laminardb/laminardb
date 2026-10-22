@@ -1,0 +1,12 @@
+{
+  "identities": [
+    {
+      "name": "laminar-test",
+      "credentials": [
+        { "accessKey": "laminar", "secretKey": "laminar-test-secret" },
+        { "accessKey": "minioadmin", "secretKey": "minioadmin" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}
