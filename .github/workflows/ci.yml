@@ -517,7 +517,7 @@ jobs:
           key: iceberg-integration
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
-      - name: Start Iceberg REST, MinIO, and Redpanda
+      - name: Start Iceberg REST, SeaweedFS, and Redpanda
         run: |
           docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml up -d --wait
           docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml up -d --wait redpanda
@@ -531,7 +531,7 @@ jobs:
         run: |
           docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml logs --no-color
           docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml logs --no-color redpanda
-      - name: Stop Iceberg REST, MinIO, and Redpanda
+      - name: Stop Iceberg REST, SeaweedFS, and Redpanda
         if: always()
         run: |
           docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml down -v

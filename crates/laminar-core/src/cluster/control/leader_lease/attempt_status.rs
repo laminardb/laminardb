@@ -1,7 +1,11 @@
 //! Audited checkpoint settlement and commit-authority observation.
 
-use crate::checkpoint::{CheckpointAssignmentFence, CheckpointAttempt, LeaderProof};
-use crate::checkpoint_decision::{CheckpointOutcome, DecisionError};
+use std::sync::Arc;
+
+use crate::checkpoint::{
+    CheckpointAssignmentFence, CheckpointAttempt, CommittedCheckpointIndex, LeaderProof,
+};
+use crate::checkpoint_decision::{CheckpointDecisionStore, CheckpointOutcome, DecisionError};
 
 use super::{ClusterCheckpointAuthorityError, LeaderLeaseStore};
 
@@ -53,6 +57,48 @@ impl LeaderLeaseStore {
         }
         let outcomes = self.audited_cluster_outcomes().await?.1;
         Ok(settlement_from_outcomes(attempt, &outcomes))
+    }
+
+    /// Greatest live cluster Commit together with its validated committed checkpoint index.
+    ///
+    /// The index is loaded through the selected Commit's own reference. A second lookup by epoch
+    /// can miss a head that retention retired as soon as a newer Commit landed between the reads.
+    ///
+    /// # Errors
+    /// Returns an error for an unavailable or invalid authority chain, or for a committed index
+    /// that is missing or mismatched while its Commit is still the head.
+    pub async fn highest_cluster_commit_with_checkpoint(
+        &self,
+    ) -> Result<
+        Option<(CheckpointOutcome, CommittedCheckpointIndex)>,
+        ClusterCheckpointAuthorityError,
+    > {
+        const LOOKUP_RETRIES: usize = 3;
+        let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
+        for _ in 0..LOOKUP_RETRIES {
+            let Some(head) = self.highest_cluster_committed_outcome().await? else {
+                return Ok(None);
+            };
+            let error = match decisions
+                .validate_committed_checkpoint_for_outcome(&head)
+                .await
+            {
+                Ok(index) => return Ok(Some((head, index))),
+                Err(error) => error,
+            };
+            // Cleanup deletes an index only after a newer Commit has retired it as head.
+            let replaced = self
+                .highest_cluster_committed_outcome()
+                .await?
+                .is_some_and(|current| current.epoch > head.epoch);
+            if !replaced {
+                return Err(error.into());
+            }
+        }
+        Err(DecisionError::InventoryChanged(
+            "cluster Commit head lookup exhausted stability retries".into(),
+        )
+        .into())
     }
 
     /// Audit the settlement and commit authority of one admitted cluster checkpoint attempt.

@@ -341,8 +341,13 @@ impl OperatorGraph {
                 )
             );
         #[cfg(feature = "cluster")]
-        let use_temporal_source_frontier =
-            matches!(managed_state, Some(ManagedStateContract::TemporalJoinV1));
+        let capped_source_frontiers = match managed_state {
+            Some(ManagedStateContract::TemporalJoinV1) => Some(&self.temporal_source_frontiers),
+            Some(ManagedStateContract::BoundedIntervalJoinV3) => {
+                Some(&self.interval_idle_source_frontiers)
+            }
+            _ => None,
+        };
         (0..port_count)
             .map(|port| {
                 let upstream = self.input_sources[node_id][port];
@@ -352,14 +357,9 @@ impl OperatorGraph {
                     .flatten()
                     .filter(|&root| root != usize::MAX)
                 {
-                    let frontier = if use_temporal_source_frontier {
-                        self.temporal_source_frontiers
-                            .get(&root)
-                            .copied()
-                            .unwrap_or(self.local_source_frontiers[root])
-                    } else {
-                        self.local_source_frontiers[root]
-                    };
+                    let frontier = capped_source_frontiers
+                        .and_then(|capped| capped.get(&root).copied())
+                        .unwrap_or(self.local_source_frontiers[root]);
                     return self.hold_buffered_chain_frontier(upstream, root, frontier);
                 }
                 if upstream < self.output_watermarks.len() {

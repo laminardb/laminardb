@@ -3945,6 +3945,92 @@ async fn stale_noncurrent_recovery_slot_does_not_mask_the_current_driver() {
     );
 }
 
+/// Announce a Prepare under the current term, then rotate the same process to a newer term.
+async fn prepare_then_regain_leadership(
+    controller: &ClusterController,
+    terminal: bool,
+) -> (Arc<super::super::LeaderLeaseStore>, LeaderProof) {
+    let (authority, old_proof) = install_recovery_authority(controller, 1).await;
+    let request = controller.next_recovery_fault_request().unwrap();
+    controller.report_fault(request).await.unwrap();
+    if terminal {
+        controller.report_terminal_fault(request).await.unwrap();
+    }
+    let round = recovery_round_from_current_faults(controller, 2, &old_proof, &[1]).await;
+    controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+    controller.announce_recover_prepare(&round).await.unwrap();
+    let owner = super::super::LeaderLeaseOwner {
+        node: controller.instance_id(),
+        boot: controller.recovery_incarnation(),
+        process_term: old_proof.owner.process_term,
+    };
+    let super::super::LeaseOutcome::Acquired(lease) =
+        authority.begin_new_term(&owner, 2).await.unwrap()
+    else {
+        panic!("the same owner must rotate to a newer term");
+    };
+    assert!(lease.token > old_proof.fencing_token);
+    (authority, old_proof)
+}
+
+#[tokio::test]
+async fn own_recovery_slot_from_an_older_leader_term_is_not_active() {
+    let controller = ctl(1, vec![]);
+    controller.publish_recovery_incarnation().await.unwrap();
+    let (_authority, old_proof) = prepare_then_regain_leadership(&controller, false).await;
+
+    assert_eq!(controller.observe_recover_control().await.unwrap(), None);
+    assert!(matches!(
+        controller
+            .observe_recover_control_for_durable_proof(&old_proof)
+            .await,
+        Err(RecoveryControlError::Superseded(_))
+    ));
+}
+
+#[tokio::test]
+async fn own_terminal_recovery_slot_from_an_older_leader_term_stays_superseded() {
+    let controller = ctl(1, vec![]);
+    controller.publish_recovery_incarnation().await.unwrap();
+    prepare_then_regain_leadership(&controller, true).await;
+
+    assert!(matches!(
+        controller.observe_recover_control().await,
+        Err(RecoveryControlError::Superseded(_))
+    ));
+}
+
+#[tokio::test]
+async fn own_recovery_slot_under_another_nodes_term_stays_superseded() {
+    let controller = ctl(1, vec![]);
+    controller.publish_recovery_incarnation().await.unwrap();
+    let (authority, proof) = install_recovery_authority(&controller, 1).await;
+    report_new_local_fault(&controller).await;
+    let round = recovery_round_from_current_faults(&controller, 2, &proof, &[1]).await;
+    controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+    controller.announce_recover_prepare(&round).await.unwrap();
+    let successor = super::super::LeaderLeaseOwner {
+        node: NodeId(2),
+        boot: Uuid::from_u128(22),
+        process_term: 1,
+    };
+    let current = authority.load().await.unwrap().unwrap();
+    let observation = authority.observe_rival(&successor, &current).unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    assert!(matches!(
+        authority
+            .try_takeover(&successor, &observation, 2)
+            .await
+            .unwrap(),
+        super::super::LeaseOutcome::Acquired(_)
+    ));
+
+    assert!(matches!(
+        controller.observe_recover_control().await,
+        Err(RecoveryControlError::Superseded(_))
+    ));
+}
+
 #[tokio::test]
 async fn durable_proof_observation_survives_local_driver_candidacy_loss() {
     let controller = ctl(1, vec![]);
