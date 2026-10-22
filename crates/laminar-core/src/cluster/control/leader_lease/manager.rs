@@ -233,12 +233,36 @@ impl LeaderLeaseManager {
         }
     }
 
+    /// Publish that this process gave up the term it just withdrew from, then wait for candidacy
+    /// to change. The local grant is already fenced, so a rival may take the released term over
+    /// at once rather than observe it for a full TTL; after one TTL the release is moot.
     #[cfg(feature = "cluster")]
-    async fn wait_for_candidacy_change(
+    async fn release_and_await_candidacy(
         &self,
         shutdown: &tokio_util::sync::CancellationToken,
         candidate: &mut watch::Receiver<LeaderCandidacy>,
+        withdrawn_term: Option<u64>,
     ) -> bool {
+        if let Some(token) = withdrawn_term {
+            let release = tokio::time::timeout(
+                self.config.ttl,
+                self.store.publish_release(&self.owner, token),
+            );
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    self.fence();
+                    return false;
+                }
+                released = release => match released {
+                    Ok(Ok(())) => {
+                        tracing::info!(owner = ?self.owner, token, "released the leader lease term");
+                    }
+                    Ok(Err(error)) => tracing::warn!(%error, "leader lease release failed"),
+                    Err(_) => tracing::warn!("leader lease release timed out"),
+                },
+            }
+        }
         tokio::select! {
             biased;
             () = shutdown.cancelled() => {
@@ -251,6 +275,28 @@ impl LeaderLeaseManager {
                     return false;
                 }
                 true
+            }
+        }
+    }
+
+    /// Keep an observation that still names the rival's liveness identity; restart it otherwise.
+    #[cfg(feature = "cluster")]
+    fn observe_held_rival(
+        &self,
+        observation: Option<LeaderLeaseObservation>,
+        rival: &LeaderLease,
+    ) -> Option<LeaderLeaseObservation> {
+        if observation
+            .as_ref()
+            .is_some_and(|observed| observed.lease.has_same_liveness_identity(rival))
+        {
+            return observation;
+        }
+        match self.store.observe_rival(&self.owner, rival) {
+            Ok(observation) => Some(observation),
+            Err(error) => {
+                tracing::warn!(%error, "leader lease observation rejected");
+                None
             }
         }
     }
@@ -273,6 +319,7 @@ impl LeaderLeaseManager {
 
         loop {
             let candidacy = *candidate.borrow_and_update();
+            let withdrawn_term = held_token;
             if candidacy.generation != candidacy_generation {
                 self.withdraw_for_new_term(
                     &mut ticker,
@@ -292,7 +339,7 @@ impl LeaderLeaseManager {
                     &mut rotate_not_before,
                 );
                 if !self
-                    .wait_for_candidacy_change(&shutdown, &mut candidate)
+                    .release_and_await_candidacy(&shutdown, &mut candidate, withdrawn_term)
                     .await
                 {
                     return;
@@ -438,18 +485,7 @@ impl LeaderLeaseManager {
                     self.withdraw();
                     valid_until = None;
                     held_token = None;
-                    let unchanged = observation
-                        .as_ref()
-                        .is_some_and(|observed| observed.lease.has_same_liveness_identity(&rival));
-                    if !unchanged {
-                        match self.store.observe_rival(&self.owner, &rival) {
-                            Ok(new_observation) => observation = Some(new_observation),
-                            Err(error) => {
-                                tracing::warn!(%error, "leader lease observation rejected");
-                                observation = None;
-                            }
-                        }
-                    }
+                    observation = self.observe_held_rival(observation.take(), &rival);
                 }
                 Err(LeaseError::Fenced(error)) => {
                     tracing::warn!(%error, "leader lease renewal was fenced");

@@ -23,6 +23,7 @@ mod topology_target_preparation;
 mod checkpoint_publication;
 mod history_retention;
 mod manager;
+mod release;
 
 pub use attempt_status::ClusterAttemptStatus;
 pub use manager::LeaderLeaseManager;
@@ -6371,10 +6372,11 @@ impl LeaderLeaseStore {
     }
 
     /// Take over only after the rival's owner, fencing token, and renewal sequence remained
-    /// current for a full TTL on the candidate's monotonic clock.
+    /// current for a full TTL on the candidate's monotonic clock, or once the rival released its
+    /// term.
     ///
     /// # Errors
-    /// Fails closed on early observation, invalid state, I/O, or arithmetic exhaustion.
+    /// Fails closed on invalid state, I/O, or arithmetic exhaustion.
     pub async fn try_takeover(
         &self,
         owner: &LeaderLeaseOwner,
@@ -6389,9 +6391,7 @@ impl LeaderLeaseStore {
                 "leader takeover observation must belong to a rival".into(),
             ));
         }
-        if observation.started.elapsed() < ttl {
-            return Ok(LeaseOutcome::Held(observation.lease.clone()));
-        }
+        let observed_for_ttl = observation.started.elapsed() >= ttl;
         let expires_at_ms = self.diagnostic_expiry(now_ms)?;
         loop {
             let published = self
@@ -6399,7 +6399,11 @@ impl LeaderLeaseStore {
                 .await?
                 .ok_or_else(|| LeaseError::Invalid("observed leader lease disappeared".into()))?;
             let current = &published.record;
-            if !current.lease.has_same_liveness_identity(&observation.lease) {
+            let unrenewed =
+                observed_for_ttl && current.lease.has_same_liveness_identity(&observation.lease);
+            // A rival fences its local grant before it publishes a release, so a released term
+            // needs no observation.
+            if !unrenewed && !self.term_released(current).await? {
                 return Ok(LeaseOutcome::Held(current.lease.clone()));
             }
             let candidate_lease = LeaderLease {
@@ -6454,8 +6458,9 @@ impl Default for LeaderLeaseConfig {
     fn default() -> Self {
         Self {
             // INVARIANT: one 5s bounded control-I/O retry after the 2s tick still fits inside
-            // the TTL, so a single transport tail cannot expire a live leader. Takeover
-            // observes a rival for a full TTL, so this also bounds failover latency.
+            // the TTL, so a single transport tail cannot expire a live leader. Takeover of a
+            // rival that did not release observes it for a full TTL, so this also bounds
+            // failover latency.
             ttl: Duration::from_secs(10),
             renew_interval: Duration::from_secs(2),
         }
