@@ -484,21 +484,26 @@ impl ClusterController {
         Ok(Some(announcement))
     }
 
+    async fn load_recovery_authority_for_observation(
+        &self,
+    ) -> Result<Option<super::super::LeaderLease>, RecoveryControlError> {
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
+        authority.load().await.map_err(|error| match error {
+            super::super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
+            error => RecoveryControlError::Conflict(error.to_string()),
+        })
+    }
+
     async fn recovery_authority_matches_for_observation(
         &self,
         proof: &LeaderProof,
     ) -> Result<bool, RecoveryControlError> {
-        let authority = self
-            .checkpoint_authority()
-            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
-        authority
-            .load()
-            .await
-            .map_err(|error| match error {
-                super::super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
-                error => RecoveryControlError::Conflict(error.to_string()),
-            })
-            .map(|lease| lease.is_some_and(|lease| lease.matches_proof(proof)))
+        Ok(self
+            .load_recovery_authority_for_observation()
+            .await?
+            .is_some_and(|lease| lease.matches_proof(proof)))
     }
 
     /// Active recovery announcement with semantic failures separated from uncertain I/O.
@@ -517,10 +522,23 @@ impl ClusterController {
         else {
             return Ok(None);
         };
-        if !self
-            .recovery_authority_matches_for_observation(&announcement.round.leader_proof)
-            .await?
+        let authority = self.load_recovery_authority_for_observation().await?;
+        if !authority
+            .as_ref()
+            .is_some_and(|lease| lease.matches_proof(&announcement.round.leader_proof))
         {
+            // A driver that regains leadership allocates a fresh generation exactly as a different
+            // successor would, and nobody reads a previous driver's slot. Its own round from an
+            // older term is therefore not active; reporting it as superseded would keep the new
+            // term from ever writing that fresh Prepare. Terminal rounds stay fail-closed.
+            let older_own_term = authority.is_some_and(|lease| {
+                lease.owner.node == current_driver
+                    && announcement.round.leader_proof.owner.node_id == current_driver.0
+                    && announcement.round.leader_proof.fencing_token < lease.token
+            });
+            if older_own_term && !announcement.round.has_terminal_fault() {
+                return Ok(None);
+            }
             return Err(RecoveryControlError::Superseded(format!(
                 "recovery phase from {current_driver} does not match durable leader authority"
             )));

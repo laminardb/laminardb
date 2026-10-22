@@ -2814,3 +2814,355 @@ fn test_name() {
     let op = IntervalJoinOperator::new("my_interval_join", test_config(), None, ctx);
     assert_eq!(&*op.projection.op_name, "my_interval_join");
 }
+
+/// Node 1's shuffle scope plus the peer receivers, which must outlive the test's sends.
+#[cfg(feature = "cluster")]
+async fn three_owner_shuffle() -> (
+    ClusterShuffleConfig,
+    Vec<Arc<laminar_core::shuffle::ShuffleReceiver>>,
+) {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::cluster::control::LeaseDeadline;
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+
+    let registry = Arc::new(VnodeRegistry::new(3));
+    registry.set_assignment(vec![NodeId(1), NodeId(2), NodeId(3)].into());
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        registry.assignment_version(),
+        &[1, 2, 3],
+        (1..=3)
+            .map(|node_id| CheckpointParticipant {
+                node_id,
+                boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let mut receivers = Vec::new();
+    for node in 1..=3_u64 {
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(
+                node,
+                "127.0.0.1:0".parse().unwrap(),
+                uuid::Uuid::from_u128(u128::from(node)),
+            )
+            .await
+            .unwrap(),
+        );
+        receiver
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(
+                60,
+            ))))
+            .unwrap();
+        receiver
+            .install_assignment_fence(&fence, &[1, 2, 3])
+            .unwrap();
+        receivers.push(receiver);
+    }
+    let sender = Arc::new(ShuffleSender::new(1, uuid::Uuid::from_u128(1)));
+    sender.register_peer(2, receivers[1].local_addr());
+    sender.register_peer(3, receivers[2].local_addr());
+    sender
+        .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
+    sender.install_assignment_fence(&fence, &[1, 2, 3]).unwrap();
+    let peers = receivers.split_off(1);
+    let scope = ClusterShuffleConfig {
+        registry,
+        sender,
+        receiver: receivers.pop().unwrap(),
+        topology: None,
+        self_id: NodeId(1),
+    };
+    (scope, peers)
+}
+
+/// Node 1 owns vnode 0. Node 2 is the only reader of the left source; node 3 never reads it and
+/// broadcasts only its own idle frontier. While every left channel is idle the join must not close
+/// past node 2's revival, so node 2's on-time row is admitted when it arrives.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn reviving_reader_row_is_admitted_after_idle_non_reader_frontier() {
+    let (scope, _peers) = three_owner_shuffle().await;
+    let mut operator = IntervalJoinOperator::new(
+        "echo_interval",
+        test_config(),
+        None,
+        laminar_sql::create_session_context(),
+    );
+    operator.set_input_schemas(
+        left_batch(&[], &[], &[]).schema(),
+        right_batch(&[], &[], &[]).schema(),
+    );
+    operator.attach_cluster_shuffle(scope.clone());
+    let idle = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    };
+    let active = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: false,
+    };
+    // Every channel has been idle at 1_000 since the reader's last rows.
+    operator.applied_left_watermark = 1_000;
+    operator.applied_right_watermark = 1_000;
+    operator.applied_left_idle = true;
+    operator.applied_right_idle = true;
+    operator.local_frontiers = [idle(1_000); 2];
+    operator.last_broadcasts = [idle(1_000); 2];
+    for port in 0..2 {
+        for peer in [2_u64, 3] {
+            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            channel.applied = idle(1_000);
+            channel.accepted = idle(1_000);
+        }
+    }
+    let assignment = scope.registry.assignment_version();
+    let recovery = scope.receiver.recovery_gen();
+
+    // Node 3's idle frontier overtakes node 2's own messages.
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "echo_interval::left",
+            3,
+            idle(1_000),
+            assignment,
+            recovery,
+        )
+        .unwrap();
+    operator
+        .process_cluster(&[Vec::new(), Vec::new()], idle(1_000), idle(1_000))
+        .await
+        .unwrap();
+    assert_eq!(operator.applied_left_watermark, 1_000);
+
+    // Node 2 revives with a row that was on time at its source, then its own frontier.
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "echo_interval::left",
+            2,
+            active(1_000),
+            assignment,
+            recovery,
+        )
+        .unwrap();
+    let key = key_for_vnode(0, 3);
+    operator
+        .stage_checkpointed_shuffle(
+            "echo_interval::left",
+            crate::operator::RetainedBatch::restored_channel(
+                left_batch(&[key.as_str()], &[3_000], &[1.0]),
+                2,
+                assignment,
+                recovery,
+                Arc::from([0_u32]),
+            ),
+            i64::MIN,
+        )
+        .unwrap();
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "echo_interval::left",
+            2,
+            active(20_000),
+            assignment,
+            recovery,
+        )
+        .unwrap();
+
+    for _ in 0..4 {
+        operator
+            .process_cluster(&[Vec::new(), Vec::new()], idle(1_000), idle(1_000))
+            .await
+            .expect("the reviving reader's on-time row must be admitted");
+    }
+    assert_eq!(operator.applied_left_watermark, 20_000);
+}
+
+/// Reader node 2 went idle at its own watermark `20_000` while the committed cut is `5_000`, which
+/// is this node's capped idle source frontier. An all-idle close must stop at the committed cut,
+/// so reader node 3, which revives at that cut, still has its row at `8_000` admitted.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn all_idle_close_stops_at_the_committed_cut_for_a_reviving_reader() {
+    let (scope, _peers) = three_owner_shuffle().await;
+    let mut operator = IntervalJoinOperator::new(
+        "idle_ceiling",
+        test_config(),
+        None,
+        laminar_sql::create_session_context(),
+    );
+    operator.set_input_schemas(
+        left_batch(&[], &[], &[]).schema(),
+        right_batch(&[], &[], &[]).schema(),
+    );
+    operator.attach_cluster_shuffle(scope.clone());
+    let idle = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    };
+    let active = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: false,
+    };
+    operator.applied_left_watermark = 1_000;
+    operator.applied_right_watermark = 1_000;
+    operator.applied_left_idle = true;
+    operator.applied_right_idle = true;
+    operator.local_frontiers = [idle(1_000); 2];
+    operator.last_broadcasts = [idle(1_000); 2];
+    for port in 0..2 {
+        for peer in [2_u64, 3] {
+            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            channel.applied = idle(1_000);
+            channel.accepted = idle(1_000);
+        }
+    }
+    let assignment = scope.registry.assignment_version();
+    let recovery = scope.receiver.recovery_gen();
+
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "idle_ceiling::left",
+            2,
+            idle(20_000),
+            assignment,
+            recovery,
+        )
+        .unwrap();
+    operator
+        .process_cluster(&[Vec::new(), Vec::new()], idle(5_000), idle(5_000))
+        .await
+        .unwrap();
+    assert_eq!(operator.applied_left_watermark, 5_000);
+
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "idle_ceiling::left",
+            3,
+            active(5_000),
+            assignment,
+            recovery,
+        )
+        .unwrap();
+    let key = key_for_vnode(0, 3);
+    operator
+        .stage_checkpointed_shuffle(
+            "idle_ceiling::left",
+            crate::operator::RetainedBatch::restored_channel(
+                left_batch(&[key.as_str()], &[8_000], &[1.0]),
+                3,
+                assignment,
+                recovery,
+                Arc::from([0_u32]),
+            ),
+            i64::MIN,
+        )
+        .unwrap();
+    for _ in 0..4 {
+        operator
+            .process_cluster(&[Vec::new(), Vec::new()], idle(5_000), idle(5_000))
+            .await
+            .expect("the reviving reader's row at the committed cut must be admitted");
+    }
+}
+
+/// Without the echo an all-idle merge can trail the cut this node already applied; it must hold
+/// there instead of failing as a regression.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn all_idle_merge_below_the_applied_cut_holds() {
+    let (scope, _peers) = three_owner_shuffle().await;
+    let mut operator = IntervalJoinOperator::new(
+        "idle_hold",
+        test_config(),
+        None,
+        laminar_sql::create_session_context(),
+    );
+    operator.set_input_schemas(
+        left_batch(&[], &[], &[]).schema(),
+        right_batch(&[], &[], &[]).schema(),
+    );
+    operator.attach_cluster_shuffle(scope);
+    let idle = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    };
+    operator.applied_left_watermark = 20_000;
+    operator.applied_right_watermark = 20_000;
+    operator.applied_left_idle = true;
+    operator.applied_right_idle = true;
+    operator.local_frontiers = [idle(1_000); 2];
+    operator.last_broadcasts = [idle(1_000); 2];
+    for port in 0..2 {
+        for peer in [2_u64, 3] {
+            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            channel.applied = idle(1_000);
+            channel.accepted = idle(1_000);
+        }
+    }
+
+    operator
+        .process_cluster(&[Vec::new(), Vec::new()], idle(1_000), idle(1_000))
+        .await
+        .unwrap();
+    assert_eq!(operator.applied_left_watermark, 20_000);
+    assert_eq!(operator.applied_right_watermark, 20_000);
+}
+
+/// A node that never read the left source broadcasts only its own idle left frontier, never the
+/// cut it applied from a peer.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn idle_non_reader_does_not_echo_its_applied_cut() {
+    let (scope, _) = two_owner_shuffle().await;
+    let mut operator = IntervalJoinOperator::new(
+        "echo_sender",
+        test_config(),
+        None,
+        laminar_sql::create_session_context(),
+    );
+    operator.attach_cluster_shuffle(scope.clone());
+    let idle = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    };
+    operator.applied_left_watermark = 20_000;
+    operator.applied_right_watermark = 1_000;
+    operator.applied_left_idle = false;
+    operator.applied_right_idle = true;
+    operator.local_frontiers = [idle(1_000); 2];
+    operator.last_broadcasts = [idle(1_000); 2];
+    for port in 0..2 {
+        let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+        let applied = if port == 0 {
+            InputFrontier {
+                watermark: Some(20_000),
+                idle: false,
+            }
+        } else {
+            idle(1_000)
+        };
+        channel.applied = applied;
+        channel.accepted = applied;
+    }
+    let assignment = scope.registry.versioned_snapshot();
+    let plan = operator
+        .plan_cluster_inputs(
+            &[Vec::new(), Vec::new()],
+            [idle(1_000), idle(1_000)],
+            &scope,
+            &assignment,
+            &[2],
+        )
+        .unwrap();
+    assert_eq!(plan.local_frontiers[0], idle(1_000));
+    assert!(!plan.outbound.iter().any(|(_, message)| matches!(
+        message,
+        laminar_core::shuffle::ShuffleMessage::Frontier {
+            watermark: Some(20_000),
+            ..
+        }
+    )));
+}
