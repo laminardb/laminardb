@@ -10,25 +10,21 @@
 # the `KAFKA_BROKERS` constant in `crates/laminar-db/tests/common/kafka.rs`.
 
 services:
-  minio:
-    build:
-      context: .
-      dockerfile: minio.Dockerfile
-    image: laminardb-minio-test:2024-10-13
-    pull_policy: build
-    container_name: laminardb-minio
+  seaweedfs:
+    # S3-compatible store for the fault soaks. It honours the conditional create and update
+    # requests that checkpoint, lease, and exactly-once Delta commits depend on.
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    container_name: laminardb-seaweedfs
     ports:
-      - "19000:9000"
-      - "19001:9001"
-    environment:
-      MINIO_ROOT_USER: laminar
-      MINIO_ROOT_PASSWORD: laminar-test-secret
-    command: server /data --console-address ":9001"
+      - "19000:8333"
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    command: server -dir=/data -s3 -s3.config=/etc/seaweedfs/s3.json -volume.max=0 -master.volumeSizeLimitMB=1024
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
       interval: 2s
       timeout: 2s
-      retries: 20
+      retries: 30
 
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.36.0

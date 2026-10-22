@@ -1,7 +1,7 @@
 name: Checkpoint fault and soak
 
 # Process-death and coordinated-recovery soaks. Expensive and timing-sensitive, so they run weekly
-# (and on demand) rather than on the per-PR critical path. Cluster jobs use Redpanda plus MinIO for
+# (and on demand) rather than on the per-PR critical path. Cluster jobs use Redpanda plus SeaweedFS for
 # replayable partitions and cluster-shared durability; the RabbitMQ sink leg also starts RabbitMQ.
 on:
   workflow_dispatch:
@@ -138,7 +138,7 @@ jobs:
             discovery: gossip
             emulator: "0"
             checkpoint_ms: "250"
-            # Three Laminar nodes share a two-core hosted runner with Redpanda and MinIO. Keep
+            # Three Laminar nodes share a two-core hosted runner with Redpanda and SeaweedFS. Keep
             # enough headroom for the strict Kafka visibility gate while the 8 MiB state floor
             # continues to enforce a substantial retained-state workload.
             rps: "250"
@@ -197,7 +197,7 @@ jobs:
             discovery: gossip
             emulator: "1"
             checkpoint_ms: "10000"
-            # Keep 23 Delta sinks plus partitioned subscription output below hosted-runner MinIO
+            # Keep 23 Delta sinks plus partitioned subscription output below hosted-runner S3
             # saturation while leaving headroom above the 8 MiB retained-state floor.
             rps: "120"
             visibility_ms: "120000"
@@ -229,7 +229,7 @@ jobs:
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
-            services: minio redpanda rabbitmq
+            services: seaweedfs redpanda rabbitmq
     steps:
       - uses: actions/checkout@v6
         with:
@@ -265,12 +265,11 @@ jobs:
 
       - name: Start cluster-shared dependencies
         env:
-          SOAK_SERVICES: ${{ matrix.services || 'minio redpanda' }}
+          SOAK_SERVICES: ${{ matrix.services || 'seaweedfs redpanda' }}
         run: |
-          docker compose -f tests/docker/compose.yml build minio
           docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 $SOAK_SERVICES
-          docker compose -f tests/docker/compose.yml exec -T minio /bin/sh -c \
-            'mc alias set soak http://127.0.0.1:9000 laminar laminar-test-secret && mc mb --ignore-existing soak/laminardb-soak'
+          docker compose -f tests/docker/compose.yml exec -T seaweedfs /bin/sh -c \
+            'echo "s3.bucket.create -name laminardb-soak" | weed shell'
 
       - name: Verify Kafka global source handoff
         if: matrix.discovery == 'static' && matrix.delivery == 'alo'
@@ -292,7 +291,7 @@ jobs:
           LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SINGLE_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
-          # MinIO EO is protocol validation, not a throughput certificate. Use the production
+          # Local S3 EO is protocol validation, not a throughput certificate. Use the production
           # 10s checkpoint cadence and a load that still exceeds the 8 MiB state floor. Cluster EO
           # gets a bounded 60s checkpoint-operation timeout and recovery-aware observation window
           # for fault-built backlog across 23 emulator-backed sinks. The real-store soak profile
@@ -339,7 +338,7 @@ jobs:
       - name: Print dependency diagnostics on failure
         if: failure()
         env:
-          SOAK_SERVICES: ${{ matrix.services || 'minio redpanda' }}
+          SOAK_SERVICES: ${{ matrix.services || 'seaweedfs redpanda' }}
         run: |
           docker compose -f tests/docker/compose.yml ps -a
           docker compose -f tests/docker/compose.yml logs $SOAK_SERVICES
@@ -395,10 +394,9 @@ jobs:
 
       - name: Start cluster-shared dependencies
         run: |
-          docker compose -f tests/docker/compose.yml build minio
-          docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 minio redpanda
-          docker compose -f tests/docker/compose.yml exec -T minio /bin/sh -c \
-            'mc alias set soak http://127.0.0.1:9000 laminar laminar-test-secret && mc mb --ignore-existing soak/laminardb-soak'
+          docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 seaweedfs redpanda
+          docker compose -f tests/docker/compose.yml exec -T seaweedfs /bin/sh -c \
+            'echo "s3.bucket.create -name laminardb-soak" | weed shell'
 
       - name: Inject a fatal pipeline cycle fault on the ${{ matrix.role }}
         shell: bash
@@ -470,7 +468,7 @@ jobs:
         if: failure()
         run: |
           docker compose -f tests/docker/compose.yml ps -a
-          docker compose -f tests/docker/compose.yml logs minio redpanda
+          docker compose -f tests/docker/compose.yml logs seaweedfs redpanda
           docker inspect --format '{{json .State.Health}}' laminardb-redpanda || true
 
       - name: Stop cluster-shared dependencies
