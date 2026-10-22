@@ -191,7 +191,8 @@ jobs:
             visibility_slo_mode: certify
           - label: Cluster EO stateful joins (gossip)
             test: three_node_eo_join_kill9_soak
-            features: cluster,aws,kafka,delta-lake-s3
+            features: cluster,aws,kafka,delta-lake-s3,iceberg
+            iceberg: "1"
             delivery: eo
             topology: cluster
             discovery: gossip
@@ -205,7 +206,8 @@ jobs:
             visibility_slo_mode: observe
           - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
-            features: cluster,aws,kafka,delta-lake-s3
+            features: cluster,aws,kafka,delta-lake-s3,iceberg
+            iceberg: "1"
             delivery: eo
             topology: cluster
             discovery: static
@@ -271,6 +273,10 @@ jobs:
           docker compose -f tests/docker/compose.yml exec -T seaweedfs /bin/sh -c \
             'echo "s3.bucket.create -name laminardb-soak" | weed shell'
 
+      - name: Start Iceberg REST catalog and storage
+        if: matrix.iceberg == '1'
+        run: docker compose -p laminardb-iceberg-soak -f tests/docker/iceberg-compose.yml up -d --wait --wait-timeout 180
+
       - name: Verify Kafka global source handoff
         if: matrix.discovery == 'static' && matrix.delivery == 'alo'
         run: cargo test --profile soak -p laminar-connectors --no-default-features --features "kafka,testing" --test kafka_global_drain -- --nocapture
@@ -319,6 +325,8 @@ jobs:
           LAMINAR_SOAK_S3_SECRET_KEY: laminar-test-secret
           LAMINAR_SOAK_S3_REGION: us-east-1
           LAMINAR_SOAK_DELTA_BUCKET: laminardb-soak
+          # The tests/docker/iceberg-compose.yml S3 credential; only the Iceberg leg reads it.
+          LAMINAR_SOAK_ICEBERG_S3_SECRET_KEY: minioadmin
           LAMINAR_SOAK_ALLOW_S3_EMULATOR: ${{ matrix.emulator }}
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
           # The compose broker's default account; only the RabbitMQ sink leg reads it.
@@ -346,7 +354,9 @@ jobs:
 
       - name: Stop cluster-shared dependencies
         if: always()
-        run: docker compose -f tests/docker/compose.yml down -v
+        run: |
+          docker compose -f tests/docker/compose.yml down -v
+          docker compose -p laminardb-iceberg-soak -f tests/docker/iceberg-compose.yml down -v
 
   cluster-coordinated-recovery:
     name: Coordinated recovery (${{ matrix.role }}, ${{ matrix.discovery }})

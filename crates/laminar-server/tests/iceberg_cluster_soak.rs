@@ -17,16 +17,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use arrow_array::{Array as _, Int64Array};
-use futures::TryStreamExt as _;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore as _;
-use object_store::ObjectStoreExt as _;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::producer::{FutureProducer, FutureRecord};
-use serde::Deserialize;
+
+mod iceberg_table;
+use iceberg_table::TableMetadata;
 
 const NODE_COUNT: usize = 3;
 const INPUT_PARTITIONS: i32 = 3;
@@ -54,8 +52,6 @@ const FIRST_ROWS: i64 = 30;
 const SECOND_ROWS: i64 = 30;
 const THIRD_ROWS: i64 = 30;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
-const CATALOG_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
-const DATA_FILE_ORACLE_LIMIT: u64 = 8 * 1024 * 1024;
 const MAX_EXTERNAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -518,116 +514,6 @@ struct GateEvidence {
     fencing_token: u64,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct LoadTableResponse {
-    metadata: TableMetadata,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct TableMetadata {
-    location: String,
-    current_snapshot_id: Option<i64>,
-    #[serde(default)]
-    snapshots: Vec<Snapshot>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct Snapshot {
-    snapshot_id: i64,
-    summary: BTreeMap<String, String>,
-}
-
-impl TableMetadata {
-    fn total_records(&self) -> u64 {
-        self.current_snapshot()
-            .and_then(|snapshot| snapshot.summary.get("total-records"))
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0)
-    }
-
-    fn total_data_files(&self) -> u64 {
-        self.current_snapshot()
-            .and_then(|snapshot| snapshot.summary.get("total-data-files"))
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0)
-    }
-
-    fn current_snapshot(&self) -> Option<&Snapshot> {
-        let current = self.current_snapshot_id?;
-        self.snapshots
-            .iter()
-            .find(|snapshot| snapshot.snapshot_id == current)
-    }
-
-    fn commit_uuid(&self, checkpoint_id: u64) -> Option<&str> {
-        self.snapshots.iter().find_map(|snapshot| {
-            let committed_checkpoint = snapshot
-                .summary
-                .get("laminardb.checkpoint.id")
-                .and_then(|value| value.parse().ok());
-            if committed_checkpoint != Some(checkpoint_id) {
-                return None;
-            }
-            snapshot
-                .summary
-                .get("laminardb.commit.uuid")
-                .map(String::as_str)
-        })
-    }
-
-    fn validate_exact_commit_identities(&self) {
-        let mut checkpoints = BTreeSet::new();
-        let mut commit_uuids = BTreeSet::new();
-        for snapshot in &self.snapshots {
-            let Some(checkpoint) = snapshot.summary.get("laminardb.checkpoint.id") else {
-                continue;
-            };
-            let checkpoint = checkpoint
-                .parse::<u64>()
-                .expect("LaminarDB snapshot checkpoint must be a u64");
-            let commit_uuid = snapshot
-                .summary
-                .get("laminardb.commit.uuid")
-                .expect("LaminarDB snapshot must carry a commit UUID");
-            assert!(
-                checkpoints.insert(checkpoint),
-                "checkpoint {checkpoint} produced more than one Iceberg snapshot"
-            );
-            assert!(
-                commit_uuids.insert(commit_uuid),
-                "Iceberg commit UUID {commit_uuid} was reused across checkpoints"
-            );
-            for required in [
-                "laminardb.commit.namespace",
-                "laminardb.deployment.id",
-                "laminardb.sink.id",
-                "laminardb.fencing.token",
-                "laminardb.batch.fingerprint",
-                "laminardb.file-set.fingerprint",
-            ] {
-                assert!(
-                    snapshot
-                        .summary
-                        .get(required)
-                        .is_some_and(|value| !value.is_empty()),
-                    "Iceberg snapshot {} lacks {required}",
-                    snapshot.snapshot_id
-                );
-            }
-        }
-    }
-
-    fn laminar_snapshot_count(&self) -> usize {
-        self.snapshots
-            .iter()
-            .filter(|snapshot| snapshot.summary.contains_key("laminardb.checkpoint.id"))
-            .count()
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "spawns three real laminardb processes with Kafka, Iceberg REST, and S3"]
 async fn leader_restart_reconciles_one_iceberg_snapshot_per_checkpoint() {
@@ -825,49 +711,20 @@ async fn create_table(
     namespace: &str,
     table: &str,
 ) {
-    let namespace_response = profile
-        .catalog_request(client.post(format!("{}/v1/namespaces", profile.catalog_uri)))
-        .json(&serde_json::json!({
-            "namespace": [namespace],
-            "properties": {}
-        }))
-        .send()
-        .await
-        .expect("create Iceberg namespace");
-    assert!(
-        namespace_response.status().is_success(),
-        "create Iceberg namespace returned {}",
-        namespace_response.status()
-    );
-    let table_response = profile
-        .catalog_request(client.post(format!(
-            "{}/v1/namespaces/{namespace}/tables",
-            profile.catalog_uri
-        )))
-        .json(&serde_json::json!({
-            "name": table,
-            "schema": {
-                "type": "struct",
-                "schema-id": 0,
-                "fields": [{
-                    "id": 1,
-                    "name": "id",
-                    "required": true,
-                    "type": "long"
-                }],
-                "identifier-field-ids": []
-            },
-            "stage-create": false,
-            "properties": { "format-version": "2" }
-        }))
-        .send()
-        .await
-        .expect("create Iceberg table");
-    assert!(
-        table_response.status().is_success(),
-        "create Iceberg table returned {}",
-        table_response.status()
-    );
+    iceberg_table::create_table(
+        client,
+        &profile.catalog_uri,
+        |request| profile.catalog_request(request),
+        namespace,
+        table,
+        serde_json::json!([{
+            "id": 1,
+            "name": "id",
+            "required": true,
+            "type": "long"
+        }]),
+    )
+    .await;
 }
 
 async fn produce_rows(profile: &ClusterProfile, topic: &str, start: i64, count: i64) {
@@ -1196,25 +1053,11 @@ async fn load_table(
     namespace: &str,
     table: &str,
 ) -> Result<TableMetadata, String> {
-    let response = profile
-        .catalog_request(client.get(format!(
-            "{}/v1/namespaces/{namespace}/tables/{table}",
-            profile.catalog_uri
-        )))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-    if bytes.len() > CATALOG_RESPONSE_LIMIT {
-        return Err(format!(
-            "Iceberg load-table response exceeds {CATALOG_RESPONSE_LIMIT} bytes"
-        ));
-    }
-    serde_json::from_slice::<LoadTableResponse>(&bytes)
-        .map(|response| response.metadata)
-        .map_err(|error| error.to_string())
+    iceberg_table::load_table(profile.catalog_request(client.get(format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        profile.catalog_uri
+    ))))
+    .await
 }
 
 async fn verify_exact_data_files(
@@ -1223,10 +1066,6 @@ async fn verify_exact_data_files(
     expected_rows: u64,
 ) {
     assert_eq!(metadata.total_records(), expected_rows);
-    let prefix = metadata
-        .location
-        .strip_prefix(&format!("s3://{}/", profile.s3_bucket))
-        .expect("Iceberg table location must use the configured test bucket");
     assert!(
         metadata.location.starts_with(&profile.warehouse_uri()),
         "Iceberg table location must remain under the configured warehouse"
@@ -1244,73 +1083,29 @@ async fn verify_exact_data_files(
         .with_region(&profile.s3_region)
         .build()
         .expect("build S3 data-file verifier");
-    let expected_files = metadata.total_data_files();
-    let data_prefix = ObjectPath::parse(format!("{prefix}/data"))
-        .expect("Iceberg table data prefix must be a valid object-store path");
-    let mut objects = store.list(Some(&data_prefix));
-    let mut parquet_count = 0_u64;
     let expected_end = i64::try_from(expected_rows).expect("expected row count fits i64");
     let mut observed_ids = BTreeSet::new();
-    while let Some(object) = objects.try_next().await.expect("list Iceberg data files") {
-        assert!(
-            !object.location.as_ref().contains("-stage-"),
-            "a publish-ineligible staging object survived recovery"
-        );
-        if !object.location.as_ref().ends_with(".parquet") {
-            continue;
-        }
-        parquet_count = parquet_count
-            .checked_add(1)
-            .expect("data-file count must not overflow");
-        assert!(
-            parquet_count <= expected_files,
-            "listed Parquet files exceed Iceberg's current data-file count"
-        );
-        assert!(object.size >= 8, "Iceberg data file is incomplete");
-        assert!(
-            object.size <= DATA_FILE_ORACLE_LIMIT,
-            "Iceberg data file exceeds the bounded soak oracle"
-        );
-        let object_size = usize::try_from(object.size).expect("bounded data-file size fits usize");
-        let bytes = store
-            .get(&object.location)
-            .await
-            .expect("read Iceberg data file")
-            .bytes()
-            .await
-            .expect("collect bounded Iceberg data file");
-        assert_eq!(bytes.len(), object_size, "Iceberg data file was truncated");
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .expect("read Iceberg Parquet metadata")
-            .with_batch_size(128)
-            .build()
-            .expect("build Iceberg Parquet row oracle");
-        for batch in reader {
-            let batch = batch.expect("decode Iceberg Parquet rows");
-            let id_index = batch.schema().index_of("id").expect("Iceberg id column");
-            let ids = batch
-                .column(id_index)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("Iceberg id column must be Int64");
-            for row in 0..ids.len() {
-                assert!(!ids.is_null(row), "Iceberg id must not be null");
-                let id = ids.value(row);
-                assert!(
-                    (0..expected_end).contains(&id),
-                    "Iceberg contains out-of-range id {id}"
-                );
-                assert!(
-                    observed_ids.insert(id),
-                    "Iceberg contains duplicate id {id} after checkpoint replay"
-                );
-            }
+    for batch in iceberg_table::read_current_data_files(&store, &profile.s3_bucket, metadata).await
+    {
+        let id_index = batch.schema().index_of("id").expect("Iceberg id column");
+        let ids = batch
+            .column(id_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Iceberg id column must be Int64");
+        for row in 0..ids.len() {
+            assert!(!ids.is_null(row), "Iceberg id must not be null");
+            let id = ids.value(row);
+            assert!(
+                (0..expected_end).contains(&id),
+                "Iceberg contains out-of-range id {id}"
+            );
+            assert!(
+                observed_ids.insert(id),
+                "Iceberg contains duplicate id {id} after checkpoint replay"
+            );
         }
     }
-    assert_eq!(
-        parquet_count, expected_files,
-        "listed Parquet files differ from Iceberg's current data-file count"
-    );
     assert_eq!(
         observed_ids.len(),
         usize::try_from(expected_rows).expect("expected row count fits usize"),
