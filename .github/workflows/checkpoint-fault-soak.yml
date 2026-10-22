@@ -325,7 +325,7 @@ jobs:
           LAMINAR_SOAK_S3_SECRET_KEY: laminar-test-secret
           LAMINAR_SOAK_S3_REGION: us-east-1
           LAMINAR_SOAK_DELTA_BUCKET: laminardb-soak
-          # The tests/docker/iceberg-compose.yml MinIO credential; only the Iceberg leg reads it.
+          # The tests/docker/iceberg-compose.yml S3 credential; only the Iceberg leg reads it.
           LAMINAR_SOAK_ICEBERG_S3_SECRET_KEY: minioadmin
           LAMINAR_SOAK_ALLOW_S3_EMULATOR: ${{ matrix.emulator }}
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
