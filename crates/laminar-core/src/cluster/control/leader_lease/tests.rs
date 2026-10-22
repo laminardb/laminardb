@@ -7564,6 +7564,52 @@ async fn handoff_pin_rejects_stale_commits_and_releases_on_a_target_commit() {
 }
 
 #[tokio::test]
+async fn highest_commit_lookup_survives_retention_of_the_head_it_selected() {
+    let (store, _incumbent, proof, fence, references) = artifact_cleanup_chain(1_000, 2).await;
+    let (raw, reader) = blocking_get_once_with_inner(
+        1_000,
+        Arc::clone(&store.store),
+        committed_checkpoint_path(&references[1]),
+    );
+    let lookup = tokio::spawn(async move { reader.highest_cluster_commit_with_checkpoint().await });
+    tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+
+    let newer = match record_commit(&store, &proof, &fence, 3, 3).await {
+        RecordOutcomeResult::Created(outcome) => outcome,
+        outcome => panic!("unexpected checkpoint result: {outcome:?}"),
+    };
+    store
+        .begin_cluster_artifact_cleanup(
+            &proof,
+            newer.committed_checkpoint.clone().unwrap(),
+            accept_recovery_artifacts,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.cluster_outcome(references[1].epoch).await.unwrap(),
+        None
+    );
+    CheckpointDecisionStore::new(Arc::clone(&store.store))
+        .delete_committed_checkpoint(&references[1])
+        .await
+        .unwrap();
+    raw.release.add_permits(1);
+
+    let (head, index) = lookup.await.unwrap().unwrap().unwrap();
+    assert_eq!(head, newer);
+    assert_eq!(
+        head.committed_checkpoint.as_ref(),
+        Some(&index.encode_and_reference().unwrap().1)
+    );
+}
+
+#[tokio::test]
 async fn cluster_artifact_cleanup_advances_only_through_durable_phases() {
     let (store, _incumbent, proof, _fence, references) = artifact_cleanup_chain(1_000, 3).await;
     let cursor = store
