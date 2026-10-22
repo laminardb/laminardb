@@ -108,8 +108,8 @@ evidence behind each admitted exactly-once composition and exactly what that evi
 
 | Composition | Mode | Evidence |
 |---|---|---|
-| Kafka → Delta Lake append (S3/S3A) | Cluster | `three_node_eo_join_kill9_soak`: repeated `kill -9` of the leader and followers inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (MinIO). |
-| Kafka → Iceberg append (REST + S3) | Cluster | `iceberg_cluster_soak`: leader killed at the external commit gate and restarted; one snapshot per checkpoint and an exact data-file oracle. |
-| Kafka → Delta Lake append | Embedded / single-node | `single_node_eo_join_kill9_soak`: repeated `kill -9` of the server inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (MinIO). |
+| Kafka → Delta Lake append (S3/S3A) | Cluster | `three_node_eo_join_kill9_soak`: repeated `kill -9` of the leader and followers inside checkpoints, and leaders frozen with `SIGSTOP` at the committed-index and sink-commit gates, then resumed after a successor commits; the stale leader must fence itself and exit. Frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
+| Kafka → Iceberg append (REST + S3) | Cluster | `three_node_eo_join_kill9_soak`: the same join also writes to Iceberg through every `kill -9` and paused-leader round; the table's data files must hold every join pair exactly once, and every snapshot must belong to exactly one checkpoint. `iceberg_cluster_soak`: leader killed at the external commit gate and restarted; one snapshot per checkpoint and an exact data-file oracle. |
+| Kafka → Delta Lake append | Embedded / single-node | `single_node_eo_join_kill9_soak`: repeated `kill -9` of the server inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Kafka | Embedded / single-node | `crates/laminar-connectors/tests/kafka_exactly_once.rs`, `crates/laminar-db/tests/kafka_exactly_once_e2e.rs` |
 | FIX → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/fix_source_exactly_once.rs` |
