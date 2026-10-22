@@ -69,7 +69,7 @@ three-member set for election tests (`127.0.0.1:27201-27203`), and PostgreSQL
 advertises the host-published address, so the driver discovers the same topology from the
 host.
 
-The history → Iceberg case also needs `iceberg-compose.yml` (MinIO on 9000, REST catalog on 8181).
+The history → Iceberg case also needs `iceberg-compose.yml` (SeaweedFS S3 on 9000, REST catalog on 8181).
 
 ```
 docker compose -f tests/docker/mongodb-cdc-compose.yml up -d --wait
@@ -103,21 +103,17 @@ LAMINAR_MONGODB_SOAK_SECONDS=300 cargo test --release -p laminar-server \
 docker compose -f tests/docker/compose.yml down
 ```
 
-## MinIO (S3-compatible object store)
+## SeaweedFS (S3-compatible object store)
 
-Host port 19000 (API) / 19001 (console). Login at
-http://localhost:19001 with `laminar` / `laminar-test-secret`.
-
-Used by the `minio` cases in `crates/laminar-db/tests/cluster_integration.rs` to
-exercise shared state, control-plane CAS, and restart recovery through fresh
-object-store clients. Each test creates a unique bucket.
+Host port 19000 serves the S3 API with access key `laminar` / `laminar-test-secret`
+(`seaweedfs-s3.json`). SeaweedFS honours the conditional create and update requests that
+checkpoint, lease, and exactly-once Delta commits depend on. The fault soaks create their bucket
+with:
 
 ```
-LAMINAR_REQUIRE_MINIO=1 cargo test -p laminar-db --no-default-features \
-  --features cluster --test cluster_integration minio:: -- --test-threads=1
+docker compose -f tests/docker/compose.yml exec -T seaweedfs /bin/sh -c \
+  'echo "s3.bucket.create -name laminardb-soak" | weed shell'
 ```
-
-Without `LAMINAR_REQUIRE_MINIO=1`, these cases skip when MinIO is unavailable.
 
 ## Scenarios covered
 
@@ -133,13 +129,3 @@ Without `LAMINAR_REQUIRE_MINIO=1`, these cases skip when MinIO is unavailable.
    a second batch while stopped, reopens against the same storage dir,
    stops the writer, then verifies the final stable snapshot has exactly the
    expected IDs and values and no growth in pre-checkpoint per-ID counts.
-4. **`minio::two_node_minio_leader_commits_follower_mirrors`**
-   — 2-node cluster sharing one MinIO bucket via `ObjectStoreBackend`.
-   Verifies the leader's full-registry gate reads follower markers off
-   shared storage and seals the exact checkpoint after the 2PC ack.
-5. **`minio::cluster_control_state_survives_fresh_minio_client_restart`**
-   — restarts both cluster processes with a newly constructed MinIO client,
-   then verifies assignment recovery and a durable post-restart commit.
-6. **`minio::two_node_coordinated_descriptors_aggregate_on_leader`**
-   — verifies the designated committer seals only after both nodes publish
-   the required sink descriptors.
