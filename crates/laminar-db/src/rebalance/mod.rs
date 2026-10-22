@@ -1925,8 +1925,8 @@ fn audit_materialized_recovery_with_authority<'a>(
                 snapshot.version
             ));
         }
-        let committed_head = authority
-            .highest_cluster_committed_outcome()
+        let (committed_head, committed_index) = authority
+            .highest_cluster_commit_with_checkpoint()
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
@@ -1953,31 +1953,9 @@ fn audit_materialized_recovery_with_authority<'a>(
                     snapshot.version
                 ));
             }
-            let (observed_outcome, observed_index) = authority
-                .cluster_outcome_with_committed_checkpoint(pinned.epoch)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    format!(
-                        "assignment {} pinned recovery Commit disappeared",
-                        snapshot.version
-                    )
-                })?;
-            if observed_outcome != committed_head {
-                return Err(format!(
-                    "assignment {} recovery checkpoint head changed during authority audit",
-                    snapshot.version
-                ));
-            }
-            let observed_index = observed_index.ok_or_else(|| {
-                format!(
-                    "assignment {} pinned recovery Commit has no checkpoint index",
-                    snapshot.version
-                )
-            })?;
             let origin = validate_portable_recovery_cut(
-                &observed_outcome,
-                &observed_index,
+                &committed_head,
+                &committed_index,
                 &pinned,
                 &decision.predecessor,
                 "materialized assignment recovery",
@@ -1990,31 +1968,9 @@ fn audit_materialized_recovery_with_authority<'a>(
             // A Commit under the recovery target atomically consumes its handoff pin. The older
             // decision checkpoint may then be garbage-collected; validate and recover from the
             // exact target-fenced head instead of reopening that retired artifact.
-            let (observed_outcome, observed_index) = authority
-                .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    format!(
-                        "assignment {} consumed recovery Commit disappeared",
-                        snapshot.version
-                    )
-                })?;
-            if observed_outcome != committed_head {
-                return Err(format!(
-                    "assignment {} recovery checkpoint head changed during authority audit",
-                    snapshot.version
-                ));
-            }
-            let observed_index = observed_index.ok_or_else(|| {
-                format!(
-                    "assignment {} consumed recovery Commit has no checkpoint index",
-                    snapshot.version
-                )
-            })?;
             let origin = validate_portable_recovery_cut(
-                &observed_outcome,
-                &observed_index,
+                &committed_head,
+                &committed_index,
                 &head_reference,
                 &decision.target,
                 "consumed assignment recovery",
@@ -2061,31 +2017,9 @@ fn audit_materialized_recovery_with_authority<'a>(
                     snapshot.version
                 ));
             }
-            let (observed_outcome, observed_index) = authority
-                .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    format!(
-                        "assignment {} propagated recovery Commit disappeared",
-                        snapshot.version
-                    )
-                })?;
-            if observed_outcome != committed_head {
-                return Err(format!(
-                    "assignment {} recovery checkpoint head changed during authority audit",
-                    snapshot.version
-                ));
-            }
-            let observed_index = observed_index.ok_or_else(|| {
-                format!(
-                    "assignment {} propagated recovery Commit has no checkpoint index",
-                    snapshot.version
-                )
-            })?;
             let origin = validate_portable_recovery_cut(
-                &observed_outcome,
-                &observed_index,
+                &committed_head,
+                &committed_index,
                 &head_reference,
                 &decision.predecessor,
                 "propagated assignment recovery",
