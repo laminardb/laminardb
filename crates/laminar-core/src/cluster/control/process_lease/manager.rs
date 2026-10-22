@@ -131,42 +131,40 @@ impl ProcessLeaseManager {
             // The acquisition itself is the first successful tick.
             ticker.tick().await;
             loop {
-                let now = std::time::Instant::now();
-                if now >= valid_until {
-                    self.deadline.fence();
-                    self.live_tx.send_replace(false);
+                if Instant::now() >= valid_until {
+                    self.expire("renewal tick ran past the lease deadline");
                     return;
                 }
+                let lease_deadline = tokio::time::Instant::from_std(valid_until);
                 tokio::select! {
                     biased;
                     () = shutdown.cancelled() => {
-                        self.deadline.fence();
-                        self.live_tx.send_replace(false);
+                        self.fence();
                         return;
                     },
-                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(valid_until)) => {
-                        self.deadline.fence();
-                        self.live_tx.send_replace(false);
+                    () = tokio::time::sleep_until(lease_deadline) => {
+                        self.expire("no renewal completed before the lease deadline");
                         return;
                     }
                     _ = ticker.tick() => {}
                 }
 
-                let now = std::time::Instant::now();
-                if now >= valid_until {
-                    self.deadline.fence();
-                    self.live_tx.send_replace(false);
+                if Instant::now() >= valid_until {
+                    self.expire("renewal tick ran past the lease deadline");
                     return;
                 }
                 let attempt_started_at = Instant::now();
                 let Some(attempt_valid_until) = attempt_started_at.checked_add(self.config.ttl)
                 else {
-                    self.deadline.fence();
-                    self.live_tx.send_replace(false);
+                    self.expire("lease deadline overflows the monotonic clock");
                     return;
                 };
+                // A stalled store request must not hold the only attempt until the lease lapses.
+                // An abandoned create that still lands is read back as this owner's head on retry.
+                let attempt_deadline =
+                    lease_deadline.min(tokio::time::Instant::now() + self.config.renew_interval);
                 let renewal = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(valid_until),
+                    attempt_deadline,
                     self.store.try_acquire(self.owner, now_millis()),
                 )
                 .await;
@@ -174,8 +172,7 @@ impl ProcessLeaseManager {
                     Ok(Ok(ProcessLeaseOutcome::Acquired(_))) => {
                         let response_at = Instant::now();
                         if response_at >= valid_until || response_at >= attempt_valid_until {
-                            self.deadline.fence();
-                            self.live_tx.send_replace(false);
+                            self.expire("renewal response arrived after the lease deadline");
                             return;
                         }
                         valid_until = attempt_valid_until;
@@ -188,8 +185,7 @@ impl ProcessLeaseManager {
                             term = rival.term,
                             "stable node identity lease was lost"
                         );
-                        self.deadline.fence();
-                        self.live_tx.send_replace(false);
+                        self.fence();
                         return;
                     }
                     Ok(Err(error)) => {
@@ -202,13 +198,38 @@ impl ProcessLeaseManager {
                         }
                         tracing::warn!(%error, "stable node identity lease renewal failed");
                     }
+                    Err(_) if attempt_deadline < lease_deadline => {
+                        ticker.reset_after(
+                            PROCESS_LEASE_RENEW_RETRY_DELAY.min(self.config.renew_interval),
+                        );
+                        tracing::warn!(
+                            node = self.store.node.0,
+                            timeout = ?self.config.renew_interval,
+                            "stable node identity lease renewal timed out; retrying"
+                        );
+                    }
                     Err(_) => {
-                        self.deadline.fence();
-                        self.live_tx.send_replace(false);
+                        self.expire("renewal was still pending at the lease deadline");
                         return;
                     }
                 }
             }
         })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn expire(&self, reason: &'static str) {
+        tracing::error!(
+            node = self.store.node.0,
+            reason,
+            "stable node identity lease expired locally"
+        );
+        self.fence();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn fence(&self) {
+        self.deadline.fence();
+        self.live_tx.send_replace(false);
     }
 }
