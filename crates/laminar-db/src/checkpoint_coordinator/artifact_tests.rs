@@ -1739,6 +1739,34 @@ async fn cluster_leader_durably_admits_sink_epoch_before_opening_local_gate() {
     assert_eq!(inventory.assignment_fence.as_ref(), Some(&fence));
     assert_eq!(admitted_proof, proof);
     assert!(sink_handle.open_epoch_admission(1).is_ok());
+
+    // A drain transition re-activates the assignment while the attempt that consumed epoch 1
+    // is still in flight.
+    assert_eq!(
+        coordinator
+            .allocator
+            .consume_sink_epoch_until(deadline)
+            .await
+            .unwrap(),
+        CheckpointAttempt::canonical(1)
+    );
+    coordinator
+        .ensure_assignment_sink_epoch_until(deadline)
+        .await
+        .expect("an in-flight attempt keeps its sink epoch through re-activation");
+    assert!(coordinator
+        .allocator
+        .sink_epoch_reservation
+        .lock()
+        .is_none());
+    assert_eq!(
+        authority
+            .cluster_checkpoint_artifact_admission()
+            .await
+            .unwrap()
+            .map(|(inventory, _)| inventory.attempt),
+        Some(CheckpointAttempt::canonical(1))
+    );
     sink_handle.close().await.unwrap();
 }
 
