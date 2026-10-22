@@ -1689,6 +1689,86 @@ async fn unchanged_liveness_observation_is_required_for_takeover() {
     );
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn released_term_is_taken_over_without_a_full_ttl_observation() {
+    let store = store(60_000);
+    let incumbent = owner(1, 1, 1);
+    let rival = owner(2, 2, 1);
+    let late = owner(3, 3, 1);
+    let LeaseOutcome::Acquired(held) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        panic!("initial leader acquisition");
+    };
+    let LeaseOutcome::Held(current) = store.begin_new_term(&rival, 1).await.unwrap() else {
+        panic!("rival must observe the incumbent");
+    };
+    let observation = store.observe_rival(&rival, &current).unwrap();
+    assert!(matches!(
+        store.try_takeover(&rival, &observation, 2).await.unwrap(),
+        LeaseOutcome::Held(_)
+    ));
+
+    store.publish_release(&incumbent, held.token).await.unwrap();
+    let LeaseOutcome::Acquired(takeover) =
+        store.try_takeover(&rival, &observation, 3).await.unwrap()
+    else {
+        panic!("a released term must not wait out the TTL");
+    };
+    assert_eq!(
+        (takeover.token, takeover.owner.clone()),
+        (held.token + 1, rival)
+    );
+
+    let stale = store.observe_rival(&late, &takeover).unwrap();
+    assert!(
+        matches!(
+            store.try_takeover(&late, &stale, 4).await.unwrap(),
+            LeaseOutcome::Held(_)
+        ),
+        "a release names one exact term and cannot hand over its successor"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn released_term_keeps_its_unsettled_attempt_until_the_outcome() {
+    let store = store(60_000);
+    let incumbent = owner(1, 1, 1);
+    let rival = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(held) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        panic!("initial leader acquisition");
+    };
+    let proof = held.proof();
+    let fence = assignment_fence(&incumbent);
+    begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
+    store.publish_release(&incumbent, held.token).await.unwrap();
+    let LeaseOutcome::Held(current) = store.begin_new_term(&rival, 1).await.unwrap() else {
+        panic!("rival must observe the incumbent");
+    };
+    let observation = store.observe_rival(&rival, &current).unwrap();
+    assert!(matches!(
+        store.try_takeover(&rival, &observation, 2).await.unwrap(),
+        LeaseOutcome::Held(_)
+    ));
+
+    let committed = committed_checkpoint_with_predecessor(&store, &fence, 1, 9, None).await;
+    store
+        .record_cluster_outcome(
+            &proof,
+            1,
+            1,
+            fence,
+            CheckpointVerdict::Commit,
+            Some(committed),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.try_takeover(&rival, &observation, 3).await.unwrap(),
+        LeaseOutcome::Acquired(_)
+    ));
+}
+
 #[tokio::test]
 async fn same_node_new_boot_is_a_rival_and_advances_token() {
     let store = store(10);
@@ -6982,6 +7062,39 @@ async fn candidacy_loss_interrupts_hung_renewal_and_withdraws_the_grant() {
     raw.release.add_permits(1);
     shutdown.cancel();
     task.await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn candidacy_loss_releases_the_term_for_an_immediate_rival_takeover() {
+    let store = Arc::new(store(60_000));
+    let config = LeaderLeaseConfig {
+        ttl: Duration::from_secs(60),
+        renew_interval: Duration::from_millis(20),
+    };
+    let incumbent = owner(1, 1, 1);
+    let rival = owner(2, 2, 1);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let incumbent_manager =
+        LeaderLeaseManager::new(Arc::clone(&store), &process(&incumbent), config).unwrap();
+    let mut incumbent_lease = incumbent_manager.lease_watch();
+    let (incumbent_tx, incumbent_rx) = candidacy_channel(true);
+    let incumbent_task = incumbent_manager.spawn(shutdown.clone(), incumbent_rx);
+    wait_for_lease(&mut incumbent_lease).await;
+    let rival_manager =
+        LeaderLeaseManager::new(Arc::clone(&store), &process(&rival), config).unwrap();
+    let mut rival_lease = rival_manager.lease_watch();
+    let (_rival_tx, rival_rx) = candidacy_channel(true);
+    let rival_task = rival_manager.spawn(shutdown.clone(), rival_rx);
+
+    set_candidacy(&incumbent_tx, false);
+    wait_for_lease(&mut rival_lease).await;
+    assert_eq!(rival_lease.borrow().as_ref().unwrap().owner, rival);
+    assert!(incumbent_lease.borrow().is_none());
+
+    shutdown.cancel();
+    incumbent_task.await.unwrap();
+    rival_task.await.unwrap();
 }
 
 #[cfg(feature = "cluster")]
