@@ -15,6 +15,7 @@ async fn await_participant_manifest_until<F, Fut>(
     participant_id: u64,
     attempt: CheckpointAttempt,
     deadline: tokio::time::Instant,
+    recovery_fenced: impl Fn() -> bool,
     mut load: F,
 ) -> Result<CheckpointManifest, DbError>
 where
@@ -41,6 +42,14 @@ where
                     )));
                 }
                 return Ok(manifest);
+            }
+            // Recovery admits no attempt behind its fence and rewinds this one to the committed
+            // cut, so a peer stopped by that round never publishes the missing manifest.
+            Ok(Ok(None)) if recovery_fenced() => {
+                return Err(DbError::Checkpoint(format!(
+                    "participant {participant_id} checkpoint {} epoch {} manifest readiness abandoned behind the coordinated recovery fence",
+                    attempt.checkpoint_id, attempt.epoch
+                )));
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => return Err(error),
@@ -159,6 +168,23 @@ impl CheckpointCoordinator {
             .map_err(DbError::Checkpoint)
     }
 
+    fn recovery_fence(&self) -> impl Fn() -> bool + Clone + Send + 'static {
+        #[cfg(feature = "cluster")]
+        let controller = self.cluster_controller.clone();
+        move || {
+            #[cfg(feature = "cluster")]
+            {
+                controller
+                    .as_ref()
+                    .is_some_and(|controller| controller.is_recovering())
+            }
+            #[cfg(not(feature = "cluster"))]
+            {
+                false
+            }
+        }
+    }
+
     pub(super) async fn await_prepared_participant_manifests(
         &self,
         attempt: CheckpointAttempt,
@@ -187,11 +213,13 @@ impl CheckpointCoordinator {
             )));
         }
         let mut loaded = BTreeMap::from([(local.0.participant_id, local)]);
+        let recovery_fenced = self.recovery_fence();
         let mut reads = participant_ids
             .into_iter()
             .filter(|participant_id| *participant_id != self.store.participant_id())
             .map(|participant_id| {
                 let store = Arc::clone(&self.store);
+                let recovery_fenced = recovery_fenced.clone();
                 let expected_assignment_fence = expected_assignment_fence.clone();
                 let expected_deployment_id = expected_deployment_id.clone();
                 let expected_pipeline_identity = expected_pipeline_identity.clone();
@@ -200,6 +228,7 @@ impl CheckpointCoordinator {
                         participant_id,
                         attempt,
                         deadline,
+                        recovery_fenced,
                         || {
                             let store = Arc::clone(&store);
                             async move {
@@ -520,6 +549,7 @@ mod participant_manifest_readiness_tests {
             2,
             CheckpointAttempt::canonical(7),
             tokio::time::Instant::now() + Duration::from_secs(1),
+            || false,
             {
                 let attempts = Arc::clone(&attempts);
                 let manifest = manifest.clone();
@@ -570,6 +600,7 @@ mod participant_manifest_readiness_tests {
                 2,
                 CheckpointAttempt::canonical(7),
                 started + Duration::from_secs(1),
+                || false,
                 {
                     let attempts = Arc::clone(&attempts);
                     move || {
@@ -601,6 +632,7 @@ mod participant_manifest_readiness_tests {
             2,
             CheckpointAttempt::canonical(7),
             started + Duration::from_secs(1),
+            || false,
             {
                 let attempts = Arc::clone(&attempts);
                 move || {
@@ -629,12 +661,16 @@ mod participant_manifest_readiness_tests {
             2,
             CheckpointAttempt::canonical(7),
             deadline,
+            || false,
             || async { Ok(None) },
         );
-        let blocked =
-            await_participant_manifest_until(3, CheckpointAttempt::canonical(7), deadline, || {
-                std::future::pending::<Result<Option<CheckpointManifest>, DbError>>()
-            });
+        let blocked = await_participant_manifest_until(
+            3,
+            CheckpointAttempt::canonical(7),
+            deadline,
+            || false,
+            || std::future::pending::<Result<Option<CheckpointManifest>, DbError>>(),
+        );
 
         let (missing, blocked) = tokio::join!(missing, blocked);
 
@@ -644,5 +680,56 @@ mod participant_manifest_readiness_tests {
             .contains("readiness timed out"));
         assert!(blocked.unwrap_err().to_string().contains("read timed out"));
         assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_manifest_is_abandoned_once_coordinated_recovery_fences_the_attempt() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let started = tokio::time::Instant::now();
+        let error = await_participant_manifest_until(
+            2,
+            CheckpointAttempt::canonical(7),
+            started + Duration::from_secs(60),
+            {
+                let loads = Arc::clone(&loads);
+                move || loads.load(Ordering::SeqCst) >= 2
+            },
+            {
+                let loads = Arc::clone(&loads);
+                move || {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(None) }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("coordinated recovery fence"),
+            "{error}"
+        );
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert!(tokio::time::Instant::now() < started + Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn published_manifest_is_still_accepted_behind_the_recovery_fence() {
+        let mut manifest = CheckpointManifest::new(7, 7);
+        manifest.bind_participant(2);
+        let loaded = await_participant_manifest_until(
+            2,
+            CheckpointAttempt::canonical(7),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            || true,
+            move || {
+                let manifest = manifest.clone();
+                async move { Ok(Some(manifest)) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(loaded.participant_id, 2);
     }
 }
