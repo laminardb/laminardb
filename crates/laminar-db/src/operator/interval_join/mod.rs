@@ -4,6 +4,8 @@
 //! `right_ts BETWEEN left_ts AND left_ts + time_bound`; evicts on watermark advance.
 
 mod checkpoint_validation;
+#[cfg(feature = "cluster")]
+mod cluster_frontiers;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -991,6 +993,10 @@ pub(crate) struct IntervalJoinOperator {
     peer_channels: [BTreeMap<u64, IntervalPeerChannel>; 2],
     #[cfg(feature = "cluster")]
     last_broadcasts: [InputFrontier; 2],
+    /// Highest cut an all-idle merge may close to: this node's idle graph input, which the graph
+    /// caps at the committed source cut. `None` while that input is active.
+    #[cfg(feature = "cluster")]
+    idle_close_ceilings: [Option<i64>; 2],
     #[cfg(feature = "cluster")]
     remote_side_cursor: u8,
     #[cfg(feature = "cluster")]
@@ -1065,6 +1071,8 @@ impl IntervalJoinOperator {
             peer_channels: [BTreeMap::new(), BTreeMap::new()],
             #[cfg(feature = "cluster")]
             last_broadcasts: [InputFrontier::default(); 2],
+            #[cfg(feature = "cluster")]
+            idle_close_ceilings: [Some(i64::MIN); 2],
             #[cfg(feature = "cluster")]
             remote_side_cursor: 0,
             #[cfg(feature = "cluster")]
@@ -1300,15 +1308,6 @@ impl IntervalJoinOperator {
             }
         }
         Ok(())
-    }
-
-    #[cfg(feature = "cluster")]
-    fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
-        match (current, floor) {
-            (Some(current), Some(floor)) => Some(current.max(floor)),
-            (None, floor) => floor,
-            (current, None) => current,
-        }
     }
 
     #[cfg(feature = "cluster")]
@@ -3598,59 +3597,6 @@ impl IntervalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn effective_cluster_frontiers(
-        &self,
-        local: [InputFrontier; 2],
-        override_event: Option<(usize, u64, InputFrontier, usize)>,
-    ) -> Result<[InputFrontier; 2], DbError> {
-        let merge = |port: usize| -> Result<InputFrontier, DbError> {
-            let peers = self.peer_channels[port].iter().map(|(&peer, channel)| {
-                let mut applied = override_event
-                    .filter(|(event_port, event_peer, _, _)| {
-                        *event_port == port && *event_peer == peer
-                    })
-                    .map_or(channel.applied, |(_, _, frontier, _)| frontier);
-                let consumed = override_event
-                    .filter(|(event_port, event_peer, _, _)| {
-                        *event_port == port && *event_peer == peer
-                    })
-                    .map_or(0, |(_, _, _, consumed)| consumed);
-                if channel.events.len() > consumed {
-                    applied.idle = false;
-                    let floor = if port == 0 {
-                        self.applied_left_watermark
-                    } else {
-                        self.applied_right_watermark
-                    };
-                    applied.watermark =
-                        Self::max_watermark(applied.watermark, Self::watermark_option(floor));
-                }
-                applied
-            });
-            let merged =
-                merge_input_frontier_iter(std::iter::once(local[port]).chain(peers), i64::MIN);
-            let previous = self.applied_frontiers()[port];
-            self.validate_frontier(
-                previous,
-                merged,
-                if port == 0 {
-                    JoinInputSide::Left
-                } else {
-                    JoinInputSide::Right
-                },
-            )?;
-            if self.pending_cluster_input.is_some() {
-                return Ok(InputFrontier {
-                    watermark: previous.watermark,
-                    idle: false,
-                });
-            }
-            Ok(merged)
-        };
-        Ok([merge(0)?, merge(1)?])
-    }
-
-    #[cfg(feature = "cluster")]
     fn plan_cluster_inputs(
         &self,
         inputs: &[Vec<RecordBatch>],
@@ -3692,7 +3638,7 @@ impl IntervalJoinOperator {
                 )));
             }
             let installed = self.local_frontiers[port];
-            local_frontiers[port] = super::frontier::normalize_restored_local_frontier(
+            local_frontiers[port] = super::frontier::normalize_local_frontier_without_peer_echo(
                 frontiers[port],
                 installed,
                 self.applied_frontiers()[port].watermark,
@@ -4166,6 +4112,11 @@ impl IntervalJoinOperator {
         left_frontier: InputFrontier,
         right_frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        self.idle_close_ceilings = [left_frontier, right_frontier].map(|frontier| {
+            frontier
+                .idle
+                .then(|| frontier.watermark.unwrap_or(i64::MIN))
+        });
         let scope = self.active_cluster_scope();
         let (config, assignment, peers) = match scope {
             Ok(scope) => scope,
@@ -4792,7 +4743,7 @@ impl GraphOperator for IntervalJoinOperator {
                                     } else {
                                         checkpoint.applied_right_watermark
                                     };
-                                    applied.watermark = Self::max_watermark(
+                                    applied.watermark = super::frontier::max_watermark(
                                         applied.watermark,
                                         Self::watermark_option(floor),
                                     );
@@ -5064,7 +5015,8 @@ impl GraphOperator for IntervalJoinOperator {
         } else {
             self.applied_right_watermark
         };
-        frontier.watermark = Self::max_watermark(frontier.watermark, Self::watermark_option(floor));
+        frontier.watermark =
+            super::frontier::max_watermark(frontier.watermark, Self::watermark_option(floor));
         self.validate_frontier(previous, frontier, side)?;
         let (next_bytes, next_events) = self.reserve_remote_event_slot(side, peer, 0)?;
         self.queued_shuffle_bytes = next_bytes;
