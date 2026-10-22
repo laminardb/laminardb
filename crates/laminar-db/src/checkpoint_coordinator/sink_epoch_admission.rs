@@ -118,6 +118,9 @@ impl CheckpointCoordinator {
         }
         let reservation = *self.allocator.sink_epoch_reservation.lock();
         match reservation {
+            // An admitted checkpoint consumed the open epoch and has not settled it. Settlement
+            // opens the successor, so opening one here would contend for the same attempt.
+            None if self.active_sink_artifact_intents.is_some() => Ok(()),
             None => {
                 self.begin_sink_epoch_until(deadline, super::SinkEpochPublication::Immediate)
                     .await
