@@ -1554,3 +1554,113 @@ async fn test_eowc_process_empty_inputs() {
     let result = op.process(&[vec![]], &[0]).await.unwrap();
     assert!(result.is_empty());
 }
+
+#[cfg(feature = "cluster")]
+async fn window_with_one_peer() -> (EowcQueryOperator, ClusterShuffleConfig) {
+    let mut operator = EowcQueryOperator::new(
+        "peer_frontiers",
+        AGG_SQL,
+        Some(EmitClause::OnWindowClose),
+        Some(test_window_config()),
+        aggregate_context(),
+        key_groups(),
+        None,
+    );
+    operator.initialize_managed_state().await.unwrap();
+    let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+    operator.attach_cluster_scope(scope.clone());
+    (operator, scope)
+}
+
+#[cfg(feature = "cluster")]
+fn idle_at(watermark: i64) -> InputFrontier {
+    InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn idle_non_reader_does_not_echo_its_applied_cut() {
+    let (mut operator, _) = window_with_one_peer().await;
+    operator.local_frontier = idle_at(1_000);
+    operator.last_broadcast = idle_at(1_000);
+    // The cut applied from the peer that reads the source.
+    operator.effective_frontier = InputFrontier {
+        watermark: Some(20_000),
+        idle: false,
+    };
+
+    assert_eq!(
+        operator
+            .normalized_local_frontier(idle_at(1_000), false)
+            .unwrap(),
+        idle_at(1_000)
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn all_idle_close_stops_at_the_committed_cut_for_a_reviving_reader() {
+    let (mut operator, _) = window_with_one_peer().await;
+    operator.effective_frontier = idle_at(1_000);
+    operator.idle_close_ceiling = Some(5_000);
+    operator.peer_channels.get_mut(&2).unwrap().applied = idle_at(20_000);
+
+    assert_eq!(
+        operator
+            .effective_cluster_frontier(idle_at(5_000), None)
+            .unwrap(),
+        idle_at(5_000)
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn all_idle_merge_below_the_applied_cut_holds() {
+    let (mut operator, _) = window_with_one_peer().await;
+    operator.effective_frontier = idle_at(10_000);
+    operator.idle_close_ceiling = Some(1_000);
+    operator.peer_channels.get_mut(&2).unwrap().applied = idle_at(2_000);
+
+    assert_eq!(
+        operator
+            .effective_cluster_frontier(idle_at(1_000), None)
+            .unwrap(),
+        idle_at(10_000)
+    );
+}
+
+/// A capped all-idle close checkpoints an effective frontier below the raw peer merge; restore
+/// must accept the held frontier it saved.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn held_all_idle_frontier_round_trips_through_a_checkpoint() {
+    let (mut operator, scope) = window_with_one_peer().await;
+    operator.local_frontier = idle_at(1_000);
+    operator.last_broadcast = idle_at(1_000);
+    operator.effective_frontier = idle_at(1_000);
+    let channel = operator.peer_channels.get_mut(&2).unwrap();
+    channel.applied = idle_at(1_000);
+    channel.accepted = idle_at(1_000);
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "peer_frontiers",
+            2,
+            idle_at(20_000),
+            scope.registry.assignment_version(),
+            scope.receiver.recovery_gen(),
+        )
+        .unwrap();
+    operator
+        .process_with_frontiers(&[Vec::new()], &[idle_at(5_000)])
+        .await
+        .unwrap();
+    assert_eq!(operator.effective_frontier, idle_at(5_000));
+
+    let checkpoint = operator.checkpoint().unwrap().unwrap();
+    let (mut restored, _) = window_with_one_peer().await;
+    restored.restore(checkpoint).unwrap();
+    assert_eq!(restored.effective_frontier, idle_at(5_000));
+}
