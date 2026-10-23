@@ -232,7 +232,12 @@ impl ProcessShuffle {
                 )
             }
         });
-        let merged = merge_input_frontier_iter(std::iter::once(local).chain(remote), i64::MIN);
+        // Process input is not capped at the committed cut, so an idle local input is the ceiling.
+        let merged = crate::operator::frontier::hold_all_idle_merge(
+            merge_input_frontier_iter(std::iter::once(local).chain(remote), i64::MIN),
+            self.effective.watermark,
+            crate::operator::frontier::idle_close_ceiling(local),
+        );
         input::validate_frontier(self.effective, merged)?;
         Ok(merged)
     }
