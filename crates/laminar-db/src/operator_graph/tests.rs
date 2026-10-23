@@ -7361,6 +7361,7 @@ async fn interval_output_admission_compacts_273_batches_without_changing_aggrega
         assert_eq!(graph.input_bufs[consumer][0].len(), buffered + 1);
         assert_eq!(results["joined"], vec![expected]);
         assert!(graph.execution_poison_reason().is_none());
+        #[cfg(debug_assertions)]
         graph.debug_assert_byte_sums();
 
         let results = graph
