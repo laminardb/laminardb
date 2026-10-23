@@ -166,6 +166,16 @@ impl AggregateStateUsage {
         self.saturated
     }
 
+    /// Total bytes for budget admission: a saturated snapshot reports `usize::MAX`.
+    #[must_use]
+    pub(super) fn accounted_bytes(self) -> usize {
+        if self.is_saturated() {
+            usize::MAX
+        } else {
+            self.total_bytes()
+        }
+    }
+
     fn from_parts_with_saturation(
         topology_element_storage_bytes: usize,
         vnode_inline_bytes: usize,
