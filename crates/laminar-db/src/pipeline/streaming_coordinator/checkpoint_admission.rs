@@ -94,6 +94,12 @@ impl StreamingCoordinator {
             }
             return None;
         }
+        // The end-to-end deadline starts here and assignment admission may block, so wait for the
+        // in-flight durable tail first. Only this coordinator starts a tail, so the slot cannot be
+        // taken while admission awaits.
+        if !self.checkpoint_capacity_available() {
+            return None;
+        }
         let default_deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
         let deadline = if manual {
             self.manual_deadline(default_deadline)
@@ -155,9 +161,6 @@ impl StreamingCoordinator {
             let reason = "assignment handoff ended before its replay-quiescent checkpoint";
             callback.record_checkpoint_admission_failure(reason);
             self.fail_waiting_manual(reason);
-            return None;
-        }
-        if !self.checkpoint_capacity_available() {
             return None;
         }
         Some(CheckpointAdmission {

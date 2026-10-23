@@ -3365,6 +3365,31 @@ fn checkpoint_admission_serializes_every_durable_tail() {
     assert!(!coordinator.checkpoint_capacity_available());
 }
 
+#[tokio::test]
+async fn admission_waits_for_the_durable_tail_before_starting_its_deadline() {
+    let mut coordinator = admission_coordinator(Vec::new());
+    let mut callback = MockCallback::new();
+    coordinator
+        .checkpoint_in_flight
+        .store(1, std::sync::atomic::Ordering::Release);
+    assert!(coordinator
+        .checkpoint_admission(&mut callback)
+        .await
+        .is_none());
+    assert_eq!(callback.checkpoint_assignment_calls, 0);
+
+    coordinator
+        .checkpoint_in_flight
+        .store(0, std::sync::atomic::Ordering::Release);
+    let released = tokio::time::Instant::now();
+    let admission = coordinator
+        .checkpoint_admission(&mut callback)
+        .await
+        .expect("a due periodic cut is admitted once the durable tail finishes");
+    assert_eq!(callback.checkpoint_assignment_calls, 1);
+    assert!(admission.deadline >= released + coordinator.config.checkpoint_timeout);
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn pending_output_accelerates_only_a_configured_periodic_checkpoint() {
