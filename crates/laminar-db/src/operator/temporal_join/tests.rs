@@ -2349,3 +2349,78 @@ async fn cluster_checkpoint_restore_rejects_topology_and_routes_atomically() {
     assert!(restored.restore(wrong_route).is_err());
     assert_cluster_restore_pristine(&restored);
 }
+
+#[cfg(feature = "cluster")]
+fn idle_at(watermark: i64) -> InputFrontier {
+    InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn temporal_with_one_peer(
+    local: InputFrontier,
+    effective: InputFrontier,
+    peer: InputFrontier,
+) -> (ManagedTemporalJoinOperator, ClusterShuffleConfig) {
+    let (mut operator, _, _) = operator(8);
+    let scope = two_owner_scope().await;
+    operator.attach_cluster_shuffle(scope.clone());
+    operator.local_frontiers = [local; 2];
+    operator.last_broadcasts = [local; 2];
+    operator.frontiers = [effective; 2];
+    for port in 0..2 {
+        let channel = operator.peer_channels[port].get_mut(&2).unwrap();
+        channel.applied = peer;
+        channel.accepted = peer;
+    }
+    (operator, scope)
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn idle_non_reader_temporal_join_does_not_echo_its_applied_cut() {
+    let reader = InputFrontier {
+        watermark: Some(20_000),
+        idle: false,
+    };
+    let (operator, scope) = temporal_with_one_peer(idle_at(1_000), reader, reader).await;
+    let assignment = scope.registry.versioned_snapshot();
+    let plan = operator
+        .plan_cluster_inputs(
+            &[Vec::new(), Vec::new()],
+            [idle_at(1_000); 2],
+            &scope,
+            &assignment,
+            &[2],
+        )
+        .unwrap();
+    assert_eq!(plan.local_frontiers, [idle_at(1_000); 2]);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn temporal_all_idle_close_stops_at_the_committed_cut() {
+    let (operator, _) =
+        temporal_with_one_peer(idle_at(5_000), idle_at(1_000), idle_at(20_000)).await;
+    assert_eq!(
+        operator
+            .effective_cluster_frontiers([idle_at(5_000); 2], None, None)
+            .unwrap(),
+        [idle_at(5_000); 2]
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn temporal_all_idle_merge_below_the_applied_cut_holds() {
+    let (operator, _) =
+        temporal_with_one_peer(idle_at(1_000), idle_at(10_000), idle_at(2_000)).await;
+    assert_eq!(
+        operator
+            .effective_cluster_frontiers([idle_at(1_000); 2], None, None)
+            .unwrap(),
+        [idle_at(10_000); 2]
+    );
+}
