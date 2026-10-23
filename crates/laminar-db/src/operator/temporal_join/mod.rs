@@ -1,5 +1,7 @@
 //! Managed vnode-local temporal join execution.
 
+#[cfg(feature = "cluster")]
+mod cluster_frontiers;
 mod transition_validation;
 
 use std::collections::BTreeMap;
@@ -1955,7 +1957,7 @@ impl ManagedTemporalJoinOperator {
             if peer_channels[port]
                 .values()
                 .all(|channel| channel.events.is_empty())
-                && frontier != saved_frontiers[port]
+                && !super::frontier::restored_frontier_matches(saved_frontiers[port], frontier)
             {
                 return Err(DbError::Checkpoint(format!(
                     "temporal join [{}] restored {} cluster frontier is inconsistent",
@@ -2992,43 +2994,6 @@ impl ManagedTemporalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
-    fn effective_cluster_frontiers(
-        &self,
-        local: [InputFrontier; 2],
-        applied: Option<&[BTreeMap<u64, InputFrontier>; 2]>,
-        consumed: Option<&[BTreeMap<u64, usize>; 2]>,
-    ) -> Result<[InputFrontier; 2], DbError> {
-        let merge_side = |port: usize| -> Result<InputFrontier, DbError> {
-            let peers = self.peer_channels[port].iter().map(|(peer, channel)| {
-                let mut frontier = applied
-                    .and_then(|frontiers| frontiers[port].get(peer).copied())
-                    .unwrap_or(channel.applied);
-                let consumed = consumed
-                    .and_then(|counts| counts[port].get(peer).copied())
-                    .unwrap_or(0);
-                if channel.events.len() > consumed {
-                    frontier.idle = false;
-                    frontier.watermark =
-                        max_watermark(frontier.watermark, self.frontiers[port].watermark);
-                }
-                frontier
-            });
-            let merged =
-                merge_input_frontier_iter(std::iter::once(local[port]).chain(peers), i64::MIN);
-            let side = if port == 0 { "left" } else { "right" };
-            validate_frontier(self.frontiers[port], merged, side, &self.name)?;
-            if self.pending_cluster_input.is_some() {
-                return Ok(InputFrontier {
-                    watermark: self.frontiers[port].watermark,
-                    idle: false,
-                });
-            }
-            Ok(merged)
-        };
-        Ok([merge_side(0)?, merge_side(1)?])
-    }
-
-    #[cfg(feature = "cluster")]
     fn plan_cluster_inputs(
         &self,
         inputs: &[Vec<RecordBatch>],
@@ -3070,7 +3035,7 @@ impl ManagedTemporalJoinOperator {
                 )));
             }
             let installed = self.local_frontiers[port];
-            local_frontiers[port] = super::frontier::normalize_restored_local_frontier(
+            local_frontiers[port] = super::frontier::normalize_local_frontier_without_peer_echo(
                 frontiers[port],
                 installed,
                 self.frontiers[port].watermark,
@@ -4664,7 +4629,7 @@ impl ManagedTemporalJoinOperator {
                     std::iter::once(local_frontiers[port]).chain(applied),
                     i64::MIN,
                 );
-                if merged != frontiers[port] {
+                if !super::frontier::restored_frontier_matches(frontiers[port], merged) {
                     return Err(DbError::Checkpoint(format!(
                         "temporal join [{}] donor {} input frontiers do not form one common cut",
                         self.name, restore.participant_id

@@ -37,6 +37,42 @@ pub(crate) fn normalize_local_frontier_without_peer_echo(
     normalize_restored_local_frontier(input, installed, effective_floor)
 }
 
+/// The ceiling an all-idle merge may close to: this node's idle graph input, which the graph caps
+/// at the committed cut. An active input imposes none.
+pub(crate) fn idle_close_ceiling(input: InputFrontier) -> Option<i64> {
+    input.idle.then(|| input.watermark.unwrap_or(i64::MIN))
+}
+
+/// Bound an all-idle peer merge. Idle channels never echo the applied cut, so the merge can trail
+/// it; hold there instead of regressing. A reader idle at its own higher watermark must not close
+/// past `idle_ceiling`, this node's committed cut, where a second idle reader revives.
+pub(crate) fn hold_all_idle_merge(
+    mut merged: InputFrontier,
+    applied: Option<i64>,
+    idle_ceiling: Option<i64>,
+) -> InputFrontier {
+    if merged.idle {
+        let closable = match idle_ceiling {
+            Some(ceiling) => merged.watermark.map(|watermark| watermark.min(ceiling)),
+            None => merged.watermark,
+        };
+        merged.watermark = max_watermark(closable, applied);
+    }
+    merged
+}
+
+/// Whether a checkpointed effective frontier is an all-idle close that the live merge held at or
+/// below `merged`, the raw peer merge recomputed at restore. The committed-cut ceiling that capped
+/// it is not part of the checkpoint, so restore cannot recompute the held value exactly.
+pub(crate) fn is_held_all_idle_frontier(saved: InputFrontier, merged: InputFrontier) -> bool {
+    merged.idle && saved.idle && saved.watermark <= merged.watermark
+}
+
+/// Whether a checkpointed effective frontier matches `merged` exactly or as a held all-idle close.
+pub(crate) fn restored_frontier_matches(saved: InputFrontier, merged: InputFrontier) -> bool {
+    saved == merged || is_held_all_idle_frontier(saved, merged)
+}
+
 pub(crate) fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
     match (current, floor) {
         (Some(current), Some(floor)) => Some(current.max(floor)),

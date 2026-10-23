@@ -343,9 +343,11 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let capped_source_frontiers = match managed_state {
             Some(ManagedStateContract::TemporalJoinV1) => Some(&self.temporal_source_frontiers),
-            Some(ManagedStateContract::BoundedIntervalJoinV3) => {
-                Some(&self.interval_idle_source_frontiers)
-            }
+            Some(
+                ManagedStateContract::CoreWindowV1
+                | ManagedStateContract::SqlAggregateV1
+                | ManagedStateContract::BoundedIntervalJoinV3,
+            ) => Some(&self.idle_source_frontiers),
             _ => None,
         };
         (0..port_count)

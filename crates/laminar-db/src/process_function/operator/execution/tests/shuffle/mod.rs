@@ -344,6 +344,33 @@ async fn peer_idleness_requires_ordered_revival_before_data() {
     assert_eq!(operator.output_frontier(frontier(100)[0]), frontier(100)[0]);
 }
 
+#[tokio::test]
+async fn all_idle_peer_frontier_closes_no_further_than_the_idle_local_input() {
+    let pair = Pair::new().await;
+    let mut operator = pair.operator(0);
+    let idle_local = [InputFrontier {
+        watermark: Some(100),
+        idle: true,
+    }];
+    let drain = async |operator: &mut ProcessFunctionOperator| loop {
+        operator
+            .process_with_frontiers(&[], &idle_local)
+            .await
+            .unwrap();
+        if !operator.checkpoint_drain_pending() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    };
+    drain(&mut operator).await;
+    stage(
+        &mut operator,
+        pair.ship(0, peer_frontier(Some(500), true)).await,
+    );
+    drain(&mut operator).await;
+    assert_eq!(operator.watermark_us, 100_000);
+}
+
 mod recovery;
 #[cfg(feature = "process-remote")]
 mod remote;
