@@ -1925,7 +1925,9 @@ fn audit_materialized_recovery_with_authority<'a>(
                 snapshot.version
             ));
         }
-        let (committed_head, committed_index) = authority
+        // The head, its index, and both handoff pins come from one authority record: a target
+        // Commit clears the pin in the same write that moves the head.
+        let commit_head = authority
             .highest_cluster_commit_with_checkpoint()
             .await
             .map_err(|error| error.to_string())?
@@ -1935,16 +1937,14 @@ fn audit_materialized_recovery_with_authority<'a>(
                     snapshot.version
                 )
             })?;
+        let (committed_head, committed_index) = (&commit_head.outcome, &commit_head.index);
         let head_reference = committed_head.committed_checkpoint.clone().ok_or_else(|| {
             format!(
                 "assignment {} recovery committed head has no checkpoint reference",
                 snapshot.version
             )
         })?;
-        let pinned = authority
-            .assignment_handoff_checkpoint(&decision.target)
-            .await
-            .map_err(|error| error.to_string())?;
+        let pinned = commit_head.handoff_checkpoint(&decision.target).cloned();
 
         let recovery_checkpoint = if let Some(pinned) = pinned {
             if pinned != decision.recovery_checkpoint || head_reference != pinned {
@@ -1954,8 +1954,8 @@ fn audit_materialized_recovery_with_authority<'a>(
                 ));
             }
             let origin = validate_portable_recovery_cut(
-                &committed_head,
-                &committed_index,
+                committed_head,
+                committed_index,
                 &pinned,
                 &decision.predecessor,
                 "materialized assignment recovery",
@@ -1969,8 +1969,8 @@ fn audit_materialized_recovery_with_authority<'a>(
             // decision checkpoint may then be garbage-collected; validate and recover from the
             // exact target-fenced head instead of reopening that retired artifact.
             let origin = validate_portable_recovery_cut(
-                &committed_head,
-                &committed_index,
+                committed_head,
+                committed_index,
                 &head_reference,
                 &decision.target,
                 "consumed assignment recovery",
@@ -2007,19 +2007,15 @@ fn audit_materialized_recovery_with_authority<'a>(
                     snapshot.version
                 ));
             }
-            let successor_pin = authority
-                .assignment_handoff_checkpoint(&successor.target)
-                .await
-                .map_err(|error| error.to_string())?;
-            if successor_pin.as_ref() != Some(&head_reference) {
+            if commit_head.handoff_checkpoint(&successor.target) != Some(&head_reference) {
                 return Err(format!(
                     "assignment {} recovery checkpoint is not pinned to its exact pending successor",
                     snapshot.version
                 ));
             }
             let origin = validate_portable_recovery_cut(
-                &committed_head,
-                &committed_index,
+                committed_head,
+                committed_index,
                 &head_reference,
                 &decision.predecessor,
                 "propagated assignment recovery",

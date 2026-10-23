@@ -7714,11 +7714,11 @@ async fn highest_commit_lookup_survives_retention_of_the_head_it_selected() {
         .unwrap();
     raw.release.add_permits(1);
 
-    let (head, index) = lookup.await.unwrap().unwrap().unwrap();
-    assert_eq!(head, newer);
+    let head = lookup.await.unwrap().unwrap().unwrap();
+    assert_eq!(head.outcome, newer);
     assert_eq!(
-        head.committed_checkpoint.as_ref(),
-        Some(&index.encode_and_reference().unwrap().1)
+        head.outcome.committed_checkpoint.as_ref(),
+        Some(&head.index.encode_and_reference().unwrap().1)
     );
 }
 
