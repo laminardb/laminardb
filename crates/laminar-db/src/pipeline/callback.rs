@@ -28,6 +28,10 @@ pub enum ExternalOutputPressure {
     Normal,
     /// Accelerate the next configured periodic checkpoint without pausing compute.
     CheckpointDue,
+    /// Stop compute intake until the next checkpoint's barriers are in flight. With no prepared
+    /// cut, only a new checkpoint can release the open output, and a topology hold can keep one
+    /// from starting.
+    CheckpointBackpressured,
     /// Stop compute intake while a prepared checkpoint cut completes.
     CommitBackpressured,
 }
@@ -35,12 +39,17 @@ pub enum ExternalOutputPressure {
 impl ExternalOutputPressure {
     #[cfg(feature = "cluster")]
     pub(crate) const fn checkpoint_due(self) -> bool {
-        matches!(self, Self::CheckpointDue)
+        matches!(self, Self::CheckpointDue | Self::CheckpointBackpressured)
     }
 
-    #[cfg(feature = "cluster")]
-    pub(crate) const fn commit_backpressured(self) -> bool {
-        matches!(self, Self::CommitBackpressured)
+    /// Whether compute intake must stop. Checkpoint barriers reach the coordinator through the
+    /// same source FIFO as data, so checkpoint backpressure releases intake while one is in flight.
+    pub(crate) const fn pauses_intake(self, barrier_in_flight: bool) -> bool {
+        match self {
+            Self::Normal | Self::CheckpointDue => false,
+            Self::CheckpointBackpressured => !barrier_in_flight,
+            Self::CommitBackpressured => true,
+        }
     }
 }
 
@@ -797,8 +806,9 @@ pub trait PipelineCallback: Send + 'static {
     }
 
     /// Pressure from bounded checkpoint-committable output. A due checkpoint accelerates the next
-    /// periodic cut without stopping compute. Commit backpressure keeps checkpoint completion and
-    /// control traffic live but stops source and deferred-input work until the prepared cut resolves.
+    /// periodic cut without stopping compute. Checkpoint and commit backpressure keep checkpoint
+    /// completion and control traffic live but stop source and deferred-input work until the next
+    /// checkpoint's barriers are in flight or the prepared cut resolves.
     fn external_output_pressure(&self) -> ExternalOutputPressure {
         ExternalOutputPressure::Normal
     }

@@ -810,6 +810,70 @@ async fn external_commit_pressure_keeps_completion_live_and_source_queued() {
     assert_eq!(published.lock().as_slice(), &[(7, 7)]);
 }
 
+#[tokio::test]
+async fn checkpoint_backpressure_queues_source_input_until_a_barrier_is_in_flight() {
+    for barrier_in_flight in [false, true] {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (source_tx, rx) = test_source_channel(4);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        if barrier_in_flight {
+            coordinator
+                .pending_barrier
+                .reset(CheckpointAttempt::new(7, 7), 1);
+        }
+        source_tx
+            .send(SourceMsg::Batch {
+                source_idx: 0,
+                batch: int_batch(42),
+                cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
+            })
+            .await
+            .unwrap();
+
+        let callback = MockCallback::new();
+        callback
+            .external_checkpoint_backpressure
+            .store(true, Ordering::Release);
+        let pressure = Arc::clone(&callback.external_checkpoint_backpressure);
+        let written_rows = Arc::clone(&callback.written_rows);
+        let observed_rows = Arc::clone(&written_rows);
+        let release = tokio::spawn(async move {
+            if !barrier_in_flight {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                assert_eq!(
+                    observed_rows.load(Ordering::Acquire),
+                    0,
+                    "source input ran before a checkpoint could release pending output"
+                );
+                pressure.store(false, Ordering::Release);
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while observed_rows.load(Ordering::Acquire) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("source input did not run");
+            shutdown.notify_one();
+        });
+
+        let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
+            .await
+            .expect("coordinator did not settle checkpoint backpressure");
+        release.await.unwrap();
+        drop(source_tx);
+        assert!(matches!(exit, ExitReason::Shutdown));
+        assert_eq!(written_rows.load(Ordering::Acquire), 1);
+    }
+}
+
 fn assignment_fence(
     version: u64,
     participants: &[u64],
@@ -959,6 +1023,7 @@ struct MockCallback {
     intake_gate: Arc<AtomicBool>,
     intake_pause_call_audit: Arc<AtomicU64>,
     external_checkpoint_pressure: Arc<AtomicBool>,
+    external_checkpoint_backpressure: Arc<AtomicBool>,
     external_commit_backpressure: Arc<AtomicBool>,
     handoff_replay_pending: bool,
     pending_vnode_transition: bool,
@@ -1061,6 +1126,7 @@ impl MockCallback {
             intake_gate: Arc::new(AtomicBool::new(false)),
             intake_pause_call_audit: Arc::new(AtomicU64::new(0)),
             external_checkpoint_pressure: Arc::new(AtomicBool::new(false)),
+            external_checkpoint_backpressure: Arc::new(AtomicBool::new(false)),
             external_commit_backpressure: Arc::new(AtomicBool::new(false)),
             handoff_replay_pending: false,
             pending_vnode_transition: false,
@@ -1223,6 +1289,11 @@ impl PipelineCallback for MockCallback {
 
         if self.external_commit_backpressure.load(Ordering::Acquire) {
             ExternalOutputPressure::CommitBackpressured
+        } else if self
+            .external_checkpoint_backpressure
+            .load(Ordering::Acquire)
+        {
+            ExternalOutputPressure::CheckpointBackpressured
         } else if self.external_checkpoint_pressure.load(Ordering::Acquire) {
             ExternalOutputPressure::CheckpointDue
         } else {
