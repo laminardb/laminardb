@@ -37,6 +37,24 @@ pub(crate) fn normalize_local_frontier_without_peer_echo(
     normalize_restored_local_frontier(input, installed, effective_floor)
 }
 
+/// Bound an all-idle peer merge. Idle channels never echo the applied cut, so the merge can trail
+/// it; hold there instead of regressing. A reader idle at its own higher watermark must not close
+/// past `idle_ceiling`, this node's committed cut, where a second idle reader revives.
+pub(crate) fn hold_all_idle_merge(
+    mut merged: InputFrontier,
+    applied: Option<i64>,
+    idle_ceiling: Option<i64>,
+) -> InputFrontier {
+    if merged.idle {
+        let closable = match idle_ceiling {
+            Some(ceiling) => merged.watermark.map(|watermark| watermark.min(ceiling)),
+            None => merged.watermark,
+        };
+        merged.watermark = max_watermark(closable, applied);
+    }
+    merged
+}
+
 pub(crate) fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
     match (current, floor) {
         (Some(current), Some(floor)) => Some(current.max(floor)),
