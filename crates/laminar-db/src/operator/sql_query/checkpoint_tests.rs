@@ -2334,15 +2334,6 @@ async fn aggregate_checkpoint_bootstrap_requires_every_whole_donor_and_installs_
     assert!(restore_preflights
         .iter()
         .any(|preflight| preflight.group_count() != 0));
-    let replacement_upper = restore_preflights
-        .iter()
-        .map(|preflight| preflight.final_state_upper_bytes())
-        .sum::<usize>();
-    let sequential_peak = restore_preflights
-        .iter()
-        .map(|preflight| preflight.sequential_decode_bytes().unwrap())
-        .max()
-        .unwrap_or(0);
     let raw_payload = restores
         .iter()
         .map(|restore| restore.state.len())
@@ -2368,22 +2359,24 @@ async fn aggregate_checkpoint_bootstrap_requires_every_whole_donor_and_installs_
         .unwrap();
     let topology_upper =
         target_owners.len() * (std::mem::size_of::<NodeId>() + std::mem::size_of::<u64>());
-    let decode_peak = target_operator.checked_live_state_bytes().unwrap()
+    let decode_base = target_operator.checked_live_state_bytes().unwrap()
         + payload_phase
         + aggregate
             .vnode_transition_restore_roster_bytes(restores.len(), revoked.len())
             .unwrap()
-        + topology_upper
-        + replacement_upper
-        + sequential_peak;
-    target_operator.set_managed_state_budget(decode_peak - 1);
+        + topology_upper;
+    // The first vnode decodes with nothing replaced yet, so its whole bound is charged.
+    let first_decode_peak = restore_preflights[0]
+        .decode_peak_bytes(decode_base)
+        .unwrap();
+    target_operator.set_managed_state_budget(first_decode_peak - 1);
     assert!(matches!(
         target_operator.prepare_vnode_transition(transition()),
         Err(DbError::ManagedStateBudgetExceeded {
             accounted_bytes,
             limit_bytes,
             ..
-        }) if accounted_bytes == decode_peak && limit_bytes == decode_peak - 1
+        }) if accounted_bytes == first_decode_peak && limit_bytes == first_decode_peak - 1
     ));
     assert!(target_operator.prepared_vnode_transition.is_none());
 
@@ -2551,6 +2544,139 @@ async fn aggregate_transition_restores_unaligned_vnode_archive_with_bounded_copy
         target.assignment_version
     );
     target_operator.finish_vnode_transition();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn aggregate_transition_charges_decoded_vnodes_at_their_accounted_size() {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+
+    let predecessor_owners = [2, 2, 2, 2, 1, 1, 1, 1];
+    let target_owners = [1; 8];
+    let scope = cluster_scope(predecessor_owners).await;
+    let (context, _) = context_and_batch();
+    let key_groups = KeyGroupCount::try_from(8_u16).unwrap();
+    let sql = "SELECT key, SUM(value) AS total FROM events GROUP BY key";
+
+    let mut donor =
+        SqlQueryOperator::new_with_key_groups("sum", sql, context.clone(), None, false, key_groups);
+    donor.initialize_managed_state().await.unwrap();
+    let keys = (0..2_000)
+        .map(|key| format!("key-{key}"))
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(keys)),
+            Arc::new(Int64Array::from((0..2_000).collect::<Vec<i64>>())),
+        ],
+    )
+    .unwrap();
+    donor.process(&[vec![batch]], &[100]).await.unwrap();
+    let acquired = [0, 1, 2, 3];
+    let donor_vnodes = donor
+        .checkpoint_vnodes(&(0..8).collect::<Vec<_>>(), 8, u64::MAX)
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .filter(|frame| acquired.contains(&frame.vnode))
+        .map(|frame| {
+            let capture = frame.state.unwrap();
+            let mut staged = capture.retained_bytes();
+            (
+                frame.vnode,
+                capture.materialize(&mut staged, u64::MAX).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(donor_vnodes.len(), acquired.len());
+
+    let mut target_operator =
+        SqlQueryOperator::new_with_key_groups("sum", sql, context, None, false, key_groups);
+    target_operator.initialize_managed_state().await.unwrap();
+    target_operator.attach_cluster_shuffle(scope.clone());
+    let participant = |node_id| CheckpointParticipant {
+        node_id,
+        boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+    };
+    let predecessor_version = scope.registry.assignment_version();
+    let predecessor = CheckpointAssignmentFence::from_owner_map(
+        predecessor_version,
+        &predecessor_owners,
+        vec![participant(1), participant(2)],
+    )
+    .unwrap();
+    let target = CheckpointAssignmentFence::from_owner_map(
+        predecessor_version + 1,
+        &target_owners,
+        vec![participant(1)],
+    )
+    .unwrap();
+    scope.registry.set_assignment_and_version(
+        Arc::from(target_owners.map(NodeId)),
+        target.assignment_version,
+    );
+    scope
+        .sender
+        .install_assignment_fence(&target, &target_owners)
+        .unwrap();
+    scope
+        .receiver
+        .install_assignment_fence(&target, &target_owners)
+        .unwrap();
+
+    let restores = donor_vnodes
+        .iter()
+        .map(|(vnode, state)| ManagedVnodeRestore {
+            participant_id: 2,
+            vnode: *vnode,
+            state,
+        })
+        .collect::<Vec<_>>();
+    let donor_whole = portable_aggregate_whole_frame(&predecessor, 2, InputFrontier::default());
+    let whole_restores = [crate::operator_graph::ManagedWholeRestore {
+        participant_id: 2,
+        state: &donor_whole,
+    }];
+    let revoked = rustc_hash::FxHashSet::default();
+    let QueryState::Agg(aggregate) = &target_operator.state else {
+        panic!("expected aggregate transition target");
+    };
+    let profile = aggregate.vnode_archive_restore_profile();
+    let summed_final_state_bound = restores
+        .iter()
+        .map(|restore| {
+            with_aligned_aggregate_checkpoint_bytes(restore.state, |state| {
+                profile
+                    .preflight(state, format_args!("summed decode-bound test"))
+                    .map(|archive| archive.restore_preflight().final_state_upper_bytes())
+            })
+            .unwrap()
+        })
+        .sum::<usize>();
+
+    // Charging every acquired vnode at its decode bound at once would need more than this.
+    target_operator.set_managed_state_budget(summed_final_state_bound - 1);
+    target_operator
+        .prepare_vnode_transition(ManagedVnodeTransition {
+            predecessor: &predecessor,
+            target: &target,
+            revoked: &revoked,
+            restores: &restores,
+            whole_restores: &whole_restores,
+            mode: ManagedVnodeTransitionMode::Live,
+        })
+        .unwrap();
+    target_operator.publish_vnode_transition();
+    target_operator.finish_vnode_transition();
+    let QueryState::Agg(aggregate) = &target_operator.state else {
+        panic!("expected restored aggregate state");
+    };
+    assert!(aggregate.logical_group_count_for_test() > 0);
+    assert!(target_operator.checked_live_state_bytes().unwrap() < summed_final_state_bound);
 }
 
 #[tokio::test]

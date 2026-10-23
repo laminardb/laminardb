@@ -3346,12 +3346,7 @@ impl GraphOperator for SqlQueryOperator {
         let accounted_bytes = live_bytes
             .checked_add(restore_bytes)
             .and_then(|bytes| bytes.checked_add(transition_roster_bytes))
-            .and_then(|bytes| {
-                restore_preflight
-                    .sequential_decode_bytes()
-                    .and_then(|decode| bytes.checked_add(decode))
-            })
-            .and_then(|bytes| bytes.checked_add(restore_preflight.final_state_upper_bytes()))
+            .and_then(|bytes| restore_preflight.decode_peak_bytes(bytes))
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "aggregate '{}' vnode {vnode} restore accounting overflow",
@@ -3673,8 +3668,6 @@ impl GraphOperator for SqlQueryOperator {
         };
 
         let archive_profile = aggregate.vnode_archive_restore_profile();
-        let mut replacement_state_upper_bytes = 0usize;
-        let mut sequential_decode_peak_bytes = 0usize;
         for restore in transition.restores {
             let restore_preflight =
                 with_aligned_aggregate_checkpoint_bytes(restore.state, |state| {
@@ -3688,14 +3681,6 @@ impl GraphOperator for SqlQueryOperator {
                         )
                         .map(|archive| archive.restore_preflight())
                 })?;
-            replacement_state_upper_bytes = replacement_state_upper_bytes
-                .checked_add(restore_preflight.final_state_upper_bytes())
-                .ok_or_else(|| self.accounting_error())?;
-            sequential_decode_peak_bytes = sequential_decode_peak_bytes.max(
-                restore_preflight
-                    .sequential_decode_bytes()
-                    .ok_or_else(|| self.accounting_error())?,
-            );
             restored_lower_bounds.push((restore.vnode, restore_preflight.group_count()));
             preflighted.push((restore.vnode, restore.state, restore_preflight));
         }
@@ -3733,22 +3718,31 @@ impl GraphOperator for SqlQueryOperator {
                     .and_then(|channels| bytes.checked_add(channels))
             })
             .ok_or_else(|| self.accounting_error())?;
-        let decode_peak_bytes = live_bytes
+        let decode_base_bytes = live_bytes
             .checked_add(payload_phase_bytes)
             .and_then(|bytes| bytes.checked_add(internal_roster_bytes))
             .and_then(|bytes| bytes.checked_add(topology_upper_bytes))
-            .and_then(|bytes| bytes.checked_add(replacement_state_upper_bytes))
-            .and_then(|bytes| bytes.checked_add(sequential_decode_peak_bytes))
             .ok_or_else(|| self.accounting_error())?;
-        if decode_peak_bytes > self.max_managed_state_bytes {
+        if decode_base_bytes > self.max_managed_state_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
                 context: format!("aggregate '{}' transition decode", self.op_name),
-                accounted_bytes: decode_peak_bytes,
+                accounted_bytes: decode_base_bytes,
                 limit_bytes: self.max_managed_state_bytes,
             });
         }
 
+        let replaced_bytes = std::cell::Cell::new(0_usize);
         let owned_restores = preflighted.into_iter().map(|(vnode, bytes, preflight)| {
+            let decode_peak_bytes = preflight
+                .decode_peak_bytes(decode_base_bytes.saturating_add(replaced_bytes.get()))
+                .ok_or_else(|| self.accounting_error())?;
+            if decode_peak_bytes > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!("aggregate '{}' transition decode", self.op_name),
+                    accounted_bytes: decode_peak_bytes,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
             let state = with_aligned_aggregate_checkpoint_bytes(bytes, |bytes| {
                 let archive = archive_profile.preflight(
                     bytes,
@@ -3766,6 +3760,7 @@ impl GraphOperator for SqlQueryOperator {
             transition.target.vnode_count,
             owned_restores,
             transition.revoked,
+            |bytes| replaced_bytes.set(replaced_bytes.get().saturating_add(bytes)),
         )?;
         let target_peers = Self::remote_owner_peers(&assignment, config.self_id);
         let mut channels = BTreeMap::new();
