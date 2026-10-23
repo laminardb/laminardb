@@ -2301,11 +2301,11 @@ impl EowcQueryOperator {
         );
         self.validate_frontier(effective_frontier, merged, "restored effective")
             .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        if merged.watermark != effective_frontier.watermark
-            || (peer_channels
-                .values()
-                .all(|channel| channel.events.is_empty())
-                && merged != effective_frontier)
+        if !super::frontier::restored_frontier_matches(effective_frontier, merged)
+            && (merged.watermark != effective_frontier.watermark
+                || peer_channels
+                    .values()
+                    .all(|channel| channel.events.is_empty()))
         {
             return Err(DbError::Checkpoint(format!(
                 "managed CoreWindow '{}' restored channel frontier does not match its saved cut",
@@ -2451,7 +2451,7 @@ impl EowcQueryOperator {
                 applied.push(frontier);
             }
             let merged = merge_input_frontier_iter(std::iter::once(local).chain(applied), i64::MIN);
-            if merged != effective {
+            if !super::frontier::restored_frontier_matches(effective, merged) {
                 return Err(DbError::Checkpoint(format!(
                     "managed CoreWindow '{}' donor {} frontiers do not form one handoff cut",
                     self.op_name, restore.participant_id

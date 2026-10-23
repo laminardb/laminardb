@@ -3166,3 +3166,62 @@ async fn idle_non_reader_does_not_echo_its_applied_cut() {
         }
     )));
 }
+
+/// An all-idle close capped at the committed cut checkpoints an applied frontier below the raw
+/// peer merge. Restore must accept the held frontier it saved.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn held_all_idle_frontier_round_trips_through_a_checkpoint() {
+    let (scope, _peers) = three_owner_shuffle().await;
+    let new_operator = || {
+        let mut operator = IntervalJoinOperator::new(
+            "held_idle",
+            test_config(),
+            None,
+            laminar_sql::create_session_context(),
+        );
+        operator.set_input_schemas(
+            left_batch(&[], &[], &[]).schema(),
+            right_batch(&[], &[], &[]).schema(),
+        );
+        operator.attach_cluster_shuffle(scope.clone());
+        operator
+    };
+    let idle = |watermark| InputFrontier {
+        watermark: Some(watermark),
+        idle: true,
+    };
+    let mut operator = new_operator();
+    operator.applied_left_watermark = 1_000;
+    operator.applied_right_watermark = 1_000;
+    operator.applied_left_idle = true;
+    operator.applied_right_idle = true;
+    operator.local_frontiers = [idle(1_000); 2];
+    operator.last_broadcasts = [idle(1_000); 2];
+    for port in 0..2 {
+        for peer in [2_u64, 3] {
+            let channel = operator.peer_channels[port].get_mut(&peer).unwrap();
+            channel.applied = idle(1_000);
+            channel.accepted = idle(1_000);
+        }
+    }
+    operator
+        .stage_checkpointed_shuffle_frontier(
+            "held_idle::left",
+            2,
+            idle(20_000),
+            scope.registry.assignment_version(),
+            scope.receiver.recovery_gen(),
+        )
+        .unwrap();
+    operator
+        .process_cluster(&[Vec::new(), Vec::new()], idle(5_000), idle(5_000))
+        .await
+        .unwrap();
+    assert_eq!(operator.applied_left_watermark, 5_000);
+
+    let checkpoint = operator.checkpoint().unwrap().unwrap();
+    let mut restored = new_operator();
+    restored.restore(checkpoint).unwrap();
+    assert_eq!(restored.applied_left_watermark, 5_000);
+}

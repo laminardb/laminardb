@@ -55,6 +55,18 @@ pub(crate) fn hold_all_idle_merge(
     merged
 }
 
+/// Whether a checkpointed effective frontier is an all-idle close that the live merge held at or
+/// below `merged`, the raw peer merge recomputed at restore. The committed-cut ceiling that capped
+/// it is not part of the checkpoint, so restore cannot recompute the held value exactly.
+pub(crate) fn is_held_all_idle_frontier(saved: InputFrontier, merged: InputFrontier) -> bool {
+    merged.idle && saved.idle && saved.watermark <= merged.watermark
+}
+
+/// Whether a checkpointed effective frontier matches `merged` exactly or as a held all-idle close.
+pub(crate) fn restored_frontier_matches(saved: InputFrontier, merged: InputFrontier) -> bool {
+    saved == merged || is_held_all_idle_frontier(saved, merged)
+}
+
 pub(crate) fn max_watermark(current: Option<i64>, floor: Option<i64>) -> Option<i64> {
     match (current, floor) {
         (Some(current), Some(floor)) => Some(current.max(floor)),
