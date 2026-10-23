@@ -3176,6 +3176,100 @@ async fn committed_recovery_target_audits_after_consuming_and_pruning_its_handof
     assert_eq!(audited.recovery_origin(), Some(&target_fence));
 }
 
+#[tokio::test]
+async fn recovery_audit_reads_its_handoff_pin_with_the_commit_head() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        _current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+    let _ = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await;
+    let target = durable.load().await.unwrap().unwrap();
+    let target_fence = target.assignment_fence().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let decision = authority
+        .assignment_recovery_decision(target.version)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Hold the audit on its committed-index read, after it has loaded the authority record.
+    let index_read = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("committed-checkpoints/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(0),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let reader = Arc::new(LeaderLeaseStore::new(
+        Arc::new(ReadBarrierStore {
+            inner: Arc::clone(&authority_store),
+            get: Some(Arc::clone(&index_read)),
+            stall_list: false,
+        }),
+        10,
+    ));
+    let audit = tokio::spawn({
+        let (durable, reader, target) = (Arc::clone(&durable), Arc::clone(&reader), target.clone());
+        async move { audit_materialized_recovery_with_authority(&durable, Some(&reader), &target).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), index_read.entered.notified())
+        .await
+        .expect("the recovery audit did not read the committed checkpoint index");
+
+    // The target's first Commit moves the head and clears the handoff pin in one authority write.
+    let target_head = record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &target_fence,
+        &controller.capture_leader_proof().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        authority
+            .assignment_handoff_checkpoint(&target_fence)
+            .await
+            .unwrap(),
+        None
+    );
+    index_read.release.notify_one();
+
+    let (_, audited, _) = tokio::time::timeout(Duration::from_secs(2), audit)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a Commit landing mid-audit must not split the head from its handoff pin");
+    assert!(matches!(
+        audited,
+        AuditedRecoveryCheckpoint::Active { ref checkpoint, .. }
+            if *checkpoint == decision.recovery_checkpoint
+    ));
+    let (_, reaudited, _) =
+        audit_materialized_recovery_with_authority(&durable, Some(&authority), &target)
+            .await
+            .unwrap();
+    assert!(matches!(
+        reaudited,
+        AuditedRecoveryCheckpoint::Consumed { ref checkpoint, .. } if *checkpoint == target_head
+    ));
+    db.close();
+}
+
 fn propagated_recovery_takeover_case() -> futures::future::BoxFuture<'static, ()> {
     Box::pin(async move {
         const AUTHORITY_IO_DEADLINE: Duration = Duration::from_secs(15);
