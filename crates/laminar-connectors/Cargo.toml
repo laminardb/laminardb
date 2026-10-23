@@ -213,7 +213,7 @@ nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 [dev-dependencies]
 apache-avro = { workspace = true }
 proptest = { workspace = true }
-rcgen = "0.13"
+rcgen = "0.14"
 criterion = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
