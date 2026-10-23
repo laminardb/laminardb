@@ -53,6 +53,8 @@ use crate::sql_analysis::{
 mod apply_failure;
 mod batch_coalescing;
 #[cfg(feature = "cluster")]
+mod cluster_frontiers;
+#[cfg(feature = "cluster")]
 mod routing;
 #[cfg(feature = "cluster")]
 mod subscription_output;
@@ -781,6 +783,9 @@ pub(crate) struct SqlQueryOperator {
     last_broadcast: InputFrontier,
     #[cfg(feature = "cluster")]
     effective_frontier: InputFrontier,
+    /// This node's idle graph input, the committed cut, which an all-idle merge must not pass.
+    #[cfg(feature = "cluster")]
+    idle_close_ceiling: Option<i64>,
     #[cfg(feature = "cluster")]
     remote_peer_cursor: Option<u64>,
     #[cfg(feature = "cluster")]
@@ -863,6 +868,8 @@ impl SqlQueryOperator {
             last_broadcast: InputFrontier::default(),
             #[cfg(feature = "cluster")]
             effective_frontier: InputFrontier::default(),
+            #[cfg(feature = "cluster")]
+            idle_close_ceiling: Some(i64::MIN),
             #[cfg(feature = "cluster")]
             remote_peer_cursor: None,
             #[cfg(feature = "cluster")]
@@ -1423,7 +1430,7 @@ impl SqlQueryOperator {
                     ),
                     i64::MIN,
                 );
-                if merged != effective {
+                if !super::frontier::restored_frontier_matches(effective, merged) {
                     return Err(DbError::Checkpoint(format!(
                         "aggregate '{}' donor {} portable frontiers do not form one drained cut",
                         self.op_name, restore.participant_id
@@ -1790,47 +1797,13 @@ impl SqlQueryOperator {
                 self.op_name
             )));
         }
-        let normalized = super::frontier::normalize_restored_local_frontier(
+        let normalized = super::frontier::normalize_local_frontier_without_peer_echo(
             input,
             self.local_frontier,
             self.effective_frontier.watermark,
         );
         self.validate_frontier(self.local_frontier, normalized, "local")?;
         Ok(normalized)
-    }
-
-    #[cfg(feature = "cluster")]
-    fn effective_cluster_frontier(
-        &self,
-        local: InputFrontier,
-        consumed: Option<(u64, InputFrontier, bool)>,
-    ) -> Result<InputFrontier, DbError> {
-        let remote = self.peer_channels.iter().map(|(&peer, channel)| {
-            let (mut applied, pending) = if let Some((target, applied, pending)) = consumed {
-                if target == peer {
-                    (applied, pending)
-                } else {
-                    (channel.applied, !channel.events.is_empty())
-                }
-            } else {
-                (channel.applied, !channel.events.is_empty())
-            };
-            if pending {
-                applied.idle = false;
-                applied.watermark =
-                    Self::max_watermark(applied.watermark, self.effective_frontier.watermark);
-            }
-            applied
-        });
-        let merged = merge_input_frontier_iter(std::iter::once(local).chain(remote), i64::MIN);
-        self.validate_frontier(self.effective_frontier, merged, "effective")?;
-        if self.pending_cluster_input.is_some() {
-            return Ok(InputFrontier {
-                watermark: self.effective_frontier.watermark,
-                idle: false,
-            });
-        }
-        Ok(merged)
     }
 
     #[cfg(feature = "cluster")]
@@ -2096,6 +2069,7 @@ impl SqlQueryOperator {
         inputs: &[Vec<RecordBatch>],
         frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        self.idle_close_ceiling = super::frontier::idle_close_ceiling(frontier);
         let (config, assignment, peers) = match self.active_cluster_scope() {
             Ok(scope) => scope,
             Err(error) if self.pending_cluster_input.is_some() => {
@@ -3034,8 +3008,8 @@ impl GraphOperator for SqlQueryOperator {
                 })),
                 i64::MIN,
             );
-            if merged.watermark != effective_frontier.watermark
-                || (queued_remote_events == 0 && merged != effective_frontier)
+            if !super::frontier::restored_frontier_matches(effective_frontier, merged)
+                && (merged.watermark != effective_frontier.watermark || queued_remote_events == 0)
             {
                 return Err(DbError::Checkpoint(format!(
                     "aggregate '{}' restored channel frontiers do not form its effective cut",

@@ -37,6 +37,12 @@ pub(crate) fn normalize_local_frontier_without_peer_echo(
     normalize_restored_local_frontier(input, installed, effective_floor)
 }
 
+/// The ceiling an all-idle merge may close to: this node's idle graph input, which the graph caps
+/// at the committed cut. An active input imposes none.
+pub(crate) fn idle_close_ceiling(input: InputFrontier) -> Option<i64> {
+    input.idle.then(|| input.watermark.unwrap_or(i64::MIN))
+}
+
 /// Bound an all-idle peer merge. Idle channels never echo the applied cut, so the merge can trail
 /// it; hold there instead of regressing. A reader idle at its own higher watermark must not close
 /// past `idle_ceiling`, this node's committed cut, where a second idle reader revives.

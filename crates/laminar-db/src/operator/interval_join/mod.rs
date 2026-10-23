@@ -4110,11 +4110,8 @@ impl IntervalJoinOperator {
         left_frontier: InputFrontier,
         right_frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        self.idle_close_ceilings = [left_frontier, right_frontier].map(|frontier| {
-            frontier
-                .idle
-                .then(|| frontier.watermark.unwrap_or(i64::MIN))
-        });
+        self.idle_close_ceilings =
+            [left_frontier, right_frontier].map(super::frontier::idle_close_ceiling);
         let scope = self.active_cluster_scope();
         let (config, assignment, peers) = match scope {
             Ok(scope) => scope,

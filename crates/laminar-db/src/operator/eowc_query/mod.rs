@@ -1628,9 +1628,7 @@ impl EowcQueryOperator {
         inputs: &[Vec<RecordBatch>],
         frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        self.idle_close_ceiling = frontier
-            .idle
-            .then(|| frontier.watermark.unwrap_or(i64::MIN));
+        self.idle_close_ceiling = super::frontier::idle_close_ceiling(frontier);
         let (config, assignment, peers) = self.active_cluster_scope()?;
         match self.finish_pending_cluster_input().await? {
             PendingEowcCompletion::Applied(output) => return Ok(output),
