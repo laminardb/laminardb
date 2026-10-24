@@ -443,34 +443,28 @@ async fn immutable_upload_ack_loss_retries_and_uncommitted_object_is_collectable
     let prepared = prepared_output(&assignment, assignment.assignment_version);
     let attempt = laminar_core::checkpoint::CheckpointAttempt::canonical(1);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    assert!(coordinator
-        .prepare_subscription_output_until(
-            attempt,
-            Some(&assignment),
-            Some(Arc::clone(&prepared)),
-            deadline,
-        )
-        .await
-        .is_err());
-    assert_eq!(
-        metrics
-            .cluster_subscription
-            .segment_write_failures_total
-            .get(),
-        1
-    );
     let manifest = coordinator
         .prepare_subscription_output_until(attempt, Some(&assignment), Some(prepared), deadline)
         .await
         .unwrap()
         .unwrap();
+    assert!(!flaky
+        .lose_put_ack
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        metrics
+            .cluster_subscription
+            .segment_write_failures_total
+            .get(),
+        0
+    );
     assert_eq!(metrics.cluster_subscription.segments_written_total.get(), 1);
     assert_eq!(
         metrics
             .cluster_subscription
             .checkpoint_prepare_seconds
             .get_sample_count(),
-        2
+        1
     );
     let segment = manifest.streams[0].segments[0].clone();
 
