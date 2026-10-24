@@ -58,7 +58,7 @@ jobs:
       actions: read # read workflow run status (private repos / scheduled)
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The all-features dependency graph (datafusion, deltalake, aws-lc,
       # rdkafka, onnx, ...) is large; free disk + add swap so extraction does
