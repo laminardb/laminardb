@@ -813,3 +813,225 @@ async fn orphan_cleanup_uses_committed_reachability_and_attempt_bounds() {
     );
 }
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy)]
+enum CreateFault {
+    /// The request never reaches the store and never returns.
+    Stall,
+    /// The store applies the request, but its response never returns.
+    ApplyThenStall,
+    /// The request fails in transport.
+    TransportError,
+}
+
+/// Faults the first `remaining` creates of any path ending in `suffix`.
+#[derive(Debug)]
+struct CreateFaultStore {
+    inner: object_store::memory::InMemory,
+    suffix: &'static str,
+    fault: CreateFault,
+    remaining: std::sync::atomic::AtomicU32,
+    attempts: std::sync::atomic::AtomicU32,
+}
+
+impl CreateFaultStore {
+    fn new(suffix: &'static str, fault: CreateFault, count: u32) -> Self {
+        Self {
+            inner: object_store::memory::InMemory::new(),
+            suffix,
+            fault,
+            remaining: count.into(),
+            attempts: 0.into(),
+        }
+    }
+
+    fn attempts(&self) -> u32 {
+        self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for CreateFaultStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CreateFaultStore({:?})", self.fault)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CreateFaultStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        use std::sync::atomic::Ordering;
+        if !location.as_ref().ends_with(self.suffix) {
+            return self.inner.put_opts(location, payload, opts).await;
+        }
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        let faulted = self
+            .remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok();
+        if !faulted {
+            return self.inner.put_opts(location, payload, opts).await;
+        }
+        match self.fault {
+            CreateFault::Stall => std::future::pending().await,
+            CreateFault::ApplyThenStall => {
+                self.inner.put_opts(location, payload, opts).await?;
+                std::future::pending().await
+            }
+            CreateFault::TransportError => Err(object_store::Error::Generic {
+                store: "CreateFaultStore",
+                source: "error sending request".into(),
+            }),
+        }
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+async fn save_through(
+    faults: &Arc<CreateFaultStore>,
+) -> (Result<Bytes, CheckpointStoreError>, std::time::Duration) {
+    let backing: Arc<dyn ObjectStore> = Arc::clone(faults) as Arc<dyn ObjectStore>;
+    let store = store(backing);
+    let payload = Bytes::from_static(b"bcdef");
+    let manifest = manifest_with_payload(&payload);
+    let started = tokio::time::Instant::now();
+    let saved = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        store.save_checkpoint(&manifest, std::slice::from_ref(&payload)),
+    )
+    .await
+    .expect("every create attempt must be bounded");
+    if saved.is_ok() {
+        assert_eq!(store.load_manifest(7).await.unwrap(), Some(manifest));
+    }
+    (saved, started.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_node_data_create_is_retried_within_a_checkpoint_deadline() {
+    let faults = Arc::new(CreateFaultStore::new(
+        "node-data.bin",
+        CreateFault::Stall,
+        1,
+    ));
+
+    let (saved, elapsed) = save_through(&faults).await;
+
+    saved.unwrap();
+    assert_eq!(faults.attempts(), 2);
+    assert!(elapsed < std::time::Duration::from_secs(30), "{elapsed:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn applied_but_unacknowledged_manifest_create_is_read_back_on_retry() {
+    let faults = Arc::new(CreateFaultStore::new(
+        "manifest.json",
+        CreateFault::ApplyThenStall,
+        1,
+    ));
+
+    let (saved, _) = save_through(&faults).await;
+
+    saved.unwrap();
+    assert_eq!(faults.attempts(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transport_failure_on_create_is_retried() {
+    let faults = Arc::new(CreateFaultStore::new(
+        "node-data.bin",
+        CreateFault::TransportError,
+        1,
+    ));
+
+    let (saved, _) = save_through(&faults).await;
+
+    saved.unwrap();
+    assert_eq!(faults.attempts(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn create_retries_are_bounded() {
+    let faults = Arc::new(CreateFaultStore::new(
+        "node-data.bin",
+        CreateFault::Stall,
+        u32::MAX,
+    ));
+
+    let (saved, elapsed) = save_through(&faults).await;
+
+    let error = saved.unwrap_err();
+    assert!(error.to_string().contains("after 3 attempts"), "{error}");
+    assert_eq!(faults.attempts(), 3);
+    assert_eq!(elapsed, std::time::Duration::from_secs(10 + 20 + 40));
+}
+
+#[test]
+fn create_attempt_timeout_scales_with_payload_size() {
+    use super::object_store_io::create_attempt_timeout;
+
+    assert_eq!(
+        create_attempt_timeout(0),
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+        create_attempt_timeout(16 * 1024 * 1024),
+        std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+        create_attempt_timeout(512 * 1024 * 1024),
+        std::time::Duration::from_secs(128)
+    );
+}
