@@ -812,66 +812,130 @@ async fn external_commit_pressure_keeps_completion_live_and_source_queued() {
 
 #[tokio::test]
 async fn checkpoint_backpressure_queues_source_input_until_a_barrier_is_in_flight() {
-    for barrier_in_flight in [false, true] {
-        let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (source_tx, rx) = test_source_channel(4);
-        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
-        let mut coordinator = test_coordinator(
-            rx,
-            control_rx,
-            Arc::clone(&shutdown),
-            DeliveryGuarantee::AtLeastOnce,
-            None,
-        );
-        if barrier_in_flight {
-            coordinator
-                .pending_barrier
-                .reset(CheckpointAttempt::new(7, 7), 1);
+    assert_checkpoint_backpressure_releases_input_with_cut(false, |_| {}).await;
+    assert_checkpoint_backpressure_releases_input_with_cut(true, |coordinator| {
+        coordinator
+            .pending_barrier
+            .reset(CheckpointAttempt::new(7, 7), 1);
+    })
+    .await;
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_backpressure_releases_input_until_a_pending_drain_cut_is_delivered() {
+    let round = AssignmentDrainId {
+        predecessor_version: 7,
+        target_version: 8,
+        digest: [9; 32],
+    };
+    let participant = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: uuid::Uuid::from_u128(11),
+    };
+    let delivered = SourceDrainTaskStatus::Ready(SourceDrainReceipt {
+        round,
+        participant,
+        source_task_incarnation: uuid::Uuid::from_u128(101),
+    });
+    // `Idle` is a source actor blocked on the full FIFO before it observed the Begin command.
+    // An exited actor retains its Begin but can deliver no further input.
+    for (live, status, cut_in_flight) in [
+        (true, SourceDrainTaskStatus::Idle, true),
+        (true, SourceDrainTaskStatus::Pausing(round), true),
+        (true, delivered, false),
+        (false, SourceDrainTaskStatus::Idle, false),
+    ] {
+        let (source, _barrier_poll) =
+            source_handle_with_actor("test_source", move |mut epoch_committed_rx| async move {
+                while live && epoch_committed_rx.changed().await.is_ok() {}
+            });
+        if !live {
+            assert!(
+                source
+                    .task
+                    .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                    .await
+            );
         }
-        source_tx
-            .send(SourceMsg::Batch {
-                source_idx: 0,
-                batch: int_batch(42),
-                cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
-            })
-            .await
-            .unwrap();
-
-        let callback = MockCallback::new();
-        callback
-            .external_checkpoint_backpressure
-            .store(true, Ordering::Release);
-        let pressure = Arc::clone(&callback.external_checkpoint_backpressure);
-        let written_rows = Arc::clone(&callback.written_rows);
-        let observed_rows = Arc::clone(&written_rows);
-        let release = tokio::spawn(async move {
-            if !barrier_in_flight {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                assert_eq!(
-                    observed_rows.load(Ordering::Acquire),
-                    0,
-                    "source input ran before a checkpoint could release pending output"
-                );
-                pressure.store(false, Ordering::Release);
-            }
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while observed_rows.load(Ordering::Acquire) == 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("source input did not run");
-            shutdown.notify_one();
+        let (command_tx, _command_rx) =
+            tokio::sync::watch::channel(Some(SourceDrainCommand::Begin {
+                request: SourceDrainRequest::new(round).unwrap(),
+                participant,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+            }));
+        let (status_tx, _status_rx) = tokio::sync::watch::channel(status);
+        source.task.install_drain_control(SourceDrainLeaseControl {
+            task_incarnation: uuid::Uuid::from_u128(101),
+            command_tx,
+            status_tx,
+            wake: Arc::new(tokio::sync::Notify::new()),
         });
-
-        let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
-            .await
-            .expect("coordinator did not settle checkpoint backpressure");
-        release.await.unwrap();
-        drop(source_tx);
-        assert!(matches!(exit, ExitReason::Shutdown));
-        assert_eq!(written_rows.load(Ordering::Acquire), 1);
+        assert_checkpoint_backpressure_releases_input_with_cut(cut_in_flight, |coordinator| {
+            coordinator.source_handles.push(source);
+        })
+        .await;
     }
+}
+
+async fn assert_checkpoint_backpressure_releases_input_with_cut(
+    cut_in_flight: bool,
+    install_cut: impl FnOnce(&mut StreamingCoordinator),
+) {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (source_tx, rx) = test_source_channel(4);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::clone(&shutdown),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    install_cut(&mut coordinator);
+    source_tx
+        .send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(42),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
+        })
+        .await
+        .unwrap();
+
+    let callback = MockCallback::new();
+    callback
+        .external_checkpoint_backpressure
+        .store(true, Ordering::Release);
+    let pressure = Arc::clone(&callback.external_checkpoint_backpressure);
+    let written_rows = Arc::clone(&callback.written_rows);
+    let observed_rows = Arc::clone(&written_rows);
+    let release = tokio::spawn(async move {
+        if !cut_in_flight {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(
+                observed_rows.load(Ordering::Acquire),
+                0,
+                "source input ran before a checkpoint could release pending output"
+            );
+            pressure.store(false, Ordering::Release);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed_rows.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source input did not run");
+        shutdown.notify_one();
+    });
+
+    let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
+        .await
+        .expect("coordinator did not settle checkpoint backpressure");
+    release.await.unwrap();
+    drop(source_tx);
+    assert!(matches!(exit, ExitReason::Shutdown));
+    assert_eq!(written_rows.load(Ordering::Acquire), 1);
 }
 
 fn assignment_fence(
@@ -2605,14 +2669,25 @@ async fn intake_gate_close_after_receive_parks_fifo_message_until_reopen() {
 fn checkpoint_source_handle(
     name: &str,
 ) -> (SourceHandle, laminar_core::checkpoint::BarrierPollHandle) {
+    source_handle_with_actor(name, |_epoch_committed_rx| async {})
+}
+
+/// The actor receives the commit watch that coordinator shutdown closes to release it.
+fn source_handle_with_actor<F>(
+    name: &str,
+    actor: impl FnOnce(tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>) -> F,
+) -> (SourceHandle, laminar_core::checkpoint::BarrierPollHandle)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let barrier_injector = CheckpointBarrierInjector::new();
     let barrier_handle = barrier_injector.handle();
-    let (epoch_committed_tx, _epoch_committed_rx) = tokio::sync::watch::channel(None);
+    let (epoch_committed_tx, epoch_committed_rx) = tokio::sync::watch::channel(None);
     let (barrier_release_tx, _barrier_release_rx) = tokio::sync::watch::channel(None);
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let expected_shutdown = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Handle::current();
-    let (join, actor_terminal) = spawn_source_actor(&runtime, async {});
+    let (join, actor_terminal) = spawn_source_actor(&runtime, actor(epoch_committed_rx));
     let task = SourceTaskLease::supervise(
         Arc::from(name),
         shutdown,
