@@ -711,37 +711,37 @@ impl RecoveryMonitor {
             }
         }
 
-        let observed = match tokio::time::timeout(
-            DECISION_IO_TIMEOUT,
-            controller.observe_recover_control(),
-        )
-        .await
-        {
-            Err(_) => {
-                controller.set_recovering(true);
-                db.set_source_gate(true);
-                return;
+        let read = tokio::time::timeout(DECISION_IO_TIMEOUT, controller.observe_recover_control())
+            .await
+            .unwrap_or_else(|_| Err(RecoveryControlError::Uncertain("read timed out".into())));
+        let observed = match read {
+            Ok(observed) => {
+                self.last_protocol_error = None;
+                observed
             }
-            Ok(result) => match result {
-                Ok(observed) => {
-                    self.last_protocol_error = None;
-                    observed
-                }
-                Err(RecoveryControlError::Uncertain(error)) => {
+            Err(RecoveryControlError::Uncertain(error)) => {
+                tracing::warn!(%error, "coordinated-recovery intent is temporarily unreadable");
+                // Outside a round, the unread intent can only be a Prepare this process has not
+                // stopped for yet; a later poll observes it and its driver waits for the stopped
+                // report. Nothing but a round's Release would reopen a gate closed here.
+                if controller.is_recovering()
+                    || db.coordinated_recovery_in_progress()
+                    || self.stopped_for.is_some()
+                    || self.restored_for.is_some()
+                {
                     controller.set_recovering(true);
                     db.set_source_gate(true);
-                    tracing::warn!(%error, "coordinated-recovery intent is temporarily unreadable");
-                    return;
                 }
-                Err(RecoveryControlError::Superseded(_)) => {
-                    self.observe_orphans(db, controller).await;
-                    return;
-                }
-                Err(RecoveryControlError::Conflict(error)) => {
-                    self.hold_for_protocol_error(db, controller, error).await;
-                    return;
-                }
-            },
+                return;
+            }
+            Err(RecoveryControlError::Superseded(_)) => {
+                self.observe_orphans(db, controller).await;
+                return;
+            }
+            Err(RecoveryControlError::Conflict(error)) => {
+                self.hold_for_protocol_error(db, controller, error).await;
+                return;
+            }
         };
         let current = match observed
             .filter(|announcement| controller.recovery_driver_is_current(&announcement.round))

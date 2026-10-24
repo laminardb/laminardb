@@ -116,6 +116,28 @@ impl object_store::ObjectStore for RecoveryAuthorityReadGateStore {
     }
 }
 
+struct UnreadableIntentKv;
+
+#[async_trait::async_trait]
+impl ClusterKv for UnreadableIntentKv {
+    async fn write(&self, _key: &str, _value: String) {}
+
+    async fn read_from(&self, _who: NodeId, _key: &str) -> Option<String> {
+        None
+    }
+
+    async fn read_from_checked(&self, _who: NodeId, key: &str) -> Result<Option<String>, String> {
+        if key == "control:recover" {
+            return Err("read timed out after 5s".into());
+        }
+        Ok(None)
+    }
+
+    async fn scan(&self, _key: &str) -> Vec<(NodeId, String)> {
+        Vec::new()
+    }
+}
+
 #[test]
 fn recovery_timeout_envelope_covers_stop_and_stopped_reporting() {
     let internal_stop = Duration::from_secs(210);
@@ -830,6 +852,52 @@ async fn healthy_monitor_does_not_require_terminal_authority() {
     assert!(!db.cluster_intake_fenced());
     assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
     assert!(monitor.last_protocol_error.is_none());
+}
+
+async fn unreadable_intent_monitor_fixture(
+    recovering: bool,
+) -> (Arc<ClusterController>, Arc<LaminarDB>) {
+    let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
+    let controller = Arc::new(ClusterController::new(
+        NodeId(1),
+        Arc::new(UnreadableIntentKv),
+        None,
+        members_rx,
+    ));
+    install_test_process_deadline(&controller);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+    db.set_source_gate(false);
+    controller.set_recovering(recovering);
+    assert!(controller.current_leader().is_some());
+    assert!(!db.cluster_intake_fenced());
+    (controller, db)
+}
+
+#[tokio::test]
+async fn unreadable_recovery_intent_outside_a_round_keeps_intake_open() {
+    let (controller, db) = unreadable_intent_monitor_fixture(false).await;
+    let mut monitor = RecoveryMonitor::default();
+
+    monitor.observe(&db, &controller, None).await;
+
+    assert!(!controller.is_recovering());
+    assert!(!db.cluster_intake_fenced());
+}
+
+#[tokio::test]
+async fn unreadable_recovery_intent_inside_a_round_closes_intake() {
+    let (controller, db) = unreadable_intent_monitor_fixture(true).await;
+    let mut monitor = RecoveryMonitor::default();
+
+    monitor.observe(&db, &controller, None).await;
+
+    assert!(controller.is_recovering());
+    assert!(db.cluster_intake_fenced());
 }
 
 #[tokio::test]
