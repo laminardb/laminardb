@@ -631,8 +631,8 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
-    /// `true` while a local topology submission waits for a gap between checkpoint artifact
-    /// reservations; periodic admission yields and manual requests proceed. Default `false`.
+    /// `true` while a local topology submission or assignment drain waits for a gap between
+    /// checkpoint cuts; periodic admission yields and manual requests proceed. Default `false`.
     fn periodic_checkpoints_held(&self) -> bool {
         false
     }

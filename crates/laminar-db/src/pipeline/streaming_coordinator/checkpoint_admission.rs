@@ -77,8 +77,8 @@ impl StreamingCoordinator {
         let retry_ready = self
             .checkpoint_retry_not_before
             .is_none_or(|deadline| Instant::now() >= deadline);
-        // A due periodic cut stays due; it waits only while this leader's topology submission
-        // needs the gap between artifact reservations that back-to-back cuts never leave.
+        // A due periodic cut stays due; it waits only while this leader's topology submission or
+        // assignment drain needs a gap between cuts that back-to-back cuts never leave.
         if !manual && (!interval || !retry_ready || callback.periodic_checkpoints_held()) {
             return None;
         }
