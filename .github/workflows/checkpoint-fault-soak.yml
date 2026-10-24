@@ -56,13 +56,15 @@ jobs:
         with:
           key: checkpoint-local-exact-kill9
       - name: Install system dependencies
-        # apt mirror fetches have hung for a full job timeout with no output; kill stalls
-        # and retry the identical package set.
+        # apt mirror fetches have hung, or crawled at tens of kB/s, for most of a job budget.
+        # Bound each fetch and retry it (partial downloads resume), then install from the cache.
         run: |
           set -euo pipefail
           packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler"
           for attempt in 1 2 3 4 5; do
-            if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
+            if timeout 300 sudo apt-get update \
+              && timeout 300 sudo apt-get install -y --download-only $packages \
+              && sudo apt-get install -y --no-download $packages; then
               exit 0
             fi
             echo "apt install attempt ${attempt} failed or stalled; retrying"
@@ -251,13 +253,15 @@ jobs:
         with:
           key: checkpoint-join-${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}
       - name: Install system dependencies
-        # apt mirror fetches have hung for a full job timeout with no output; kill stalls
-        # and retry the identical package set.
+        # apt mirror fetches have hung, or crawled at tens of kB/s, for most of a job budget.
+        # Bound each fetch and retry it (partial downloads resume), then install from the cache.
         run: |
           set -euo pipefail
           packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler"
           for attempt in 1 2 3 4 5; do
-            if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
+            if timeout 300 sudo apt-get update \
+              && timeout 300 sudo apt-get install -y --download-only $packages \
+              && sudo apt-get install -y --no-download $packages; then
               exit 0
             fi
             echo "apt install attempt ${attempt} failed or stalled; retrying"
@@ -361,9 +365,9 @@ jobs:
   cluster-coordinated-recovery:
     name: Coordinated recovery (${{ matrix.role }}, ${{ matrix.discovery }})
     runs-on: ubuntu-latest
-    # The fault soak and the process-remote qualification are two cold feature builds; a
-    # cancelled job never saves its cache, so the budget must fit both from scratch.
-    timeout-minutes: 90
+    # A cancelled job never saves its cache, so the budget must fit cold builds. The leader/static
+    # cell also qualifies process node loss: three soak-profile builds with different features.
+    timeout-minutes: ${{ matrix.role == 'leader' && matrix.discovery == 'static' && 120 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -388,13 +392,15 @@ jobs:
         with:
           key: checkpoint-cluster-recovery-${{ matrix.role }}-${{ matrix.discovery }}
       - name: Install system dependencies
-        # apt mirror fetches have hung for a full job timeout with no output; kill stalls
-        # and retry the identical package set.
+        # apt mirror fetches have hung, or crawled at tens of kB/s, for most of a job budget.
+        # Bound each fetch and retry it (partial downloads resume), then install from the cache.
         run: |
           set -euo pipefail
           packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler"
           for attempt in 1 2 3 4 5; do
-            if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
+            if timeout 300 sudo apt-get update \
+              && timeout 300 sudo apt-get install -y --download-only $packages \
+              && sudo apt-get install -y --no-download $packages; then
               exit 0
             fi
             echo "apt install attempt ${attempt} failed or stalled; retrying"
