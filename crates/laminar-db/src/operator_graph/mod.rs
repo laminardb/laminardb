@@ -3275,8 +3275,12 @@ impl OperatorGraph {
             )
         })?;
         let _rotation_guard = Arc::clone(rotation_fence).read_owned().await;
+        // An ownerless process never binds the replayed topology generation its graph was built
+        // for, and its zero-owner transition requires that inactive transport.
         if let Some(scope) = &self.cluster_shuffle {
-            scope.ensure_topology_current()?;
+            if !vnode_transition::shuffle_transport_is_inactive(scope) {
+                scope.ensure_topology_current()?;
+            }
         }
 
         // Waiting for assignment publication has not touched operator state. Cancellation after
@@ -3303,11 +3307,7 @@ impl OperatorGraph {
                     }
                     Some(version)
                 } else {
-                    if config.sender.assignment_version() != 0
-                        || config.receiver.assignment_version() != 0
-                        || config.sender.active_assignment_digest().is_some()
-                        || config.receiver.active_assignment_digest().is_some()
-                    {
+                    if !vnode_transition::shuffle_transport_is_inactive(config) {
                         return Err(DbError::ShuffleNotReady(
                             "zero-owner vnode transition requires inactive shuffle transport"
                                 .into(),
