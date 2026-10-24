@@ -1160,7 +1160,7 @@ impl SnapshotWatcher {
                                 // The local graph still needs the installed predecessor authority
                                 // to consume its staged vnode transition. Keep the prior audited
                                 // snapshot/certificate cached and retry this successor next tick.
-                                debug!(
+                                warn!(
                                     error = %error,
                                     version = snap.version,
                                     "snapshot watcher: successor waits for local vnode transition"
