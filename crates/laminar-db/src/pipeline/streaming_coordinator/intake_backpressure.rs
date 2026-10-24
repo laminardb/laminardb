@@ -1,33 +1,43 @@
+#[cfg(feature = "cluster")]
+use super::drain_ownership::source_drain_awaits_intake;
 use super::{
-    CoordinatorGates, CoordinatorRunState, CycleError, PendingBarrier, PipelineCallback,
-    QueuedSourceMsg, StreamingCoordinator,
+    CoordinatorGates, CoordinatorRunState, CycleError, PipelineCallback, QueuedSourceMsg,
+    StreamingCoordinator,
 };
 
 impl CoordinatorGates {
-    pub(super) fn capture(
-        callback: &mut impl PipelineCallback,
-        replay_pending: bool,
-        pending_barrier: &PendingBarrier,
-    ) -> Self {
-        let intake_paused = callback.intake_paused();
-        if intake_paused || replay_pending {
-            let _ = callback.is_recovering();
-        }
-        let external_output_backpressured = callback
-            .external_output_pressure()
-            .pauses_intake(pending_barrier.active);
-        Self {
-            intake_paused,
-            external_output_backpressured,
-        }
-    }
-
     pub(super) fn compute_admitted(&self) -> bool {
         !self.intake_paused && !self.external_output_backpressured
     }
 }
 
 impl StreamingCoordinator {
+    pub(super) fn capture_gates(&self, callback: &mut impl PipelineCallback) -> CoordinatorGates {
+        let intake_paused = callback.intake_paused();
+        if intake_paused || self.replay_pending {
+            let _ = callback.is_recovering();
+        }
+        let external_output_backpressured =
+            callback.external_output_pressure().pauses_intake(|| {
+                self.pending_barrier.active || {
+                    #[cfg(feature = "cluster")]
+                    {
+                        self.source_handles
+                            .iter()
+                            .any(|source| source_drain_awaits_intake(&source.task))
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    {
+                        false
+                    }
+                }
+            });
+        CoordinatorGates {
+            intake_paused,
+            external_output_backpressured,
+        }
+    }
+
     pub(super) async fn service_paused_intake(
         &mut self,
         callback: &mut impl PipelineCallback,

@@ -1,10 +1,10 @@
 //! Mechanically extracted coordinator responsibility.
 
 use super::{
-    wait_coordinator_delay, CheckpointCompletion, CheckpointControlWake, CoordinatorGates,
-    CoordinatorRunState, CoordinatorWait, CoordinatorWaitAction, CoordinatorWake, CycleError,
-    Duration, ExitReason, ForceCheckpointRequest, Instant, PipelineCallback, SourceHandle,
-    StreamingCoordinator, IDLE_TIMEOUT,
+    wait_coordinator_delay, CheckpointCompletion, CheckpointControlWake, CoordinatorRunState,
+    CoordinatorWait, CoordinatorWaitAction, CoordinatorWake, CycleError, Duration, ExitReason,
+    ForceCheckpointRequest, Instant, PipelineCallback, SourceHandle, StreamingCoordinator,
+    IDLE_TIMEOUT,
 };
 
 impl StreamingCoordinator {
@@ -40,7 +40,7 @@ impl StreamingCoordinator {
             ));
             return CoordinatorWait::stop();
         }
-        let gates = CoordinatorGates::capture(callback, self.replay_pending, &self.pending_barrier);
+        let gates = self.capture_gates(callback);
         let replay_ready = self.replay_pending
             && gates.compute_admitted()
             && (self.manual_handoff_required || callback.has_runnable_deferred_input());

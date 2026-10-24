@@ -413,7 +413,7 @@ fn unprepared_output_holds_intake_at_the_commit_high_water() {
         state.output_pressure(),
         ExternalOutputPressure::CheckpointDue
     );
-    assert!(!state.output_pressure().pauses_intake(false));
+    assert!(!state.output_pressure().pauses_intake(|| false));
 
     state
         .stage_cycle(
@@ -428,8 +428,8 @@ fn unprepared_output_holds_intake_at_the_commit_high_water() {
         ExternalOutputPressure::CheckpointBackpressured
     );
     assert!(state.output_pressure().checkpoint_due());
-    assert!(state.output_pressure().pauses_intake(false));
-    assert!(!state.output_pressure().pauses_intake(true));
+    assert!(state.output_pressure().pauses_intake(|| false));
+    assert!(!state.output_pressure().pauses_intake(|| true));
 
     let attempt = CheckpointAttempt::canonical(1);
     state.reserve_checkpoint(attempt).unwrap();
