@@ -13,7 +13,6 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use laminar_core::checkpoint::EventTimeBounds;
 
 use super::ViewShape;
-use crate::mv_store::append_log::ViewRetention;
 use crate::mv_store::slices::vnode_for_encoded;
 use crate::mv_store::{MvStorageMode, ViewKey};
 
@@ -46,13 +45,13 @@ impl ScanPruning {
                     time: None,
                 }
             }
-            MvStorageMode::AppendLog {
-                retention: ViewRetention::EventTime { column, .. },
-            } => Self {
-                vnode: None,
-                time: Some(time_range(shape.schema.field(*column).name(), filters)),
+            MvStorageMode::AppendLog { retention } => match retention.event_time_column() {
+                Some(column) => Self {
+                    vnode: None,
+                    time: Some(time_range(shape.schema.field(column).name(), filters)),
+                },
+                None => Self::default(),
             },
-            MvStorageMode::AppendLog { .. } => Self::default(),
         }
     }
 
@@ -195,6 +194,7 @@ mod tests {
 
     use super::*;
     use crate::mv_store::admission::MvLimits;
+    use crate::mv_store::append_log::ViewRetention;
 
     fn shape(mode: MvStorageMode) -> ViewShape {
         ViewShape {

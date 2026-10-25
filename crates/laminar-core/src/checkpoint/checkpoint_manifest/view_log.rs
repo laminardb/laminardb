@@ -9,7 +9,8 @@ use super::{
 };
 
 /// Most segments one manifest may retain across every view log. The bound keeps the manifest
-/// within its encoded-size limit; compacting a partition's segments is what lifts it.
+/// within its encoded-size limit; compaction merges a log's segments, so their number follows
+/// the log's bytes rather than the checkpoints that wrote it.
 pub const MAX_VIEW_LOG_SEGMENTS: usize = 32_768;
 
 /// Inclusive event-time range of one segment's rows.
@@ -121,7 +122,7 @@ pub(super) fn validate_view_logs(manifest: &CheckpointManifest, error: &mut impl
     if segment_count > MAX_VIEW_LOG_SEGMENTS {
         error(format!(
             "view logs retain {segment_count} segments; a manifest admits at most \
-             {MAX_VIEW_LOG_SEGMENTS} until segments are compacted"
+             {MAX_VIEW_LOG_SEGMENTS}"
         ));
     }
     for reference in &manifest.referenced_view_logs {

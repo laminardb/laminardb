@@ -777,8 +777,9 @@ checkpoints keep:
   interval. A view that declares nothing keeps 1 hour.
 - `WITH (retention = '<n> rows')`: the latest `n` rows. A view without an event-time column (over
   an interval join, or over a source without a watermark) must declare it.
-- `'unbounded'` is rejected until log compaction is available, and a changelog view rejects
-  `retention`.
+- `WITH (retention = 'unbounded')`: every row. It needs checkpointing, because without it the
+  whole log stays in memory.
+- A changelog view rejects `retention`.
 
 ```sql
 CREATE MATERIALIZED VIEW minute_volume AS
@@ -790,11 +791,17 @@ WITH (retention = '6 hours');
 
 Rows waiting for the next checkpoint count against `materialized_view_max_rows` and
 `materialized_view_max_bytes`, and a cycle that would exceed them fails instead of dropping rows.
-Without checkpointing the whole retained log stays in memory under the same limits. Each checkpoint
-adds at most one segment per view, and one checkpoint retains at most 32,768 segments across all
-views: 24 hours at a 10-second checkpoint interval is 8,640 segments per view. A row whose event
-time is NULL is not returned once the view has a watermark. Earlier releases kept the last
+Without checkpointing the whole retained log stays in memory under the same limits. A row whose
+event time is NULL is not returned once the view has a watermark. Earlier releases kept the last
 1,000 batches of an append view instead.
+
+Each checkpoint adds at most one segment per view. After each checkpoint, a background task
+merges consecutive older segments of a view, up to 16 MiB each, into one segment without the rows
+its retention no longer keeps, and the next checkpoint writes it in their place; reads do not
+change. A view therefore keeps a few dozen segments plus about one per 8 to 16 MiB of retained
+rows, whatever its age. One checkpoint retains at most 32,768 segments across all views, so
+`unbounded` views can grow to roughly 256 to 512 GiB of encoded rows per node before checkpoints
+fail with an error naming the largest view.
 
 ### 8. Committed reads see one checkpoint; `freshness` bounds how old it may be
 
@@ -813,8 +820,8 @@ interval. A committed read needs checkpointing, may scan only materialized views
 checkpoint for at most 30 seconds, which also bounds the wait for `AtLeast`. A view with a
 row-count retention is not exact, because which rows the cap keeps depends on arrival order.
 Equality filters on every key column of an aggregate view read only the state of that key's
-vnode, and range filters on the event-time column of an append view kept by an interval skip
-segments outside the range.
+vnode, and range filters on the event-time column of an append view kept by an interval or
+`unbounded` skip segments outside the range.
 Decoded checkpoint state is cached up to `materialized_view_read_cache_bytes` (256 MiB).
 
 `WITH (freshness = '<interval>')` declares the most committed reads of a view may lag. `CREATE`

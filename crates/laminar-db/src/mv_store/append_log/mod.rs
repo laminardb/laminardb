@@ -1,17 +1,24 @@
 //! Append-only views. Rows appended since the last capture stay in memory; each capture seals
 //! them into one log segment that the checkpoint writes, and retention decides which committed
-//! segments the checkpoint keeps. Committed segments are read back from the checkpoint store.
+//! segments the checkpoint keeps. Committed segments are read back from the checkpoint store,
+//! and compaction merges them.
 
+mod compaction;
 mod read;
 mod retention;
 
+use std::ops::Range;
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use laminar_core::checkpoint::{EventTimeBounds, ViewLog};
+use laminar_core::checkpoint::{EventTimeBounds, ViewLog, ViewLogSegment};
 use laminar_core::streaming::retained_arrow_bytes;
 
 use super::admission::{size_overflow, MvLimits};
 use crate::error::DbError;
+pub(crate) use compaction::{spawn_compactor, TARGET_SEGMENT_BYTES};
+use compaction::{CompactedSegment, PreparedCompaction};
 pub(crate) use read::{LogRead, LogReadError};
 pub(crate) use retention::ViewRetention;
 
@@ -27,6 +34,23 @@ pub(crate) struct SegmentMeta {
     pub(crate) event_time: Option<EventTimeBounds>,
 }
 
+impl SegmentMeta {
+    const fn position(&self) -> (u16, u64) {
+        (self.partition, self.sequence)
+    }
+}
+
+impl From<&ViewLogSegment> for SegmentMeta {
+    fn from(segment: &ViewLogSegment) -> Self {
+        Self {
+            partition: segment.partition,
+            sequence: segment.sequence,
+            rows: segment.rows,
+            event_time: segment.event_time,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LogBatch {
     batch: RecordBatch,
@@ -39,6 +63,7 @@ struct InFlightCapture {
     checkpoint_id: u64,
     committed: Vec<SegmentMeta>,
     sealed: Vec<LogBatch>,
+    compacted: Option<Arc<PreparedCompaction>>,
 }
 
 pub(super) struct AppendLogState {
@@ -50,6 +75,14 @@ pub(super) struct AppendLogState {
     next_sequence: u64,
     /// Greatest event-time frontier the view has reached.
     frontier: Option<i64>,
+    /// A merge prepared from a committed checkpoint; the next capture that still retains its
+    /// inputs writes it in their place.
+    prepared: Option<Arc<PreparedCompaction>>,
+    /// The oldest committed checkpoint whose segment positions name the segments this log
+    /// holds: the commit that first held the log or last merged its segments. A merged segment
+    /// takes its first input's position, so a merge prepared from an older checkpoint may name
+    /// a position whose segment has since been replaced.
+    positions_since: Option<u64>,
     /// Rows and retained bytes held in memory: staged and sealed batches.
     pub(super) rows: usize,
     pub(super) bytes: usize,
@@ -74,6 +107,7 @@ pub(crate) struct ViewLogCapture {
     pub(crate) next_sequence: u64,
     pub(crate) frontier: Option<i64>,
     pub(crate) retained: Vec<(u16, u64)>,
+    pub(crate) compacted: Option<CompactedSegment>,
     pub(crate) sealed: Option<SealedSegment>,
 }
 
@@ -94,26 +128,20 @@ impl AppendLogState {
             committed: Vec::new(),
             next_sequence: 0,
             frontier: None,
+            prepared: None,
+            positions_since: None,
             rows: 0,
             bytes: 0,
         }
     }
 
-    /// The log a committed checkpoint retained, with nothing held in memory.
-    pub(super) fn restored(retention: ViewRetention, log: &ViewLog) -> Self {
+    /// The log committed checkpoint `checkpoint_id` retained, with nothing held in memory.
+    pub(super) fn restored(retention: ViewRetention, log: &ViewLog, checkpoint_id: u64) -> Self {
         let mut state = Self::new(retention);
-        state.committed = log
-            .segments
-            .iter()
-            .map(|segment| SegmentMeta {
-                partition: segment.partition,
-                sequence: segment.sequence,
-                rows: segment.rows,
-                event_time: segment.event_time,
-            })
-            .collect();
+        state.committed = log.segments.iter().map(SegmentMeta::from).collect();
         state.next_sequence = log.next_sequence;
         state.frontier = log.frontier;
+        state.positions_since = Some(checkpoint_id);
         state
     }
 
@@ -170,6 +198,7 @@ impl AppendLogState {
                 .iter()
                 .take_while(|old| self.retention.expired(old.event_time, self.frontier))
                 .count(),
+            ViewRetention::Unbounded { .. } => 0,
             ViewRetention::Rows(limit) => {
                 let limit = usize::try_from(*limit).unwrap_or(usize::MAX);
                 let sealed: usize = self.in_flight.as_ref().map_or(0, |capture| {
@@ -204,8 +233,14 @@ impl AppendLogState {
     }
 
     /// Seal the staged rows into the next segment and decide which committed segments the
-    /// checkpoint keeps. The live state changes only when the checkpoint commits or aborts.
-    pub(super) fn capture(&mut self, checkpoint_id: u64) -> Result<ViewLogCapture, DbError> {
+    /// checkpoint keeps, writing the prepared merge in place of its inputs when `compact` allows
+    /// and the checkpoint still retains them. The live state changes only when the checkpoint
+    /// commits or aborts.
+    pub(super) fn capture(
+        &mut self,
+        checkpoint_id: u64,
+        compact: bool,
+    ) -> Result<ViewLogCapture, DbError> {
         if self
             .in_flight
             .as_ref()
@@ -228,10 +263,16 @@ impl AppendLogState {
         let mut committed = self
             .retention
             .retained(&self.committed, self.frontier, staged_rows);
-        let retained = committed
-            .iter()
-            .map(|segment| (segment.partition, segment.sequence))
-            .collect();
+        let merge = compact.then(|| self.prepared_merge(&committed)).flatten();
+        let run = merge.as_ref().map(|(run, _)| run.clone());
+        let compacted = merge
+            .as_ref()
+            .and_then(|(_, prepared)| prepared.output.clone());
+        let mut retained: Vec<(u16, u64)> = committed.iter().map(SegmentMeta::position).collect();
+        if let Some(run) = run {
+            retained.drain(run.clone());
+            committed.splice(run, compacted.iter().map(|segment| segment.meta.clone()));
+        }
         let sealed = if staged.is_empty() {
             None
         } else {
@@ -264,13 +305,52 @@ impl AppendLogState {
             checkpoint_id,
             committed,
             sealed: staged,
+            compacted: merge.map(|(_, prepared)| prepared),
         });
         Ok(ViewLogCapture {
             next_sequence: self.next_sequence,
             frontier: self.frontier,
             retained,
+            compacted,
             sealed,
         })
+    }
+
+    /// Where the prepared merge's inputs sit in `committed`, when they all still do, in order,
+    /// and its positions still name them.
+    fn prepared_merge(
+        &self,
+        committed: &[SegmentMeta],
+    ) -> Option<(Range<usize>, Arc<PreparedCompaction>)> {
+        let prepared = self.prepared.as_ref()?;
+        if self
+            .positions_since
+            .is_none_or(|since| prepared.base < since)
+        {
+            return None;
+        }
+        let first = *prepared.inputs.first()?;
+        let start = committed
+            .iter()
+            .position(|segment| segment.position() == first)?;
+        let run = start..start.checked_add(prepared.inputs.len())?;
+        let held = committed.get(run.clone())?;
+        held.iter()
+            .map(SegmentMeta::position)
+            .eq(prepared.inputs.iter().copied())
+            .then(|| (run, Arc::clone(prepared)))
+    }
+
+    /// Bytes of the prepared merge the next capture may write.
+    pub(super) fn prepared_bytes(&self) -> usize {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.output.as_ref())
+            .map_or(0, |segment| segment.payload.len())
+    }
+
+    pub(super) fn set_prepared(&mut self, prepared: Option<Arc<PreparedCompaction>>) {
+        self.prepared = prepared;
     }
 
     /// Recount memory after capture moved `sealed` out of the staged queue, dropping any
@@ -293,6 +373,13 @@ impl AppendLogState {
         for batch in &capture.sealed {
             self.rows -= batch.batch.num_rows();
             self.bytes -= batch.bytes;
+        }
+        if capture.compacted.is_some() || self.positions_since.is_none() {
+            self.positions_since = Some(checkpoint_id);
+        }
+        if let Some(compacted) = capture.compacted {
+            self.prepared
+                .take_if(|prepared| Arc::ptr_eq(prepared, &compacted));
         }
     }
 

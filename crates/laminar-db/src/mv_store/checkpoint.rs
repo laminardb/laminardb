@@ -11,7 +11,7 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::row::{OwnedRow, RowConverter};
 use datafusion_common::ScalarValue;
-use laminar_core::checkpoint::{CheckpointManifest, ViewLog};
+use laminar_core::checkpoint::{CheckpointManifest, ViewLog, MAX_VIEW_LOG_SEGMENTS};
 
 use super::append_log::{AppendLogState, ViewLogCapture};
 use super::{MvStorageMode, MvStore};
@@ -59,6 +59,19 @@ impl MvCheckpointCapture {
                     sequence,
                 })
                 .collect();
+            if let Some(compacted) = capture.compacted {
+                retained_bytes = retained_bytes
+                    .checked_add(u64::try_from(compacted.payload.len()).unwrap_or(u64::MAX))
+                    .filter(|bytes| *bytes <= max_encoded_bytes)
+                    .ok_or_else(|| capture_size_overflow(&view))?;
+                segments.push(CapturedViewLogSegment::New {
+                    partition: compacted.meta.partition,
+                    sequence: compacted.meta.sequence,
+                    rows: compacted.meta.rows,
+                    event_time: compacted.meta.event_time,
+                    payload: compacted.payload,
+                });
+            }
             if let Some(sealed) = capture.sealed {
                 let remaining = max_encoded_bytes.checked_sub(retained_bytes).ok_or_else(|| {
                     DbError::Checkpoint(format!(
@@ -180,14 +193,15 @@ impl MvStore {
             .filter_map(|(name, entry)| Some((name, &entry.schema, entry.log.as_mut()?)))
     }
 
-    /// Seal every append view's staged rows for checkpoint `checkpoint_id`. Nothing changes
-    /// when the capture does not fit within `max_bytes`.
+    /// Seal every append view's staged rows for checkpoint `checkpoint_id`, with the prepared
+    /// merges when they fit within `max_bytes` as well. Nothing changes when the capture does
+    /// not fit.
     pub(crate) fn capture_view_logs(
         &mut self,
         checkpoint_id: u64,
         max_bytes: u64,
     ) -> Result<MvCheckpointCapture, DbError> {
-        let mut estimated_bytes = 0u64;
+        let (mut estimated_bytes, mut merged_bytes) = (0u64, 0u64);
         for (name, entry) in &self.entries {
             if let Some(log) = &entry.log {
                 let bytes = CHECKPOINT_CAPTURE_ENTRY_OVERHEAD
@@ -196,6 +210,8 @@ impl MvStore {
                 estimated_bytes = estimated_bytes
                     .checked_add(u64::try_from(bytes).map_err(|_| capture_size_overflow(name))?)
                     .ok_or_else(|| capture_size_overflow(name))?;
+                merged_bytes = merged_bytes
+                    .saturating_add(u64::try_from(log.prepared_bytes()).unwrap_or(u64::MAX));
             }
         }
         if estimated_bytes > max_bytes {
@@ -203,14 +219,18 @@ impl MvStore {
                 "view-log capture estimate {estimated_bytes} bytes exceeds the staged-state cap of {max_bytes} bytes"
             )));
         }
+        let compact = estimated_bytes.saturating_add(merged_bytes) <= max_bytes;
+        if compact {
+            estimated_bytes += merged_bytes;
+        }
         let captured: Result<Vec<_>, DbError> = self
             .append_logs()
             .map(|(name, schema, log)| {
-                let capture = log.capture(checkpoint_id)?;
+                let capture = log.capture(checkpoint_id, compact)?;
                 Ok((name.clone(), Arc::clone(schema), capture))
             })
             .collect();
-        match captured {
+        match captured.and_then(within_segment_limit) {
             Ok(logs) => {
                 self.log_capture = Some(checkpoint_id);
                 Ok(MvCheckpointCapture {
@@ -281,7 +301,11 @@ impl MvStore {
                     "checkpoint holds no log for append-only view '{name}'"
                 ))
             })?;
-            entry.log = Some(AppendLogState::restored(retention.clone(), log));
+            entry.log = Some(AppendLogState::restored(
+                retention.clone(),
+                log,
+                manifest.checkpoint_id,
+            ));
         }
         if let Some(view) = logs.keys().next() {
             return Err(DbError::Checkpoint(format!(
@@ -291,6 +315,33 @@ impl MvStore {
         self.log_checkpoint = Some(manifest.checkpoint_id);
         Ok(())
     }
+}
+
+/// The captured logs, unless they retain more segments than one manifest admits.
+fn within_segment_limit(
+    logs: Vec<(String, SchemaRef, ViewLogCapture)>,
+) -> Result<Vec<(String, SchemaRef, ViewLogCapture)>, DbError> {
+    let segments = |capture: &ViewLogCapture| {
+        capture.retained.len()
+            + usize::from(capture.compacted.is_some())
+            + usize::from(capture.sealed.is_some())
+    };
+    let total = logs
+        .iter()
+        .map(|(_, _, capture)| segments(capture))
+        .sum::<usize>();
+    if total <= MAX_VIEW_LOG_SEGMENTS {
+        return Ok(logs);
+    }
+    let (view, held) = logs
+        .iter()
+        .map(|(view, _, capture)| (view.as_str(), segments(capture)))
+        .max_by_key(|(_, held)| *held)
+        .unwrap_or_default();
+    Err(DbError::Checkpoint(format!(
+        "append-only views retain {total} log segments, above the {MAX_VIEW_LOG_SEGMENTS} one \
+         checkpoint admits; view '{view}' retains {held}"
+    )))
 }
 
 fn capture_size_overflow(name: &str) -> DbError {

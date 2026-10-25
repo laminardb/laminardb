@@ -26,7 +26,7 @@ mod statement_snapshot;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
 use append_log::AppendLogState;
-pub(crate) use append_log::{LogRead, ViewRetention};
+pub(crate) use append_log::{spawn_compactor as spawn_log_compactor, LogRead, ViewRetention};
 pub(crate) use committed::CommittedViews;
 pub use committed::{CommittedRead, CommittedReadError};
 pub(crate) use frames::RestoredView;

@@ -28,10 +28,7 @@ impl LaminarDB {
         let interval = match declared {
             Some(MaterializedViewRetention::Rows(rows)) => return self.row_retention(&name, *rows),
             Some(MaterializedViewRetention::Unbounded) => {
-                return Err(DbError::MaterializedView(format!(
-                    "materialized view '{name}' cannot keep an unbounded log until log \
-                     compaction is available; declare retention as an interval or a row count"
-                )))
+                return self.unbounded_retention(candidate, schema).await
             }
             Some(MaterializedViewRetention::Interval(interval)) => *interval,
             None => DEFAULT_APPEND_VIEW_RETENTION,
@@ -61,6 +58,25 @@ impl LaminarDB {
             column,
             interval_ms,
         })
+    }
+
+    /// Every row, with segment bounds on the event-time column when the view has one. Without
+    /// checkpointing the whole log stays in memory, so it would fail its first cycle past the
+    /// view limits.
+    async fn unbounded_retention(
+        &self,
+        candidate: StreamRegistration,
+        schema: &Schema,
+    ) -> Result<ViewRetention, DbError> {
+        if self.config.checkpoint.is_none() {
+            return Err(DbError::MaterializedView(format!(
+                "materialized view '{}' keeps every row in memory without checkpointing; \
+                 declare retention as an interval or a row count",
+                candidate.name
+            )));
+        }
+        let column = self.append_view_event_time(candidate, schema).await?;
+        Ok(ViewRetention::Unbounded { column })
     }
 
     /// Without checkpointing the whole log stays in memory, so a cap at or above the view row

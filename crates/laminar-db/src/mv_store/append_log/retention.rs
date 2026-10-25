@@ -20,6 +20,9 @@ pub(crate) enum ViewRetention {
     /// The latest rows of each log partition. Not exact: rows from several splits can share a
     /// partition, and a source orders rows only within one split.
     Rows(u64),
+    /// Every row. Segments still record the bounds of `column`, when the view has one, so
+    /// reads can skip them by event time.
+    Unbounded { column: Option<usize> },
 }
 
 impl ViewRetention {
@@ -29,6 +32,15 @@ impl ViewRetention {
             Self::EventTime { interval_ms, .. } => {
                 frontier.map(|frontier| frontier.saturating_sub(*interval_ms))
             }
+            Self::Rows(_) | Self::Unbounded { .. } => None,
+        }
+    }
+
+    /// The column whose bounds each segment records.
+    pub(in crate::mv_store) const fn event_time_column(&self) -> Option<usize> {
+        match self {
+            Self::EventTime { column, .. } => Some(*column),
+            Self::Unbounded { column } => *column,
             Self::Rows(_) => None,
         }
     }
@@ -59,6 +71,7 @@ impl ViewRetention {
                 .filter(|segment| !self.expired(segment.event_time, frontier))
                 .cloned()
                 .collect(),
+            Self::Unbounded { .. } => committed.to_vec(),
             Self::Rows(limit) => {
                 let mut rows = newer_rows;
                 let mut first = committed.len();
@@ -74,10 +87,10 @@ impl ViewRetention {
     /// Event-time bounds of `batch` in milliseconds, or `None` without an event-time column or
     /// with only nulls. Reads the column in its own unit rather than casting it.
     pub(super) fn bounds(&self, batch: &RecordBatch) -> Result<Option<EventTimeBounds>, DbError> {
-        let Self::EventTime { column, .. } = self else {
+        let Some(column) = self.event_time_column() else {
             return Ok(None);
         };
-        let column = batch.column(*column);
+        let column = batch.column(column);
         let DataType::Timestamp(unit, _) = column.data_type() else {
             return Err(DbError::MaterializedView(format!(
                 "event-time column must be a timestamp, found {}",
@@ -103,6 +116,7 @@ impl ViewRetention {
         frontier: Option<i64>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         match self {
+            Self::Unbounded { .. } => Ok(batches),
             Self::EventTime { column, .. } => {
                 let Some(horizon) = self.horizon(frontier) else {
                     return Ok(batches);

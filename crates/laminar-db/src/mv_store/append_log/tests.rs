@@ -75,7 +75,7 @@ fn event_time_retention_reads_only_rows_at_or_after_the_horizon() {
 fn a_capture_keeps_only_committed_segments_inside_the_horizon() {
     let mut log = event_time(100);
     append(&mut log, &[rows(&[10, 20])]);
-    let first = log.capture(1).unwrap();
+    let first = log.capture(1, true).unwrap();
     assert_eq!(
         first.sealed.as_ref().map(|segment| segment.sequence),
         Some(0)
@@ -88,12 +88,12 @@ fn a_capture_keeps_only_committed_segments_inside_the_horizon() {
     assert_eq!((log.rows, log.bytes), (0, 0));
 
     append(&mut log, &[rows(&[200])]);
-    let second = log.capture(2).unwrap();
+    let second = log.capture(2, true).unwrap();
     assert_eq!(second.retained, [(LOG_PARTITION, 0)]);
     log.commit(2);
 
     log.advance_frontier(250);
-    let third = log.capture(3).unwrap();
+    let third = log.capture(3, true).unwrap();
     assert_eq!(third.retained, [(LOG_PARTITION, 1)]);
     assert!(third.sealed.is_none());
     assert_eq!(third.next_sequence, 2);
@@ -104,7 +104,7 @@ fn a_capture_keeps_only_committed_segments_inside_the_horizon() {
 fn row_retention_counts_committed_segments_with_memory() {
     let mut log = AppendLogState::new(ViewRetention::Rows(5));
     append(&mut log, &[rows(&[1, 2, 3, 4])]);
-    log.capture(1).unwrap();
+    log.capture(1, true).unwrap();
     log.commit(1);
 
     append(&mut log, &[rows(&[5, 6])]);
@@ -131,7 +131,7 @@ fn row_retention_counts_committed_segments_with_memory() {
 
     // Five staged rows cover the retention, so the capture drops the committed segment.
     append(&mut log, &[rows(&[7, 8, 9])]);
-    let capture = log.capture(2).unwrap();
+    let capture = log.capture(2, true).unwrap();
     assert!(capture.retained.is_empty());
 }
 
@@ -139,12 +139,122 @@ fn row_retention_counts_committed_segments_with_memory() {
 fn an_abort_returns_sealed_rows_ahead_of_later_ones() {
     let mut log = AppendLogState::new(ViewRetention::Rows(100));
     append(&mut log, &[rows(&[1, 2])]);
-    log.capture(7).unwrap();
+    log.capture(7, true).unwrap();
     append(&mut log, &[rows(&[3])]);
     log.commit(6);
     assert_eq!(times(&log), [1, 2, 3]);
     log.abort(7);
     assert_eq!(times(&log), [1, 2, 3]);
-    let capture = log.capture(8).unwrap();
+    let capture = log.capture(8, true).unwrap();
     assert_eq!(capture.sealed.map(|segment| segment.rows), Some(3));
+}
+
+/// An unbounded log with four committed single-row segments, committed by checkpoint 4.
+fn four_committed_segments() -> AppendLogState {
+    let mut log = AppendLogState::new(ViewRetention::Unbounded { column: Some(0) });
+    for checkpoint in 1..=4 {
+        append(&mut log, &[rows(&[i64::try_from(checkpoint).unwrap()])]);
+        log.capture(checkpoint, true).unwrap();
+        log.commit(checkpoint);
+    }
+    log
+}
+
+fn merged(base: u64, inputs: &[u64], rows: u64) -> Arc<PreparedCompaction> {
+    let output = (rows > 0).then(|| CompactedSegment {
+        meta: SegmentMeta {
+            partition: LOG_PARTITION,
+            sequence: inputs[0],
+            rows,
+            event_time: None,
+        },
+        payload: bytes::Bytes::from_static(b"merged"),
+    });
+    Arc::new(PreparedCompaction {
+        base,
+        inputs: inputs
+            .iter()
+            .map(|sequence| (LOG_PARTITION, *sequence))
+            .collect(),
+        output,
+    })
+}
+
+fn positions(log: &AppendLogState) -> Vec<u64> {
+    log.committed
+        .iter()
+        .map(|segment| segment.sequence)
+        .collect()
+}
+
+#[test]
+fn a_capture_writes_the_prepared_merge_in_place_of_its_inputs() {
+    let mut log = four_committed_segments();
+    log.set_prepared(Some(merged(4, &[1, 2], 2)));
+    append(&mut log, &[rows(&[5])]);
+    let capture = log.capture(5, true).unwrap();
+    assert_eq!(capture.retained, [(LOG_PARTITION, 0), (LOG_PARTITION, 3)]);
+    assert_eq!(
+        capture
+            .compacted
+            .as_ref()
+            .map(|merged| merged.meta.sequence),
+        Some(1)
+    );
+    assert_eq!(
+        capture.sealed.as_ref().map(|sealed| sealed.sequence),
+        Some(4)
+    );
+    assert_eq!(
+        positions(&log),
+        [0, 1, 2, 3],
+        "nothing changes before commit"
+    );
+
+    log.commit(5);
+    assert_eq!(positions(&log), [0, 1, 3, 4]);
+    assert_eq!(log.committed[1].rows, 2);
+    assert!(log.prepared.is_none());
+    assert_eq!(log.positions_since, Some(5));
+}
+
+#[test]
+fn a_merge_is_skipped_when_disallowed_stale_or_its_inputs_are_gone() {
+    let mut log = four_committed_segments();
+    log.set_prepared(Some(merged(4, &[1, 2], 2)));
+    assert!(log.capture(5, false).unwrap().compacted.is_none());
+    log.abort(5);
+
+    // Prepared before the log's positions last changed.
+    log.positions_since = Some(5);
+    assert!(log.capture(6, true).unwrap().compacted.is_none());
+    log.abort(6);
+
+    // An input that is no longer retained.
+    log.positions_since = Some(4);
+    log.set_prepared(Some(merged(4, &[3, 4], 2)));
+    assert!(log.capture(7, true).unwrap().compacted.is_none());
+    log.abort(7);
+}
+
+#[test]
+fn an_aborted_merge_is_written_by_the_next_capture_and_an_empty_one_removes_its_inputs() {
+    let mut log = four_committed_segments();
+    log.set_prepared(Some(merged(4, &[0, 1, 2], 0)));
+    let capture = log.capture(5, true).unwrap();
+    assert_eq!(capture.retained, [(LOG_PARTITION, 3)]);
+    assert!(capture.compacted.is_none());
+    log.abort(5);
+    assert!(log.prepared.is_some());
+
+    log.capture(6, true).unwrap();
+    // A pass replaced the merge while the capture was in flight; the newer one stays.
+    let newer = merged(5, &[3], 1);
+    log.set_prepared(Some(Arc::clone(&newer)));
+    log.commit(6);
+    assert_eq!(positions(&log), [3]);
+    assert!(log
+        .prepared
+        .as_ref()
+        .is_some_and(|held| Arc::ptr_eq(held, &newer)));
 }

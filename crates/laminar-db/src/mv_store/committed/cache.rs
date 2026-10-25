@@ -6,12 +6,17 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use quick_cache::sync::{Cache, DefaultLifecycle};
-use quick_cache::{DefaultHashBuilder, Weighter};
+use quick_cache::{DefaultHashBuilder, OptionsBuilder, Weighter};
+
+use crate::mv_store::append_log::TARGET_SEGMENT_BYTES;
 
 /// Charged per entry on top of its batches, so small artifacts still count.
 const ENTRY_OVERHEAD_BYTES: u64 = 128;
 /// Expected bytes per entry, used only to size the cache's tables.
 const TYPICAL_ENTRY_BYTES: usize = 64 * 1024;
+/// The cache admits no entry heavier than its shard's share of the budget, so each shard holds
+/// several merged log segments.
+const MIN_SHARD_BYTES: u64 = 4 * TARGET_SEGMENT_BYTES;
 
 pub(super) type Rows = Arc<[RecordBatch]>;
 
@@ -36,11 +41,19 @@ pub(super) struct ArtifactCache {
 
 impl ArtifactCache {
     pub(super) fn new(capacity_bytes: usize) -> Self {
-        let estimated_items = (capacity_bytes / TYPICAL_ENTRY_BYTES).max(16);
+        let weight = u64::try_from(capacity_bytes).unwrap_or(u64::MAX);
+        let shards = usize::try_from(weight / MIN_SHARD_BYTES)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let options = OptionsBuilder::new()
+            .estimated_items_capacity((capacity_bytes / TYPICAL_ENTRY_BYTES).max(16))
+            .weight_capacity(weight)
+            .shards(shards)
+            .build()
+            .expect("estimated items and weight capacity are set");
         Self {
-            cache: Cache::with(
-                estimated_items,
-                u64::try_from(capacity_bytes).unwrap_or(u64::MAX),
+            cache: Cache::with_options(
+                options,
                 RowsWeighter,
                 DefaultHashBuilder::default(),
                 DefaultLifecycle::default(),

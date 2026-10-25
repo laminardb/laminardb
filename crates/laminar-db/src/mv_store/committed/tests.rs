@@ -351,3 +351,14 @@ async fn a_view_created_after_the_cut_has_no_committed_state() {
         DbError::CommittedRead(CommittedReadError::ViewNotCommitted { epoch: 2, .. })
     ));
 }
+
+#[test]
+fn the_cache_admits_a_merged_segment() {
+    let cache = super::cache::ArtifactCache::new(256 << 20);
+    let rows = 2 << 20;
+    let batch = RecordBatch::try_from_iter(vec![("k", int_column(vec![7; rows]))]).unwrap();
+    assert!(batch.get_array_memory_size() >= 16 << 20);
+    cache.insert("merged", vec![batch.clone()].into());
+    assert_eq!(cache.len(), 1);
+    assert!(cache.get("merged", &batch.schema()).is_some());
+}

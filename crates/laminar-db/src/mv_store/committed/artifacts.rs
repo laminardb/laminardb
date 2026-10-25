@@ -162,6 +162,9 @@ impl PinnedCut {
                             !retention.expired(segment.event_time, log.frontier)
                                 && pruning.keeps_segment(segment.event_time)
                         }
+                        ViewRetention::Unbounded { .. } => {
+                            pruning.keeps_segment(segment.event_time)
+                        }
                         // A row cap keeps the newest rows of the whole partition, so every
                         // segment is read before the cap and the filters apply.
                         ViewRetention::Rows(_) => true,
@@ -183,6 +186,24 @@ impl PinnedCut {
         Ok(batches)
     }
 
+    /// This participant's log of `view` at this cut, with the manifest that lists it.
+    fn local(&self, views: &CommittedViews, view: &str) -> Option<(&CheckpointManifest, &ViewLog)> {
+        let participant = views.store.participant_id();
+        self.manifests
+            .iter()
+            .filter(|manifest| manifest.participant_id == participant)
+            .find_map(|manifest| Some((manifest, view_log(manifest, view)?)))
+    }
+
+    /// This participant's log of `view` at this cut.
+    pub(in crate::mv_store) fn local_log(
+        &self,
+        views: &CommittedViews,
+        view: &str,
+    ) -> Option<&ViewLog> {
+        self.local(views, view).map(|(_, log)| log)
+    }
+
     /// The batches of `wanted` segments of this participant's log of `view`, in order.
     pub(in crate::mv_store) async fn local_segments(
         &self,
@@ -191,18 +212,12 @@ impl PinnedCut {
         schema: &SchemaRef,
         wanted: &[SegmentMeta],
     ) -> Result<Vec<RecordBatch>, LogReadError> {
-        let participant = views.store.participant_id();
         let missing = |what: &str| {
             LogReadError::Failed(DbError::Checkpoint(format!(
                 "committed checkpoint does not hold {what} of view '{view}'"
             )))
         };
-        let (manifest, log) = self
-            .manifests
-            .iter()
-            .filter(|manifest| manifest.participant_id == participant)
-            .find_map(|manifest| Some((manifest, view_log(manifest, view)?)))
-            .ok_or_else(|| missing("its log"))?;
+        let (manifest, log) = self.local(views, view).ok_or_else(|| missing("its log"))?;
         let mut artifacts = Vec::with_capacity(wanted.len());
         for segment in wanted {
             let position = (segment.partition, segment.sequence);

@@ -253,6 +253,10 @@ impl LaminarDB {
                 views.freshness_contracts()
             };
             crate::mv_store::spawn_freshness_monitor(freshness, coord.committed_reads().0, metrics);
+            crate::mv_store::spawn_log_compactor(
+                Arc::clone(&self.mv_store),
+                coord.committed_reads().0,
+            );
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 
