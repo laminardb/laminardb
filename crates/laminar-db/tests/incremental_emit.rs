@@ -7,7 +7,8 @@
 //! 2. survives checkpoint → restart with a correct snapshot, and
 //! 3. feeds downstream consumers of its changelog — chained agg/projection MVs, capability-aware
 //!    sinks (upsert/changelog-capable), and SUBSCRIBE (plain consolidated snapshots) — while still
-//!    rejecting shapes it can't net (e.g. an arbitrary join, a non-capable sink).
+//!    rejecting shapes it can't net (e.g. an arbitrary join, a non-capable sink), and
+//! 4. serves `SELECT` from the latest cycle, which a restart can roll back.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -198,6 +199,38 @@ async fn incremental_emit_survives_checkpoint_restart() {
         );
         db.shutdown().await.unwrap();
     }
+}
+
+/// A `SELECT` reads the latest completed cycle, not a committed checkpoint. A restart restores
+/// the committed cut, so a row a reader already saw can disappear; an in-memory source cannot
+/// replay it.
+#[tokio::test]
+async fn view_read_can_observe_state_that_a_restart_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().to_path_buf();
+    {
+        let db = LaminarDB::open_with_config(config(&storage, true)).unwrap();
+        db.execute(SRC).await.unwrap();
+        db.execute(MV).await.unwrap();
+        db.start().await.unwrap();
+        let source = db.source_untyped("events").unwrap();
+
+        source.push_arrow(batch(&[1], &[10])).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(db.checkpoint().await.unwrap().success);
+        source.push_arrow(batch(&[2], &[20])).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
+        db.shutdown().await.unwrap();
+    }
+
+    let db = LaminarDB::open_with_config(config(&storage, true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.start().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1)]);
+    db.shutdown().await.unwrap();
 }
 
 /// A counted multiset MV must preserve duplicate rows at the durable cut. After restart, changing
@@ -590,13 +623,15 @@ async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
         "post-attach snapshot"
     );
 
-    // A change arrives as a fresh consolidated snapshot (k1: 10 -> 15).
+    // A change arrives as a fresh consolidated snapshot (k1: 10 -> 15) that also repeats the
+    // untouched k2, not as a delta.
     source.push_arrow(batch(&[1], &[5])).unwrap();
     let mut saw_update = false;
     for _ in 0..20 {
         match tokio::time::timeout(std::time::Duration::from_secs(3), portal.next_frame()).await {
             Ok(Some(PortalFrame::Batch { batch: b, .. })) => {
                 if rows_of(&b).iter().any(|&(k, t, _)| k == 1 && t == 15) {
+                    assert_eq!(rows_of(&b), vec![(1, 15, 2), (2, 20, 1)]);
                     saw_update = true;
                     break;
                 }
