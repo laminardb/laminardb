@@ -34,7 +34,11 @@ impl ViewRetention {
     }
 
     /// Whether a run of rows with these bounds has wholly left the retention horizon.
-    pub(super) fn expired(&self, bounds: Option<EventTimeBounds>, frontier: Option<i64>) -> bool {
+    pub(in crate::mv_store) fn expired(
+        &self,
+        bounds: Option<EventTimeBounds>,
+        frontier: Option<i64>,
+    ) -> bool {
         let Some(horizon) = self.horizon(frontier) else {
             return false;
         };
@@ -93,7 +97,7 @@ impl ViewRetention {
     }
 
     /// Keep the rows of `batches`, in log order, that this retention keeps at `frontier`.
-    pub(super) fn apply(
+    pub(in crate::mv_store) fn apply(
         &self,
         batches: Vec<RecordBatch>,
         frontier: Option<i64>,

@@ -354,6 +354,11 @@ impl CheckpointCoordinator {
             .flatten();
         self.local_watermark = Self::manifest_watermark(local_manifest.as_deref())?;
         self.last_committed_manifest = local_manifest;
+        self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
+            committed.clone(),
+            reference.clone(),
+            &recovered.manifests,
+        )));
         self.last_committed_ref = Some(reference.clone());
         self.last_committed_source_watermarks =
             Some((reference, committed_source_watermarks.clone()));
@@ -626,6 +631,7 @@ impl CheckpointCoordinator {
         }
         self.prepared.clear();
         self.last_committed_manifest = None;
+        self.publish_committed_cut(None);
         self.last_committed_ref = None;
         self.last_committed_source_watermarks = None;
         self.local_watermark = CheckpointWatermark::Uninitialized;

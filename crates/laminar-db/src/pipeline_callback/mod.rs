@@ -5125,9 +5125,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
         if updates > 0 {
-            self.prom.mv_updates.inc_by(updates);
+            self.prom.views.updates.inc_by(updates);
             let bytes = i64::try_from(store.total_bytes()).unwrap_or(i64::MAX);
-            self.prom.mv_bytes_stored.set(bytes);
+            self.prom.views.bytes_stored.set(bytes);
         }
         drop(store);
 

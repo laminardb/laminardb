@@ -8,6 +8,7 @@ mod attempt;
 mod attempt_failure;
 mod capture;
 mod commit_index;
+pub(crate) mod committed_reads;
 mod coordinator;
 #[cfg(feature = "cluster")]
 mod follower_completion;
@@ -65,6 +66,7 @@ pub use request::{CapturedStateFrame, CheckpointConfig, CheckpointRequest};
 pub(crate) use request::{
     CapturedViewLog, CapturedViewLogSegment, ManagedVnodeOperator, ManagedVnodePlacement,
 };
+pub(crate) use retention::load_index_manifests;
 use retention::GcRequest;
 use sha2::{Digest, Sha256};
 
@@ -174,6 +176,16 @@ mod subscription_output_tests;
 #[cfg(all(test, feature = "cluster"))]
 mod handoff_tests;
 
+/// Bytes of the data objects a participant writes for one checkpoint: node data and view log.
+fn data_object_bytes(manifest: &CheckpointManifest) -> u64 {
+    manifest.node_data.object_length.saturating_add(
+        manifest
+            .view_log
+            .as_ref()
+            .map_or(0, |object| object.object_length),
+    )
+}
+
 struct ActiveSinkArtifactIntents {
     attempt: CheckpointAttempt,
     by_sink: BTreeMap<String, Option<Vec<u8>>>,
@@ -211,4 +223,6 @@ pub struct CheckpointCoordinator {
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     gc_requests: tokio::sync::watch::Sender<Option<GcRequest>>,
     gc_task: tokio::task::JoinHandle<()>,
+    committed_cut: tokio::sync::watch::Sender<Option<Arc<committed_reads::CommittedCut>>>,
+    read_pins: Arc<committed_reads::ReadPins>,
 }

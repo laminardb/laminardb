@@ -227,7 +227,7 @@ impl CheckpointCoordinator {
         };
         self.total_bytes_written = self
             .total_bytes_written
-            .saturating_add(packed.manifest.node_data.object_length);
+            .saturating_add(super::data_object_bytes(&packed.manifest));
         self.prepared.insert(
             CheckpointAttempt::canonical(packed.manifest.checkpoint_id),
             (Arc::new(packed.manifest.clone()), manifest_bytes.clone()),

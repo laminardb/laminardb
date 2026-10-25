@@ -16,7 +16,9 @@ use crate::operator::capability::OperatorStateClass;
 mod admission;
 mod append_log;
 mod checkpoint;
+mod committed;
 mod frames;
+mod freshness;
 mod multiset;
 mod slices;
 mod staging;
@@ -24,10 +26,16 @@ mod statement_snapshot;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
 use append_log::AppendLogState;
-pub(crate) use append_log::{LogRead, ViewLogReader, ViewRetention};
+pub(crate) use append_log::{LogRead, ViewRetention};
+pub(crate) use committed::CommittedViews;
+pub use committed::{CommittedRead, CommittedReadError};
 pub(crate) use frames::RestoredView;
+pub(crate) use freshness::{spawn_monitor as spawn_freshness_monitor, FreshnessContracts};
 use multiset::MultisetState;
-pub(crate) use statement_snapshot::{plan_statement, read_views, StatementViewSnapshot};
+pub(crate) use statement_snapshot::{
+    plan_committed_statement, plan_statement, read_views, CommittedStatement,
+    StatementViewSnapshot, VIEW_READ_DEADLINE,
+};
 use upsert::UpsertState;
 
 #[cfg(feature = "benchmark-internals")]
@@ -185,12 +193,13 @@ pub(crate) struct MvStore {
     limits: MvLimits,
     /// Lets the hot path skip the write lock when no MVs exist.
     has_any: Arc<AtomicBool>,
-    /// Reads committed append-log segments once checkpointing is configured.
-    log_reader: Option<Arc<ViewLogReader>>,
+    /// Reads committed checkpoints once checkpointing is configured.
+    committed: Option<Arc<CommittedViews>>,
     /// The checkpoint whose view logs the store last committed or restored.
     log_checkpoint: Option<u64>,
     /// The checkpoint attempt whose view-log capture awaits its outcome.
     log_capture: Option<u64>,
+    freshness: Arc<FreshnessContracts>,
 }
 
 impl MvStore {
@@ -207,9 +216,10 @@ impl MvStore {
                 bytes: config.materialized_view_max_bytes,
             },
             has_any: Arc::new(AtomicBool::new(false)),
-            log_reader: None,
+            committed: None,
             log_checkpoint: None,
             log_capture: None,
+            freshness: Arc::default(),
         }
     }
 
@@ -217,9 +227,18 @@ impl MvStore {
         Arc::clone(&self.has_any)
     }
 
-    /// Read committed view-log segments through `reader` from now on.
-    pub(crate) fn set_log_reader(&mut self, reader: Arc<ViewLogReader>) {
-        self.log_reader = Some(reader);
+    /// Read committed checkpoints through `views` from now on.
+    pub(crate) fn set_committed_views(&mut self, views: Arc<CommittedViews>) {
+        self.committed = Some(views);
+    }
+
+    pub(crate) fn committed_views(&self) -> Option<Arc<CommittedViews>> {
+        self.committed.clone()
+    }
+
+    /// Freshness the views declared; it outlives recovery images of this store.
+    pub(crate) fn freshness_contracts(&self) -> Arc<FreshnessContracts> {
+        Arc::clone(&self.freshness)
     }
 
     pub fn create_mv(
@@ -235,6 +254,7 @@ impl MvStore {
     }
 
     pub fn drop_mv(&mut self, name: &str) -> bool {
+        self.freshness.remove(name);
         let removed = self.entries.remove(name).is_some();
         if self.entries.is_empty() {
             self.has_any.store(false, Ordering::Release);
@@ -334,8 +354,8 @@ impl MvStore {
                 .map(|batch| Some(ViewRead::Ready(batch)));
         };
         let (segments, memory, frontier) = log.read_parts();
-        let committed = match (&self.log_reader, self.log_checkpoint) {
-            (Some(reader), Some(checkpoint)) => Some((Arc::clone(reader), checkpoint)),
+        let committed = match (&self.committed, self.log_checkpoint) {
+            (Some(views), Some(checkpoint)) => Some((Arc::clone(views), checkpoint)),
             _ if segments.is_empty() => None,
             _ => {
                 return Err(DbError::MaterializedView(format!(
@@ -373,9 +393,10 @@ impl MvStore {
             entries,
             limits: self.limits,
             has_any: Arc::clone(&self.has_any),
-            log_reader: self.log_reader.clone(),
+            committed: self.committed.clone(),
             log_checkpoint: None,
             log_capture: None,
+            freshness: Arc::clone(&self.freshness),
         })
     }
 

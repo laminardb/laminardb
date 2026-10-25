@@ -2,6 +2,7 @@
 //! provider registration, and create/drop orchestration.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema};
 
@@ -71,6 +72,7 @@ impl LaminarDB {
             if_not_exists,
             query_sql,
             retention,
+            freshness,
         } = statement
         else {
             return Err(DbError::InvalidOperation(
@@ -96,6 +98,9 @@ impl LaminarDB {
             ));
         }
         Self::reject_interval_output_subquery(&name_str, query_sql)?;
+        if let Some(freshness) = freshness {
+            self.admit_view_freshness(&name_str, *freshness)?;
+        }
         let Some(reservation) = self.reserve_catalog_name(
             &name_str,
             CatalogObjectKind::MaterializedView,
@@ -123,6 +128,12 @@ impl LaminarDB {
             retention.as_ref(),
         )
         .await?;
+        if let Some(freshness) = freshness {
+            self.mv_store
+                .read()
+                .freshness_contracts()
+                .declare(&name_str, *freshness);
+        }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE MATERIALIZED VIEW".to_string(),
@@ -131,6 +142,30 @@ impl LaminarDB {
             topology_operation: None,
             applied: true,
         }))
+    }
+
+    /// A view may promise committed reads no fresher than the checkpoint cadence that commits
+    /// them.
+    fn admit_view_freshness(&self, view: &str, freshness: Duration) -> Result<(), DbError> {
+        let interval = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.interval_ms)
+            .map(Duration::from_millis);
+        let Some(interval) = interval else {
+            return Err(DbError::InvalidOperation(format!(
+                "view '{view}' declares freshness {freshness:?}, which needs a periodic \
+                 checkpoint interval to commit its reads"
+            )));
+        };
+        if freshness < interval {
+            return Err(DbError::InvalidOperation(format!(
+                "view '{view}' declares freshness {freshness:?}, below the checkpoint interval \
+                 of {interval:?} that commits its reads"
+            )));
+        }
+        Ok(())
     }
 
     /// Every pre-mutation MV admission check, returning the planned query and

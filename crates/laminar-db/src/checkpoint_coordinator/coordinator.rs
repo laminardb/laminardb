@@ -40,7 +40,12 @@ impl CheckpointCoordinator {
             usize::try_from(config.max_node_data_bytes).unwrap_or(usize::MAX);
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
         let (gc_requests, gc_receiver) = tokio::sync::watch::channel(None);
-        let gc_task = tokio::spawn(run_gc_worker(Arc::clone(&store), gc_receiver));
+        let read_pins = Arc::<super::committed_reads::ReadPins>::default();
+        let gc_task = tokio::spawn(run_gc_worker(
+            Arc::clone(&store),
+            gc_receiver,
+            Arc::clone(&read_pins),
+        ));
         Ok(Self {
             allocator: Arc::new(EpochAllocator::new()),
             config,
@@ -73,6 +78,8 @@ impl CheckpointCoordinator {
             prom: None,
             gc_requests,
             gc_task,
+            committed_cut: tokio::sync::watch::Sender::new(None),
+            read_pins,
         })
     }
 

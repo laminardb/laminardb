@@ -8,6 +8,7 @@ mod catalog_bootstrap;
 mod checkpoint_namespace;
 #[cfg(feature = "cluster")]
 mod cluster_subscription;
+pub(crate) mod committed_read;
 #[cfg(test)]
 mod datafusion_memory_tests;
 mod explain;

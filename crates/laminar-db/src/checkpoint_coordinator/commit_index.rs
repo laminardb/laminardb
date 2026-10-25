@@ -332,7 +332,7 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    pub(super) fn build_committed_index(
+    pub(crate) fn build_committed_index(
         &self,
         attempt: CheckpointAttempt,
         scope: CheckpointScope,

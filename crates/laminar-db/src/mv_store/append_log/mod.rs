@@ -12,7 +12,7 @@ use laminar_core::streaming::retained_arrow_bytes;
 
 use super::admission::{size_overflow, MvLimits};
 use crate::error::DbError;
-pub(crate) use read::{LogRead, LogReadError, ViewLogReader};
+pub(crate) use read::{LogRead, LogReadError};
 pub(crate) use retention::ViewRetention;
 
 /// Every view log has one partition until rows carry their origin vnode.

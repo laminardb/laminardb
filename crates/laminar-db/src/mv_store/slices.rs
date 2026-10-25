@@ -29,21 +29,24 @@ impl<T: Default> VnodeSlices<T> {
     }
 }
 
+/// The vnode owning a row whose placement columns encode to `encoded`; the same mapping the
+/// aggregate applies to its group key.
+pub(super) fn vnode_for_encoded(encoded: &[u8], vnode_count: NonZeroU32) -> u32 {
+    if vnode_count.get() == 1 {
+        0
+    } else {
+        PartitionKeyCodecV1::vnode_for_encoded(encoded, vnode_count)
+    }
+}
+
 impl<T> VnodeSlices<T> {
     pub(super) fn vnode_count(&self) -> NonZeroU32 {
         let count = u32::try_from(self.slots.len()).expect("key-group count fits u32");
         NonZeroU32::new(count).expect("key-group count is nonzero")
     }
 
-    /// The vnode owning a row whose placement columns encode to `encoded`; the same mapping the
-    /// aggregate applies to its group key.
     pub(super) fn vnode_for(&self, encoded: &[u8]) -> u32 {
-        let count = self.vnode_count();
-        if count.get() == 1 {
-            0
-        } else {
-            PartitionKeyCodecV1::vnode_for_encoded(encoded, count)
-        }
+        vnode_for_encoded(encoded, self.vnode_count())
     }
 
     pub(super) fn slot(&self, vnode: u32) -> &T {

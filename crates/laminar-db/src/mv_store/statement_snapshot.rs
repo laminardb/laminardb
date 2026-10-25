@@ -1,16 +1,20 @@
-//! Statement planning that reads every scanned materialized view from one completed cycle.
+//! Statement planning that reads every scanned materialized view from one completed cycle, or
+//! from one committed checkpoint.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
 use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::TreeNodeRecursion;
 
 use super::append_log::LogReadError;
+use super::committed::{CommittedRead, CommittedReadError, CommittedViews, PinnedCut, ViewShape};
 use super::{MvStore, ViewRead};
 use crate::error::DbError;
 use crate::table_provider::MvTableProvider;
@@ -28,13 +32,53 @@ impl StatementViewSnapshot {
     }
 }
 
-/// Attempts at reading views whose captured checkpoint is retired before its segments load.
+/// The committed cut a statement reads every view at, pinned until the statement is dropped.
+/// Each scan reads its view from the cut's artifacts with the scan's filters.
+pub(crate) struct CommittedStatement {
+    views: Arc<CommittedViews>,
+    cut: PinnedCut,
+    shapes: HashMap<String, ViewShape>,
+}
+
+impl std::fmt::Debug for CommittedStatement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommittedStatement")
+            .field("epoch", &self.cut.epoch)
+            .field("views", &self.shapes.keys())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommittedStatement {
+    pub(crate) async fn read(
+        &self,
+        view: &str,
+        filters: &[Expr],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let shape = self.shapes.get(view).ok_or_else(|| {
+            DbError::MaterializedView(format!("view '{view}' was not planned for this read"))
+        })?;
+        self.cut.read_view(&self.views, shape, filters).await
+    }
+}
+
+/// The committed cut a planned statement reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadCut {
+    pub(crate) epoch: u64,
+    pub(crate) checkpoint_id: u64,
+    pub(crate) taken_at_ms: u64,
+}
+
+/// Attempts at reading views whose captured checkpoint retention moves past before it is pinned.
 const VIEW_READ_ATTEMPTS: u32 = 4;
-const VIEW_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+const VIEW_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
+/// How long a read may hold a committed checkpoint against retention.
+pub(crate) const VIEW_READ_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Read `views` as of one completed cycle. Every view is captured under one store read guard;
-/// append views then load their committed segments, and a read whose checkpoint was retired
-/// meanwhile is captured again.
+/// append views then pin the checkpoint they captured and load its segments. A read whose
+/// checkpoint retention moved past before it was pinned is captured again.
 pub(crate) async fn read_views(
     store: &parking_lot::RwLock<MvStore>,
     views: &[String],
@@ -51,7 +95,7 @@ pub(crate) async fn read_views(
             }
             captured
         };
-        match materialize(captured).await {
+        match materialize(captured, Instant::now() + VIEW_READ_DEADLINE).await {
             Ok(views) => return Ok(views),
             Err(LogReadError::Failed(error)) => return Err(error),
             Err(LogReadError::Retired) if attempt < VIEW_READ_ATTEMPTS => {
@@ -71,12 +115,13 @@ pub(crate) async fn read_views(
 
 async fn materialize(
     captured: Vec<(String, ViewRead)>,
+    deadline: Instant,
 ) -> Result<HashMap<String, RecordBatch>, LogReadError> {
     let mut views = HashMap::with_capacity(captured.len());
     for (view, read) in captured {
         let batch = match read {
             ViewRead::Ready(batch) => batch,
-            ViewRead::Log(log) => log.materialize().await?,
+            ViewRead::Log(log) => log.materialize(deadline).await?,
         };
         views.insert(view, batch);
     }
@@ -95,7 +140,7 @@ pub(crate) async fn plan_statement(
     if matches!(plan, LogicalPlan::Ddl(_) | LogicalPlan::Statement(_)) {
         return Ok(ctx.execute_logical_plan(plan).await?);
     }
-    let views = scanned_views(&plan)?;
+    let views = scanned_tables(&plan)?.views;
     if !views.is_empty() {
         let snapshot = StatementViewSnapshot {
             views: read_views(store, &views).await?,
@@ -107,31 +152,85 @@ pub(crate) async fn plan_statement(
     Ok(DataFrame::new(state, plan))
 }
 
-/// Sorted, distinct names of the materialized views `plan` scans, including subqueries and
-/// views that `DataFusion` inlines at planning.
-fn scanned_views(plan: &LogicalPlan) -> Result<Vec<String>, DataFusionError> {
-    let mut views = Vec::new();
-    collect_scanned_views(plan, &mut views)?;
-    views.sort_unstable();
-    views.dedup();
-    Ok(views)
+/// Plan the query `sql` so that every materialized view it scans reads the committed cut `at`
+/// resolves to. The cut stays pinned until the returned frame and every stream executed from it
+/// are dropped, or until `deadline`.
+pub(crate) async fn plan_committed_statement(
+    ctx: &SessionContext,
+    store: &parking_lot::RwLock<MvStore>,
+    sql: &str,
+    at: CommittedRead,
+    deadline: Instant,
+) -> Result<(DataFrame, ReadCut), DbError> {
+    let mut state = ctx.state();
+    let plan = state.create_logical_plan(sql).await?;
+    if matches!(plan, LogicalPlan::Ddl(_) | LogicalPlan::Statement(_)) {
+        return Err(DbError::InvalidOperation(
+            "a committed read must be a query".into(),
+        ));
+    }
+    let scanned = scanned_tables(&plan)?;
+    if let Some(table) = scanned.live.into_iter().next() {
+        return Err(CommittedReadError::LiveTable { table }.into());
+    }
+    let views = store
+        .read()
+        .committed_views()
+        .ok_or(CommittedReadError::CheckpointingDisabled)?;
+    let cut = views.pin(at, deadline).await?;
+    let shapes = {
+        let guard = store.read();
+        scanned
+            .views
+            .iter()
+            .filter_map(|view| Some((view.clone(), guard.view_shape(view)?)))
+            .collect()
+    };
+    let read_cut = ReadCut {
+        epoch: cut.epoch,
+        checkpoint_id: cut.checkpoint_id,
+        taken_at_ms: cut.taken_at_ms,
+    };
+    state
+        .config_mut()
+        .set_extension(Arc::new(CommittedStatement { views, cut, shapes }));
+    Ok((DataFrame::new(state, plan), read_cut))
 }
 
-fn collect_scanned_views(
+/// Tables a plan scans: sorted, distinct materialized views, including subqueries and views
+/// that `DataFusion` inlines at planning, and every other table.
+#[derive(Debug, Default)]
+struct ScannedTables {
+    views: Vec<String>,
+    live: Vec<String>,
+}
+
+fn scanned_tables(plan: &LogicalPlan) -> Result<ScannedTables, DataFusionError> {
+    let mut scanned = ScannedTables::default();
+    collect_scanned_tables(plan, &mut scanned)?;
+    scanned.views.sort_unstable();
+    scanned.views.dedup();
+    Ok(scanned)
+}
+
+fn collect_scanned_tables(
     plan: &LogicalPlan,
-    views: &mut Vec<String>,
+    scanned: &mut ScannedTables,
 ) -> Result<(), DataFusionError> {
     plan.apply_with_subqueries(|node| {
         let LogicalPlan::TableScan(scan) = node else {
             return Ok(TreeNodeRecursion::Continue);
         };
         let Ok(provider) = source_as_provider(&scan.source) else {
+            scanned.live.push(scan.table_name.to_string());
             return Ok(TreeNodeRecursion::Continue);
         };
         if let Some(view) = provider.as_any().downcast_ref::<MvTableProvider>() {
-            views.push(view.name().to_owned());
+            scanned.views.push(view.name().to_owned());
         } else if let Some(inner) = provider.get_logical_plan() {
-            collect_scanned_views(&inner, views)?;
+            collect_scanned_tables(&inner, scanned)?;
+        } else {
+            scanned.live.push(scan.table_name.to_string());
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
@@ -273,7 +372,7 @@ mod tests {
             ),
         ] {
             let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-            assert_eq!(scanned_views(&plan).unwrap(), expected, "{sql}");
+            assert_eq!(scanned_tables(&plan).unwrap().views, expected, "{sql}");
         }
     }
 

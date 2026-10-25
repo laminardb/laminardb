@@ -58,7 +58,7 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
             matches!(error, crate::pipeline::CycleError::Recovery(ref reason) if reason.contains("quota exceeded"))
         );
         assert!(callback.checkpoint_fault.lock().is_some());
-        assert_eq!(callback.prom.mv_updates.get(), 0);
+        assert_eq!(callback.prom.views.updates.get(), 0);
         assert_eq!(callback.mv_store.read().total_bytes(), before_bytes);
         for name in ["a", "b"] {
             let snapshot = callback
@@ -83,7 +83,7 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
             .all(|portal| portal.try_next_frame().is_none()));
         *results.get_mut(&second).unwrap() = vec![input(vec![2])];
         callback.update_mv_stores(&results).unwrap();
-        assert_eq!(callback.prom.mv_updates.get(), 2);
+        assert_eq!(callback.prom.views.updates.get(), 2);
         for portal in &mut portals {
             let Some(PortalFrame::Batch { batch, .. }) = portal.try_next_frame() else {
                 panic!("successful cycle must publish plain rows")

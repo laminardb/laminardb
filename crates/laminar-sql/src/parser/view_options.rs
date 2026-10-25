@@ -15,23 +15,45 @@ pub enum MaterializedViewRetention {
     Unbounded,
 }
 
-/// Parse the trailing `WITH (...)` tokens of a view; `retention` is the only option.
+/// Options declared in a view's trailing `WITH (...)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ViewOptions {
+    pub(super) retention: Option<MaterializedViewRetention>,
+    pub(super) freshness: Option<Duration>,
+}
+
+/// Parse the trailing `WITH (...)` tokens of a view: `retention` and `freshness`.
 pub(super) fn parse_view_options(
     tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
-) -> Result<Option<MaterializedViewRetention>, ParseError> {
+) -> Result<ViewOptions, ParseError> {
     let dialect = super::dialect::LaminarDialect::default();
     let mut parser = sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
     let options = tokenizer::parse_with_options(&mut parser)?;
-    let mut retention = None;
+    let mut parsed = ViewOptions::default();
     for (key, value) in options {
-        if !key.eq_ignore_ascii_case("retention") {
+        if key.eq_ignore_ascii_case("retention") {
+            parsed.retention = Some(parse_retention(&value)?);
+        } else if key.eq_ignore_ascii_case("freshness") {
+            parsed.freshness = Some(parse_freshness(&value)?);
+        } else {
             return Err(ParseError::StreamingError(format!(
-                "unknown CREATE MATERIALIZED VIEW option '{key}' (expected retention)"
+                "unknown CREATE MATERIALIZED VIEW option '{key}' (expected retention or freshness)"
             )));
         }
-        retention = Some(parse_retention(&value)?);
     }
-    Ok(retention)
+    Ok(parsed)
+}
+
+fn parse_freshness(value: &str) -> Result<Duration, ParseError> {
+    let value = value.trim();
+    WindowRewriter::parse_interval_string(value)
+        .ok()
+        .filter(|interval| !interval.is_zero())
+        .ok_or_else(|| {
+            ParseError::StreamingError(format!(
+                "freshness '{value}' must be a nonzero interval such as '5 seconds'"
+            ))
+        })
 }
 
 fn parse_retention(value: &str) -> Result<MaterializedViewRetention, ParseError> {
@@ -85,6 +107,13 @@ mod tests {
             parse_retention("UNBOUNDED").unwrap(),
             MaterializedViewRetention::Unbounded
         );
+        assert_eq!(
+            parse_freshness("500 milliseconds").unwrap(),
+            Duration::from_millis(500)
+        );
+        for invalid in ["", "0 seconds", "10 rows"] {
+            assert!(parse_freshness(invalid).is_err(), "{invalid}");
+        }
         for invalid in [
             "",
             "0 rows",

@@ -102,7 +102,11 @@ impl CheckpointDecisionStore {
             })
     }
 
-    async fn load_committed_checkpoint_optional(
+    /// Load and verify one committed checkpoint index, or `None` once retention deleted it.
+    ///
+    /// # Errors
+    /// Object-store I/O, malformed content, or any reference mismatch.
+    pub async fn load_committed_checkpoint_optional(
         &self,
         reference: &CommittedCheckpointRef,
     ) -> Result<Option<CommittedCheckpointIndex>, DecisionError> {

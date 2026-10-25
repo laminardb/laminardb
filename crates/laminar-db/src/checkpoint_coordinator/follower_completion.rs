@@ -92,6 +92,11 @@ impl CheckpointCoordinator {
         participant
             .verify_manifest(manifest.as_ref(), &manifest_bytes)
             .map_err(DbError::Checkpoint)?;
+        self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
+            index,
+            reference.clone(),
+            [manifest.as_ref()],
+        )));
         self.last_committed_ref = Some(reference.clone());
         self.last_committed_source_watermarks = Some((reference, source_watermarks));
         self.last_committed_manifest = Some(manifest);
@@ -175,7 +180,7 @@ impl CheckpointCoordinator {
         let checkpoint_bytes = if committed {
             self.last_committed_manifest
                 .as_ref()
-                .map(|manifest| manifest.node_data.object_length)
+                .map(|manifest| super::data_object_bytes(manifest))
         } else {
             None
         };

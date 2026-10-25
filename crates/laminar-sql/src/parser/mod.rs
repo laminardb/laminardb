@@ -870,10 +870,10 @@ fn parse_create_materialized_view(
         &emit_tokens,
         with_tokens.as_deref(),
     );
-    let retention = with_tokens
+    let options = with_tokens
         .map(view_options::parse_view_options)
         .transpose()?
-        .flatten();
+        .unwrap_or_default();
 
     let mv_dialect = LaminarDialect::default();
 
@@ -917,7 +917,8 @@ fn parse_create_materialized_view(
         or_replace,
         if_not_exists,
         query_sql,
-        retention,
+        retention: options.retention,
+        freshness: options.freshness,
     })
 }
 

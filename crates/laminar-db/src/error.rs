@@ -215,6 +215,9 @@ pub enum DbError {
     /// Materialized view error
     MaterializedView(String),
 
+    /// A read of materialized views at a committed checkpoint could not be served.
+    CommittedRead(crate::mv_store::CommittedReadError),
+
     /// A local materialized-view update or restore exceeded its live or staging quota.
     MaterializedViewQuotaExceeded {
         /// View whose projected state was rejected.
@@ -331,9 +334,9 @@ impl DbError {
             | Self::StatefulOperatorPartialApply(_) => error_codes::PIPELINE_ERROR,
             Self::ManagedStateBudgetExceeded { .. } => error_codes::MANAGED_STATE_BUDGET_EXCEEDED,
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
-            Self::MaterializedView(_) | Self::MaterializedViewQuotaExceeded { .. } => {
-                error_codes::MATERIALIZED_VIEW_ERROR
-            }
+            Self::MaterializedView(_)
+            | Self::MaterializedViewQuotaExceeded { .. }
+            | Self::CommittedRead(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
             Self::Config(_) => error_codes::INVALID_CONFIG,
         }
@@ -474,6 +477,9 @@ impl std::fmt::Display for DbError {
             } => write!(f, "Stream '{context}': {translated}"),
             Self::MaterializedView(msg) => {
                 write!(f, "[{}] Materialized view error: {msg}", self.code())
+            }
+            Self::CommittedRead(error) => {
+                write!(f, "[{}] Committed read: {error}", self.code())
             }
             Self::Storage(msg) => {
                 write!(f, "[{}] Storage error: {msg}", self.code())

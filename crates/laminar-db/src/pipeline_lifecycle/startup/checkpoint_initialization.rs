@@ -138,18 +138,13 @@ impl LaminarDB {
                 participant_id,
                 uses_local_checkpoint_store,
             )?;
-            let view_log_store = checkpoint_store(
+            let reader_store = checkpoint_store(
                 Arc::clone(&checkpoint_backing),
                 max_node_data_bytes,
                 key_group_count,
                 participant_id,
                 false,
             )?;
-            self.mv_store
-                .write()
-                .set_log_reader(Arc::new(crate::mv_store::ViewLogReader::new(Arc::from(
-                    view_log_store,
-                ))));
             let decision_backing = (!uses_local_checkpoint_store).then_some(checkpoint_backing);
 
             let defaults = CkpConfig::default();
@@ -246,6 +241,18 @@ impl LaminarDB {
                 ))
                 })?
             };
+            let metrics = self.engine_metrics.lock().clone();
+            let freshness = {
+                let mut views = self.mv_store.write();
+                views.set_committed_views(Arc::new(crate::mv_store::CommittedViews::new(
+                    Arc::from(reader_store),
+                    Arc::clone(&ds),
+                    coord.committed_reads(),
+                    self.config.materialized_view_read_cache_bytes,
+                )));
+                views.freshness_contracts()
+            };
+            crate::mv_store::spawn_freshness_monitor(freshness, coord.committed_reads().0, metrics);
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 

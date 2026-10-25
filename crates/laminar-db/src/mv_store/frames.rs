@@ -19,7 +19,7 @@ use crate::operator_graph::{CapturedVnodeState, EncodedStateFrame, StateFrameCap
 
 /// An empty slice. An Arrow IPC stream begins with continuation bytes `0xFF`, so this frame
 /// never parses as one.
-const EMPTY_SLICE_FRAME: [u8; 1] = [0];
+pub(super) const EMPTY_SLICE_FRAME: [u8; 1] = [0];
 
 impl MvEntry {
     fn changelog_slices_mut(&mut self, name: &str) -> Result<SlicesMut<'_>, DbError> {
@@ -256,6 +256,19 @@ impl MvStore {
             limits: self.limits,
         })
     }
+}
+
+/// The rows of one committed vnode frame of a changelog view, decoded and validated as a
+/// restore would.
+pub(super) fn decode_view_frame(
+    shape: &super::committed::ViewShape,
+    vnode: u32,
+    vnode_count: u32,
+    bytes: &[u8],
+) -> Result<arrow::array::RecordBatch, DbError> {
+    let mut entry = MvEntry::new(Arc::clone(&shape.schema), shape.mode.clone())?;
+    entry.restore_vnode(&shape.name, vnode, vnode_count, bytes, shape.limits)?;
+    entry.to_record_batch()
 }
 
 /// One changelog view's slices restored from committed vnode frames, held privately until the

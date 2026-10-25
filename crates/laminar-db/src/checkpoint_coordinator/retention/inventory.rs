@@ -4,7 +4,7 @@ use super::{
     MAX_RETENTION_IO_CONCURRENCY,
 };
 
-pub(in crate::checkpoint_coordinator) async fn load_index_manifests(
+pub(crate) async fn load_index_manifests(
     store: &dyn CheckpointStore,
     index: &CommittedCheckpointIndex,
 ) -> Result<Vec<CheckpointManifest>, DbError> {

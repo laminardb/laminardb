@@ -172,6 +172,53 @@ impl ClusterSubscriptionMetrics {
     }
 }
 
+/// Materialized view results and the freshness of committed view reads.
+pub struct ViewMetrics {
+    /// Materialized view updates.
+    pub updates: IntCounter,
+    /// Approximate MV bytes stored.
+    pub bytes_stored: IntGauge,
+    /// Age of the newest committed checkpoint, which committed view reads observe.
+    pub committed_staleness_ms: IntGauge,
+    /// Times a view's committed reads became staler than its declared freshness. Label: `view`.
+    pub freshness_breaches_total: IntCounterVec,
+}
+
+impl ViewMetrics {
+    fn new(registry: &Registry) -> Self {
+        let metrics = Self {
+            updates: IntCounter::new("mv_updates_total", "Materialized view updates").unwrap(),
+            bytes_stored: IntGauge::new("mv_bytes_stored", "Approximate MV bytes stored").unwrap(),
+            committed_staleness_ms: IntGauge::new(
+                "mv_committed_staleness_ms",
+                "Age of the newest committed checkpoint that committed view reads observe",
+            )
+            .unwrap(),
+            freshness_breaches_total: IntCounterVec::new(
+                Opts::new(
+                    "mv_freshness_breaches_total",
+                    "Times committed view reads became staler than the view's declared freshness",
+                ),
+                &["view"],
+            )
+            .unwrap(),
+        };
+        registry
+            .register(Box::new(metrics.updates.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.bytes_stored.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.committed_staleness_ms.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.freshness_breaches_total.clone()))
+            .unwrap();
+        metrics
+    }
+}
+
 /// Vnode placement as this process last adopted it.
 #[cfg(feature = "cluster")]
 pub struct PlacementMetrics {
@@ -296,10 +343,8 @@ pub struct EngineMetrics {
     pub queries_cached_plan: IntCounter,
     /// Cycles skipped by backpressure.
     pub cycles_backpressured: IntCounter,
-    /// Materialized view updates.
-    pub mv_updates: IntCounter,
-    /// Approximate MV bytes stored.
-    pub mv_bytes_stored: IntGauge,
+    /// Materialized view results and committed reads.
+    pub views: ViewMetrics,
     /// Global pipeline watermark.
     pub pipeline_watermark: IntGauge,
     /// Per-source watermark (epoch-ms). Label: `source`.
@@ -455,12 +500,7 @@ impl EngineMetrics {
                 "Cycles skipped by backpressure"
             )
             .unwrap()),
-            mv_updates: reg!(
-                IntCounter::new("mv_updates_total", "Materialized view updates").unwrap()
-            ),
-            mv_bytes_stored: reg!(
-                IntGauge::new("mv_bytes_stored", "Approximate MV bytes stored").unwrap()
-            ),
+            views: ViewMetrics::new(registry),
             pipeline_watermark: reg!(IntGauge::new(
                 "pipeline_watermark",
                 "Global pipeline watermark"

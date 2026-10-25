@@ -796,6 +796,39 @@ views: 24 hours at a 10-second checkpoint interval is 8,640 segments per view. A
 time is NULL is not returned once the view has a watermark. Earlier releases kept the last
 1,000 batches of an append view instead.
 
+### 8. Committed reads see one checkpoint; `freshness` bounds how old it may be
+
+`SELECT` over materialized views reads the last completed cycle, which recovery can roll back.
+The Rust API `LaminarDB::query_committed(sql, at)` reads every view a query scans at one committed
+checkpoint instead, and returns the checkpoint's epoch and when it was taken:
+
+- `CommittedRead::Latest` reads the newest committed checkpoint.
+- `CommittedRead::AtLeast(epoch)` waits for a checkpoint at or after `epoch`. Pass an epoch a
+  previous result returned to read no earlier than it.
+- `CommittedRead::Exact(epoch)` reads that checkpoint, and fails once checkpoint cleanup retired
+  it. Cleanup keeps only the newest checkpoint and any checkpoint a read holds.
+
+Such a result is never rolled back and never mixes checkpoints. It is as fresh as the checkpoint
+interval. A committed read needs checkpointing, may scan only materialized views, and holds its
+checkpoint for at most 30 seconds, which also bounds the wait for `AtLeast`. A view with a
+row-count retention is not exact, because which rows the cap keeps depends on arrival order.
+Equality filters on every key column of an aggregate view read only the state of that key's
+vnode, and range filters on the event-time column of an append view kept by an interval skip
+segments outside the range.
+Decoded checkpoint state is cached up to `materialized_view_read_cache_bytes` (256 MiB).
+
+`WITH (freshness = '<interval>')` declares the most committed reads of a view may lag. `CREATE`
+rejects it when checkpoints are manual or disabled, or when it is below the checkpoint interval.
+While the newest committed checkpoint is older than a view's freshness, a warning is logged and
+`mv_freshness_breaches_total{view}` counts the breach once; `mv_committed_staleness_ms` exports
+the age.
+
+```sql
+CREATE MATERIALIZED VIEW positions AS
+SELECT account, SUM(qty) AS qty FROM fills GROUP BY account
+WITH (freshness = '10 seconds');
+```
+
 ---
 
 ## Tested Combinations

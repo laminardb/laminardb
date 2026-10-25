@@ -930,6 +930,7 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
             #[cfg(feature = "cluster")]
             metrics: None,
         },
+        &super::committed_reads::ReadPins::default(),
     )
     .await
     .unwrap();
@@ -1063,6 +1064,7 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
             #[cfg(feature = "cluster")]
             metrics: None,
         },
+        &super::committed_reads::ReadPins::default(),
     )
     .await
     .unwrap();

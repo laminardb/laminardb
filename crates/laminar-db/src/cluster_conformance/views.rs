@@ -1,5 +1,6 @@
 //! View conformance: once every fixture batch is delivered and a checkpoint commits, each read of
-//! an embedded materialized view equals batch SQL over the complete input. Each case also states
+//! an embedded materialized view equals batch SQL over the complete input, both at the last cycle
+//! and at the committed checkpoint. Each case also states
 //! the cluster verdict on the same catalog; a case that must change verdict changes here in the
 //! same commit as the runtime change that moves it.
 
@@ -13,7 +14,7 @@ use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
 use super::tests::{assert_rejected, events, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN};
 use super::{embedded_db, Verdict, DEADLINE, NODES, VNODES};
-use crate::{ExecuteResult, LaminarDB};
+use crate::{CommittedRead, ExecuteResult, LaminarDB};
 
 struct ViewCase {
     name: &'static str,
@@ -86,13 +87,22 @@ impl ViewCase {
             if expected.is_empty() {
                 return Err(format!("{}: empty ground truth for `{read}`", self.name));
             }
-            let observed = oracle::consolidate(&read_all(db, read).await?, OutputForm::Rows)?;
-            if observed != expected {
-                return Err(format!(
-                    "{}: `{read}` diverges from batch ground truth; {}",
-                    self.name,
-                    oracle::diff(&expected, &observed)
-                ));
+            let committed = db
+                .query_committed(read, CommittedRead::Exact(checkpoint.epoch))
+                .await
+                .map_err(|e| format!("{}: committed `{read}`: {e}", self.name))?;
+            for (level, batches) in [
+                ("latest", read_all(db, read).await?),
+                ("committed", committed.batches),
+            ] {
+                let observed = oracle::consolidate(&batches, OutputForm::Rows)?;
+                if observed != expected {
+                    return Err(format!(
+                        "{}: {level} `{read}` diverges from batch ground truth; {}",
+                        self.name,
+                        oracle::diff(&expected, &observed)
+                    ));
+                }
             }
         }
         Ok(())

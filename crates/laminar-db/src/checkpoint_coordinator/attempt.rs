@@ -370,6 +370,11 @@ impl CheckpointCoordinator {
             .as_ref()
             .map_or(0, |reference| reference.checkpoint_id);
         self.last_committed_ref = Some(reference.clone());
+        self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
+            index.clone(),
+            reference.clone(),
+            prepared.manifests.iter().map(|(manifest, _)| manifest),
+        )));
         self.last_committed_source_watermarks = Some((reference, index.source_watermarks.clone()));
         self.last_committed_manifest = prepared
             .manifests
@@ -470,7 +475,7 @@ impl CheckpointCoordinator {
         let checkpoint_bytes = self
             .last_committed_manifest
             .as_ref()
-            .map(|manifest| manifest.node_data.object_length);
+            .map(|manifest| super::data_object_bytes(manifest));
         self.record_checkpoint_outcome(true, attempt, duration, checkpoint_bytes);
         let continuation_error = continuation.err().map(|error| {
             self.failure_requires_recovery = true;
