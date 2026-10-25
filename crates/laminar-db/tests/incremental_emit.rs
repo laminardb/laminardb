@@ -649,7 +649,8 @@ async fn global_view_survives_checkpoint_restart_and_keeps_updating() {
     let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(
-        "CREATE MATERIALIZED VIEW overall AS SELECT SUM(v) AS total, COUNT(*) AS n FROM events",
+        "CREATE MATERIALIZED VIEW overall AS \
+         SELECT SUM(v) AS total, COUNT(*) AS n, MAX(v) AS peak FROM events",
     )
     .await
     .unwrap();
@@ -659,16 +660,16 @@ async fn global_view_survives_checkpoint_restart_and_keeps_updating() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     source.push_arrow(batch(&[3], &[5])).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let sql = "SELECT total, n FROM overall";
-    assert_eq!(read_query(&db, sql, 2).await, vec![vec![35, 3]]);
+    let sql = "SELECT total, n, peak FROM overall";
+    assert_eq!(read_query(&db, sql, 3).await, vec![vec![35, 3, 20]]);
 
-    assert_eq!(restart_and_read(&db, sql, 2).await, vec![vec![35, 3]]);
+    assert_eq!(restart_and_read(&db, sql, 3).await, vec![vec![35, 3, 20]]);
     db.source_untyped("events")
         .unwrap()
         .push_arrow(batch(&[1], &[1]))
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    assert_eq!(read_query(&db, sql, 2).await, vec![vec![36, 4]]);
+    assert_eq!(read_query(&db, sql, 3).await, vec![vec![36, 4, 20]]);
     db.shutdown().await.unwrap();
 }
 
@@ -708,5 +709,56 @@ async fn keyed_filter_view_survives_restart_and_retracts_rows_leaving_the_filter
         read_query(&db, sql, 2).await,
         vec![vec![1, 10], vec![2, 10]]
     );
+    db.shutdown().await.unwrap();
+}
+
+/// A running pipeline without checkpoints drops a changelog view with its result node and admits
+/// a new view under the same name, which starts empty.
+#[tokio::test]
+async fn a_dropped_changelog_view_can_be_created_again_while_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path())).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.start().await.unwrap();
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
+
+    db.execute("DROP MATERIALIZED VIEW agg").await.unwrap();
+    db.execute(MV).await.unwrap();
+    source.push_arrow(batch(&[3], &[30])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(read_mv(&db, "agg").await, vec![(3, 30, 1)]);
+    db.shutdown().await.unwrap();
+}
+
+/// View slices take the configured vnode count, and restore checks frames against it.
+#[tokio::test]
+async fn views_restore_under_a_non_default_vnode_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::builder()
+        .storage_dir(dir.path())
+        .checkpoint(StreamCheckpointConfig {
+            interval_ms: None,
+            ..StreamCheckpointConfig::default()
+        })
+        .key_groups(laminar_core::state::KeyGroupCount::try_from(16u16).unwrap())
+        .build()
+        .await
+        .unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.start().await.unwrap();
+    db.source_untyped("events")
+        .unwrap()
+        .push_arrow(batch(&[1, 2, 3, 1], &[10, 20, 30, 5]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let sql = "SELECT k, total, cnt FROM agg";
+    let expected = vec![vec![1, 15, 2], vec![2, 20, 1], vec![3, 30, 1]];
+    assert_eq!(read_query(&db, sql, 3).await, expected);
+    assert_eq!(restart_and_read(&db, sql, 3).await, expected);
     db.shutdown().await.unwrap();
 }
