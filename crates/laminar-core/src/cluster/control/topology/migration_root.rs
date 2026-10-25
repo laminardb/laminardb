@@ -155,8 +155,11 @@ impl TopologyMigrationRoot {
                         kind: object.kind,
                         catalog_generation: object.catalog_generation,
                         compatibility_sha256: object.compatibility_sha256.clone(),
-                        state_operator_id: (object.kind == CatalogObjectKind::Stream)
-                            .then(|| format!("graph:{}", object.name)),
+                        state_operator_id: matches!(
+                            object.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
+                        .then(|| format!("graph:{}", object.name)),
                     });
                 }
                 ClusterTopologyObjectTransition::AddFutureOnly => {
@@ -286,9 +289,8 @@ impl TopologyMigrationRoot {
                     .objects
                     .iter()
                     .find(|o| {
-                        o.kind == CatalogObjectKind::Stream
-                            && o.transition != ClusterTopologyObjectTransition::AddFutureOnly
-                            && operator_id.strip_prefix("graph:") == Some(o.name.as_str())
+                        o.transition != ClusterTopologyObjectTransition::AddFutureOnly
+                            && o.owns_state_frame(operator_id)
                     })
                     .ok_or_else(|| {
                         TopologyError::Unsupported(format!(
@@ -310,7 +312,7 @@ impl TopologyMigrationRoot {
             if !manifests.iter().any(|m| {
                 m.state_frames.iter().any(|frame| {
                     matches!(&frame.key, StateFrameKey::Vnode { operator_id, .. }
-                    if operator_id.strip_prefix("graph:") == Some(object.name.as_str()))
+                    if object.owns_state_frame(operator_id))
                 })
             }) {
                 return Err(TopologyError::Invalid(format!(

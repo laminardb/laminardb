@@ -290,6 +290,16 @@ impl RestoredView {
             .restore_vnode(&self.name, vnode, vnode_count, bytes, self.limits)
     }
 
+    #[cfg(feature = "cluster")]
+    pub(super) const fn entry(&self) -> &MvEntry {
+        &self.entry
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn into_entry(self) -> MvEntry {
+        self.entry
+    }
+
     pub(super) fn install(self, entries: &mut HashMap<String, MvEntry>) -> Result<(), DbError> {
         let current = entries.get_mut(&self.name).ok_or_else(|| {
             DbError::Checkpoint(format!(

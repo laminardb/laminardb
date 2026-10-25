@@ -10,16 +10,7 @@ use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
 use super::{DbError, DbState, LaminarDB};
 
 pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError> {
-    let mut parsed = parse_streaming_sql(sql)?;
-    if parsed.len() != 1 {
-        return Err(TopologyError::Invalid(
-            "each validation entry must contain exactly one topology DDL statement".into(),
-        )
-        .into());
-    }
-    let statement = parsed
-        .pop()
-        .ok_or_else(|| TopologyError::Invalid("empty validation entry".into()))?;
+    let statement = parse_single(sql)?;
     let allowed = match &statement {
         StreamingStatement::CreateSource(_)
         | StreamingStatement::CreateSink(_)
@@ -36,6 +27,29 @@ pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError>
         .into());
     }
     Ok(statement)
+}
+
+/// One persisted catalog entry: a change topology validation accepts, or a materialized view
+/// the bootstrap catalog created.
+pub(super) fn parse_catalog_entry(sql: &str) -> Result<StreamingStatement, DbError> {
+    let statement = parse_single(sql)?;
+    if matches!(statement, StreamingStatement::CreateMaterializedView { .. }) {
+        return Ok(statement);
+    }
+    parse_one_change(sql)
+}
+
+fn parse_single(sql: &str) -> Result<StreamingStatement, DbError> {
+    let mut parsed = parse_streaming_sql(sql)?;
+    if parsed.len() != 1 {
+        return Err(TopologyError::Invalid(
+            "each validation entry must contain exactly one topology DDL statement".into(),
+        )
+        .into());
+    }
+    parsed
+        .pop()
+        .ok_or_else(|| TopologyError::Invalid("empty validation entry".into()).into())
 }
 
 pub(super) fn statement_identity(

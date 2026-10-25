@@ -55,6 +55,12 @@ impl LaminarDB {
             .get(name)
             .cloned()
             .ok_or_else(|| unsupported("the named object is not a managed stream"))?;
+        if self.mv_registry.lock().get(name).is_some() {
+            return Err(unsupported(
+                "a materialized view's subscription needs a snapshot at the subscribed cut before \
+                 its deltas, which has not shipped",
+            ));
+        }
         let certificate = registration
             .subscription_certificate
             .map(Arc::new)

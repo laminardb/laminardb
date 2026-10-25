@@ -35,14 +35,13 @@ impl LaminarDB {
     /// no earlier than a previous result. An append view with a row-count retention is not exact:
     /// which rows a cap keeps depends on arrival order.
     ///
-    /// Embedded and single-node only. The statement may scan only materialized views. The
-    /// checkpoint is held against retention
+    /// The statement may scan only materialized views. The checkpoint is held against retention
     /// for at most 30 seconds, which bounds the read, including any wait for
-    /// [`CommittedRead::AtLeast`].
+    /// [`CommittedRead::AtLeast`]. A cluster node reads every participant's committed state, so
+    /// any node serves any view; it reads only cuts at or after the durable pin it holds.
     ///
     /// # Errors
-    /// [`DbError::Unsupported`] in cluster mode; [`DbError::CommittedRead`] when checkpointing is
-    /// disabled, the requested epoch has not
+    /// [`DbError::CommittedRead`] when checkpointing is disabled, the requested epoch has not
     /// committed in time or is no longer retained, the statement scans live state, or the read
     /// passes its deadline; any planning or execution error of `sql`.
     pub async fn query_committed(
@@ -62,13 +61,6 @@ impl LaminarDB {
     ) -> Result<CommittedQuery, DbError> {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(DbError::Shutdown);
-        }
-        // Cluster retention does not honour this process's read pins, so a cluster read could
-        // lose its checkpoint mid-read.
-        if self.is_cluster_runtime() {
-            return Err(DbError::Unsupported(
-                "committed reads are not served in cluster mode".into(),
-            ));
         }
         let (frame, cut) =
             crate::mv_store::plan_committed_statement(&self.ctx, &self.mv_store, sql, at, deadline)

@@ -373,7 +373,7 @@ pub(super) async fn replay_entry(
     candidate: &LaminarDB,
     entry: &CatalogManifestEntry,
 ) -> Result<(), DbError> {
-    let statement = super::catalog_changes::parse_one_change(&entry.ddl)?;
+    let statement = super::catalog_changes::parse_catalog_entry(&entry.ddl)?;
     let (name, kind, _) =
         super::super::validate_cluster_catalog_create(candidate, &entry.ddl, &statement)?;
     if name != entry.canonical_name || kind != entry.kind {
@@ -420,12 +420,18 @@ pub(super) fn describe_catalog(
             })
             .transpose()?;
         let operator = graph.operators.get(name);
+        let view_result = (entry.kind == CatalogObjectKind::MaterializedView)
+            .then(|| laminar_core::mv::view_result_operator(name));
         let operators: Vec<_> = std::iter::once(name)
+            .chain(view_result.as_ref())
             .chain(&stages)
             .map(|operator| (operator, graph.operators.get(operator)))
             .collect();
         if let Some((missing, _)) = operators.iter().find(|(_, operator)| operator.is_none()) {
-            if entry.kind == CatalogObjectKind::Stream {
+            if matches!(
+                entry.kind,
+                CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+            ) {
                 return Err(TopologyError::Invalid(format!(
                     "stream '{missing}' is absent from the physical candidate graph"
                 ))
@@ -503,7 +509,7 @@ fn catalog_dependencies(
             .ok_or_else(|| TopologyError::Invalid(format!("sink '{name}' has no registration")))?
             .input
             .clone()],
-        CatalogObjectKind::Stream => {
+        CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView => {
             // A split stream's inputs are those of its stages.
             let mut references = std::collections::BTreeSet::new();
             let mut pending = vec![name.clone()];

@@ -89,6 +89,51 @@ pub struct ClusterTopologyObjectPlan {
     pub managed_state_contract: Option<String>,
 }
 
+impl ClusterTopologyObjectPlan {
+    /// The only initialization this object's transition and kind admit.
+    fn canonical_initialization(&self) -> Result<TopologyInitialization, TopologyError> {
+        Ok(match (self.transition, self.kind) {
+            (ClusterTopologyObjectTransition::Preserve, _) => {
+                TopologyInitialization::PreserveExactCut
+            }
+            (
+                ClusterTopologyObjectTransition::Remove,
+                CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink,
+            ) => TopologyInitialization::RetireAtCut,
+            (ClusterTopologyObjectTransition::Remove, _) => {
+                return Err(TopologyError::Unsupported(
+                    "only sources, streams and sinks have a certified removal contract".into(),
+                ))
+            }
+            (_, CatalogObjectKind::Source) => TopologyInitialization::ResolveSourcePositionsOnce,
+            (_, CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView)
+                if self.managed_state_contract.is_some() =>
+            {
+                TopologyInitialization::EmptyManagedStateAtCut
+            }
+            _ => TopologyInitialization::FutureOnlyAtCut,
+        })
+    }
+
+    /// Whether `operator_id` is a state frame of this object: a stream's operator, or a
+    /// materialized view's operator and the operator that owns its result slices.
+    #[must_use]
+    pub fn owns_state_frame(&self, operator_id: &str) -> bool {
+        let Some(operator) = operator_id.strip_prefix("graph:") else {
+            return false;
+        };
+        match self.kind {
+            CatalogObjectKind::Stream => operator == self.name,
+            CatalogObjectKind::MaterializedView => {
+                operator == self.name
+                    || operator.strip_suffix(crate::mv::VIEW_RESULT_OPERATOR_SUFFIX)
+                        == Some(self.name.as_str())
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Effect-free candidate validation. This is neither a durable admission nor an activation receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -316,27 +361,7 @@ impl ClusterTopologyValidation {
             ));
         }
         for object in &self.objects {
-            let initialization = match (object.transition, object.kind) {
-                (ClusterTopologyObjectTransition::Preserve, _) => {
-                    TopologyInitialization::PreserveExactCut
-                }
-                (
-                    ClusterTopologyObjectTransition::Remove,
-                    CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink,
-                ) => TopologyInitialization::RetireAtCut,
-                (ClusterTopologyObjectTransition::Remove, _) => {
-                    return Err(TopologyError::Unsupported(
-                        "only sources, streams and sinks have a certified removal contract".into(),
-                    ))
-                }
-                (_, CatalogObjectKind::Source) => {
-                    TopologyInitialization::ResolveSourcePositionsOnce
-                }
-                (_, CatalogObjectKind::Stream) if object.managed_state_contract.is_some() => {
-                    TopologyInitialization::EmptyManagedStateAtCut
-                }
-                _ => TopologyInitialization::FutureOnlyAtCut,
-            };
+            let initialization = object.canonical_initialization()?;
             if object.name.is_empty()
                 || object.name.len() > 256
                 || object.catalog_generation == 0

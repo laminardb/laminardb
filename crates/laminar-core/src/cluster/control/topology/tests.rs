@@ -361,3 +361,28 @@ async fn unknown_protocol_or_nonbaseline_version_is_rejected() {
         Err(TopologyError::Invalid(_))
     ));
 }
+
+#[test]
+fn a_view_owns_its_stream_frame_and_its_result_slices() {
+    let object = |name: &str, kind| ClusterTopologyObjectPlan {
+        name: name.into(),
+        kind,
+        catalog_generation: 1,
+        transition: ClusterTopologyObjectTransition::Preserve,
+        initialization: TopologyInitialization::PreserveExactCut,
+        definition_sha256: String::new(),
+        compatibility_sha256: String::new(),
+        dependencies: Vec::new(),
+        schema_sha256: None,
+        managed_state_contract: Some("contract".into()),
+    };
+    let view = object("counts", CatalogObjectKind::MaterializedView);
+    assert!(view.owns_state_frame("graph:counts"));
+    assert!(view.owns_state_frame("graph:counts::view"));
+    assert!(!view.owns_state_frame("graph:counts$stage1::view"));
+    assert!(!view.owns_state_frame("counts::view"));
+    let stream = object("counts", CatalogObjectKind::Stream);
+    assert!(stream.owns_state_frame("graph:counts"));
+    assert!(!stream.owns_state_frame("graph:counts::view"));
+    assert!(!object("counts", CatalogObjectKind::Source).owns_state_frame("graph:counts"));
+}

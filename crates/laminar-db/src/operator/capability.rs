@@ -227,11 +227,7 @@ impl OperatorCapability {
                 State::LocalOnly,
                 "SQL execution shape has not been classified",
             ),
-            Implementation::ViewResult => Self::rejected(
-                implementation,
-                State::VnodeKeyed,
-                "materialized-view results have no assignment-fenced read and lifecycle contract",
-            ),
+            Implementation::ViewResult => Self::ddl_guarded(implementation, State::VnodeKeyed),
             #[cfg(test)]
             Implementation::TestProbe => Self::internal(implementation, State::LocalOnly),
         }
@@ -310,15 +306,11 @@ impl OperatorCapability {
         )
     }
 
-    /// A materialized view's result slices, placed like the view key. Cluster admission stays
-    /// closed until views have a committed read and lifecycle contract.
+    /// A materialized view's result slices, placed like the view key. `CREATE` admits only the
+    /// placements a cluster keeps on the producing node.
     pub(crate) const fn view_result(state_class: OperatorStateClass) -> Self {
-        Self::rejected(
-            OperatorImplementation::ViewResult,
-            state_class,
-            "materialized-view results have no assignment-fenced read and lifecycle contract",
-        )
-        .with_managed_state(ManagedStateContract::ViewResultV1)
+        Self::ddl_guarded(OperatorImplementation::ViewResult, state_class)
+            .with_managed_state(ManagedStateContract::ViewResultV1)
     }
 
     /// Fail-closed descriptor for SQL whose retained-state shape is ambiguous.

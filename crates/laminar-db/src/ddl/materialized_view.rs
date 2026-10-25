@@ -90,13 +90,6 @@ impl LaminarDB {
                     .into(),
             ));
         }
-        if self.is_cluster_runtime() {
-            return Err(Self::cluster_state_lifecycle_error(
-                "materialized view",
-                &name_str,
-                "materialized state has no planner-certified distribution and assignment-fenced checkpoint/read lifecycle",
-            ));
-        }
         Self::reject_interval_output_subquery(&name_str, query_sql)?;
         if let Some(freshness) = freshness {
             self.admit_view_freshness(&name_str, *freshness)?;
@@ -178,6 +171,7 @@ impl LaminarDB {
         query_sql: &str,
     ) -> Result<(PlannedStreamingQuery, IntervalTopologyCandidate), DbError> {
         let name_str = canonical_object_name(name)?;
+        self.validate_cluster_query_shape_before_plan("materialized view", &name_str, query_sql)?;
         let planned = self
             .plan_streaming_query(name, query, emit_clause, query_sql)
             .await?;
@@ -215,6 +209,8 @@ impl LaminarDB {
                 &planned,
             )
             .await?;
+        self.validate_cluster_query_shape("materialized view", &name_str, query_sql, &planned)
+            .await?;
         Ok((planned, interval_topology))
     }
 
@@ -239,7 +235,7 @@ impl LaminarDB {
             join_config: plan_joins,
             has_analytic: plan_has_analytic,
             has_frame: plan_has_frame,
-            subscription_output: _,
+            subscription_output: plan_subscription_output,
         } = planned;
         let query_sql = query_sql.to_string();
         // A chained MV over an incremental MV must net the changelog — a non-windowed aggregate or
@@ -271,14 +267,14 @@ impl LaminarDB {
             mutation: Arc::clone(&mutation),
         };
 
-        // Decide the store once so the operator and the store agree: a changelog view's stream
-        // emits weighted deltas and its slices follow the planned output distribution.
-        let output = self
-            .view_output(&query_sql, plan_window.is_some(), &interval_topology)
-            .await;
-        let incremental = matches!(output, ViewOutput::Changelog { .. });
-        let mode = self
-            .view_storage_mode(candidate, &schema, output, retention)
+        let (incremental, mode, subscription_output) = self
+            .plan_view_store(
+                candidate,
+                &schema,
+                (plan_window.is_some(), &interval_topology),
+                retention,
+                plan_subscription_output,
+            )
             .await?;
 
         {
@@ -293,8 +289,8 @@ impl LaminarDB {
                 has_analytic: plan_has_analytic,
                 has_frame: plan_has_frame,
                 incremental,
-                // Cluster materialized-view subscriptions remain fail-closed.
-                subscription_output: None,
+                // Certifies the view stream's distribution; subscribing to a view stays closed.
+                subscription_output,
                 subscription_retention_bytes: 0,
                 catalog_generation: 1,
                 subscription_certificate: None,
@@ -498,6 +494,48 @@ impl LaminarDB {
         ViewOutput::Append
     }
 
+    /// Decide the store once so the operator and the store agree: a changelog view's stream
+    /// emits weighted deltas, its slices follow the planned output distribution, and its
+    /// certificate is planned as a changelog, whatever the statement's EMIT says. Returns
+    /// whether the view is a changelog, its store and its certificate.
+    async fn plan_view_store(
+        &self,
+        candidate: crate::connector_manager::StreamRegistration,
+        schema: &Schema,
+        (windowed, interval_topology): (bool, &IntervalTopologyCandidate),
+        retention: Option<&MaterializedViewRetention>,
+        planned_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
+    ) -> Result<
+        (
+            bool,
+            crate::mv_store::MvStorageMode,
+            Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
+        ),
+        DbError,
+    > {
+        let name = candidate.name.clone();
+        let output = self
+            .view_output(&candidate.query_sql, windowed, interval_topology)
+            .await;
+        let incremental = matches!(output, ViewOutput::Changelog { .. });
+        let subscription_output = if incremental {
+            crate::subscription::distribution::plan(
+                &candidate.query_sql,
+                Some(&laminar_sql::parser::EmitClause::Changes),
+                &self.ctx,
+                self.checkpoint_key_groups(),
+            )?
+        } else {
+            self.admit_cluster_view(&name, None)?;
+            planned_output
+        };
+        let mode = self
+            .view_storage_mode(candidate, schema, output, retention)
+            .await?;
+        self.admit_cluster_view(&name, Some(&mode))?;
+        Ok((incremental, mode, subscription_output))
+    }
+
     /// The store a view keeps: changelog slices placed by its planned key, or an append log
     /// under its retention.
     async fn view_storage_mode(
@@ -525,6 +563,43 @@ impl LaminarDB {
                     .await?,
             },
         })
+    }
+
+    /// A cluster keeps a changelog view's slices on the nodes that produce them, so it admits
+    /// views placed by their producer's key or on one vnode. Append logs (`None` before their
+    /// retention resolves) and views placed by the full row need cluster writers and a
+    /// repartition port first.
+    fn admit_cluster_view(
+        &self,
+        name: &str,
+        mode: Option<&crate::mv_store::MvStorageMode>,
+    ) -> Result<(), DbError> {
+        use crate::mv_store::{MvStorageMode, ViewKey};
+
+        if !self.is_cluster_runtime() {
+            return Ok(());
+        }
+        let reason = match mode {
+            Some(MvStorageMode::Changelog {
+                key: ViewKey::Global | ViewKey::Keyed(_) | ViewKey::MultisetByKey(_),
+                ..
+            }) => return Ok(()),
+            Some(MvStorageMode::Changelog {
+                key: ViewKey::MultisetByRow,
+                ..
+            }) => {
+                "a view placed by its full row needs a repartition port to the nodes that own \
+                 its rows, which has not shipped"
+            }
+            None | Some(MvStorageMode::AppendLog { .. }) => {
+                "append-only views are not admitted in a cluster yet"
+            }
+        };
+        Err(Self::cluster_state_lifecycle_error(
+            "materialized view",
+            name,
+            reason,
+        ))
     }
 
     /// The view key from the view stream's planned output distribution.

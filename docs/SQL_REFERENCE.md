@@ -507,10 +507,22 @@ one statement that is split into stages; windowed joins remain rejected. A strea
 three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
 which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
 
-Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
-retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
-the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. The
-cluster admission path rejects unsupported state before connector I/O.
+Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admits when the view
+keeps its rows on the nodes that produce them:
+
+- a keyed or global aggregate view;
+- a projection or filter over such a view that keeps its key columns unchanged.
+
+Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
+moves them with their vnodes when ownership changes. `LaminarDB::query_committed` on any node reads
+every view at one committed checkpoint, from every node's checkpointed state. Rejected with
+`[LDB-4007]` before connector I/O:
+
+- append-only views (a projection over a source, a closed window, an interval join);
+- a projection over a view that drops or changes its key;
+- `SUBSCRIBE` to a view.
+
+The materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes.
 
 ### SUBSCRIBE over the Postgres wire protocol
 

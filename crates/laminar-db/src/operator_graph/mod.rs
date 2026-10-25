@@ -1306,9 +1306,13 @@ impl OperatorGraph {
                 ))
                 .into());
             }
+            let bound = self.output_map.contains_key(node.name.as_ref())
+                || node
+                    .name
+                    .strip_suffix(laminar_core::mv::VIEW_RESULT_OPERATOR_SUFFIX)
+                    .is_some_and(|view| self.output_map.contains_key(view));
             if node.capability.state_class != OperatorStateClass::Stateless
-                && (node.capability.managed_state.is_none()
-                    || !self.output_map.contains_key(node.name.as_ref()))
+                && (node.capability.managed_state.is_none() || !bound)
             {
                 return Err(TopologyError::Unsupported(format!(
                     "retained-state operator '{}' lacks a catalog-bound managed state mapping",
@@ -1326,6 +1330,11 @@ impl OperatorGraph {
                     TopologyError::Invalid(format!("output '{name}' has no live planned operator"))
                 })?;
             contracts.insert(name.to_string(), node.capability);
+        }
+        for node in self.nodes.iter().filter(|node| {
+            !node.removed && node.capability.implementation == OperatorImplementation::ViewResult
+        }) {
+            contracts.insert(node.name.to_string(), node.capability);
         }
         Ok(contracts)
     }

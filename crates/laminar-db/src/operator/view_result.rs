@@ -1,6 +1,7 @@
 //! The graph node owning a changelog view's checkpoint lifecycle. The view's rows stay in the
 //! shared `MvStore`, applied once per cycle for every view, so readers keep one cycle across
-//! views; this node captures them as vnode frames and restores frames into a private image.
+//! views; this node captures them as vnode frames, restores frames into a private image, and
+//! moves slices with their vnodes when a cluster reassigns them.
 
 use std::sync::Arc;
 
@@ -17,6 +18,8 @@ pub(crate) struct ViewResultOperator {
     state_class: OperatorStateClass,
     store: Arc<parking_lot::RwLock<MvStore>>,
     restored: Option<RestoredView>,
+    #[cfg(feature = "cluster")]
+    transition: Option<crate::mv_store::ViewTransition>,
 }
 
 impl ViewResultOperator {
@@ -30,6 +33,8 @@ impl ViewResultOperator {
             state_class,
             store,
             restored: None,
+            #[cfg(feature = "cluster")]
+            transition: None,
         }
     }
 }
@@ -80,6 +85,48 @@ impl GraphOperator for ViewResultOperator {
 
     fn take_restored_view(&mut self) -> Option<RestoredView> {
         self.restored.take()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn prepare_vnode_transition(
+        &mut self,
+        transition: crate::operator_graph::ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        if self.transition.is_some() {
+            return Err(DbError::Checkpoint(format!(
+                "view '{}' already holds a prepared vnode transition",
+                self.view
+            )));
+        }
+        if !transition.whole_restores.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "view '{}' has no whole-operator state to restore",
+                self.view
+            )));
+        }
+        let prepared = self.store.read().prepare_view_transition(
+            &self.view,
+            transition.target.vnode_count,
+            transition.revoked,
+            transition
+                .restores
+                .iter()
+                .map(|restore| (restore.vnode, restore.state)),
+        )?;
+        self.transition = Some(prepared);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_vnode_transition(&mut self) {
+        self.transition = None;
+    }
+
+    #[cfg(feature = "cluster")]
+    fn publish_vnode_transition(&mut self) {
+        if let Some(transition) = self.transition.take() {
+            self.store.write().publish_view_transition(transition);
+        }
     }
 
     fn force_full_vnode_capture(&mut self) {

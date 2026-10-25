@@ -146,6 +146,19 @@ impl ReadPins {
     }
 }
 
+#[cfg(feature = "cluster")]
+impl ReadPins {
+    /// Refuse every pin until [`Self::open_at`].
+    pub(super) fn close(&self) {
+        self.state.lock().floor = u64::MAX;
+    }
+
+    /// Admit pins at or after `epoch`, which a durable pin now protects.
+    pub(super) fn open_at(&self, epoch: u64) {
+        self.state.lock().floor = epoch;
+    }
+}
+
 impl CheckpointCoordinator {
     /// Readers of committed cuts: the latest cut and the pins retention honours.
     pub(crate) fn committed_reads(&self) -> (CommittedCuts, Arc<ReadPins>) {

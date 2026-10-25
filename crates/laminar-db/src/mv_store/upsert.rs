@@ -97,6 +97,44 @@ impl UpsertState {
         keys.map_or_else(global_aggregate_key, |keys| keys.row(row_idx).owned())
     }
 
+    /// The rows and bytes the slices of `vnodes` hold.
+    #[cfg(feature = "cluster")]
+    pub(super) fn slices_charge(&self, vnodes: &[u32]) -> (usize, usize) {
+        vnodes.iter().fold((0, 0), |(rows, bytes), &vnode| {
+            let (slice_rows, slice_bytes) = Self::slice_charge(self.slices.slot(vnode));
+            (rows + slice_rows, bytes.saturating_add(slice_bytes))
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn slice_charge(slice: &UpsertSlice) -> (usize, usize) {
+        let bytes = slice
+            .iter()
+            .map(|(key, values)| Self::row_size(key, values).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add);
+        (slice.len(), bytes)
+    }
+
+    /// Empty the slices of `revoked` and move in those of `acquired` from `staged`, with their
+    /// charge. Preparation checked the result against the view limits, so this saturates
+    /// rather than fails. The next capture writes every owned vnode.
+    #[cfg(feature = "cluster")]
+    pub(super) fn exchange_slices(&mut self, revoked: &[u32], staged: &mut Self, acquired: &[u32]) {
+        for &vnode in revoked.iter().chain(acquired) {
+            let (rows, bytes) = Self::slice_charge(&std::mem::take(self.slices.slot_mut(vnode)));
+            self.rows = self.rows.saturating_sub(rows);
+            self.approx_bytes = self.approx_bytes.saturating_sub(bytes);
+        }
+        for &vnode in acquired {
+            let slice = std::mem::take(staged.slices.slot_mut(vnode));
+            let (rows, bytes) = Self::slice_charge(&slice);
+            self.rows = self.rows.saturating_add(rows);
+            self.approx_bytes = self.approx_bytes.saturating_add(bytes);
+            *self.slices.slot_mut(vnode) = slice;
+        }
+        self.slices.require_full_capture();
+    }
+
     fn vnode_of(&self, key: &OwnedRow) -> u32 {
         if self.key_converter.is_some() {
             self.slices.vnode_for(key.as_ref())

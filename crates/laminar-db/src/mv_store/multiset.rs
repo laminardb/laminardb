@@ -90,6 +90,28 @@ struct StagedCount {
 const STAGED_ROW_OVERHEAD: usize =
     std::mem::size_of::<(OwnedRow, StagedCount)>() - std::mem::size_of::<(OwnedRow, i64)>();
 
+/// The rows, bytes and snapshot expansion one slice holds.
+#[cfg(feature = "cluster")]
+fn slice_charge(slice: &MultisetSlice) -> (usize, usize, Expansion) {
+    slice.iter().fold(
+        (0, 0, Expansion::default()),
+        |(rows, bytes, expansion), (key, &count)| {
+            let added = Expansion::contribution(key, count).unwrap_or(Expansion {
+                rows: u128::MAX,
+                bytes: u128::MAX,
+            });
+            (
+                rows + 1,
+                bytes.saturating_add(row_size(key).unwrap_or(usize::MAX)),
+                Expansion {
+                    rows: expansion.rows.saturating_add(added.rows),
+                    bytes: expansion.bytes.saturating_add(added.bytes),
+                },
+            )
+        },
+    )
+}
+
 fn row_size(key: &OwnedRow) -> Result<usize, DbError> {
     std::mem::size_of::<(OwnedRow, i64)>()
         .checked_add(key.as_ref().len())
@@ -161,6 +183,45 @@ impl MultisetState {
             approx_bytes: 0,
             expansion: Expansion::default(),
         })
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) const fn row_count(&self) -> usize {
+        self.rows
+    }
+
+    /// The rows and bytes the slices of `vnodes` hold.
+    #[cfg(feature = "cluster")]
+    pub(super) fn slices_charge(&self, vnodes: &[u32]) -> (usize, usize) {
+        vnodes.iter().fold((0, 0), |(rows, bytes), &vnode| {
+            let (slice_rows, slice_bytes, _) = slice_charge(self.slices.slot(vnode));
+            (rows + slice_rows, bytes.saturating_add(slice_bytes))
+        })
+    }
+
+    /// Empty the slices of `revoked` and move in those of `acquired` from `staged`, with their
+    /// charge. Preparation checked the result against the view limits, so this saturates
+    /// rather than fails. The next capture writes every owned vnode.
+    #[cfg(feature = "cluster")]
+    pub(super) fn exchange_slices(&mut self, revoked: &[u32], staged: &mut Self, acquired: &[u32]) {
+        for &vnode in revoked.iter().chain(acquired) {
+            let (rows, bytes, expansion) =
+                slice_charge(&std::mem::take(self.slices.slot_mut(vnode)));
+            self.rows = self.rows.saturating_sub(rows);
+            self.approx_bytes = self.approx_bytes.saturating_sub(bytes);
+            self.expansion.rows = self.expansion.rows.saturating_sub(expansion.rows);
+            self.expansion.bytes = self.expansion.bytes.saturating_sub(expansion.bytes);
+        }
+        for &vnode in acquired {
+            let slice = std::mem::take(staged.slices.slot_mut(vnode));
+            let (rows, bytes, expansion) = slice_charge(&slice);
+            self.rows = self.rows.saturating_add(rows);
+            self.approx_bytes = self.approx_bytes.saturating_add(bytes);
+            self.expansion.rows = self.expansion.rows.saturating_add(expansion.rows);
+            self.expansion.bytes = self.expansion.bytes.saturating_add(expansion.bytes);
+            *self.slices.slot_mut(vnode) = slice;
+        }
+        self.slices.require_full_capture();
     }
 
     /// Encoded placement keys when rows are placed by an inherited hash key. `columns[i]` is

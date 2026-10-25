@@ -7,8 +7,12 @@ mod artifacts;
 mod attempt;
 mod attempt_failure;
 mod capture;
+#[cfg(feature = "cluster")]
+mod cluster_read_pin;
 mod commit_index;
 pub(crate) mod committed_reads;
+#[cfg(feature = "cluster")]
+pub(crate) use cluster_read_pin::start_cluster_read_pin;
 mod coordinator;
 #[cfg(feature = "cluster")]
 mod follower_completion;

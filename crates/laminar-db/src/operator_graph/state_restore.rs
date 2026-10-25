@@ -334,7 +334,6 @@ fn select_topology_state_frames<'a>(
 ) -> Result<Vec<&'a crate::recovery_manager::RecoveredStateFrame>, DbError> {
     use laminar_core::checkpoint::StateFrameKey;
     use laminar_core::cluster::control::topology::ClusterTopologyObjectTransition;
-    use laminar_core::cluster::control::CatalogObjectKind;
 
     let parent_cut = recovered.committed.pipeline_identity == input.descriptor().parent_pipeline;
     let mut frames = Vec::new();
@@ -351,8 +350,7 @@ fn select_topology_state_frames<'a>(
             .objects
             .iter()
             .find(|object| {
-                object.kind == CatalogObjectKind::Stream
-                    && operator_id.strip_prefix("graph:") == Some(object.name.as_str())
+                object.owns_state_frame(operator_id)
                     && if parent_cut {
                         object.transition != ClusterTopologyObjectTransition::AddFutureOnly
                     } else {

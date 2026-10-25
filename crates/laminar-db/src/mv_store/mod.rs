@@ -23,6 +23,8 @@ mod multiset;
 mod slices;
 mod staging;
 mod statement_snapshot;
+#[cfg(feature = "cluster")]
+mod transition;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
 use append_log::AppendLogState;
@@ -36,6 +38,8 @@ pub(crate) use statement_snapshot::{
     plan_committed_statement, plan_statement, read_views, CommittedStatement,
     StatementViewSnapshot, VIEW_READ_DEADLINE,
 };
+#[cfg(feature = "cluster")]
+pub(crate) use transition::ViewTransition;
 use upsert::UpsertState;
 
 #[cfg(feature = "benchmark-internals")]
@@ -236,6 +240,24 @@ impl MvStore {
         self.committed.clone()
     }
 
+    /// A view whose state a cluster cannot keep yet: an append log or a multiset placed by row.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn first_view_outside_cluster(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(_, entry)| {
+                matches!(
+                    entry.mode,
+                    MvStorageMode::AppendLog { .. }
+                        | MvStorageMode::Changelog {
+                            key: ViewKey::MultisetByRow,
+                            ..
+                        }
+                )
+            })
+            .map(|(name, _)| name.as_str())
+    }
+
     /// Freshness the views declared; it outlives recovery images of this store.
     pub(crate) fn freshness_contracts(&self) -> Arc<FreshnessContracts> {
         Arc::clone(&self.freshness)
@@ -277,11 +299,6 @@ impl MvStore {
             MvStorageMode::Changelog { key, .. } => Some(key.state_class()),
             MvStorageMode::AppendLog { .. } => None,
         }
-    }
-
-    #[cfg(feature = "cluster")]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 
     /// Apply one cycle's output atomically to a single MV.

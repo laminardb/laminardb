@@ -10187,13 +10187,13 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  SELECT id, value FROM left_events",
             )
             .await;
-            assert_cluster_rejection(
-                &db,
-                "rejected_global_aggregate",
-                "CREATE MATERIALIZED VIEW rejected_global_aggregate AS \
+            db.execute(
+                "CREATE MATERIALIZED VIEW global_view_ok AS \
                  SELECT SUM(value) AS total FROM left_events",
             )
-            .await;
+            .await
+            .expect("a global aggregate view keeps its slice on vnode 0's owner");
+            assert!(db.mv_store.read().has_mv("global_view_ok"));
             db.execute(
                 "CREATE STREAM projection_ok AS \
                  SELECT id, value FROM left_events WHERE value > 0",

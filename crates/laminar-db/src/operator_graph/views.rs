@@ -23,7 +23,7 @@ impl OperatorGraph {
         };
         let operator = ViewResultOperator::new(stream.to_owned(), state_class, Arc::clone(store));
         self.allocate_node(GraphNode::new(
-            Arc::from(format!("{stream}::view")),
+            Arc::from(laminar_core::mv::view_result_operator(stream)),
             Box::new(operator),
             0,
         ));

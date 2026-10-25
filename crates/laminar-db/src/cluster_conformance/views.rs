@@ -44,16 +44,64 @@ impl ViewCase {
         let checked = self.check_reads_after_drain(&db, &polled).await;
         let _ = tokio::time::timeout(DEADLINE, db.shutdown()).await;
         checked?;
-        match Cluster::start(NODES, VNODES, &self.sources, &self.ddl()).await {
-            Startup::Rejected(error) => Ok(Verdict::Rejected(error.to_string())),
-            Startup::Running(cluster) => {
-                cluster.shutdown().await;
-                Err(format!(
-                    "{}: cluster admitted the views but has no committed view read to compare",
-                    self.name
-                ))
+        let cluster = match Cluster::start(NODES, VNODES, &self.sources, &self.ddl()).await {
+            Startup::Rejected(error) => return Ok(Verdict::Rejected(error.to_string())),
+            Startup::Running(cluster) => cluster,
+        };
+        let checked = self.check_cluster_reads(&cluster).await;
+        cluster.shutdown().await;
+        checked.map(|()| Verdict::Equal)
+    }
+
+    /// Every node reads every view at the cut committed after the sources delivered, and each
+    /// read equals batch SQL over the complete input.
+    async fn check_cluster_reads(&self, cluster: &Cluster) -> Result<(), String> {
+        cluster
+            .activate()
+            .await
+            .map_err(|e| format!("{}: cluster start: {e}", self.name))?;
+        let total: u64 = self.sources.iter().map(FixtureSource::batch_count).sum();
+        let delivered = || -> u64 {
+            cluster
+                .polled
+                .iter()
+                .map(|polled| polled.load(Ordering::Acquire))
+                .sum()
+        };
+        super::wait_until(DEADLINE, || delivered() >= total)
+            .await
+            .map_err(|()| format!("{}: cluster sources did not deliver", self.name))?;
+        let checkpoint = cluster.dbs[0]
+            .checkpoint_with_timeout(DEADLINE)
+            .await
+            .map_err(|e| format!("{}: cluster checkpoint: {e}", self.name))?;
+        if !checkpoint.success {
+            return Err(format!(
+                "{}: cluster checkpoint failed: {checkpoint:?}",
+                self.name
+            ));
+        }
+        for (read, truth) in &self.reads {
+            let expected = oracle::ground_truth(&self.sources, truth).await?;
+            for (node, db) in cluster.dbs.iter().enumerate() {
+                let committed = db
+                    .query_committed(read, CommittedRead::Exact(checkpoint.epoch))
+                    .await
+                    .map_err(|e| {
+                        format!("{}: node {} committed `{read}`: {e}", self.name, node + 1)
+                    })?;
+                let observed = oracle::consolidate(&committed.batches, OutputForm::Rows)?;
+                if observed != expected {
+                    return Err(format!(
+                        "{}: node {} committed `{read}` diverges from batch ground truth; {}",
+                        self.name,
+                        node + 1,
+                        oracle::diff(&expected, &observed)
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     async fn check_reads_after_drain(
@@ -160,9 +208,9 @@ const KEYED_TRUTH: &str = "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROU
 
 /// Keyed upsert, global replace-every-cycle, and the multiset and keyed views chained over an
 /// incremental view, plus statements that read two views; the invariant runs while 240 batches
-/// are still being delivered.
+/// are still being delivered. Every cluster node reads the same rows at the committed cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn keyed_and_chained_views_are_rejected_in_cluster() {
+async fn keyed_and_chained_views_match_batch_sql_in_cluster() {
     let case = ViewCase {
         name: "keyed_and_chained_views",
         sources: vec![events_with("events", 0, 40)],
@@ -200,7 +248,7 @@ async fn keyed_and_chained_views_are_rejected_in_cluster() {
              (SELECT 1 FROM counts c WHERE c.k = b.k AND c.n = b.n)",
         ],
     };
-    assert_rejected(verdict(case).await, "materialized view");
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 /// A projection over a source and a closed tumbling window both append.
@@ -242,4 +290,74 @@ async fn interval_join_view_is_rejected_in_cluster() {
         same_cycle_invariants: vec![],
     };
     assert_rejected(verdict(case).await, "materialized view");
+}
+
+/// A read on a follower holds its cut against cluster cleanup while later checkpoints commit;
+/// once it ends, the node's pin moves on and cleanup retires the cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_cluster_read_keeps_its_cut_from_cleanup() {
+    let sources = vec![events_with("events", 0, 4)];
+    let ddl: Vec<String> = sources
+        .iter()
+        .map(FixtureSource::ddl)
+        .chain(views(&["CREATE MATERIALIZED VIEW counts AS \
+             SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k"]))
+        .collect();
+    let Startup::Running(cluster) = Cluster::start(NODES, VNODES, &sources, &ddl).await else {
+        panic!("keyed views are admitted in cluster");
+    };
+    cluster.activate().await.unwrap();
+    let checkpoint = |db: &Arc<LaminarDB>| {
+        let db = Arc::clone(db);
+        async move {
+            let checkpoint = db.checkpoint_with_timeout(DEADLINE).await.unwrap();
+            assert!(checkpoint.success, "{checkpoint:?}");
+            checkpoint.epoch
+        }
+    };
+    let held_epoch = checkpoint(&cluster.dbs[0]).await;
+    let follower = &cluster.dbs[1];
+    let views = follower.mv_store.read().committed_views().unwrap();
+    let shape = follower.mv_store.read().view_shape("counts").unwrap();
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let held = views
+        .pin(CommittedRead::Exact(held_epoch), deadline)
+        .await
+        .unwrap();
+    // Longer than the pin's advance interval, so the node pin is asked to move past the cut.
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        checkpoint(&cluster.dbs[0]).await;
+    }
+    assert!(!held
+        .read_view(&views, &shape, &[])
+        .await
+        .unwrap()
+        .is_empty());
+    // Cleanup retires a cut's committed index with it, so an exact read proves it was kept.
+    follower
+        .query_committed("SELECT * FROM counts", CommittedRead::Exact(held_epoch))
+        .await
+        .unwrap();
+    drop(held);
+
+    let retired = async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            checkpoint(&cluster.dbs[0]).await;
+            let read = follower
+                .query_committed("SELECT * FROM counts", CommittedRead::Exact(held_epoch))
+                .await;
+            if let Err(crate::DbError::CommittedRead(crate::CommittedReadError::Retired {
+                ..
+            })) = read
+            {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(DEADLINE, retired)
+        .await
+        .expect("cleanup retires the cut once no read holds it");
+    cluster.shutdown().await;
 }

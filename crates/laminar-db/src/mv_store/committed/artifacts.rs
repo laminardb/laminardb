@@ -81,7 +81,10 @@ impl PinnedCut {
         vnode_count: u32,
         pruning: &ScanPruning,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let operator_id = format!("graph:{}::view", shape.name);
+        let operator_id = format!(
+            "graph:{}",
+            laminar_core::mv::view_result_operator(&shape.name)
+        );
         let mut frames = BTreeMap::new();
         for manifest in self.manifests.iter() {
             for frame in &manifest.state_frames {
