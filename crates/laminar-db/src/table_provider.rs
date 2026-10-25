@@ -198,14 +198,15 @@ impl TableProvider for MvTableProvider {
         let batch = match snapshot.as_ref().and_then(|views| views.get(&self.mv_name)) {
             Some(batch) => batch.clone(),
             // Propagate a materialization error; an empty batch would look like a legitimately empty MV.
-            None => self
-                .mv_store
-                .read()
-                .to_record_batch(&self.mv_name)
-                .map_err(|e| {
-                    DataFusionError::Execution(format!("MV scan '{}': {e}", self.mv_name))
-                })?
-                .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone())),
+            None => {
+                crate::mv_store::read_views(&self.mv_store, std::slice::from_ref(&self.mv_name))
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("MV scan '{}': {e}", self.mv_name))
+                    })?
+                    .remove(&self.mv_name)
+                    .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()))
+            }
         };
 
         let schema = batch.schema();

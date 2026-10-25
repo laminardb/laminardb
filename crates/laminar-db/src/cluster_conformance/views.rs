@@ -201,7 +201,8 @@ async fn append_views_are_rejected_in_cluster() {
         sources: vec![events("events", 0)],
         views: views(&[
             "CREATE MATERIALIZED VIEW multiples AS \
-             SELECT k, v * 2 AS v2 FROM events WHERE v % 3 = 0",
+             SELECT k, v * 2 AS v2 FROM events WHERE v % 3 = 0 \
+             WITH (retention = '100000 rows')",
             "CREATE MATERIALIZED VIEW windows AS \
              SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, \
              COUNT(*) AS n, SUM(v) AS s FROM events \
@@ -225,7 +226,7 @@ async fn interval_join_view_is_rejected_in_cluster() {
         name: "interval_join_view",
         sources: vec![events("orders", 0), events("payments", 3)],
         views: vec![format!(
-            "CREATE MATERIALIZED VIEW joined AS {INTERVAL_JOIN}"
+            "CREATE MATERIALIZED VIEW joined AS {INTERVAL_JOIN} WITH (retention = '100000 rows')"
         )],
         reads: vec![("SELECT * FROM joined", INTERVAL_JOIN)],
         same_cycle_invariants: vec![],

@@ -1,4 +1,4 @@
-//! Result nodes of changelog materialized views.
+//! Result nodes of changelog materialized views, and the frontiers append views retain by.
 
 use std::sync::Arc;
 
@@ -30,6 +30,13 @@ impl OperatorGraph {
         self.topo_dirty = true;
     }
 
+    /// The output watermark of stream `name`, once it has one.
+    pub(crate) fn stream_watermark(&self, name: &str) -> Option<i64> {
+        let node = *self.output_map.get(name)?;
+        let watermark = self.output_watermarks[node];
+        (watermark != i64::MIN).then_some(watermark)
+    }
+
     /// Slices that result nodes restored from the selected checkpoint.
     pub(crate) fn take_restored_views(&mut self) -> Vec<RestoredView> {
         self.nodes
@@ -42,8 +49,6 @@ impl OperatorGraph {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use arrow::array::{Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -142,7 +147,7 @@ mod tests {
         assert_eq!(restored_frames, 256);
         let image = store
             .read()
-            .recovery_image(&HashMap::new(), restored.take_restored_views())
+            .recovery_image(restored.take_restored_views(), None)
             .unwrap();
         assert_eq!(rows(&image), vec![(1, 1), (2, 1), (3, 1)]);
         assert_eq!(rows(&store.read()), vec![(1, 1), (2, 5), (3, 1)]);

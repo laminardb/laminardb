@@ -761,6 +761,41 @@ aggregates included, so an aggregate or projection over a view needs no `EMIT` c
 rule makes a window or join over such a view fail, and a sink that reads the view must accept
 full changelogs.
 
+### 7. Append-only views keep rows by a declared retention
+
+A view whose query only appends rows (a projection or filter over a source, a window with `EMIT ON
+WINDOW CLOSE` or `EMIT FINAL`, or an interval join) keeps its rows as a log. With checkpointing,
+each checkpoint writes the rows appended since the previous one as one segment beside the
+checkpoint's state, memory holds only those rows, and `SELECT` reads committed segments back from
+the checkpoint store. Retention decides which rows a read returns and which segments later
+checkpoints keep:
+
+- `WITH (retention = '<interval>')`, for example `'2 hours'`: rows whose event time is at or after
+  the view's watermark minus the interval. The event-time column is the source's watermark column
+  when the query forwards it unchanged, or the window column of a windowed view, which keeps a
+  window while its end (start plus window size, or plus the gap for a session) is inside the
+  interval. A view that declares nothing keeps 1 hour.
+- `WITH (retention = '<n> rows')`: the latest `n` rows. A view without an event-time column (over
+  an interval join, or over a source without a watermark) must declare it.
+- `'unbounded'` is rejected until log compaction is available, and a changelog view rejects
+  `retention`.
+
+```sql
+CREATE MATERIALIZED VIEW minute_volume AS
+SELECT symbol, tumble(ts, INTERVAL '1' MINUTE) AS window_start, SUM(qty) AS volume
+FROM trades GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE
+WITH (retention = '6 hours');
+```
+
+Rows waiting for the next checkpoint count against `materialized_view_max_rows` and
+`materialized_view_max_bytes`, and a cycle that would exceed them fails instead of dropping rows.
+Without checkpointing the whole retained log stays in memory under the same limits. Each checkpoint
+adds at most one segment per view, and one checkpoint retains at most 32,768 segments across all
+views: 24 hours at a 10-second checkpoint interval is 8,640 segments per view. A row whose event
+time is NULL is not returned once the view has a watermark. Earlier releases kept the last
+1,000 batches of an append view instead.
+
 ---
 
 ## Tested Combinations

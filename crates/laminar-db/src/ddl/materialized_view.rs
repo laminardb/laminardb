@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 
 use laminar_core::catalog::CatalogObjectKind;
-use laminar_sql::parser::StreamingStatement;
+use laminar_sql::parser::{MaterializedViewRetention, StreamingStatement};
 
 use crate::db::{canonical_object_name, exact_table_reference, LaminarDB};
 use crate::error::DbError;
@@ -61,13 +61,23 @@ impl LaminarDB {
     pub(crate) async fn handle_create_materialized_view(
         &self,
         sql: &str,
-        name: &sqlparser::ast::ObjectName,
-        query: &StreamingStatement,
-        emit_clause: Option<laminar_sql::parser::EmitClause>,
-        or_replace: bool,
-        if_not_exists: bool,
-        query_sql: &str,
+        statement: &StreamingStatement,
     ) -> Result<ExecuteResult, DbError> {
+        let StreamingStatement::CreateMaterializedView {
+            name,
+            query,
+            emit_clause,
+            or_replace,
+            if_not_exists,
+            query_sql,
+            retention,
+        } = statement
+        else {
+            return Err(DbError::InvalidOperation(
+                "expected a CREATE MATERIALIZED VIEW statement".into(),
+            ));
+        };
+        let (or_replace, if_not_exists) = (*or_replace, *if_not_exists);
         self.ensure_topology_ddl_allowed("CREATE MATERIALIZED VIEW")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
@@ -102,15 +112,15 @@ impl LaminarDB {
         };
 
         let (planned, interval_topology) = self
-            .validate_mv_admission(name, query, emit_clause, query_sql)
+            .validate_mv_admission(name, query, emit_clause.clone(), query_sql)
             .await?;
         self.register_and_admit_mv(
             sql,
             &name_str,
             reservation,
-            planned,
-            interval_topology,
+            (planned, interval_topology),
             query_sql,
+            retention.as_ref(),
         )
         .await?;
 
@@ -182,9 +192,9 @@ impl LaminarDB {
         sql: &str,
         name_str: &str,
         mut reservation: CatalogNameReservation<'_>,
-        planned: PlannedStreamingQuery,
-        interval_topology: IntervalTopologyCandidate,
+        (planned, interval_topology): (PlannedStreamingQuery, IntervalTopologyCandidate),
         query_sql: &str,
+        retention: Option<&MaterializedViewRetention>,
     ) -> Result<(), DbError> {
         let candidate = planned.candidate_registration(name_str, query_sql);
         let PlannedStreamingQuery {
@@ -232,13 +242,9 @@ impl LaminarDB {
             .view_output(&query_sql, plan_window.is_some(), &interval_topology)
             .await;
         let incremental = matches!(output, ViewOutput::Changelog { .. });
-        let mode = match output {
-            ViewOutput::Changelog { aggregate } => crate::mv_store::MvStorageMode::Changelog {
-                key: self.planned_view_key(candidate, &schema, aggregate).await?,
-                key_groups: self.checkpoint_key_groups(),
-            },
-            ViewOutput::Append => crate::mv_store::MvStorageMode::append_default(),
-        };
+        let mode = self
+            .view_storage_mode(candidate, &schema, output, retention)
+            .await?;
 
         {
             let mut mgr = self.connector_manager.lock();
@@ -455,6 +461,35 @@ impl LaminarDB {
             return ViewOutput::Changelog { aggregate: false };
         }
         ViewOutput::Append
+    }
+
+    /// The store a view keeps: changelog slices placed by its planned key, or an append log
+    /// under its retention.
+    async fn view_storage_mode(
+        &self,
+        candidate: crate::connector_manager::StreamRegistration,
+        schema: &Schema,
+        output: ViewOutput,
+        retention: Option<&MaterializedViewRetention>,
+    ) -> Result<crate::mv_store::MvStorageMode, DbError> {
+        Ok(match output {
+            ViewOutput::Changelog { .. } if retention.is_some() => {
+                return Err(DbError::MaterializedView(format!(
+                    "materialized view '{}' maintains a changelog; retention applies only to \
+                     append-only views",
+                    candidate.name
+                )));
+            }
+            ViewOutput::Changelog { aggregate } => crate::mv_store::MvStorageMode::Changelog {
+                key: self.planned_view_key(candidate, schema, aggregate).await?,
+                key_groups: self.checkpoint_key_groups(),
+            },
+            ViewOutput::Append => crate::mv_store::MvStorageMode::AppendLog {
+                retention: self
+                    .append_view_retention(candidate, schema, retention)
+                    .await?,
+            },
+        })
     }
 
     /// The view key from the view stream's planned output distribution.

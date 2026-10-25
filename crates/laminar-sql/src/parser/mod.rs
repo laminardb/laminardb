@@ -20,6 +20,7 @@ mod source_parser;
 mod statements;
 mod subscribe_parser;
 mod tokenizer;
+mod view_options;
 mod window_rewriter;
 
 pub use lookup_table::CreateLookupTableStatement;
@@ -28,6 +29,7 @@ pub use statements::{
     FormatSpec, LateDataClause, ShowCommand, SinkFrom, StreamingStatement, SubscribeStatement,
     WatermarkDef, WindowFunction,
 };
+pub use view_options::MaterializedViewRetention;
 pub use window_rewriter::WindowRewriter;
 
 use dialect::LaminarDialect;
@@ -859,10 +861,19 @@ fn parse_create_materialized_view(
         .expect_keyword(sqlparser::keywords::Keyword::AS)
         .map_err(ParseError::SqlParseError)?;
 
-    // Collect remaining tokens and split at EMIT boundary (same strategy as continuous query)
     let remaining = collect_remaining_tokens(parser);
-    let (query_tokens, emit_tokens) = split_at_emit(&remaining);
-    let raw_query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
+    let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
+    let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
+    let raw_query_sql = query_body_sql(
+        original_sql,
+        &query_tokens,
+        &emit_tokens,
+        with_tokens.as_deref(),
+    );
+    let retention = with_tokens
+        .map(view_options::parse_view_options)
+        .transpose()?
+        .flatten();
 
     let mv_dialect = LaminarDialect::default();
 
@@ -906,6 +917,7 @@ fn parse_create_materialized_view(
         or_replace,
         if_not_exists,
         query_sql,
+        retention,
     })
 }
 

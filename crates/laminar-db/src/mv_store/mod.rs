@@ -1,7 +1,7 @@
 //! Materialized view result storage, queryable via `SELECT * FROM mv_name`.
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use crate::error::DbError;
 use crate::operator::capability::OperatorStateClass;
 
 mod admission;
+mod append_log;
 mod checkpoint;
 mod frames;
 mod multiset;
@@ -22,20 +23,19 @@ mod staging;
 mod statement_snapshot;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
+use append_log::AppendLogState;
+pub(crate) use append_log::{LogRead, ViewLogReader, ViewRetention};
 pub(crate) use frames::RestoredView;
 use multiset::MultisetState;
-pub(crate) use statement_snapshot::{plan_statement, StatementViewSnapshot};
+pub(crate) use statement_snapshot::{plan_statement, read_views, StatementViewSnapshot};
 use upsert::UpsertState;
 
 #[cfg(feature = "benchmark-internals")]
 pub(crate) mod benchmark;
 
+pub(crate) use checkpoint::MvCheckpointCapture;
 #[cfg(test)]
 use checkpoint::{batches_to_ipc, ipc_to_schema_and_batches, multiset_checkpoint_schema};
-pub(crate) use checkpoint::{MvCheckpointCapture, CHECKPOINT_KEY_PREFIX};
-
-/// Default maximum batches retained in append mode.
-const DEFAULT_APPEND_MAX_BATCHES: usize = 1000;
 
 /// Existing multiset snapshot expansion byte guard (256 MiB), separate from live quotas.
 const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
@@ -73,8 +73,8 @@ impl ViewKey {
 /// How a materialized view accumulates results.
 #[derive(Debug, Clone)]
 pub(crate) enum MvStorageMode {
-    /// Append-only output with bounded retention.
-    Append { max_batches: usize },
+    /// Append-only rows kept as a committed log under a declared retention.
+    AppendLog { retention: ViewRetention },
     /// A `__weight` changelog maintained as vnode slices over `key_groups` vnodes.
     Changelog {
         key: ViewKey,
@@ -83,9 +83,10 @@ pub(crate) enum MvStorageMode {
 }
 
 impl MvStorageMode {
-    pub fn append_default() -> Self {
-        Self::Append {
-            max_batches: DEFAULT_APPEND_MAX_BATCHES,
+    #[cfg(test)]
+    pub(crate) fn append_rows(rows: u64) -> Self {
+        Self::AppendLog {
+            retention: ViewRetention::Rows(rows),
         }
     }
 
@@ -119,20 +120,23 @@ fn weight_and_plain_cols(batch: &RecordBatch) -> Result<(&Int64Array, Vec<usize>
 pub(crate) struct MvEntry {
     schema: SchemaRef,
     mode: MvStorageMode,
-    batches: VecDeque<RecordBatch>,
+    /// Present only for an append-only view.
+    log: Option<AppendLogState>,
     /// Present only for a `Global` or `Keyed` changelog view.
     upsert: Option<UpsertState>,
     /// Present only for a multiset changelog view.
     multiset: Option<MultisetState>,
     approx_bytes: usize,
-    rows: usize,
 }
 
 impl MvEntry {
     fn new(schema: SchemaRef, mode: MvStorageMode) -> Result<Self, DbError> {
-        let (mut upsert, mut multiset) = (None, None);
-        if let MvStorageMode::Changelog { key, key_groups } = &mode {
-            match key {
+        let (mut log, mut upsert, mut multiset) = (None, None, None);
+        match &mode {
+            MvStorageMode::AppendLog { retention } => {
+                log = Some(AppendLogState::new(retention.clone()));
+            }
+            MvStorageMode::Changelog { key, key_groups } => match key {
                 ViewKey::Global => upsert = Some(UpsertState::new(&schema, &[], *key_groups)?),
                 ViewKey::Keyed(columns) => {
                     upsert = Some(UpsertState::new(&schema, columns, *key_groups)?);
@@ -143,16 +147,15 @@ impl MvEntry {
                 ViewKey::MultisetByRow => {
                     multiset = Some(MultisetState::new(&schema, &[], *key_groups)?);
                 }
-            }
+            },
         }
         Ok(Self {
             schema,
             mode,
-            batches: VecDeque::new(),
+            log,
             upsert,
             multiset,
             approx_bytes: 0,
-            rows: 0,
         })
     }
 
@@ -163,13 +166,17 @@ impl MvEntry {
         if let Some(ms) = self.multiset.as_ref() {
             return ms.to_record_batch(&self.schema);
         }
-        if self.batches.is_empty() {
-            return Ok(RecordBatch::new_empty(self.schema.clone()));
+        match &self.log {
+            Some(log) => log.memory_batch(&self.schema),
+            None => Err(DbError::Storage("MV has no result state".into())),
         }
-        let refs: Vec<&RecordBatch> = self.batches.iter().collect();
-        arrow::compute::concat_batches(&self.schema, refs.iter().copied())
-            .map_err(|e| DbError::Storage(format!("MV batch concat: {e}")))
     }
+}
+
+/// One view's contents captured under the store read guard.
+pub(crate) enum ViewRead {
+    Ready(RecordBatch),
+    Log(Box<LogRead>),
 }
 
 /// Store for all materialized view results; shared via `Arc<RwLock<MvStore>>`.
@@ -178,6 +185,12 @@ pub(crate) struct MvStore {
     limits: MvLimits,
     /// Lets the hot path skip the write lock when no MVs exist.
     has_any: Arc<AtomicBool>,
+    /// Reads committed append-log segments once checkpointing is configured.
+    log_reader: Option<Arc<ViewLogReader>>,
+    /// The checkpoint whose view logs the store last committed or restored.
+    log_checkpoint: Option<u64>,
+    /// The checkpoint attempt whose view-log capture awaits its outcome.
+    log_capture: Option<u64>,
 }
 
 impl MvStore {
@@ -194,11 +207,19 @@ impl MvStore {
                 bytes: config.materialized_view_max_bytes,
             },
             has_any: Arc::new(AtomicBool::new(false)),
+            log_reader: None,
+            log_checkpoint: None,
+            log_capture: None,
         }
     }
 
     pub fn has_any_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.has_any)
+    }
+
+    /// Read committed view-log segments through `reader` from now on.
+    pub(crate) fn set_log_reader(&mut self, reader: Arc<ViewLogReader>) {
+        self.log_reader = Some(reader);
     }
 
     pub fn create_mv(
@@ -234,7 +255,7 @@ impl MvStore {
     pub(crate) fn view_state_class(&self, name: &str) -> Option<OperatorStateClass> {
         match &self.entries.get(name)?.mode {
             MvStorageMode::Changelog { key, .. } => Some(key.state_class()),
-            MvStorageMode::Append { .. } => None,
+            MvStorageMode::AppendLog { .. } => None,
         }
     }
 
@@ -275,17 +296,62 @@ impl MvStore {
         Ok(())
     }
 
+    /// Advance each append view's retention frontier to its stream's output watermark.
+    pub(crate) fn advance_view_frontiers(
+        &mut self,
+        mut watermark: impl FnMut(&str) -> Option<i64>,
+    ) {
+        for (name, entry) in &mut self.entries {
+            if let (Some(log), Some(watermark)) = (entry.log.as_mut(), watermark(name)) {
+                log.advance_frontier(watermark);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn update(&mut self, name: &str, batch: &RecordBatch) {
         self.update_cycle(name, std::slice::from_ref(batch))
             .expect("test MV update must succeed");
     }
 
+    /// A changelog view's rows, or an append view's rows while none are committed. An append
+    /// view with committed segments is read with [`Self::read`].
     pub fn to_record_batch(&self, name: &str) -> Result<Option<RecordBatch>, DbError> {
         self.entries
             .get(name)
             .map(MvEntry::to_record_batch)
             .transpose()
+    }
+
+    /// Capture `name` for one read; an append view's committed segments load after the guard.
+    pub(crate) fn read(&self, name: &str) -> Result<Option<ViewRead>, DbError> {
+        let Some(entry) = self.entries.get(name) else {
+            return Ok(None);
+        };
+        let Some(log) = &entry.log else {
+            return entry
+                .to_record_batch()
+                .map(|batch| Some(ViewRead::Ready(batch)));
+        };
+        let (segments, memory, frontier) = log.read_parts();
+        let committed = match (&self.log_reader, self.log_checkpoint) {
+            (Some(reader), Some(checkpoint)) => Some((Arc::clone(reader), checkpoint)),
+            _ if segments.is_empty() => None,
+            _ => {
+                return Err(DbError::MaterializedView(format!(
+                    "view '{name}' has committed segments but no checkpoint store to read them"
+                )))
+            }
+        };
+        Ok(Some(ViewRead::Log(Box::new(LogRead {
+            view: name.to_owned(),
+            schema: Arc::clone(&entry.schema),
+            retention: log.retention().clone(),
+            frontier,
+            committed,
+            segments,
+            memory,
+        }))))
     }
 
     pub fn total_bytes(&self) -> usize {
@@ -307,16 +373,19 @@ impl MvStore {
             entries,
             limits: self.limits,
             has_any: Arc::clone(&self.has_any),
+            log_reader: self.log_reader.clone(),
+            log_checkpoint: None,
+            log_capture: None,
         })
     }
 
-    /// Restore a complete checkpoint into a private image: append views from their whole
-    /// frames, changelog views from the slices their graph nodes restored. The live store is
+    /// Restore a complete checkpoint into a private image: changelog views from the slices their
+    /// graph nodes restored, append views from the logs `manifest` retains. The live store is
     /// never mutated.
     pub fn recovery_image(
         &self,
-        states: &HashMap<String, Vec<u8>>,
         restored_views: Vec<RestoredView>,
+        manifest: Option<&laminar_core::checkpoint::CheckpointManifest>,
     ) -> Result<Self, DbError> {
         let mut image = self.fresh_image().map_err(|error| {
             DbError::Checkpoint(format!("cannot create an empty MV recovery image: {error}"))
@@ -324,35 +393,7 @@ impl MvStore {
         for view in restored_views {
             view.install(&mut image.entries)?;
         }
-        let mut restored = HashSet::with_capacity(states.len());
-
-        for (name, bytes) in states {
-            if !image.entries.contains_key(name) {
-                return Err(DbError::Checkpoint(format!(
-                    "MV checkpoint '{name}' has no matching registered materialized view"
-                )));
-            }
-            image.restore_from_ipc(name, bytes).map_err(|error| {
-                DbError::Checkpoint(format!("MV restore failed for '{name}': {error}"))
-            })?;
-            restored.insert(name.as_str());
-        }
-
-        let mut missing: Vec<&str> = image
-            .entries
-            .iter()
-            .filter(|(_, entry)| matches!(entry.mode, MvStorageMode::Append { .. }))
-            .map(|(name, _)| name.as_str())
-            .filter(|name| !restored.contains(name))
-            .collect();
-        if !missing.is_empty() {
-            missing.sort_unstable();
-            return Err(DbError::Checkpoint(format!(
-                "MV checkpoint is missing required state for: {}",
-                missing.join(", ")
-            )));
-        }
-
+        image.restore_view_logs(manifest)?;
         Ok(image)
     }
 }

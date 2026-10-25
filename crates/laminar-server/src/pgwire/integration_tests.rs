@@ -29,7 +29,7 @@ async fn spawn_server_with(
         .expect("create source");
     db.execute(
         "CREATE MATERIALIZED VIEW prices AS \
-         SELECT symbol, price FROM trades",
+         SELECT symbol, price FROM trades WITH (retention = '1000 rows')",
     )
     .await
     .expect("create mv");
@@ -288,7 +288,7 @@ async fn subscribe_streams_emitted_rows_over_the_wire() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -362,7 +362,7 @@ async fn subscribe_decodes_text_array_in_binary_format() {
         .await
         .expect("create source");
     db.execute(
-        "CREATE MATERIALIZED VIEW tagged AS SELECT id, make_array('en','ja') AS tags FROM feed",
+        "CREATE MATERIALIZED VIEW tagged AS SELECT id, make_array('en','ja') AS tags FROM feed WITH (retention = '1000 rows')",
     )
     .await
     .expect("create mv");
@@ -610,7 +610,7 @@ async fn connection_cap_drops_excess_clients() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -650,7 +650,7 @@ async fn cancel_request_bypasses_full_session_cap() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -1456,7 +1456,7 @@ async fn spawn_with_data() -> (
         .expect("create source");
     db.execute(
         "CREATE MATERIALIZED VIEW prices AS \
-         SELECT symbol, price FROM trades",
+         SELECT symbol, price FROM trades WITH (retention = '1000 rows')",
     )
     .await
     .expect("create mv");
@@ -1655,7 +1655,7 @@ async fn extended_query_emits_committed_checkpoint_progress() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
         .await
         .expect("create source");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create mv");
     db.start().await.expect("db starts");
@@ -1738,7 +1738,7 @@ async fn prepared_subscribe_rejects_drop_recreate_schema_change() {
     db.execute("DROP MATERIALIZED VIEW prices")
         .await
         .expect("drop old view");
-    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol FROM trades WITH (retention = '1000 rows')")
         .await
         .expect("create changed view");
 

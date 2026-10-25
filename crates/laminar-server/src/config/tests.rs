@@ -1937,7 +1937,7 @@ async fn materialized_view_memory_limits_reach_server_database() {
         .await
         .unwrap();
     db.execute("CREATE SOURCE generated (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, value VARCHAR NOT NULL) FROM GENERATOR ('rows.per.second' = '1000', 'max.rows' = '1')").await.unwrap();
-    db.execute("CREATE MATERIALIZED VIEW stored AS SELECT seq FROM generated")
+    db.execute("CREATE MATERIALIZED VIEW stored AS SELECT seq FROM generated WITH (retention = '1000 rows')")
         .await
         .unwrap();
     db.start().await.unwrap();

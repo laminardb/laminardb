@@ -311,6 +311,39 @@ fn test_parse_create_materialized_view_with_emit() {
 }
 
 #[test]
+fn test_parse_create_materialized_view_with_retention() {
+    let stmt = parse_one(
+        "CREATE MATERIALIZED VIEW recent AS SELECT * FROM events EMIT ON WINDOW CLOSE \
+         WITH (retention = '2 hours')",
+    );
+    let StreamingStatement::CreateMaterializedView {
+        query_sql,
+        emit_clause,
+        retention,
+        ..
+    } = stmt
+    else {
+        panic!("Expected CreateMaterializedView, got {stmt:?}");
+    };
+    assert_eq!(query_sql, "SELECT * FROM events");
+    assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
+    assert_eq!(
+        retention,
+        Some(crate::parser::MaterializedViewRetention::Interval(
+            std::time::Duration::from_secs(7200)
+        ))
+    );
+
+    let error = StreamingParser::parse_sql(
+        "CREATE MATERIALIZED VIEW recent AS SELECT * FROM events WITH (keep = '1 hour')",
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unknown CREATE MATERIALIZED VIEW option 'keep'"));
+}
+
+#[test]
 fn test_parse_create_or_replace_materialized_view() {
     let stmt =
         parse_one("CREATE OR REPLACE MATERIALIZED VIEW live_stats AS SELECT COUNT(*) FROM events");

@@ -152,7 +152,7 @@ fn snapshot_rows(store: &MvStore, name: &str) -> Vec<(i64, i64)> {
 fn create_and_drop() {
     let mut store = MvStore::new();
     store
-        .create_mv("mv1", test_schema(), MvStorageMode::append_default())
+        .create_mv("mv1", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     assert!(store.has_mv("mv1"));
     assert!(store.drop_mv("mv1"));
@@ -180,37 +180,26 @@ fn a_global_view_keeps_one_row_on_vnode_zero() {
 }
 
 #[test]
-fn append_evicts_oldest() {
+fn row_retention_keeps_the_latest_rows() {
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "app",
-            test_schema(),
-            MvStorageMode::Append { max_batches: 3 },
-        )
+        .create_mv("app", test_schema(), MvStorageMode::append_rows(3))
         .unwrap();
-
     for i in 0..4 {
         store.update("app", &make_batch(&[i], &["x"], &[f64::from(i)]));
     }
-
-    let result = store.to_record_batch("app").unwrap().unwrap();
-    assert_eq!(result.num_rows(), 3);
-
-    // Batch 0 evicted, should start at 1
-    let ids = result
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    assert_eq!(ids.value(0), 1);
+    let ids: Vec<i32> = id_names(&store, "app")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, [1, 2, 3]);
 }
 
 #[test]
 fn empty_mv_returns_empty_batch() {
     let mut store = MvStore::new();
     store
-        .create_mv("empty", test_schema(), MvStorageMode::append_default())
+        .create_mv("empty", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store
         .create_mv("keyed", upsert_plain_schema(), keyed())
@@ -230,42 +219,78 @@ fn nonexistent_returns_none() {
 }
 
 #[test]
-fn checkpoint_round_trip() {
+fn a_capture_seals_staged_rows_until_its_checkpoint_commits() {
+    use crate::checkpoint_coordinator::CapturedViewLogSegment;
+
     let mut store = MvStore::new();
     store
-        .create_mv("app", test_schema(), MvStorageMode::append_default())
+        .create_mv("app", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store.update("app", &make_batch(&[1, 2], &["a", "b"], &[1.0, 2.0]));
 
-    let states = store.checkpoint_states().unwrap();
-    assert_eq!(states.len(), 1);
-    assert!(states.contains_key("mv:app"));
+    let capture = store.capture_view_logs(1, u64::MAX).unwrap();
+    assert!(capture.sealed_rows());
+    store.update("app", &make_batch(&[3], &["c"], &[3.0]));
+    let (logs, _) = capture.encode(u64::MAX).unwrap();
+    assert_eq!((logs[0].view.as_str(), logs[0].next_sequence), ("app", 1));
+    let [CapturedViewLogSegment::New {
+        sequence: 0,
+        rows: 2,
+        payload,
+        ..
+    }] = logs[0].segments.as_slice()
+    else {
+        panic!("unexpected segments {:?}", logs[0].segments);
+    };
+    let (schema, batches) = ipc_to_schema_and_batches(payload).unwrap();
+    assert_eq!(schema, test_schema());
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    // Sealed rows stay readable until the checkpoint commits, and come back on abort.
+    assert_eq!(id_names(&store, "app").len(), 3);
+    store.abort_view_logs(1);
+    assert_eq!(id_names(&store, "app").len(), 3);
 
-    // Simulate recovery into a fresh store
-    let mut store2 = MvStore::new();
-    store2
-        .create_mv("app", test_schema(), MvStorageMode::append_default())
+    let (logs, _) = store
+        .capture_view_logs(2, u64::MAX)
+        .unwrap()
+        .encode(u64::MAX)
         .unwrap();
-    for (key, bytes) in &states {
-        let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
-        store2.restore_from_ipc(name, bytes).unwrap();
-    }
-    assert_eq!(
-        store2.to_record_batch("app").unwrap().unwrap().num_rows(),
-        2
-    );
+    assert!(matches!(
+        logs[0].segments.as_slice(),
+        [CapturedViewLogSegment::New {
+            sequence: 1,
+            rows: 3,
+            ..
+        }]
+    ));
+    store.commit_view_logs(2);
+    assert_eq!(store.total_bytes(), 0);
+    let error = store.to_record_batch("app").unwrap_err();
+    assert!(error.to_string().contains("read through its log"));
+
+    let (logs, _) = store
+        .capture_view_logs(3, u64::MAX)
+        .unwrap()
+        .encode(u64::MAX)
+        .unwrap();
+    assert!(matches!(
+        logs[0].segments.as_slice(),
+        [CapturedViewLogSegment::Retained {
+            partition: 0,
+            sequence: 1
+        }]
+    ));
+    store.update("app", &make_batch(&[4], &["d"], &[4.0]));
+    store.capture_view_logs(4, u64::MAX).unwrap();
+    let overlapping = store.capture_view_logs(5, u64::MAX).err().unwrap();
+    assert!(overlapping
+        .to_string()
+        .contains("neither committed nor aborted"));
 }
 
 #[test]
 fn checkpoint_capture_is_point_in_time_after_live_mutation() {
     let mut store = MvStore::new();
-    store
-        .create_mv(
-            "append",
-            test_schema(),
-            MvStorageMode::Append { max_batches: 8 },
-        )
-        .unwrap();
     store
         .create_mv("upsert", upsert_plain_schema(), keyed())
         .unwrap();
@@ -273,10 +298,8 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
         .create_mv("multiset", one_col_schema(), multiset())
         .unwrap();
 
-    store.update("append", &make_batch(&[2], &["old-append"], &[2.0]));
     store.update("upsert", &changelog_batch(&[(1, 10, 1)]));
     store.update("multiset", &weight_batch_1col(&[(10, 2)]));
-    let capture = store.capture_checkpoint(u64::MAX).unwrap();
     let vnodes: Vec<u32> = (0..256).collect();
     let upsert = store
         .capture_view_vnodes("upsert", &vnodes, 256, u64::MAX)
@@ -285,23 +308,9 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
         .capture_view_vnodes("multiset", &vnodes, 256, u64::MAX)
         .unwrap();
 
-    store.update("append", &make_batch(&[3], &["new-append"], &[3.0]));
     store.update("upsert", &changelog_batch(&[(1, 10, -1), (1, 99, 1)]));
     store.update("multiset", &weight_batch_1col(&[(10, -1), (20, 1)]));
 
-    let states = capture
-        .encode(u64::MAX)
-        .unwrap()
-        .into_parts()
-        .0
-        .into_iter()
-        .map(|(key, bytes)| {
-            (
-                key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap().to_string(),
-                bytes.to_vec(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
     let mut restored = Vec::new();
     for (view, captures) in [("upsert", upsert), ("multiset", multiset)] {
         let mut target = store.restore_target(view).unwrap();
@@ -310,19 +319,10 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
         }
         restored.push(target);
     }
-    let image = store.recovery_image(&states, restored).unwrap();
+    let image = store.recovery_image(restored, None).unwrap();
 
-    assert_eq!(
-        id_names(&image, "append"),
-        vec![(2, "old-append".to_string())]
-    );
     assert_eq!(snapshot_rows(&image, "upsert"), vec![(1, 10)]);
     assert_eq!(multiset_values(&image, "multiset"), vec![10, 10]);
-
-    assert_eq!(
-        id_names(&store, "append"),
-        vec![(2, "old-append".to_string()), (3, "new-append".to_string())]
-    );
     assert_eq!(snapshot_rows(&store, "upsert"), vec![(1, 99)]);
     assert_eq!(multiset_values(&store, "multiset"), vec![10, 20]);
 }
@@ -348,54 +348,43 @@ fn view_capture_budget_rejection_preserves_live_state() {
 }
 
 #[test]
-fn checkpoint_ipc_encoding_enforces_dynamic_remaining_budget_without_mutation() {
+fn view_log_encoding_enforces_the_remaining_budget() {
     let mut store = MvStore::new();
     for name in ["a", "b"] {
         store
-            .create_mv(name, test_schema(), MvStorageMode::append_default())
+            .create_mv(name, test_schema(), MvStorageMode::append_rows(1_000))
             .unwrap();
         store.update(name, &make_batch(&[1, 2], &["one", "two"], &[1.0, 2.0]));
     }
-    let before_a = store.to_record_batch("a").unwrap().unwrap();
-    let before_b = store.to_record_batch("b").unwrap().unwrap();
-    let before_bytes = store.total_bytes();
-
-    let full = store
-        .capture_checkpoint(u64::MAX)
+    let (_, retained) = store
+        .capture_view_logs(1, u64::MAX)
         .unwrap()
         .encode(u64::MAX)
         .unwrap();
-    let full_bytes = full.states().values().try_fold(0u64, |total, bytes| {
-        total.checked_add(u64::try_from(bytes.len()).unwrap())
-    });
-    let full_bytes = full_bytes.unwrap();
+    assert!(retained > 0);
+    store.abort_view_logs(1);
 
     let error = store
-        .capture_checkpoint(u64::MAX)
-        .unwrap()
-        .encode(full_bytes - 1)
-        .unwrap_err();
-    assert!(error.to_string().contains("MV 'b'"));
-    assert!(error.to_string().contains("configured bound"));
-
-    let tiny_error = store
-        .capture_checkpoint(u64::MAX)
+        .capture_view_logs(2, u64::MAX)
         .unwrap()
         .encode(1)
         .unwrap_err();
-    assert!(tiny_error.to_string().contains("MV 'a'"));
-    assert!(tiny_error.to_string().contains("configured bound"));
+    assert!(error.to_string().contains("log serialization"));
+    store.abort_view_logs(2);
 
-    assert_eq!(store.to_record_batch("a").unwrap().unwrap(), before_a);
-    assert_eq!(store.to_record_batch("b").unwrap().unwrap(), before_b);
-    assert_eq!(store.total_bytes(), before_bytes);
+    let estimate = store.capture_view_logs(3, 1).err().unwrap();
+    assert!(estimate
+        .to_string()
+        .contains("exceeds the staged-state cap"));
+    assert_eq!(id_names(&store, "a").len(), 2);
+    assert_eq!(id_names(&store, "b").len(), 2);
 }
 
 #[test]
-fn an_empty_checkpoint_has_an_append_entry_and_an_empty_frame_per_view_vnode() {
+fn an_empty_checkpoint_has_an_empty_log_and_an_empty_frame_per_view_vnode() {
     let mut store = MvStore::new();
     store
-        .create_mv("append", test_schema(), MvStorageMode::append_default())
+        .create_mv("append", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store
         .create_mv("upsert", upsert_plain_schema(), keyed())
@@ -404,12 +393,12 @@ fn an_empty_checkpoint_has_an_append_entry_and_an_empty_frame_per_view_vnode() {
         .create_mv("multiset", one_col_schema(), multiset())
         .unwrap();
 
-    let states = store.checkpoint_states().unwrap();
-    let keys: Vec<&str> = states.keys().map(String::as_str).collect();
-    assert_eq!(keys, ["mv:append"]);
-    let (schema, batches) = ipc_to_schema_and_batches(&states["mv:append"]).unwrap();
-    assert_eq!(schema, test_schema());
-    assert!(batches.is_empty());
+    let capture = store.capture_view_logs(1, u64::MAX).unwrap();
+    assert!(!capture.sealed_rows());
+    let (logs, _) = capture.encode(u64::MAX).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].view, "append");
+    assert!(logs[0].segments.is_empty());
     for view in ["upsert", "multiset"] {
         let frames = store.full_view_frames(view);
         assert_eq!(frames.len(), 256, "{view}");
@@ -516,84 +505,22 @@ fn update_nonexistent_is_noop() {
 fn create_replaces_existing() {
     let mut store = MvStore::new();
     store
-        .create_mv("mv1", test_schema(), MvStorageMode::append_default())
+        .create_mv("mv1", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store.update("mv1", &make_batch(&[1], &["a"], &[1.0]));
     assert_eq!(store.to_record_batch("mv1").unwrap().unwrap().num_rows(), 1);
 
     store
-        .create_mv("mv1", test_schema(), MvStorageMode::append_default())
+        .create_mv("mv1", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     assert_eq!(store.to_record_batch("mv1").unwrap().unwrap().num_rows(), 0);
-}
-
-#[test]
-fn restore_rejects_schema_mismatch() {
-    let schema_a = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let schema_b = Arc::new(Schema::new(vec![
-        Field::new("x", DataType::Int32, false),
-        Field::new("y", DataType::Utf8, false),
-    ]));
-
-    // Serialize a batch with schema_b
-    let batch_b = RecordBatch::try_new(
-        schema_b.clone(),
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["a"])),
-        ],
-    )
-    .unwrap();
-    let mut deque = VecDeque::new();
-    deque.push_back(batch_b);
-    let ipc_bytes = batches_to_ipc(&schema_b, &deque).unwrap();
-
-    // Try to restore into an MV with schema_a
-    let mut store = MvStore::new();
-    store
-        .create_mv("mv1", schema_a, MvStorageMode::append_default())
-        .unwrap();
-    let err = store.restore_from_ipc("mv1", &ipc_bytes);
-    assert!(err.is_err(), "should reject mismatched schema");
-}
-
-#[test]
-fn restore_rejects_schema_only_stream_with_wrong_schema() {
-    let expected = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let wrong = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-    let bytes = batches_to_ipc(&wrong, std::iter::empty::<&RecordBatch>()).unwrap();
-    let mut store = MvStore::new();
-    store
-        .create_mv("mv1", expected, MvStorageMode::append_default())
-        .unwrap();
-
-    let error = store.restore_from_ipc("mv1", &bytes).unwrap_err();
-    assert!(error.to_string().contains("schema mismatch"));
-}
-
-#[test]
-fn a_whole_frame_for_a_changelog_view_is_rejected() {
-    let mut store = MvStore::new();
-    store
-        .create_mv("u", upsert_plain_schema(), keyed())
-        .unwrap();
-    let bytes = batches_to_ipc(
-        &upsert_plain_schema(),
-        std::iter::once(&upsert_snapshot_batch(&[(1, 10)])),
-    )
-    .unwrap();
-    let error = store
-        .recovery_image(&HashMap::from([("u".to_string(), bytes)]), Vec::new())
-        .err()
-        .expect("a pre-slice whole frame must fail closed");
-    assert!(error.to_string().contains("restored from vnode frames"));
 }
 
 #[test]
 fn fresh_image_is_empty_and_preserves_the_hot_path_handle() {
     let mut store = MvStore::new();
     store
-        .create_mv("app", test_schema(), MvStorageMode::append_default())
+        .create_mv("app", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store.update("app", &make_batch(&[1], &["a"], &[1.0]));
     let handle = store.has_any_handle();
@@ -606,39 +533,42 @@ fn fresh_image_is_empty_and_preserves_the_hot_path_handle() {
 }
 
 #[test]
-fn recovery_image_requires_an_exact_append_inventory() {
+fn recovery_image_requires_an_exact_view_log_inventory() {
+    use laminar_core::checkpoint::{CheckpointManifest, ViewLog};
+
     let mut store = MvStore::new();
     store
-        .create_mv("app", test_schema(), MvStorageMode::append_default())
+        .create_mv("app", test_schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store
         .create_mv("keyed", upsert_plain_schema(), keyed())
         .unwrap();
+    let log = |view: &str| ViewLog {
+        view: view.into(),
+        next_sequence: 4,
+        frontier: Some(100),
+        segments: Vec::new(),
+    };
+    let mut manifest = CheckpointManifest::new(7, 7);
 
     let missing = store
-        .recovery_image(&HashMap::new(), Vec::new())
+        .recovery_image(Vec::new(), Some(&manifest))
         .err()
-        .expect("missing inventory must fail");
+        .unwrap();
     assert!(missing
         .to_string()
-        .contains("missing required state for: app"));
+        .contains("no log for append-only view 'app'"));
 
-    let bytes = batches_to_ipc(
-        &test_schema(),
-        std::iter::once(&make_batch(&[1], &["a"], &[1.0])),
-    )
-    .unwrap();
+    manifest.view_logs = vec![log("app"), log("ghost")];
     let unknown = store
-        .recovery_image(
-            &HashMap::from([
-                ("app".to_string(), bytes.clone()),
-                ("ghost".to_string(), bytes),
-            ]),
-            Vec::new(),
-        )
+        .recovery_image(Vec::new(), Some(&manifest))
         .err()
-        .expect("unknown inventory must fail");
-    assert!(unknown.to_string().contains("no matching registered"));
+        .unwrap();
+    assert!(unknown.to_string().contains("log for 'ghost'"));
+
+    manifest.view_logs = vec![log("app")];
+    let image = store.recovery_image(Vec::new(), Some(&manifest)).unwrap();
+    assert_eq!(image.to_record_batch("app").unwrap().unwrap().num_rows(), 0);
 }
 
 #[test]
@@ -646,7 +576,7 @@ fn failed_recovery_image_never_mutates_live_state() {
     let mut store = MvStore::new();
     for name in ["first", "second"] {
         store
-            .create_mv(name, test_schema(), MvStorageMode::append_default())
+            .create_mv(name, test_schema(), MvStorageMode::append_rows(1_000))
             .unwrap();
     }
     store
@@ -657,21 +587,14 @@ fn failed_recovery_image_never_mutates_live_state() {
     store.update("u", &changelog_batch(&[(1, 10, 1)]));
     let live_bytes = store.total_bytes();
 
-    let valid = batches_to_ipc(
-        &test_schema(),
-        std::iter::once(&make_batch(&[9], &["checkpoint"], &[9.0])),
-    )
-    .unwrap();
-    let states = HashMap::from([
-        ("first".to_string(), valid),
-        ("second".to_string(), b"not arrow ipc".to_vec()),
-    ]);
-
     let error = store
-        .recovery_image(&states, Vec::new())
+        .recovery_image(
+            Vec::new(),
+            Some(&laminar_core::checkpoint::CheckpointManifest::new(7, 7)),
+        )
         .err()
-        .expect("corrupt inventory must fail");
-    assert!(error.to_string().contains("MV restore failed"));
+        .expect("a checkpoint without the views' logs must fail");
+    assert!(error.to_string().contains("no log for append-only view"));
     let corrupt_frame = store.image_from_view_frames("u", &[(0, bytes::Bytes::from_static(b"x"))]);
     assert!(corrupt_frame.is_err());
     assert_eq!(store.total_bytes(), live_bytes);

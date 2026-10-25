@@ -312,3 +312,108 @@ fn absent_and_empty_sink_descriptors_remain_distinct() {
         serde_json::to_vec(&empty).unwrap()
     );
 }
+
+fn view_log_segment(
+    chunk: StateChunkId,
+    sequence: u64,
+    offset: u64,
+    payload: &[u8],
+) -> ViewLogSegment {
+    ViewLogSegment {
+        partition: 0,
+        sequence,
+        chunk,
+        range: ByteRange {
+            offset,
+            length: u64::try_from(payload.len()).unwrap(),
+        },
+        sha256: checkpoint_sha256(payload),
+        rows: 2,
+        event_time: Some(EventTimeBounds { min: 10, max: 20 }),
+    }
+}
+
+/// Checkpoint 9 writes `new` and carries one segment of checkpoint 4 forward.
+fn manifest_with_view_log(new: &[u8], prior: &[u8]) -> CheckpointManifest {
+    let mut manifest = valid_manifest(9);
+    let current = manifest.node_data.chunk;
+    let older = StateChunkId {
+        participant_id: current.participant_id,
+        checkpoint_id: 4,
+    };
+    manifest.view_log = Some(NodeDataObject {
+        chunk: current,
+        object_length: u64::try_from(new.len()).unwrap(),
+        sha256: checkpoint_sha256(new),
+    });
+    manifest.referenced_view_logs = vec![ReferencedStateChunk {
+        chunk: older,
+        object_length: u64::try_from(prior.len()).unwrap(),
+        sha256: checkpoint_sha256(prior),
+        ref_count: NonZeroU32::new(1).unwrap(),
+    }];
+    manifest.view_logs = vec![ViewLog {
+        view: "recent".into(),
+        next_sequence: 2,
+        frontier: Some(30),
+        segments: vec![
+            view_log_segment(older, 0, 0, prior),
+            view_log_segment(current, 1, 0, new),
+        ],
+    }];
+    manifest
+}
+
+#[test]
+fn view_logs_validate_their_objects_ranges_and_references() {
+    let groups = KeyGroupCount::try_from(1_u16).unwrap();
+    let manifest = manifest_with_view_log(b"new rows", b"old rows");
+    assert!(
+        manifest.validate(groups).is_empty(),
+        "{:?}",
+        manifest.validate(groups)
+    );
+    let decoded: CheckpointManifest =
+        serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert_eq!(decoded, manifest);
+
+    let invalid = |mutate: fn(&mut CheckpointManifest), expected: &str| {
+        let mut manifest = manifest_with_view_log(b"new rows", b"old rows");
+        mutate(&mut manifest);
+        let errors = manifest.validate(groups);
+        assert!(
+            errors.iter().any(|error| error.message.contains(expected)),
+            "{expected}: {errors:?}"
+        );
+    };
+    invalid(
+        |manifest| manifest.view_logs[0].next_sequence = 1,
+        "is not below the log's next sequence",
+    );
+    invalid(
+        |manifest| manifest.view_logs[0].segments.swap(0, 1),
+        "strictly ordered by partition and sequence",
+    );
+    invalid(
+        |manifest| manifest.referenced_view_logs.clear(),
+        "untracked view-log object",
+    );
+    invalid(
+        |manifest| manifest.view_log.as_mut().unwrap().object_length += 1,
+        "current view-log segments cover",
+    );
+    invalid(
+        |manifest| manifest.view_logs[0].segments[1].partition = 1,
+        "outside the vnode domain",
+    );
+    invalid(
+        |manifest| {
+            manifest.view_logs[0].segments[0].event_time = Some(EventTimeBounds { min: 5, max: 1 });
+        },
+        "event-time bounds are reversed",
+    );
+    invalid(
+        |manifest| manifest.referenced_view_logs[0].ref_count = NonZeroU32::new(2).unwrap(),
+        "declares ref_count 2",
+    );
+}

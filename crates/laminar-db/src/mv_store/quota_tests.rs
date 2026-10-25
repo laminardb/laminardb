@@ -35,7 +35,7 @@ fn is_multiset(mode: &MvStorageMode) -> bool {
 }
 
 fn input(batch: &RecordBatch, mode: &MvStorageMode, weight: i64) -> RecordBatch {
-    if matches!(mode, MvStorageMode::Append { .. }) {
+    if matches!(mode, MvStorageMode::AppendLog { .. }) {
         return batch.clone();
     }
     let mut fields = batch.schema().fields().to_vec();
@@ -46,22 +46,11 @@ fn input(batch: &RecordBatch, mode: &MvStorageMode, weight: i64) -> RecordBatch 
 }
 
 fn modes() -> [MvStorageMode; 3] {
-    [MvStorageMode::append_default(), keyed(0), multiset()]
+    [MvStorageMode::append_rows(1_000), keyed(0), multiset()]
 }
 
-/// A recovery image of `target` holding `source`'s committed state for view `v`.
-fn restored_image(
-    source: &mut MvStore,
-    target: &MvStore,
-    mode: &MvStorageMode,
-) -> Result<MvStore, DbError> {
-    if matches!(mode, MvStorageMode::Append { .. }) {
-        let encoded = source.checkpoint_states().unwrap();
-        return target.recovery_image(
-            &HashMap::from([("v".to_owned(), encoded["mv:v"].to_vec())]),
-            Vec::new(),
-        );
-    }
+/// A recovery image of `target` holding `source`'s committed slices for changelog view `v`.
+fn restored_image(source: &mut MvStore, target: &MvStore) -> Result<MvStore, DbError> {
     target.image_from_view_frames("v", &source.full_view_frames("v"))
 }
 
@@ -94,7 +83,11 @@ fn schema_mismatches_are_rejected_before_any_view_changes() {
     for mode in modes().into_iter().chain([keyed(1)]) {
         let mut store = store(64, 64 * 1024);
         store
-            .create_mv("first", original.schema(), MvStorageMode::append_default())
+            .create_mv(
+                "first",
+                original.schema(),
+                MvStorageMode::append_rows(1_000),
+            )
             .unwrap();
         store
             .create_mv("second", original.schema(), mode.clone())
@@ -139,7 +132,11 @@ fn keyed_staging_is_bounded_across_batches_even_when_final_state_would_fit() {
             let original = batch(&[0], 1);
             let mut store = store(rows, bytes);
             store
-                .create_mv("first", original.schema(), MvStorageMode::append_default())
+                .create_mv(
+                    "first",
+                    original.schema(),
+                    MvStorageMode::append_rows(1_000),
+                )
                 .unwrap();
             store
                 .create_mv("second", original.schema(), mode.clone())
@@ -300,7 +297,7 @@ fn default_quota_rejects_an_oversized_batch() {
     .unwrap();
     let mut store = MvStore::new();
     store
-        .create_mv("v", batch.schema(), MvStorageMode::append_default())
+        .create_mv("v", batch.schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     assert!(
         store.update_cycle("v", &[batch]).is_err(),
@@ -335,14 +332,10 @@ fn all_modes_reject_single_oversized_updates_without_changing_state() {
 }
 
 #[test]
-fn append_retains_newest_complete_batches_and_rejects_later_oversized_batch_atomically() {
+fn append_row_retention_evicts_leading_batches_and_rejects_an_oversized_stage_atomically() {
     let mut store = store(3, 16384);
     store
-        .create_mv(
-            "v",
-            batch(&[], 1).schema(),
-            MvStorageMode::Append { max_batches: 2 },
-        )
+        .create_mv("v", batch(&[], 1).schema(), MvStorageMode::append_rows(2))
         .unwrap();
     store
         .update_cycle("v", &[batch(&[1], 1), batch(&[2], 1)])
@@ -356,7 +349,7 @@ fn append_retains_newest_complete_batches_and_rejects_later_oversized_batch_atom
     store
         .update_cycle("v", &[batch(&[], 1), batch(&[3], 1), batch(&[4, 5], 1)])
         .unwrap();
-    assert_eq!(ids(&store, "v"), [3, 4, 5]);
+    assert_eq!(ids(&store, "v"), [4, 5]);
     store.update_cycle("v", &[batch(&[6, 7], 1)]).unwrap();
     assert_eq!(ids(&store, "v"), [6, 7]);
 }
@@ -399,8 +392,8 @@ fn keyed_deletes_release_memory_and_replacements_use_final_state_quota() {
 }
 
 #[test]
-fn all_modes_reject_over_limit_restore_and_recovery_images_atomically() {
-    for mode in modes() {
+fn changelog_views_reject_over_limit_recovery_images_atomically() {
+    for mode in [keyed(0), multiset()] {
         let mut source = MvStore::new();
         source
             .create_mv("v", batch(&[], 1).schema(), mode.clone())
@@ -416,22 +409,15 @@ fn all_modes_reject_over_limit_restore_and_recovery_images_atomically() {
             .update_cycle("v", &[input(&batch(&[9], 1), &mode, 1)])
             .unwrap();
         let before_bytes = target.total_bytes();
-        if matches!(mode, MvStorageMode::Append { .. }) {
-            let encoded = source.checkpoint_states().unwrap();
-            assert!(matches!(
-                target.restore_from_ipc("v", &encoded["mv:v"]),
-                Err(DbError::MaterializedViewQuotaExceeded { .. })
-            ));
-        }
-        assert!(restored_image(&mut source, &target, &mode).is_err());
+        assert!(restored_image(&mut source, &target).is_err());
         assert_eq!(ids(&target, "v"), [9]);
         assert_eq!(target.total_bytes(), before_bytes);
     }
 }
 
 #[test]
-fn all_modes_reject_over_byte_limit_restore_without_losing_old_rows() {
-    for mode in modes() {
+fn changelog_views_reject_over_byte_limit_restore_without_losing_old_rows() {
+    for mode in [keyed(0), multiset()] {
         let mut source = MvStore::new();
         source
             .create_mv("v", batch(&[], 1).schema(), mode.clone())
@@ -447,12 +433,7 @@ fn all_modes_reject_over_byte_limit_restore_without_losing_old_rows() {
             .update_cycle("v", &[input(&batch(&[9], 1), &mode, 1)])
             .unwrap();
         let bytes = target.total_bytes();
-        let error = if matches!(mode, MvStorageMode::Append { .. }) {
-            let encoded = source.checkpoint_states().unwrap();
-            target.restore_from_ipc("v", &encoded["mv:v"]).unwrap_err()
-        } else {
-            restored_image(&mut source, &target, &mode).err().unwrap()
-        };
+        let error = restored_image(&mut source, &target).err().unwrap();
         assert!(
             matches!(error, DbError::MaterializedViewQuotaExceeded { .. }),
             "{mode:?}"
@@ -463,8 +444,8 @@ fn all_modes_reject_over_byte_limit_restore_without_losing_old_rows() {
 }
 
 #[test]
-fn append_byte_eviction_and_shorter_keyed_replacements_release_live_charge() {
-    let mode = MvStorageMode::Append { max_batches: 100 };
+fn append_stages_fail_at_the_byte_limit_and_shorter_keyed_replacements_release_charge() {
+    let mode = MvStorageMode::append_rows(1_000);
     let original = batch(&[1], 1024);
     let mut probe = MvStore::new();
     probe
@@ -478,8 +459,16 @@ fn append_byte_eviction_and_shorter_keyed_replacements_release_live_charge() {
     append
         .update_cycle("v", std::slice::from_ref(&original))
         .unwrap();
+    // A stage over the limit fails rather than silently dropping retained rows.
+    assert!(matches!(
+        append.update_cycle("v", &[batch(&[2], 1024)]),
+        Err(DbError::MaterializedViewQuotaExceeded { .. })
+    ));
+    assert_eq!(ids(&append, "v"), [1]);
+    // A committed checkpoint moves the stage out of memory, so the next row fits.
+    append.capture_view_logs(1, u64::MAX).unwrap();
+    append.commit_view_logs(1);
     append.update_cycle("v", &[batch(&[2], 1024)]).unwrap();
-    assert_eq!(ids(&append, "v"), [2]);
     assert_eq!(append.total_bytes(), probe.total_bytes());
 
     let mode = keyed(0);
@@ -524,7 +513,7 @@ fn sliced_arrow_and_view_backing_storage_count_toward_live_quota() {
     for data in [original.slice(0, 1), views.slice(0, 1)] {
         let mut store = store(4, 4096);
         store
-            .create_mv("v", data.schema(), MvStorageMode::append_default())
+            .create_mv("v", data.schema(), MvStorageMode::append_rows(1_000))
             .unwrap();
         assert!(store
             .update_cycle("v", std::slice::from_ref(&data))
@@ -633,7 +622,7 @@ fn publication_preflight_rejects_multiset_expansion_before_applying_other_view()
     let plain = batch(&[1], 1);
     let mut store = MvStore::new();
     store
-        .create_mv("first", plain.schema(), MvStorageMode::append_default())
+        .create_mv("first", plain.schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store
         .create_mv("second", plain.schema(), multiset())

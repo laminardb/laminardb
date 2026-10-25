@@ -308,7 +308,7 @@ impl MvStore {
     fn view_vnode_count(&self, view: &str) -> u32 {
         match &self.entries[view].mode {
             MvStorageMode::Changelog { key_groups, .. } => u32::from(key_groups.get()),
-            MvStorageMode::Append { .. } => panic!("view '{view}' has no vnode slices"),
+            MvStorageMode::AppendLog { .. } => panic!("view '{view}' has no vnode slices"),
         }
     }
 
@@ -339,7 +339,7 @@ impl MvStore {
         for (vnode, bytes) in frames {
             restored.restore_vnode(*vnode, count, bytes)?;
         }
-        self.recovery_image(&HashMap::new(), vec![restored])
+        self.recovery_image(vec![restored], None)
     }
 }
 

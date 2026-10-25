@@ -9888,7 +9888,7 @@ async fn mv_quota_failure_discards_source_cursors_and_faults_every_delivery_mode
             .create_mv(
                 "test_source",
                 int_batch(1).schema(),
-                crate::mv_store::MvStorageMode::append_default(),
+                crate::mv_store::MvStorageMode::append_rows(1_000),
             )
             .unwrap();
         callback.mv_store = Some(Mutex::new(store));

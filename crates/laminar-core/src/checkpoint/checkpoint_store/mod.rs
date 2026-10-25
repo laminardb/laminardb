@@ -10,7 +10,7 @@ use object_store::{ObjectStore, PutPayload};
 
 use crate::checkpoint::checkpoint_manifest::{
     checkpoint_artifact_intent_sha256, checkpoint_descriptor_sha256, ByteRange, CheckpointManifest,
-    PreparedSinkArtifactIntent, PreparedSinkDescriptor, StateChunkId,
+    NodeDataObject, PreparedSinkArtifactIntent, PreparedSinkDescriptor, StateChunkId,
 };
 use crate::checkpoint::{canonical_json_bytes, OutputSegmentRef};
 use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID};
@@ -23,6 +23,7 @@ mod conditional_probe;
 mod object_store_io;
 mod subscription_segments;
 mod validation;
+mod view_log;
 
 pub use artifact_identity::checkpoint_artifact_identity_sha256;
 pub use artifact_intent::{
@@ -222,6 +223,31 @@ pub trait CheckpointStore: Send + Sync {
     /// Delete an explicitly identified node object after its durable reference count reaches zero.
     async fn delete_node_data(&self, chunk: StateChunkId) -> Result<(), CheckpointStoreError>;
 
+    /// Create this checkpoint's view-log object before its manifest, accepting an identical
+    /// retry only.
+    async fn save_view_log(
+        &self,
+        _object: &NodeDataObject,
+        _payload: &[Bytes],
+    ) -> Result<(), CheckpointStoreError> {
+        Err(view_log::unsupported_store_error())
+    }
+
+    /// Read exact view-log ranges after verifying the object's declared length.
+    async fn load_view_log_ranges(
+        &self,
+        _chunk: StateChunkId,
+        _expected_object_length: u64,
+        _ranges: &[ByteRange],
+    ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError> {
+        Err(view_log::unsupported_store_error())
+    }
+
+    /// Delete a view-log object no retained manifest references.
+    async fn delete_view_log(&self, _chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
+        Err(view_log::unsupported_store_error())
+    }
+
     /// Read and verify one prepared sink descriptor.
     async fn load_prepared_sink_descriptor(
         &self,
@@ -343,7 +369,9 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let payload: PutPayload = node_data.iter().cloned().collect();
         let path = self.node_data_path(manifest.node_data.chunk);
         if !self.create_immutable(&path, payload).await?
-            && !self.existing_node_data_matches(&manifest.node_data).await?
+            && !self
+                .existing_object_matches(&path, &manifest.node_data)
+                .await?
         {
             return Err(CheckpointStoreError::Invalid(format!(
                 "node data for participant {} checkpoint {} already exists with different immutable content",
@@ -677,7 +705,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         expected_object_length: u64,
         ranges: &[ByteRange],
     ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError> {
-        self.load_node_data_ranges_inner(chunk, expected_object_length, ranges)
+        self.load_object_ranges(&self.node_data_path(chunk), expected_object_length, ranges)
             .await
     }
 
@@ -687,6 +715,28 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
 
     async fn delete_node_data(&self, chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
         self.delete_exact(&self.node_data_path(chunk)).await
+    }
+
+    async fn save_view_log(
+        &self,
+        object: &NodeDataObject,
+        payload: &[Bytes],
+    ) -> Result<(), CheckpointStoreError> {
+        view_log::save(self, object, payload).await
+    }
+
+    async fn load_view_log_ranges(
+        &self,
+        chunk: StateChunkId,
+        expected_object_length: u64,
+        ranges: &[ByteRange],
+    ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError> {
+        self.load_object_ranges(&self.view_log_path(chunk), expected_object_length, ranges)
+            .await
+    }
+
+    async fn delete_view_log(&self, chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
+        self.delete_exact(&self.view_log_path(chunk)).await
     }
 
     async fn save_subscription_segment(

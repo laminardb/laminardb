@@ -28,6 +28,7 @@ pub(crate) mod sink_epoch_admission;
 mod sink_protocol;
 #[cfg(feature = "cluster")]
 pub(crate) mod subscription_output;
+mod view_log;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -61,7 +62,9 @@ pub use protocol::{CheckpointFailureDisposition, CheckpointPhase, CheckpointResu
 pub(crate) use protocol::{FollowerPrepareOutcome, PrepareQuorum, QuorumPeer};
 pub(crate) use protocol::{QuorumStage, SinkEpochPublication};
 pub use request::{CapturedStateFrame, CheckpointConfig, CheckpointRequest};
-pub(crate) use request::{ManagedVnodeOperator, ManagedVnodePlacement};
+pub(crate) use request::{
+    CapturedViewLog, CapturedViewLogSegment, ManagedVnodeOperator, ManagedVnodePlacement,
+};
 use retention::GcRequest;
 use sha2::{Digest, Sha256};
 
@@ -78,6 +81,7 @@ pub(crate) struct RegisteredSink {
 struct PackedCheckpoint {
     manifest: CheckpointManifest,
     node_data: Vec<Bytes>,
+    view_log: Vec<Bytes>,
 }
 
 #[cfg(test)]

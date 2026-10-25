@@ -2144,7 +2144,7 @@ async fn typed_namespace_rejects_every_cross_kind_create_and_drop() {
         ),
         (
             CatalogObjectKind::MaterializedView,
-            "CREATE MATERIALIZED VIEW shared AS SELECT id FROM base_input",
+            "CREATE MATERIALIZED VIEW shared AS SELECT id FROM base_input WITH (retention = '1000 rows')",
         ),
     ];
     let drops = [
@@ -4484,7 +4484,7 @@ fn assert_cancellation_test_stream_state(db: &LaminarDB, name: &str, present: bo
 const CANCELLATION_STREAM_DDL: &str =
     "CREATE STREAM cancellable AS SELECT id FROM events WITH ('retain_history' = '4mb')";
 const CANCELLATION_MV_DDL: &str =
-    "CREATE MATERIALIZED VIEW cancellable_mv AS SELECT id FROM events";
+    "CREATE MATERIALIZED VIEW cancellable_mv AS SELECT id FROM events WITH (retention = '1000 rows')";
 
 async fn create_cancellation_test_stream(
     db: &LaminarDB,
@@ -4588,7 +4588,8 @@ async fn applied_mv_create_drop_survives_lost_ack_and_persists() {
     let (control_tx, control_rx) = crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     *db.control_tx.lock() = Some(control_tx);
 
-    const CREATE: &str = "CREATE MATERIALIZED VIEW ack_mv AS SELECT id FROM events";
+    const CREATE: &str =
+        "CREATE MATERIALIZED VIEW ack_mv AS SELECT id FROM events WITH (retention = '1000 rows')";
     let caller_db = Arc::clone(&db);
     let create = tokio::spawn(async move { caller_db.execute(CREATE).await });
     let message = control_rx.recv().await.unwrap();
@@ -4782,7 +4783,7 @@ async fn hot_stream_and_mv_ddl_requires_a_live_running_control_coordinator() {
 
         for sql in [
             "CREATE STREAM blocked_stream AS SELECT id FROM events",
-            "CREATE MATERIALIZED VIEW blocked_mv AS SELECT id FROM events",
+            "CREATE MATERIALIZED VIEW blocked_mv AS SELECT id FROM events WITH (retention = '1000 rows')",
         ] {
             let error = db.execute(sql).await.unwrap_err();
             assert!(
@@ -6191,7 +6192,8 @@ async fn test_mv_emit_on_window_close_threads_through_to_registration() {
          AS SELECT sym, AVG(price) AS avg_px \
             FROM ticks \
             GROUP BY sym, tumble(ts, INTERVAL '1' MINUTE) \
-            EMIT ON WINDOW CLOSE",
+            EMIT ON WINDOW CLOSE \
+            WITH (retention = '1000 rows')",
     )
     .await
     .expect("MV creation should succeed");
@@ -6270,9 +6272,11 @@ async fn test_drop_materialized_view_not_found() {
 async fn test_create_mv_if_not_exists() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE events (id INT)").await.unwrap();
-    db.execute("CREATE MATERIALIZED VIEW my_view AS SELECT id FROM events")
-        .await
-        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW my_view AS SELECT id FROM events WITH (retention = '1000 rows')",
+    )
+    .await
+    .unwrap();
 
     // IF NOT EXISTS should succeed without error
     let result = db
@@ -6293,7 +6297,7 @@ async fn materialized_view_replace_is_rejected_before_mutating_old_definition() 
     for running in [false, true] {
         let db = LaminarDB::open().unwrap();
         db.execute("CREATE SOURCE events (id INT)").await.unwrap();
-        let original = "CREATE MATERIALIZED VIEW current_mv AS SELECT id FROM events";
+        let original = "CREATE MATERIALIZED VIEW current_mv AS SELECT id FROM events WITH (retention = '1000 rows')";
         db.execute(original).await.unwrap();
 
         let old_registry_sql = db.mv_registry.lock().get("current_mv").unwrap().sql.clone();
@@ -7069,7 +7073,7 @@ async fn create_materialized_view_closed_admission_reply_rolls_back_local_regist
     });
 
     let error = db
-        .execute("CREATE MATERIALIZED VIEW rejected_mv AS SELECT id FROM events")
+        .execute("CREATE MATERIALIZED VIEW rejected_mv AS SELECT id FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap_err();
     close_reply.await.unwrap();
@@ -7152,7 +7156,7 @@ async fn test_show_materialized_views_with_entries() {
 async fn test_drop_mv_and_show() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE events (id INT)").await.unwrap();
-    db.execute("CREATE MATERIALIZED VIEW temp_view AS SELECT id FROM events")
+    db.execute("CREATE MATERIALIZED VIEW temp_view AS SELECT id FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap();
 
@@ -10234,7 +10238,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         .create_mv(
             "stale_mv",
             Arc::new(arrow_schema::Schema::empty()),
-            crate::mv_store::MvStorageMode::append_default(),
+            crate::mv_store::MvStorageMode::append_rows(1_000),
         )
         .unwrap();
     let error = stale
@@ -12283,7 +12287,7 @@ async fn test_mv_append_mode_queryable() {
 
     db.execute(
         "CREATE MATERIALIZED VIEW filtered AS \
-         SELECT id, value FROM events WHERE value > 10.0",
+         SELECT id, value FROM events WHERE value > 10.0 WITH (retention = '1000 rows')",
     )
     .await
     .unwrap();
@@ -12315,9 +12319,11 @@ async fn test_mv_drop_cleans_up_table() {
     db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
         .await
         .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT * FROM events")
-        .await
-        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW ev_mv AS SELECT * FROM events WITH (retention = '1000 rows')",
+    )
+    .await
+    .unwrap();
 
     assert!(db.ctx.sql("SELECT * FROM ev_mv").await.is_ok());
     assert!(db.mv_store.read().has_mv("ev_mv"));
@@ -12337,7 +12343,7 @@ async fn test_mv_empty_returns_correct_schema() {
     db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
         .await
         .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT id, value FROM events")
+    db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT id, value FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap();
 
@@ -12795,7 +12801,7 @@ async fn open_subscription_with_invalid_filter_errors_at_open() {
         .unwrap();
     // Subscribe against an MV (filterable schema resolved at CREATE); a bare
     // source isn't subscribable.
-    db.execute("CREATE MATERIALIZED VIEW priced AS SELECT symbol FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW priced AS SELECT symbol FROM trades WITH (retention = '1000 rows')")
         .await
         .unwrap();
 

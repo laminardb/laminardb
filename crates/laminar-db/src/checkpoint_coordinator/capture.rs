@@ -461,6 +461,9 @@ impl CheckpointCoordinator {
             .await?;
         self.validate_sink_payload_roster(&sink_payloads)?;
 
+        let view_logs = self
+            .pack_view_logs_until(attempt, std::mem::take(&mut request.view_logs), deadline)
+            .await?;
         let state = self.pack_state_frames(attempt, &mut request)?;
         let empty_intents = BTreeMap::new();
         let intents = if sink_payloads.is_empty() {
@@ -477,13 +480,15 @@ impl CheckpointCoordinator {
             )));
         }
         let digested = Self::digest_artifact_until(artifact, deadline).await?;
-        let packed = self.assemble_checkpoint(attempt, request, digested)?;
+        let mut packed = self.assemble_checkpoint(attempt, request, digested)?;
+        packed.manifest.view_log = view_logs.object;
+        packed.manifest.view_logs = view_logs.logs;
+        packed.manifest.referenced_view_logs = view_logs.referenced;
+        packed.view_log = view_logs.payload;
         #[cfg(feature = "cluster")]
-        let packed = {
-            let mut packed = packed;
+        {
             packed.manifest.subscription_output = subscription_output;
-            packed
-        };
+        }
         self.validate_packed_manifest(&packed.manifest)?;
         Ok(packed)
     }
@@ -751,6 +756,7 @@ impl CheckpointCoordinator {
         Ok(PackedCheckpoint {
             manifest,
             node_data,
+            view_log: Vec::new(),
         })
     }
 

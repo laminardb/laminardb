@@ -203,7 +203,8 @@ pub struct LaminarConfig {
     /// schema/converter/allocator overhead, snapshots and checkpoint scratch are separate.
     /// Keyed staging and input conversion have separate limits of twice this charge plus
     /// bounded staging metadata. Oversized net-neutral cycles can fail before live admission.
-    /// Append mode evicts oldest batches; an oversized single batch fails.
+    /// An append view counts the rows it holds in memory: those since the last committed
+    /// checkpoint, or its whole retained log without checkpointing. A cycle over the limit fails.
     pub materialized_view_max_bytes: usize,
     /// Maximum live rows in each reference table (default 1,000,000).
     /// Applies to embedded and single-node tables; must be nonzero.
@@ -448,7 +449,7 @@ mod tests {
             .create_mv(
                 "v",
                 batch.schema(),
-                crate::mv_store::MvStorageMode::append_default(),
+                crate::mv_store::MvStorageMode::append_rows(1_000),
             )
             .unwrap();
         assert!(matches!(

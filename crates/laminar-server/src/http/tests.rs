@@ -1734,7 +1734,7 @@ async fn test_list_mvs_after_create() {
     // required for it to be listed.
     exec_sql(
         &app,
-        "CREATE MATERIALIZED VIEW event_stats AS SELECT * FROM events",
+        "CREATE MATERIALIZED VIEW event_stats AS SELECT * FROM events WITH (retention = '1000 rows')",
     )
     .await;
 
@@ -2196,7 +2196,7 @@ async fn ws_emits_committed_checkpoint_progress() {
         .unwrap();
     state
         .db
-        .execute("CREATE MATERIALIZED VIEW visible AS SELECT id FROM events")
+        .execute("CREATE MATERIALIZED VIEW visible AS SELECT id FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap();
     state.db.start().await.unwrap();

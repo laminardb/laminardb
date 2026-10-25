@@ -138,6 +138,18 @@ impl LaminarDB {
                 participant_id,
                 uses_local_checkpoint_store,
             )?;
+            let view_log_store = checkpoint_store(
+                Arc::clone(&checkpoint_backing),
+                max_node_data_bytes,
+                key_group_count,
+                participant_id,
+                false,
+            )?;
+            self.mv_store
+                .write()
+                .set_log_reader(Arc::new(crate::mv_store::ViewLogReader::new(Arc::from(
+                    view_log_store,
+                ))));
             let decision_backing = (!uses_local_checkpoint_store).then_some(checkpoint_backing);
 
             let defaults = CkpConfig::default();

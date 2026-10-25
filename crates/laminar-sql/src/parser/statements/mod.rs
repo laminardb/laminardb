@@ -130,6 +130,8 @@ pub enum StreamingStatement {
         if_not_exists: bool,
         /// Raw query text between `AS` and `EMIT`.
         query_sql: String,
+        /// Declared retention from the trailing `WITH (...)`.
+        retention: Option<crate::parser::MaterializedViewRetention>,
     },
 
     /// `CREATE STREAM` for a named streaming pipeline.

@@ -42,9 +42,10 @@ pub use barrier::{
 
 pub use checkpoint_manifest::{
     checkpoint_artifact_intent_sha256, checkpoint_descriptor_sha256, checkpoint_sha256, ByteRange,
-    ChannelProgress, CheckpointManifest, ConnectorCheckpoint, NodeDataObject, PipelineIdentity,
-    PreparedSinkArtifactIntent, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId,
-    StateFrame, StateFrameKey, PIPELINE_IDENTITY_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
+    ChannelProgress, CheckpointManifest, ConnectorCheckpoint, EventTimeBounds, NodeDataObject,
+    PipelineIdentity, PreparedSinkArtifactIntent, PreparedSinkDescriptor, ReferencedStateChunk,
+    StateChunkId, StateFrame, StateFrameKey, ViewLog, ViewLogSegment, MAX_VIEW_LOG_SEGMENTS,
+    PIPELINE_IDENTITY_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 pub use checkpoint_store::{
     checkpoint_artifact_identity_sha256, checkpoint_manifest_bytes,

@@ -4502,25 +4502,9 @@ impl LaminarDB {
                     self.handle_explain(statement).await
                 }
             }
-            StreamingStatement::CreateMaterializedView {
-                name,
-                query,
-                emit_clause,
-                or_replace,
-                if_not_exists,
-                query_sql,
-                ..
-            } => {
+            StreamingStatement::CreateMaterializedView { .. } => {
                 let result = self
-                    .handle_create_materialized_view(
-                        sql,
-                        name,
-                        query,
-                        emit_clause.clone(),
-                        *or_replace,
-                        *if_not_exists,
-                        query_sql,
-                    )
+                    .handle_create_materialized_view(sql, statement)
                     .await?;
                 if let ExecuteResult::Ddl(ref info) = result {
                     if info.applied {

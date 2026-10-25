@@ -60,6 +60,7 @@ pub(super) struct LiveChunkInventory {
     references: BTreeSet<StateChunkId>,
     pinned: BTreeSet<StateChunkId>,
     subscription_segments: BTreeSet<String>,
+    view_logs: BTreeSet<StateChunkId>,
 }
 
 pub(super) async fn delete_retired_data(
@@ -82,6 +83,19 @@ pub(super) async fn delete_retired_data(
         .filter(|chunk| !live.pinned.contains(chunk) && !live.references.contains(chunk));
     let results = futures::stream::iter(deletions)
         .map(|chunk| async move { store.delete_node_data(chunk).await })
+        .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for result in results {
+        result.map_err(DbError::from)?;
+    }
+    let view_log_candidates = manifests
+        .iter()
+        .flat_map(inventory::view_log_chunks)
+        .filter(|chunk| !live.view_logs.contains(chunk))
+        .collect::<BTreeSet<_>>();
+    let results = futures::stream::iter(view_log_candidates)
+        .map(|chunk| async move { store.delete_view_log(chunk).await })
         .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;

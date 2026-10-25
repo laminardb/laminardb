@@ -16,7 +16,7 @@ const VIEWS: [&str; 2] = ["first", "second"];
 /// Storage modes exercised by the non-default benchmark feature.
 #[derive(Clone, Copy, Debug)]
 pub enum MaterializedViewBenchmarkMode {
-    /// Retain the last eight batches.
+    /// Keep the latest 8192 rows in an append log.
     Append,
     /// Replace rows by their first-column key, in vnode slices.
     Upsert,
@@ -28,6 +28,7 @@ pub enum MaterializedViewBenchmarkMode {
 pub struct MaterializedViewBenchmark {
     store: MvStore,
     mode: MaterializedViewBenchmarkMode,
+    checkpoint_id: u64,
 }
 
 impl MaterializedViewBenchmark {
@@ -41,7 +42,9 @@ impl MaterializedViewBenchmark {
             key_groups: DEFAULT_KEY_GROUP_COUNT,
         };
         let storage = match mode {
-            MaterializedViewBenchmarkMode::Append => MvStorageMode::Append { max_batches: 8 },
+            MaterializedViewBenchmarkMode::Append => MvStorageMode::AppendLog {
+                retention: super::ViewRetention::Rows(8192),
+            },
             MaterializedViewBenchmarkMode::Upsert => changelog(ViewKey::Keyed(vec![0])),
             MaterializedViewBenchmarkMode::Multiset => changelog(ViewKey::MultisetByRow),
         };
@@ -49,7 +52,11 @@ impl MaterializedViewBenchmark {
         for name in VIEWS {
             store.create_mv(name, Arc::clone(schema), storage.clone())?;
         }
-        Ok(Self { store, mode })
+        Ok(Self {
+            store,
+            mode,
+            checkpoint_id: 0,
+        })
     }
 
     /// Apply a cycle to both views.
@@ -60,7 +67,8 @@ impl MaterializedViewBenchmark {
         self.store.update_views(VIEWS.map(|name| (name, batches)))
     }
 
-    /// Materialize one view as a query/subscriber snapshot.
+    /// Materialize one view as a query/subscriber snapshot. An append view reads its memory
+    /// rows, so call this before the first checkpoint.
     ///
     /// # Errors
     /// Returns Arrow conversion or snapshot-admission errors.
@@ -69,15 +77,19 @@ impl MaterializedViewBenchmark {
     }
 
     /// Capture the old cut, update both views, then encode the checkpoint. Returns the number
-    /// of encoded frames: one per append view, one per changed vnode of a changelog view.
+    /// of encoded payloads: one per append view with rows since the previous checkpoint, which
+    /// then commits, and one per changed vnode of a changelog view.
     ///
     /// # Errors
     /// Returns checkpoint or update errors.
     pub fn checkpoint_during_update(&mut self, batches: &[RecordBatch]) -> Result<usize, DbError> {
         if let MaterializedViewBenchmarkMode::Append = self.mode {
-            let capture = self.store.capture_checkpoint(u64::MAX)?;
+            self.checkpoint_id += 1;
+            let capture = self.store.capture_view_logs(self.checkpoint_id, u64::MAX)?;
             self.update(batches)?;
-            return Ok(capture.encode(u64::MAX)?.into_parts().0.len());
+            let (logs, _) = capture.encode(u64::MAX)?;
+            self.store.commit_view_logs(self.checkpoint_id);
+            return Ok(logs.iter().map(|log| log.segments.len()).sum());
         }
         let vnode_count = u32::from(DEFAULT_KEY_GROUP_COUNT.get());
         let vnodes: Vec<u32> = (0..vnode_count).collect();

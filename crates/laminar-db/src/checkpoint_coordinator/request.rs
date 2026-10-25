@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use laminar_core::checkpoint::{ChannelProgress, ConnectorCheckpoint, StateFrameKey};
+use laminar_core::checkpoint::{
+    ChannelProgress, ConnectorCheckpoint, EventTimeBounds, StateFrameKey,
+};
 
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
@@ -35,6 +37,7 @@ pub struct CheckpointRequest {
     pub assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
     pub state_frames: Vec<CapturedStateFrame>,
     pub(crate) managed_vnode_operators: Vec<ManagedVnodeOperator>,
+    pub(crate) view_logs: Vec<CapturedViewLog>,
     pub source_names: Vec<String>,
     pub channel_progress: Vec<ChannelProgress>,
     pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
@@ -47,6 +50,45 @@ pub struct CheckpointRequest {
 pub struct CapturedStateFrame {
     pub key: StateFrameKey,
     pub state: Option<Bytes>,
+}
+
+/// One append-only view's log at the cut.
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedViewLog {
+    pub(crate) view: String,
+    pub(crate) next_sequence: u64,
+    pub(crate) frontier: Option<i64>,
+    pub(crate) segments: Vec<CapturedViewLogSegment>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CapturedViewLogSegment {
+    /// Rows appended since the previous capture.
+    New {
+        partition: u16,
+        sequence: u64,
+        rows: u64,
+        event_time: Option<EventTimeBounds>,
+        payload: Bytes,
+    },
+    /// A segment the committed predecessor holds and retention keeps.
+    Retained { partition: u16, sequence: u64 },
+}
+
+impl CapturedViewLogSegment {
+    pub(crate) const fn position(&self) -> (u16, u64) {
+        match self {
+            Self::New {
+                partition,
+                sequence,
+                ..
+            }
+            | Self::Retained {
+                partition,
+                sequence,
+            } => (*partition, *sequence),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

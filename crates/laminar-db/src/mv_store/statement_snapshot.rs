@@ -10,7 +10,8 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::TreeNodeRecursion;
 
-use super::MvStore;
+use super::append_log::LogReadError;
+use super::{MvStore, ViewRead};
 use crate::error::DbError;
 use crate::table_provider::MvTableProvider;
 
@@ -27,16 +28,59 @@ impl StatementViewSnapshot {
     }
 }
 
-impl MvStore {
-    fn statement_snapshot(&self, views: &[String]) -> Result<StatementViewSnapshot, DbError> {
-        let mut captured = HashMap::with_capacity(views.len());
-        for view in views {
-            if let Some(batch) = self.to_record_batch(view)? {
-                captured.insert(view.clone(), batch);
+/// Attempts at reading views whose captured checkpoint is retired before its segments load.
+const VIEW_READ_ATTEMPTS: u32 = 4;
+const VIEW_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Read `views` as of one completed cycle. Every view is captured under one store read guard;
+/// append views then load their committed segments, and a read whose checkpoint was retired
+/// meanwhile is captured again.
+pub(crate) async fn read_views(
+    store: &parking_lot::RwLock<MvStore>,
+    views: &[String],
+) -> Result<HashMap<String, RecordBatch>, DbError> {
+    let mut attempt = 1;
+    loop {
+        let captured = {
+            let guard = store.read();
+            let mut captured = Vec::with_capacity(views.len());
+            for view in views {
+                if let Some(read) = guard.read(view)? {
+                    captured.push((view.clone(), read));
+                }
+            }
+            captured
+        };
+        match materialize(captured).await {
+            Ok(views) => return Ok(views),
+            Err(LogReadError::Failed(error)) => return Err(error),
+            Err(LogReadError::Retired) if attempt < VIEW_READ_ATTEMPTS => {
+                tokio::time::sleep(VIEW_READ_RETRY_DELAY * attempt).await;
+                attempt += 1;
+            }
+            Err(LogReadError::Retired) => {
+                return Err(DbError::MaterializedView(format!(
+                    "materialized views [{}] were checkpointed {VIEW_READ_ATTEMPTS} times while \
+                     being read; retry the statement",
+                    views.join(", ")
+                )))
             }
         }
-        Ok(StatementViewSnapshot { views: captured })
     }
+}
+
+async fn materialize(
+    captured: Vec<(String, ViewRead)>,
+) -> Result<HashMap<String, RecordBatch>, LogReadError> {
+    let mut views = HashMap::with_capacity(captured.len());
+    for (view, read) in captured {
+        let batch = match read {
+            ViewRead::Ready(batch) => batch,
+            ViewRead::Log(log) => log.materialize().await?,
+        };
+        views.insert(view, batch);
+    }
+    Ok(views)
 }
 
 /// Plan `sql` so that every materialized view it scans reads the same completed cycle.
@@ -53,7 +97,9 @@ pub(crate) async fn plan_statement(
     }
     let views = scanned_views(&plan)?;
     if !views.is_empty() {
-        let snapshot = store.read().statement_snapshot(&views)?;
+        let snapshot = StatementViewSnapshot {
+            views: read_views(store, &views).await?,
+        };
         state
             .config_mut()
             .set_extension(std::sync::Arc::new(snapshot));

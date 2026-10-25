@@ -203,11 +203,14 @@ impl CheckpointCoordinator {
                 "checkpoint persistence timed out".into(),
             ));
         }
-        let persisted = tokio::time::timeout_at(
-            deadline,
+        let persisted = tokio::time::timeout_at(deadline, async {
+            if let Some(object) = &packed.manifest.view_log {
+                self.store.save_view_log(object, &packed.view_log).await?;
+            }
             self.store
-                .save_checkpoint(&packed.manifest, &packed.node_data),
-        )
+                .save_checkpoint(&packed.manifest, &packed.node_data)
+                .await
+        })
         .await;
         let manifest_bytes = match persisted {
             Err(_) => {

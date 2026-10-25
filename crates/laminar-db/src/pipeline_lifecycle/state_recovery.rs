@@ -2,7 +2,7 @@ use crate::operator_graph::OperatorGraph;
 
 use super::{
     channel_progress_frontier, validate_source_recovery_assignment, Arc, DbError, FxHashMap,
-    HashMap, LaminarDB, PipelineRecoveryState, RecoveredInputChannelProgress, RuntimeMode,
+    LaminarDB, PipelineRecoveryState, RecoveredInputChannelProgress, RuntimeMode,
     TrackedSourceRegistration, SINGLETON_WATERMARK_CHANNEL,
 };
 
@@ -47,7 +47,6 @@ impl LaminarDB {
         let mut graph_vnodes = Vec::new();
         #[cfg(feature = "cluster")]
         let mut reassigned_graph = Vec::new();
-        let mut mv_states = HashMap::new();
         let mut reference_tables = None;
 
         for frame in &recovered.state_frames {
@@ -76,22 +75,6 @@ impl LaminarDB {
                             return Err(DbError::Checkpoint(
                                 "checkpoint repeats reference-table state".into(),
                             ));
-                        }
-                    } else if let Some(name) =
-                        operator_id.strip_prefix(crate::mv_store::CHECKPOINT_KEY_PREFIX)
-                    {
-                        if frame.participant_id != participant_id {
-                            return Err(DbError::Checkpoint(
-                                "checkpoint selected a remote materialized-view image".into(),
-                            ));
-                        }
-                        if mv_states
-                            .insert(name.to_owned(), frame.payload.to_vec())
-                            .is_some()
-                        {
-                            return Err(DbError::Checkpoint(format!(
-                                "checkpoint repeats materialized-view state '{name}'"
-                            )));
                         }
                     } else {
                         return Err(DbError::Checkpoint(format!(
@@ -198,16 +181,20 @@ impl LaminarDB {
             &graph_vnodes,
             u32::from(recovered.committed.vnode_count),
         )?;
+        let local_manifest = recovered
+            .manifests
+            .iter()
+            .find(|manifest| manifest.participant_id == participant_id);
         let recovered_mv_store = self
             .mv_store
             .read()
-            .recovery_image(&mv_states, graph.take_restored_views())?;
+            .recovery_image(graph.take_restored_views(), local_manifest)?;
         let restored_reference_tables =
             self.restore_reference_table_checkpoint(recovered.epoch(), reference_tables.as_ref())?;
         tracing::info!(
             checkpoint_id = recovered.committed.checkpoint_id,
             graph_frames = restored_graph_frames,
-            materialized_views = mv_states.len(),
+            view_logs = local_manifest.map_or(0, |manifest| manifest.view_logs.len()),
             "restored checkpoint state frames"
         );
         Ok((graph, recovered_mv_store, restored_reference_tables))

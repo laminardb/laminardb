@@ -9,7 +9,7 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
     use arrow::datatypes::{DataType, Field, Schema};
 
     for mode in [
-        MvStorageMode::append_default(),
+        MvStorageMode::append_rows(1_000),
         MvStorageMode::changelog(ViewKey::Keyed(vec![0])),
         MvStorageMode::changelog(ViewKey::MultisetByRow),
     ] {
@@ -4229,7 +4229,10 @@ async fn terminal_operator_capture_populates_halt_without_recovery_fault() {
         .push_test_node("terminal-capture", Box::new(TerminalCaptureFailureOperator));
 
     let error = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .err()
         .expect("terminal operator capture must reject the checkpoint");
 
@@ -4289,7 +4292,10 @@ async fn unchanged_vnode_capture_does_not_arm_the_mutable_capture_guard() {
         .push_test_node("unchanged-vnodes", Box::new(UnchangedVnodeCaptureOperator));
 
     let capture = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .unwrap();
     drop(capture);
 
@@ -4312,9 +4318,10 @@ async fn busy_serialization_gate_rejects_synchronously_before_mutating_operator_
         .await
         .unwrap();
 
-    let error = match callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(10))
-    {
+    let error = match callback.capture_operator_state_until(
+        CheckpointAttempt::new(1, 1),
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    ) {
         Ok(_) => panic!("a busy serialization gate must reject synchronously"),
         Err(error) => error,
     };
@@ -4356,7 +4363,8 @@ async fn busy_serialization_gate_does_not_hold_assignment_writer_until_timeout()
         .unwrap()
         .expect("configured callback must acquire its rotation token");
 
-    let error = match callback.capture_operator_state_until(deadline) {
+    let error = match callback.capture_operator_state_until(CheckpointAttempt::new(1, 1), deadline)
+    {
         Ok(_) => panic!("serialization contention must not wait under the rotation token"),
         Err(error) => error,
     };
@@ -4411,7 +4419,9 @@ async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
         }),
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let capture = callback.capture_operator_state_until(deadline).unwrap();
+    let capture = callback
+        .capture_operator_state_until(CheckpointAttempt::new(1, 1), deadline)
+        .unwrap();
     let serialized = capture
         .serialize_until(
             callback.checkpoint_state_cap_bytes,
@@ -4444,7 +4454,10 @@ async fn destructive_vnode_capture_failure_faults_runtime() {
     );
 
     let error = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .err()
         .expect("vnode capture failure must reject the checkpoint");
 
