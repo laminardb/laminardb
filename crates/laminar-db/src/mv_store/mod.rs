@@ -15,9 +15,11 @@ mod admission;
 mod checkpoint;
 mod multiset;
 mod staging;
+mod statement_snapshot;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
 use multiset::MultisetState;
+pub(crate) use statement_snapshot::{plan_statement, StatementViewSnapshot};
 use upsert::UpsertState;
 
 #[cfg(feature = "benchmark-internals")]

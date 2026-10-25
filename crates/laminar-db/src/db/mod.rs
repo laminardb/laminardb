@@ -4856,17 +4856,14 @@ impl LaminarDB {
                     ));
                 }
                 let plan_sql = query_plan.statement.to_string();
-                let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
-                let df = self.ctx.execute_logical_plan(logical_plan).await?;
-                let stream = df.execute_stream().await?;
-
+                let df = crate::mv_store::plan_statement(&self.ctx, &self.mv_store, &plan_sql);
+                let stream = df.await?.execute_stream().await?;
                 Ok(self.bridge_query_stream(sql, stream))
             }
             laminar_sql::planner::StreamingPlan::Standard(stmt) => {
                 let sql_str = stmt.to_string();
-                let df = self.ctx.sql(&sql_str).await?;
-                let stream = df.execute_stream().await?;
-
+                let df = crate::mv_store::plan_statement(&self.ctx, &self.mv_store, &sql_str);
+                let stream = df.await?.execute_stream().await?;
                 Ok(self.bridge_query_stream(sql, stream))
             }
             laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
