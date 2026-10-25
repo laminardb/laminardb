@@ -48,7 +48,7 @@ pub(super) fn events(name: &'static str, seed: i64) -> FixtureSource {
     events_with(name, seed, BATCHES_PER_PARTITION)
 }
 
-fn events_with(name: &'static str, seed: i64, batches: i64) -> FixtureSource {
+pub(super) fn events_with(name: &'static str, seed: i64, batches: i64) -> FixtureSource {
     let partitions = (0..PARTITIONS)
         .map(|partition| {
             (0..batches)

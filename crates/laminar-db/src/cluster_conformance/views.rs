@@ -11,8 +11,8 @@ use arrow::array::RecordBatch;
 use super::cluster::{Cluster, Startup};
 use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
-use super::tests::{assert_rejected, events, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN};
-use super::{embedded_db, wait_until, Verdict, DEADLINE, NODES, VNODES};
+use super::tests::{assert_rejected, events, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN};
+use super::{embedded_db, Verdict, DEADLINE, NODES, VNODES};
 use crate::{ExecuteResult, LaminarDB};
 
 struct ViewCase {
@@ -21,6 +21,9 @@ struct ViewCase {
     views: Vec<String>,
     /// Each read and the batch SQL over the complete input whose rows it must equal.
     reads: Vec<(&'static str, &'static str)>,
+    /// Reads that return no rows whenever every view they scan comes from one cycle. They run
+    /// repeatedly while the sources deliver.
+    same_cycle_invariants: Vec<&'static str>,
 }
 
 impl ViewCase {
@@ -66,9 +69,10 @@ impl ViewCase {
             .await
             .map_err(|e| format!("{}: embedded start: {e}", self.name))?;
         let total: u64 = self.sources.iter().map(FixtureSource::batch_count).sum();
-        wait_until(DEADLINE, || polled.load(Ordering::Acquire) >= total)
+        let delivered = || polled.load(Ordering::Acquire) >= total;
+        tokio::time::timeout(DEADLINE, self.check_invariants_until(db, delivered))
             .await
-            .map_err(|()| format!("{}: sources did not deliver {total} batches", self.name))?;
+            .map_err(|_| format!("{}: sources did not deliver {total} batches", self.name))??;
         // The cut drains the graph and applies cycle output to every view before capture.
         let checkpoint = db
             .checkpoint_with_timeout(DEADLINE)
@@ -90,6 +94,25 @@ impl ViewCase {
                     oracle::diff(&expected, &observed)
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+impl ViewCase {
+    async fn check_invariants_until(
+        &self,
+        db: &LaminarDB,
+        done: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        while !done() {
+            for read in &self.same_cycle_invariants {
+                let batches = read_all(db, read).await?;
+                if batches.iter().any(|batch| batch.num_rows() > 0) {
+                    return Err(format!("{}: `{read}` saw views from two cycles", self.name));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         Ok(())
     }
@@ -126,17 +149,18 @@ fn views(statements: &[&str]) -> Vec<String> {
 const KEYED_TRUTH: &str = "SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k";
 
 /// Keyed upsert, global replace-every-cycle, and the multiset and keyed views chained over an
-/// incremental view, plus one statement that reads two views.
+/// incremental view, plus statements that read two views; the invariant runs while 240 batches
+/// are still being delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn keyed_and_chained_views_are_rejected_in_cluster() {
     let case = ViewCase {
         name: "keyed_and_chained_views",
-        sources: vec![events("events", 0)],
+        sources: vec![events_with("events", 0, 40)],
         views: views(&[
             "CREATE MATERIALIZED VIEW counts AS \
              SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k",
             "CREATE MATERIALIZED VIEW totals AS SELECT COUNT(*) AS n, SUM(v) AS s FROM events",
-            "CREATE MATERIALIZED VIEW busy AS SELECT k, n FROM counts WHERE n > 12",
+            "CREATE MATERIALIZED VIEW busy AS SELECT k, n FROM counts WHERE n > 160",
             "CREATE MATERIALIZED VIEW histogram AS \
              SELECT n, COUNT(*) AS key_count FROM counts GROUP BY n",
         ]),
@@ -148,7 +172,7 @@ async fn keyed_and_chained_views_are_rejected_in_cluster() {
             ),
             (
                 "SELECT * FROM busy",
-                "SELECT k, COUNT(*) AS n FROM events GROUP BY k HAVING COUNT(*) > 12",
+                "SELECT k, COUNT(*) AS n FROM events GROUP BY k HAVING COUNT(*) > 160",
             ),
             (
                 "SELECT * FROM histogram",
@@ -158,8 +182,12 @@ async fn keyed_and_chained_views_are_rejected_in_cluster() {
             (
                 "SELECT k, n FROM busy WHERE k IN (SELECT k FROM counts WHERE s % 2 = 0)",
                 "SELECT k, COUNT(*) AS n FROM events GROUP BY k \
-                 HAVING COUNT(*) > 12 AND SUM(v) % 2 = 0",
+                 HAVING COUNT(*) > 160 AND SUM(v) % 2 = 0",
             ),
+        ],
+        same_cycle_invariants: vec![
+            "SELECT k FROM busy b WHERE NOT EXISTS \
+             (SELECT 1 FROM counts c WHERE c.k = b.k AND c.n = b.n)",
         ],
     };
     assert_rejected(verdict(case).await, "materialized view");
@@ -186,6 +214,7 @@ async fn append_views_are_rejected_in_cluster() {
             ),
             ("SELECT * FROM windows", CLOSED_TUMBLE_TRUTH),
         ],
+        same_cycle_invariants: vec![],
     };
     assert_rejected(verdict(case).await, "materialized view");
 }
@@ -199,6 +228,7 @@ async fn interval_join_view_is_rejected_in_cluster() {
             "CREATE MATERIALIZED VIEW joined AS {INTERVAL_JOIN}"
         )],
         reads: vec![("SELECT * FROM joined", INTERVAL_JOIN)],
+        same_cycle_invariants: vec![],
     };
     assert_rejected(verdict(case).await, "materialized view");
 }
