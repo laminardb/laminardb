@@ -1,4 +1,5 @@
-//! Checkpoint capture, deterministic encoding, and restore validation for materialized views.
+//! Whole-frame checkpoint capture for append views, and the deterministic row encodings shared
+//! with changelog-view vnode frames.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::row::{OwnedRow, RowConverter};
 use datafusion_common::ScalarValue;
 
-use super::{MultisetState, MvEntry, MvStorageMode, MvStore, UpsertState};
+use super::{MvEntry, MvStorageMode, MvStore};
 use crate::error::DbError;
 
 const MULTISET_CHECKPOINT_COUNT_COLUMN: &str = "__laminardb_multiset_count";
@@ -20,29 +21,18 @@ const MULTISET_CHECKPOINT_FORMAT_VERSION: &str = "counted-v1";
 
 const CHECKPOINT_CAPTURE_ENTRY_OVERHEAD: usize = 256;
 const CHECKPOINT_CAPTURE_FIELD_OVERHEAD: usize = 128;
-const CHECKPOINT_CAPTURE_ROW_OVERHEAD: usize = 64;
+pub(super) const CHECKPOINT_CAPTURE_ROW_OVERHEAD: usize = 64;
 
-/// Prefix for materialized-view checkpoint frame identifiers.
+/// Prefix for append-view whole-frame checkpoint identifiers.
 pub(crate) const CHECKPOINT_KEY_PREFIX: &str = "mv:";
 
-enum MvCheckpointEntryCapture {
-    Batches {
-        schema: SchemaRef,
-        batches: Vec<RecordBatch>,
-    },
-    Upsert {
-        schema: SchemaRef,
-        rows: Vec<(OwnedRow, Vec<ScalarValue>)>,
-    },
-    Multiset {
-        schema: SchemaRef,
-        row_converter: Arc<RowConverter>,
-        counts: Vec<(OwnedRow, i64)>,
-    },
+struct AppendCapture {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
 }
 
 pub(crate) struct MvCheckpointCapture {
-    entries: Vec<(String, MvCheckpointEntryCapture)>,
+    entries: Vec<(String, AppendCapture)>,
     estimated_bytes: u64,
 }
 
@@ -79,33 +69,12 @@ impl MvCheckpointCapture {
                     "MV checkpoint serialization exceeded its staged-state budget of {max_encoded_bytes} bytes"
                 ))
             })?;
-            let bytes = match entry {
-                MvCheckpointEntryCapture::Batches { schema, batches } => {
-                    batches_to_ipc_bounded(&schema, &batches, remaining_bytes)
-                }
-                MvCheckpointEntryCapture::Upsert { schema, mut rows } => {
-                    upsert_checkpoint_batch(&schema, &mut rows).and_then(|batch| {
-                        batches_to_ipc_bounded(&schema, std::iter::once(&batch), remaining_bytes)
-                    })
-                }
-                MvCheckpointEntryCapture::Multiset {
-                    schema,
-                    row_converter,
-                    mut counts,
-                } => multiset_counted_checkpoint_batch(&schema, &row_converter, &mut counts)
-                    .and_then(|batch| {
-                        batches_to_ipc_bounded(
-                            &batch.schema(),
-                            std::iter::once(&batch),
-                            remaining_bytes,
-                        )
-                    }),
-            }
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "MV '{name}' checkpoint serialization failed: {error}"
-                ))
-            })?;
+            let bytes = batches_to_ipc_bounded(&entry.schema, &entry.batches, remaining_bytes)
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "MV '{name}' checkpoint serialization failed: {error}"
+                    ))
+                })?;
             // `Bytes::from(Vec)` retains the Vec allocation, so charge capacity rather than
             // payload length to keep the aggregate live allocation within the caller's cap.
             let retained_entry_bytes =
@@ -141,7 +110,8 @@ pub(super) fn multiset_checkpoint_schema(schema: &SchemaRef) -> SchemaRef {
     Arc::new(Schema::new_with_metadata(fields, metadata))
 }
 
-fn upsert_checkpoint_batch(
+/// Rows sorted by key, so equal state always encodes to equal bytes.
+pub(super) fn upsert_checkpoint_batch(
     schema: &SchemaRef,
     rows: &mut Vec<(OwnedRow, Vec<ScalarValue>)>,
 ) -> Result<RecordBatch, DbError> {
@@ -174,7 +144,8 @@ fn upsert_checkpoint_batch(
         .map_err(|error| DbError::Storage(format!("upsert MV batch assembly: {error}")))
 }
 
-fn multiset_counted_checkpoint_batch(
+/// Distinct rows sorted by their encoding, each with its positive multiplicity.
+pub(super) fn multiset_counted_checkpoint_batch(
     schema: &SchemaRef,
     row_converter: &RowConverter,
     counts: &mut [(OwnedRow, i64)],
@@ -215,60 +186,32 @@ impl MvEntry {
             add_capture_estimate(&mut bytes, value.len(), name)?;
         }
 
-        match &self.mode {
-            MvStorageMode::Aggregate | MvStorageMode::Append { .. } => {
-                for batch in &self.batches {
-                    add_capture_estimate(&mut bytes, std::mem::size_of::<RecordBatch>(), name)?;
-                    add_capture_estimate(&mut bytes, batch.get_array_memory_size(), name)?;
-                }
-            }
-            MvStorageMode::Upsert { .. } => {
-                let upsert = self.upsert.as_ref().ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "MV '{name}' is missing its upsert checkpoint state"
-                    ))
-                })?;
-                for (key, row) in &upsert.rows {
-                    add_capture_estimate(&mut bytes, CHECKPOINT_CAPTURE_ROW_OVERHEAD, name)?;
-                    add_capture_estimate(&mut bytes, key.row().data().len(), name)?;
-                    add_capture_estimate(
-                        &mut bytes,
-                        std::mem::size_of::<ScalarValue>()
-                            .checked_mul(row.len())
-                            .ok_or_else(|| capture_size_overflow(name))?,
-                        name,
-                    )?;
-                    for value in row {
-                        add_capture_estimate(&mut bytes, value.size(), name)?;
-                    }
-                }
-            }
-            MvStorageMode::Multiset => {
-                let multiset = self.multiset.as_ref().ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "MV '{name}' is missing its multiset checkpoint state"
-                    ))
-                })?;
-                for key in multiset.counts.keys() {
-                    add_capture_estimate(&mut bytes, CHECKPOINT_CAPTURE_ROW_OVERHEAD, name)?;
-                    add_capture_estimate(&mut bytes, key.row().data().len(), name)?;
-                }
-            }
+        for batch in &self.batches {
+            add_capture_estimate(&mut bytes, std::mem::size_of::<RecordBatch>(), name)?;
+            add_capture_estimate(&mut bytes, batch.get_array_memory_size(), name)?;
         }
         Ok(bytes.max(u64::try_from(self.approx_bytes).map_err(|_| capture_size_overflow(name))?))
     }
 }
 
 impl MvStore {
-    pub(super) fn checkpoint_capture_estimated_bytes(&self) -> Result<u64, DbError> {
-        self.entries.iter().try_fold(0u64, |total, (name, entry)| {
-            total
-                .checked_add(entry.checkpoint_capture_estimate(name)?)
-                .ok_or_else(|| capture_size_overflow(name))
-        })
+    fn append_entries(&self) -> impl Iterator<Item = (&String, &MvEntry)> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry.mode, MvStorageMode::Append { .. }))
     }
 
-    /// Capture an immutable point-in-time image without materializing Arrow output.
+    pub(super) fn checkpoint_capture_estimated_bytes(&self) -> Result<u64, DbError> {
+        self.append_entries()
+            .try_fold(0u64, |total, (name, entry)| {
+                total
+                    .checked_add(entry.checkpoint_capture_estimate(name)?)
+                    .ok_or_else(|| capture_size_overflow(name))
+            })
+    }
+
+    /// Capture an immutable image of every append view. Changelog views checkpoint as vnode
+    /// frames through their graph nodes instead.
     pub fn capture_checkpoint(&self, max_bytes: u64) -> Result<MvCheckpointCapture, DbError> {
         let estimated_bytes = self.checkpoint_capture_estimated_bytes()?;
         if estimated_bytes > max_bytes {
@@ -277,49 +220,16 @@ impl MvStore {
             )));
         }
 
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for (name, entry) in &self.entries {
-            let captured = match &entry.mode {
-                MvStorageMode::Aggregate | MvStorageMode::Append { .. } => {
-                    MvCheckpointEntryCapture::Batches {
-                        schema: Arc::clone(&entry.schema),
-                        batches: entry.batches.iter().cloned().collect(),
-                    }
-                }
-                MvStorageMode::Upsert { .. } => {
-                    let upsert = entry.upsert.as_ref().ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "MV '{name}' is missing its upsert checkpoint state"
-                        ))
-                    })?;
-                    MvCheckpointEntryCapture::Upsert {
-                        schema: Arc::clone(&entry.schema),
-                        rows: upsert
-                            .rows
-                            .iter()
-                            .map(|(key, values)| (key.clone(), values.clone()))
-                            .collect(),
-                    }
-                }
-                MvStorageMode::Multiset => {
-                    let multiset = entry.multiset.as_ref().ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "MV '{name}' is missing its multiset checkpoint state"
-                        ))
-                    })?;
-                    MvCheckpointEntryCapture::Multiset {
-                        schema: Arc::clone(&entry.schema),
-                        row_converter: Arc::clone(&multiset.row_converter),
-                        counts: multiset
-                            .counts
-                            .iter()
-                            .map(|(key, count)| (key.clone(), *count))
-                            .collect(),
-                    }
-                }
-            };
-            entries.push((name.clone(), captured));
-        }
+        let entries = self
+            .append_entries()
+            .map(|(name, entry)| {
+                let capture = AppendCapture {
+                    schema: Arc::clone(&entry.schema),
+                    batches: entry.batches.iter().cloned().collect(),
+                };
+                (name.clone(), capture)
+            })
+            .collect();
         Ok(MvCheckpointCapture {
             entries,
             estimated_bytes,
@@ -337,23 +247,13 @@ impl MvStore {
         let Some(entry) = self.entries.get_mut(name) else {
             return Err(DbError::Storage(format!("MV '{name}' is not registered")));
         };
+        let MvStorageMode::Append { max_batches } = entry.mode else {
+            return Err(DbError::Storage(format!(
+                "MV '{name}' is a changelog view; its state is restored from vnode frames"
+            )));
+        };
         let (checkpoint_schema, batches) = ipc_to_schema_and_batches(bytes)
             .map_err(|e| DbError::Storage(format!("MV restore '{name}': {e}")))?;
-
-        if matches!(&entry.mode, MvStorageMode::Multiset) {
-            if checkpoint_schema != multiset_checkpoint_schema(&entry.schema) {
-                return Err(DbError::Storage(format!(
-                    "MV '{name}' multiset checkpoint schema or format mismatch on restore"
-                )));
-            }
-            let mut restored = MultisetState::new(&entry.schema)?;
-            for batch in &batches {
-                restored.load_counted_snapshot(name, batch, self.limits)?;
-            }
-            entry.approx_bytes = restored.approx_bytes;
-            entry.multiset = Some(restored);
-            return Ok(());
-        }
 
         // COMPAT: reject stale checkpoints from before a schema change rather than admitting
         // data that will fail or be misinterpreted during a later materialization.
@@ -363,24 +263,13 @@ impl MvStore {
             )));
         }
 
-        if let MvStorageMode::Upsert { key_cols } = &entry.mode {
-            let mut restored = UpsertState::new(&entry.schema, key_cols)?;
-            for batch in &batches {
-                restored.load_snapshot(name, batch, self.limits)?;
-            }
-            entry.approx_bytes = restored.approx_bytes;
-            entry.upsert = Some(restored);
-            return Ok(());
-        }
         let (rows, restored_bytes) = super::admission::batch_usage(batches.iter())?;
         self.limits.validate(name, rows, restored_bytes)?;
         // Restore rejects over-limit state instead of silently evicting committed rows.
-        if let MvStorageMode::Append { max_batches } = entry.mode {
-            if batches.iter().filter(|batch| batch.num_rows() > 0).count() > max_batches.max(1) {
-                return Err(DbError::Storage(format!(
-                    "MV '{name}' checkpoint exceeds append batch retention"
-                )));
-            }
+        if batches.iter().filter(|batch| batch.num_rows() > 0).count() > max_batches.max(1) {
+            return Err(DbError::Storage(format!(
+                "MV '{name}' checkpoint exceeds append batch retention"
+            )));
         }
         entry.batches = batches
             .into_iter()
@@ -425,7 +314,7 @@ where
     Ok(buf)
 }
 
-fn batches_to_ipc_bounded<'a, I>(
+pub(super) fn batches_to_ipc_bounded<'a, I>(
     schema: &SchemaRef,
     batches: I,
     max_bytes: u64,

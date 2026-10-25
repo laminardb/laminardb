@@ -5,24 +5,30 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
-use super::{MvStorageMode, MvStore};
+use laminar_core::state::DEFAULT_KEY_GROUP_COUNT;
+
+use super::{MvStorageMode, MvStore, ViewKey};
+use crate::operator_graph::StateFrameCapture;
 use crate::DbError;
+
+const VIEWS: [&str; 2] = ["first", "second"];
 
 /// Storage modes exercised by the non-default benchmark feature.
 #[derive(Clone, Copy, Debug)]
 pub enum MaterializedViewBenchmarkMode {
-    /// Replace the entire snapshot each cycle.
-    Aggregate,
     /// Retain the last eight batches.
     Append,
-    /// Replace rows by their first-column key.
+    /// Replace rows by their first-column key, in vnode slices.
     Upsert,
-    /// Consolidate signed full-row multiplicities.
+    /// Consolidate signed full-row multiplicities, in vnode slices placed by row.
     Multiset,
 }
 
 /// Fixture owning two independent local MVs.
-pub struct MaterializedViewBenchmark(MvStore);
+pub struct MaterializedViewBenchmark {
+    store: MvStore,
+    mode: MaterializedViewBenchmarkMode,
+}
 
 impl MaterializedViewBenchmark {
     /// Create two empty views with the same schema and storage mode.
@@ -30,17 +36,20 @@ impl MaterializedViewBenchmark {
     /// # Errors
     /// Returns MV schema or key-converter errors.
     pub fn new(schema: &SchemaRef, mode: MaterializedViewBenchmarkMode) -> Result<Self, DbError> {
-        let mode = match mode {
-            MaterializedViewBenchmarkMode::Aggregate => MvStorageMode::Aggregate,
+        let changelog = |key| MvStorageMode::Changelog {
+            key,
+            key_groups: DEFAULT_KEY_GROUP_COUNT,
+        };
+        let storage = match mode {
             MaterializedViewBenchmarkMode::Append => MvStorageMode::Append { max_batches: 8 },
-            MaterializedViewBenchmarkMode::Upsert => MvStorageMode::Upsert { key_cols: vec![0] },
-            MaterializedViewBenchmarkMode::Multiset => MvStorageMode::Multiset,
+            MaterializedViewBenchmarkMode::Upsert => changelog(ViewKey::Keyed(vec![0])),
+            MaterializedViewBenchmarkMode::Multiset => changelog(ViewKey::MultisetByRow),
         };
         let mut store = MvStore::new();
-        for name in ["first", "second"] {
-            store.create_mv(name, Arc::clone(schema), mode.clone())?;
+        for name in VIEWS {
+            store.create_mv(name, Arc::clone(schema), storage.clone())?;
         }
-        Ok(Self(store))
+        Ok(Self { store, mode })
     }
 
     /// Apply a cycle to both views.
@@ -48,8 +57,7 @@ impl MaterializedViewBenchmark {
     /// # Errors
     /// Returns state-admission or changelog-validation errors.
     pub fn update(&mut self, batches: &[RecordBatch]) -> Result<(), DbError> {
-        self.0
-            .update_views([("first", batches), ("second", batches)])
+        self.store.update_views(VIEWS.map(|name| (name, batches)))
     }
 
     /// Materialize one view as a query/subscriber snapshot.
@@ -57,16 +65,42 @@ impl MaterializedViewBenchmark {
     /// # Errors
     /// Returns Arrow conversion or snapshot-admission errors.
     pub fn snapshot(&self) -> Result<Option<RecordBatch>, DbError> {
-        self.0.to_record_batch("first")
+        self.store.to_record_batch(VIEWS[0])
     }
 
-    /// Capture the old cut, update both views, then encode the checkpoint.
+    /// Capture the old cut, update both views, then encode the checkpoint. Returns the number
+    /// of encoded frames: one per append view, one per changed vnode of a changelog view.
     ///
     /// # Errors
     /// Returns checkpoint or update errors.
     pub fn checkpoint_during_update(&mut self, batches: &[RecordBatch]) -> Result<usize, DbError> {
-        let capture = self.0.capture_checkpoint(u64::MAX)?;
+        if let MaterializedViewBenchmarkMode::Append = self.mode {
+            let capture = self.store.capture_checkpoint(u64::MAX)?;
+            self.update(batches)?;
+            return Ok(capture.encode(u64::MAX)?.into_parts().0.len());
+        }
+        let vnode_count = u32::from(DEFAULT_KEY_GROUP_COUNT.get());
+        let vnodes: Vec<u32> = (0..vnode_count).collect();
+        let mut captures = Vec::new();
+        for name in VIEWS {
+            captures.extend(self.store.capture_view_vnodes(
+                name,
+                &vnodes,
+                vnode_count,
+                u64::MAX,
+            )?);
+        }
         self.update(batches)?;
-        Ok(capture.encode(u64::MAX)?.into_parts().0.len())
+        let mut staged = captures
+            .iter()
+            .filter_map(|captured| captured.state.as_ref())
+            .map(StateFrameCapture::retained_bytes)
+            .sum();
+        let mut frames = 0;
+        for capture in captures.into_iter().filter_map(|captured| captured.state) {
+            capture.materialize(&mut staged, u64::MAX)?;
+            frames += 1;
+        }
+        Ok(frames)
     }
 }

@@ -711,6 +711,7 @@ const fn state_contract_name(contract: ManagedStateContract) -> &'static str {
         ManagedStateContract::BoundedIntervalJoinV3 => "bounded_interval_join_v3",
         ManagedStateContract::TemporalJoinV1 => "temporal_join_v1",
         ManagedStateContract::ProcessFunctionV1 => "process_function_v1",
+        ManagedStateContract::ViewResultV1 => "view_result_v1",
         #[cfg(test)]
         ManagedStateContract::TestVnodeStateV1 => "test_vnode_state_v1",
     }

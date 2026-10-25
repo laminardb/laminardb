@@ -756,6 +756,11 @@ CREATE STREAM histogram AS SELECT n, COUNT(*) AS keys FROM per_key GROUP BY n;
 A server configuration or sealed cluster catalog containing this chain is rejected when it is
 replayed at startup.
 
+A non-windowed aggregate inside `CREATE MATERIALIZED VIEW` always emits its changelog, global
+aggregates included, so an aggregate or projection over a view needs no `EMIT` clause. The same
+rule makes a window or join over such a view fail, and a sink that reads the view must accept
+full changelogs.
+
 ---
 
 ## Tested Combinations

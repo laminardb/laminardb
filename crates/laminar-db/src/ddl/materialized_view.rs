@@ -20,14 +20,13 @@ use super::stream::{
     query_inputs_registered, validate_managed_aggregate_admission, PlannedStreamingQuery,
 };
 
-/// Incremental-emit store decision for a non-windowed MV.
-enum IncEmit {
-    /// Keyed running aggregate → keyed upsert snapshot (key = GROUP BY column indices).
-    Upsert(Vec<usize>),
-    /// Projection/filter over a changelog → Z-set multiset snapshot.
-    Multiset,
-    /// Full-emit (not incremental): replace-all aggregate or append.
-    None,
+/// What a view's stream emits into its store.
+#[derive(Clone, Copy)]
+enum ViewOutput {
+    /// A weighted changelog kept as vnode slices; an aggregate upserts on its planned key.
+    Changelog { aggregate: bool },
+    /// Append-only rows with bounded retention.
+    Append,
 }
 
 struct MaterializedViewCreateGuard<'a> {
@@ -52,8 +51,8 @@ impl Drop for MaterializedViewCreateGuard<'_> {
 pub(crate) fn incremental_mv_consumer_error(mv: &str, consumer: &str) -> DbError {
     DbError::MaterializedView(format!(
         "[LDB-1300] {consumer} cannot consume incremental materialized view '{mv}': it emits a \
-         dirty-only changelog, not a full snapshot. Read it with `SELECT * FROM {mv}` (snapshot), \
-         or recreate '{mv}' without `incremental_emit`."
+         changelog, not a full snapshot. Read it with `SELECT * FROM {mv}` (snapshot), or consume \
+         its changelog with an aggregate or a projection."
     ))
 }
 
@@ -187,6 +186,7 @@ impl LaminarDB {
         interval_topology: IntervalTopologyCandidate,
         query_sql: &str,
     ) -> Result<(), DbError> {
+        let candidate = planned.candidate_registration(name_str, query_sql);
         let PlannedStreamingQuery {
             emit_clause: plan_emit,
             window_config: plan_window,
@@ -226,15 +226,19 @@ impl LaminarDB {
             mutation: Arc::clone(&mutation),
         };
 
-        // An incremental MV emits a dirty-only changelog into a snapshot store; decide the store once
-        // so the operator and MV store agree (keyed upsert for aggregates, Z-set for proj/filter).
-        let (inc, has_aggregate) = if interval_topology.mutable_join {
-            (IncEmit::Multiset, false)
-        } else {
-            self.incremental_emit_mode(&query_sql, plan_window.is_some(), &interval_topology)
-                .await
+        // Decide the store once so the operator and the store agree: a changelog view's stream
+        // emits weighted deltas and its slices follow the planned output distribution.
+        let output = self
+            .view_output(&query_sql, plan_window.is_some(), &interval_topology)
+            .await;
+        let incremental = matches!(output, ViewOutput::Changelog { .. });
+        let mode = match output {
+            ViewOutput::Changelog { aggregate } => crate::mv_store::MvStorageMode::Changelog {
+                key: self.planned_view_key(candidate, &schema, aggregate).await?,
+                key_groups: self.checkpoint_key_groups(),
+            },
+            ViewOutput::Append => crate::mv_store::MvStorageMode::append_default(),
         };
-        let incremental = !matches!(inc, IncEmit::None);
 
         {
             let mut mgr = self.connector_manager.lock();
@@ -257,7 +261,7 @@ impl LaminarDB {
             mgr.store_ddl(name_str, sql);
         }
 
-        self.register_mv_provider(name_str, &schema, plan_window.is_some(), inc, has_aggregate)?;
+        self.register_mv_provider(name_str, &schema, mode)?;
 
         let admission = {
             let guard = self.control_tx.lock();
@@ -414,79 +418,103 @@ impl LaminarDB {
         }
     }
 
-    /// Store decision for a non-windowed MV: keyed `Upsert` for a keyed aggregate, `Multiset` for a
-    /// projection/filter over a changelog, `None` (full-emit) otherwise (incl. global aggregates).
-    /// Returns the store mode and whether the query is an aggregate (threaded to
-    /// `register_mv_provider` so it needn't re-plan to pick `Aggregate` vs append storage).
-    async fn incremental_emit_mode(
+    /// A non-windowed aggregate, a projection or enrichment of a changelog, and a mutable
+    /// interval join maintain a changelog; everything else appends.
+    async fn view_output(
         &self,
         query_sql: &str,
         has_window: bool,
         topology: &IntervalTopologyCandidate,
-    ) -> (IncEmit, bool) {
-        if has_window {
-            return (IncEmit::None, false);
+    ) -> ViewOutput {
+        if topology.mutable_join {
+            return ViewOutput::Changelog { aggregate: false };
         }
-        let flag = self.config.incremental_emit;
-        let reads_incremental =
-            topology.changelog_input.is_some() || self.first_incremental_ref(query_sql).is_some();
+        if has_window {
+            return ViewOutput::Append;
+        }
         let Some(df) = self.ctx.sql(query_sql).await.ok() else {
-            return (IncEmit::None, false);
+            return ViewOutput::Append;
         };
         let plan = df.logical_plan();
-        if let Some(agg) = crate::aggregate_state::find_aggregate(plan) {
-            let n = agg.group_exprs.len();
-            // Keyed aggregate → upsert (terminal under the flag, or chained over an incremental
-            // MV). A global aggregate (no GROUP BY) is single-row → full-emit.
-            let inc = if n > 0 && (flag || reads_incremental) {
-                IncEmit::Upsert((0..n).collect())
-            } else {
-                IncEmit::None
-            };
-            return (inc, true);
+        if crate::aggregate_state::find_aggregate(plan).is_some() {
+            return ViewOutput::Changelog { aggregate: true };
         }
-        // Projection/filter over an incremental MV's changelog → Z-set multiset snapshot.
+        let enriches_changelog = matches!(
+            topology.changelog_input,
+            Some(ChangelogInputKind::StaticEnrich)
+        ) || crate::sql_analysis::detect_changelog_enrich_query(
+            query_sql,
+            &self.incremental_mv_names(),
+            &self.static_table_names(),
+        )
+        .is_some();
         if topology.candidate_carries_changelog
-            && crate::sql_analysis::extract_projection_filter(plan).is_some()
+            && (crate::sql_analysis::extract_projection_filter(plan).is_some()
+                || enriches_changelog)
         {
-            return (IncEmit::Multiset, false);
+            return ViewOutput::Changelog { aggregate: false };
         }
-        // `changelog ⋈ static dim` enrich join → Z-set multiset snapshot.
-        if topology.candidate_carries_changelog
-            && (matches!(
-                topology.changelog_input,
-                Some(ChangelogInputKind::StaticEnrich)
-            ) || crate::sql_analysis::detect_changelog_enrich_query(
-                query_sql,
-                &self.incremental_mv_names(),
-                &self.static_table_names(),
-            )
-            .is_some())
-        {
-            return (IncEmit::Multiset, false);
-        }
-        (IncEmit::None, false)
+        ViewOutput::Append
+    }
+
+    /// The view key from the view stream's planned output distribution.
+    async fn planned_view_key(
+        &self,
+        candidate: crate::connector_manager::StreamRegistration,
+        schema: &Schema,
+        aggregate: bool,
+    ) -> Result<crate::mv_store::ViewKey, DbError> {
+        use crate::exchange_plan::{Distribution, KeyColumn};
+        use crate::mv_store::ViewKey;
+
+        let name = candidate.name.clone();
+        let resolved = self
+            .resolve_catalog_stream_outputs(Some(crate::connector_manager::StreamRegistration {
+                incremental: true,
+                ..candidate
+            }))
+            .await?;
+        let distribution = &resolved
+            .exchange_plan
+            .stream(&name)
+            .ok_or_else(|| {
+                DbError::MaterializedView(format!(
+                    "materialized view '{name}' has no exchange plan"
+                ))
+            })?
+            .output
+            .distribution;
+        let key = match distribution {
+            Distribution::Singleton { .. } => return Ok(ViewKey::Global),
+            Distribution::Arbitrary => return Ok(ViewKey::MultisetByRow),
+            Distribution::Hash(key) => key,
+        };
+        let columns = key
+            .0
+            .iter()
+            .map(|column| match column {
+                KeyColumn::Column { name: column, .. } => schema.index_of(column).ok(),
+                KeyColumn::Computed { .. } => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                DbError::MaterializedView(format!(
+                    "materialized view '{name}' output key {key} is not a set of its columns"
+                ))
+            })?;
+        Ok(if aggregate {
+            ViewKey::Keyed(columns)
+        } else {
+            ViewKey::MultisetByKey(columns)
+        })
     }
 
     fn register_mv_provider(
         &self,
         name_str: &str,
         schema: &Arc<Schema>,
-        has_window: bool,
-        inc: IncEmit,
-        has_aggregate: bool,
+        mode: crate::mv_store::MvStorageMode,
     ) -> Result<(), DbError> {
-        use crate::mv_store::MvStorageMode;
-
-        // Incremental MVs maintain a snapshot from a dirty-only changelog. Otherwise: non-windowed
-        // aggs replace-all every cycle; windowed aggs append (preserving prior windows), as do non-aggregates.
-        let mode = match inc {
-            IncEmit::Upsert(key_cols) => MvStorageMode::Upsert { key_cols },
-            IncEmit::Multiset => MvStorageMode::Multiset,
-            IncEmit::None if has_aggregate && !has_window => MvStorageMode::Aggregate,
-            IncEmit::None => MvStorageMode::append_default(),
-        };
-
         self.mv_store
             .write()
             .create_mv(name_str, schema.clone(), mode)?;

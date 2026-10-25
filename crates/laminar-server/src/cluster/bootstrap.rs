@@ -185,7 +185,6 @@ async fn install_controller_and_build_database(
         verified_namespaces,
     } = resolved;
     // LaminarDB derives the participant namespace from the installed controller.
-    builder = builder.incremental_emit(config.server.incremental_emit);
     builder = config.server.apply_memory_limits(builder);
     if let Some(retention) = temporal_join_idle_history_retention {
         builder = builder.temporal_join_idle_history_retention(retention);

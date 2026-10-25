@@ -1,3 +1,5 @@
+use crate::operator_graph::OperatorGraph;
+
 use super::{
     channel_progress_frontier, validate_source_recovery_assignment, Arc, DbError, FxHashMap,
     HashMap, LaminarDB, PipelineRecoveryState, RecoveredInputChannelProgress, RuntimeMode,
@@ -35,17 +37,10 @@ impl LaminarDB {
 
     pub(super) fn restore_recovered_state_frames(
         &self,
-        graph: crate::operator_graph::OperatorGraph,
+        graph: OperatorGraph,
         recovered: &crate::recovery_manager::RecoveredState,
         participant_id: u64,
-    ) -> Result<
-        (
-            crate::operator_graph::OperatorGraph,
-            crate::mv_store::MvStore,
-            bool,
-        ),
-        DbError,
-    > {
+    ) -> Result<(OperatorGraph, crate::mv_store::MvStore, bool), DbError> {
         use laminar_core::checkpoint::StateFrameKey;
 
         let mut graph_whole = Vec::new();
@@ -139,7 +134,7 @@ impl LaminarDB {
             ));
         }
         #[cfg(feature = "cluster")]
-        let (graph, restored_graph_frames) = if recovered.reassigned
+        let (mut graph, restored_graph_frames) = if recovered.reassigned
             && !recovered.target_vnodes.is_empty()
         {
             let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
@@ -198,12 +193,15 @@ impl LaminarDB {
             )?
         };
         #[cfg(not(feature = "cluster"))]
-        let (graph, restored_graph_frames) = graph.restore_state_frames(
+        let (mut graph, restored_graph_frames) = graph.restore_state_frames(
             &graph_whole,
             &graph_vnodes,
             u32::from(recovered.committed.vnode_count),
         )?;
-        let recovered_mv_store = self.mv_store.read().recovery_image(&mv_states)?;
+        let recovered_mv_store = self
+            .mv_store
+            .read()
+            .recovery_image(&mv_states, graph.take_restored_views())?;
         let restored_reference_tables =
             self.restore_reference_table_checkpoint(recovered.epoch(), reference_tables.as_ref())?;
         tracing::info!(
@@ -326,7 +324,7 @@ impl LaminarDB {
 
     pub(super) async fn recover_pipeline_state(
         &self,
-        mut graph: crate::operator_graph::OperatorGraph,
+        mut graph: OperatorGraph,
         sources: &mut [TrackedSourceRegistration],
         runtime_mode: RuntimeMode,
         vnode_state_report_timeout: std::time::Duration,

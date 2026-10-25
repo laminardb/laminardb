@@ -2,24 +2,23 @@ use super::*;
 
 #[tokio::test]
 async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metrics() {
-    use crate::mv_store::{MvStorageMode, MvStore};
+    use crate::mv_store::{MvStorageMode, MvStore, ViewKey};
     use crate::pipeline::PipelineCallback;
     use crate::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
     for mode in [
-        MvStorageMode::Aggregate,
         MvStorageMode::append_default(),
-        MvStorageMode::Upsert { key_cols: vec![0] },
-        MvStorageMode::Multiset,
+        MvStorageMode::changelog(ViewKey::Keyed(vec![0])),
+        MvStorageMode::changelog(ViewKey::MultisetByRow),
     ] {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let input = |ids: Vec<i64>| {
             let rows = ids.len();
             let mut fields = schema.fields().to_vec();
             let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(Int64Array::from(ids))];
-            if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset) {
+            if matches!(mode, MvStorageMode::Changelog { .. }) {
                 fields.push(Arc::new(Field::new("__weight", DataType::Int64, false)));
                 columns.push(Arc::new(Int64Array::from(vec![1; rows])));
             }
@@ -90,8 +89,7 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
                 panic!("successful cycle must publish plain rows")
             };
             assert_eq!(batch.num_columns(), 1);
-            let expected = if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset)
-            {
+            let expected = if matches!(mode, MvStorageMode::Changelog { .. }) {
                 2
             } else {
                 1

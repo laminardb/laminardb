@@ -6376,11 +6376,7 @@ async fn materialized_view_namespace_collision_preserves_existing_provider() {
 
 #[tokio::test]
 async fn multiway_incremental_mv_is_rejected_without_partial_registration() {
-    let db = LaminarDB::open_with_config(LaminarConfig {
-        incremental_emit: true,
-        ..Default::default()
-    })
-    .unwrap();
+    let db = LaminarDB::open().unwrap();
     for source in ["ev_a", "ev_b", "ev_c"] {
         db.execute(&format!("CREATE SOURCE {source} (k BIGINT, v BIGINT)"))
             .await
@@ -9401,6 +9397,50 @@ async fn test_retracting_temporal_filter_emits_insert_then_retract() {
     );
 }
 
+/// A view's key comes from its planned output distribution: an aggregate upserts on its group
+/// columns, a global aggregate holds one row, and a projection keeps the placement of an
+/// upstream key it forwards.
+#[tokio::test]
+async fn view_storage_follows_the_planned_output_distribution() {
+    use crate::mv_store::{MvStorageMode, ViewKey};
+
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (k BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    for (view, sql, expected) in [
+        (
+            "keyed",
+            "SELECT k, SUM(v) AS total FROM events GROUP BY k",
+            ViewKey::Keyed(vec![0]),
+        ),
+        (
+            "overall",
+            "SELECT COUNT(*) AS n FROM events",
+            ViewKey::Global,
+        ),
+        (
+            "kept_key",
+            "SELECT total, k FROM keyed WHERE total > 0",
+            ViewKey::MultisetByKey(vec![1]),
+        ),
+        (
+            "dropped_key",
+            "SELECT total FROM keyed",
+            ViewKey::MultisetByRow,
+        ),
+    ] {
+        db.execute(&format!("CREATE MATERIALIZED VIEW {view} AS {sql}"))
+            .await
+            .unwrap_or_else(|error| panic!("{view}: {error}"));
+        let mode = db.mv_store.read().storage_mode_for_test(view);
+        assert!(
+            matches!(&mode, Some(MvStorageMode::Changelog { key, .. }) if *key == expected),
+            "{view}: {mode:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn first_temporal_filter_mv_uses_multiset_storage() {
     let db = LaminarDB::open().unwrap();
@@ -9416,7 +9456,10 @@ async fn first_temporal_filter_mv_uses_multiset_storage() {
 
     assert!(matches!(
         db.mv_store.read().storage_mode_for_test("recent_mv"),
-        Some(crate::mv_store::MvStorageMode::Multiset)
+        Some(crate::mv_store::MvStorageMode::Changelog {
+            key: crate::mv_store::ViewKey::MultisetByRow,
+            ..
+        })
     ));
 }
 

@@ -39,6 +39,7 @@ mod catalog_context;
 mod input_admission;
 mod process;
 mod state_restore;
+mod views;
 
 #[cfg(test)]
 use input_admission::retained_input_bytes;
@@ -598,6 +599,11 @@ pub(crate) trait GraphOperator: Send {
     /// Force the next capture to include full bytes for every requested vnode. This is required
     /// after a destructive dirty capture fails before the checkpoint commits.
     fn force_full_vnode_capture(&mut self) {}
+
+    /// Hand over view slices restored by [`Self::restore_vnode`] for the recovery image.
+    fn take_restored_view(&mut self) -> Option<crate::mv_store::RestoredView> {
+        None
+    }
 }
 
 /// One authoritative full vnode image prepared for a managed operator.
@@ -710,7 +716,7 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 7;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 8;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {
@@ -1052,6 +1058,8 @@ pub(crate) struct OperatorGraph {
     source_list: Vec<SourceRoute>,
     source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
+    // Changelog views in this store get a result node beside their stream node.
+    view_store: Option<Arc<parking_lot::RwLock<crate::mv_store::MvStore>>>,
     // Reverse of `output_map` (node id → is an output); rebuilt in `compute_topo_order`.
     output_node_ids: FxHashSet<usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
@@ -1175,6 +1183,7 @@ impl OperatorGraph {
             source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
             output_map: FxHashMap::default(),
+            view_store: None,
             output_node_ids: FxHashSet::default(),
             input_bufs: Vec::new(),
             input_buf_bytes: Vec::new(),
@@ -2407,9 +2416,9 @@ impl OperatorGraph {
             self.order_configs.insert(node_id, oc);
         }
         self.output_map.insert(Arc::from(name.as_str()), node_id);
-        if incremental || ordered_interval {
-            self.changelog_tables.insert(name.clone());
-        }
+        self.attach_view_result(&name);
+        self.changelog_tables
+            .extend((incremental || ordered_interval).then(|| name.clone()));
         self.topo_dirty = true;
     }
 

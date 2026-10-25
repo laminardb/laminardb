@@ -216,7 +216,6 @@ fn test_parse_minimal_config() {
     let config: ServerConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.server.mode, ServerMode::Single);
     assert_eq!(config.server.bind, "127.0.0.1:8080");
-    assert!(config.server.incremental_emit);
     assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
     assert!(config.sources.is_empty());
     assert!(config.pipelines.is_empty());
@@ -1577,16 +1576,18 @@ interval = "500ms"
 }
 
 #[test]
-fn incremental_emit_is_server_execution_policy() {
-    let config: ServerConfig = toml::from_str(
+fn removed_incremental_emit_setting_is_rejected() {
+    let error = toml::from_str::<ServerConfig>(
         r#"
 [server]
 incremental_emit = false
 "#,
     )
-    .unwrap();
+    .unwrap_err();
 
-    assert!(!config.server.incremental_emit);
+    assert!(error
+        .to_string()
+        .contains("unknown field `incremental_emit`"));
 }
 
 #[test]

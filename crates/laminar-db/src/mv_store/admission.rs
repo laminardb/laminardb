@@ -50,10 +50,7 @@ pub(super) fn size_overflow() -> DbError {
 
 impl MvEntry {
     fn validate_input_schema(&self, name: &str, batch: &RecordBatch) -> Result<(), DbError> {
-        let weighted = matches!(
-            self.mode,
-            MvStorageMode::Upsert { .. } | MvStorageMode::Multiset
-        );
+        let weighted = matches!(self.mode, MvStorageMode::Changelog { .. });
         let schema = batch.schema_ref();
         if !weighted && std::sync::Arc::ptr_eq(&self.schema, schema) {
             return Ok(());
@@ -107,32 +104,19 @@ impl MvEntry {
         if batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(PreparedUpdate::Unchanged);
         }
-        match &self.mode {
-            MvStorageMode::Aggregate => {
-                let (rows, bytes) = batch_usage(batches.iter())?;
-                limits.validate(name, rows, bytes)?;
-                Ok(PreparedUpdate::Batches {
-                    evicted: self.batches.len(),
-                    incoming: batches,
-                    rows,
-                    bytes,
-                })
-            }
-            MvStorageMode::Append { max_batches } => {
-                self.prepare_append(name, batches, limits, *max_batches)
-            }
-            MvStorageMode::Upsert { .. } => self
-                .upsert
-                .as_ref()
-                .ok_or_else(|| DbError::Storage("MV is missing its upsert state".into()))?
+        if let MvStorageMode::Append { max_batches } = &self.mode {
+            return self.prepare_append(name, batches, limits, *max_batches);
+        }
+        match (&self.upsert, &self.multiset) {
+            (Some(upsert), None) => upsert
                 .prepare_cycle(name, batches, limits)
                 .map(PreparedUpdate::Upsert),
-            MvStorageMode::Multiset => self
-                .multiset
-                .as_ref()
-                .ok_or_else(|| DbError::Storage("MV is missing its multiset state".into()))?
+            (None, Some(multiset)) => multiset
                 .prepare_cycle(name, batches, limits, snapshot)
                 .map(PreparedUpdate::Multiset),
+            _ => Err(DbError::Storage(format!(
+                "MV '{name}' is missing its changelog state"
+            ))),
         }
     }
 

@@ -101,7 +101,7 @@ mod tests {
     use datafusion::datasource::MemTable;
 
     use super::*;
-    use crate::mv_store::MvStorageMode;
+    use crate::mv_store::{MvStorageMode, ViewKey};
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -121,16 +121,34 @@ mod tests {
         .unwrap()
     }
 
-    /// Two replace-every-cycle views registered on a fresh context, both at cycle 1.
+    /// Upserts of `(k, n)` rows into a keyed view.
+    fn upserts(k: &[i64], n: &[i64]) -> RecordBatch {
+        let plain = rows(k, n);
+        let mut fields = plain.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        )));
+        let mut columns = plain.columns().to_vec();
+        columns.push(Arc::new(Int64Array::from(vec![1; k.len()])));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    /// Two keyed views registered on a fresh context, both at cycle 1.
     fn two_views() -> (SessionContext, Arc<parking_lot::RwLock<MvStore>>) {
         let store = Arc::new(parking_lot::RwLock::new(MvStore::new()));
         let ctx = laminar_sql::create_session_context();
         for view in ["a", "b"] {
             store
                 .write()
-                .create_mv(view, schema(), MvStorageMode::Aggregate)
+                .create_mv(
+                    view,
+                    schema(),
+                    MvStorageMode::changelog(ViewKey::Keyed(vec![0])),
+                )
                 .unwrap();
-            store.write().update(view, &rows(&[1, 2], &[1, 1]));
+            store.write().update(view, &upserts(&[1, 2], &[1, 1]));
             let provider = MvTableProvider::new(view.into(), schema(), Arc::clone(&store));
             ctx.register_table(view, Arc::new(provider)).unwrap();
         }
@@ -140,8 +158,8 @@ mod tests {
     /// Apply cycle 2 to both views under one write guard, as the coordinator does.
     fn apply_second_cycle(store: &parking_lot::RwLock<MvStore>) {
         let mut store = store.write();
-        store.update("a", &rows(&[1, 2], &[2, 2]));
-        store.update("b", &rows(&[1, 2], &[2, 2]));
+        store.update("a", &upserts(&[1, 2], &[2, 2]));
+        store.update("b", &upserts(&[1, 2], &[2, 2]));
     }
 
     async fn joined_counts(df: DataFrame) -> Vec<(i64, i64)> {

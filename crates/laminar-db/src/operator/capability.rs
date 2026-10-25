@@ -39,6 +39,8 @@ pub(crate) enum ManagedStateContract {
     TemporalJoinV1,
     /// Process-function state and event-time timers, partitioned by canonical key.
     ProcessFunctionV1,
+    /// Materialized-view result slices, one sorted frame per vnode.
+    ViewResultV1,
     #[cfg(test)]
     TestVnodeStateV1,
 }
@@ -94,6 +96,7 @@ pub(crate) enum OperatorImplementation {
     TemporalJoin,
     WindowFrame,
     ProcessFunction,
+    ViewResult,
     #[cfg(test)]
     TestProbe,
 }
@@ -224,6 +227,11 @@ impl OperatorCapability {
                 State::LocalOnly,
                 "SQL execution shape has not been classified",
             ),
+            Implementation::ViewResult => Self::rejected(
+                implementation,
+                State::VnodeKeyed,
+                "materialized-view results have no assignment-fenced read and lifecycle contract",
+            ),
             #[cfg(test)]
             Implementation::TestProbe => Self::internal(implementation, State::LocalOnly),
         }
@@ -300,6 +308,17 @@ impl OperatorCapability {
             OperatorStateClass::VnodeKeyed,
             "windowed keyed state has no qualified vnode-scoped timer, watermark eviction, output, and checkpoint/rebalance lifecycle",
         )
+    }
+
+    /// A materialized view's result slices, placed like the view key. Cluster admission stays
+    /// closed until views have a committed read and lifecycle contract.
+    pub(crate) const fn view_result(state_class: OperatorStateClass) -> Self {
+        Self::rejected(
+            OperatorImplementation::ViewResult,
+            state_class,
+            "materialized-view results have no assignment-fenced read and lifecycle contract",
+        )
+        .with_managed_state(ManagedStateContract::ViewResultV1)
     }
 
     /// Fail-closed descriptor for SQL whose retained-state shape is ambiguous.

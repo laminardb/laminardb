@@ -148,9 +148,6 @@ pub struct ServerSection {
     /// End-to-end pipeline delivery contract. Connector protocols are derived from this value.
     #[serde(default = "default_delivery")]
     pub delivery: DeliveryGuarantee,
-    /// Query execution policy for keyed running aggregates; independent of checkpoint storage.
-    #[serde(default = "default_incremental_emit")]
-    pub incremental_emit: bool,
     /// Per-DB/node limit for participating `DataFusion` reservations; excludes process RSS.
     /// DB-owned contexts disable disk spilling. Must be greater than zero.
     #[serde(default = "default_datafusion_memory_limit_bytes")]
@@ -256,7 +253,6 @@ impl Default for ServerSection {
             key_groups: None,
             bind: default_bind(),
             delivery: default_delivery(),
-            incremental_emit: default_incremental_emit(),
             datafusion_memory_limit_bytes: default_datafusion_memory_limit_bytes(),
             source_queue_max_bytes: default_source_queue_max_bytes(),
             reference_table_max_rows: default_reference_table_max_rows(),
@@ -914,9 +910,6 @@ fn default_checkpoint_url() -> String {
     } else {
         format!("file:///{path_str}")
     }
-}
-fn default_incremental_emit() -> bool {
-    true
 }
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)

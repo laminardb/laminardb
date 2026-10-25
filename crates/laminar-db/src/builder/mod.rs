@@ -286,13 +286,6 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Select dirty-only changelog emission for keyed running aggregates.
-    #[must_use]
-    pub fn incremental_emit(mut self, enabled: bool) -> Self {
-        self.config.incremental_emit = enabled;
-        self
-    }
-
     /// Set the deployment profile.
     ///
     /// See [`Profile`] for the available tiers. [`Profile::Cluster`] also requires a cluster

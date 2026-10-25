@@ -8,16 +8,21 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use laminar_core::changelog::WEIGHT_COLUMN;
+use laminar_core::state::KeyGroupCount;
 
 use crate::error::DbError;
+use crate::operator::capability::OperatorStateClass;
 
 mod admission;
 mod checkpoint;
+mod frames;
 mod multiset;
+mod slices;
 mod staging;
 mod statement_snapshot;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
+pub(crate) use frames::RestoredView;
 use multiset::MultisetState;
 pub(crate) use statement_snapshot::{plan_statement, StatementViewSnapshot};
 use upsert::UpsertState;
@@ -40,23 +45,55 @@ const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_MULTISET_MATERIALIZED_ROWS: usize = 1_000_000;
 const MULTISET_MATERIALIZATION_ROW_OVERHEAD: usize = 64;
 
+/// How a changelog view keys its rows and places them on vnodes, from the view stream's
+/// planned output distribution. Column indices are positions in the view schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ViewKey {
+    /// A singleton output: at most one live row, on vnode 0.
+    Global,
+    /// A keyed aggregate: rows upserted on these columns and placed by them.
+    Keyed(Vec<usize>),
+    /// Full rows with multiplicities, placed by the inherited hash key on these columns.
+    MultisetByKey(Vec<usize>),
+    /// Full rows with multiplicities, placed by the full row.
+    MultisetByRow,
+}
+
+impl ViewKey {
+    pub(crate) const fn state_class(&self) -> OperatorStateClass {
+        match self {
+            Self::Global => OperatorStateClass::GlobalSingleton,
+            Self::Keyed(_) | Self::MultisetByKey(_) | Self::MultisetByRow => {
+                OperatorStateClass::VnodeKeyed
+            }
+        }
+    }
+}
+
 /// How a materialized view accumulates results.
 #[derive(Debug, Clone)]
 pub(crate) enum MvStorageMode {
-    /// GROUP BY queries: replace the result set each cycle.
-    Aggregate,
-    /// Non-aggregate queries: append with bounded retention.
+    /// Append-only output with bounded retention.
     Append { max_batches: usize },
-    /// Incremental keyed snapshot from a dirty-only `__weight` changelog; `key_cols` index the GROUP BY columns.
-    Upsert { key_cols: Vec<usize> },
-    /// Chained projection/filter: Z-set multiset keyed by the full row; handles key-dropping dups.
-    Multiset,
+    /// A `__weight` changelog maintained as vnode slices over `key_groups` vnodes.
+    Changelog {
+        key: ViewKey,
+        key_groups: KeyGroupCount,
+    },
 }
 
 impl MvStorageMode {
     pub fn append_default() -> Self {
         Self::Append {
             max_batches: DEFAULT_APPEND_MAX_BATCHES,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changelog(key: ViewKey) -> Self {
+        Self::Changelog {
+            key,
+            key_groups: laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
         }
     }
 }
@@ -83,9 +120,9 @@ pub(crate) struct MvEntry {
     schema: SchemaRef,
     mode: MvStorageMode,
     batches: VecDeque<RecordBatch>,
-    /// Present only in `Upsert` mode.
+    /// Present only for a `Global` or `Keyed` changelog view.
     upsert: Option<UpsertState>,
-    /// Present only in `Multiset` mode.
+    /// Present only for a multiset changelog view.
     multiset: Option<MultisetState>,
     approx_bytes: usize,
     rows: usize,
@@ -93,14 +130,21 @@ pub(crate) struct MvEntry {
 
 impl MvEntry {
     fn new(schema: SchemaRef, mode: MvStorageMode) -> Result<Self, DbError> {
-        let upsert = match &mode {
-            MvStorageMode::Upsert { key_cols } => Some(UpsertState::new(&schema, key_cols)?),
-            _ => None,
-        };
-        let multiset = match &mode {
-            MvStorageMode::Multiset => Some(MultisetState::new(&schema)?),
-            _ => None,
-        };
+        let (mut upsert, mut multiset) = (None, None);
+        if let MvStorageMode::Changelog { key, key_groups } = &mode {
+            match key {
+                ViewKey::Global => upsert = Some(UpsertState::new(&schema, &[], *key_groups)?),
+                ViewKey::Keyed(columns) => {
+                    upsert = Some(UpsertState::new(&schema, columns, *key_groups)?);
+                }
+                ViewKey::MultisetByKey(columns) => {
+                    multiset = Some(MultisetState::new(&schema, columns, *key_groups)?);
+                }
+                ViewKey::MultisetByRow => {
+                    multiset = Some(MultisetState::new(&schema, &[], *key_groups)?);
+                }
+            }
+        }
         Ok(Self {
             schema,
             mode,
@@ -186,6 +230,14 @@ impl MvStore {
         self.entries.get(name).map(|entry| entry.mode.clone())
     }
 
+    /// The vnode placement of `name`'s slices, or `None` for an append view.
+    pub(crate) fn view_state_class(&self, name: &str) -> Option<OperatorStateClass> {
+        match &self.entries.get(name)?.mode {
+            MvStorageMode::Changelog { key, .. } => Some(key.state_class()),
+            MvStorageMode::Append { .. } => None,
+        }
+    }
+
     #[cfg(feature = "cluster")]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -258,11 +310,20 @@ impl MvStore {
         })
     }
 
-    /// Restore a complete checkpoint into a private image. The live store is never mutated.
-    pub fn recovery_image(&self, states: &HashMap<String, Vec<u8>>) -> Result<Self, DbError> {
+    /// Restore a complete checkpoint into a private image: append views from their whole
+    /// frames, changelog views from the slices their graph nodes restored. The live store is
+    /// never mutated.
+    pub fn recovery_image(
+        &self,
+        states: &HashMap<String, Vec<u8>>,
+        restored_views: Vec<RestoredView>,
+    ) -> Result<Self, DbError> {
         let mut image = self.fresh_image().map_err(|error| {
             DbError::Checkpoint(format!("cannot create an empty MV recovery image: {error}"))
         })?;
+        for view in restored_views {
+            view.install(&mut image.entries)?;
+        }
         let mut restored = HashSet::with_capacity(states.len());
 
         for (name, bytes) in states {
@@ -279,8 +340,9 @@ impl MvStore {
 
         let mut missing: Vec<&str> = image
             .entries
-            .keys()
-            .map(String::as_str)
+            .iter()
+            .filter(|(_, entry)| matches!(entry.mode, MvStorageMode::Append { .. }))
+            .map(|(name, _)| name.as_str())
             .filter(|name| !restored.contains(name))
             .collect();
         if !missing.is_empty() {

@@ -4,6 +4,22 @@ use super::*;
 use arrow::array::{Float64Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
+fn keyed() -> MvStorageMode {
+    MvStorageMode::changelog(ViewKey::Keyed(vec![0]))
+}
+
+fn multiset() -> MvStorageMode {
+    MvStorageMode::changelog(ViewKey::MultisetByRow)
+}
+
+fn nonempty_vnodes(frames: &[(u32, bytes::Bytes)]) -> Vec<u32> {
+    frames
+        .iter()
+        .filter(|(_, bytes)| bytes.as_ref() != [0])
+        .map(|(vnode, _)| *vnode)
+        .collect()
+}
+
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -136,7 +152,7 @@ fn snapshot_rows(store: &MvStore, name: &str) -> Vec<(i64, i64)> {
 fn create_and_drop() {
     let mut store = MvStore::new();
     store
-        .create_mv("mv1", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("mv1", test_schema(), MvStorageMode::append_default())
         .unwrap();
     assert!(store.has_mv("mv1"));
     assert!(store.drop_mv("mv1"));
@@ -145,45 +161,22 @@ fn create_and_drop() {
 }
 
 #[test]
-fn aggregate_replaces_on_each_update() {
+fn a_global_view_keeps_one_row_on_vnode_zero() {
     let mut store = MvStore::new();
     store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
-        .unwrap();
-
-    store.update("agg", &make_batch(&[1], &["a"], &[1.0]));
-    assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 1);
-
-    store.update("agg", &make_batch(&[2, 3], &["b", "c"], &[2.0, 3.0]));
-    assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 2);
-}
-
-#[test]
-fn aggregate_keeps_all_batches_of_a_multi_batch_cycle() {
-    let mut store = MvStore::new();
-    store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
-        .unwrap();
-
-    // A non-incremental GROUP BY MV whose output spans several DataFusion batches must
-    // retain every chunk within the cycle, not just the last (EX-1).
-    store
-        .update_cycle(
-            "agg",
-            &[
-                make_batch(&[1, 2], &["a", "b"], &[1.0, 2.0]),
-                make_batch(&[3, 4], &["c", "d"], &[3.0, 4.0]),
-                make_batch(&[5], &["e"], &[5.0]),
-            ],
+        .create_mv(
+            "g",
+            upsert_plain_schema(),
+            MvStorageMode::changelog(ViewKey::Global),
         )
         .unwrap();
-    assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 5);
+    store.update("g", &changelog_batch(&[(1, 10, 1)]));
+    store.update("g", &changelog_batch(&[(1, 10, -1), (2, 25, 1)]));
+    assert_eq!(snapshot_rows(&store, "g"), vec![(2, 25)]);
+    assert_eq!(nonempty_vnodes(&store.full_view_frames("g")), vec![0]);
 
-    // The next cycle replaces the whole result set.
-    store
-        .update_cycle("agg", &[make_batch(&[9], &["z"], &[9.0])])
-        .unwrap();
-    assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 1);
+    store.update("g", &changelog_batch(&[(2, 25, -1)]));
+    assert!(snapshot_rows(&store, "g").is_empty());
 }
 
 #[test]
@@ -217,11 +210,17 @@ fn append_evicts_oldest() {
 fn empty_mv_returns_empty_batch() {
     let mut store = MvStore::new();
     store
-        .create_mv("empty", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("empty", test_schema(), MvStorageMode::append_default())
+        .unwrap();
+    store
+        .create_mv("keyed", upsert_plain_schema(), keyed())
         .unwrap();
     let result = store.to_record_batch("empty").unwrap().unwrap();
     assert_eq!(result.num_rows(), 0);
     assert_eq!(result.schema(), test_schema());
+    let keyed = store.to_record_batch("keyed").unwrap().unwrap();
+    assert_eq!(keyed.num_rows(), 0);
+    assert_eq!(keyed.schema(), upsert_plain_schema());
 }
 
 #[test]
@@ -234,25 +233,25 @@ fn nonexistent_returns_none() {
 fn checkpoint_round_trip() {
     let mut store = MvStore::new();
     store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("app", test_schema(), MvStorageMode::append_default())
         .unwrap();
-    store.update("agg", &make_batch(&[1, 2], &["a", "b"], &[1.0, 2.0]));
+    store.update("app", &make_batch(&[1, 2], &["a", "b"], &[1.0, 2.0]));
 
     let states = store.checkpoint_states().unwrap();
     assert_eq!(states.len(), 1);
-    assert!(states.contains_key("mv:agg"));
+    assert!(states.contains_key("mv:app"));
 
     // Simulate recovery into a fresh store
     let mut store2 = MvStore::new();
     store2
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("app", test_schema(), MvStorageMode::append_default())
         .unwrap();
     for (key, bytes) in &states {
         let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
         store2.restore_from_ipc(name, bytes).unwrap();
     }
     assert_eq!(
-        store2.to_record_batch("agg").unwrap().unwrap().num_rows(),
+        store2.to_record_batch("app").unwrap().unwrap().num_rows(),
         2
     );
 }
@@ -261,9 +260,6 @@ fn checkpoint_round_trip() {
 fn checkpoint_capture_is_point_in_time_after_live_mutation() {
     let mut store = MvStore::new();
     store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
-        .unwrap();
-    store
         .create_mv(
             "append",
             test_schema(),
@@ -271,23 +267,24 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
         )
         .unwrap();
     store
-        .create_mv(
-            "upsert",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("upsert", upsert_plain_schema(), keyed())
         .unwrap();
     store
-        .create_mv("multiset", one_col_schema(), MvStorageMode::Multiset)
+        .create_mv("multiset", one_col_schema(), multiset())
         .unwrap();
 
-    store.update("agg", &make_batch(&[1], &["old-agg"], &[1.0]));
     store.update("append", &make_batch(&[2], &["old-append"], &[2.0]));
     store.update("upsert", &changelog_batch(&[(1, 10, 1)]));
     store.update("multiset", &weight_batch_1col(&[(10, 2)]));
     let capture = store.capture_checkpoint(u64::MAX).unwrap();
+    let vnodes: Vec<u32> = (0..256).collect();
+    let upsert = store
+        .capture_view_vnodes("upsert", &vnodes, 256, u64::MAX)
+        .unwrap();
+    let multiset = store
+        .capture_view_vnodes("multiset", &vnodes, 256, u64::MAX)
+        .unwrap();
 
-    store.update("agg", &make_batch(&[9], &["new-agg"], &[9.0]));
     store.update("append", &make_batch(&[3], &["new-append"], &[3.0]));
     store.update("upsert", &changelog_batch(&[(1, 10, -1), (1, 99, 1)]));
     store.update("multiset", &weight_batch_1col(&[(10, -1), (20, 1)]));
@@ -305,9 +302,16 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
             )
         })
         .collect::<HashMap<_, _>>();
-    let image = store.recovery_image(&states).unwrap();
+    let mut restored = Vec::new();
+    for (view, captures) in [("upsert", upsert), ("multiset", multiset)] {
+        let mut target = store.restore_target(view).unwrap();
+        for (vnode, bytes) in frames::encode_captures(captures) {
+            target.restore_vnode(vnode, 256, &bytes).unwrap();
+        }
+        restored.push(target);
+    }
+    let image = store.recovery_image(&states, restored).unwrap();
 
-    assert_eq!(id_names(&image, "agg"), vec![(1, "old-agg".to_string())]);
     assert_eq!(
         id_names(&image, "append"),
         vec![(2, "old-append".to_string())]
@@ -315,7 +319,6 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
     assert_eq!(snapshot_rows(&image, "upsert"), vec![(1, 10)]);
     assert_eq!(multiset_values(&image, "multiset"), vec![10, 10]);
 
-    assert_eq!(id_names(&store, "agg"), vec![(9, "new-agg".to_string())]);
     assert_eq!(
         id_names(&store, "append"),
         vec![(2, "old-append".to_string()), (3, "new-append".to_string())]
@@ -325,27 +328,21 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
 }
 
 #[test]
-fn checkpoint_capture_cap_rejection_preserves_live_state() {
+fn view_capture_budget_rejection_preserves_live_state() {
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "upsert",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("upsert", upsert_plain_schema(), keyed())
         .unwrap();
     store.update("upsert", &changelog_batch(&[(1, 10, 1), (2, 20, 1)]));
     let before = snapshot_rows(&store, "upsert");
     let before_bytes = store.total_bytes();
-    let estimated = store.checkpoint_capture_estimated_bytes().unwrap();
-    assert!(estimated > 0);
+    let vnodes: Vec<u32> = (0..256).collect();
 
     let error = store
-        .capture_checkpoint(estimated - 1)
-        .err()
-        .expect("capture above the remaining checkpoint budget must fail");
+        .capture_view_vnodes("upsert", &vnodes, 256, 1)
+        .expect_err("capture above the remaining checkpoint budget must fail");
 
-    assert!(error.to_string().contains("staged-state cap"));
+    assert!(error.to_string().contains("remaining capture budget"));
     assert_eq!(snapshot_rows(&store, "upsert"), before);
     assert_eq!(store.total_bytes(), before_bytes);
 }
@@ -355,7 +352,7 @@ fn checkpoint_ipc_encoding_enforces_dynamic_remaining_budget_without_mutation() 
     let mut store = MvStore::new();
     for name in ["a", "b"] {
         store
-            .create_mv(name, test_schema(), MvStorageMode::Aggregate)
+            .create_mv(name, test_schema(), MvStorageMode::append_default())
             .unwrap();
         store.update(name, &make_batch(&[1, 2], &["one", "two"], &[1.0, 2.0]));
     }
@@ -395,42 +392,115 @@ fn checkpoint_ipc_encoding_enforces_dynamic_remaining_budget_without_mutation() 
 }
 
 #[test]
-fn empty_local_checkpoint_has_an_explicit_entry_for_every_storage_mode() {
+fn an_empty_checkpoint_has_an_append_entry_and_an_empty_frame_per_view_vnode() {
     let mut store = MvStore::new();
-    store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
-        .unwrap();
     store
         .create_mv("append", test_schema(), MvStorageMode::append_default())
         .unwrap();
     store
-        .create_mv(
-            "upsert",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("upsert", upsert_plain_schema(), keyed())
         .unwrap();
     store
-        .create_mv("multiset", one_col_schema(), MvStorageMode::Multiset)
+        .create_mv("multiset", one_col_schema(), multiset())
         .unwrap();
 
     let states = store.checkpoint_states().unwrap();
-    let mut keys: Vec<&str> = states.keys().map(String::as_str).collect();
-    keys.sort_unstable();
-    assert_eq!(keys, ["mv:agg", "mv:append", "mv:multiset", "mv:upsert"]);
-    for (key, bytes) in &states {
-        let (schema, batches) = ipc_to_schema_and_batches(bytes).unwrap();
-        let expected = match key.as_str() {
-            "mv:agg" | "mv:append" => test_schema(),
-            "mv:upsert" => upsert_plain_schema(),
-            "mv:multiset" => multiset_checkpoint_schema(&one_col_schema()),
-            other => panic!("unexpected checkpoint key {other}"),
-        };
-        assert_eq!(schema, expected, "schema for {key}");
+    let keys: Vec<&str> = states.keys().map(String::as_str).collect();
+    assert_eq!(keys, ["mv:append"]);
+    let (schema, batches) = ipc_to_schema_and_batches(&states["mv:append"]).unwrap();
+    assert_eq!(schema, test_schema());
+    assert!(batches.is_empty());
+    for view in ["upsert", "multiset"] {
+        let frames = store.full_view_frames(view);
+        assert_eq!(frames.len(), 256, "{view}");
+        assert!(nonempty_vnodes(&frames).is_empty(), "{view}");
+    }
+}
+
+#[test]
+fn the_first_view_capture_is_full_and_later_ones_hold_only_changed_vnodes() {
+    let mut store = MvStore::new();
+    store
+        .create_mv("u", upsert_plain_schema(), keyed())
+        .unwrap();
+    store.update("u", &changelog_batch(&[(1, 10, 1), (2, 20, 1), (3, 30, 1)]));
+    assert_eq!(store.encoded_view_frames("u").len(), 256);
+    assert!(store.encoded_view_frames("u").is_empty());
+
+    store.update("u", &changelog_batch(&[(2, 20, -1), (2, 21, 1)]));
+    let changed = store.encoded_view_frames("u");
+    assert_eq!(changed.len(), 1);
+    let image = store.image_from_view_frames("u", &changed).unwrap();
+    assert_eq!(snapshot_rows(&image, "u"), vec![(2, 21)]);
+}
+
+#[test]
+fn equal_view_state_encodes_to_equal_frames() {
+    let rows = [(1, 10, 1), (2, 20, 1), (3, 30, 1), (4, 40, 1)];
+    let mut forward = MvStore::new();
+    let mut backward = MvStore::new();
+    for store in [&mut forward, &mut backward] {
+        store
+            .create_mv("u", upsert_plain_schema(), keyed())
+            .unwrap();
+    }
+    forward.update("u", &changelog_batch(&rows));
+    let mut reversed = rows;
+    reversed.reverse();
+    for row in reversed {
+        backward.update("u", &changelog_batch(&[row]));
+    }
+    assert_eq!(
+        forward.full_view_frames("u"),
+        backward.full_view_frames("u")
+    );
+}
+
+#[test]
+fn keyed_slices_use_the_partition_key_vnode_of_their_key() {
+    use laminar_core::state::PartitionKeyCodecV1;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("day", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let changelog_schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("day", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let codec = PartitionKeyCodecV1::try_new([DataType::Utf8, DataType::Int64]).unwrap();
+    let vnode_count = std::num::NonZeroU32::new(256).unwrap();
+    for (symbol, day) in [("a", 1), ("b", 1), ("a", 2), ("zzz", 900)] {
+        let mut store = MvStore::new();
+        store
+            .create_mv(
+                "v",
+                Arc::clone(&schema),
+                MvStorageMode::changelog(ViewKey::Keyed(vec![0, 1])),
+            )
+            .unwrap();
+        let symbols: arrow::array::ArrayRef = Arc::new(StringArray::from(vec![symbol]));
+        let days: arrow::array::ArrayRef = Arc::new(Int64Array::from(vec![day]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&changelog_schema),
+            vec![
+                Arc::clone(&symbols),
+                Arc::clone(&days),
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        store.update("v", &batch);
+        let encoded = codec.encode_columns(&[symbols, days]).unwrap();
+        let expected = PartitionKeyCodecV1::vnode_for_encoded(encoded.row(0).data(), vnode_count);
         assert_eq!(
-            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            0,
-            "rows for {key}"
+            nonempty_vnodes(&store.full_view_frames("v")),
+            vec![expected],
+            "{symbol}/{day}"
         );
     }
 }
@@ -446,7 +516,7 @@ fn update_nonexistent_is_noop() {
 fn create_replaces_existing() {
     let mut store = MvStore::new();
     store
-        .create_mv("mv1", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("mv1", test_schema(), MvStorageMode::append_default())
         .unwrap();
     store.update("mv1", &make_batch(&[1], &["a"], &[1.0]));
     assert_eq!(store.to_record_batch("mv1").unwrap().unwrap().num_rows(), 1);
@@ -481,7 +551,7 @@ fn restore_rejects_schema_mismatch() {
     // Try to restore into an MV with schema_a
     let mut store = MvStore::new();
     store
-        .create_mv("mv1", schema_a, MvStorageMode::Aggregate)
+        .create_mv("mv1", schema_a, MvStorageMode::append_default())
         .unwrap();
     let err = store.restore_from_ipc("mv1", &ipc_bytes);
     assert!(err.is_err(), "should reject mismatched schema");
@@ -494,7 +564,7 @@ fn restore_rejects_schema_only_stream_with_wrong_schema() {
     let bytes = batches_to_ipc(&wrong, std::iter::empty::<&RecordBatch>()).unwrap();
     let mut store = MvStore::new();
     store
-        .create_mv("mv1", expected, MvStorageMode::Aggregate)
+        .create_mv("mv1", expected, MvStorageMode::append_default())
         .unwrap();
 
     let error = store.restore_from_ipc("mv1", &bytes).unwrap_err();
@@ -502,35 +572,56 @@ fn restore_rejects_schema_only_stream_with_wrong_schema() {
 }
 
 #[test]
+fn a_whole_frame_for_a_changelog_view_is_rejected() {
+    let mut store = MvStore::new();
+    store
+        .create_mv("u", upsert_plain_schema(), keyed())
+        .unwrap();
+    let bytes = batches_to_ipc(
+        &upsert_plain_schema(),
+        std::iter::once(&upsert_snapshot_batch(&[(1, 10)])),
+    )
+    .unwrap();
+    let error = store
+        .recovery_image(&HashMap::from([("u".to_string(), bytes)]), Vec::new())
+        .err()
+        .expect("a pre-slice whole frame must fail closed");
+    assert!(error.to_string().contains("restored from vnode frames"));
+}
+
+#[test]
 fn fresh_image_is_empty_and_preserves_the_hot_path_handle() {
     let mut store = MvStore::new();
     store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("app", test_schema(), MvStorageMode::append_default())
         .unwrap();
-    store.update("agg", &make_batch(&[1], &["a"], &[1.0]));
+    store.update("app", &make_batch(&[1], &["a"], &[1.0]));
     let handle = store.has_any_handle();
 
     let image = store.fresh_image().unwrap();
 
     assert!(Arc::ptr_eq(&handle, &image.has_any_handle()));
-    assert_eq!(image.to_record_batch("agg").unwrap().unwrap().num_rows(), 0);
-    assert_eq!(store.to_record_batch("agg").unwrap().unwrap().num_rows(), 1);
+    assert_eq!(image.to_record_batch("app").unwrap().unwrap().num_rows(), 0);
+    assert_eq!(store.to_record_batch("app").unwrap().unwrap().num_rows(), 1);
 }
 
 #[test]
-fn recovery_image_requires_an_exact_inventory() {
+fn recovery_image_requires_an_exact_append_inventory() {
     let mut store = MvStore::new();
     store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("app", test_schema(), MvStorageMode::append_default())
+        .unwrap();
+    store
+        .create_mv("keyed", upsert_plain_schema(), keyed())
         .unwrap();
 
     let missing = store
-        .recovery_image(&HashMap::new())
+        .recovery_image(&HashMap::new(), Vec::new())
         .err()
         .expect("missing inventory must fail");
     assert!(missing
         .to_string()
-        .contains("missing required state for: agg"));
+        .contains("missing required state for: app"));
 
     let bytes = batches_to_ipc(
         &test_schema(),
@@ -538,7 +629,13 @@ fn recovery_image_requires_an_exact_inventory() {
     )
     .unwrap();
     let unknown = store
-        .recovery_image(&HashMap::from([("ghost".to_string(), bytes)]))
+        .recovery_image(
+            &HashMap::from([
+                ("app".to_string(), bytes.clone()),
+                ("ghost".to_string(), bytes),
+            ]),
+            Vec::new(),
+        )
         .err()
         .expect("unknown inventory must fail");
     assert!(unknown.to_string().contains("no matching registered"));
@@ -547,14 +644,17 @@ fn recovery_image_requires_an_exact_inventory() {
 #[test]
 fn failed_recovery_image_never_mutates_live_state() {
     let mut store = MvStore::new();
+    for name in ["first", "second"] {
+        store
+            .create_mv(name, test_schema(), MvStorageMode::append_default())
+            .unwrap();
+    }
     store
-        .create_mv("agg", test_schema(), MvStorageMode::Aggregate)
+        .create_mv("u", upsert_plain_schema(), keyed())
         .unwrap();
-    store
-        .create_mv("append", test_schema(), MvStorageMode::append_default())
-        .unwrap();
-    store.update("agg", &make_batch(&[1], &["live"], &[1.0]));
-    store.update("append", &make_batch(&[2], &["live"], &[2.0]));
+    store.update("first", &make_batch(&[1], &["live"], &[1.0]));
+    store.update("second", &make_batch(&[2], &["live"], &[2.0]));
+    store.update("u", &changelog_batch(&[(1, 10, 1)]));
     let live_bytes = store.total_bytes();
 
     let valid = batches_to_ipc(
@@ -563,29 +663,28 @@ fn failed_recovery_image_never_mutates_live_state() {
     )
     .unwrap();
     let states = HashMap::from([
-        ("agg".to_string(), valid),
-        ("append".to_string(), b"not arrow ipc".to_vec()),
+        ("first".to_string(), valid),
+        ("second".to_string(), b"not arrow ipc".to_vec()),
     ]);
 
     let error = store
-        .recovery_image(&states)
+        .recovery_image(&states, Vec::new())
         .err()
         .expect("corrupt inventory must fail");
     assert!(error.to_string().contains("MV restore failed"));
+    let corrupt_frame = store.image_from_view_frames("u", &[(0, bytes::Bytes::from_static(b"x"))]);
+    assert!(corrupt_frame.is_err());
     assert_eq!(store.total_bytes(), live_bytes);
-    assert_eq!(id_names(&store, "agg"), [(1, "live".to_string())]);
-    assert_eq!(id_names(&store, "append"), [(2, "live".to_string())]);
+    assert_eq!(id_names(&store, "first"), [(1, "live".to_string())]);
+    assert_eq!(id_names(&store, "second"), [(2, "live".to_string())]);
+    assert_eq!(snapshot_rows(&store, "u"), vec![(1, 10)]);
 }
 
 #[test]
 fn upsert_applies_inserts_changes_and_deletes() {
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "u",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("u", upsert_plain_schema(), keyed())
         .unwrap();
 
     // Two new keys.
@@ -605,11 +704,7 @@ fn upsert_applies_inserts_changes_and_deletes() {
 fn upsert_cycle_is_atomic_when_a_later_batch_has_null_weight() {
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "u",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("u", upsert_plain_schema(), keyed())
         .unwrap();
     store.update("u", &changelog_batch(&[(1, 10, 1)]));
     let before = snapshot_rows(&store, "u");
@@ -643,11 +738,7 @@ fn upsert_snapshot_equals_full_recompute() {
     let mut truth: BTreeMap<i64, i64> = BTreeMap::new();
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "u",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("u", upsert_plain_schema(), keyed())
         .unwrap();
     for rows in &batches {
         for &(k, v, w) in rows {
@@ -664,50 +755,30 @@ fn upsert_snapshot_equals_full_recompute() {
 }
 
 #[test]
-fn upsert_checkpoint_round_trip() {
+fn upsert_frames_round_trip() {
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "u",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("u", upsert_plain_schema(), keyed())
         .unwrap();
     store.update("u", &changelog_batch(&[(1, 10, 1), (2, 20, 1), (3, 30, 1)]));
     store.update("u", &changelog_batch(&[(2, 20, -1)]));
     let before = snapshot_rows(&store, "u");
 
-    let states = store.checkpoint_states().unwrap();
-    assert!(states.contains_key("mv:u"));
-
-    let mut store2 = MvStore::new();
-    store2
-        .create_mv(
-            "u",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
-        .unwrap();
-    for (key, bytes) in &states {
-        let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
-        store2.restore_from_ipc(name, bytes).unwrap();
-    }
-    assert_eq!(snapshot_rows(&store2, "u"), before);
+    let frames = store.full_view_frames("u");
+    let mut restored = store.image_from_view_frames("u", &frames).unwrap();
+    assert_eq!(snapshot_rows(&restored, "u"), before);
+    assert_eq!(restored.total_bytes(), store.total_bytes());
 
     // A restored store keeps applying changelog correctly.
-    store2.update("u", &changelog_batch(&[(1, 10, -1), (1, 99, 1)]));
-    assert_eq!(snapshot_rows(&store2, "u"), vec![(1, 99), (3, 30)]);
+    restored.update("u", &changelog_batch(&[(1, 10, -1), (1, 99, 1)]));
+    assert_eq!(snapshot_rows(&restored, "u"), vec![(1, 99), (3, 30)]);
 }
 
 #[test]
 fn failed_upsert_restore_preserves_live_state() {
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "u",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("u", upsert_plain_schema(), keyed())
         .unwrap();
     store.update("u", &changelog_batch(&[(1, 10, 1)]));
     let before = snapshot_rows(&store, "u");
@@ -720,31 +791,54 @@ fn failed_upsert_restore_preserves_live_state() {
     )
     .unwrap();
     let bytes = batches_to_ipc(&wrong_schema, std::iter::once(&bad)).unwrap();
-    assert!(store.restore_from_ipc("u", &bytes).is_err());
+    let error = store
+        .image_from_view_frames("u", &[(0, bytes.into())])
+        .err()
+        .expect("a frame with the wrong schema must fail");
+    assert!(error.to_string().contains("schema does not match"));
     assert_eq!(snapshot_rows(&store, "u"), before);
     assert_eq!(store.total_bytes(), before_bytes);
 }
 
 #[test]
-fn upsert_restore_duplicate_key_accounting_tracks_only_replacement() {
+fn upsert_frames_reject_misplaced_and_repeated_keys() {
     let mut store = MvStore::new();
     store
-        .create_mv(
-            "u",
-            upsert_plain_schema(),
-            MvStorageMode::Upsert { key_cols: vec![0] },
-        )
+        .create_mv("u", upsert_plain_schema(), keyed())
         .unwrap();
-    let snapshot = upsert_snapshot_batch(&[(1, 10), (1, 20)]);
-    let bytes = batches_to_ipc(&upsert_plain_schema(), std::iter::once(&snapshot)).unwrap();
+    store.update("u", &changelog_batch(&[(1, 10, 1)]));
+    let frames = store.full_view_frames("u");
+    let [owner] = nonempty_vnodes(&frames)[..] else {
+        panic!("one key occupies one vnode");
+    };
 
-    store.restore_from_ipc("u", &bytes).unwrap();
-    assert_eq!(snapshot_rows(&store, "u"), vec![(1, 20)]);
+    let encode = |rows: &[(i64, i64)]| -> bytes::Bytes {
+        batches_to_ipc(
+            &upsert_plain_schema(),
+            std::iter::once(&upsert_snapshot_batch(rows)),
+        )
+        .unwrap()
+        .into()
+    };
+    let misplaced = store
+        .image_from_view_frames("u", &[((owner + 1) % 256, encode(&[(1, 10)]))])
+        .err()
+        .expect("a row on the wrong vnode must fail");
+    assert!(misplaced.to_string().contains("placed on vnode"));
+    let repeated = store
+        .image_from_view_frames("u", &[(owner, encode(&[(1, 10), (1, 20)]))])
+        .err()
+        .expect("a repeated key must fail");
+    assert!(repeated.to_string().contains("repeats a key"));
+
+    let restored = store
+        .image_from_view_frames("u", &[(owner, encode(&[(1, 20)]))])
+        .unwrap();
     let mut single = store.fresh_image().unwrap();
     single.update("u", &changelog_batch(&[(1, 20, 1)]));
-    assert_eq!(store.total_bytes(), single.total_bytes());
+    assert_eq!(restored.total_bytes(), single.total_bytes());
     assert!(
-        store.total_bytes() > 16,
+        restored.total_bytes() > 16,
         "owned keys and row metadata must also be charged"
     );
 }
@@ -834,7 +928,7 @@ fn multiset_values(store: &MvStore, name: &str) -> Vec<i64> {
 fn multiset_nets_retractions_for_keyed_rows() {
     let mut store = MvStore::new();
     store
-        .create_mv("m", upsert_plain_schema(), MvStorageMode::Multiset)
+        .create_mv("m", upsert_plain_schema(), multiset())
         .unwrap();
     store.update("m", &changelog_batch(&[(1, 10, 1), (2, 20, 1)]));
     assert_eq!(snapshot_rows(&store, "m"), vec![(1, 10), (2, 20)]);
@@ -844,12 +938,27 @@ fn multiset_nets_retractions_for_keyed_rows() {
 }
 
 #[test]
+fn a_multiset_placed_by_key_keeps_every_row_of_a_key_on_its_vnode() {
+    let mut store = MvStore::new();
+    store
+        .create_mv(
+            "m",
+            upsert_plain_schema(),
+            MvStorageMode::changelog(ViewKey::MultisetByKey(vec![0])),
+        )
+        .unwrap();
+    store.update("m", &changelog_batch(&[(7, 1, 1), (7, 2, 1), (7, 3, 1)]));
+    let frames = store.full_view_frames("m");
+    assert_eq!(nonempty_vnodes(&frames).len(), 1);
+    let image = store.image_from_view_frames("m", &frames).unwrap();
+    assert_eq!(snapshot_rows(&image, "m"), vec![(7, 1), (7, 2), (7, 3)]);
+}
+
+#[test]
 fn multiset_tracks_duplicate_rows() {
     // Key-dropping projection: two upstream keys with the same value v=10 → multiplicity 2.
     let mut store = MvStore::new();
-    store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
+    store.create_mv("m", one_col_schema(), multiset()).unwrap();
     store.update("m", &weight_batch_1col(&[(10, 1), (10, 1), (20, 1)]));
     assert_eq!(multiset_values(&store, "m"), vec![10, 10, 20]);
 
@@ -865,9 +974,7 @@ fn multiset_tracks_duplicate_rows() {
 #[test]
 fn multiset_cycle_is_atomic_when_a_later_batch_is_invalid() {
     let mut store = MvStore::new();
-    store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
+    store.create_mv("m", one_col_schema(), multiset()).unwrap();
     store.update("m", &weight_batch_1col(&[(10, 1)]));
     let before = multiset_values(&store, "m");
     let before_bytes = store.total_bytes();
@@ -883,12 +990,25 @@ fn multiset_cycle_is_atomic_when_a_later_batch_is_invalid() {
     assert_eq!(store.total_bytes(), before_bytes);
 }
 
+fn only_count(store: &MvStore, name: &str) -> Option<i64> {
+    store
+        .entries
+        .get(name)
+        .and_then(|entry| entry.multiset.as_ref())
+        .and_then(|state| {
+            state
+                .slices
+                .slots()
+                .flat_map(|(_, slice)| slice.values())
+                .next()
+                .copied()
+        })
+}
+
 #[test]
 fn multiset_rejects_negative_overflow_and_null_weight_without_mutation() {
     let mut store = MvStore::new();
-    store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
+    store.create_mv("m", one_col_schema(), multiset()).unwrap();
     store.update("m", &weight_batch_1col(&[(10, 1)]));
     let before = multiset_values(&store, "m");
     let before_bytes = store.total_bytes();
@@ -912,7 +1032,7 @@ fn multiset_rejects_negative_overflow_and_null_weight_without_mutation() {
 
     let mut overflow_store = MvStore::new();
     overflow_store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
+        .create_mv("m", one_col_schema(), multiset())
         .unwrap();
     overflow_store
         .update_cycle("m", &[weight_batch_1col(&[(10, i64::MAX)])])
@@ -922,48 +1042,31 @@ fn multiset_rejects_negative_overflow_and_null_weight_without_mutation() {
         .update_cycle("m", &[weight_batch_1col(&[(10, 1)])])
         .expect_err("multiplicity overflow must fail");
     assert!(overflow.to_string().contains("multiplicity overflow"));
-    let count = overflow_store
-        .entries
-        .get("m")
-        .and_then(|entry| entry.multiset.as_ref())
-        .and_then(|state| state.counts.values().next())
-        .copied();
-    assert_eq!(count, Some(i64::MAX));
+    assert_eq!(only_count(&overflow_store, "m"), Some(i64::MAX));
     assert_eq!(overflow_store.total_bytes(), before_overflow);
 }
 
 #[test]
-fn multiset_checkpoint_round_trip_preserves_multiplicity() {
+fn multiset_frames_round_trip_preserves_multiplicity() {
     let mut store = MvStore::new();
-    store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
+    store.create_mv("m", one_col_schema(), multiset()).unwrap();
     store.update("m", &weight_batch_1col(&[(10, 1), (10, 1), (20, 1)]));
     let before = multiset_values(&store, "m");
     assert_eq!(before, vec![10, 10, 20]);
 
-    let states = store.checkpoint_states().unwrap();
-    let mut store2 = MvStore::new();
-    store2
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
-    for (key, bytes) in &states {
-        let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
-        store2.restore_from_ipc(name, bytes).unwrap();
-    }
+    let frames = store.full_view_frames("m");
+    let mut restored = store.image_from_view_frames("m", &frames).unwrap();
     // Multiplicity (10 appears twice) survives the round-trip.
-    assert_eq!(multiset_values(&store2, "m"), before);
+    assert_eq!(multiset_values(&restored, "m"), before);
     // And a restored store keeps netting: retract one 10.
-    store2.update("m", &weight_batch_1col(&[(10, -1)]));
-    assert_eq!(multiset_values(&store2, "m"), vec![10, 20]);
+    restored.update("m", &weight_batch_1col(&[(10, -1)]));
+    assert_eq!(multiset_values(&restored, "m"), vec![10, 20]);
 }
 
 #[test]
-fn multiset_checkpoint_is_counted_and_does_not_materialize_multiplicity() {
+fn multiset_frames_are_counted_and_do_not_materialize_multiplicity() {
     let mut store = MvStore::new();
-    store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
+    store.create_mv("m", one_col_schema(), multiset()).unwrap();
     store
         .update_cycle("m", &[weight_batch_1col(&[(10, i64::MAX)])])
         .unwrap();
@@ -973,9 +1076,11 @@ fn multiset_checkpoint_is_counted_and_does_not_materialize_multiplicity() {
     assert!(read_error.to_string().contains("safe row limit"));
     assert_eq!(store.total_bytes(), live_bytes);
 
-    let states = store.checkpoint_states().unwrap();
-    let bytes = states.get("mv:m").unwrap();
-    let (schema, batches) = ipc_to_schema_and_batches(bytes).unwrap();
+    let frames = store.full_view_frames("m");
+    let [owner] = nonempty_vnodes(&frames)[..] else {
+        panic!("one value occupies one vnode");
+    };
+    let (schema, batches) = ipc_to_schema_and_batches(&frames[owner as usize].1).unwrap();
     assert_eq!(schema, multiset_checkpoint_schema(&one_col_schema()));
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].num_rows(), 1);
@@ -986,18 +1091,8 @@ fn multiset_checkpoint_is_counted_and_does_not_materialize_multiplicity() {
         .unwrap();
     assert_eq!(counts.value(0), i64::MAX);
 
-    let mut restored = MvStore::new();
-    restored
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
-    restored.restore_from_ipc("m", bytes).unwrap();
-    let restored_count = restored
-        .entries
-        .get("m")
-        .and_then(|entry| entry.multiset.as_ref())
-        .and_then(|state| state.counts.values().next())
-        .copied();
-    assert_eq!(restored_count, Some(i64::MAX));
+    let restored = store.image_from_view_frames("m", &frames).unwrap();
+    assert_eq!(only_count(&restored, "m"), Some(i64::MAX));
     assert!(restored.to_record_batch("m").is_err());
 }
 
@@ -1021,9 +1116,7 @@ fn multiset_read_rejects_excessive_expanded_bytes_before_conversion() {
     )
     .unwrap();
     let mut store = MvStore::new();
-    store
-        .create_mv("m", plain_schema, MvStorageMode::Multiset)
-        .unwrap();
+    store.create_mv("m", plain_schema, multiset()).unwrap();
     store.update_cycle("m", &[changelog]).unwrap();
 
     let error = store.to_record_batch("m").unwrap_err();
@@ -1031,44 +1124,45 @@ fn multiset_read_rejects_excessive_expanded_bytes_before_conversion() {
 }
 
 #[test]
-fn multiset_restore_rejects_invalid_counts_atomically() {
+fn multiset_restore_rejects_invalid_counts() {
     let mut store = MvStore::new();
-    store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
-    store.update("m", &weight_batch_1col(&[(10, 2)]));
-    let before = multiset_values(&store, "m");
-    let before_bytes = store.total_bytes();
+    store.create_mv("m", one_col_schema(), multiset()).unwrap();
+    store.update("m", &weight_batch_1col(&[(20, 1)]));
+    let [owner] = nonempty_vnodes(&store.full_view_frames("m"))[..] else {
+        panic!("one value occupies one vnode");
+    };
+    let encode = |rows: &[(i64, i64)]| -> bytes::Bytes {
+        let batch = counted_multiset_checkpoint_batch(rows);
+        batches_to_ipc(&batch.schema(), std::iter::once(&batch))
+            .unwrap()
+            .into()
+    };
 
-    let zero = counted_multiset_checkpoint_batch(&[(20, 0)]);
-    let zero_bytes = batches_to_ipc(&zero.schema(), std::iter::once(&zero)).unwrap();
-    let zero_error = store.restore_from_ipc("m", &zero_bytes).unwrap_err();
+    let zero_error = store
+        .image_from_view_frames("m", &[(owner, encode(&[(20, 0)]))])
+        .err()
+        .expect("a zero count must fail");
     assert!(zero_error.to_string().contains("must be positive"));
-    assert_eq!(multiset_values(&store, "m"), before);
-    assert_eq!(store.total_bytes(), before_bytes);
 
-    let duplicate = counted_multiset_checkpoint_batch(&[(20, 1), (20, 2)]);
-    let duplicate_bytes = batches_to_ipc(&duplicate.schema(), std::iter::once(&duplicate)).unwrap();
-    let duplicate_error = store.restore_from_ipc("m", &duplicate_bytes).unwrap_err();
+    let duplicate_error = store
+        .image_from_view_frames("m", &[(owner, encode(&[(20, 1), (20, 2)]))])
+        .err()
+        .expect("a duplicate value must fail");
     assert!(duplicate_error.to_string().contains("duplicate value"));
-    assert_eq!(multiset_values(&store, "m"), before);
-    assert_eq!(store.total_bytes(), before_bytes);
+    assert_eq!(multiset_values(&store, "m"), vec![20]);
 }
 
 #[test]
-fn multiset_restore_rejects_expanded_snapshot_atomically() {
+fn multiset_restore_rejects_expanded_snapshot() {
     let mut store = MvStore::new();
-    store
-        .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
-        .unwrap();
-    store.update("m", &weight_batch_1col(&[(10, 2)]));
-    let before = multiset_values(&store, "m");
-    let before_bytes = store.total_bytes();
-
+    store.create_mv("m", one_col_schema(), multiset()).unwrap();
     let expanded = plain_one_col_batch(&[20, 20]);
     let bytes = batches_to_ipc(&expanded.schema(), std::iter::once(&expanded)).unwrap();
-    let error = store.restore_from_ipc("m", &bytes).unwrap_err();
-    assert!(error.to_string().contains("schema or format mismatch"));
-    assert_eq!(multiset_values(&store, "m"), before);
-    assert_eq!(store.total_bytes(), before_bytes);
+    let error = store
+        .image_from_view_frames("m", &[(0, bytes.into())])
+        .err()
+        .expect("an expanded snapshot must fail");
+    assert!(error
+        .to_string()
+        .contains("schema or format does not match"));
 }
