@@ -53,8 +53,8 @@ impl ViewCase {
         checked.map(|()| Verdict::Equal)
     }
 
-    /// Every node reads every view at the cut committed after the sources delivered, and each
-    /// read equals batch SQL over the complete input.
+    /// Every node reads every view at the cut committed after the sources delivered, each read
+    /// equals batch SQL over the complete input, and a live read of a view is refused.
     async fn check_cluster_reads(&self, cluster: &Cluster) -> Result<(), String> {
         cluster
             .activate()
@@ -82,6 +82,17 @@ impl ViewCase {
             ));
         }
         for (read, truth) in &self.reads {
+            // A node holds only its part of each view, so it refuses a live read.
+            let live = cluster.dbs[1].execute(read).await;
+            if !live
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("committed cut"))
+            {
+                return Err(format!(
+                    "{}: node 2 answered live `{read}` from its part",
+                    self.name
+                ));
+            }
             let expected = oracle::ground_truth(&self.sources, truth).await?;
             for (node, db) in cluster.dbs.iter().enumerate() {
                 let committed = db
