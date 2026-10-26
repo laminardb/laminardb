@@ -244,6 +244,28 @@ impl MultisetState {
             .map_err(|e| DbError::Storage(format!("multiset MV placement conversion: {e}")))
     }
 
+    /// The vnode each row of the changelog `batch` is placed on, as staging places it.
+    #[cfg(feature = "cluster")]
+    pub(super) fn row_vnodes(&self, batch: &RecordBatch) -> Result<Vec<u32>, DbError> {
+        let (_, plain_indices) = weight_and_plain_cols(batch)?;
+        if let Some(keys) = self.placement_keys(batch, &plain_indices)? {
+            return Ok((0..batch.num_rows())
+                .map(|row| self.slices.vnode_for(keys.row(row).as_ref()))
+                .collect());
+        }
+        let plain_cols: Vec<ArrayRef> = plain_indices
+            .iter()
+            .map(|&c| Arc::clone(batch.column(c)))
+            .collect();
+        let rows = self
+            .row_converter
+            .convert_columns(&plain_cols)
+            .map_err(|e| DbError::Storage(format!("multiset MV row conversion: {e}")))?;
+        Ok((0..batch.num_rows())
+            .map(|row| self.slices.vnode_for(rows.row(row).as_ref()))
+            .collect())
+    }
+
     fn vnode_of(&self, placement: Option<&Rows>, row: &OwnedRow, row_idx: usize) -> u32 {
         match placement {
             Some(keys) => self.slices.vnode_for(keys.row(row_idx).as_ref()),

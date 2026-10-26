@@ -686,17 +686,6 @@ impl LaminarDB {
         startup_runtime: RuntimeMode,
     ) -> Result<Option<Arc<dyn object_store::ObjectStore>>, DbError> {
         #[cfg(feature = "cluster")]
-        if startup_runtime == RuntimeMode::Cluster {
-            if let Some(view) = self.mv_store.read().first_view_outside_cluster() {
-                return Err(DbError::InvalidOperation(format!(
-                    "[{}] cluster startup found materialized view '{view}', whose row \
-                     placement a cluster cannot keep yet",
-                    laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
-                )));
-            }
-        }
-
-        #[cfg(feature = "cluster")]
         let has_injected_decision_store = self.decision_store.lock().is_some();
         #[cfg(not(feature = "cluster"))]
         let has_injected_decision_store = false;

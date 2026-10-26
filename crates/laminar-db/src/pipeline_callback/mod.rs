@@ -5077,6 +5077,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 results
                     .iter()
                     .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
+                self.graph.routes_views_by_row(),
             )
             .map_err(|error| {
                 let reason = format!("materialized-view cycle preflight failed: {error}");

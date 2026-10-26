@@ -513,7 +513,6 @@ impl LaminarDB {
         ),
         DbError,
     > {
-        let name = candidate.name.clone();
         let output = self
             .view_output(&candidate.query_sql, windowed, interval_topology)
             .await;
@@ -526,13 +525,11 @@ impl LaminarDB {
                 self.checkpoint_key_groups(),
             )?
         } else {
-            self.admit_cluster_view(&name, None)?;
             planned_output
         };
         let mode = self
             .view_storage_mode(candidate, schema, output, retention)
             .await?;
-        self.admit_cluster_view(&name, Some(&mode))?;
         Ok((incremental, mode, subscription_output))
     }
 
@@ -563,41 +560,6 @@ impl LaminarDB {
                     .await?,
             },
         })
-    }
-
-    /// A cluster keeps a changelog view's slices on the nodes that produce them, so it admits
-    /// views placed by their producer's key or on one vnode. Each node keeps its own part of an
-    /// append view's log (`None` before its retention resolves). A view placed by its full row
-    /// needs a repartition port first.
-    fn admit_cluster_view(
-        &self,
-        name: &str,
-        mode: Option<&crate::mv_store::MvStorageMode>,
-    ) -> Result<(), DbError> {
-        use crate::mv_store::{MvStorageMode, ViewKey};
-
-        if !self.is_cluster_runtime() {
-            return Ok(());
-        }
-        match mode {
-            None
-            | Some(
-                MvStorageMode::AppendLog { .. }
-                | MvStorageMode::Changelog {
-                    key: ViewKey::Global | ViewKey::Keyed(_) | ViewKey::MultisetByKey(_),
-                    ..
-                },
-            ) => Ok(()),
-            Some(MvStorageMode::Changelog {
-                key: ViewKey::MultisetByRow,
-                ..
-            }) => Err(Self::cluster_state_lifecycle_error(
-                "materialized view",
-                name,
-                "a view placed by its full row needs a repartition port to the nodes that own \
-                 its rows, which has not shipped",
-            )),
-        }
     }
 
     /// The view key from the view stream's planned output distribution.

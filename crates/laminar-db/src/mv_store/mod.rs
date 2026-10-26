@@ -173,6 +173,16 @@ impl MvEntry {
         })
     }
 
+    const fn places_by_row(&self) -> bool {
+        matches!(
+            self.mode,
+            MvStorageMode::Changelog {
+                key: ViewKey::MultisetByRow,
+                ..
+            }
+        )
+    }
+
     fn to_record_batch(&self) -> Result<RecordBatch, DbError> {
         if let Some(up) = self.upsert.as_ref() {
             return up.to_record_batch(&self.schema);
@@ -281,21 +291,23 @@ impl MvStore {
         }
     }
 
-    /// A view whose state a cluster cannot keep yet: a multiset placed by row.
+    /// Whether view `name` places its rows by the full row, so in a cluster the node that
+    /// produces a row is not in general the one that keeps it.
     #[cfg(feature = "cluster")]
-    pub(crate) fn first_view_outside_cluster(&self) -> Option<&str> {
+    pub(crate) fn places_by_row(&self, name: &str) -> bool {
+        self.entries.get(name).is_some_and(MvEntry::places_by_row)
+    }
+
+    /// The vnode each row of the changelog `batch` takes in view `name`.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn row_vnodes(&self, name: &str, batch: &RecordBatch) -> Result<Vec<u32>, DbError> {
         self.entries
-            .iter()
-            .find(|(_, entry)| {
-                matches!(
-                    entry.mode,
-                    MvStorageMode::Changelog {
-                        key: ViewKey::MultisetByRow,
-                        ..
-                    }
-                )
-            })
-            .map(|(name, _)| name.as_str())
+            .get(name)
+            .and_then(|entry| entry.multiset.as_ref())
+            .ok_or_else(|| {
+                DbError::MaterializedView(format!("view '{name}' keeps no multiset to place rows"))
+            })?
+            .row_vnodes(batch)
     }
 
     /// Whether this store holds only this node's part of each view, as in a cluster, so a
@@ -367,13 +379,20 @@ impl MvStore {
     /// Preflight every affected view under the caller's existing write lock, then install.
     /// Callers supply each view once. Prepared batch updates borrow input; keyed
     /// updates own only their existing staged deltas, never a clone of the live row map.
+    /// With `routed_by_row`, views placed by their full row are skipped: in a cluster their
+    /// result nodes route those rows to their owners.
     pub fn update_views<'a>(
         &mut self,
         results: impl IntoIterator<Item = (&'a str, &'a [RecordBatch])>,
+        routed_by_row: bool,
     ) -> Result<(), DbError> {
         let mut prepared = smallvec::SmallVec::<[(&str, PreparedUpdate<'_>); 4]>::new();
         for (name, batches) in results {
-            if let Some(entry) = self.entries.get(name) {
+            if let Some(entry) = self
+                .entries
+                .get(name)
+                .filter(|entry| !(routed_by_row && entry.places_by_row()))
+            {
                 let update = entry.prepare_cycle(
                     name,
                     batches,

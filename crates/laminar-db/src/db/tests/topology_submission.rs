@@ -1570,6 +1570,7 @@ async fn seeded_views_after_migration(recover_from_root: bool) {
             "CREATE MATERIALIZED VIEW by_n AS SELECT n, COUNT(*) AS ids FROM counts GROUP BY n"
                 .into(),
             "CREATE MATERIALIZED VIEW running AS SELECT id, total FROM totals".into(),
+            "CREATE MATERIALIZED VIEW sizes AS SELECT n, n * 10 AS tens FROM counts".into(),
         ],
     );
     Box::pin(fixture.db.submit_cluster_topology_change(&request))
@@ -1607,6 +1608,7 @@ async fn seeded_views_after_migration(recover_from_root: bool) {
         read("SELECT id, total FROM running").await,
         [(1, 4), (2, 2)]
     );
+    assert_eq!(read("SELECT n, tens FROM sizes").await, [(2, 20), (4, 40)]);
 
     // The target checkpoint holds the seeded rows, so recovering from it seeds nothing again.
     let prior_starts = probe.starts.lock().len();

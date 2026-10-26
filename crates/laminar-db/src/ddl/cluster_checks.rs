@@ -312,7 +312,14 @@ impl LaminarDB {
         let resolved = self
             .resolve_catalog_stream_outputs(Some(plan.candidate_registration(name, query_sql)))
             .await?;
-        let depth = resolved.exchange_plan.remote_depth(name);
+        // A view placed by its full row routes its rows to their owners: one more exchange.
+        let routes_by_row = (object_kind == "materialized view"
+            || self.mv_store.read().has_mv(name))
+            && resolved.exchange_plan.stream(name).is_some_and(|plan| {
+                plan.output.distribution == crate::exchange_plan::Distribution::Arbitrary
+                    && plan.output.changelog == crate::exchange_plan::ChangelogKind::Weighted
+            });
+        let depth = resolved.exchange_plan.remote_depth(name) + usize::from(routes_by_row);
         if depth > MAX_CLUSTER_REMOTE_EXCHANGE_DEPTH {
             return Err(Self::cluster_state_lifecycle_error(
                 object_kind,

@@ -507,15 +507,16 @@ one statement that is split into stages; windowed joins remain rejected. A strea
 three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
 which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
 
-Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admits when the view
-keeps its rows on the nodes that produce them:
+Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admits:
 
 - a keyed or global aggregate view;
-- a projection or filter over such a view that keeps its key columns unchanged;
+- a projection or filter over such a view, keeping or dropping its key columns;
 - an append-only view: a projection over a source, a closed window, or an interval join.
 
 Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
-moves them with their vnodes when ownership changes. Each node keeps the part of an append-only
+moves them with their vnodes when ownership changes. A view that drops or changes its input's
+key places each row by the whole row, so the node that produces a row sends it to the node that
+owns it; that counts as one more remote exchange. Each node keeps the part of an append-only
 view's log that it produced. When a node leaves, through rebalancing or failure, another node
 takes over its log in the next checkpoint without copying it. A topology migration that adds,
 replaces or drops other objects keeps every view and its rows. A migration may also add a view
@@ -526,10 +527,7 @@ source starts empty there and sees only later rows. A new view over a stream tha
 an aggregate's changes is rejected, because no node keeps that stream's rows; define it over the
 aggregate. `LaminarDB::query_committed` on any node reads every view at one committed checkpoint,
 from every node's checkpointed state; `SELECT` of a view on a cluster node fails, because the node
-holds only its part. Rejected with `[LDB-4007]` before connector I/O:
-
-- a projection over a view that drops or changes its key;
-- `SUBSCRIBE` to a view.
+holds only its part. `SUBSCRIBE` to a view is rejected with `[LDB-4007]` before connector I/O.
 
 An append-only view's interval retention follows one event-time frontier per view, committed
 with each checkpoint: the lowest frontier among the nodes whose input is active, never moving

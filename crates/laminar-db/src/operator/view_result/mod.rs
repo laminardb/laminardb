@@ -1,7 +1,12 @@
 //! The graph node owning a changelog view's checkpoint lifecycle. The view's rows stay in the
 //! shared `MvStore`, applied once per cycle for every view, so readers keep one cycle across
 //! views; this node captures them as vnode frames, restores frames into a private image, and
-//! moves slices with their vnodes when a cluster reassigns them.
+//! moves slices with their vnodes when a cluster reassigns them. In a cluster it also routes
+//! the rows of a view placed by its full row to their owners; nodes there refuse live reads, so
+//! those rows need not apply in the same cycle as the other views.
+
+#[cfg(feature = "cluster")]
+mod routing;
 
 use std::sync::Arc;
 
@@ -20,6 +25,8 @@ pub(crate) struct ViewResultOperator {
     restored: Option<RestoredView>,
     #[cfg(feature = "cluster")]
     transition: Option<crate::mv_store::ViewTransition>,
+    #[cfg(feature = "cluster")]
+    routing: Option<routing::ViewRouting>,
 }
 
 impl ViewResultOperator {
@@ -35,7 +42,30 @@ impl ViewResultOperator {
             restored: None,
             #[cfg(feature = "cluster")]
             transition: None,
+            #[cfg(feature = "cluster")]
+            routing: None,
         }
+    }
+
+    /// Route the view stream's rows, which reach this node's input port, to their owners.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn route_to_owners(
+        &mut self,
+        config: crate::operator::sql_query::ClusterShuffleConfig,
+    ) {
+        self.routing = Some(routing::ViewRouting::new(config));
+    }
+
+    #[cfg(feature = "cluster")]
+    fn is_sending(&self) -> bool {
+        self.routing
+            .as_ref()
+            .is_some_and(routing::ViewRouting::is_sending)
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    const fn is_sending(&self) -> bool {
+        false
     }
 }
 
@@ -54,7 +84,23 @@ impl GraphOperator for ViewResultOperator {
         _inputs: &[Vec<RecordBatch>],
         _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
+        #[cfg(feature = "cluster")]
+        if let Some(routing) = &mut self.routing {
+            routing.process(
+                &self.view,
+                &self.store,
+                _inputs.first().map_or(&[][..], Vec::as_slice),
+            )?;
+        }
         Ok(Vec::new())
+    }
+
+    fn wants_input(&self) -> bool {
+        !self.is_sending()
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        self.is_sending()
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -67,6 +113,12 @@ impl GraphOperator for ViewResultOperator {
         vnode_count: u32,
         max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
+        if self.is_sending() {
+            return Err(DbError::Checkpoint(format!(
+                "view '{}' captured while routing rows to their owners",
+                self.view
+            )));
+        }
         self.store
             .write()
             .capture_view_vnodes(&self.view, required_vnodes, vnode_count, max_capture_bytes)
@@ -93,6 +145,29 @@ impl GraphOperator for ViewResultOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, topology: laminar_core::shuffle::ShuffleTopologyFence) {
+        if let Some(routing) = &mut self.routing {
+            routing.bind_topology(topology);
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stage_checkpointed_shuffle(
+        &mut self,
+        stage: &str,
+        batch: crate::operator::RetainedBatch,
+        _watermark: i64,
+    ) -> Result<(), DbError> {
+        let Some(routing) = &self.routing else {
+            return Err(DbError::Pipeline(format!(
+                "view '{}' routes no rows but received shuffle stage '{stage}'",
+                self.view
+            )));
+        };
+        routing.apply_received(&self.view, &self.store, &batch)
+    }
+
+    #[cfg(feature = "cluster")]
     fn changelog_at_cut(&self) -> Option<Result<Vec<RecordBatch>, DbError>> {
         Some(self.restored.as_ref().map_or(Ok(Vec::new()), |restored| {
             restored.changelog().map(|batch| vec![batch])
@@ -104,9 +179,9 @@ impl GraphOperator for ViewResultOperator {
         &mut self,
         transition: crate::operator_graph::ManagedVnodeTransition<'_>,
     ) -> Result<(), DbError> {
-        if self.transition.is_some() {
+        if self.transition.is_some() || self.is_sending() {
             return Err(DbError::Checkpoint(format!(
-                "view '{}' already holds a prepared vnode transition",
+                "view '{}' already holds a prepared vnode transition or routes rows in flight",
                 self.view
             )));
         }

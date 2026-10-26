@@ -262,6 +262,35 @@ async fn keyed_and_chained_views_match_batch_sql_in_cluster() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// Views that drop their upstream's key are placed by their full row: each node routes a row to
+/// the owner of its vnode, and every node reads all of them at the committed cut. Rows repeat
+/// across keys, so the owners keep multiplicities from several producers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn row_placed_views_match_batch_sql_in_cluster() {
+    let case = ViewCase {
+        name: "row_placed_views",
+        sources: vec![events_with("events", 0, 40)],
+        views: views(&[
+            "CREATE MATERIALIZED VIEW counts AS \
+             SELECT k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k",
+            "CREATE MATERIALIZED VIEW sizes AS SELECT n FROM counts",
+            "CREATE MATERIALIZED VIEW sums AS SELECT n, s FROM counts WHERE s % 2 = 0",
+        ]),
+        reads: vec![
+            (
+                "SELECT * FROM sizes",
+                "SELECT COUNT(*) AS n FROM events GROUP BY k",
+            ),
+            (
+                "SELECT * FROM sums",
+                "SELECT COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k HAVING SUM(v) % 2 = 0",
+            ),
+        ],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// A projection over a source and a closed tumbling window both append; each node keeps its
 /// own part of their logs, and every node reads all of it at the committed cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

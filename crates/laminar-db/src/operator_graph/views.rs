@@ -12,8 +12,9 @@ impl OperatorGraph {
         self.view_store = Some(store);
     }
 
-    /// Add `<stream>::view` when `stream` is a changelog view. The node has no input ports;
-    /// `remove_query` drops it with its stream.
+    /// Add `<stream>::view` when `stream` is a changelog view; `remove_query` drops it with its
+    /// stream. The node has no input ports, except in a cluster for a view placed by its full
+    /// row: there it reads the stream's rows and routes them to their owners.
     pub(super) fn attach_view_result(&mut self, stream: &str) {
         let Some(store) = &self.view_store else {
             return;
@@ -21,13 +22,35 @@ impl OperatorGraph {
         let Some(state_class) = store.read().view_state_class(stream) else {
             return;
         };
-        let operator = ViewResultOperator::new(stream.to_owned(), state_class, Arc::clone(store));
-        self.allocate_node(GraphNode::new(
+        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+        let mut operator =
+            ViewResultOperator::new(stream.to_owned(), state_class, Arc::clone(store));
+        #[cfg(feature = "cluster")]
+        let routed = self.routes_views_by_row() && store.read().places_by_row(stream);
+        #[cfg(not(feature = "cluster"))]
+        let routed = false;
+        #[cfg(feature = "cluster")]
+        if let Some(config) = self.cluster_shuffle.clone().filter(|_| routed) {
+            operator.route_to_owners(config);
+        }
+        let node = self.allocate_node(GraphNode::new(
             Arc::from(laminar_core::mv::view_result_operator(stream)),
             Box::new(operator),
-            0,
+            usize::from(routed),
         ));
+        if let Some(&producer) = self.output_map.get(stream).filter(|_| routed) {
+            self.add_edge(producer, node, 0);
+        }
         self.topo_dirty = true;
+    }
+
+    /// Whether result nodes route the rows of views placed by their full row, as in a
+    /// cluster, so the cycle leaves those views to them.
+    pub(crate) fn routes_views_by_row(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        return self.cluster_shuffle.is_some();
+        #[cfg(not(feature = "cluster"))]
+        false
     }
 
     /// The output frontier of stream `name`.

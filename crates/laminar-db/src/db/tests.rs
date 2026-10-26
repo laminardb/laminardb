@@ -10201,6 +10201,16 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             .expect("a global aggregate view keeps its slice on vnode 0's owner");
             assert!(db.mv_store.read().has_mv("global_view_ok"));
             db.execute(
+                "CREATE MATERIALIZED VIEW keyed_view_ok AS \
+                 SELECT id, SUM(value) AS total FROM left_events GROUP BY id",
+            )
+            .await
+            .unwrap();
+            db.execute("CREATE MATERIALIZED VIEW row_placed_view_ok AS SELECT total FROM keyed_view_ok")
+                .await
+                .expect("a view that drops its key routes each row to the owner of its vnode");
+            assert!(db.mv_store.read().places_by_row("row_placed_view_ok"));
+            db.execute(
                 "CREATE STREAM projection_ok AS \
                  SELECT id, value FROM left_events WHERE value > 0",
             )
@@ -10234,24 +10244,6 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             assert!(db.catalog.get_stream_entry("global_count_ok").is_some());
         })
         .await;
-
-    // Startup independently enforces the same invariant so an inconsistent in-memory catalog
-    // cannot bypass DDL admission.
-    let stale = one_owner_cluster().await;
-    stale
-        .mv_store
-        .write()
-        .create_mv(
-            "stale_mv",
-            Arc::new(arrow_schema::Schema::empty()),
-            crate::mv_store::MvStorageMode::changelog(crate::mv_store::ViewKey::MultisetByRow),
-        )
-        .unwrap();
-    let error = stale
-        .start()
-        .await
-        .expect_err("cluster startup must reject residual materialized state");
-    assert!(error.to_string().contains("LDB-4007"), "{error}");
 
     // A cluster-capable binary may also host an independent local database. Cluster admission is
     // scoped to configured mode, while the ordinary planner retains its local join contract.
