@@ -359,7 +359,10 @@ impl TopologyMigrationRoot {
                 .iter()
                 .find(|o| {
                     o.name == parent_certificate.stream_id
-                        && o.kind == CatalogObjectKind::Stream
+                        && matches!(
+                            o.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
                         && o.transition != ClusterTopologyObjectTransition::AddFutureOnly
                 })
                 .ok_or_else(|| {
@@ -458,7 +461,10 @@ impl TopologyMigrationRoot {
                 .iter()
                 .find(|o| {
                     o.name == certificate.stream_id
-                        && o.kind == CatalogObjectKind::Stream
+                        && matches!(
+                            o.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
                         && o.transition == ClusterTopologyObjectTransition::Preserve
                 })
                 .ok_or_else(|| {

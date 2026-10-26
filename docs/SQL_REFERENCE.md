@@ -514,9 +514,10 @@ keeps its rows on the nodes that produce them:
 - a projection or filter over such a view that keeps its key columns unchanged.
 
 Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
-moves them with their vnodes when ownership changes. `LaminarDB::query_committed` on any node reads
-every view at one committed checkpoint, from every node's checkpointed state. Rejected with
-`[LDB-4007]` before connector I/O:
+moves them with their vnodes when ownership changes. A topology migration that adds, replaces or
+drops other objects keeps every view and its rows; a migration cannot yet add or drop a view.
+`LaminarDB::query_committed` on any node reads every view at one committed checkpoint, from every
+node's checkpointed state. Rejected with `[LDB-4007]` before connector I/O:
 
 - append-only views (a projection over a source, a closed window, an interval join);
 - a projection over a view that drops or changes its key;

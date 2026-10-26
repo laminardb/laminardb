@@ -45,6 +45,15 @@ pub(crate) enum ManagedStateContract {
     TestVnodeStateV1,
 }
 
+#[cfg(feature = "cluster")]
+impl ManagedStateContract {
+    /// Whether the operator checkpoints a whole frame of channel and frontier state beside its
+    /// vnode frames. A view's result node keeps only its vnode slices.
+    pub(crate) const fn has_whole_frame(self) -> bool {
+        !matches!(self, Self::ViewResultV1)
+    }
+}
+
 /// Current relationship between this inventory entry and cluster DDL admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

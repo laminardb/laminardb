@@ -88,6 +88,11 @@ impl GraphOperator for ViewResultOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn bind_view_store(&mut self, store: &Arc<parking_lot::RwLock<MvStore>>) {
+        self.store = Arc::clone(store);
+    }
+
+    #[cfg(feature = "cluster")]
     fn prepare_vnode_transition(
         &mut self,
         transition: crate::operator_graph::ManagedVnodeTransition<'_>,

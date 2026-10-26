@@ -71,6 +71,7 @@ impl LaminarDB {
         graph.set_pending_vnode_transition_handle(Arc::clone(&self.pending_vnode_transition));
         graph.set_installed_vnode_state_handle(Arc::clone(&self.installed_vnode_state));
         graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
+        graph.bind_view_store(&self.mv_store);
         if let Some(metrics) = self.engine_metrics.lock().clone() {
             graph.set_metrics(metrics);
         }
@@ -137,9 +138,19 @@ impl LaminarDB {
                     .map(|channels| (name.clone(), Arc::from(channels.clone())))
             })
             .collect();
+        let participant_id = metadata.input.process().participant.node_id;
+        let local_manifest = metadata
+            .recovered
+            .manifests
+            .iter()
+            .find(|manifest| manifest.participant_id == participant_id);
+        let recovered_mv_store = self
+            .mv_store
+            .read()
+            .recovery_image(graph.take_restored_views(), local_manifest)?;
         Ok(PipelineRecoveryState {
             graph,
-            recovered_mv_store: self.mv_store.read().fresh_image()?,
+            recovered_mv_store,
             recovered_channel_progress: progress,
             recovered_input_channels: inventories,
             recovered_source_watermarks: metadata

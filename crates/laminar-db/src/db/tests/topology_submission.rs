@@ -1167,3 +1167,139 @@ async fn topology_pipeline_reset_separates_incarnations_and_recovers_future_inpu
     assert_eq!(fixture.effects.load(Ordering::Acquire), 0);
     Box::pin(fixture.db.shutdown()).await.unwrap();
 }
+
+async fn committed_counts(db: &LaminarDB, epoch: u64) -> std::collections::BTreeMap<i64, i64> {
+    let read = Box::pin(db.query_committed(
+        "SELECT id, n FROM counts",
+        crate::CommittedRead::Exact(epoch),
+    ))
+    .await
+    .unwrap();
+    let mut counts = std::collections::BTreeMap::new();
+    for batch in &read.batches {
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .clone()
+        };
+        counts.extend(
+            column("id")
+                .values()
+                .iter()
+                .copied()
+                .zip(column("n").values().iter().copied()),
+        );
+    }
+    counts
+}
+
+#[tokio::test]
+async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_rows() {
+    let (fixture, _) = Box::pin(preparation_fixture_with_bootstrap(
+        1,
+        vec![
+            "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
+                .into(),
+        ],
+    ))
+    .await;
+    let probe = enable_runtime(&fixture);
+    probe.allow_parent_initial.store(true, Ordering::Release);
+    fixture
+        .authority
+        .controller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            fixture.process_lease.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    DbState::Created.store(&fixture.db.state);
+    fixture.db.enable_coordinated_recovery().unwrap();
+    Box::pin(fixture.db.start()).await.unwrap();
+    assert_eq!(
+        Box::pin(
+            fixture
+                .db
+                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(5))
+        )
+        .await
+        .unwrap(),
+        crate::ClusterStartupDisposition::Serving
+    );
+    let deliver = |ids: [i64; 3], first: u64| {
+        let batch = RecordBatch::try_new(
+            crate::temporal_test_source::schema(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids.to_vec())),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1000, 2000, 3000,
+                ])),
+                Arc::new(arrow::array::Int64Array::from(vec![1; 3])),
+            ],
+        )
+        .unwrap();
+        probe.output.lock().clear();
+        probe.input.lock().insert(
+            "trades".into(),
+            std::collections::VecDeque::from([runtime_probe::positioned(batch, first)]),
+        );
+    };
+    let old_output = || {
+        probe
+            .output
+            .lock()
+            .iter()
+            .any(|(topic, _)| topic == "old-output")
+    };
+
+    deliver([1, 2, 2], 0);
+    wait_until(old_output).await;
+    let parent = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(parent.success, "{parent:?}");
+    assert_eq!(
+        committed_counts(&fixture.db, parent.epoch).await,
+        [(1, 1), (2, 2)].into()
+    );
+    let parent_identity = latest_index(&fixture).await.pipeline_identity;
+
+    let request = request(1302, independent_pipeline());
+    Box::pin(fixture.db.submit_cluster_topology_change(&request))
+        .await
+        .unwrap();
+    active(&fixture, request.operation_id).await;
+    deliver([1, 1, 1], 3);
+    probe.input.lock().insert(
+        "added_source".into(),
+        std::collections::VecDeque::from([runtime_probe::positioned(
+            input(19)["trades"][0].clone(),
+            91,
+        )]),
+    );
+    wait_until(|| {
+        old_output()
+            && probe
+                .output
+                .lock()
+                .iter()
+                .any(|(topic, _)| topic == "new-output")
+    })
+    .await;
+    let target = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(target.success, "{target:?}");
+    assert_ne!(
+        latest_index(&fixture).await.pipeline_identity,
+        parent_identity
+    );
+    // Key 2 is not touched after the migration, so only the migrated slice can hold it.
+    assert_eq!(
+        committed_counts(&fixture.db, target.epoch).await,
+        [(1, 4), (2, 2)].into()
+    );
+    fixture.db.shutdown().await.unwrap();
+}

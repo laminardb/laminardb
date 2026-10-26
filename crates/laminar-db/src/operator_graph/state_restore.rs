@@ -1,6 +1,8 @@
 //! Strict checkpoint restoration through certified topology mappings.
 
 use super::{DbError, FxHashMap, OperatorCheckpoint, OperatorGraph};
+#[cfg(feature = "cluster")]
+use crate::operator::capability::ManagedStateContract;
 
 impl OperatorGraph {
     /// Restore independently checksummed whole-operator and vnode frames into a newly built graph.
@@ -70,11 +72,13 @@ impl OperatorGraph {
                 }
             }
         }
-        for node in self
-            .nodes
-            .iter()
-            .filter(|node| !node.removed && node.capability.managed_state.is_some())
-        {
+        for node in self.nodes.iter().filter(|node| {
+            !node.removed
+                && node
+                    .capability
+                    .managed_state
+                    .is_some_and(ManagedStateContract::has_whole_frame)
+        }) {
             // Zero-vnode processes have no participant state manifest at the selected cut.
             if !input.owned_vnodes().is_empty()
                 && !empty_at_cut.contains(&node.name.as_ref())

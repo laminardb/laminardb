@@ -392,7 +392,10 @@ impl ClusterTopologyValidation {
                     .is_some_and(|contract| {
                         contract.is_empty()
                             || contract.len() > 128
-                            || object.kind != CatalogObjectKind::Stream
+                            || !matches!(
+                                object.kind,
+                                CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                            )
                     })
             {
                 return Err(TopologyError::Invalid(

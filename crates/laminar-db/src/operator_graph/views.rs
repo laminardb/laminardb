@@ -37,6 +37,15 @@ impl OperatorGraph {
         (watermark != i64::MIN).then_some(watermark)
     }
 
+    /// Bind the graph and every view result node to `store`.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn bind_view_store(&mut self, store: &Arc<parking_lot::RwLock<MvStore>>) {
+        for node in self.nodes.iter_mut().filter(|node| !node.removed) {
+            node.operator.bind_view_store(store);
+        }
+        self.view_store = Some(Arc::clone(store));
+    }
+
     /// Slices that result nodes restored from the selected checkpoint.
     pub(crate) fn take_restored_views(&mut self) -> Vec<RestoredView> {
         self.nodes

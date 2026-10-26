@@ -604,6 +604,11 @@ pub(crate) trait GraphOperator: Send {
     fn take_restored_view(&mut self) -> Option<crate::mv_store::RestoredView> {
         None
     }
+
+    /// Point a view's result node at the store readers query; a migration compiles its graph
+    /// against a private candidate's store.
+    #[cfg(feature = "cluster")]
+    fn bind_view_store(&mut self, _store: &Arc<parking_lot::RwLock<crate::mv_store::MvStore>>) {}
 }
 
 /// One authoritative full vnode image prepared for a managed operator.
