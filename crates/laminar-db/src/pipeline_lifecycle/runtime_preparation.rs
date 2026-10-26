@@ -120,6 +120,9 @@ impl LaminarDB {
             .lock()
             .clone()
             .expect("EngineMetrics must be set before start()");
+        self.mv_store
+            .write()
+            .count_horizon_drops(prom.views.rows_below_horizon_total.clone());
 
         let (force_checkpoint_tx, force_checkpoint_rx) =
             crossfire::mpsc::bounded_async::<crate::db::ForceCheckpointRequest>(

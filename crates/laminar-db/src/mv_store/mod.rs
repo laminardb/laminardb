@@ -207,6 +207,8 @@ pub(crate) struct MvStore {
     log_capture: Option<u64>,
     /// In a cluster, the committed cuts whose view frontiers append-log retention follows.
     horizon_cuts: Option<CommittedCuts>,
+    /// Counts the rows append views drop because they arrived behind the retention horizon.
+    horizon_drops: Option<prometheus::IntCounter>,
     freshness: Arc<FreshnessContracts>,
 }
 
@@ -228,6 +230,7 @@ impl MvStore {
             log_checkpoint: None,
             log_capture: None,
             horizon_cuts: None,
+            horizon_drops: None,
             freshness: Arc::default(),
         }
     }
@@ -243,6 +246,11 @@ impl MvStore {
 
     pub(crate) fn committed_views(&self) -> Option<Arc<CommittedViews>> {
         self.committed.clone()
+    }
+
+    /// Count on `counter` the rows append views drop behind their retention horizon.
+    pub(crate) fn count_horizon_drops(&mut self, counter: prometheus::IntCounter) {
+        self.horizon_drops = Some(counter);
     }
 
     /// In a cluster, keep append-log rows against each view's frontier at the newest of `cuts`
@@ -350,7 +358,7 @@ impl MvStore {
     #[cfg(test)]
     pub fn update_cycle(&mut self, name: &str, batches: &[RecordBatch]) -> Result<(), DbError> {
         if let Some(entry) = self.entries.get_mut(name) {
-            let update = entry.prepare_cycle(name, batches, self.limits, false)?;
+            let update = entry.prepare_cycle(name, batches, self.limits, false, None)?;
             entry.apply_prepared(update);
         }
         Ok(())
@@ -359,28 +367,29 @@ impl MvStore {
     /// Preflight every affected view under the caller's existing write lock, then install.
     /// Callers supply each view once. Prepared batch updates borrow input; keyed
     /// updates own only their existing staged deltas, never a clone of the live row map.
-    /// Returns the rows append views dropped because they arrived behind the retention horizon.
     pub fn update_views<'a>(
         &mut self,
         results: impl IntoIterator<Item = (&'a str, &'a [RecordBatch])>,
-    ) -> Result<usize, DbError> {
+    ) -> Result<(), DbError> {
         let mut prepared = smallvec::SmallVec::<[(&str, PreparedUpdate<'_>); 4]>::new();
         for (name, batches) in results {
             if let Some(entry) = self.entries.get(name) {
-                let update = entry.prepare_cycle(name, batches, self.limits, true)?;
+                let update = entry.prepare_cycle(
+                    name,
+                    batches,
+                    self.limits,
+                    true,
+                    self.horizon_drops.as_ref(),
+                )?;
                 prepared.push((name, update));
             }
         }
-        let mut below_horizon = 0;
         for (name, update) in prepared {
-            if let PreparedUpdate::Log(log) = &update {
-                below_horizon += log.rows_below_horizon();
-            }
             if let Some(entry) = self.entries.get_mut(name) {
                 entry.apply_prepared(update);
             }
         }
-        Ok(below_horizon)
+        Ok(())
     }
 
     /// Advance each append view's frontier to its stream's output frontier, and in a cluster
@@ -472,6 +481,7 @@ impl MvStore {
             log_checkpoint: None,
             log_capture: None,
             horizon_cuts: self.horizon_cuts.clone(),
+            horizon_drops: self.horizon_drops.clone(),
             freshness: Arc::clone(&self.freshness),
         };
         image.install_log_horizons();

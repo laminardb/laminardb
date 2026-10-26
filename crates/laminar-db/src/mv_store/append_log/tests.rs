@@ -30,7 +30,7 @@ const LIMITS: MvLimits = MvLimits {
 };
 
 fn append(log: &mut AppendLogState, batches: &[RecordBatch]) {
-    let update = log.prepare("v", batches, LIMITS).unwrap();
+    let update = log.prepare("v", batches, LIMITS, None).unwrap();
     log.apply(update);
 }
 
@@ -358,4 +358,16 @@ fn a_capture_holding_only_adopted_segments_must_settle_first() {
     log.adopt([adopted(0, 1, 10)]);
     log.capture(1, true).unwrap();
     assert!(log.capture(2, true).is_err());
+}
+
+#[test]
+fn rows_behind_the_horizon_are_counted_when_dropped() {
+    let mut log = event_time(100);
+    log.advance_frontier(active(250));
+    let drops = prometheus::IntCounter::new("drops", "rows behind the horizon").unwrap();
+    let late = [rows(&[10, 20]), rows(&[200])];
+    let update = log.prepare("v", &late, LIMITS, Some(&drops)).unwrap();
+    log.apply(update);
+    assert_eq!(drops.get(), 2);
+    assert_eq!(times(&log), [200]);
 }

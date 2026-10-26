@@ -5072,7 +5072,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
         let mut store = self.mv_store.write();
         store.advance_view_frontiers(|view| self.graph.stream_frontier(view));
-        let below_horizon = store
+        store
             .update_views(
                 results
                     .iter()
@@ -5123,12 +5123,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if changelog && self.subscription_registry.subscriber_count(stream_name) > 0 {
                 changelog_broadcasts.push(Arc::clone(stream_name));
             }
-        }
-        if below_horizon > 0 {
-            self.prom
-                .views
-                .rows_below_horizon_total
-                .inc_by(below_horizon as u64);
         }
         if updates > 0 {
             self.prom.views.updates.inc_by(updates);

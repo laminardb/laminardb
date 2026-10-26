@@ -92,6 +92,7 @@ impl MvEntry {
         batches: &'a [RecordBatch],
         limits: MvLimits,
         snapshot: bool,
+        horizon_drops: Option<&prometheus::IntCounter>,
     ) -> Result<PreparedUpdate<'a>, DbError> {
         for batch in batches {
             self.validate_input_schema(name, batch)?;
@@ -100,7 +101,9 @@ impl MvEntry {
             return Ok(PreparedUpdate::Unchanged);
         }
         if let Some(log) = &self.log {
-            return log.prepare(name, batches, limits).map(PreparedUpdate::Log);
+            return log
+                .prepare(name, batches, limits, horizon_drops)
+                .map(PreparedUpdate::Log);
         }
         match (&self.upsert, &self.multiset) {
             (Some(upsert), None) => upsert

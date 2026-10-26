@@ -64,9 +64,7 @@ impl MaterializedViewBenchmark {
     /// # Errors
     /// Returns state-admission or changelog-validation errors.
     pub fn update(&mut self, batches: &[RecordBatch]) -> Result<(), DbError> {
-        self.store
-            .update_views(VIEWS.map(|name| (name, batches)))
-            .map(drop)
+        self.store.update_views(VIEWS.map(|name| (name, batches)))
     }
 
     /// Materialize one view as a query/subscriber snapshot. An append view reads its memory
