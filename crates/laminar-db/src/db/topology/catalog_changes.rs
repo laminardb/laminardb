@@ -15,28 +15,22 @@ pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError>
         StreamingStatement::CreateSource(_)
         | StreamingStatement::CreateSink(_)
         | StreamingStatement::CreateStream { .. } => true,
+        StreamingStatement::CreateMaterializedView { or_replace, .. } => !or_replace,
         StreamingStatement::DropSource { cascade, .. }
         | StreamingStatement::DropStream { cascade, .. }
+        | StreamingStatement::DropMaterializedView { cascade, .. }
         | StreamingStatement::DropSink { cascade, .. } => !cascade,
         _ => false,
     };
     if !allowed {
         return Err(TopologyError::Unsupported(
-            "topology validation supports CREATE, CREATE OR REPLACE and DROP SOURCE/STREAM/SINK without CASCADE".into(),
+            "topology validation supports CREATE, CREATE OR REPLACE and DROP SOURCE/STREAM/SINK, \
+             CREATE and DROP MATERIALIZED VIEW, without CASCADE"
+                .into(),
         )
         .into());
     }
     Ok(statement)
-}
-
-/// One persisted catalog entry: a change topology validation accepts, or a materialized view
-/// the bootstrap catalog created.
-pub(super) fn parse_catalog_entry(sql: &str) -> Result<StreamingStatement, DbError> {
-    let statement = parse_single(sql)?;
-    if matches!(statement, StreamingStatement::CreateMaterializedView { .. }) {
-        return Ok(statement);
-    }
-    parse_one_change(sql)
 }
 
 fn parse_single(sql: &str) -> Result<StreamingStatement, DbError> {
@@ -67,6 +61,11 @@ pub(super) fn statement_identity(
         StreamingStatement::DropSink { name, .. } => {
             Some((name, CatalogObjectKind::Sink, "DROP SINK"))
         }
+        StreamingStatement::DropMaterializedView { name, .. } => Some((
+            name,
+            CatalogObjectKind::MaterializedView,
+            "DROP MATERIALIZED VIEW",
+        )),
         _ => None,
     };
     if let Some((name, kind, operation)) = drop {
@@ -130,6 +129,7 @@ pub(super) async fn apply_catalog_changes(
             statement,
             StreamingStatement::DropSource { .. }
                 | StreamingStatement::DropStream { .. }
+                | StreamingStatement::DropMaterializedView { .. }
                 | StreamingStatement::DropSink { .. }
         ) {
             if !changed.insert(name.clone()) {
@@ -199,6 +199,15 @@ pub(super) async fn apply_catalog_changes(
                 return Err(TopologyError::Unsupported(
                     "recreation must retain the catalog kind".into(),
                 )
+                .into());
+            }
+            // A cut keys a view's committed frontier and log by name, so a view recreated in the
+            // same migration would continue the dropped view's.
+            if dropped.contains(&name) && kind == CatalogObjectKind::MaterializedView {
+                return Err(TopologyError::Unsupported(format!(
+                    "materialized view '{name}' cannot be dropped and recreated in one migration; \
+                     drop it in one migration and create it in a later one"
+                ))
                 .into());
             }
             new_objects += 1;
@@ -336,7 +345,10 @@ impl LaminarDB {
         if superseded.iter().any(|entry| {
             !matches!(
                 entry.kind,
-                CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink
+                CatalogObjectKind::Source
+                    | CatalogObjectKind::Stream
+                    | CatalogObjectKind::MaterializedView
+                    | CatalogObjectKind::Sink
             ) || if manifest
                 .entries
                 .iter()

@@ -314,11 +314,13 @@ impl MvStore {
         Ok(())
     }
 
-    /// Restore every append view from the log `manifest` retains; with no manifest, every
-    /// append view starts empty.
+    /// Restore every append view `restores` names from the log `manifest` retains; with no
+    /// manifest, every append view starts empty. The other views start empty, and their logs
+    /// in `manifest` are left behind.
     pub(super) fn restore_view_logs(
         &mut self,
         manifest: Option<&CheckpointManifest>,
+        restores: impl Fn(&str) -> bool,
     ) -> Result<(), DbError> {
         let Some(manifest) = manifest else {
             return Ok(());
@@ -326,12 +328,16 @@ impl MvStore {
         let mut logs: HashMap<&str, &ViewLog> = manifest
             .view_logs
             .iter()
+            .filter(|log| restores(&log.view))
             .map(|log| (log.view.as_str(), log))
             .collect();
         for (name, entry) in &mut self.entries {
             let MvStorageMode::AppendLog { retention } = &entry.mode else {
                 continue;
             };
+            if !restores(name) {
+                continue;
+            }
             let log = logs.remove(name.as_str()).ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "checkpoint holds no log for append-only view '{name}'"

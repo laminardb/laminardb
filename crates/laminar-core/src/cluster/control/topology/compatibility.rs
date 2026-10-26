@@ -98,11 +98,14 @@ impl ClusterTopologyObjectPlan {
             }
             (
                 ClusterTopologyObjectTransition::Remove,
-                CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink,
+                CatalogObjectKind::Source
+                | CatalogObjectKind::Stream
+                | CatalogObjectKind::MaterializedView
+                | CatalogObjectKind::Sink,
             ) => TopologyInitialization::RetireAtCut,
             (ClusterTopologyObjectTransition::Remove, _) => {
                 return Err(TopologyError::Unsupported(
-                    "only sources, streams and sinks have a certified removal contract".into(),
+                    "only sources, streams, materialized views and sinks have a certified removal contract".into(),
                 ))
             }
             (_, CatalogObjectKind::Source) => TopologyInitialization::ResolveSourcePositionsOnce,
@@ -264,6 +267,11 @@ impl ClusterTopologyValidation {
                 ) && replacement.is_none_or(|new| new.kind == entry.kind
                     && Some(new.catalog_generation) == entry.catalog_generation.checked_add(1)) =>
                 {
+                    ClusterTopologyObjectTransition::Remove
+                }
+                // A cut keys a view's frontier and log by name, so a view has no successor in the
+                // migration that retires it.
+                None if entry.kind == CatalogObjectKind::MaterializedView => {
                     ClusterTopologyObjectTransition::Remove
                 }
                 _ => return Err(TopologyError::Invalid(

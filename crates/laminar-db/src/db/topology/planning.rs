@@ -373,7 +373,7 @@ pub(super) async fn replay_entry(
     candidate: &LaminarDB,
     entry: &CatalogManifestEntry,
 ) -> Result<(), DbError> {
-    let statement = super::catalog_changes::parse_catalog_entry(&entry.ddl)?;
+    let statement = super::catalog_changes::parse_one_change(&entry.ddl)?;
     let (name, kind, _) =
         super::super::validate_cluster_catalog_create(candidate, &entry.ddl, &statement)?;
     if name != entry.canonical_name || kind != entry.kind {
@@ -420,8 +420,10 @@ pub(super) fn describe_catalog(
             })
             .transpose()?;
         let operator = graph.operators.get(name);
+        // Append views keep their rows in a log, not in a result node.
         let view_result = (entry.kind == CatalogObjectKind::MaterializedView)
-            .then(|| laminar_core::mv::view_result_operator(name));
+            .then(|| laminar_core::mv::view_result_operator(name))
+            .filter(|operator| graph.operators.contains_key(operator));
         let operators: Vec<_> = std::iter::once(name)
             .chain(view_result.as_ref())
             .chain(&stages)

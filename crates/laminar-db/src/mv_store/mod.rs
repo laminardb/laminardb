@@ -497,14 +497,37 @@ impl MvStore {
         manifest: Option<&laminar_core::checkpoint::CheckpointManifest>,
         adopted: &[laminar_core::checkpoint::AdoptedViewLog],
     ) -> Result<Self, DbError> {
+        let mut image = self.restored_image(restored_views, manifest, |_| true)?;
+        image.adopt_view_logs(adopted)?;
+        Ok(image)
+    }
+
+    /// Restore a topology migration's root cut into a private image: as `recovery_image`, except
+    /// that only the `preserved` views take their logs from `manifest`. Views the migration adds
+    /// start empty, and the logs of views it drops are left behind.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn migration_root_image(
+        &self,
+        restored_views: Vec<RestoredView>,
+        manifest: Option<&laminar_core::checkpoint::CheckpointManifest>,
+        preserved: &[&str],
+    ) -> Result<Self, DbError> {
+        self.restored_image(restored_views, manifest, |view| preserved.contains(&view))
+    }
+
+    fn restored_image(
+        &self,
+        restored_views: Vec<RestoredView>,
+        manifest: Option<&laminar_core::checkpoint::CheckpointManifest>,
+        restores: impl Fn(&str) -> bool,
+    ) -> Result<Self, DbError> {
         let mut image = self.fresh_image().map_err(|error| {
             DbError::Checkpoint(format!("cannot create an empty MV recovery image: {error}"))
         })?;
         for view in restored_views {
             view.install(&mut image.entries)?;
         }
-        image.restore_view_logs(manifest)?;
-        image.adopt_view_logs(adopted)?;
+        image.restore_view_logs(manifest, restores)?;
         image.install_log_horizons();
         Ok(image)
     }

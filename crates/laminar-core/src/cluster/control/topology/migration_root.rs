@@ -179,6 +179,7 @@ impl TopologyMigrationRoot {
                         object.kind,
                         CatalogObjectKind::Source
                             | CatalogObjectKind::Stream
+                            | CatalogObjectKind::MaterializedView
                             | CatalogObjectKind::Sink
                     ) || object.initialization != super::TopologyInitialization::RetireAtCut
                     {

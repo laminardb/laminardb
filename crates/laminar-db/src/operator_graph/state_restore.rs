@@ -119,7 +119,8 @@ impl OperatorGraph {
     }
 
     /// Operators that start empty at the cut: managed objects added by the migration, with each
-    /// split stream's stages, when restoring the parent's checkpoint; none at a target checkpoint.
+    /// split stream's stages and each view's result node, when restoring the parent's checkpoint;
+    /// none at a target checkpoint.
     #[cfg(feature = "cluster")]
     fn empty_state_at_cut(
         &self,
@@ -158,6 +159,10 @@ impl OperatorGraph {
             .iter()
             .filter(|node| {
                 crate::sql_analysis::stage_owner(&node.name)
+                    .or_else(|| {
+                        node.name
+                            .strip_suffix(laminar_core::mv::VIEW_RESULT_OPERATOR_SUFFIX)
+                    })
                     .is_some_and(|owner| empty.iter().any(|object| object == owner))
             })
             .map(|node| node.name.to_string())

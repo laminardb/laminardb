@@ -1303,3 +1303,170 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
     );
     fixture.db.shutdown().await.unwrap();
 }
+
+async fn committed_pairs(db: &LaminarDB, sql: &str, epoch: u64) -> Vec<(i64, i64)> {
+    let read = Box::pin(db.query_committed(sql, crate::CommittedRead::Exact(epoch)))
+        .await
+        .unwrap();
+    let mut pairs = Vec::new();
+    for batch in &read.batches {
+        let column = |index: usize| {
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .clone()
+        };
+        pairs.extend(
+            column(0)
+                .values()
+                .iter()
+                .copied()
+                .zip(column(1).values().iter().copied()),
+        );
+    }
+    pairs.sort_unstable();
+    pairs
+}
+
+#[tokio::test]
+async fn topology_sql_migration_adds_and_drops_materialized_views() {
+    let (fixture, _) = Box::pin(preparation_fixture_with_bootstrap(
+        1,
+        vec![
+            "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
+                .into(),
+            "CREATE MATERIALIZED VIEW doomed AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
+                .into(),
+            "CREATE MATERIALIZED VIEW seen AS SELECT id, value FROM trades WITH (retention = '100 rows')"
+                .into(),
+            "CREATE MATERIALIZED VIEW doomed_seen AS SELECT id, value FROM trades WITH (retention = '100 rows')"
+                .into(),
+        ],
+    ))
+    .await;
+    let probe = enable_runtime(&fixture);
+    probe.allow_parent_initial.store(true, Ordering::Release);
+    fixture
+        .authority
+        .controller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            fixture.process_lease.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    DbState::Created.store(&fixture.db.state);
+    fixture.db.enable_coordinated_recovery().unwrap();
+    Box::pin(fixture.db.start()).await.unwrap();
+    assert_eq!(
+        Box::pin(
+            fixture
+                .db
+                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(5))
+        )
+        .await
+        .unwrap(),
+        crate::ClusterStartupDisposition::Serving
+    );
+    let deliver = |ids: [i64; 3], first: u64| {
+        let batch = RecordBatch::try_new(
+            crate::temporal_test_source::schema(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids.to_vec())),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1000, 2000, 3000,
+                ])),
+                Arc::new(arrow::array::Int64Array::from(vec![1; 3])),
+            ],
+        )
+        .unwrap();
+        probe.output.lock().clear();
+        probe.input.lock().insert(
+            "trades".into(),
+            std::collections::VecDeque::from([runtime_probe::positioned(batch, first)]),
+        );
+    };
+    let old_output = || {
+        probe
+            .output
+            .lock()
+            .iter()
+            .any(|(topic, _)| topic == "old-output")
+    };
+
+    deliver([1, 2, 2], 0);
+    wait_until(old_output).await;
+    let parent = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(parent.success, "{parent:?}");
+
+    let recreate = fixture
+        .db
+        .validate_cluster_topology_change(
+            TopologyVersion::LEGACY_BASELINE,
+            &[
+                "DROP MATERIALIZED VIEW counts".into(),
+                "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
+                    .into(),
+            ],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        recreate.contains("dropped and recreated in one migration"),
+        "{recreate}"
+    );
+
+    let request = request(
+        1303,
+        vec![
+            "DROP MATERIALIZED VIEW doomed".into(),
+            "DROP MATERIALIZED VIEW doomed_seen".into(),
+            "CREATE MATERIALIZED VIEW added_counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
+                .into(),
+            "CREATE MATERIALIZED VIEW added_seen AS SELECT id, value FROM trades WITH (retention = '100 rows')"
+                .into(),
+        ],
+    );
+    Box::pin(fixture.db.submit_cluster_topology_change(&request))
+        .await
+        .unwrap();
+    active(&fixture, request.operation_id).await;
+    deliver([1, 1, 1], 3);
+    wait_until(old_output).await;
+    let target = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(target.success, "{target:?}");
+
+    // Preserved views keep the rows from before the migration; added views start at the cut.
+    let read = |sql: &'static str| committed_pairs(&fixture.db, sql, target.epoch);
+    assert_eq!(read("SELECT id, n FROM counts").await, [(1, 4), (2, 2)]);
+    assert_eq!(read("SELECT id, n FROM added_counts").await, [(1, 3)]);
+    assert_eq!(
+        read("SELECT id, value FROM seen").await,
+        [(1, 1), (1, 1), (1, 1), (1, 1), (2, 1), (2, 1)]
+    );
+    assert_eq!(
+        read("SELECT id, value FROM added_seen").await,
+        [(1, 1), (1, 1), (1, 1)]
+    );
+    for dropped in ["doomed", "doomed_seen"] {
+        assert!(
+            Box::pin(fixture.db.query_committed(
+                &format!("SELECT * FROM {dropped}"),
+                crate::CommittedRead::Exact(target.epoch),
+            ))
+            .await
+            .is_err(),
+            "{dropped} is still readable"
+        );
+    }
+    let index = latest_index(&fixture).await;
+    assert!(index
+        .view_frontiers
+        .keys()
+        .all(|view| view != "doomed_seen"));
+    fixture.db.shutdown().await.unwrap();
+}

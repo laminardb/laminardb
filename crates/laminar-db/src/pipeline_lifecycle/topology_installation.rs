@@ -1,6 +1,8 @@
 //! Install the previously decoded root through the ordinary source/sink/runtime handoff.
 
-use laminar_core::cluster::control::{TopologyError, TopologyRecoveryInput, TopologyRestoreInput};
+use laminar_core::cluster::control::{
+    CatalogObjectKind, TopologyError, TopologyRecoveryInput, TopologyRestoreInput,
+};
 use laminar_core::shuffle::ShuffleTopologyFence;
 
 use super::{
@@ -138,17 +140,7 @@ impl LaminarDB {
                     .map(|channels| (name.clone(), Arc::from(channels.clone())))
             })
             .collect();
-        let participant_id = metadata.input.process().participant.node_id;
-        let local_manifest = metadata
-            .recovered
-            .manifests
-            .iter()
-            .find(|manifest| manifest.participant_id == participant_id);
-        let recovered_mv_store = self.mv_store.read().recovery_image(
-            graph.take_restored_views(),
-            local_manifest,
-            &[],
-        )?;
+        let recovered_mv_store = self.topology_view_store_image(&mut graph, metadata)?;
         Ok(PipelineRecoveryState {
             graph,
             recovered_mv_store,
@@ -167,6 +159,37 @@ impl LaminarDB {
                 .map_err(DbError::Checkpoint)?,
             restored_reference_tables: false,
         })
+    }
+
+    /// The view store at the selected cut. At a migration root only the views the migration
+    /// preserves take their logs from the parent's manifest.
+    fn topology_view_store_image(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        metadata: &TopologyRuntimeMetadata,
+    ) -> Result<crate::mv_store::MvStore, DbError> {
+        let participant_id = metadata.input.process().participant.node_id;
+        let local_manifest = metadata
+            .recovered
+            .manifests
+            .iter()
+            .find(|manifest| manifest.participant_id == participant_id);
+        let restored_views = graph.take_restored_views();
+        let store = self.mv_store.read();
+        if metadata.recovered.committed.pipeline_identity
+            != metadata.input.descriptor().parent_pipeline
+        {
+            return store.recovery_image(restored_views, local_manifest, &[]);
+        }
+        let preserved: Vec<&str> = metadata
+            .input
+            .root()
+            .preserved_objects
+            .iter()
+            .filter(|object| object.kind == CatalogObjectKind::MaterializedView)
+            .map(|object| object.name.as_str())
+            .collect();
+        store.migration_root_image(restored_views, local_manifest, &preserved)
     }
 
     pub(crate) async fn ensure_topology_runtime_ready(
