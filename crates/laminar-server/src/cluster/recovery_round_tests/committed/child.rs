@@ -1,5 +1,7 @@
 use super::*;
+use arrow_array::{Array as _, Int64Array};
 use connectors::ReplayProbe;
+use laminar_db::CommittedRead;
 
 struct DatabasePeer {
     peer: Peer,
@@ -200,6 +202,33 @@ impl DatabasePeer {
         })
     }
 
+    async fn read_view(&self, sql: &str, epoch: Option<u64>) -> Result<Response> {
+        let at = epoch.map_or(CommittedRead::Latest, CommittedRead::Exact);
+        let read = self.db()?.query_committed(sql, at).await?;
+        let mut rows = Vec::new();
+        for batch in &read.batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .filter(|column| column.null_count() == 0)
+                        .ok_or_else(|| anyhow!("fixture views read only non-null BIGINT columns"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.extend((0..batch.num_rows()).map(|row| {
+                columns
+                    .iter()
+                    .map(|column| column.value(row))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        rows.sort_unstable();
+        Ok(Response::Rows(rows))
+    }
+
     fn remove_failed_peer(&mut self, failed: u64) -> Result<()> {
         if self.peer.controller.instance_id() == NodeId(failed) || !self.rebalance_tasks.is_empty()
         {
@@ -258,6 +287,11 @@ impl DatabasePeer {
                     // Split into a stage and an owner, so both take over the lost vnodes.
                     "CREATE STREAM recovery_output AS SELECT account, SUM(total) AS total FROM (SELECT account, SUM(amount) AS total FROM recovery_input GROUP BY account) per_account GROUP BY account".into(),
                     "CREATE SINK recovery_probe FROM recovery_output INTO \"recovery-output-probe\" ('fixture' = 'bounded-replay-v1')".into(),
+                    // A keyed view, a view placed by its full row, and an append view: the
+                    // survivor restores the first two's lost slices and adopts the third's log.
+                    "CREATE MATERIALIZED VIEW recovery_totals AS SELECT account, SUM(amount) AS total, COUNT(*) AS n FROM recovery_input GROUP BY account".into(),
+                    "CREATE MATERIALIZED VIEW recovery_amounts AS SELECT total FROM recovery_totals".into(),
+                    "CREATE MATERIALIZED VIEW recovery_rows AS SELECT account, amount, ts FROM recovery_input WITH (retention = '1 hour')".into(),
                 ];
                 self.db()?.execute_cluster_bootstrap_batch(&ddl).await?;
             }
@@ -304,6 +338,7 @@ impl DatabasePeer {
             Command::ClearProcessObservation => self.clear_process_observation(),
             Command::Observe => return Ok(Response::Observed(Box::new(self.observe().await?))),
             Command::Checkpoint => return self.checkpoint().await,
+            Command::ReadView(sql, epoch) => return self.read_view(&sql, epoch).await,
             Command::Release => self.probe.hold.store(false, Ordering::Release),
             Command::Stop => return Err(anyhow!("the peer lifecycle owns Stop")),
         }

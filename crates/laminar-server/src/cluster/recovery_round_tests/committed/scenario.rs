@@ -264,6 +264,13 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     assert_eq!(offsets, cursors);
     assert_eq!(participants, [7, 8]);
     println!("selected shared checkpoint: {reference:?}; offsets: {offsets:?}");
+    let committed_views = expected_views(keys, 2);
+    for process in &mut *processes {
+        assert_eq!(
+            read_views(process, Some(reference.epoch)).await?,
+            committed_views
+        );
+    }
     for process in &mut *processes {
         process.done(&Command::Prefix(3)).await?;
     }
@@ -272,11 +279,70 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     processes[1].kill().await?;
     processes[0].done(&Command::RemoveFailedPeer(8)).await?;
     qualify_recovered_owner(&mut processes[0], &reference, &cursors, &first).await?;
+    // The departed node's committed slices and log stay readable at the handoff cut.
+    assert_eq!(
+        read_views(&mut processes[0], Some(reference.epoch)).await?,
+        committed_views
+    );
     wait_totals(
         &mut processes[..1],
         &BTreeMap::from([(keys[0], 104), (keys[1], 100)]),
     )
-    .await
+    .await?;
+    let Response::Committed {
+        reference: recovered,
+        participants,
+        ..
+    } = processes[0].request(&Command::Checkpoint).await?
+    else {
+        return Err(anyhow!("expected committed checkpoint"));
+    };
+    assert_eq!(participants, [7]);
+    assert_eq!(
+        read_views(&mut processes[0], Some(recovered.epoch)).await?,
+        expected_views(keys, 4)
+    );
+    Ok(())
+}
+
+const VIEWS: [&str; 3] = [
+    "SELECT account, total, n FROM recovery_totals",
+    "SELECT total FROM recovery_amounts",
+    "SELECT account, amount FROM recovery_rows",
+];
+
+/// The sorted rows of each of [`VIEWS`] once each partition delivered `prefix` records;
+/// partition `p` delivers account `keys[1 - p]` with amounts `10 * i + p`.
+fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> {
+    let mut totals = Vec::new();
+    let mut rows = Vec::new();
+    for (partition, account) in [(0, keys[1]), (1, keys[0])] {
+        let amounts = (1..=prefix).map(|i| 10 * i + partition).collect::<Vec<_>>();
+        totals.push(vec![account, amounts.iter().sum(), prefix]);
+        rows.extend(amounts.into_iter().map(|amount| vec![account, amount]));
+    }
+    let mut amounts = totals
+        .iter()
+        .map(|total| vec![total[1]])
+        .collect::<Vec<_>>();
+    for view in [&mut totals, &mut amounts, &mut rows] {
+        view.sort_unstable();
+    }
+    vec![totals, amounts, rows]
+}
+
+async fn read_views(process: &mut Process, epoch: Option<u64>) -> Result<Vec<Vec<Vec<i64>>>> {
+    let mut views = Vec::new();
+    for sql in VIEWS {
+        match process
+            .request(&Command::ReadView(sql.into(), epoch))
+            .await?
+        {
+            Response::Rows(rows) => views.push(rows),
+            response => return Err(anyhow!("expected view rows: {response:?}")),
+        }
+    }
+    Ok(views)
 }
 
 async fn qualify_recovered_owner(

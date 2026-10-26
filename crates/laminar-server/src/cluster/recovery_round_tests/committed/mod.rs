@@ -46,6 +46,8 @@ enum Command {
     ClearProcessObservation,
     Observe,
     Checkpoint,
+    /// A committed read of one view: the newest cut, or exactly this epoch.
+    ReadView(String, Option<u64>),
     Release,
     Stop,
 }
@@ -88,6 +90,7 @@ enum Response {
         channels: Vec<Vec<u8>>,
         watermark: Option<i64>,
     },
+    Rows(Vec<Vec<i64>>),
 }
 
 fn write_message(path: &Path, value: &impl Serialize) -> Result<()> {
