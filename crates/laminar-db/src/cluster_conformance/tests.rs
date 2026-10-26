@@ -49,7 +49,18 @@ pub(super) fn events(name: &'static str, seed: i64) -> FixtureSource {
 }
 
 pub(super) fn events_with(name: &'static str, seed: i64, batches: i64) -> FixtureSource {
-    let partitions = (0..PARTITIONS)
+    events_in(name, seed, PARTITIONS, batches)
+}
+
+/// [`events_with`] over `partitions` partitions; with fewer partitions than nodes, some nodes
+/// own none.
+pub(super) fn events_in(
+    name: &'static str,
+    seed: i64,
+    partitions: i64,
+    batches: i64,
+) -> FixtureSource {
+    let partitions = (0..partitions)
         .map(|partition| {
             (0..batches)
                 .map(|batch| {

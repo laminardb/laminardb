@@ -511,17 +511,31 @@ Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admit
 keeps its rows on the nodes that produce them:
 
 - a keyed or global aggregate view;
-- a projection or filter over such a view that keeps its key columns unchanged.
+- a projection or filter over such a view that keeps its key columns unchanged;
+- an append-only view: a projection over a source, a closed window, or an interval join.
 
 Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
-moves them with their vnodes when ownership changes. A topology migration that adds, replaces or
-drops other objects keeps every view and its rows; a migration cannot yet add or drop a view.
-`LaminarDB::query_committed` on any node reads every view at one committed checkpoint, from every
-node's checkpointed state. Rejected with `[LDB-4007]` before connector I/O:
+moves them with their vnodes when ownership changes. Each node keeps the part of an append-only
+view's log that it produced. When a node leaves, through rebalancing or failure, another node
+takes over its log in the next checkpoint without copying it. A topology migration that adds,
+replaces or drops other objects keeps every view and its rows; a migration cannot yet add or drop
+a view. `LaminarDB::query_committed` on any node reads every view at one committed checkpoint,
+from every node's checkpointed state; `SELECT` of a view on a cluster node fails, because the node
+holds only its part. Rejected with `[LDB-4007]` before connector I/O:
 
-- append-only views (a projection over a source, a closed window, an interval join);
 - a projection over a view that drops or changes its key;
 - `SUBSCRIBE` to a view.
+
+An append-only view's interval retention follows one event-time frontier per view, committed
+with each checkpoint: the lowest frontier among the nodes whose input is active, never moving
+back. Every node keeps the same rows, wherever they were written. A row that arrives behind that
+frontier minus the interval is dropped and counted in `mv_rows_below_horizon_total`; embedded and
+single-node runtimes count their drops the same way. A `'<n> rows'` retention applies on each
+node separately, so a cluster keeps up to `n` rows per node and may keep fewer after a node
+leaves; when a node takes over another's log, the adopted rows count as its newest. A cluster
+checkpoint retains at most 24,576 view-log segments across all nodes, an even share per node
+(8,192 each on three nodes), and a rebalance is refused before it starts when the remaining nodes
+could not take over the leaving nodes' logs within their share.
 
 The materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes.
 

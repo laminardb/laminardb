@@ -118,6 +118,14 @@ pub(super) struct LogUpdate<'a> {
     evicted: usize,
     rows: usize,
     bytes: usize,
+    /// Rows of batches that arrived wholly behind the retention horizon and were dropped.
+    below_horizon: usize,
+}
+
+impl LogUpdate<'_> {
+    pub(super) const fn rows_below_horizon(&self) -> usize {
+        self.below_horizon
+    }
 }
 
 struct LogBatchRef<'a> {
@@ -209,9 +217,11 @@ impl AppendLogState {
     ) -> Result<LogUpdate<'a>, DbError> {
         let (mut rows, mut bytes) = (self.rows, self.bytes);
         let mut incoming = smallvec::SmallVec::new();
+        let mut below_horizon = 0;
         for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
             let event_time = self.retention.bounds(batch)?;
             if self.retention.expired(event_time, self.horizon_frontier()) {
+                below_horizon += batch.num_rows();
                 continue;
             }
             let charge = retained_arrow_bytes(batch);
@@ -237,6 +247,7 @@ impl AppendLogState {
             evicted,
             rows,
             bytes,
+            below_horizon,
         })
     }
 

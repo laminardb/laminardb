@@ -566,9 +566,9 @@ impl LaminarDB {
     }
 
     /// A cluster keeps a changelog view's slices on the nodes that produce them, so it admits
-    /// views placed by their producer's key or on one vnode. Append logs (`None` before their
-    /// retention resolves) and views placed by the full row need cluster writers and a
-    /// repartition port first.
+    /// views placed by their producer's key or on one vnode. Each node keeps its own part of an
+    /// append view's log (`None` before its retention resolves). A view placed by its full row
+    /// needs a repartition port first.
     fn admit_cluster_view(
         &self,
         name: &str,
@@ -579,27 +579,25 @@ impl LaminarDB {
         if !self.is_cluster_runtime() {
             return Ok(());
         }
-        let reason = match mode {
-            Some(MvStorageMode::Changelog {
-                key: ViewKey::Global | ViewKey::Keyed(_) | ViewKey::MultisetByKey(_),
-                ..
-            }) => return Ok(()),
+        match mode {
+            None
+            | Some(
+                MvStorageMode::AppendLog { .. }
+                | MvStorageMode::Changelog {
+                    key: ViewKey::Global | ViewKey::Keyed(_) | ViewKey::MultisetByKey(_),
+                    ..
+                },
+            ) => Ok(()),
             Some(MvStorageMode::Changelog {
                 key: ViewKey::MultisetByRow,
                 ..
-            }) => {
+            }) => Err(Self::cluster_state_lifecycle_error(
+                "materialized view",
+                name,
                 "a view placed by its full row needs a repartition port to the nodes that own \
-                 its rows, which has not shipped"
-            }
-            None | Some(MvStorageMode::AppendLog { .. }) => {
-                "append-only views are not admitted in a cluster yet"
-            }
-        };
-        Err(Self::cluster_state_lifecycle_error(
-            "materialized view",
-            name,
-            reason,
-        ))
+                 its rows, which has not shipped",
+            )),
+        }
     }
 
     /// The view key from the view stream's planned output distribution.

@@ -184,7 +184,7 @@ impl CommittedViews {
         }
     }
 
-    fn latest(&self) -> Option<Arc<CommittedCut>> {
+    pub(crate) fn latest(&self) -> Option<Arc<CommittedCut>> {
         self.cuts.borrow().clone()
     }
 

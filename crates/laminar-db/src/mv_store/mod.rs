@@ -273,7 +273,7 @@ impl MvStore {
         }
     }
 
-    /// A view whose state a cluster cannot keep yet: an append log or a multiset placed by row.
+    /// A view whose state a cluster cannot keep yet: a multiset placed by row.
     #[cfg(feature = "cluster")]
     pub(crate) fn first_view_outside_cluster(&self) -> Option<&str> {
         self.entries
@@ -281,14 +281,19 @@ impl MvStore {
             .find(|(_, entry)| {
                 matches!(
                     entry.mode,
-                    MvStorageMode::AppendLog { .. }
-                        | MvStorageMode::Changelog {
-                            key: ViewKey::MultisetByRow,
-                            ..
-                        }
+                    MvStorageMode::Changelog {
+                        key: ViewKey::MultisetByRow,
+                        ..
+                    }
                 )
             })
             .map(|(name, _)| name.as_str())
+    }
+
+    /// Whether this store holds only this node's part of each view, as in a cluster, so a
+    /// statement reads views only at a committed cut.
+    pub(crate) const fn holds_node_part(&self) -> bool {
+        self.horizon_cuts.is_some()
     }
 
     /// Freshness the views declared; it outlives recovery images of this store.
@@ -354,10 +359,11 @@ impl MvStore {
     /// Preflight every affected view under the caller's existing write lock, then install.
     /// Callers supply each view once. Prepared batch updates borrow input; keyed
     /// updates own only their existing staged deltas, never a clone of the live row map.
+    /// Returns the rows append views dropped because they arrived behind the retention horizon.
     pub fn update_views<'a>(
         &mut self,
         results: impl IntoIterator<Item = (&'a str, &'a [RecordBatch])>,
-    ) -> Result<(), DbError> {
+    ) -> Result<usize, DbError> {
         let mut prepared = smallvec::SmallVec::<[(&str, PreparedUpdate<'_>); 4]>::new();
         for (name, batches) in results {
             if let Some(entry) = self.entries.get(name) {
@@ -365,12 +371,16 @@ impl MvStore {
                 prepared.push((name, update));
             }
         }
+        let mut below_horizon = 0;
         for (name, update) in prepared {
+            if let PreparedUpdate::Log(log) = &update {
+                below_horizon += log.rows_below_horizon();
+            }
             if let Some(entry) = self.entries.get_mut(name) {
                 entry.apply_prepared(update);
             }
         }
-        Ok(())
+        Ok(below_horizon)
     }
 
     /// Advance each append view's frontier to its stream's output frontier, and in a cluster

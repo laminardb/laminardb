@@ -689,8 +689,8 @@ impl LaminarDB {
         if startup_runtime == RuntimeMode::Cluster {
             if let Some(view) = self.mv_store.read().first_view_outside_cluster() {
                 return Err(DbError::InvalidOperation(format!(
-                    "[{}] cluster startup found materialized view '{view}', whose append log or \
-                     row placement a cluster cannot keep yet",
+                    "[{}] cluster startup found materialized view '{view}', whose row \
+                     placement a cluster cannot keep yet",
                     laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
                 )));
             }

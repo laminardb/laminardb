@@ -10186,13 +10186,13 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                 .lock()
                 .contains_key("nested_aggregate$stage1"));
 
-            assert_cluster_rejection(
-                &db,
-                "rejected_append_mv",
-                "CREATE MATERIALIZED VIEW rejected_append_mv AS \
-                 SELECT id, value FROM left_events",
+            db.execute(
+                "CREATE MATERIALIZED VIEW append_view_ok AS \
+                 SELECT id, value FROM left_events WITH (retention = '1000 rows')",
             )
-            .await;
+            .await
+            .expect("each node keeps its own part of an append view's log");
+            assert!(db.mv_store.read().has_mv("append_view_ok"));
             db.execute(
                 "CREATE MATERIALIZED VIEW global_view_ok AS \
                  SELECT SUM(value) AS total FROM left_events",
@@ -10244,7 +10244,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         .create_mv(
             "stale_mv",
             Arc::new(arrow_schema::Schema::empty()),
-            crate::mv_store::MvStorageMode::append_rows(1_000),
+            crate::mv_store::MvStorageMode::changelog(crate::mv_store::ViewKey::MultisetByRow),
         )
         .unwrap();
     let error = stale

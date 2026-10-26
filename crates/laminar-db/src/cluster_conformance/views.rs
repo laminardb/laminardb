@@ -12,7 +12,7 @@ use arrow::array::RecordBatch;
 use super::cluster::{Cluster, Startup};
 use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
-use super::tests::{assert_rejected, events, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN};
+use super::tests::{events, events_in, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN};
 use super::{embedded_db, Verdict, DEADLINE, NODES, VNODES};
 use crate::{CommittedRead, ExecuteResult, LaminarDB};
 
@@ -251,9 +251,10 @@ async fn keyed_and_chained_views_match_batch_sql_in_cluster() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-/// A projection over a source and a closed tumbling window both append.
+/// A projection over a source and a closed tumbling window both append; each node keeps its
+/// own part of their logs, and every node reads all of it at the committed cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn append_views_are_rejected_in_cluster() {
+async fn append_views_match_batch_sql_in_cluster() {
     let case = ViewCase {
         name: "append_views",
         sources: vec![events("events", 0)],
@@ -275,11 +276,12 @@ async fn append_views_are_rejected_in_cluster() {
         ],
         same_cycle_invariants: vec![],
     };
-    assert_rejected(verdict(case).await, "materialized view");
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// An interval join's output appends, so its view keeps a log on each node like any other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn interval_join_view_is_rejected_in_cluster() {
+async fn interval_join_view_matches_batch_sql_in_cluster() {
     let case = ViewCase {
         name: "interval_join_view",
         sources: vec![events("orders", 0), events("payments", 3)],
@@ -289,7 +291,94 @@ async fn interval_join_view_is_rejected_in_cluster() {
         reads: vec![("SELECT * FROM joined", INTERVAL_JOIN)],
         same_cycle_invariants: vec![],
     };
-    assert_rejected(verdict(case).await, "materialized view");
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Two partitions over three nodes leave node 3 without input, so its view is idle and takes no
+/// part in the view's committed frontier. Every node keeps exactly the rows at or after that one
+/// frontier minus the interval, wherever they were written, and refuses a live read of its part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_view_retention_follows_one_committed_frontier_on_every_node() {
+    let sources = vec![events_in("events", 0, 2, 3)];
+    let ddl: Vec<String> = sources
+        .iter()
+        .map(FixtureSource::ddl)
+        .chain(views(&[
+            "CREATE MATERIALIZED VIEW recent AS \
+             SELECT k, v, ts FROM events WITH (retention = '100 milliseconds')",
+        ]))
+        .collect();
+    let Startup::Running(cluster) = Cluster::start(NODES, VNODES, &sources, &ddl).await else {
+        panic!("append views are admitted in cluster");
+    };
+    cluster.activate().await.unwrap();
+    let total: u64 = sources.iter().map(FixtureSource::batch_count).sum();
+    super::wait_until(DEADLINE, || {
+        cluster
+            .polled
+            .iter()
+            .map(|polled| polled.load(Ordering::Acquire))
+            .sum::<u64>()
+            >= total
+    })
+    .await
+    .expect("sources deliver");
+    // A participant's frontier follows the committed cluster frontier, so the view's committed
+    // frontier reaches the input's within a few cuts.
+    for _ in 0..3 {
+        let checkpoint = cluster.dbs[0]
+            .checkpoint_with_timeout(DEADLINE)
+            .await
+            .unwrap();
+        assert!(checkpoint.success, "{checkpoint:?}");
+    }
+    let views = cluster.dbs[0].mv_store.read().committed_views().unwrap();
+    let cut = views.latest().unwrap();
+    let frontier = *cut
+        .index
+        .view_frontiers
+        .get("recent")
+        .expect("the idle node does not hold back the committed frontier");
+    let expected = oracle::ground_truth(
+        &sources,
+        &format!(
+            "SELECT k, v, ts FROM events WHERE ts >= to_timestamp_millis({})",
+            frontier - 100
+        ),
+    )
+    .await
+    .unwrap();
+    let all = oracle::ground_truth(&sources, "SELECT k, v, ts FROM events")
+        .await
+        .unwrap();
+    assert!(
+        !expected.is_empty() && expected.len() < all.len(),
+        "retention must keep some rows and drop others"
+    );
+    for (node, db) in cluster.dbs.iter().enumerate() {
+        let read = db
+            .query_committed(
+                "SELECT * FROM recent",
+                CommittedRead::Exact(cut.index.epoch),
+            )
+            .await
+            .unwrap();
+        let observed = oracle::consolidate(&read.batches, OutputForm::Rows).unwrap();
+        assert_eq!(
+            observed,
+            expected,
+            "node {} diverges; {}",
+            node + 1,
+            oracle::diff(&expected, &observed)
+        );
+    }
+    let live = cluster.dbs[1].execute("SELECT * FROM recent").await;
+    assert!(
+        live.as_ref()
+            .is_err_and(|error| error.to_string().contains("committed cut")),
+        "a cluster node must refuse a live read of its part"
+    );
+    cluster.shutdown().await;
 }
 
 /// A read on a follower holds its cut against cluster cleanup while later checkpoints commit;

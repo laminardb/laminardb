@@ -182,6 +182,9 @@ pub struct ViewMetrics {
     pub committed_staleness_ms: IntGauge,
     /// Times a view's committed reads became staler than its declared freshness. Label: `view`.
     pub freshness_breaches_total: IntCounterVec,
+    /// Rows append-only views dropped at ingest because they arrived behind the event-time
+    /// retention horizon. A row-cap retention has no horizon and never drops here.
+    pub rows_below_horizon_total: IntCounter,
 }
 
 impl ViewMetrics {
@@ -202,6 +205,11 @@ impl ViewMetrics {
                 &["view"],
             )
             .unwrap(),
+            rows_below_horizon_total: IntCounter::new(
+                "mv_rows_below_horizon_total",
+                "Rows append-only views dropped because they arrived behind the retention horizon",
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.updates.clone()))
@@ -214,6 +222,9 @@ impl ViewMetrics {
             .unwrap();
         registry
             .register(Box::new(metrics.freshness_breaches_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.rows_below_horizon_total.clone()))
             .unwrap();
         metrics
     }

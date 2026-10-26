@@ -141,6 +141,13 @@ pub(crate) async fn plan_statement(
         return Ok(ctx.execute_logical_plan(plan).await?);
     }
     let views = scanned_tables(&plan)?.views;
+    if !views.is_empty() && store.read().holds_node_part() {
+        return Err(DbError::InvalidOperation(format!(
+            "a cluster node holds only its part of materialized views [{}]; read them at a \
+             committed cut",
+            views.join(", ")
+        )));
+    }
     if !views.is_empty() {
         let snapshot = StatementViewSnapshot {
             views: read_views(store, &views).await?,
