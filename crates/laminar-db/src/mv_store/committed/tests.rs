@@ -94,13 +94,15 @@ fn view_store(events: MvStorageMode) -> MvStore {
 }
 
 fn participant_manifest(
-    (participant, vnodes, events): (u64, [u16; 2], &[i64]),
+    (participant, vnodes, events): (u64, &[u16], &[i64]),
+    checkpoint: u64,
     frontier: Option<i64>,
     frames: &[(u32, Bytes)],
     deployment_id: &str,
     fence: &CheckpointAssignmentFence,
 ) -> (CheckpointManifest, Bytes, Bytes) {
-    let mut manifest = CheckpointManifest::new_with_key_group_count(2, 2, key_groups());
+    let mut manifest =
+        CheckpointManifest::new_with_key_group_count(checkpoint, checkpoint, key_groups());
     manifest.bind_participant(participant);
     manifest.deployment_id = deployment_id.into();
     manifest.assignment_fence = Some(fence.clone());
@@ -108,7 +110,7 @@ fn participant_manifest(
     manifest.owned_vnodes = vnodes.to_vec();
     let chunk = manifest.node_data.chunk;
     let mut node_data = Vec::new();
-    for vnode in vnodes {
+    for &vnode in vnodes {
         let (_, frame) = frames
             .iter()
             .find(|(captured, _)| *captured == u32::from(vnode))
@@ -174,6 +176,8 @@ struct SynthesizedCut {
     objects: Arc<dyn ObjectStore>,
     views: CommittedViews,
     store: MvStore,
+    decisions: Arc<CheckpointDecisionStore>,
+    deployment_id: String,
     _cuts: tokio::sync::watch::Sender<Option<Arc<CommittedCut>>>,
 }
 
@@ -201,10 +205,16 @@ async fn synthesized_cut_with(
     let mut store = view_store(events);
     let frames = store.full_view_frames("counts");
     let mut prepared = Vec::new();
-    for (shape, frontier) in PARTICIPANTS.into_iter().zip(frontiers) {
-        let (manifest, node_data, segment) =
-            participant_manifest(shape, frontier, &frames, &deployment_id, &fence);
-        let writer = checkpoint_store(&objects, shape.0);
+    for ((participant, vnodes, keys), frontier) in PARTICIPANTS.into_iter().zip(frontiers) {
+        let (manifest, node_data, segment) = participant_manifest(
+            (participant, &vnodes, keys),
+            2,
+            frontier,
+            &frames,
+            &deployment_id,
+            &fence,
+        );
+        let writer = checkpoint_store(&objects, participant);
         writer
             .save_view_log(manifest.view_log.as_ref().unwrap(), &[segment])
             .await
@@ -223,7 +233,9 @@ async fn synthesized_cut_with(
     coordinator
         .bind_pipeline_identity(PipelineIdentity::empty())
         .unwrap();
-    coordinator.bind_deployment_id(deployment_id).unwrap();
+    coordinator
+        .bind_deployment_id(deployment_id.clone())
+        .unwrap();
     let index = coordinator
         .build_committed_index(
             CheckpointAttempt::canonical(2),
@@ -244,7 +256,7 @@ async fn synthesized_cut_with(
     let (sender, cuts) = tokio::sync::watch::channel(Some(Arc::new(cut)));
     let views = CommittedViews::new(
         Arc::new(checkpoint_store(&objects, 1)),
-        decisions,
+        Arc::clone(&decisions),
         (cuts, Arc::default()),
         1 << 20,
     );
@@ -252,6 +264,8 @@ async fn synthesized_cut_with(
         objects,
         views,
         store,
+        decisions,
+        deployment_id,
         _cuts: sender,
     }
 }
@@ -366,6 +380,137 @@ async fn a_cluster_store_keeps_live_rows_against_the_newest_committed_frontier()
     });
     let rows = store.to_record_batch("events").unwrap().unwrap();
     assert_eq!(values(&[rows], 0), [1, 2, 3]);
+}
+
+/// Participant 2 leaves after the synthesized cut. Participant 1 takes every vnode, writes key 4
+/// and, as an adopter would, lists participant 2's `events` segment by reference.
+#[tokio::test]
+async fn a_cut_after_a_participant_leaves_lists_its_view_log_segments() {
+    let mut synthesized = synthesized_cut().await;
+    let predecessor = synthesized._cuts.borrow().clone().unwrap();
+    let reference = synthesized
+        .decisions
+        .create_committed_checkpoint(&predecessor.index)
+        .await
+        .unwrap();
+    let leaver = crate::checkpoint_coordinator::load_index_manifests(
+        &checkpoint_store(&synthesized.objects, 1),
+        &predecessor.index,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .find(|manifest| manifest.participant_id == 2)
+    .unwrap();
+
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        10,
+        &[1, 1, 1, 1],
+        vec![CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(1),
+        }],
+    )
+    .unwrap();
+    let frames = synthesized.store.full_view_frames("counts");
+    let (mut manifest, node_data, segment) = participant_manifest(
+        (1, &[0, 1, 2, 3], &[4]),
+        3,
+        None,
+        &frames,
+        &synthesized.deployment_id,
+        &fence,
+    );
+    let leaver_object = leaver.view_log.clone().unwrap();
+    let mut adopted = leaver.view_logs[0].segments[0].clone();
+    adopted.partition = 0;
+    adopted.sequence = 1;
+    let log = &mut manifest.view_logs[0];
+    log.segments.push(adopted);
+    log.next_sequence = 2;
+    manifest.referenced_view_logs = vec![laminar_core::checkpoint::ReferencedStateChunk {
+        chunk: leaver_object.chunk,
+        object_length: leaver_object.object_length,
+        sha256: leaver_object.sha256,
+        ref_count: std::num::NonZeroU32::new(1).unwrap(),
+    }];
+    let writer = checkpoint_store(&synthesized.objects, 1);
+    writer
+        .save_view_log(manifest.view_log.as_ref().unwrap(), &[segment])
+        .await
+        .unwrap();
+
+    let mut coordinator = CheckpointCoordinator::new(
+        CheckpointConfig::default(),
+        Box::new(checkpoint_store(&synthesized.objects, 1)),
+    )
+    .unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator
+        .bind_deployment_id(synthesized.deployment_id.clone())
+        .unwrap();
+    coordinator
+        .set_decision_store(Arc::clone(&synthesized.decisions))
+        .unwrap();
+    let frontiers =
+        crate::checkpoint_coordinator::CommittedFrontiers::of(&predecessor.index).unwrap();
+    let build = |manifest: CheckpointManifest, encoded: Bytes| {
+        let prepared = vec![(manifest, encoded)];
+        let coordinator = &coordinator;
+        let reference = reference.clone();
+        let fence = fence.clone();
+        let frontiers = frontiers.clone();
+        async move {
+            coordinator
+                .build_validated_committed_index_until(
+                    CheckpointAttempt::canonical(3),
+                    CheckpointScope::Cluster,
+                    Some(fence),
+                    Some(reference),
+                    &frontiers,
+                    &prepared,
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                )
+                .await
+                .map(|index| (index, prepared))
+        }
+    };
+
+    // Without participant 2's segment the cut would lose its rows.
+    let mut lost = manifest.clone();
+    lost.view_logs[0].segments.pop();
+    lost.referenced_view_logs.clear();
+    let encoded = Bytes::from(laminar_core::checkpoint::checkpoint_manifest_bytes(&lost).unwrap());
+    let error = build(lost, encoded).await.unwrap_err();
+    assert!(error.to_string().contains("0 times"), "{error}");
+
+    let encoded = writer
+        .save_checkpoint(&manifest, &[node_data])
+        .await
+        .unwrap();
+    let (index, prepared) = build(manifest, encoded).await.unwrap();
+    let (_, successor) = index.encode_and_reference().unwrap();
+    synthesized
+        ._cuts
+        .send_replace(Some(Arc::new(CommittedCut::new(
+            index,
+            successor,
+            prepared.iter().map(|(manifest, _)| manifest),
+        ))));
+    let cut = synthesized
+        .views
+        .pin(CommittedRead::Latest, deadline())
+        .await
+        .unwrap();
+    let events = synthesized.store.view_shape("events").unwrap();
+    let rows = cut
+        .read_view(&synthesized.views, &events, &[])
+        .await
+        .unwrap();
+    assert_eq!(values(&rows, 0), [3, 4]);
 }
 
 #[tokio::test]

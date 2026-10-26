@@ -153,13 +153,16 @@ fn referenced_view_logs<'a>(
     {
         error("referenced_view_logs must be strictly ordered and unique".into());
     }
+    // A cluster participant may list another participant's segments after adopting the log of
+    // one that left; a local cut has one participant.
+    let cluster = manifest.assignment_fence.is_some();
     for reference in references {
-        if reference.chunk.participant_id != manifest.participant_id
+        if (!cluster && reference.chunk.participant_id != manifest.participant_id)
             || reference.chunk.checkpoint_id == 0
             || reference.chunk.checkpoint_id >= manifest.checkpoint_id
         {
             error(format!(
-                "referenced view log {:?} is not an older object of this participant",
+                "referenced view log {:?} is not an older object this participant may reference",
                 reference.chunk
             ));
         }

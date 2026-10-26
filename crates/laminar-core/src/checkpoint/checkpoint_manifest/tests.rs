@@ -418,3 +418,49 @@ fn view_logs_validate_their_objects_ranges_and_references() {
         "declares ref_count 2",
     );
 }
+
+#[test]
+fn only_a_cluster_manifest_references_another_participants_view_log() {
+    let groups = KeyGroupCount::try_from(1_u16).unwrap();
+    let refuses = |manifest: &CheckpointManifest| {
+        manifest
+            .validate(groups)
+            .iter()
+            .any(|error| error.message.contains("may reference"))
+    };
+    let mut local = manifest_with_view_log(b"new rows", b"old rows");
+    let foreign = StateChunkId {
+        participant_id: 7,
+        checkpoint_id: 4,
+    };
+    local.referenced_view_logs[0].chunk = foreign;
+    local.view_logs[0].segments[0].chunk = foreign;
+    assert!(refuses(&local));
+
+    let mut cluster = local;
+    cluster.assignment_fence = Some(
+        CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[LOCAL_NODE_ID.0],
+            vec![crate::checkpoint::CheckpointParticipant {
+                node_id: LOCAL_NODE_ID.0,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            }],
+        )
+        .unwrap(),
+    );
+    cluster.reassignment_portable = true;
+    assert!(
+        cluster.validate(groups).is_empty(),
+        "{:?}",
+        cluster.validate(groups)
+    );
+
+    let newer = StateChunkId {
+        participant_id: 7,
+        checkpoint_id: 9,
+    };
+    cluster.referenced_view_logs[0].chunk = newer;
+    cluster.view_logs[0].segments[0].chunk = newer;
+    assert!(refuses(&cluster));
+}

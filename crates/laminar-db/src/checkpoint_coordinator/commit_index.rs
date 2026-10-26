@@ -8,11 +8,13 @@ use super::{
 #[cfg(feature = "cluster")]
 use super::{LeaderProof, QuorumPeer};
 
-/// The frontiers a committed cut carries forward to its successor.
+/// The frontiers a committed cut carries forward to its successor, and the participants that
+/// held them.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CommittedFrontiers {
     pub(crate) sources: BTreeMap<String, i64>,
     pub(crate) views: BTreeMap<String, i64>,
+    participants: Vec<u64>,
 }
 
 impl CommittedFrontiers {
@@ -22,7 +24,26 @@ impl CommittedFrontiers {
                 .effective_source_watermarks()
                 .map_err(DbError::Checkpoint)?,
             views: index.view_frontiers.clone(),
+            participants: index
+                .participants
+                .iter()
+                .map(|participant| participant.participant_id)
+                .collect(),
         })
+    }
+
+    /// Participants of this cut that `successor` no longer has.
+    fn departed(&self, successor: &CommittedCheckpointIndex) -> Vec<u64> {
+        self.participants
+            .iter()
+            .copied()
+            .filter(|participant| {
+                successor
+                    .participants
+                    .binary_search_by_key(participant, |reference| reference.participant_id)
+                    .is_err()
+            })
+            .collect()
     }
 
     /// The source decision frontiers of the next cut: these, for the sources it still has,
@@ -486,6 +507,10 @@ impl CheckpointCoordinator {
         index
             .validate_participant_manifests(&manifest_views)
             .map_err(DbError::Checkpoint)?;
+        laminar_core::checkpoint::validate_cut_view_logs(
+            manifests.iter().map(|(manifest, _)| manifest),
+        )
+        .map_err(DbError::Checkpoint)?;
         Ok(index)
     }
 
@@ -514,6 +539,11 @@ impl CheckpointCoordinator {
             manifests,
             quorum_watermark,
         )?;
+        let departed = predecessor_frontiers.departed(&index);
+        if !departed.is_empty() {
+            self.validate_departed_view_logs_until(&index, &departed, manifests, deadline)
+                .await?;
+        }
         #[cfg(feature = "cluster")]
         let subscription_validation = self
             .validate_subscription_continuity_until(&index, manifests, deadline)
@@ -527,6 +557,44 @@ impl CheckpointCoordinator {
         #[cfg(not(feature = "cluster"))]
         let _ = deadline;
         Ok(index)
+    }
+
+    /// The participants that left at `index` lose none of their view-log segments: another
+    /// participant lists each one exactly once.
+    async fn validate_departed_view_logs_until(
+        &self,
+        index: &CommittedCheckpointIndex,
+        departed: &[u64],
+        manifests: &[(CheckpointManifest, Bytes)],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let (decisions, reference) = self
+            .decision_store
+            .as_ref()
+            .zip(index.predecessor.as_ref())
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "a departed participant's view logs need the committed predecessor".into(),
+                )
+            })?;
+        let predecessor = tokio::time::timeout_at(deadline, async {
+            let index = decisions
+                .load_committed_checkpoint(reference)
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("committed predecessor read failed: {error}"))
+                })?;
+            super::retention::load_index_manifests(self.store.as_ref(), &index).await
+        })
+        .await
+        .map_err(|_| DbError::Checkpoint("committed predecessor read timed out".into()))??;
+        laminar_core::checkpoint::validate_departed_view_logs(
+            predecessor
+                .iter()
+                .filter(|manifest| departed.contains(&manifest.participant_id)),
+            manifests.iter().map(|(manifest, _)| manifest),
+        )
+        .map_err(DbError::Checkpoint)
     }
 
     #[cfg(feature = "cluster")]

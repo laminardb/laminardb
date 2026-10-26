@@ -62,6 +62,10 @@ pub(crate) async fn load_index_manifests(
     index
         .validate_participant_manifests(&views)
         .map_err(DbError::Checkpoint)?;
+    laminar_core::checkpoint::validate_cut_view_logs(
+        loaded.iter().map(|(_, manifest, _)| manifest),
+    )
+    .map_err(DbError::Checkpoint)?;
     Ok(loaded
         .into_iter()
         .map(|(_, manifest, _)| manifest)
