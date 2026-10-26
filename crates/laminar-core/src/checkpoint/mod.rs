@@ -55,8 +55,8 @@ pub use checkpoint_store::{
     MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_AGGREGATE_BYTES, MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_BYTES,
 };
 pub use committed_checkpoint::{
-    canonical_json_bytes, canonical_json_sha256, CheckpointScope, CheckpointWatermark,
-    CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef,
+    canonical_json_bytes, canonical_json_sha256, fold_view_frontiers, CheckpointScope,
+    CheckpointWatermark, CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef,
     COMMITTED_CHECKPOINT_INDEX_VERSION, MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
 };
 pub use subscription::{

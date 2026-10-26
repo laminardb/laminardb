@@ -79,9 +79,7 @@ impl CheckpointCoordinator {
         let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
             DbError::Checkpoint("follower Commit has no committed checkpoint reference".into())
         })?;
-        let source_watermarks = index
-            .effective_source_watermarks()
-            .map_err(DbError::Checkpoint)?;
+        let frontiers = super::CommittedFrontiers::of(&index)?;
         let participant = index
             .participants
             .iter()
@@ -98,7 +96,7 @@ impl CheckpointCoordinator {
             [manifest.as_ref()],
         )));
         self.last_committed_ref = Some(reference.clone());
-        self.last_committed_source_watermarks = Some((reference, source_watermarks));
+        self.last_committed_frontiers = Some((reference, frontiers));
         self.last_committed_manifest = Some(manifest);
         self.prepared.remove(&attempt);
         Ok(())

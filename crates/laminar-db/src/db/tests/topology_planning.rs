@@ -948,6 +948,7 @@ async fn assert_root_staging(add_source: bool) {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let reference = CheckpointDecisionStore::new(fixture.authority.checkpoint_store.clone())
         .create_committed_checkpoint(&index)

@@ -102,6 +102,7 @@ impl MvCheckpointCapture {
                 view,
                 next_sequence: capture.next_sequence,
                 frontier: capture.frontier,
+                idle: capture.idle,
                 segments,
             });
         }

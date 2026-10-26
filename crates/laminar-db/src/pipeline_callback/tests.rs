@@ -5437,6 +5437,7 @@ async fn cold_empty_successor_rehydrates_the_callback_source_pin() {
         }],
         source_watermarks: BTreeMap::from([("orders".into(), 900)]),
         checkpoint_watermark: Some(900),
+        view_frontiers: Default::default(),
     };
     let predecessor_ref = warm_store
         .create_committed_checkpoint(&predecessor)
@@ -7063,6 +7064,7 @@ async fn gate_committed_checkpoint(
         channel_progress,
         source_watermarks: std::collections::BTreeMap::from([("source".into(), 42)]),
         checkpoint_watermark: Some(42),
+        view_frontiers: Default::default(),
     }
 }
 

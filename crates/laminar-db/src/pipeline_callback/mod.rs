@@ -5071,7 +5071,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return Ok(());
         }
         let mut store = self.mv_store.write();
-        store.advance_view_frontiers(|view| self.graph.stream_watermark(view));
+        store.advance_view_frontiers(|view| self.graph.stream_frontier(view));
         store
             .update_views(
                 results

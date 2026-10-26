@@ -547,6 +547,7 @@ fn recovery_image_requires_an_exact_view_log_inventory() {
         view: view.into(),
         next_sequence: 4,
         frontier: Some(100),
+        idle: false,
         segments: Vec::new(),
     };
     let mut manifest = CheckpointManifest::new(7, 7);

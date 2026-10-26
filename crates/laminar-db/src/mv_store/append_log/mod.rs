@@ -17,6 +17,7 @@ use laminar_core::streaming::retained_arrow_bytes;
 
 use super::admission::{size_overflow, MvLimits};
 use crate::error::DbError;
+use crate::operator_graph::InputFrontier;
 pub(crate) use compaction::{spawn_compactor, TARGET_SEGMENT_BYTES};
 use compaction::{CompactedSegment, PreparedCompaction};
 pub(crate) use read::{LogRead, LogReadError};
@@ -24,6 +25,16 @@ pub(crate) use retention::ViewRetention;
 
 /// Every view log has one partition until rows carry their origin vnode.
 const LOG_PARTITION: u16 = 0;
+
+/// The event-time frontier a log's retention follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogHorizon {
+    /// The view's own frontier on this node.
+    Local,
+    /// In a cluster, the view's frontier at the newest committed cut, which every participant
+    /// shares, so which participant holds a row never decides whether retention keeps it.
+    Committed(Option<i64>),
+}
 
 /// Metadata of a committed segment; its rows live in the checkpoint store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,8 +84,11 @@ pub(super) struct AppendLogState {
     /// Segments retained by the last committed checkpoint.
     committed: Vec<SegmentMeta>,
     next_sequence: u64,
-    /// Greatest event-time frontier the view has reached.
+    /// Greatest event-time frontier the view has reached on this node.
     frontier: Option<i64>,
+    /// Whether every input of the view is idle; a capture reports it with the frontier.
+    idle: bool,
+    horizon: LogHorizon,
     /// A merge prepared from a committed checkpoint; the next capture that still retains its
     /// inputs writes it in their place.
     prepared: Option<Arc<PreparedCompaction>>,
@@ -106,6 +120,7 @@ struct LogBatchRef<'a> {
 pub(crate) struct ViewLogCapture {
     pub(crate) next_sequence: u64,
     pub(crate) frontier: Option<i64>,
+    pub(crate) idle: bool,
     pub(crate) retained: Vec<(u16, u64)>,
     pub(crate) compacted: Option<CompactedSegment>,
     pub(crate) sealed: Option<SealedSegment>,
@@ -128,6 +143,8 @@ impl AppendLogState {
             committed: Vec::new(),
             next_sequence: 0,
             frontier: None,
+            idle: false,
+            horizon: LogHorizon::Local,
             prepared: None,
             positions_since: None,
             rows: 0,
@@ -145,9 +162,25 @@ impl AppendLogState {
         state
     }
 
-    pub(super) fn advance_frontier(&mut self, watermark: i64) {
-        if watermark != i64::MIN && self.frontier.is_none_or(|frontier| watermark > frontier) {
+    pub(super) fn advance_frontier(&mut self, stream: InputFrontier) {
+        if let Some(watermark) = stream
+            .watermark
+            .filter(|watermark| self.frontier.is_none_or(|frontier| *watermark > frontier))
+        {
             self.frontier = Some(watermark);
+        }
+        self.idle = stream.idle;
+    }
+
+    pub(super) fn set_horizon(&mut self, horizon: LogHorizon) {
+        self.horizon = horizon;
+    }
+
+    /// The frontier retention keeps rows against.
+    fn horizon_frontier(&self) -> Option<i64> {
+        match self.horizon {
+            LogHorizon::Local => self.frontier,
+            LogHorizon::Committed(frontier) => frontier,
         }
     }
 
@@ -161,7 +194,7 @@ impl AppendLogState {
         let mut incoming = smallvec::SmallVec::new();
         for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
             let event_time = self.retention.bounds(batch)?;
-            if self.retention.expired(event_time, self.frontier) {
+            if self.retention.expired(event_time, self.horizon_frontier()) {
                 continue;
             }
             let charge = retained_arrow_bytes(batch);
@@ -196,7 +229,10 @@ impl AppendLogState {
             ViewRetention::EventTime { .. } => self
                 .staged
                 .iter()
-                .take_while(|old| self.retention.expired(old.event_time, self.frontier))
+                .take_while(|old| {
+                    self.retention
+                        .expired(old.event_time, self.horizon_frontier())
+                })
                 .count(),
             ViewRetention::Unbounded { .. } => 0,
             ViewRetention::Rows(limit) => {
@@ -250,10 +286,11 @@ impl AppendLogState {
                 "an append view's previous capture has neither committed nor aborted".into(),
             ));
         }
+        let horizon = self.horizon_frontier();
         let staged: Vec<LogBatch> = self
             .staged
             .drain(..)
-            .filter(|batch| !self.retention.expired(batch.event_time, self.frontier))
+            .filter(|batch| !self.retention.expired(batch.event_time, horizon))
             .collect();
         let staged_rows = staged
             .iter()
@@ -262,7 +299,7 @@ impl AppendLogState {
         let staged_rows = u64::try_from(staged_rows).map_err(|_| size_overflow())?;
         let mut committed = self
             .retention
-            .retained(&self.committed, self.frontier, staged_rows);
+            .retained(&self.committed, horizon, staged_rows);
         let merge = compact.then(|| self.prepared_merge(&committed)).flatten();
         let run = merge.as_ref().map(|(run, _)| run.clone());
         let compacted = merge
@@ -310,6 +347,7 @@ impl AppendLogState {
         Ok(ViewLogCapture {
             next_sequence: self.next_sequence,
             frontier: self.frontier,
+            idle: self.idle,
             retained,
             compacted,
             sealed,
@@ -407,12 +445,13 @@ impl AppendLogState {
             .map(|batch| batch.batch.clone())
             .collect();
         let memory_rows = memory.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let horizon = self.horizon_frontier();
         let committed = self.retention.retained(
             &self.committed,
-            self.frontier,
+            horizon,
             u64::try_from(memory_rows).unwrap_or(u64::MAX),
         );
-        (committed, memory, self.frontier)
+        (committed, memory, horizon)
     }
 
     pub(super) const fn retention(&self) -> &ViewRetention {

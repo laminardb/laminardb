@@ -44,6 +44,13 @@ fn times(log: &AppendLogState) -> Vec<i64> {
     column.values().to_vec()
 }
 
+const fn active(watermark: i64) -> InputFrontier {
+    InputFrontier {
+        watermark: Some(watermark),
+        idle: false,
+    }
+}
+
 fn event_time(interval_ms: i64) -> AppendLogState {
     AppendLogState::new(ViewRetention::EventTime {
         column: 0,
@@ -59,16 +66,40 @@ fn event_time_retention_reads_only_rows_at_or_after_the_horizon() {
 
     // Frontier 250 sets the horizon at 150: the earlier rows leave reads at once, and the
     // leading batch that lies wholly behind the horizon leaves memory on the next append.
-    log.advance_frontier(250);
+    log.advance_frontier(active(250));
     assert_eq!(times(&log), [150, 300]);
     append(&mut log, &[rows(&[50]), rows(&[260])]);
     assert_eq!(log.staged.len(), 2);
     assert_eq!(times(&log), [150, 300, 260]);
 
-    // A frontier never moves back, and the uninitialized watermark is ignored.
-    log.advance_frontier(200);
-    log.advance_frontier(i64::MIN);
+    // A frontier never moves back, and a stream without a watermark leaves it.
+    log.advance_frontier(active(200));
+    log.advance_frontier(InputFrontier::default());
     assert_eq!(log.frontier, Some(250));
+}
+
+#[test]
+fn a_committed_horizon_decides_retention_and_the_capture_reports_the_local_frontier() {
+    let mut log = event_time(100);
+    log.set_horizon(LogHorizon::Committed(None));
+    append(&mut log, &[rows(&[10, 20]), rows(&[150, 300])]);
+    // In a cluster this node's own frontier moves no horizon.
+    log.advance_frontier(active(250));
+    assert_eq!(times(&log), [10, 20, 150, 300]);
+
+    // The committed frontier does: horizon 120 hides the leading batch from reads, ingest
+    // drops a batch wholly behind it, and the capture leaves it out.
+    log.set_horizon(LogHorizon::Committed(Some(220)));
+    assert_eq!(times(&log), [150, 300]);
+    append(&mut log, &[rows(&[110]), rows(&[130])]);
+    assert_eq!(times(&log), [150, 300, 130]);
+    log.advance_frontier(InputFrontier {
+        watermark: None,
+        idle: true,
+    });
+    let capture = log.capture(1, true).unwrap();
+    assert_eq!(capture.sealed.map(|segment| segment.rows), Some(3));
+    assert_eq!((capture.frontier, capture.idle), (Some(250), true));
 }
 
 #[test]
@@ -92,7 +123,7 @@ fn a_capture_keeps_only_committed_segments_inside_the_horizon() {
     assert_eq!(second.retained, [(LOG_PARTITION, 0)]);
     log.commit(2);
 
-    log.advance_frontier(250);
+    log.advance_frontier(active(250));
     let third = log.capture(3, true).unwrap();
     assert_eq!(third.retained, [(LOG_PARTITION, 1)]);
     assert!(third.sealed.is_none());

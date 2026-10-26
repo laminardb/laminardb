@@ -9,11 +9,14 @@ mod pruning;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::datatypes::SchemaRef;
-use laminar_core::checkpoint::{CheckpointManifest, CheckpointStore, CommittedCheckpointRef};
+use laminar_core::checkpoint::{
+    CheckpointManifest, CheckpointScope, CheckpointStore, CommittedCheckpointRef, ViewLog,
+};
 use laminar_core::checkpoint_decision::CheckpointDecisionStore;
 
 use super::admission::MvLimits;
@@ -140,8 +143,28 @@ pub(crate) struct PinnedCut {
     /// Earliest participant capture time of the cut, in Unix milliseconds.
     pub(crate) taken_at_ms: u64,
     manifests: Arc<[CheckpointManifest]>,
+    /// The frontier each append view's retention follows at this cut.
+    log_frontiers: LogFrontiers,
     deadline: Instant,
     _pin: ReadPin,
+}
+
+/// Where a cut records the frontier an append view's retention follows.
+enum LogFrontiers {
+    /// A local cut: the frontier its one participant logged.
+    Logged,
+    /// A cluster cut: the committed frontier its index carries for every participant.
+    Committed(BTreeMap<String, i64>),
+}
+
+impl PinnedCut {
+    /// The frontier `log` of `view` keeps rows against at this cut.
+    pub(crate) fn log_frontier(&self, view: &str, log: &ViewLog) -> Option<i64> {
+        match &self.log_frontiers {
+            LogFrontiers::Logged => log.frontier,
+            LogFrontiers::Committed(frontiers) => frontiers.get(view).copied(),
+        }
+    }
 }
 
 impl CommittedViews {
@@ -320,11 +343,16 @@ impl CommittedViews {
             .map(|manifest| manifest.timestamp_ms)
             .min()
             .unwrap_or(cut.taken_at_ms);
+        let log_frontiers = match cut.index.scope {
+            CheckpointScope::Local => LogFrontiers::Logged,
+            CheckpointScope::Cluster => LogFrontiers::Committed(cut.index.view_frontiers.clone()),
+        };
         Ok(PinnedCut {
             epoch: cut.index.epoch,
             checkpoint_id: cut.index.checkpoint_id,
             taken_at_ms,
             manifests,
+            log_frontiers,
             deadline,
             _pin: pin,
         })

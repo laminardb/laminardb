@@ -356,6 +356,7 @@ fn manifest_with_view_log(new: &[u8], prior: &[u8]) -> CheckpointManifest {
         view: "recent".into(),
         next_sequence: 2,
         frontier: Some(30),
+        idle: false,
         segments: vec![
             view_log_segment(older, 0, 0, prior),
             view_log_segment(current, 1, 0, new),

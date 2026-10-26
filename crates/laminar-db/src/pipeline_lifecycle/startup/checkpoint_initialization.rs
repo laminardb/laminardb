@@ -277,7 +277,8 @@ impl LaminarDB {
     }
 
     /// Serve committed view reads from `reader_store`, and start the services that follow
-    /// each commit: freshness monitoring and append-log compaction.
+    /// each commit: freshness monitoring and append-log compaction. In a cluster, append-log
+    /// retention follows each view's committed frontier.
     fn start_committed_view_reads(
         &self,
         coord: &crate::checkpoint_coordinator::CheckpointCoordinator,
@@ -293,6 +294,10 @@ impl LaminarDB {
                 coord.committed_reads(),
                 self.config.materialized_view_read_cache_bytes,
             )));
+            #[cfg(feature = "cluster")]
+            if self.cluster_controller.lock().is_some() {
+                views.follow_committed_frontiers(coord.committed_reads().0);
+            }
             views.freshness_contracts()
         };
         crate::mv_store::spawn_freshness_monitor(freshness, coord.committed_reads().0, metrics);

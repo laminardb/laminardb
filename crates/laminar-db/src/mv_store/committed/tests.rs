@@ -1,17 +1,16 @@
 //! Reads of a synthesized two-participant committed cut, the shape a cluster checkpoint has:
 //! each participant lists the vnode frames it owns and its own view-log segment.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, TimestampMillisecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use bytes::Bytes;
 use datafusion::prelude::{col, lit};
 use laminar_core::checkpoint::{
     checkpoint_sha256, ByteRange, CheckpointAssignmentFence, CheckpointAttempt, CheckpointManifest,
-    CheckpointParticipant, CheckpointScope, CheckpointStore, NodeDataObject,
+    CheckpointParticipant, CheckpointScope, CheckpointStore, EventTimeBounds, NodeDataObject,
     ObjectStoreCheckpointStore, PipelineIdentity, StateChunkId, StateFrame, StateFrameKey, ViewLog,
     ViewLogSegment,
 };
@@ -22,10 +21,11 @@ use object_store::ObjectStore;
 use super::*;
 use crate::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
 use crate::mv_store::checkpoint::batches_to_ipc;
-use crate::mv_store::{MvStore, ViewKey};
+use crate::mv_store::{MvStore, ViewKey, ViewRetention};
 
 const KEY_GROUPS: u16 = 4;
-/// Participant, the vnodes it owns, and the keys its `events` segment holds.
+/// Participant, the vnodes it owns, and the keys its `events` segment holds. Key `k` happened at
+/// `k × 100` ms.
 const PARTICIPANTS: [(u64, [u16; 2], &[i64]); 2] = [(1, [0, 1], &[1, 2]), (2, [2, 3], &[3])];
 
 fn key_groups() -> KeyGroupCount {
@@ -45,8 +45,28 @@ fn int_column(values: Vec<i64>) -> ArrayRef {
     Arc::new(Int64Array::from(values))
 }
 
-/// `counts` holds keys 1..=20 with n = 10 × k; `events` is an append view.
-fn view_store() -> MvStore {
+fn events_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+    ]))
+}
+
+fn events_rows(keys: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        events_schema(),
+        vec![
+            int_column(keys.to_vec()),
+            Arc::new(TimestampMillisecondArray::from(
+                keys.iter().map(|k| k * 100).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// `counts` holds keys 1..=20 with n = 10 × k; `events` is an append view stored as `events`.
+fn view_store(events: MvStorageMode) -> MvStore {
     let mut store = MvStore::new();
     store
         .create_mv(
@@ -58,13 +78,7 @@ fn view_store() -> MvStore {
             },
         )
         .unwrap();
-    store
-        .create_mv(
-            "events",
-            int_schema(&["k"]),
-            MvStorageMode::append_rows(100),
-        )
-        .unwrap();
+    store.create_mv("events", events_schema(), events).unwrap();
     let keys: Vec<i64> = (1..=20).collect();
     let changes = RecordBatch::try_from_iter(vec![
         ("k", int_column(keys.clone())),
@@ -80,9 +94,8 @@ fn view_store() -> MvStore {
 }
 
 fn participant_manifest(
-    participant: u64,
-    vnodes: [u16; 2],
-    events: &[i64],
+    (participant, vnodes, events): (u64, [u16; 2], &[i64]),
+    frontier: Option<i64>,
     frames: &[(u32, Bytes)],
     deployment_id: &str,
     fence: &CheckpointAssignmentFence,
@@ -117,8 +130,8 @@ fn participant_manifest(
     manifest.node_data.object_length = node_data.len() as u64;
     manifest.node_data.sha256 = checkpoint_sha256(&node_data);
 
-    let rows = RecordBatch::try_from_iter(vec![("k", int_column(events.to_vec()))]).unwrap();
-    let segment = batches_to_ipc(&int_schema(&["k"]), [&rows]).unwrap();
+    let rows = events_rows(events);
+    let segment = batches_to_ipc(&events_schema(), [&rows]).unwrap();
     manifest.view_log = Some(NodeDataObject {
         chunk,
         object_length: segment.len() as u64,
@@ -127,7 +140,8 @@ fn participant_manifest(
     manifest.view_logs = vec![ViewLog {
         view: "events".into(),
         next_sequence: 1,
-        frontier: None,
+        frontier,
+        idle: false,
         segments: vec![ViewLogSegment {
             partition: vnodes[0],
             sequence: 0,
@@ -138,7 +152,10 @@ fn participant_manifest(
             },
             sha256: checkpoint_sha256(&segment),
             rows: events.len() as u64,
-            event_time: None,
+            event_time: Some(EventTimeBounds {
+                min: events[0] * 100,
+                max: events[events.len() - 1] * 100,
+            }),
         }],
     }];
     (manifest, node_data.into(), segment.into())
@@ -160,8 +177,16 @@ struct SynthesizedCut {
     _cuts: tokio::sync::watch::Sender<Option<Arc<CommittedCut>>>,
 }
 
-/// One committed cut of two participants, written to an in-memory object store.
 async fn synthesized_cut() -> SynthesizedCut {
+    synthesized_cut_with(MvStorageMode::append_rows(100), [None, None]).await
+}
+
+/// One committed cut of two participants, written to an in-memory object store, where each
+/// participant logged `events` with its frontier in `frontiers`.
+async fn synthesized_cut_with(
+    events: MvStorageMode,
+    frontiers: [Option<i64>; 2],
+) -> SynthesizedCut {
     let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
     let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
@@ -173,13 +198,13 @@ async fn synthesized_cut() -> SynthesizedCut {
         })
         .collect();
     let fence = CheckpointAssignmentFence::from_owner_map(9, &[1, 1, 2, 2], participants).unwrap();
-    let mut store = view_store();
+    let mut store = view_store(events);
     let frames = store.full_view_frames("counts");
     let mut prepared = Vec::new();
-    for (participant, vnodes, events) in PARTICIPANTS {
+    for (shape, frontier) in PARTICIPANTS.into_iter().zip(frontiers) {
         let (manifest, node_data, segment) =
-            participant_manifest(participant, vnodes, events, &frames, &deployment_id, &fence);
-        let writer = checkpoint_store(&objects, participant);
+            participant_manifest(shape, frontier, &frames, &deployment_id, &fence);
+        let writer = checkpoint_store(&objects, shape.0);
         writer
             .save_view_log(manifest.view_log.as_ref().unwrap(), &[segment])
             .await
@@ -205,7 +230,7 @@ async fn synthesized_cut() -> SynthesizedCut {
             CheckpointScope::Cluster,
             Some(fence),
             None,
-            &BTreeMap::new(),
+            &crate::checkpoint_coordinator::CommittedFrontiers::default(),
             &prepared,
             None,
         )
@@ -280,6 +305,67 @@ async fn a_cut_reads_each_view_from_every_participant() {
         .await
         .unwrap();
     assert_eq!(values(&rows, 0), [1, 2, 3]);
+}
+
+#[tokio::test]
+async fn a_cluster_cut_keeps_append_rows_against_its_committed_frontier() {
+    let interval = MvStorageMode::AppendLog {
+        retention: ViewRetention::EventTime {
+            column: 1,
+            interval_ms: 150,
+        },
+    };
+    // Participant 1 alone would keep rows from 150 ms and drop key 1. The cut's frontier is the
+    // participants' minimum, 200, so every participant keeps rows from 50 ms.
+    let synthesized = synthesized_cut_with(interval.clone(), [Some(300), Some(200)]).await;
+    let cut = synthesized
+        .views
+        .pin(CommittedRead::Latest, deadline())
+        .await
+        .unwrap();
+    let events = synthesized.store.view_shape("events").unwrap();
+    let rows = cut
+        .read_view(&synthesized.views, &events, &[])
+        .await
+        .unwrap();
+    assert_eq!(values(&rows, 0), [1, 2, 3]);
+
+    // At frontier 400 the horizon is 250 on both participants: only key 3 remains.
+    let synthesized = synthesized_cut_with(interval, [Some(400), Some(400)]).await;
+    let cut = synthesized
+        .views
+        .pin(CommittedRead::Latest, deadline())
+        .await
+        .unwrap();
+    let rows = cut
+        .read_view(&synthesized.views, &events, &[])
+        .await
+        .unwrap();
+    assert_eq!(values(&rows, 0), [3]);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn a_cluster_store_keeps_live_rows_against_the_newest_committed_frontier() {
+    let interval = MvStorageMode::AppendLog {
+        retention: ViewRetention::EventTime {
+            column: 1,
+            interval_ms: 150,
+        },
+    };
+    let mut synthesized = synthesized_cut_with(interval, [Some(300), Some(200)]).await;
+    let store = &mut synthesized.store;
+    store.follow_committed_frontiers(synthesized._cuts.subscribe());
+    store.update("events", &events_rows(&[1, 2, 3]));
+    // This node's frontier alone would keep only rows from 850 ms; the cut's is 200.
+    store.advance_view_frontiers(|_| {
+        Some(crate::operator_graph::InputFrontier {
+            watermark: Some(1_000),
+            idle: false,
+        })
+    });
+    let rows = store.to_record_batch("events").unwrap().unwrap();
+    assert_eq!(values(&[rows], 0), [1, 2, 3]);
 }
 
 #[tokio::test]

@@ -431,15 +431,15 @@ impl CheckpointCoordinator {
         } else {
             CheckpointScope::Local
         };
-        let predecessor_source_watermarks = self
-            .predecessor_source_watermarks_until(predecessor.as_ref(), deadline)
+        let predecessor_frontiers = self
+            .predecessor_frontiers_until(predecessor.as_ref(), deadline)
             .await?;
         let candidate = self.build_committed_index(
             inventory.attempt,
             scope,
             inventory.assignment_fence.clone(),
             predecessor,
-            &predecessor_source_watermarks,
+            &predecessor_frontiers,
             &manifests,
             None,
         )?;

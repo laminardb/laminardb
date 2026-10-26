@@ -10,8 +10,10 @@ use arrow::datatypes::SchemaRef;
 use laminar_core::changelog::WEIGHT_COLUMN;
 use laminar_core::state::KeyGroupCount;
 
+use crate::checkpoint_coordinator::committed_reads::CommittedCuts;
 use crate::error::DbError;
 use crate::operator::capability::OperatorStateClass;
+use crate::operator_graph::InputFrontier;
 
 mod admission;
 mod append_log;
@@ -27,8 +29,8 @@ mod statement_snapshot;
 mod transition;
 mod upsert;
 use admission::{MvLimits, PreparedUpdate};
-use append_log::AppendLogState;
 pub(crate) use append_log::{spawn_compactor as spawn_log_compactor, LogRead, ViewRetention};
+use append_log::{AppendLogState, LogHorizon};
 pub(crate) use committed::CommittedViews;
 pub use committed::{CommittedRead, CommittedReadError};
 pub(crate) use frames::RestoredView;
@@ -203,6 +205,8 @@ pub(crate) struct MvStore {
     log_checkpoint: Option<u64>,
     /// The checkpoint attempt whose view-log capture awaits its outcome.
     log_capture: Option<u64>,
+    /// In a cluster, the committed cuts whose view frontiers append-log retention follows.
+    horizon_cuts: Option<CommittedCuts>,
     freshness: Arc<FreshnessContracts>,
 }
 
@@ -223,6 +227,7 @@ impl MvStore {
             committed: None,
             log_checkpoint: None,
             log_capture: None,
+            horizon_cuts: None,
             freshness: Arc::default(),
         }
     }
@@ -238,6 +243,34 @@ impl MvStore {
 
     pub(crate) fn committed_views(&self) -> Option<Arc<CommittedViews>> {
         self.committed.clone()
+    }
+
+    /// In a cluster, keep append-log rows against each view's frontier at the newest of `cuts`
+    /// rather than this node's own frontier.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn follow_committed_frontiers(&mut self, cuts: CommittedCuts) {
+        self.horizon_cuts = Some(cuts);
+        self.install_log_horizons();
+    }
+
+    /// Point every append log's retention at the frontier this store follows.
+    fn install_log_horizons(&mut self) {
+        let committed = self
+            .horizon_cuts
+            .as_mut()
+            .map(|cuts| cuts.borrow_and_update().clone());
+        for (name, entry) in &mut self.entries {
+            let Some(log) = entry.log.as_mut() else {
+                continue;
+            };
+            log.set_horizon(match &committed {
+                None => LogHorizon::Local,
+                Some(cut) => LogHorizon::Committed(
+                    cut.as_ref()
+                        .and_then(|cut| cut.index.view_frontiers.get(name).copied()),
+                ),
+            });
+        }
     }
 
     /// A view whose state a cluster cannot keep yet: an append log or a multiset placed by row.
@@ -272,6 +305,7 @@ impl MvStore {
         self.entries
             .insert(name.to_string(), MvEntry::new(schema, mode)?);
         self.has_any.store(true, Ordering::Release);
+        self.install_log_horizons();
         Ok(())
     }
 
@@ -333,14 +367,22 @@ impl MvStore {
         Ok(())
     }
 
-    /// Advance each append view's retention frontier to its stream's output watermark.
+    /// Advance each append view's frontier to its stream's output frontier, and in a cluster
+    /// follow a newly committed cut.
     pub(crate) fn advance_view_frontiers(
         &mut self,
-        mut watermark: impl FnMut(&str) -> Option<i64>,
+        mut stream: impl FnMut(&str) -> Option<InputFrontier>,
     ) {
+        if self
+            .horizon_cuts
+            .as_ref()
+            .is_some_and(|cuts| cuts.has_changed().unwrap_or(false))
+        {
+            self.install_log_horizons();
+        }
         for (name, entry) in &mut self.entries {
-            if let (Some(log), Some(watermark)) = (entry.log.as_mut(), watermark(name)) {
-                log.advance_frontier(watermark);
+            if let (Some(log), Some(stream)) = (entry.log.as_mut(), stream(name)) {
+                log.advance_frontier(stream);
             }
         }
     }
@@ -406,15 +448,18 @@ impl MvStore {
                 MvEntry::new(Arc::clone(&entry.schema), entry.mode.clone())?,
             );
         }
-        Ok(Self {
+        let mut image = Self {
             entries,
             limits: self.limits,
             has_any: Arc::clone(&self.has_any),
             committed: self.committed.clone(),
             log_checkpoint: None,
             log_capture: None,
+            horizon_cuts: self.horizon_cuts.clone(),
             freshness: Arc::clone(&self.freshness),
-        })
+        };
+        image.install_log_horizons();
+        Ok(image)
     }
 
     /// Restore a complete checkpoint into a private image: changelog views from the slices their
@@ -432,6 +477,7 @@ impl MvStore {
             view.install(&mut image.entries)?;
         }
         image.restore_view_logs(manifest)?;
+        image.install_log_horizons();
         Ok(image)
     }
 }

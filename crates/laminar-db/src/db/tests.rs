@@ -956,6 +956,7 @@ async fn record_two_vnode_acquisition_checkpoint(
         channel_progress: Vec::new(),
         source_watermarks: Default::default(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let reference = authority.create_committed_checkpoint(&index).await.unwrap();
     authority

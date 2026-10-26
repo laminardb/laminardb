@@ -642,6 +642,7 @@ async fn retention_protected_cut_rejects_missing_or_corrupt_incremental_state() 
                 channel_progress: Vec::new(),
                 source_watermarks: BTreeMap::new(),
                 checkpoint_watermark: None,
+                view_frontiers: Default::default(),
             };
             let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
             load_protected_checkpoint(&store, &decisions, &reference)
@@ -884,6 +885,7 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
             channel_progress: Vec::new(),
             source_watermarks: BTreeMap::new(),
             checkpoint_watermark: None,
+            view_frontiers: Default::default(),
         };
         let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
         decisions
@@ -998,6 +1000,7 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
     decisions
@@ -1163,7 +1166,7 @@ async fn committed_index_binds_sorted_participants_predecessor_and_assignment_fe
             CheckpointScope::Cluster,
             Some(fence.clone()),
             Some(predecessor.clone()),
-            &BTreeMap::new(),
+            &CommittedFrontiers::default(),
             &manifests,
             None,
         )
@@ -1210,7 +1213,7 @@ async fn initial_committed_index_derives_an_empty_inventory_source_cut_from_its_
             CheckpointScope::Local,
             None,
             None,
-            &BTreeMap::new(),
+            &CommittedFrontiers::default(),
             &[(manifest, encoded)],
             None,
         )
@@ -1255,7 +1258,7 @@ async fn committed_index_retains_a_predecessor_cut_for_an_empty_source_inventory
             CheckpointScope::Local,
             None,
             None,
-            &BTreeMap::new(),
+            &CommittedFrontiers::default(),
             &[(predecessor_manifest, predecessor_bytes)],
             None,
         )
@@ -1265,7 +1268,7 @@ async fn committed_index_retains_a_predecessor_cut_for_an_empty_source_inventory
         .await
         .unwrap();
     let retained = coordinator
-        .predecessor_source_watermarks_until(
+        .predecessor_frontiers_until(
             Some(&predecessor),
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
@@ -1418,6 +1421,7 @@ async fn recovery_aborts_and_seals_unresolved_candidate_index() {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let candidate = decisions.create_committed_checkpoint(&index).await.unwrap();
     drop(interrupted);
@@ -1483,6 +1487,7 @@ async fn commit_winner_prevents_prepared_artifact_sealing() {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
     decisions
@@ -2126,7 +2131,7 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
             CheckpointScope::Cluster,
             Some(fence.clone()),
             None,
-            &BTreeMap::new(),
+            &CommittedFrontiers::default(),
             &manifests,
             None,
         )
@@ -2287,7 +2292,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
             CheckpointScope::Cluster,
             Some(fence.clone()),
             None,
-            &BTreeMap::new(),
+            &CommittedFrontiers::default(),
             &nonportable_manifests,
             None,
         )
@@ -2304,7 +2309,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
             CheckpointScope::Cluster,
             Some(fence.clone()),
             None,
-            &BTreeMap::new(),
+            &CommittedFrontiers::default(),
             &predecessor_manifests,
             None,
         )
@@ -2365,7 +2370,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
             CheckpointScope::Cluster,
             Some(fence.clone()),
             Some(predecessor.clone()),
-            &predecessor_index.source_watermarks,
+            &CommittedFrontiers::of(&predecessor_index).unwrap(),
             &manifests,
             None,
         )
@@ -2535,6 +2540,7 @@ async fn topology_retention_pins_root_chunks_and_rejects_damaged_root_state() {
                 channel_progress: Vec::new(),
                 source_watermarks: BTreeMap::new(),
                 checkpoint_watermark: None,
+                view_frontiers: Default::default(),
             };
             let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
             if checkpoint_id == 1 {

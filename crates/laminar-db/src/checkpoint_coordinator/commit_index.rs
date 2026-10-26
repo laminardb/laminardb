@@ -8,6 +8,72 @@ use super::{
 #[cfg(feature = "cluster")]
 use super::{LeaderProof, QuorumPeer};
 
+/// The frontiers a committed cut carries forward to its successor.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CommittedFrontiers {
+    pub(crate) sources: BTreeMap<String, i64>,
+    pub(crate) views: BTreeMap<String, i64>,
+}
+
+impl CommittedFrontiers {
+    pub(crate) fn of(index: &CommittedCheckpointIndex) -> Result<Self, DbError> {
+        Ok(Self {
+            sources: index
+                .effective_source_watermarks()
+                .map_err(DbError::Checkpoint)?,
+            views: index.view_frontiers.clone(),
+        })
+    }
+
+    /// The source decision frontiers of the next cut: these, for the sources it still has,
+    /// advanced by its channel progress.
+    fn next_sources(
+        &self,
+        source_names: &[String],
+        channel_progress: &[ChannelProgress],
+    ) -> Result<BTreeMap<String, i64>, DbError> {
+        let mut source_watermarks = self
+            .sources
+            .iter()
+            .filter(|(source, _)| source_names.binary_search(source).is_ok())
+            .map(|(source, watermark)| (source.clone(), *watermark))
+            .collect::<BTreeMap<_, _>>();
+        for (source, frontier) in
+            channel_progress_frontiers_by_source(channel_progress).map_err(DbError::Checkpoint)?
+        {
+            let Some(frontier) = frontier else {
+                continue;
+            };
+            if source_watermarks
+                .get(source)
+                .is_some_and(|predecessor| *predecessor > frontier)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "source '{source}' decision watermark regressed below its committed predecessor"
+                )));
+            }
+            source_watermarks.insert(source.to_owned(), frontier);
+        }
+        Ok(source_watermarks)
+    }
+
+    /// The committed view frontiers of the next cut. A local cut has none: its participant's
+    /// logged frontier is the view's.
+    fn next_views(
+        &self,
+        scope: CheckpointScope,
+        manifests: &[(CheckpointManifest, Bytes)],
+    ) -> BTreeMap<String, i64> {
+        match scope {
+            CheckpointScope::Cluster => laminar_core::checkpoint::fold_view_frontiers(
+                &self.views,
+                manifests.iter().map(|(manifest, _)| manifest),
+            ),
+            CheckpointScope::Local => BTreeMap::new(),
+        }
+    }
+}
+
 const PARTICIPANT_MANIFEST_POLL_INITIAL: Duration = Duration::from_millis(10);
 const PARTICIPANT_MANIFEST_POLL_MAX: Duration = Duration::from_millis(250);
 
@@ -130,42 +196,36 @@ impl CheckpointCoordinator {
             .transpose()
     }
 
-    pub(super) async fn predecessor_source_watermarks_until(
+    pub(super) async fn predecessor_frontiers_until(
         &self,
         predecessor: Option<&CommittedCheckpointRef>,
         deadline: tokio::time::Instant,
-    ) -> Result<BTreeMap<String, i64>, DbError> {
+    ) -> Result<CommittedFrontiers, DbError> {
         let Some(predecessor) = predecessor else {
-            return Ok(BTreeMap::new());
+            return Ok(CommittedFrontiers::default());
         };
-        if let Some((cached_reference, source_watermarks)) =
-            self.last_committed_source_watermarks.as_ref()
-        {
+        if let Some((cached_reference, frontiers)) = self.last_committed_frontiers.as_ref() {
             if cached_reference == predecessor {
-                return Ok(source_watermarks.clone());
+                return Ok(frontiers.clone());
             }
         }
         let store = self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
-                "committed predecessor source-watermark read requires a decision store".into(),
+                "committed predecessor frontier read requires a decision store".into(),
             )
         })?;
         let committed =
             tokio::time::timeout_at(deadline, store.load_committed_checkpoint(predecessor))
                 .await
                 .map_err(|_| {
-                    DbError::Checkpoint(
-                        "committed predecessor source-watermark read timed out".into(),
-                    )
+                    DbError::Checkpoint("committed predecessor frontier read timed out".into())
                 })?
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
-                        "committed predecessor source-watermark read failed: {error}"
+                        "committed predecessor frontier read failed: {error}"
                     ))
                 })?;
-        committed
-            .effective_source_watermarks()
-            .map_err(DbError::Checkpoint)
+        CommittedFrontiers::of(&committed)
     }
 
     fn recovery_fence(&self) -> impl Fn() -> bool + Clone + Send + 'static {
@@ -338,7 +398,7 @@ impl CheckpointCoordinator {
         scope: CheckpointScope,
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         predecessor: Option<CommittedCheckpointRef>,
-        predecessor_source_watermarks: &BTreeMap<String, i64>,
+        predecessor_frontiers: &CommittedFrontiers,
         manifests: &[(CheckpointManifest, Bytes)],
         quorum_watermark: Option<CheckpointWatermark>,
     ) -> Result<CommittedCheckpointIndex, DbError> {
@@ -394,30 +454,12 @@ impl CheckpointCoordinator {
         let source_names = manifests
             .first()
             .map_or_else(Vec::new, |(manifest, _)| manifest.source_names.clone());
-        let mut source_watermarks = predecessor_source_watermarks
-            .iter()
-            .filter(|(source, _)| source_names.binary_search(source).is_ok())
-            .map(|(source, watermark)| (source.clone(), *watermark))
-            .collect::<BTreeMap<_, _>>();
-        for (source, frontier) in
-            channel_progress_frontiers_by_source(&channel_progress).map_err(DbError::Checkpoint)?
-        {
-            let Some(frontier) = frontier else {
-                continue;
-            };
-            if source_watermarks
-                .get(source)
-                .is_some_and(|predecessor| *predecessor > frontier)
-            {
-                return Err(DbError::Checkpoint(format!(
-                    "source '{source}' decision watermark regressed below its committed predecessor"
-                )));
-            }
-            source_watermarks.insert(source.to_owned(), frontier);
-        }
+        let source_watermarks =
+            predecessor_frontiers.next_sources(&source_names, &channel_progress)?;
         let reassignment_portable = manifests
             .first()
             .is_some_and(|(manifest, _)| manifest.reassignment_portable);
+        let view_frontiers = predecessor_frontiers.next_views(scope, manifests);
         let index = CommittedCheckpointIndex {
             version: COMMITTED_CHECKPOINT_INDEX_VERSION,
             deployment_id: self.expected_deployment_id()?.to_owned(),
@@ -435,6 +477,7 @@ impl CheckpointCoordinator {
             channel_progress,
             source_watermarks,
             checkpoint_watermark,
+            view_frontiers,
         };
         let manifest_views = manifests
             .iter()
@@ -457,7 +500,7 @@ impl CheckpointCoordinator {
         scope: CheckpointScope,
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         predecessor: Option<CommittedCheckpointRef>,
-        predecessor_source_watermarks: &BTreeMap<String, i64>,
+        predecessor_frontiers: &CommittedFrontiers,
         manifests: &[(CheckpointManifest, Bytes)],
         quorum_watermark: Option<CheckpointWatermark>,
         deadline: tokio::time::Instant,
@@ -467,7 +510,7 @@ impl CheckpointCoordinator {
             scope,
             assignment_fence.clone(),
             predecessor.clone(),
-            predecessor_source_watermarks,
+            predecessor_frontiers,
             manifests,
             quorum_watermark,
         )?;

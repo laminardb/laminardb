@@ -154,6 +154,7 @@ impl PinnedCut {
                 continue;
             };
             found = true;
+            let frontier = self.log_frontier(&shape.name, log);
             for partition in log
                 .segments
                 .chunk_by(|left, right| left.partition == right.partition)
@@ -162,7 +163,7 @@ impl PinnedCut {
                     .iter()
                     .filter(|segment| match retention {
                         ViewRetention::EventTime { .. } => {
-                            !retention.expired(segment.event_time, log.frontier)
+                            !retention.expired(segment.event_time, frontier)
                                 && pruning.keeps_segment(segment.event_time)
                         }
                         ViewRetention::Unbounded { .. } => {
@@ -180,7 +181,7 @@ impl PinnedCut {
                     })
                     .await?;
                 let rows = rows.iter().flat_map(|rows| rows.iter().cloned()).collect();
-                batches.extend(retention.apply(rows, log.frontier)?);
+                batches.extend(retention.apply(rows, frontier)?);
             }
         }
         if !found {

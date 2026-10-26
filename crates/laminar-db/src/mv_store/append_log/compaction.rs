@@ -230,7 +230,7 @@ impl Merge<'_> {
         let rewrite = Rewrite {
             retention: self.retention,
             kept_by,
-            frontier: self.log.frontier,
+            frontier: self.cut.log_frontier(self.view, self.log),
             schema: self.schema,
             position: (first.partition, first.sequence),
         };

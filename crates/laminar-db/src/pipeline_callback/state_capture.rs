@@ -356,7 +356,7 @@ impl ConnectorPipelineCallback {
             })?;
         let materialized_views = {
             let mut store = self.mv_store.write();
-            store.advance_view_frontiers(|view| self.graph.stream_watermark(view));
+            store.advance_view_frontiers(|view| self.graph.stream_frontier(view));
             store.capture_view_logs(attempt.checkpoint_id, mv_budget)?
         };
         let table_budget = mv_budget

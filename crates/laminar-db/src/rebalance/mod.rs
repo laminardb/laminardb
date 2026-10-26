@@ -4139,6 +4139,7 @@ pub(crate) async fn record_assignment_checkpoint_for_test(
         channel_progress: Vec::new(),
         source_watermarks: Default::default(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     admit_cluster_checkpoint_artifacts_for_test(authority, proof, &index).await;
     let reference = authority.create_committed_checkpoint(&index).await.unwrap();

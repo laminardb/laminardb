@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::{GraphNode, OperatorGraph};
+use super::{GraphNode, InputFrontier, OperatorGraph};
 use crate::mv_store::{MvStore, RestoredView};
 use crate::operator::view_result::ViewResultOperator;
 
@@ -30,11 +30,14 @@ impl OperatorGraph {
         self.topo_dirty = true;
     }
 
-    /// The output watermark of stream `name`, once it has one.
-    pub(crate) fn stream_watermark(&self, name: &str) -> Option<i64> {
+    /// The output frontier of stream `name`.
+    pub(crate) fn stream_frontier(&self, name: &str) -> Option<InputFrontier> {
         let node = *self.output_map.get(name)?;
         let watermark = self.output_watermarks[node];
-        (watermark != i64::MIN).then_some(watermark)
+        Some(InputFrontier {
+            watermark: (watermark != i64::MIN).then_some(watermark),
+            idle: self.output_idle[node],
+        })
     }
 
     /// Bind the graph and every view result node to `store`.

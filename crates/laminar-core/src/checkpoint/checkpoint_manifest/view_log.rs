@@ -51,9 +51,14 @@ pub struct ViewLog {
     pub view: String,
     /// Sequence of the view's next segment; every retained segment is below it.
     pub next_sequence: u64,
-    /// Greatest event-time frontier the view had reached at this cut. An event-time retention
-    /// keeps exactly the rows at or after this frontier minus its interval.
+    /// Greatest event-time frontier the view had reached on this participant at this cut. In a
+    /// local cut an event-time retention keeps exactly the rows at or after this frontier minus
+    /// its interval; a cluster cut uses the committed index's view frontier instead.
     pub frontier: Option<i64>,
+    /// Whether every input of the view was idle at this cut. An idle participant's frontier
+    /// does not hold back the view's committed cluster frontier.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle: bool,
     /// Retained segments ordered by partition, then sequence.
     pub segments: Vec<ViewLogSegment>,
 }

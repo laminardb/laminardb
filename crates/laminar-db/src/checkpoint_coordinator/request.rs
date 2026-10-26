@@ -58,6 +58,7 @@ pub(crate) struct CapturedViewLog {
     pub(crate) view: String,
     pub(crate) next_sequence: u64,
     pub(crate) frontier: Option<i64>,
+    pub(crate) idle: bool,
     pub(crate) segments: Vec<CapturedViewLogSegment>,
 }
 

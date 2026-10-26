@@ -288,8 +288,8 @@ impl CheckpointCoordinator {
         let predecessor = self
             .authoritative_committed_predecessor_until(scope, deadline)
             .await?;
-        let predecessor_source_watermarks = self
-            .predecessor_source_watermarks_until(predecessor.as_ref(), deadline)
+        let predecessor_frontiers = self
+            .predecessor_frontiers_until(predecessor.as_ref(), deadline)
             .await?;
         let index = self
             .build_validated_committed_index_until(
@@ -297,7 +297,7 @@ impl CheckpointCoordinator {
                 scope,
                 assignment_fence.cloned(),
                 predecessor.clone(),
-                &predecessor_source_watermarks,
+                &predecessor_frontiers,
                 &prepared.manifests,
                 quorum_watermark,
                 deadline,
@@ -375,7 +375,7 @@ impl CheckpointCoordinator {
             reference.clone(),
             prepared.manifests.iter().map(|(manifest, _)| manifest),
         )));
-        self.last_committed_source_watermarks = Some((reference, index.source_watermarks.clone()));
+        self.last_committed_frontiers = Some((reference, super::CommittedFrontiers::of(&index)?));
         self.last_committed_manifest = prepared
             .manifests
             .iter()

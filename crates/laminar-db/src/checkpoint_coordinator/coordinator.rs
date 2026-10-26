@@ -63,7 +63,7 @@ impl CheckpointCoordinator {
             prepared: HashMap::new(),
             last_committed_manifest: None,
             last_committed_ref: None,
-            last_committed_source_watermarks: None,
+            last_committed_frontiers: None,
             failure_requires_recovery: false,
             local_watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             #[cfg(feature = "cluster")]
@@ -354,7 +354,7 @@ impl CheckpointCoordinator {
 
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn set_last_committed_ref_for_test(&mut self, reference: CommittedCheckpointRef) {
-        self.last_committed_source_watermarks = None;
+        self.last_committed_frontiers = None;
         self.last_committed_ref = Some(reference);
     }
 

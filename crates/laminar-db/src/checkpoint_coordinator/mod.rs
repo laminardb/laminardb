@@ -13,6 +13,7 @@ mod commit_index;
 pub(crate) mod committed_reads;
 #[cfg(feature = "cluster")]
 pub(crate) use cluster_read_pin::start_cluster_read_pin;
+pub(crate) use commit_index::CommittedFrontiers;
 mod coordinator;
 #[cfg(feature = "cluster")]
 mod follower_completion;
@@ -212,7 +213,7 @@ pub struct CheckpointCoordinator {
     prepared: HashMap<CheckpointAttempt, (Arc<CheckpointManifest>, Bytes)>,
     last_committed_manifest: Option<Arc<CheckpointManifest>>,
     last_committed_ref: Option<CommittedCheckpointRef>,
-    last_committed_source_watermarks: Option<(CommittedCheckpointRef, BTreeMap<String, i64>)>,
+    last_committed_frontiers: Option<(CommittedCheckpointRef, commit_index::CommittedFrontiers)>,
     failure_requires_recovery: bool,
     local_watermark: laminar_core::checkpoint::CheckpointWatermark,
     #[cfg(feature = "cluster")]

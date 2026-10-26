@@ -109,6 +109,7 @@ impl ViewLogPacker {
             view,
             next_sequence,
             frontier,
+            idle,
             mut segments,
         } = captured;
         segments.sort_unstable_by_key(CapturedViewLogSegment::position);
@@ -160,6 +161,7 @@ impl ViewLogPacker {
             view,
             next_sequence,
             frontier,
+            idle,
             segments: packed,
         })
     }

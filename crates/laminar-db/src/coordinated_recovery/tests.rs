@@ -3365,6 +3365,7 @@ async fn recovery_target_is_the_exact_commit_and_global_index() {
         channel_progress: Vec::new(),
         source_watermarks: Default::default(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let authority = controller.checkpoint_authority().unwrap();
     let proof = controller.capture_leader_proof().unwrap();
