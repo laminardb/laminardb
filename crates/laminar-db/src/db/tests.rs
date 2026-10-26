@@ -10210,6 +10210,23 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                 .await
                 .expect("a view that drops its key routes each row to the owner of its vnode");
             assert!(db.mv_store.read().places_by_row("row_placed_view_ok"));
+            // Routing a view's rows to their owners is one more remote exchange: a key-dropping
+            // view over three chained exchanges crosses four.
+            for chained in [
+                "CREATE MATERIALIZED VIEW by_total AS \
+                 SELECT total, COUNT(*) AS ids FROM keyed_view_ok GROUP BY total",
+                "CREATE MATERIALIZED VIEW by_ids AS \
+                 SELECT ids, COUNT(*) AS totals FROM by_total GROUP BY ids",
+            ] {
+                db.execute(chained).await.unwrap();
+            }
+            let deep = assert_cluster_rejection(
+                &db,
+                "too_deep",
+                "CREATE MATERIALIZED VIEW too_deep AS SELECT totals FROM by_ids",
+            )
+            .await;
+            assert!(deep.contains("crosses 4 remote exchanges"), "{deep}");
             db.execute(
                 "CREATE STREAM projection_ok AS \
                  SELECT id, value FROM left_events WHERE value > 0",

@@ -295,7 +295,7 @@ impl LaminarDB {
 
     /// Reject a stream whose pipeline crosses more remote exchanges than cluster checkpoints are
     /// measured for; every flush wave moves rows one remote hop while sources are held. A stream
-    /// that reads only sources crosses at most one.
+    /// that reads only sources crosses at most one; a materialized view is a stream input too.
     async fn validate_cluster_exchange_depth(
         &self,
         object_kind: &str,
@@ -305,7 +305,9 @@ impl LaminarDB {
     ) -> Result<(), DbError> {
         if !crate::sql_analysis::extract_table_references(query_sql)
             .iter()
-            .any(|input| self.catalog.get_stream_entry(input).is_some())
+            .any(|input| {
+                self.catalog.get_stream_entry(input).is_some() || self.mv_store.read().has_mv(input)
+            })
         {
             return Ok(());
         }
