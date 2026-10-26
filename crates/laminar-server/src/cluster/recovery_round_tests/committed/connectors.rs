@@ -4,10 +4,13 @@ use arrow_array::{
     Array as _, BinaryArray, Int64Array, RecordBatch, TimestampMicrosecondArray, UInt32Array,
 };
 use laminar_connectors::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourcePosition,
-    SourceRowPositionCapability, SourceRowPositions, WriteResult,
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceDrainOutcome,
+    SourceDrainRequest, SourceDrainResolution, SourcePosition, SourceRowPositionCapability,
+    SourceRowPositions, WriteResult,
 };
+use laminar_core::checkpoint::AssignmentDrainId;
 use laminar_core::state::PartitionKeyCodecV1;
+use object_store::ObjectStoreExt as _;
 
 #[derive(Default)]
 pub(super) struct ReplayProbe {
@@ -56,6 +59,61 @@ struct ReplaySource {
     owned: Vec<u8>,
     assignment: std::num::NonZeroU64,
     checkpoint: SourceCheckpoint,
+    registry: Option<(Arc<VnodeRegistry>, StateNodeId)>,
+    /// Shared storage carrying partition cursors from a draining owner to its successor, as a
+    /// provider's own offset store would.
+    handoff: Arc<dyn object_store::ObjectStore>,
+    /// Cursor writes of a live handoff in progress; the source reads nothing until it resolves.
+    draining: Option<tokio::task::JoinHandle<object_store::Result<()>>>,
+}
+
+fn handoff_cursor(partition: u8) -> object_store::path::Path {
+    object_store::path::Path::from(format!("fixture-handoff/partition-{partition}"))
+}
+
+impl ReplaySource {
+    /// Install the cursor of every owned partition with its channel and assignment binding.
+    fn install_cursors(
+        &mut self,
+        cursor: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), ConnectorError> {
+        let mut checkpoint = SourceCheckpoint::new();
+        for partition in &self.owned {
+            let key = format!("partition-{partition}");
+            let offset = cursor(&key)
+                .filter(|value| value.parse::<u64>().is_ok_and(|cursor| cursor <= 4))
+                .ok_or_else(|| {
+                    ConnectorError::ConfigurationError(
+                        "fixture resume cursor is missing or invalid".into(),
+                    )
+                })?;
+            checkpoint.set_offset(key, offset);
+        }
+        checkpoint.set_metadata("fixture", "bounded-replay-v1");
+        checkpoint.set_input_channels(
+            self.owned
+                .iter()
+                .map(|partition| vec![1, *partition])
+                .collect::<Vec<_>>(),
+        )?;
+        checkpoint.bind_assignment_version(self.assignment);
+        self.checkpoint = checkpoint;
+        Ok(())
+    }
+
+    fn own_assignment(&mut self) -> Result<(), ConnectorError> {
+        let (registry, node) = self.registry.as_ref().ok_or_else(|| {
+            ConnectorError::ConfigurationError("fixture assignment is absent".into())
+        })?;
+        let assignment = registry.versioned_snapshot();
+        self.assignment = std::num::NonZeroU64::new(assignment.version()).ok_or_else(|| {
+            ConnectorError::ConfigurationError("fixture assignment is absent".into())
+        })?;
+        self.owned = (0..2_u8)
+            .filter(|partition| assignment.owners()[usize::from(*partition)] == *node)
+            .collect();
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -80,14 +138,8 @@ impl SourceConnector for ReplaySource {
                 "unknown fixture source".into(),
             ));
         }
-        let assignment = registry.versioned_snapshot();
-        self.assignment = std::num::NonZeroU64::new(assignment.version()).ok_or_else(|| {
-            ConnectorError::ConfigurationError("fixture assignment is absent".into())
-        })?;
-        self.owned = (0..2_u8)
-            .filter(|partition| assignment.owners()[usize::from(*partition)] == node)
-            .collect();
-        Ok(())
+        self.registry = Some((registry, node));
+        self.own_assignment()
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -104,29 +156,10 @@ impl SourceConnector for ReplaySource {
                 ))
             }
         };
-        let mut checkpoint = SourceCheckpoint::new();
-        for partition in &self.owned {
-            let key = format!("partition-{partition}");
-            let offset = match (id, recovered.get_offset(&key)) {
-                (0, None) => "0",
-                (_, Some(value)) if value.parse::<u64>().is_ok_and(|cursor| cursor <= 4) => value,
-                _ => {
-                    return Err(ConnectorError::ConfigurationError(
-                        "fixture resume cursor is missing or invalid".into(),
-                    ))
-                }
-            };
-            checkpoint.set_offset(key, offset);
-        }
-        checkpoint.set_metadata("fixture", "bounded-replay-v1");
-        checkpoint.set_input_channels(
-            self.owned
-                .iter()
-                .map(|partition| vec![1, *partition])
-                .collect::<Vec<_>>(),
-        )?;
-        checkpoint.bind_assignment_version(self.assignment);
-        self.checkpoint = checkpoint;
+        self.install_cursors(|key| match (id, recovered.get_offset(key)) {
+            (0, None) => Some("0".into()),
+            (_, value) => value.map(str::to_owned),
+        })?;
         {
             let mut starts = self.probe.starts.lock();
             if starts.len() >= 8 {
@@ -155,8 +188,85 @@ impl SourceConnector for ReplaySource {
         .map_err(|_| ConnectorError::ConfigurationError("fixture recovery hold expired".into()))
     }
 
+    // Each poll delivers a whole record, so a paused source holds nothing past the boundary
+    // once its cursors are stored.
+    fn begin_drain(
+        &mut self,
+        _: &SourceDrainRequest,
+        _: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        let cursors = self
+            .owned
+            .iter()
+            .filter_map(|partition| {
+                let offset = self
+                    .checkpoint
+                    .get_offset(&format!("partition-{partition}"))?;
+                Some((handoff_cursor(*partition), offset.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        let handoff = Arc::clone(&self.handoff);
+        self.draining = Some(tokio::spawn(async move {
+            for (path, offset) in cursors {
+                handoff.put(&path, offset.into_bytes().into()).await?;
+            }
+            Ok(())
+        }));
+        Ok(())
+    }
+
+    fn poll_drain_ready(&mut self, _: AssignmentDrainId) -> Result<bool, ConnectorError> {
+        match self.draining.as_mut().map(futures::FutureExt::now_or_never) {
+            Some(None) => Ok(false),
+            Some(Some(Ok(Ok(())))) => Ok(true),
+            outcome => Err(ConnectorError::ConfigurationError(format!(
+                "fixture handoff cursors were not stored: {outcome:?}"
+            ))),
+        }
+    }
+
+    /// A committed handoff takes the acquired partitions' cursors from their former owner.
+    async fn finish_drain(
+        &mut self,
+        resolution: SourceDrainResolution,
+        _: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.draining = None;
+        if resolution.outcome == SourceDrainOutcome::Abort {
+            return Ok(());
+        }
+        let mut cursors = self
+            .checkpoint
+            .offsets()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        self.own_assignment()?;
+        for partition in &self.owned {
+            let key = format!("partition-{partition}");
+            if cursors.contains_key(&key) {
+                continue;
+            }
+            let stored = self
+                .handoff
+                .get(&handoff_cursor(*partition))
+                .await
+                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?
+                .bytes()
+                .await
+                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
+            let offset = String::from_utf8(stored.to_vec())
+                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
+            cursors.insert(key, offset);
+        }
+        self.install_cursors(|key| cursors.get(key).cloned())
+    }
+
     async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
         self.probe.polls.fetch_add(1, Ordering::Relaxed);
+        if self.draining.is_some() {
+            return Ok(None);
+        }
         let prefix = self.probe.prefix.load(Ordering::Acquire);
         for &partition in &self.owned {
             let key = format!("partition-{partition}");
@@ -311,6 +421,7 @@ pub(super) fn register(
     probe: Arc<ReplayProbe>,
     path: PathBuf,
     runtime: Runtime,
+    handoff: Arc<dyn object_store::ObjectStore>,
 ) -> impl FnOnce(&laminar_connectors::registry::ConnectorRegistry) -> Result<(), ConnectorError> {
     move |registry| {
         if runtime != Runtime::Aggregate {
@@ -337,6 +448,9 @@ pub(super) fn register(
                     owned: Vec::new(),
                     assignment: std::num::NonZeroU64::new(1).unwrap(),
                     checkpoint: SourceCheckpoint::new(),
+                    registry: None,
+                    handoff: Arc::clone(&handoff),
+                    draining: None,
                 }))
             }),
         )?;

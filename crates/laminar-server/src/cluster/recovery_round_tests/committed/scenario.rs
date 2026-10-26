@@ -308,7 +308,7 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     Ok(())
 }
 
-const VIEWS: [&str; 3] = [
+pub(super) const VIEWS: [&str; 3] = [
     "SELECT account, total, n FROM recovery_totals",
     "SELECT total FROM recovery_amounts",
     "SELECT account, amount FROM recovery_rows",
@@ -316,7 +316,7 @@ const VIEWS: [&str; 3] = [
 
 /// The sorted rows of each of [`VIEWS`] once each partition delivered `prefix` records;
 /// partition `p` delivers account `keys[1 - p]` with amounts `10 * i + p`.
-fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> {
+pub(super) fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> {
     let mut totals = Vec::new();
     let mut rows = Vec::new();
     for (partition, account) in [(0, keys[1]), (1, keys[0])] {
@@ -332,6 +332,29 @@ fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> {
         view.sort_unstable();
     }
     vec![totals, amounts, rows]
+}
+
+pub(super) async fn leader(processes: &mut [Process; 2]) -> Result<usize> {
+    for (index, process) in processes.iter_mut().enumerate() {
+        if process.observe().await?.leader {
+            return Ok(index);
+        }
+    }
+    Err(anyhow!("neither database holds leadership"))
+}
+
+/// Commit a checkpoint of exactly `participants` and return its epoch.
+pub(super) async fn checkpoint(process: &mut Process, participants: &[u64]) -> Result<u64> {
+    match process.request(&Command::Checkpoint).await? {
+        Response::Committed {
+            reference,
+            participants: committed,
+            ..
+        } if committed == participants => Ok(reference.epoch),
+        response => Err(anyhow!(
+            "expected a checkpoint of {participants:?}: {response:?}"
+        )),
+    }
 }
 
 pub(super) async fn read_views(
@@ -396,6 +419,7 @@ async fn qualify_recovered_owner(
 enum Scenario {
     FailedOwner,
     Migration,
+    Drain,
     Process(u64),
 }
 
@@ -407,6 +431,12 @@ pub(super) async fn run() -> Result<()> {
 
 pub(super) async fn run_migration() -> Result<()> {
     run_pair(Runtime::Aggregate, Scenario::Migration)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn run_drain() -> Result<()> {
+    run_pair(Runtime::Aggregate, Scenario::Drain)
         .await
         .map(|_| ())
 }
@@ -457,6 +487,9 @@ async fn run_pair(runtime: Runtime, scenario: Scenario) -> Result<process::Trans
                 .await
                 .map(|()| (Vec::new(), Vec::new())),
             Scenario::Migration => migration::qualify(&mut processes)
+                .await
+                .map(|()| (Vec::new(), Vec::new())),
+            Scenario::Drain => rotation::qualify(&mut processes)
                 .await
                 .map(|()| (Vec::new(), Vec::new())),
             Scenario::Process(failed) => process::qualify(&mut processes, failed).await,

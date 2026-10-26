@@ -98,13 +98,14 @@ impl DatabasePeer {
         let (sender, address, registry) = self
             .peer
             .initialize(
-                objects,
+                Arc::clone(&objects),
                 &config.assignment,
                 Arc::clone(&self.assignments),
                 connectors::register(
                     Arc::clone(&self.probe),
                     root.join("output.jsonl"),
                     self.runtime,
+                    objects,
                 ),
             )
             .await?;
@@ -134,12 +135,22 @@ impl DatabasePeer {
             .ok_or_else(|| anyhow!("fixture registry is absent"))?;
         let starts = self.probe.starts.lock().clone();
         let output = self.probe.output.lock().clone();
-        let handoff = if registry.assignment_version() > 1 {
-            controller
-                .checkpoint_authority()?
-                .assignment_recovery_decision(registry.assignment_version())
-                .await?
-                .map(|decision| decision.recovery_checkpoint)
+        let authority = controller.checkpoint_authority()?;
+        let version = registry.assignment_version();
+        let handoff = if version > 1 {
+            match authority.assignment_recovery_decision(version).await {
+                Ok(decision) => decision.map(|decision| decision.recovery_checkpoint),
+                // A drain, not recovery, settled a live handoff's assignment.
+                Err(_)
+                    if authority
+                        .assignment_drain_decision(version)
+                        .await?
+                        .is_some() =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             None
         };
@@ -284,11 +295,14 @@ impl DatabasePeer {
         })
     }
 
-    fn remove_failed_peer(&mut self, failed: u64) -> Result<()> {
-        if self.peer.controller.instance_id() == NodeId(failed) || !self.rebalance_tasks.is_empty()
+    /// Start rebalancing after one membership change: `node` failed and left the membership,
+    /// or it is `Draining` and hands its vnodes over live.
+    fn change_membership(&mut self, node: u64, state: Option<NodeState>) -> Result<()> {
+        if (state.is_none() && self.peer.controller.instance_id() == NodeId(node))
+            || !self.rebalance_tasks.is_empty()
         {
             return Err(anyhow!(
-                "fixture accepts one failed-peer transition on the survivor"
+                "fixture accepts one membership change, and a failed peer only on the survivor"
             ));
         }
         let db = Arc::clone(self.db()?);
@@ -300,7 +314,13 @@ impl DatabasePeer {
         self.peer._membership.send(
             membership()
                 .into_iter()
-                .filter(|member| member.id != NodeId(failed))
+                .filter_map(|mut member| {
+                    if member.id != NodeId(node) {
+                        return Some(member);
+                    }
+                    member.state = state?;
+                    Some(member)
+                })
                 .collect(),
         )?;
         let config = laminar_db::rebalance::RebalanceConfig::test_defaults();
@@ -389,7 +409,8 @@ impl DatabasePeer {
                 self.probe.output.lock().clear();
                 self.clear_process_observation();
             }
-            Command::RemoveFailedPeer(failed) => self.remove_failed_peer(failed)?,
+            Command::RemoveFailedPeer(failed) => self.change_membership(failed, None)?,
+            Command::Drain(node) => self.change_membership(node, Some(NodeState::Draining))?,
             Command::ClearProcessObservation => self.clear_process_observation(),
             Command::Observe => return Ok(Response::Observed(Box::new(self.observe().await?))),
             Command::Checkpoint => return self.checkpoint().await,

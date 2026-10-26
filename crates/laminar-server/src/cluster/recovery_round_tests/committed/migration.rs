@@ -2,7 +2,7 @@
 //! which each database seeds from the slices it restored at the migration's cut, and drops the
 //! view placed by its full row.
 
-use super::scenario::{read_views, start_pair, wait_totals, Process};
+use super::scenario::{checkpoint, leader, read_views, start_pair, wait_totals, Process};
 use super::*;
 
 const OPERATION: u128 = 0x5d00_0001;
@@ -47,7 +47,7 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     let version = wait_active(processes).await?;
     println!("migration {OPERATION:#x} active as topology {version:?} on both databases");
     // The seeds hold the cut's rows, read on both databases.
-    let epoch = checkpoint(&mut processes[leader]).await?;
+    let epoch = checkpoint(&mut processes[leader], &[7, 8]).await?;
     for process in &mut *processes {
         assert_eq!(
             read_views(process, &VIEWS, Some(epoch)).await?,
@@ -58,7 +58,7 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
         process.done(&Command::Prefix(3)).await?;
     }
     wait_totals(processes, &BTreeMap::from([(keys[0], 63), (keys[1], 60)])).await?;
-    let epoch = checkpoint(&mut processes[leader]).await?;
+    let epoch = checkpoint(&mut processes[leader], &[7, 8]).await?;
     for process in &mut *processes {
         assert_eq!(
             read_views(process, &VIEWS, Some(epoch)).await?,
@@ -66,28 +66,6 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
         );
     }
     Ok(())
-}
-
-async fn leader(processes: &mut [Process; 2]) -> Result<usize> {
-    for (index, process) in processes.iter_mut().enumerate() {
-        if process.observe().await?.leader {
-            return Ok(index);
-        }
-    }
-    Err(anyhow!("neither database holds leadership"))
-}
-
-async fn checkpoint(process: &mut Process) -> Result<u64> {
-    match process.request(&Command::Checkpoint).await? {
-        Response::Committed {
-            reference,
-            participants,
-            ..
-        } if participants == [7, 8] => Ok(reference.epoch),
-        response => Err(anyhow!(
-            "expected a checkpoint both databases committed: {response:?}"
-        )),
-    }
 }
 
 /// Wait until the migration is Active and both databases run its topology.

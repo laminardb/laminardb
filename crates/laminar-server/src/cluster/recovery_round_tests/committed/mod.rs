@@ -14,6 +14,7 @@ mod child;
 mod connectors;
 mod migration;
 mod process;
+mod rotation;
 mod scenario;
 
 const CHILD_ENV: &str = "LAMINAR_DATABASE_RECOVERY_PEER";
@@ -45,6 +46,8 @@ enum Command {
     Prefix(u64),
     HoldRecovery,
     RemoveFailedPeer(u64),
+    /// Mark a node `Draining`, so the leader moves its vnodes to the other node live.
+    Drain(u64),
     ClearProcessObservation,
     Observe,
     Checkpoint,
@@ -143,4 +146,10 @@ async fn surviving_database_recovers_lost_vnodes_and_replays_the_committed_sourc
 #[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
 async fn two_databases_migrate_and_seed_views_from_the_cut() {
     scenario::run_migration().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_draining_database_hands_its_views_over_live() {
+    scenario::run_drain().await.unwrap();
 }
