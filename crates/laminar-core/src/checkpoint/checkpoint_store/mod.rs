@@ -243,9 +243,10 @@ pub trait CheckpointStore: Send + Sync {
         Err(view_log::unsupported_store_error())
     }
 
-    /// Delete a view-log object no retained manifest references.
+    /// Delete a view-log object no retained manifest references, if it exists. A store without
+    /// view logs holds none.
     async fn delete_view_log(&self, _chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
-        Err(view_log::unsupported_store_error())
+        Ok(())
     }
 
     /// Read and verify one prepared sink descriptor.

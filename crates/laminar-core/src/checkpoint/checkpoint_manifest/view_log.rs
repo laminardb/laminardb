@@ -13,6 +13,22 @@ use super::{
 /// the log's bytes rather than the checkpoints that wrote it.
 pub const MAX_VIEW_LOG_SEGMENTS: usize = 32_768;
 
+/// Most segments one cluster cut retains across all of its participants. Cleanup and topology
+/// migration load a cut's manifests, and a migration root beside its first target cut, within
+/// 16 MiB together; at about 285 encoded bytes a segment, two cuts at this budget stay near
+/// 13 MiB and leave room for state frames.
+pub const MAX_CLUSTER_VIEW_LOG_SEGMENTS: usize = 24_576;
+
+/// Most segments one manifest may retain when its cut has `participants` participants: in a
+/// cluster an even share of [`MAX_CLUSTER_VIEW_LOG_SEGMENTS`], and never more than
+/// [`MAX_VIEW_LOG_SEGMENTS`].
+#[must_use]
+pub fn view_log_segment_limit(participants: Option<usize>) -> usize {
+    participants.map_or(MAX_VIEW_LOG_SEGMENTS, |participants| {
+        MAX_VIEW_LOG_SEGMENTS.min(MAX_CLUSTER_VIEW_LOG_SEGMENTS / participants.max(1))
+    })
+}
+
 /// Inclusive event-time range of one segment's rows.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -124,10 +140,15 @@ pub(super) fn validate_view_logs(manifest: &CheckpointManifest, error: &mut impl
             validate_range(segment.range, object_length, &owner, error);
         }
     }
-    if segment_count > MAX_VIEW_LOG_SEGMENTS {
+    let limit = view_log_segment_limit(
+        manifest
+            .assignment_fence
+            .as_ref()
+            .map(|fence| fence.participants.len()),
+    );
+    if segment_count > limit {
         error(format!(
-            "view logs retain {segment_count} segments; a manifest admits at most \
-             {MAX_VIEW_LOG_SEGMENTS}"
+            "view logs retain {segment_count} segments; this manifest admits at most {limit}"
         ));
     }
     for reference in &manifest.referenced_view_logs {

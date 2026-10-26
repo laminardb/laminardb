@@ -457,6 +457,8 @@ impl CheckpointCoordinator {
         })
     }
 
+    /// Seal each participant's node-data object of an aborted attempt, and delete its view-log
+    /// object.
     async fn seal_participant_node_data_until(
         &self,
         inventory: &CheckpointArtifactInventory,
@@ -474,10 +476,13 @@ impl CheckpointCoordinator {
                     checkpoint_artifact_identity_sha256(inventory, chunk).map_err(DbError::from);
                 async move {
                     let artifact_identity = artifact_identity?;
+                    // No committed manifest references an aborted checkpoint's view-log object,
+                    // so it goes once the attempt's node data is sealed.
                     tokio::time::timeout_at(deadline, async {
                         store
                             .seal_aborted_node_data(chunk, &artifact_identity)
-                            .await
+                            .await?;
+                        store.delete_view_log(chunk).await
                     })
                     .await
                     .map_err(|_| {

@@ -1341,6 +1341,18 @@ async fn durable_abort_seals_only_its_exact_prepared_artifact_and_is_idempotent(
         .save_checkpoint(&unrelated, std::slice::from_ref(&unrelated_payload))
         .await
         .unwrap();
+    for chunk in [aborted.node_data.chunk, unrelated.node_data.chunk] {
+        let object = laminar_core::checkpoint::NodeDataObject {
+            chunk,
+            object_length: 4,
+            sha256: checkpoint_sha256(b"rows"),
+        };
+        coordinator
+            .store
+            .save_view_log(&object, &[Bytes::from_static(b"rows")])
+            .await
+            .unwrap();
+    }
 
     let attempt = CheckpointAttempt::canonical(1);
     coordinator
@@ -1390,6 +1402,9 @@ async fn durable_abort_seals_only_its_exact_prepared_artifact_and_is_idempotent(
         )
         .await
     );
+    let view_log = |chunk| coordinator.store.load_view_log_ranges(chunk, 4, &[]);
+    assert!(view_log(aborted.node_data.chunk).await.unwrap().is_none());
+    assert!(view_log(unrelated.node_data.chunk).await.unwrap().is_some());
 }
 
 #[tokio::test]

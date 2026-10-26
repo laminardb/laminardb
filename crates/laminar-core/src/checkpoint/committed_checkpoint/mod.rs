@@ -20,8 +20,8 @@ use crate::state::{KeyGroupCount, LOCAL_NODE_ID};
 
 pub use view_frontiers::fold_view_frontiers;
 pub use view_log_references::{
-    adopted_view_logs, validate_cut_view_logs, validate_departed_view_logs, AdoptedSegment,
-    AdoptedViewLog,
+    adopted_view_logs, check_view_log_adoption, validate_cut_view_logs,
+    validate_departed_view_logs, AdoptedSegment, AdoptedViewLog,
 };
 
 /// Current committed-checkpoint index format.

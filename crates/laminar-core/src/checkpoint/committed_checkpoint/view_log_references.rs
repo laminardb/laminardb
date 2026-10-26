@@ -6,7 +6,7 @@ use std::collections::btree_map::Entry;
 
 use super::{BTreeMap, CheckpointManifest};
 use crate::checkpoint::{
-    ByteRange, CheckpointAssignmentFence, StateChunkId, ViewLogSegment, MAX_VIEW_LOG_SEGMENTS,
+    view_log_segment_limit, ByteRange, CheckpointAssignmentFence, StateChunkId, ViewLogSegment,
 };
 
 /// One segment a survivor adopts from a participant that left, with the view-log object that
@@ -38,13 +38,33 @@ pub struct AdoptedViewLog {
 ///
 /// # Errors
 /// Returns an error when departed logs have no survivor to adopt them, when a survivor would
-/// hold more segments than one manifest admits, or when a departed segment's object is
-/// untracked.
+/// hold more segments than its share of the cluster budget, or when a departed segment's object
+/// is untracked.
 pub fn adopted_view_logs(
     cut: &[CheckpointManifest],
     target: &CheckpointAssignmentFence,
     adopter: u64,
 ) -> Result<Vec<AdoptedViewLog>, String> {
+    plan_adoption(cut, target, Some(adopter))
+}
+
+/// Whether the survivors of `target` can adopt the logs of the participants of `cut` it lacks.
+///
+/// # Errors
+/// Returns the error [`adopted_view_logs`] would return to any survivor.
+pub fn check_view_log_adoption(
+    cut: &[CheckpointManifest],
+    target: &CheckpointAssignmentFence,
+) -> Result<(), String> {
+    plan_adoption(cut, target, None).map(drop)
+}
+
+fn plan_adoption(
+    cut: &[CheckpointManifest],
+    target: &CheckpointAssignmentFence,
+    adopter: Option<u64>,
+) -> Result<Vec<AdoptedViewLog>, String> {
+    let limit = view_log_segment_limit(Some(target.participants.len()));
     let mut manifests: Vec<&CheckpointManifest> = cut.iter().collect();
     manifests.sort_unstable_by_key(|manifest| manifest.participant_id);
     let (survivors, departed): (Vec<_>, Vec<_>) = manifests
@@ -66,18 +86,20 @@ pub fn adopted_view_logs(
                 .min_by_key(|(id, held)| (**held, **id))
                 .ok_or_else(|| {
                     format!(
-                        "participant {} left with view logs, and no surviving participant can                          adopt them",
+                        "participant {} left with view logs, and no surviving participant can \
+                         adopt them",
                         manifest.participant_id
                     )
                 })?;
             *held = held.saturating_add(log.segments.len());
-            if *held > MAX_VIEW_LOG_SEGMENTS {
+            if *held > limit {
                 return Err(format!(
-                    "participant {chosen} would hold {held} view-log segments after adopting                      view '{}' from participant {}; a manifest admits at most                      {MAX_VIEW_LOG_SEGMENTS}",
+                    "participant {chosen} would hold {held} view-log segments after adopting \
+                     view '{}' from participant {}; its share of the cluster budget is {limit}",
                     log.view, manifest.participant_id
                 ));
             }
-            if chosen != adopter {
+            if adopter != Some(chosen) {
                 continue;
             }
             let segments = log
@@ -374,12 +396,19 @@ mod tests {
             .unwrap_err()
             .contains("no surviving participant"));
 
-        let mut full = manifest(1, vec![segment(chunk(1, 5), 0)]);
-        full.view_logs[0].segments = vec![segment(chunk(1, 5), 0); MAX_VIEW_LOG_SEGMENTS];
-        let cut = [full, manifest(3, vec![segment(leaver, 0)])];
-        assert!(adopted_view_logs(&cut, &fence(&[1]), 1)
-            .unwrap_err()
-            .contains("at most"));
+        // Two survivors share the cluster budget, and both already hold their whole share.
+        let share = view_log_segment_limit(Some(2));
+        let mut first = manifest(1, vec![segment(chunk(1, 5), 0)]);
+        first.view_logs[0].segments = vec![segment(chunk(1, 5), 0); share];
+        let mut second = manifest(2, vec![segment(chunk(2, 5), 0)]);
+        second.view_logs[0].segments = vec![segment(chunk(2, 5), 0); share];
+        let cut = [first, second, manifest(3, vec![segment(leaver, 0)])];
+        let error = check_view_log_adoption(&cut, &fence(&[1, 2])).unwrap_err();
+        assert!(error.contains("share of the cluster budget"), "{error}");
+        assert_eq!(
+            adopted_view_logs(&cut, &fence(&[1, 2]), 2).unwrap_err(),
+            error
+        );
     }
 
     #[test]

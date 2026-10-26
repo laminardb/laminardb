@@ -464,3 +464,17 @@ fn only_a_cluster_manifest_references_another_participants_view_log() {
     cluster.view_logs[0].segments[0].chunk = newer;
     assert!(refuses(&cluster));
 }
+
+#[test]
+fn a_cluster_participant_holds_an_even_share_of_the_view_log_budget() {
+    assert_eq!(view_log_segment_limit(None), MAX_VIEW_LOG_SEGMENTS);
+    assert_eq!(
+        view_log_segment_limit(Some(1)),
+        MAX_CLUSTER_VIEW_LOG_SEGMENTS
+    );
+    assert_eq!(view_log_segment_limit(Some(3)), 8_192);
+    assert_eq!(
+        view_log_segment_limit(Some(0)),
+        MAX_CLUSTER_VIEW_LOG_SEGMENTS
+    );
+}

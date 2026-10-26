@@ -41,10 +41,11 @@ pub use barrier::{
 };
 
 pub use checkpoint_manifest::{
-    checkpoint_artifact_intent_sha256, checkpoint_descriptor_sha256, checkpoint_sha256, ByteRange,
-    ChannelProgress, CheckpointManifest, ConnectorCheckpoint, EventTimeBounds, NodeDataObject,
-    PipelineIdentity, PreparedSinkArtifactIntent, PreparedSinkDescriptor, ReferencedStateChunk,
-    StateChunkId, StateFrame, StateFrameKey, ViewLog, ViewLogSegment, MAX_VIEW_LOG_SEGMENTS,
+    checkpoint_artifact_intent_sha256, checkpoint_descriptor_sha256, checkpoint_sha256,
+    view_log_segment_limit, ByteRange, ChannelProgress, CheckpointManifest, ConnectorCheckpoint,
+    EventTimeBounds, NodeDataObject, PipelineIdentity, PreparedSinkArtifactIntent,
+    PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId, StateFrame, StateFrameKey, ViewLog,
+    ViewLogSegment, MAX_CLUSTER_VIEW_LOG_SEGMENTS, MAX_VIEW_LOG_SEGMENTS,
     PIPELINE_IDENTITY_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 pub use checkpoint_store::{
@@ -55,10 +56,10 @@ pub use checkpoint_store::{
     MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_AGGREGATE_BYTES, MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_BYTES,
 };
 pub use committed_checkpoint::{
-    adopted_view_logs, canonical_json_bytes, canonical_json_sha256, fold_view_frontiers,
-    validate_cut_view_logs, validate_departed_view_logs, AdoptedSegment, AdoptedViewLog,
-    CheckpointScope, CheckpointWatermark, CommittedCheckpointIndex, CommittedCheckpointRef,
-    CommittedParticipantRef, COMMITTED_CHECKPOINT_INDEX_VERSION,
+    adopted_view_logs, canonical_json_bytes, canonical_json_sha256, check_view_log_adoption,
+    fold_view_frontiers, validate_cut_view_logs, validate_departed_view_logs, AdoptedSegment,
+    AdoptedViewLog, CheckpointScope, CheckpointWatermark, CommittedCheckpointIndex,
+    CommittedCheckpointRef, CommittedParticipantRef, COMMITTED_CHECKPOINT_INDEX_VERSION,
     MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
 };
 pub use subscription::{

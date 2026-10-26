@@ -358,6 +358,17 @@ impl CommittedViews {
         })
     }
 
+    /// Every participant manifest of the newest committed cut, if one has committed.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn latest_manifests(
+        &self,
+    ) -> Result<Option<Arc<[CheckpointManifest]>>, DbError> {
+        match self.latest() {
+            Some(cut) => self.manifests(&cut).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Every participant manifest of `cut`, verified against its committed index.
     async fn manifests(&self, cut: &CommittedCut) -> Result<Arc<[CheckpointManifest]>, DbError> {
         let checkpoint_id = cut.index.checkpoint_id;

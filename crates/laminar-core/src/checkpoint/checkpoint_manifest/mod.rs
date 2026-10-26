@@ -18,7 +18,10 @@ mod view_log;
 pub use sink_artifacts::{
     checkpoint_artifact_intent_sha256, PreparedSinkArtifactIntent, PreparedSinkDescriptor,
 };
-pub use view_log::{EventTimeBounds, ViewLog, ViewLogSegment, MAX_VIEW_LOG_SEGMENTS};
+pub use view_log::{
+    view_log_segment_limit, EventTimeBounds, ViewLog, ViewLogSegment,
+    MAX_CLUSTER_VIEW_LOG_SEGMENTS, MAX_VIEW_LOG_SEGMENTS,
+};
 
 /// Current checkpoint manifest format. Every other version is rejected.
 pub const CHECKPOINT_MANIFEST_VERSION: u32 = 11;
