@@ -1,7 +1,6 @@
 //! Serializable checkpoint shapes for aggregate and window state.
 //!
-//! `AggStateCheckpoint` is columnar; `GroupCheckpoint` (window/EOWC) and
-//! `EmittedCheckpoint` hold one-row IPC tuples.
+//! `AggStateCheckpoint` is columnar; `GroupCheckpoint` (window/EOWC) holds one-row IPC tuples.
 
 use arrow::datatypes::Schema;
 use xxhash_rust::xxh3::Xxh3;
@@ -36,6 +35,8 @@ pub(crate) struct GroupCheckpoint {
 /// Columnar running-aggregate state: all keys in one IPC batch, each accumulator's
 /// state across all groups in one IPC batch. Row `j` of `keys_ipc`, every
 /// `acc_state_ipc[i]`, `input_weights[j]`, and `last_updated_ms[j]` refer to the same group.
+/// A changelog's last emitted values are one IPC batch whose row `i` belongs to the group in row
+/// `emitted_groups[i]`; those rows strictly ascend, so each group has at most one entry.
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct AggStateCheckpoint {
     pub fingerprint: u64,
@@ -45,13 +46,8 @@ pub(crate) struct AggStateCheckpoint {
     pub acc_state_ipc: Vec<Vec<u8>>,
     pub input_weights: Vec<i64>,
     pub last_updated_ms: Vec<i64>,
-    pub last_emitted: Vec<EmittedCheckpoint>,
-}
-
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct EmittedCheckpoint {
-    pub key: Vec<u8>,
-    pub values: Vec<u8>,
+    pub emitted_groups: Vec<u32>,
+    pub emitted_values_ipc: Vec<u8>,
 }
 
 impl AggStateCheckpoint {
@@ -81,14 +77,8 @@ impl AggStateCheckpoint {
         }
         add(&mut bytes, roster::<i64>(self.input_weights.capacity())?)?;
         add(&mut bytes, roster::<i64>(self.last_updated_ms.capacity())?)?;
-        add(
-            &mut bytes,
-            roster::<EmittedCheckpoint>(self.last_emitted.capacity())?,
-        )?;
-        for emitted in &self.last_emitted {
-            add(&mut bytes, emitted.key.capacity())?;
-            add(&mut bytes, emitted.values.capacity())?;
-        }
+        add(&mut bytes, roster::<u32>(self.emitted_groups.capacity())?)?;
+        add(&mut bytes, self.emitted_values_ipc.capacity())?;
         Ok(bytes)
     }
 }

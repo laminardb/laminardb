@@ -2297,6 +2297,46 @@ async fn pending_group_deletion_survives_vnode_checkpoint() {
 }
 
 #[tokio::test]
+async fn a_restored_changelog_retracts_exactly_the_values_it_emitted() {
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let key_groups = KeyGroupCount::try_from(1_u32).unwrap();
+    let (_, mut original) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    original
+        .process_batch(&sum_pre_agg_batch(&["a", "b", "c"], &[1.0, 2.0, 3.0]), 10)
+        .unwrap();
+    original.emit().unwrap();
+    original
+        .process_batch(&sum_pre_agg_batch(&["d"], &[4.0]), 20)
+        .unwrap();
+    let checkpoints = capture_all_vnodes(&mut original).unwrap();
+    let (_, mut restored) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    for (vnode, checkpoint) in checkpoints {
+        restored.restore_vnode(vnode, 1, checkpoint).unwrap();
+    }
+
+    let next = sum_pre_agg_batch(&["a", "d"], &[10.0, 1.0]);
+    let sorted_lines = |state: &mut IncrementalAggState| {
+        state.process_batch(&next, 30).unwrap();
+        let output = arrow::util::pretty::pretty_format_batches(&state.emit().unwrap())
+            .unwrap()
+            .to_string();
+        let mut lines = output.lines().map(str::to_owned).collect::<Vec<_>>();
+        lines.sort();
+        lines
+    };
+    let expected = sorted_lines(&mut original);
+    assert_eq!(sorted_lines(&mut restored), expected);
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|line| line.starts_with("| "))
+            .count(),
+        4,
+        "a header, a's retraction and insertion, and d's first insertion"
+    );
+}
+
+#[tokio::test]
 async fn test_cascaded_avg_over_changelog() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
