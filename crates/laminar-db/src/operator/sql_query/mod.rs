@@ -2496,6 +2496,16 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn changelog_at_cut(&self) -> Option<Result<Vec<RecordBatch>, DbError>> {
+        match &self.state {
+            QueryState::Agg(aggregate) if self.emit_changelog => {
+                Some(aggregate.emitted_changelog())
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
     fn checkpoint_aligned_replay_pending(&self) -> bool {
         self.pending_cluster_input.is_some() || self.queued_remote_events != 0
     }

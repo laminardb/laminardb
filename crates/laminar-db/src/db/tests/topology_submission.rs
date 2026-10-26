@@ -1470,3 +1470,160 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
         .all(|view| view != "doomed_seen"));
     fixture.db.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn topology_sql_migration_seeds_a_new_view_from_its_upstream_at_the_cut() {
+    seeded_views_after_migration(false).await;
+}
+
+#[tokio::test]
+async fn topology_root_recovery_seeds_a_new_view_once() {
+    seeded_views_after_migration(true).await;
+}
+
+/// Views a migration adds over an existing view and aggregate hold the rows from before the cut,
+/// also when the target recovers from the migration root before its first checkpoint.
+async fn seeded_views_after_migration(recover_from_root: bool) {
+    let (fixture, _) = Box::pin(preparation_fixture_with_bootstrap(
+        1,
+        vec![
+            "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
+                .into(),
+            "CREATE STREAM relay AS SELECT id, total FROM totals".into(),
+        ],
+    ))
+    .await;
+    let probe = enable_runtime(&fixture);
+    probe.allow_parent_initial.store(true, Ordering::Release);
+    fixture
+        .authority
+        .controller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            fixture.process_lease.as_ref().unwrap(),
+        )
+        .await
+        .unwrap();
+    DbState::Created.store(&fixture.db.state);
+    fixture.db.enable_coordinated_recovery().unwrap();
+    Box::pin(fixture.db.start()).await.unwrap();
+    assert_eq!(
+        Box::pin(
+            fixture
+                .db
+                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(5))
+        )
+        .await
+        .unwrap(),
+        crate::ClusterStartupDisposition::Serving
+    );
+    let deliver = |ids: [i64; 3], first: u64| {
+        let batch = RecordBatch::try_new(
+            crate::temporal_test_source::schema(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(ids.to_vec())),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1000, 2000, 3000,
+                ])),
+                Arc::new(arrow::array::Int64Array::from(vec![1; 3])),
+            ],
+        )
+        .unwrap();
+        probe.output.lock().clear();
+        probe.input.lock().insert(
+            "trades".into(),
+            std::collections::VecDeque::from([runtime_probe::positioned(batch, first)]),
+        );
+    };
+    let old_output = || {
+        probe
+            .output
+            .lock()
+            .iter()
+            .any(|(topic, _)| topic == "old-output")
+    };
+
+    deliver([1, 2, 2], 0);
+    wait_until(old_output).await;
+    let parent = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(parent.success, "{parent:?}");
+
+    let unseedable = fixture
+        .db
+        .validate_cluster_topology_change(
+            TopologyVersion::LEGACY_BASELINE,
+            &["CREATE MATERIALIZED VIEW over_relay AS SELECT id, total FROM relay".into()],
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        unseedable.contains("keeps no rows to seed it"),
+        "{unseedable}"
+    );
+
+    let request = request(
+        1304,
+        vec![
+            "CREATE MATERIALIZED VIEW busy AS SELECT id, n FROM counts WHERE n > 1".into(),
+            "CREATE MATERIALIZED VIEW by_n AS SELECT n, COUNT(*) AS ids FROM counts GROUP BY n"
+                .into(),
+            "CREATE MATERIALIZED VIEW running AS SELECT id, total FROM totals".into(),
+        ],
+    );
+    Box::pin(fixture.db.submit_cluster_topology_change(&request))
+        .await
+        .unwrap();
+    active(&fixture, request.operation_id).await;
+    if recover_from_root {
+        let prior_starts = probe.starts.lock().len();
+        probe.block_start.store(true, Ordering::Release);
+        super::recovery::request_recovery(&fixture);
+        super::recovery::held_start(&fixture, &probe, prior_starts).await;
+        super::recovery::released(&fixture).await;
+        let runtime = fixture
+            .db
+            .installed_topology_runtime
+            .lock()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            runtime.recovery.as_ref().unwrap().selection.cut(),
+            laminar_core::cluster::control::TopologyRecoveryCut::MigrationRoot
+        );
+    }
+    deliver([1, 1, 1], 3);
+    wait_until(old_output).await;
+    let target = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(target.success, "{target:?}");
+
+    // Key 2 is not touched after the cut, so only the seed can hold it.
+    let read = |sql: &'static str| committed_pairs(&fixture.db, sql, target.epoch);
+    assert_eq!(read("SELECT id, n FROM counts").await, [(1, 4), (2, 2)]);
+    assert_eq!(read("SELECT id, n FROM busy").await, [(1, 4), (2, 2)]);
+    assert_eq!(read("SELECT n, ids FROM by_n").await, [(2, 1), (4, 1)]);
+    assert_eq!(
+        read("SELECT id, total FROM running").await,
+        [(1, 4), (2, 2)]
+    );
+
+    // The target checkpoint holds the seeded rows, so recovering from it seeds nothing again.
+    let prior_starts = probe.starts.lock().len();
+    super::recovery::restart_settled_target(&fixture, &probe, prior_starts).await;
+    super::recovery::released(&fixture).await;
+    deliver([3, 3, 3], 6);
+    wait_until(old_output).await;
+    let after = Box::pin(fixture.db.checkpoint()).await.unwrap();
+    assert!(after.success, "{after:?}");
+    let read = |sql: &'static str| committed_pairs(&fixture.db, sql, after.epoch);
+    assert_eq!(
+        read("SELECT id, n FROM busy").await,
+        [(1, 4), (2, 2), (3, 3)]
+    );
+    assert_eq!(
+        read("SELECT n, ids FROM by_n").await,
+        [(2, 1), (3, 1), (4, 1)]
+    );
+    fixture.db.shutdown().await.unwrap();
+}

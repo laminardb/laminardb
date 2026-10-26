@@ -300,6 +300,26 @@ impl RestoredView {
         self.entry
     }
 
+    /// The view's rows as a changelog that inserts each of them once.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn changelog(&self) -> Result<arrow::array::RecordBatch, DbError> {
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let rows = self.entry.to_record_batch()?;
+        let mut fields = rows.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        )));
+        let mut columns = rows.columns().to_vec();
+        columns.push(Arc::new(Int64Array::from(vec![1; rows.num_rows()])));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
+            DbError::Checkpoint(format!("view '{}' changelog: {error}", self.name))
+        })
+    }
+
     pub(super) fn install(self, entries: &mut HashMap<String, MvEntry>) -> Result<(), DbError> {
         let current = entries.get_mut(&self.name).ok_or_else(|| {
             DbError::Checkpoint(format!(

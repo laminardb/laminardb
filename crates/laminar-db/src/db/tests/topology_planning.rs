@@ -1317,7 +1317,6 @@ async fn topology_validation_rejects_implicit_reset_unsafe_removal_and_unsupport
         "CREATE OR REPLACE MATERIALIZED VIEW new_mv AS SELECT * FROM trades",
         "DROP MATERIALIZED VIEW absent_view",
         "DROP MATERIALIZED VIEW totals",
-        "CREATE MATERIALIZED VIEW unseeded_view AS SELECT id, total FROM totals",
         "CREATE SOURCE plain_ingress (id BIGINT)",
         "CREATE STREAM bad_schema AS SELECT missing_column FROM trades",
         "CREATE STREAM bad_dependency AS SELECT * FROM not_created",

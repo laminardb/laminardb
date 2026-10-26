@@ -34,6 +34,8 @@ mod keys;
 #[cfg(feature = "cluster")]
 mod output_sequence;
 mod scalar_ipc;
+#[cfg(feature = "cluster")]
+mod seeding;
 mod vnode_state;
 pub(crate) use checkpoints::AggStateArchiveRestoreProfile;
 #[cfg(feature = "cluster")]

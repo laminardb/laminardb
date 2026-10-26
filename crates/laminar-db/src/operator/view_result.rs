@@ -93,6 +93,13 @@ impl GraphOperator for ViewResultOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn changelog_at_cut(&self) -> Option<Result<Vec<RecordBatch>, DbError>> {
+        Some(self.restored.as_ref().map_or(Ok(Vec::new()), |restored| {
+            restored.changelog().map(|batch| vec![batch])
+        }))
+    }
+
+    #[cfg(feature = "cluster")]
     fn prepare_vnode_transition(
         &mut self,
         transition: crate::operator_graph::ManagedVnodeTransition<'_>,

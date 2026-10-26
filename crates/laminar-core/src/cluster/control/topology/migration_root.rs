@@ -164,8 +164,7 @@ impl TopologyMigrationRoot {
                 }
                 ClusterTopologyObjectTransition::AddFutureOnly => {
                     if object.managed_state_contract.is_some()
-                        && object.initialization
-                            != super::TopologyInitialization::EmptyManagedStateAtCut
+                        && !object.initialization.starts_empty_at_cut()
                     {
                         return Err(TopologyError::Unsupported(
                             "new managed state requires an explicit empty-state cut contract"

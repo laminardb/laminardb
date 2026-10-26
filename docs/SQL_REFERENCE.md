@@ -519,10 +519,12 @@ moves them with their vnodes when ownership changes. Each node keeps the part of
 view's log that it produced. When a node leaves, through rebalancing or failure, another node
 takes over its log in the next checkpoint without copying it. A topology migration that adds,
 replaces or drops other objects keeps every view and its rows. A migration may also add a view
-(`CREATE MATERIALIZED VIEW`, which starts empty at the migration's checkpoint and sees only later
-input) or drop one (`DROP MATERIALIZED VIEW` without `CASCADE`); it cannot drop and recreate the
-same view, and it rejects a new view over an existing aggregate or view, whose earlier changes it
-would miss. `LaminarDB::query_committed` on any node reads every view at one committed checkpoint,
+(`CREATE MATERIALIZED VIEW`) or drop one (`DROP MATERIALIZED VIEW` without `CASCADE`), but not
+drop and recreate the same view. A new view over an existing aggregate or view starts from that
+input's rows at the migration's checkpoint, then follows its later changes; a new view over a
+source starts empty there and sees only later rows. A new view over a stream that only reshapes
+an aggregate's changes is rejected, because no node keeps that stream's rows; define it over the
+aggregate. `LaminarDB::query_committed` on any node reads every view at one committed checkpoint,
 from every node's checkpointed state; `SELECT` of a view on a cluster node fails, because the node
 holds only its part. Rejected with `[LDB-4007]` before connector I/O:
 

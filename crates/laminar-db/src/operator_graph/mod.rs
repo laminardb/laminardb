@@ -38,6 +38,8 @@ use laminar_sql::translator::{
 mod catalog_context;
 mod input_admission;
 mod process;
+#[cfg(feature = "cluster")]
+mod seeding;
 mod state_restore;
 mod views;
 
@@ -609,6 +611,13 @@ pub(crate) trait GraphOperator: Send {
     /// against a private candidate's store.
     #[cfg(feature = "cluster")]
     fn bind_view_store(&mut self, _store: &Arc<parking_lot::RwLock<crate::mv_store::MvStore>>) {}
+
+    /// The consolidated changelog this operator holds at the restored cut, one `+1` row per row
+    /// it holds, or `None` when it keeps none.
+    #[cfg(feature = "cluster")]
+    fn changelog_at_cut(&self) -> Option<Result<Vec<RecordBatch>, DbError>> {
+        None
+    }
 }
 
 /// One authoritative full vnode image prepared for a managed operator.

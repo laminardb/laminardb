@@ -90,14 +90,14 @@ impl OperatorGraph {
                 )));
             }
         }
-        if recovered.reassigned {
+        let (mut graph, restored) = if recovered.reassigned {
             self.validate_restore_frame_roster(
                 &whole,
                 &vnodes,
                 input.owned_vnodes(),
                 &empty_at_cut,
             )?;
-            return self.restore_reassigned_vnode_state_inner(
+            self.restore_reassigned_vnode_state_inner(
                 recovered
                     .committed
                     .assignment_fence
@@ -107,29 +107,30 @@ impl OperatorGraph {
                 input.assignment(),
                 &frames.into_iter().cloned().collect::<Vec<_>>(),
                 &empty_at_cut,
-            );
-        }
-        self.restore_state_frames_inner(
-            &whole,
-            &vnodes,
-            input.plan().assignment.vnode_count,
-            input.owned_vnodes(),
-            &empty_at_cut,
-        )
+            )?
+        } else {
+            self.restore_state_frames_inner(
+                &whole,
+                &vnodes,
+                input.plan().assignment.vnode_count,
+                input.owned_vnodes(),
+                &empty_at_cut,
+            )?
+        };
+        graph.seed_views_at_cut(recovered, input)?;
+        Ok((graph, restored))
     }
 
-    /// Operators that start empty at the cut: managed objects added by the migration, with each
-    /// split stream's stages and each view's result node, when restoring the parent's checkpoint;
-    /// none at a target checkpoint.
+    /// Managed operators that start empty at the cut: those of objects added by the migration,
+    /// with each split stream's stages and each view's result node, when restoring the parent's
+    /// checkpoint; none at a target checkpoint.
     #[cfg(feature = "cluster")]
     fn empty_state_at_cut(
         &self,
         recovered: &crate::recovery_manager::RecoveredState,
         input: &laminar_core::cluster::control::TopologyRestoreInput,
     ) -> Result<Vec<String>, DbError> {
-        use laminar_core::cluster::control::topology::{
-            ClusterTopologyObjectTransition, TopologyInitialization,
-        };
+        use laminar_core::cluster::control::topology::ClusterTopologyObjectTransition;
 
         let descriptor = input.descriptor();
         if recovered.committed.pipeline_identity != descriptor.parent_pipeline {
@@ -140,35 +141,35 @@ impl OperatorGraph {
                 "topology restore has a foreign checkpoint identity".into(),
             ));
         }
-        let mut empty: Vec<String> = descriptor
+        let added: Vec<&str> = descriptor
             .objects
             .iter()
             .filter(|object| {
                 object.transition == ClusterTopologyObjectTransition::AddFutureOnly
-                    && object.initialization == TopologyInitialization::EmptyManagedStateAtCut
+                    && object.initialization.starts_empty_at_cut()
                     && input
                         .root()
                         .future_only_objects
                         .binary_search(&object.name)
                         .is_ok()
             })
-            .map(|object| object.name.clone())
+            .map(|object| object.name.as_str())
             .collect();
-        let stages: Vec<String> = self
+        Ok(self
             .nodes
             .iter()
+            .filter(|node| !node.removed && node.capability.managed_state.is_some())
             .filter(|node| {
-                crate::sql_analysis::stage_owner(&node.name)
+                let owner = crate::sql_analysis::stage_owner(&node.name)
                     .or_else(|| {
                         node.name
                             .strip_suffix(laminar_core::mv::VIEW_RESULT_OPERATOR_SUFFIX)
                     })
-                    .is_some_and(|owner| empty.iter().any(|object| object == owner))
+                    .unwrap_or(&node.name);
+                added.contains(&owner)
             })
             .map(|node| node.name.to_string())
-            .collect();
-        empty.extend(stages);
-        Ok(empty)
+            .collect())
     }
 
     fn validate_restore_frame_roster(

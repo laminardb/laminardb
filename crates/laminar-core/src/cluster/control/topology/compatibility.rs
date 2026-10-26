@@ -43,6 +43,20 @@ pub enum TopologyInitialization {
     ResolveSourcePositionsOnce,
     /// Settle old-generation state/progress/effects at the cut and omit the object from the target.
     RetireAtCut,
+    /// Initialize a new materialized view's managed state empty at the exact cut, then apply
+    /// the rows its preserved upstream changelog holds at the cut before any subsequent input.
+    SeedFromUpstreamAtCut,
+}
+
+impl TopologyInitialization {
+    /// Whether the object's managed state starts empty at the cut.
+    #[must_use]
+    pub const fn starts_empty_at_cut(self) -> bool {
+        matches!(
+            self,
+            Self::EmptyManagedStateAtCut | Self::SeedFromUpstreamAtCut
+        )
+    }
 }
 
 /// Authorization still needed before this local plan can activate a target graph.
@@ -116,6 +130,25 @@ impl ClusterTopologyObjectPlan {
             }
             _ => TopologyInitialization::FutureOnlyAtCut,
         })
+    }
+
+    /// Whether this new view seeds from an upstream the migration preserves, in place of its
+    /// canonical empty start.
+    pub(super) fn seeds_from_preserved_upstream(&self, objects: &[Self]) -> bool {
+        self.initialization == TopologyInitialization::SeedFromUpstreamAtCut
+            && self.transition == ClusterTopologyObjectTransition::AddFutureOnly
+            && self.kind == CatalogObjectKind::MaterializedView
+            && self.managed_state_contract.is_some()
+            && self.dependencies.iter().any(|name| {
+                objects.iter().any(|dependency| {
+                    &dependency.name == name
+                        && dependency.transition == ClusterTopologyObjectTransition::Preserve
+                        && matches!(
+                            dependency.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
+                })
+            })
     }
 
     /// Whether `operator_id` is a state frame of this object: a stream's operator, or a
@@ -379,7 +412,8 @@ impl ClusterTopologyValidation {
                     .schema_sha256
                     .as_ref()
                     .is_some_and(|hash| !is_digest(hash))
-                || object.initialization != initialization
+                || (object.initialization != initialization
+                    && !object.seeds_from_preserved_upstream(&self.objects))
                 || object.dependencies.len() > 256
                 || !object.dependencies.windows(2).all(|pair| pair[0] < pair[1])
                 || object.dependencies.iter().any(|name| {
