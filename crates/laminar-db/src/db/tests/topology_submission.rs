@@ -1204,6 +1204,10 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
         vec![
             "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
                 .into(),
+            // Split into a stage and its owner; the migration maps the stage's frames to it.
+            "CREATE STREAM nested AS SELECT id, SUM(n) AS n FROM \
+             (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) per_id GROUP BY id"
+                .into(),
         ],
     ))
     .await;

@@ -363,7 +363,7 @@ async fn unknown_protocol_or_nonbaseline_version_is_rejected() {
 }
 
 #[test]
-fn a_view_owns_its_stream_frame_and_its_result_slices() {
+fn an_object_owns_its_stream_frame_its_result_slices_and_its_stages() {
     let object = |name: &str, kind| ClusterTopologyObjectPlan {
         name: name.into(),
         kind,
@@ -379,10 +379,14 @@ fn a_view_owns_its_stream_frame_and_its_result_slices() {
     let view = object("counts", CatalogObjectKind::MaterializedView);
     assert!(view.owns_state_frame("graph:counts"));
     assert!(view.owns_state_frame("graph:counts::view"));
+    assert!(view.owns_state_frame("graph:counts$stage1"));
     assert!(!view.owns_state_frame("graph:counts$stage1::view"));
     assert!(!view.owns_state_frame("counts::view"));
     let stream = object("counts", CatalogObjectKind::Stream);
     assert!(stream.owns_state_frame("graph:counts"));
+    assert!(stream.owns_state_frame("graph:counts$stage2"));
+    assert!(!stream.owns_state_frame("graph:counts$stage"));
+    assert!(!stream.owns_state_frame("graph:other$stage1"));
     assert!(!stream.owns_state_frame("graph:counts::view"));
     assert!(!object("counts", CatalogObjectKind::Source).owns_state_frame("graph:counts"));
 }

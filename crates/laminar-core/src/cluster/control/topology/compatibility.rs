@@ -152,12 +152,14 @@ impl ClusterTopologyObjectPlan {
     }
 
     /// Whether `operator_id` is a state frame of this object: a stream's operator, or a
-    /// materialized view's operator and the operator that owns its result slices.
+    /// materialized view's operator and the operator that owns its result slices, or a stage
+    /// split out of either's query.
     #[must_use]
     pub fn owns_state_frame(&self, operator_id: &str) -> bool {
         let Some(operator) = operator_id.strip_prefix("graph:") else {
             return false;
         };
+        let operator = crate::catalog::stage_owner(operator).unwrap_or(operator);
         match self.kind {
             CatalogObjectKind::Stream => operator == self.name,
             CatalogObjectKind::MaterializedView => {
