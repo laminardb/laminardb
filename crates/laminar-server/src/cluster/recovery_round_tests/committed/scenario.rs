@@ -160,7 +160,10 @@ pub(super) async fn wait_open(process: &mut Process, epoch: u64) -> Result<Recov
     .context("database did not open after durable Release")?
 }
 
-async fn wait_totals(processes: &mut [Process], expected: &BTreeMap<i64, i64>) -> Result<()> {
+pub(super) async fn wait_totals(
+    processes: &mut [Process],
+    expected: &BTreeMap<i64, i64>,
+) -> Result<()> {
     let mut last = BTreeMap::new();
     tokio::time::timeout(DEADLINE, async {
         loop {
@@ -267,7 +270,7 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     let committed_views = expected_views(keys, 2);
     for process in &mut *processes {
         assert_eq!(
-            read_views(process, Some(reference.epoch)).await?,
+            read_views(process, &VIEWS, Some(reference.epoch)).await?,
             committed_views
         );
     }
@@ -281,7 +284,7 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     qualify_recovered_owner(&mut processes[0], &reference, &cursors, &first).await?;
     // The departed node's committed slices and log stay readable at the handoff cut.
     assert_eq!(
-        read_views(&mut processes[0], Some(reference.epoch)).await?,
+        read_views(&mut processes[0], &VIEWS, Some(reference.epoch)).await?,
         committed_views
     );
     wait_totals(
@@ -299,7 +302,7 @@ async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     };
     assert_eq!(participants, [7]);
     assert_eq!(
-        read_views(&mut processes[0], Some(recovered.epoch)).await?,
+        read_views(&mut processes[0], &VIEWS, Some(recovered.epoch)).await?,
         expected_views(keys, 4)
     );
     Ok(())
@@ -331,18 +334,22 @@ fn expected_views(keys: [i64; 2], prefix: i64) -> Vec<Vec<Vec<i64>>> {
     vec![totals, amounts, rows]
 }
 
-async fn read_views(process: &mut Process, epoch: Option<u64>) -> Result<Vec<Vec<Vec<i64>>>> {
-    let mut views = Vec::new();
-    for sql in VIEWS {
+pub(super) async fn read_views(
+    process: &mut Process,
+    views: &[&str],
+    epoch: Option<u64>,
+) -> Result<Vec<Vec<Vec<i64>>>> {
+    let mut read = Vec::new();
+    for sql in views {
         match process
-            .request(&Command::ReadView(sql.into(), epoch))
+            .request(&Command::ReadView((*sql).into(), epoch))
             .await?
         {
-            Response::Rows(rows) => views.push(rows),
+            Response::Rows(rows) => read.push(rows),
             response => return Err(anyhow!("expected view rows: {response:?}")),
         }
     }
-    Ok(views)
+    Ok(read)
 }
 
 async fn qualify_recovered_owner(
@@ -385,11 +392,30 @@ async fn qualify_recovered_owner(
     Ok(())
 }
 
+/// What the parent drives once both databases are spawned.
+enum Scenario {
+    FailedOwner,
+    Migration,
+    Process(u64),
+}
+
 pub(super) async fn run() -> Result<()> {
-    run_process(Runtime::Aggregate, 8).await.map(|_| ())
+    run_pair(Runtime::Aggregate, Scenario::FailedOwner)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn run_migration() -> Result<()> {
+    run_pair(Runtime::Aggregate, Scenario::Migration)
+        .await
+        .map(|_| ())
 }
 
 pub(super) async fn run_process(runtime: Runtime, failed: u64) -> Result<process::Transcript> {
+    run_pair(runtime, Scenario::Process(failed)).await
+}
+
+async fn run_pair(runtime: Runtime, scenario: Scenario) -> Result<process::Transcript> {
     let root = tempfile::tempdir()?;
     let namespace = format!("committed-database/{}", Uuid::new_v4());
     let objects = shared_store(&namespace)?;
@@ -426,13 +452,14 @@ pub(super) async fn run_process(runtime: Runtime, failed: u64) -> Result<process
         }
     };
     let outcome = std::panic::AssertUnwindSafe(async {
-        match runtime {
-            Runtime::Aggregate => qualify(&mut processes)
+        match scenario {
+            Scenario::FailedOwner => qualify(&mut processes)
                 .await
                 .map(|()| (Vec::new(), Vec::new())),
-            Runtime::Native => process::qualify(&mut processes, failed).await,
-            #[cfg(feature = "process-remote")]
-            Runtime::RemoteRust => process::qualify(&mut processes, failed).await,
+            Scenario::Migration => migration::qualify(&mut processes)
+                .await
+                .map(|()| (Vec::new(), Vec::new())),
+            Scenario::Process(failed) => process::qualify(&mut processes, failed).await,
         }
     })
     .catch_unwind()

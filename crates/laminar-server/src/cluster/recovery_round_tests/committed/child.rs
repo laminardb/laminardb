@@ -1,6 +1,7 @@
 use super::*;
 use arrow_array::{Array as _, Int64Array};
 use connectors::ReplayProbe;
+use laminar_core::cluster::control::{CheckpointDecisionStore, TopologyCatalogState};
 use laminar_db::CommittedRead;
 
 struct DatabasePeer {
@@ -12,6 +13,7 @@ struct DatabasePeer {
     rebalance_shutdown: CancellationToken,
     rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
     runtime: Runtime,
+    objects: Arc<dyn object_store::ObjectStore>,
     #[cfg(feature = "process-remote")]
     worker: Option<tokio::task::JoinHandle<Result<(), laminar_db::DbError>>>,
 }
@@ -154,6 +156,7 @@ impl DatabasePeer {
                 .map_err(anyhow::Error::msg)?,
             release: controller.latest_committed_recover_release().await?,
             fault: self.db()?.last_fault(),
+            leader: controller.is_leader(),
             callbacks: self.probe.callbacks.lock().clone(),
             activity: self.probe.activity.lock().clone(),
         })
@@ -227,6 +230,58 @@ impl DatabasePeer {
         }
         rows.sort_unstable();
         Ok(Response::Rows(rows))
+    }
+
+    async fn adopt(&self) -> Result<()> {
+        let TopologyCatalogState::LegacySealed { manifest } =
+            self.peer.catalog.topology_state().await?
+        else {
+            return Err(anyhow!("fixture adopts only its sealed bootstrap catalog"));
+        };
+        let deployment = CheckpointDecisionStore::new(Arc::clone(&self.objects))
+            .load_deployment_id()
+            .await?
+            .ok_or_else(|| anyhow!("fixture deployment is absent"))?;
+        self.db()?
+            .adopt_cluster_topology(&laminar_db::ClusterTopologyAdoptionRequest {
+                operation_id: Uuid::new_v4().try_into()?,
+                expected_manifest: manifest,
+                expected_deployment_id: deployment,
+                coordinated_upgrade_complete: true,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn migrate(&self, operation: u128, statements: Vec<String>) -> Result<()> {
+        let parent = self
+            .db()?
+            .cluster_topology_status()
+            .await?
+            .committed_version
+            .ok_or_else(|| anyhow!("fixture migrates only an adopted topology"))?;
+        self.db()?
+            .submit_cluster_topology_change(&laminar_db::ClusterTopologyRequest {
+                operation_id: Uuid::from_u128(operation).try_into()?,
+                expected_parent_version: parent,
+                statements,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn topology(&self, operation: u128) -> Result<Response> {
+        let db = self.db()?;
+        let phase = db
+            .cluster_topology_operation_status(Uuid::from_u128(operation).try_into()?)
+            .await?
+            .map(|status| status.phase);
+        let status = db.cluster_topology_status().await?;
+        Ok(Response::Topology {
+            phase,
+            committed: status.committed_version,
+            active: status.locally_active_version,
+        })
     }
 
     fn remove_failed_peer(&mut self, failed: u64) -> Result<()> {
@@ -339,6 +394,9 @@ impl DatabasePeer {
             Command::Observe => return Ok(Response::Observed(Box::new(self.observe().await?))),
             Command::Checkpoint => return self.checkpoint().await,
             Command::ReadView(sql, epoch) => return self.read_view(&sql, epoch).await,
+            Command::Adopt => self.adopt().await?,
+            Command::Migrate(operation, statements) => self.migrate(operation, statements).await?,
+            Command::Topology(operation) => return self.topology(operation).await,
             Command::Release => self.probe.hold.store(false, Ordering::Release),
             Command::Stop => return Err(anyhow!("the peer lifecycle owns Stop")),
         }
@@ -413,6 +471,7 @@ pub(super) async fn run(root: &Path) -> Result<()> {
         rebalance_shutdown: CancellationToken::new(),
         rebalance_tasks: Vec::new(),
         runtime: config.runtime,
+        objects: Arc::clone(&objects),
         #[cfg(feature = "process-remote")]
         worker: None,
     };
