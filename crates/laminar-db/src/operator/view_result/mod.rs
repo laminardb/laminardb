@@ -191,6 +191,16 @@ impl GraphOperator for ViewResultOperator {
                 self.view
             )));
         }
+        // A bootstrap restores a pristine graph, whose store the recovery image replaces with
+        // the views its nodes restored, so the acquired slices restore as a whole restore's do.
+        if let crate::operator_graph::ManagedVnodeTransitionMode::CheckpointBootstrap { .. } =
+            transition.mode
+        {
+            for restore in transition.restores {
+                self.restore_vnode(restore.vnode, transition.target.vnode_count, restore.state)?;
+            }
+            return Ok(());
+        }
         let prepared = self.store.read().prepare_view_transition(
             &self.view,
             transition.target.vnode_count,
@@ -207,6 +217,7 @@ impl GraphOperator for ViewResultOperator {
     #[cfg(feature = "cluster")]
     fn abort_vnode_transition(&mut self) {
         self.transition = None;
+        self.restored = None;
     }
 
     #[cfg(feature = "cluster")]
@@ -220,3 +231,6 @@ impl GraphOperator for ViewResultOperator {
         self.store.write().require_full_view_capture(&self.view);
     }
 }
+
+#[cfg(all(test, feature = "cluster"))]
+mod tests;
