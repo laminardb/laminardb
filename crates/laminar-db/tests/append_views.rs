@@ -196,25 +196,22 @@ fn retained_segments(dir: &std::path::Path) -> std::collections::BTreeMap<String
     let mut manifests = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(path) = pending.pop() {
-        for entry in std::fs::read_dir(&path).unwrap().flatten() {
+        // Retention may retire a checkpoint between listing it and reading it.
+        for entry in std::fs::read_dir(&path).into_iter().flatten().flatten() {
             let path = entry.path();
             if path.is_dir() {
                 pending.push(path);
             } else if path.file_name().is_some_and(|name| name == "manifest.json") {
-                manifests.push(path);
+                if let Ok(bytes) = std::fs::read(&path) {
+                    manifests.push(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+                }
             }
         }
     }
-    let newest = manifests
-        .iter()
-        .max_by_key(|path| {
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            manifest["checkpoint_id"].as_u64().unwrap()
-        })
+    let manifest = manifests
+        .into_iter()
+        .max_by_key(|manifest| manifest["checkpoint_id"].as_u64().unwrap())
         .unwrap();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(newest).unwrap()).unwrap();
     manifest["view_logs"]
         .as_array()
         .unwrap()
