@@ -38,7 +38,8 @@ impl LaminarDB {
     /// The statement may scan only materialized views. The checkpoint is held against retention
     /// for at most 30 seconds, which bounds the read, including any wait for
     /// [`CommittedRead::AtLeast`]. A cluster node reads every participant's committed state, so
-    /// any node serves any view; it reads only cuts at or after the durable pin it holds.
+    /// any node serves any view; it reads only cuts at or after the durable pin it holds. A node
+    /// that owns no vnodes takes part in no checkpoint and learns of no later cut.
     ///
     /// # Errors
     /// [`DbError::CommittedRead`] when checkpointing is disabled, the requested epoch has not
