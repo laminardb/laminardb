@@ -3041,39 +3041,24 @@ impl LaminarDB {
                 } else {
                     None
                 };
-            let stopped_commit_owner_pin_is_active = if stopped_recovery_topology_common
-                && stopped_committed_owner_topology_shape
-            {
-                let expected = committed_handoff_checkpoint
-                    .as_ref()
-                    .expect("committed drain authority has a handoff checkpoint");
-                let authority = controller.checkpoint_authority().map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit checkpoint authority is unavailable: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                let pinned = tokio::time::timeout_at(
-                    deadline,
-                    authority.assignment_handoff_checkpoint(&target_fence),
-                )
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin audit timed out",
-                        snapshot.version
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin audit failed: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                pinned.as_ref() == Some(expected)
-            } else {
-                false
-            };
+            let stopped_commit_owner_pin_is_active =
+                if stopped_recovery_topology_common && stopped_committed_owner_topology_shape {
+                    assignment_authority::handoff_pin_is_active(
+                        &controller,
+                        &target_fence,
+                        committed_handoff_checkpoint
+                            .as_ref()
+                            .expect("committed drain authority has a handoff checkpoint"),
+                        &format!(
+                            "assignment {} stopped-Commit handoff-pin audit",
+                            snapshot.version
+                        ),
+                        deadline,
+                    )
+                    .await?
+                } else {
+                    false
+                };
             let stopped_recovery_topology = stopped_recovery_topology_common
                 && ((stopped_committed_topology_shape && prepared_recovery_fault_is_active)
                     || (stopped_aborted_topology_shape && stopped_abort_round.is_some())
@@ -3275,6 +3260,30 @@ impl LaminarDB {
             } else {
                 Vec::new()
             };
+            // A survivor adopts the append-view logs of participants that left, whether or not
+            // it acquires a vnode. Without a handoff cut there is nothing to adopt from, and the
+            // leader refuses a cut that loses a departed participant's segments.
+            let adopted_view_logs = match (
+                committed_handoff_checkpoint.as_ref(),
+                predecessor_fence.as_ref(),
+                guard.as_ref(),
+            ) {
+                (Some(handoff), Some(predecessor), Some(coordinator))
+                    if mode == AssignmentAdoptionMode::LiveTransition
+                        && !startup_restore_deferred
+                        && self.mv_store.read().has_append_views() =>
+                {
+                    coordinator
+                        .load_handoff_view_log_adoptions(
+                            handoff,
+                            predecessor,
+                            &target_fence,
+                            deadline,
+                        )
+                        .await?
+                }
+                _ => Vec::new(),
+            };
 
             drop(guard);
 
@@ -3377,33 +3386,19 @@ impl LaminarDB {
                 == AssignmentAdoptionMode::StoppedRecoveryTopology
                 && stopped_committed_owner_topology_shape
             {
-                let expected = committed_handoff_checkpoint
-                    .as_ref()
-                    .expect("committed drain authority has a handoff checkpoint");
-                let authority = controller.checkpoint_authority().map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit checkpoint authority changed: {error}",
+                assignment_authority::handoff_pin_is_active(
+                    &controller,
+                    &target_fence,
+                    committed_handoff_checkpoint
+                        .as_ref()
+                        .expect("committed drain authority has a handoff checkpoint"),
+                    &format!(
+                        "assignment {} stopped-Commit handoff-pin recheck",
                         snapshot.version
-                    ))
-                })?;
-                let pinned = tokio::time::timeout_at(
+                    ),
                     deadline,
-                    authority.assignment_handoff_checkpoint(&target_fence),
                 )
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin recheck timed out",
-                        snapshot.version
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin recheck failed: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                pinned.as_ref() == Some(expected)
+                .await?
             } else {
                 true
             };
@@ -3411,33 +3406,19 @@ impl LaminarDB {
                 == AssignmentAdoptionMode::StoppedRecoveryTopology
                 && stopped_recovery_successor_topology_shape
             {
-                let expected = committed_handoff_checkpoint
-                    .as_ref()
-                    .expect("recovery successor authority has a handoff checkpoint");
-                let authority = controller.checkpoint_authority().map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-recovery checkpoint authority changed: {error}",
+                assignment_authority::handoff_pin_is_active(
+                    &controller,
+                    &target_fence,
+                    committed_handoff_checkpoint
+                        .as_ref()
+                        .expect("recovery successor authority has a handoff checkpoint"),
+                    &format!(
+                        "assignment {} stopped-recovery handoff-pin recheck",
                         snapshot.version
-                    ))
-                })?;
-                let pinned = tokio::time::timeout_at(
+                    ),
                     deadline,
-                    authority.assignment_handoff_checkpoint(&target_fence),
                 )
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-recovery handoff-pin recheck timed out",
-                        snapshot.version
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-recovery handoff-pin recheck failed: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                pinned.as_ref() == Some(expected)
+                .await?
             } else {
                 true
             };
@@ -3519,6 +3500,7 @@ impl LaminarDB {
                         local_participant,
                         pipeline_identity,
                         state_frames,
+                        adopted_view_logs,
                         final_owner_exit,
                     )?;
                 if transition.acquired_vnodes() != vnodes_requiring_restore {

@@ -338,6 +338,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         local,
         PipelineIdentity::empty(),
         Vec::new(),
+        Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
     )
     .unwrap();
@@ -356,6 +357,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &target_owners,
         local,
         PipelineIdentity::empty(),
+        Vec::new(),
         Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
     )
@@ -377,6 +379,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         wrong_process,
         PipelineIdentity::empty(),
         Vec::new(),
+        Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition).unwrap()),
     )
     .is_err());
@@ -390,6 +393,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &predecessor_owners,
         local,
         PipelineIdentity::empty(),
+        Vec::new(),
         Vec::new(),
         None,
     )
@@ -1247,6 +1251,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         &owners,
         local,
         identity.clone(),
+        Vec::new(),
         Vec::new(),
         None,
     )

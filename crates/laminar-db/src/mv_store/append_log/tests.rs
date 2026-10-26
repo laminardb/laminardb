@@ -289,3 +289,73 @@ fn an_aborted_merge_is_written_by_the_next_capture_and_an_empty_one_removes_its_
         .as_ref()
         .is_some_and(|held| Arc::ptr_eq(held, &newer)));
 }
+
+fn adopted(sequence: u64, rows: u64, max: i64) -> AdoptedSegment {
+    AdoptedSegment {
+        segment: ViewLogSegment {
+            partition: 3,
+            sequence,
+            chunk: laminar_core::checkpoint::StateChunkId {
+                participant_id: 9,
+                checkpoint_id: 4,
+            },
+            range: laminar_core::checkpoint::ByteRange {
+                offset: sequence * 10,
+                length: 10,
+            },
+            sha256: "0".repeat(64),
+            rows,
+            event_time: Some(EventTimeBounds { min: max - 5, max }),
+        },
+        object_length: 100,
+        object_sha256: "1".repeat(64),
+    }
+}
+
+#[test]
+fn a_capture_lists_adopted_segments_verbatim_before_the_sealed_rows() {
+    let mut log = event_time(100);
+    append(&mut log, &[rows(&[10])]);
+    log.capture(1, true).unwrap();
+    log.commit(1);
+
+    // The committed horizon has passed both adopted segments; they are listed anyway.
+    log.set_horizon(LogHorizon::Committed(Some(1_000)));
+    log.adopt([adopted(7, 2, 20), adopted(8, 3, 30)]);
+    append(&mut log, &[rows(&[950])]);
+    let capture = log.capture(2, true).unwrap();
+    let sequences: Vec<u64> = capture
+        .adopted
+        .iter()
+        .map(|(sequence, _)| *sequence)
+        .collect();
+    assert_eq!(sequences, [1, 2]);
+    assert_eq!(capture.adopted[1].1, adopted(8, 3, 30));
+    assert_eq!(
+        capture.sealed.as_ref().map(|sealed| sealed.sequence),
+        Some(3)
+    );
+    assert!(capture.retained.is_empty());
+
+    // An abort returns them for the next capture.
+    log.abort(2);
+    let retry = log.capture(3, true).unwrap();
+    assert_eq!(retry.adopted.len(), 2);
+    assert_eq!(retry.adopted[0].0, 4);
+
+    // Once committed they are ordinary segments of partition 0, kept by retention from now on.
+    log.commit(3);
+    assert!(log.adopted.is_empty());
+    assert_eq!(positions(&log), [4, 5, 6]);
+    let next = log.capture(4, true).unwrap();
+    assert!(next.adopted.is_empty());
+    assert_eq!(next.retained, [(LOG_PARTITION, 6)]);
+}
+
+#[test]
+fn a_capture_holding_only_adopted_segments_must_settle_first() {
+    let mut log = event_time(100);
+    log.adopt([adopted(0, 1, 10)]);
+    log.capture(1, true).unwrap();
+    assert!(log.capture(2, true).is_err());
+}

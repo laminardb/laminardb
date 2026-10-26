@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use laminar_core::checkpoint::{
-    CheckpointAssignmentFence, CheckpointManifest, CheckpointScope, CheckpointStore,
-    CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef, PipelineIdentity,
-    StateFrameKey,
+    AdoptedViewLog, CheckpointAssignmentFence, CheckpointManifest, CheckpointScope,
+    CheckpointStore, CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef,
+    PipelineIdentity, StateFrameKey,
 };
 use laminar_core::state::NodeId;
 
@@ -431,5 +431,37 @@ impl CheckpointCoordinator {
         )
         .await
         .map_err(|_| handoff_error("vnode handoff frame read timed out"))?
+    }
+
+    /// The append-view logs this participant adopts from the participants of the handoff cut
+    /// that `target` lacks. Only a survivor, in both assignments, adopts; without a departure
+    /// it reads nothing.
+    pub(crate) async fn load_handoff_view_log_adoptions(
+        &self,
+        pinned: &CommittedCheckpointRef,
+        predecessor: &CheckpointAssignmentFence,
+        target: &CheckpointAssignmentFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<AdoptedViewLog>, DbError> {
+        let me = self.store.participant_id();
+        if !predecessor.contains(me)
+            || !target.contains(me)
+            || predecessor
+                .participant_ids()
+                .into_iter()
+                .all(|participant| target.contains(participant))
+        {
+            return Ok(Vec::new());
+        }
+        let cut = self
+            .load_validated_handoff_cut_until(pinned, predecessor, deadline)
+            .await?;
+        let manifests = tokio::time::timeout_at(
+            deadline,
+            super::retention::load_index_manifests(self.store.as_ref(), &cut.committed),
+        )
+        .await
+        .map_err(|_| handoff_error("vnode handoff manifest read timed out"))??;
+        laminar_core::checkpoint::adopted_view_logs(&manifests, target, me).map_err(handoff_error)
     }
 }

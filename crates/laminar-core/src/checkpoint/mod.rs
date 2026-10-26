@@ -55,9 +55,10 @@ pub use checkpoint_store::{
     MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_AGGREGATE_BYTES, MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_BYTES,
 };
 pub use committed_checkpoint::{
-    canonical_json_bytes, canonical_json_sha256, fold_view_frontiers, validate_cut_view_logs,
-    validate_departed_view_logs, CheckpointScope, CheckpointWatermark, CommittedCheckpointIndex,
-    CommittedCheckpointRef, CommittedParticipantRef, COMMITTED_CHECKPOINT_INDEX_VERSION,
+    adopted_view_logs, canonical_json_bytes, canonical_json_sha256, fold_view_frontiers,
+    validate_cut_view_logs, validate_departed_view_logs, AdoptedSegment, AdoptedViewLog,
+    CheckpointScope, CheckpointWatermark, CommittedCheckpointIndex, CommittedCheckpointRef,
+    CommittedParticipantRef, COMMITTED_CHECKPOINT_INDEX_VERSION,
     MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
 };
 pub use subscription::{

@@ -340,18 +340,16 @@ impl CheckpointCoordinator {
             DbError::Checkpoint("Commit outcome has no committed checkpoint reference".into())
         })?;
         let committed_frontiers = super::CommittedFrontiers::of(committed)?;
-        let local_manifest = (!recovered.reassigned)
-            .then(|| {
-                recovered
-                    .manifests
-                    .iter()
-                    .find(|manifest| manifest.participant_id == self.store.participant_id())
-                    .cloned()
-                    .map(Arc::new)
-            })
-            .flatten();
+        let own_manifest = recovered
+            .manifests
+            .iter()
+            .find(|manifest| manifest.participant_id == self.store.participant_id())
+            .cloned()
+            .map(Arc::new);
+        let local_manifest = own_manifest.clone().filter(|_| !recovered.reassigned);
         self.local_watermark = Self::manifest_watermark(local_manifest.as_deref())?;
         self.last_committed_manifest = local_manifest;
+        self.view_log_predecessor = own_manifest;
         self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
             committed.clone(),
             reference.clone(),
@@ -628,6 +626,7 @@ impl CheckpointCoordinator {
         }
         self.prepared.clear();
         self.last_committed_manifest = None;
+        self.view_log_predecessor = None;
         self.publish_committed_cut(None);
         self.last_committed_ref = None;
         self.last_committed_frontiers = None;

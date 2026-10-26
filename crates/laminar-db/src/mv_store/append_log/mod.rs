@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use laminar_core::checkpoint::{EventTimeBounds, ViewLog, ViewLogSegment};
+use laminar_core::checkpoint::{AdoptedSegment, EventTimeBounds, ViewLog, ViewLogSegment};
 use laminar_core::streaming::retained_arrow_bytes;
 
 use super::admission::{size_overflow, MvLimits};
@@ -24,7 +24,7 @@ pub(crate) use read::{LogRead, LogReadError};
 pub(crate) use retention::ViewRetention;
 
 /// Every view log has one partition until rows carry their origin vnode.
-const LOG_PARTITION: u16 = 0;
+pub(super) const LOG_PARTITION: u16 = 0;
 
 /// The event-time frontier a log's retention follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,15 @@ struct InFlightCapture {
     checkpoint_id: u64,
     committed: Vec<SegmentMeta>,
     sealed: Vec<LogBatch>,
+    adopted: Vec<AdoptedSegment>,
     compacted: Option<Arc<PreparedCompaction>>,
+}
+
+impl InFlightCapture {
+    /// Whether an abort must return anything to the log.
+    fn holds_rows(&self) -> bool {
+        !self.sealed.is_empty() || !self.adopted.is_empty()
+    }
 }
 
 pub(super) struct AppendLogState {
@@ -83,6 +91,8 @@ pub(super) struct AppendLogState {
     in_flight: Option<InFlightCapture>,
     /// Segments retained by the last committed checkpoint.
     committed: Vec<SegmentMeta>,
+    /// Segments adopted from participants that left, which the next capture lists unfiltered.
+    adopted: Vec<AdoptedSegment>,
     next_sequence: u64,
     /// Greatest event-time frontier the view has reached on this node.
     frontier: Option<i64>,
@@ -122,6 +132,8 @@ pub(crate) struct ViewLogCapture {
     pub(crate) frontier: Option<i64>,
     pub(crate) idle: bool,
     pub(crate) retained: Vec<(u16, u64)>,
+    /// Adopted segments at their new sequences in partition 0.
+    pub(crate) adopted: Vec<(u64, AdoptedSegment)>,
     pub(crate) compacted: Option<CompactedSegment>,
     pub(crate) sealed: Option<SealedSegment>,
 }
@@ -141,6 +153,7 @@ impl AppendLogState {
             staged: std::collections::VecDeque::new(),
             in_flight: None,
             committed: Vec::new(),
+            adopted: Vec::new(),
             next_sequence: 0,
             frontier: None,
             idle: false,
@@ -170,6 +183,10 @@ impl AppendLogState {
             self.frontier = Some(watermark);
         }
         self.idle = stream.idle;
+    }
+
+    pub(super) fn adopt(&mut self, segments: impl IntoIterator<Item = AdoptedSegment>) {
+        self.adopted.extend(segments);
     }
 
     pub(super) fn set_horizon(&mut self, horizon: LogHorizon) {
@@ -280,7 +297,7 @@ impl AppendLogState {
         if self
             .in_flight
             .as_ref()
-            .is_some_and(|capture| !capture.sealed.is_empty())
+            .is_some_and(InFlightCapture::holds_rows)
         {
             return Err(DbError::Checkpoint(
                 "an append view's previous capture has neither committed nor aborted".into(),
@@ -310,6 +327,7 @@ impl AppendLogState {
             retained.drain(run.clone());
             committed.splice(run, compacted.iter().map(|segment| segment.meta.clone()));
         }
+        let adopted = self.number_adopted(&mut committed)?;
         let sealed = if staged.is_empty() {
             None
         } else {
@@ -342,6 +360,7 @@ impl AppendLogState {
             checkpoint_id,
             committed,
             sealed: staged,
+            adopted: adopted.iter().map(|(_, segment)| segment.clone()).collect(),
             compacted: merge.map(|(_, prepared)| prepared),
         });
         Ok(ViewLogCapture {
@@ -349,9 +368,34 @@ impl AppendLogState {
             frontier: self.frontier,
             idle: self.idle,
             retained,
+            adopted,
             compacted,
             sealed,
         })
+    }
+
+    /// Give each adopted segment the next sequence of partition 0 and list it in `committed`.
+    /// Retention does not filter them: the leader requires a departed participant's segments
+    /// verbatim in the first cut without it.
+    fn number_adopted(
+        &mut self,
+        committed: &mut Vec<SegmentMeta>,
+    ) -> Result<Vec<(u64, AdoptedSegment)>, DbError> {
+        let count = u64::try_from(self.adopted.len()).map_err(|_| size_overflow())?;
+        let first = self.next_sequence;
+        self.next_sequence = first.checked_add(count).ok_or_else(size_overflow)?;
+        Ok((first..)
+            .zip(std::mem::take(&mut self.adopted))
+            .map(|(sequence, adopted)| {
+                committed.push(SegmentMeta {
+                    partition: LOG_PARTITION,
+                    sequence,
+                    rows: adopted.segment.rows,
+                    event_time: adopted.segment.event_time,
+                });
+                (sequence, adopted)
+            })
+            .collect())
     }
 
     /// Where the prepared merge's inputs sit in `committed`, when they all still do, in order,
@@ -421,7 +465,8 @@ impl AppendLogState {
         }
     }
 
-    /// Return the sealed rows of an attempt that will not commit to the front of the stage.
+    /// Return the sealed rows and adopted segments of an attempt that will not commit to the
+    /// front of the log.
     pub(super) fn abort(&mut self, checkpoint_id: u64) {
         let Some(capture) = self
             .in_flight
@@ -432,6 +477,7 @@ impl AppendLogState {
         for batch in capture.sealed.into_iter().rev() {
             self.staged.push_front(batch);
         }
+        self.adopted.splice(0..0, capture.adopted);
     }
 
     /// Committed segments to read and the rows held in memory, in log order.

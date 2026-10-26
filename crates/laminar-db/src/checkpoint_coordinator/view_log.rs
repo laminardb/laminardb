@@ -34,7 +34,7 @@ impl CheckpointCoordinator {
             participant_id: self.store.participant_id(),
             checkpoint_id: attempt.checkpoint_id,
         };
-        let prior = self.last_committed_manifest.as_deref();
+        let prior = self.view_log_predecessor.as_deref();
         let mut packer = ViewLogPacker::new(current);
         let mut logs = Vec::with_capacity(captured.len());
         for log in captured {
@@ -153,6 +153,22 @@ impl ViewLogPacker {
                     partition,
                     sequence,
                 } => self.retain(prior, prior_log, &view, (partition, sequence))?,
+                CapturedViewLogSegment::Adopted {
+                    partition,
+                    sequence,
+                    adopted,
+                } => {
+                    self.reference(
+                        adopted.segment.chunk,
+                        adopted.object_length,
+                        &adopted.object_sha256,
+                    )?;
+                    ViewLogSegment {
+                        partition,
+                        sequence,
+                        ..adopted.segment
+                    }
+                }
             };
             packed.push(segment);
         }
@@ -212,21 +228,26 @@ impl ViewLogPacker {
                 segment.chunk
             ))
         })?;
+        self.reference(segment.chunk, length, &digest)?;
+        Ok(segment)
+    }
+
+    /// Count one more segment of this manifest in the older object `chunk`.
+    fn reference(&mut self, chunk: StateChunkId, length: u64, digest: &str) -> Result<(), DbError> {
         let entry = self
             .referenced
-            .entry(segment.chunk)
-            .or_insert((length, digest.clone(), 0));
+            .entry(chunk)
+            .or_insert_with(|| (length, digest.to_owned(), 0));
         if entry.0 != length || entry.1 != digest {
             return Err(DbError::Checkpoint(format!(
-                "conflicting metadata for referenced view log {:?}",
-                segment.chunk
+                "conflicting metadata for referenced view log {chunk:?}"
             )));
         }
         entry.2 = entry
             .2
             .checked_add(1)
             .ok_or_else(|| DbError::Checkpoint("referenced segment count overflow".into()))?;
-        Ok(segment)
+        Ok(())
     }
 }
 
@@ -272,4 +293,78 @@ async fn digest_until(
             DbError::Checkpoint("view-log digest task exceeded its end-to-end deadline".into())
         })?
         .map_err(|error| DbError::Checkpoint(format!("view-log digest task failed: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use laminar_core::checkpoint::{AdoptedSegment, EventTimeBounds};
+
+    use super::*;
+
+    fn adopted(sequence: u64, object_length: u64) -> CapturedViewLogSegment {
+        CapturedViewLogSegment::Adopted {
+            partition: 0,
+            sequence,
+            adopted: AdoptedSegment {
+                segment: ViewLogSegment {
+                    partition: 2,
+                    sequence: 40 + sequence,
+                    chunk: StateChunkId {
+                        participant_id: 9,
+                        checkpoint_id: 4,
+                    },
+                    range: ByteRange {
+                        offset: sequence * 10,
+                        length: 10,
+                    },
+                    sha256: "a".repeat(64),
+                    rows: 3,
+                    event_time: Some(EventTimeBounds { min: 1, max: 2 }),
+                },
+                object_length,
+                object_sha256: "b".repeat(64),
+            },
+        }
+    }
+
+    fn captured(segments: Vec<CapturedViewLogSegment>) -> CapturedViewLog {
+        CapturedViewLog {
+            view: "events".into(),
+            next_sequence: 8,
+            frontier: None,
+            idle: false,
+            segments,
+        }
+    }
+
+    #[test]
+    fn an_adopted_segment_references_the_departed_participants_object() {
+        let mut packer = ViewLogPacker::new(StateChunkId {
+            participant_id: 1,
+            checkpoint_id: 5,
+        });
+        let log = packer
+            .pack_log(None, captured(vec![adopted(6, 100), adopted(7, 100)]))
+            .unwrap();
+        let positions: Vec<_> = log
+            .segments
+            .iter()
+            .map(|segment| (segment.partition, segment.sequence, segment.range.offset))
+            .collect();
+        assert_eq!(positions, [(0, 6, 60), (0, 7, 70)]);
+        assert_eq!(log.segments[0].rows, 3);
+        let reference = &packer.referenced[&StateChunkId {
+            participant_id: 9,
+            checkpoint_id: 4,
+        }];
+        assert_eq!((reference.0, reference.2), (100, 2));
+
+        let error = packer
+            .pack_log(None, captured(vec![adopted(6, 101)]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("conflicting metadata"),
+            "{error}"
+        );
+    }
 }

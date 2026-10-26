@@ -318,6 +318,12 @@ impl MvStore {
         removed
     }
 
+    /// Whether any view keeps an append log; without one there is no view log to adopt.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn has_append_views(&self) -> bool {
+        self.entries.values().any(|entry| entry.log.is_some())
+    }
+
     pub fn has_mv(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
@@ -463,12 +469,13 @@ impl MvStore {
     }
 
     /// Restore a complete checkpoint into a private image: changelog views from the slices their
-    /// graph nodes restored, append views from the logs `manifest` retains. The live store is
-    /// never mutated.
+    /// graph nodes restored, append views from the logs `manifest` retains plus the logs
+    /// `adopted` from participants that left. The live store is never mutated.
     pub fn recovery_image(
         &self,
         restored_views: Vec<RestoredView>,
         manifest: Option<&laminar_core::checkpoint::CheckpointManifest>,
+        adopted: &[laminar_core::checkpoint::AdoptedViewLog],
     ) -> Result<Self, DbError> {
         let mut image = self.fresh_image().map_err(|error| {
             DbError::Checkpoint(format!("cannot create an empty MV recovery image: {error}"))
@@ -477,6 +484,7 @@ impl MvStore {
             view.install(&mut image.entries)?;
         }
         image.restore_view_logs(manifest)?;
+        image.adopt_view_logs(adopted)?;
         image.install_log_horizons();
         Ok(image)
     }

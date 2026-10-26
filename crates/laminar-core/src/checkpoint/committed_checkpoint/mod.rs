@@ -19,7 +19,10 @@ use super::{
 use crate::state::{KeyGroupCount, LOCAL_NODE_ID};
 
 pub use view_frontiers::fold_view_frontiers;
-pub use view_log_references::{validate_cut_view_logs, validate_departed_view_logs};
+pub use view_log_references::{
+    adopted_view_logs, validate_cut_view_logs, validate_departed_view_logs, AdoptedSegment,
+    AdoptedViewLog,
+};
 
 /// Current committed-checkpoint index format.
 pub const COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 5;

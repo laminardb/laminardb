@@ -97,6 +97,7 @@ impl CheckpointCoordinator {
         )));
         self.last_committed_ref = Some(reference.clone());
         self.last_committed_frontiers = Some((reference, frontiers));
+        self.view_log_predecessor = Some(std::sync::Arc::clone(&manifest));
         self.last_committed_manifest = Some(manifest);
         self.prepared.remove(&attempt);
         Ok(())

@@ -144,10 +144,11 @@ impl LaminarDB {
             .manifests
             .iter()
             .find(|manifest| manifest.participant_id == participant_id);
-        let recovered_mv_store = self
-            .mv_store
-            .read()
-            .recovery_image(graph.take_restored_views(), local_manifest)?;
+        let recovered_mv_store = self.mv_store.read().recovery_image(
+            graph.take_restored_views(),
+            local_manifest,
+            &[],
+        )?;
         Ok(PipelineRecoveryState {
             graph,
             recovered_mv_store,

@@ -74,6 +74,12 @@ pub(crate) enum CapturedViewLogSegment {
     },
     /// A segment the committed predecessor holds and retention keeps.
     Retained { partition: u16, sequence: u64 },
+    /// A segment adopted from a participant that left, at its new position.
+    Adopted {
+        partition: u16,
+        sequence: u64,
+        adopted: laminar_core::checkpoint::AdoptedSegment,
+    },
 }
 
 impl CapturedViewLogSegment {
@@ -87,6 +93,11 @@ impl CapturedViewLogSegment {
             | Self::Retained {
                 partition,
                 sequence,
+            }
+            | Self::Adopted {
+                partition,
+                sequence,
+                ..
             } => (*partition, *sequence),
         }
     }

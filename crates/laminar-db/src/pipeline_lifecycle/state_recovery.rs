@@ -117,7 +117,7 @@ impl LaminarDB {
             ));
         }
         #[cfg(feature = "cluster")]
-        let (mut graph, restored_graph_frames) = if recovered.reassigned
+        let (mut graph, restored_graph_frames, adopted_view_logs) = if recovered.reassigned
             && !recovered.target_vnodes.is_empty()
         {
             let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
@@ -162,33 +162,46 @@ impl LaminarDB {
                         "reassigned checkpoint restore has no predecessor assignment".into(),
                     )
                 })?;
-            graph.restore_reassigned_vnode_state(
+            // A survivor adopts the append-view logs of participants the target lacks.
+            let adopted = laminar_core::checkpoint::adopted_view_logs(
+                &recovered.manifests,
+                &target,
+                participant_id,
+            )
+            .map_err(DbError::Checkpoint)?;
+            let (graph, frames) = graph.restore_reassigned_vnode_state(
                 predecessor,
                 &recovered.predecessor_owners,
                 &target,
                 &reassigned_graph,
-            )?
+            )?;
+            (graph, frames, adopted)
         } else {
-            graph.restore_state_frames(
+            let (graph, frames) = graph.restore_state_frames(
                 &graph_whole,
                 &graph_vnodes,
                 u32::from(recovered.committed.vnode_count),
-            )?
+            )?;
+            (graph, frames, Vec::new())
         };
         #[cfg(not(feature = "cluster"))]
-        let (mut graph, restored_graph_frames) = graph.restore_state_frames(
-            &graph_whole,
-            &graph_vnodes,
-            u32::from(recovered.committed.vnode_count),
-        )?;
+        let (mut graph, restored_graph_frames, adopted_view_logs) = {
+            let (graph, frames) = graph.restore_state_frames(
+                &graph_whole,
+                &graph_vnodes,
+                u32::from(recovered.committed.vnode_count),
+            )?;
+            (graph, frames, Vec::new())
+        };
         let local_manifest = recovered
             .manifests
             .iter()
             .find(|manifest| manifest.participant_id == participant_id);
-        let recovered_mv_store = self
-            .mv_store
-            .read()
-            .recovery_image(graph.take_restored_views(), local_manifest)?;
+        let recovered_mv_store = self.mv_store.read().recovery_image(
+            graph.take_restored_views(),
+            local_manifest,
+            &adopted_view_logs,
+        )?;
         let restored_reference_tables =
             self.restore_reference_table_checkpoint(recovered.epoch(), reference_tables.as_ref())?;
         tracing::info!(

@@ -1102,6 +1102,7 @@ fn compute_fault_retires_stale_pending_transition_before_fault_publication() {
             participant,
             pipeline_identity.clone(),
             Vec::new(),
+            Vec::new(),
             None,
         )
         .unwrap(),
@@ -1153,6 +1154,7 @@ fn staged_vnode_transition_pair() -> (
         &owners,
         participant,
         identity.clone(),
+        Vec::new(),
         Vec::new(),
         None,
     )

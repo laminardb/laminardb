@@ -362,7 +362,7 @@ impl MvStore {
         for (vnode, bytes) in frames {
             restored.restore_vnode(*vnode, count, bytes)?;
         }
-        self.recovery_image(vec![restored], None)
+        self.recovery_image(vec![restored], None, &[])
     }
 }
 

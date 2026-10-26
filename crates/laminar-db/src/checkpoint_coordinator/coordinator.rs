@@ -62,6 +62,7 @@ impl CheckpointCoordinator {
             active_sink_artifact_intents: None,
             prepared: HashMap::new(),
             last_committed_manifest: None,
+            view_log_predecessor: None,
             last_committed_ref: None,
             last_committed_frontiers: None,
             failure_requires_recovery: false,

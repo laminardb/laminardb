@@ -381,6 +381,7 @@ impl CheckpointCoordinator {
             .iter()
             .find(|(manifest, _)| manifest.participant_id == self.store.participant_id())
             .map(|(manifest, _)| Arc::new(manifest.clone()));
+        self.view_log_predecessor = self.last_committed_manifest.clone();
         self.prepared.remove(&attempt);
         self.allocator
             .advance_epoch_to(super::checked_successor_epoch(

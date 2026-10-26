@@ -58,6 +58,13 @@ impl MvCheckpointCapture {
                     partition,
                     sequence,
                 })
+                .chain(capture.adopted.into_iter().map(|(sequence, adopted)| {
+                    CapturedViewLogSegment::Adopted {
+                        partition: super::append_log::LOG_PARTITION,
+                        sequence,
+                        adopted,
+                    }
+                }))
                 .collect();
             if let Some(compacted) = capture.compacted {
                 retained_bytes = retained_bytes
@@ -279,6 +286,34 @@ impl MvStore {
         }
     }
 
+    /// List the segments of logs adopted from participants that left in each view's next
+    /// capture.
+    pub(crate) fn adopt_view_logs(
+        &mut self,
+        logs: &[laminar_core::checkpoint::AdoptedViewLog],
+    ) -> Result<(), DbError> {
+        if let Some(view) = logs.iter().find(|log| {
+            self.entries
+                .get(&log.view)
+                .is_none_or(|entry| entry.log.is_none())
+        }) {
+            return Err(DbError::Checkpoint(format!(
+                "a departed participant's log names '{}', which is not an append-only view",
+                view.view
+            )));
+        }
+        for log in logs {
+            if let Some(state) = self
+                .entries
+                .get_mut(&log.view)
+                .and_then(|entry| entry.log.as_mut())
+            {
+                state.adopt(log.segments.iter().cloned());
+            }
+        }
+        Ok(())
+    }
+
     /// Restore every append view from the log `manifest` retains; with no manifest, every
     /// append view starts empty.
     pub(super) fn restore_view_logs(
@@ -324,6 +359,7 @@ fn within_segment_limit(
 ) -> Result<Vec<(String, SchemaRef, ViewLogCapture)>, DbError> {
     let segments = |capture: &ViewLogCapture| {
         capture.retained.len()
+            + capture.adopted.len()
             + usize::from(capture.compacted.is_some())
             + usize::from(capture.sealed.is_some())
     };

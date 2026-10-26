@@ -5,7 +5,130 @@
 use std::collections::btree_map::Entry;
 
 use super::{BTreeMap, CheckpointManifest};
-use crate::checkpoint::{ByteRange, StateChunkId};
+use crate::checkpoint::{
+    ByteRange, CheckpointAssignmentFence, StateChunkId, ViewLogSegment, MAX_VIEW_LOG_SEGMENTS,
+};
+
+/// One segment a survivor adopts from a participant that left, with the view-log object that
+/// holds its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedSegment {
+    /// The segment as the departed participant listed it.
+    pub segment: ViewLogSegment,
+    /// Exact length of the object holding the segment.
+    pub object_length: u64,
+    /// SHA-256 of that whole object.
+    pub object_sha256: String,
+}
+
+/// The segments of one view a survivor adopts, in the departed log's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedViewLog {
+    /// Catalog name of the view.
+    pub view: String,
+    /// Adopted segments.
+    pub segments: Vec<AdoptedSegment>,
+}
+
+/// The view logs `adopter` adopts when the participants of `cut` that `target` lacks leave.
+///
+/// Every participant derives the same plan from the same cut and target. Each departed log goes
+/// whole to the survivor (a participant of both) holding the fewest segments so far, ties to
+/// the lowest node id, in order of departed participant and then view.
+///
+/// # Errors
+/// Returns an error when departed logs have no survivor to adopt them, when a survivor would
+/// hold more segments than one manifest admits, or when a departed segment's object is
+/// untracked.
+pub fn adopted_view_logs(
+    cut: &[CheckpointManifest],
+    target: &CheckpointAssignmentFence,
+    adopter: u64,
+) -> Result<Vec<AdoptedViewLog>, String> {
+    let mut manifests: Vec<&CheckpointManifest> = cut.iter().collect();
+    manifests.sort_unstable_by_key(|manifest| manifest.participant_id);
+    let (survivors, departed): (Vec<_>, Vec<_>) = manifests
+        .into_iter()
+        .partition(|manifest| target.contains(manifest.participant_id));
+    let mut load: BTreeMap<u64, usize> = survivors
+        .iter()
+        .map(|manifest| (manifest.participant_id, segment_count(manifest)))
+        .collect();
+    let mut logs = Vec::new();
+    for manifest in departed {
+        for log in manifest
+            .view_logs
+            .iter()
+            .filter(|log| !log.segments.is_empty())
+        {
+            let (&chosen, held) = load
+                .iter_mut()
+                .min_by_key(|(id, held)| (**held, **id))
+                .ok_or_else(|| {
+                    format!(
+                        "participant {} left with view logs, and no surviving participant can                          adopt them",
+                        manifest.participant_id
+                    )
+                })?;
+            *held = held.saturating_add(log.segments.len());
+            if *held > MAX_VIEW_LOG_SEGMENTS {
+                return Err(format!(
+                    "participant {chosen} would hold {held} view-log segments after adopting                      view '{}' from participant {}; a manifest admits at most                      {MAX_VIEW_LOG_SEGMENTS}",
+                    log.view, manifest.participant_id
+                ));
+            }
+            if chosen != adopter {
+                continue;
+            }
+            let segments = log
+                .segments
+                .iter()
+                .map(|segment| adopted_segment(manifest, segment))
+                .collect::<Result<_, _>>()?;
+            logs.push(AdoptedViewLog {
+                view: log.view.clone(),
+                segments,
+            });
+        }
+    }
+    Ok(logs)
+}
+
+fn segment_count(manifest: &CheckpointManifest) -> usize {
+    manifest
+        .view_logs
+        .iter()
+        .map(|log| log.segments.len())
+        .sum()
+}
+
+fn adopted_segment(
+    manifest: &CheckpointManifest,
+    segment: &ViewLogSegment,
+) -> Result<AdoptedSegment, String> {
+    let written = manifest
+        .view_log
+        .iter()
+        .map(|object| (object.chunk, object.object_length, &object.sha256));
+    let referenced = manifest
+        .referenced_view_logs
+        .iter()
+        .map(|object| (object.chunk, object.object_length, &object.sha256));
+    let (_, object_length, object_sha256) = written
+        .chain(referenced)
+        .find(|(chunk, _, _)| *chunk == segment.chunk)
+        .ok_or_else(|| {
+            format!(
+                "participant {} lists view-log segment {} of untracked object {:?}",
+                manifest.participant_id, segment.sequence, segment.chunk
+            )
+        })?;
+    Ok(AdoptedSegment {
+        segment: segment.clone(),
+        object_length,
+        object_sha256: object_sha256.clone(),
+    })
+}
 
 /// Every view-log segment of a cut is listed once, and every participant that writes or
 /// references a view-log object agrees on its length and digest.
@@ -188,6 +311,75 @@ mod tests {
         assert!(validate_cut_view_logs([&first, &disagreeing])
             .unwrap_err()
             .contains("disagree"));
+    }
+
+    fn fence(participants: &[u64]) -> CheckpointAssignmentFence {
+        let owners: Vec<u64> = participants.iter().copied().cycle().take(4).collect();
+        CheckpointAssignmentFence::from_owner_map(
+            9,
+            &owners,
+            participants
+                .iter()
+                .map(|&node_id| crate::checkpoint::CheckpointParticipant {
+                    node_id,
+                    boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn with_view(mut manifest: CheckpointManifest, view: &str) -> CheckpointManifest {
+        manifest.view_logs[0].view = view.into();
+        manifest
+    }
+
+    #[test]
+    fn each_departed_log_goes_whole_to_the_least_loaded_survivor() {
+        let leaver = chunk(3, 4);
+        let mut departed = manifest(3, vec![segment(leaver, 0), segment(leaver, 1)]);
+        let mut second = with_view(manifest(3, vec![segment(leaver, 2)]), "w");
+        departed.view_logs.append(&mut second.view_logs);
+        // Survivor 1 holds two segments, survivor 2 one.
+        let one = manifest(1, vec![segment(chunk(1, 5), 0), segment(chunk(1, 5), 1)]);
+        let two = manifest(2, vec![segment(chunk(2, 5), 0)]);
+        let cut = [one, two, departed];
+        let target = fence(&[1, 2]);
+
+        // `v` (two segments) goes to survivor 2, which then holds three, so `w` goes to 1.
+        let to_two = adopted_view_logs(&cut, &target, 2).unwrap();
+        assert_eq!(to_two.len(), 1);
+        assert_eq!(to_two[0].view, "v");
+        assert_eq!(to_two[0].segments.len(), 2);
+        assert_eq!(to_two[0].segments[0].object_length, 64);
+        let to_one = adopted_view_logs(&cut, &target, 1).unwrap();
+        assert_eq!(to_one[0].view, "w");
+        assert_eq!(to_one[0].segments[0].segment, segment(leaver, 2));
+
+        // The same cut in another order makes the same plan.
+        let reordered = [cut[2].clone(), cut[0].clone(), cut[1].clone()];
+        assert_eq!(adopted_view_logs(&reordered, &target, 2).unwrap(), to_two);
+
+        // A participant joining in the target adopts nothing.
+        assert!(adopted_view_logs(&cut, &fence(&[1, 2, 4]), 4)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn departed_logs_need_a_survivor_with_room() {
+        let leaver = chunk(3, 4);
+        let cut = [manifest(3, vec![segment(leaver, 0)])];
+        assert!(adopted_view_logs(&cut, &fence(&[4]), 4)
+            .unwrap_err()
+            .contains("no surviving participant"));
+
+        let mut full = manifest(1, vec![segment(chunk(1, 5), 0)]);
+        full.view_logs[0].segments = vec![segment(chunk(1, 5), 0); MAX_VIEW_LOG_SEGMENTS];
+        let cut = [full, manifest(3, vec![segment(leaver, 0)])];
+        assert!(adopted_view_logs(&cut, &fence(&[1]), 1)
+            .unwrap_err()
+            .contains("at most"));
     }
 
     #[test]

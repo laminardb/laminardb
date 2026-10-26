@@ -289,6 +289,70 @@ fn a_capture_seals_staged_rows_until_its_checkpoint_commits() {
 }
 
 #[test]
+fn a_store_adopts_departed_logs_only_into_append_views() {
+    use crate::checkpoint_coordinator::CapturedViewLogSegment;
+    use laminar_core::checkpoint::{
+        AdoptedSegment, AdoptedViewLog, ByteRange, StateChunkId, ViewLogSegment,
+    };
+
+    let mut store = MvStore::new();
+    store
+        .create_mv("app", test_schema(), MvStorageMode::append_rows(1_000))
+        .unwrap();
+    store
+        .create_mv(
+            "keyed",
+            test_schema(),
+            MvStorageMode::changelog(ViewKey::Keyed(vec![0])),
+        )
+        .unwrap();
+    let log = |view: &str| AdoptedViewLog {
+        view: view.into(),
+        segments: vec![AdoptedSegment {
+            segment: ViewLogSegment {
+                partition: 0,
+                sequence: 3,
+                chunk: StateChunkId {
+                    participant_id: 9,
+                    checkpoint_id: 4,
+                },
+                range: ByteRange {
+                    offset: 0,
+                    length: 10,
+                },
+                sha256: "a".repeat(64),
+                rows: 2,
+                event_time: None,
+            },
+            object_length: 10,
+            object_sha256: "a".repeat(64),
+        }],
+    };
+    let error = store
+        .adopt_view_logs(&[log("app"), log("keyed")])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not an append-only view"),
+        "{error}"
+    );
+
+    store.adopt_view_logs(&[log("app")]).unwrap();
+    let (logs, _) = store
+        .capture_view_logs(1, u64::MAX)
+        .unwrap()
+        .encode(u64::MAX)
+        .unwrap();
+    assert!(
+        matches!(
+            logs[0].segments.as_slice(),
+            [CapturedViewLogSegment::Adopted { sequence: 0, .. }]
+        ),
+        "{:?}",
+        logs[0].segments
+    );
+}
+
+#[test]
 fn checkpoint_capture_is_point_in_time_after_live_mutation() {
     let mut store = MvStore::new();
     store
@@ -319,7 +383,7 @@ fn checkpoint_capture_is_point_in_time_after_live_mutation() {
         }
         restored.push(target);
     }
-    let image = store.recovery_image(restored, None).unwrap();
+    let image = store.recovery_image(restored, None, &[]).unwrap();
 
     assert_eq!(snapshot_rows(&image, "upsert"), vec![(1, 10)]);
     assert_eq!(multiset_values(&image, "multiset"), vec![10, 10]);
@@ -553,7 +617,7 @@ fn recovery_image_requires_an_exact_view_log_inventory() {
     let mut manifest = CheckpointManifest::new(7, 7);
 
     let missing = store
-        .recovery_image(Vec::new(), Some(&manifest))
+        .recovery_image(Vec::new(), Some(&manifest), &[])
         .err()
         .unwrap();
     assert!(missing
@@ -562,13 +626,15 @@ fn recovery_image_requires_an_exact_view_log_inventory() {
 
     manifest.view_logs = vec![log("app"), log("ghost")];
     let unknown = store
-        .recovery_image(Vec::new(), Some(&manifest))
+        .recovery_image(Vec::new(), Some(&manifest), &[])
         .err()
         .unwrap();
     assert!(unknown.to_string().contains("log for 'ghost'"));
 
     manifest.view_logs = vec![log("app")];
-    let image = store.recovery_image(Vec::new(), Some(&manifest)).unwrap();
+    let image = store
+        .recovery_image(Vec::new(), Some(&manifest), &[])
+        .unwrap();
     assert_eq!(image.to_record_batch("app").unwrap().unwrap().num_rows(), 0);
 }
 
@@ -592,6 +658,7 @@ fn failed_recovery_image_never_mutates_live_state() {
         .recovery_image(
             Vec::new(),
             Some(&laminar_core::checkpoint::CheckpointManifest::new(7, 7)),
+            &[],
         )
         .err()
         .expect("a checkpoint without the views' logs must fail");

@@ -49,6 +49,24 @@ impl OperatorGraph {
         self.view_store = Some(Arc::clone(store));
     }
 
+    /// Hand the view store the append-view logs a vnode transition adopts from participants
+    /// that left.
+    #[cfg(feature = "cluster")]
+    pub(super) fn adopt_view_logs(
+        &self,
+        logs: &[laminar_core::checkpoint::AdoptedViewLog],
+    ) -> Result<(), crate::error::DbError> {
+        if logs.is_empty() {
+            return Ok(());
+        }
+        let store = self.view_store.as_ref().ok_or_else(|| {
+            crate::error::DbError::Checkpoint(
+                "a vnode transition adopts view logs, but the graph has no view store".into(),
+            )
+        })?;
+        store.write().adopt_view_logs(logs)
+    }
+
     /// Slices that result nodes restored from the selected checkpoint.
     pub(crate) fn take_restored_views(&mut self) -> Vec<RestoredView> {
         self.nodes
@@ -159,7 +177,7 @@ mod tests {
         assert_eq!(restored_frames, 256);
         let image = store
             .read()
-            .recovery_image(restored.take_restored_views(), None)
+            .recovery_image(restored.take_restored_views(), None, &[])
             .unwrap();
         assert_eq!(rows(&image), vec![(1, 1), (2, 1), (3, 1)]);
         assert_eq!(rows(&store.read()), vec![(1, 1), (2, 5), (3, 1)]);

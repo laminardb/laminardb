@@ -440,3 +440,24 @@ impl LaminarDB {
         })
     }
 }
+
+/// Whether cluster authority still pins `expected` as the handoff cut of `target`. `context`
+/// names the check in errors.
+pub(super) async fn handoff_pin_is_active(
+    controller: &ClusterController,
+    target: &CheckpointAssignmentFence,
+    expected: &laminar_core::checkpoint::CommittedCheckpointRef,
+    context: &str,
+    deadline: tokio::time::Instant,
+) -> Result<bool, DbError> {
+    let authority = controller.checkpoint_authority().map_err(|error| {
+        DbError::Checkpoint(format!(
+            "[LDB-6053] {context}: checkpoint authority is unavailable: {error}"
+        ))
+    })?;
+    let pinned = tokio::time::timeout_at(deadline, authority.assignment_handoff_checkpoint(target))
+        .await
+        .map_err(|_| DbError::Checkpoint(format!("[LDB-6053] {context} timed out")))?
+        .map_err(|error| DbError::Checkpoint(format!("[LDB-6053] {context} failed: {error}")))?;
+    Ok(pinned.as_ref() == Some(expected))
+}

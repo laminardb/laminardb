@@ -212,6 +212,10 @@ pub struct CheckpointCoordinator {
     active_sink_artifact_intents: Option<ActiveSinkArtifactIntents>,
     prepared: HashMap<CheckpointAttempt, (Arc<CheckpointManifest>, Bytes)>,
     last_committed_manifest: Option<Arc<CheckpointManifest>>,
+    /// This participant's manifest in the last committed or recovered cut, whose view-log
+    /// segments the next capture retains by position. Unlike `last_committed_manifest` it
+    /// survives a reassigned recovery, which restores this participant's view logs too.
+    view_log_predecessor: Option<Arc<CheckpointManifest>>,
     last_committed_ref: Option<CommittedCheckpointRef>,
     last_committed_frontiers: Option<(CommittedCheckpointRef, commit_index::CommittedFrontiers)>,
     failure_requires_recovery: bool,
