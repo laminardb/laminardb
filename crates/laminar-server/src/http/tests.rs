@@ -1754,7 +1754,8 @@ async fn post_sql(app: &Router, body: serde_json::Value) -> (StatusCode, serde_j
 }
 
 /// A query reads views at the request's level: latest by default, or the committed checkpoint,
-/// whose epoch, checkpoint and capture time the response reports.
+/// whose epoch, checkpoint and capture time the response reports. A recent read takes
+/// `min_epoch` as its floor, and refuses a view over a pushed source, which has no upstream to ask.
 #[tokio::test]
 async fn sql_queries_read_views_at_the_requested_level() {
     let dir = tempfile::tempdir().unwrap();
@@ -1850,6 +1851,23 @@ async fn sql_queries_read_views_at_the_requested_level() {
     ] {
         assert_eq!(read(invalid).await.0, StatusCode::BAD_REQUEST);
     }
+
+    let request: super::catalog::SqlRequest = serde_json::from_value(serde_json::json!({
+        "sql": query, "read_level": "recent", "min_epoch": epoch
+    }))
+    .unwrap();
+    assert_eq!(
+        super::catalog::read_level(&db, &request),
+        Ok(laminar_db::ReadLevel::Committed(
+            laminar_db::CommittedRead::Recent { at_least: epoch }
+        ))
+    );
+    let (status, recent) = read(serde_json::json!({ "read_level": "recent" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        recent["error"].as_str().unwrap().contains("'events'"),
+        "{recent}"
+    );
     db.shutdown().await.unwrap();
 }
 

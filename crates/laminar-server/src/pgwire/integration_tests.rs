@@ -313,7 +313,8 @@ fn sqlstate(error: &tokio_postgres::Error) -> &str {
 
 /// `SELECT` reads views over the simple and extended protocols and joins them. A connection that
 /// sets the committed level reads only checkpointed rows, reports the epoch it read, and never
-/// reads an earlier one; the setting is the connection's alone.
+/// reads an earlier one; the setting is the connection's alone. A recent read of a view over a
+/// pushed source is refused, because the source has no upstream to ask.
 #[tokio::test]
 async fn select_reads_views_at_the_connection_read_level() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -433,6 +434,24 @@ async fn select_reads_views_at_the_connection_read_level() {
         .await
         .expect_err("missing table");
     assert_eq!(sqlstate(&error), "42P01", "{error:?}");
+
+    client
+        .simple_query("SET laminar.read_level = 'recent'")
+        .await
+        .expect("set recent");
+    assert_eq!(
+        simple_column(&client, "SHOW laminar.read_level").await,
+        ["recent"]
+    );
+    let error = client
+        .simple_query(latest)
+        .await
+        .expect_err("pushed source");
+    assert_eq!(sqlstate(&error), "0A000", "{error:?}");
+    assert!(
+        error.as_db_error().unwrap().message().contains("'trades'"),
+        "{error:?}"
+    );
     handle.abort();
 }
 

@@ -20,7 +20,7 @@ use laminar_db::{CommittedRead, CommittedReadError, DbError, LaminarDB, QueryRow
 use super::dispatch::user_error;
 use super::encoding::{encode_row, field_infos, text_response};
 
-/// `latest` or `committed`: how a `SELECT` reads materialized views.
+/// `latest`, `committed` or `recent`: how a `SELECT` reads materialized views.
 pub(super) const READ_LEVEL: &str = "laminar.read_level";
 /// The earliest epoch a committed read may observe.
 pub(super) const MIN_EPOCH: &str = "laminar.min_epoch";
@@ -37,23 +37,35 @@ pub(super) struct ReadSession {
 #[derive(Debug, Default, Clone, Copy)]
 struct ReadSettings {
     /// `None` reads at the database's default level.
-    committed: Option<bool>,
+    level: Option<SessionLevel>,
     min_epoch: u64,
     read_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionLevel {
+    Latest,
+    Committed,
+    Recent,
 }
 
 impl ReadSession {
     fn level(&self, db: &LaminarDB) -> ReadLevel {
         let settings = *self.settings.lock();
-        let committed = settings
-            .committed
-            .unwrap_or_else(|| matches!(db.default_read_level(), ReadLevel::Committed(_)));
-        if !committed {
-            return ReadLevel::Latest;
-        }
-        match settings.min_epoch.max(settings.read_epoch.unwrap_or(0)) {
-            0 => ReadLevel::Committed(CommittedRead::Latest),
-            floor => ReadLevel::Committed(CommittedRead::AtLeast(floor)),
+        let level = settings
+            .level
+            .unwrap_or_else(|| match db.default_read_level() {
+                ReadLevel::Latest => SessionLevel::Latest,
+                ReadLevel::Committed(_) => SessionLevel::Committed,
+            });
+        let floor = settings.min_epoch.max(settings.read_epoch.unwrap_or(0));
+        match (level, floor) {
+            (SessionLevel::Latest, _) => ReadLevel::Latest,
+            (SessionLevel::Committed, 0) => ReadLevel::Committed(CommittedRead::Latest),
+            (SessionLevel::Committed, floor) => ReadLevel::Committed(CommittedRead::AtLeast(floor)),
+            (SessionLevel::Recent, at_least) => {
+                ReadLevel::Committed(CommittedRead::Recent { at_least })
+            }
         }
     }
 
@@ -66,10 +78,11 @@ impl ReadSession {
         let value = value.to_ascii_lowercase();
         let mut settings = self.settings.lock();
         match (name, value.as_str()) {
-            (READ_LEVEL, "default") => settings.committed = None,
-            (READ_LEVEL, "committed") => settings.committed = Some(true),
+            (READ_LEVEL, "default") => settings.level = None,
+            (READ_LEVEL, "committed") => settings.level = Some(SessionLevel::Committed),
+            (READ_LEVEL, "recent") => settings.level = Some(SessionLevel::Recent),
             (READ_LEVEL, "latest") if matches!(db.default_read_level(), ReadLevel::Latest) => {
-                settings.committed = Some(false);
+                settings.level = Some(SessionLevel::Latest);
             }
             (READ_LEVEL, "latest") => {
                 return Err(user_error(
@@ -81,7 +94,7 @@ impl ReadSession {
             (READ_LEVEL, _) => {
                 return Err(user_error(
                     "22023",
-                    format!("{READ_LEVEL} must be 'latest', 'committed' or 'default'"),
+                    format!("{READ_LEVEL} must be 'latest', 'committed', 'recent' or 'default'"),
                 ));
             }
             (MIN_EPOCH, "default") => settings.min_epoch = 0,
@@ -106,6 +119,7 @@ impl ReadSession {
         Ok(match name {
             READ_LEVEL => match self.level(db) {
                 ReadLevel::Latest => "latest".into(),
+                ReadLevel::Committed(CommittedRead::Recent { .. }) => "recent".into(),
                 ReadLevel::Committed(_) => "committed".into(),
             },
             MIN_EPOCH => settings.min_epoch.to_string(),
@@ -348,6 +362,24 @@ mod tests {
         );
         assert_eq!(session.show(&db, READ_EPOCH).unwrap(), "9");
         assert!(session_statement(&db, &session, &statement("SHOW laminar.read_level")).is_some());
+
+        let set_recent = statement("SET laminar.read_level = 'recent'");
+        let fresh = ReadSession::default();
+        for session in [&session, &fresh] {
+            assert!(session_statement(&db, session, &set_recent)
+                .unwrap()
+                .is_ok());
+            assert_eq!(session.show(&db, READ_LEVEL).unwrap(), "recent");
+        }
+        assert_eq!(
+            fresh.level(&db),
+            ReadLevel::Committed(CommittedRead::Recent { at_least: 0 })
+        );
+        assert_eq!(
+            session.level(&db),
+            ReadLevel::Committed(CommittedRead::Recent { at_least: 9 }),
+            "a recent read keeps the connection's floor"
+        );
         assert!(session_statement(&db, &session, &statement("SET search_path = public")).is_none());
 
         for (sql, code) in [

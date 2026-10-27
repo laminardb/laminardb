@@ -37,11 +37,11 @@ struct SinkResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct SqlRequest {
     sql: String,
-    /// How a query reads materialized views: `latest` or `committed`. Omitted, it is the
-    /// database's default: latest locally, committed on a cluster node.
+    /// How a query reads materialized views: `latest`, `committed` or `recent`. Omitted, it is
+    /// the database's default: latest locally, committed on a cluster node.
     #[serde(default)]
     read_level: Option<String>,
-    /// The earliest epoch a committed query may read.
+    /// The earliest epoch a committed or recent query may read.
     #[serde(default)]
     min_epoch: Option<u64>,
 }
@@ -232,7 +232,7 @@ async fn read_sql(db: &laminar_db::LaminarDB, req: &SqlRequest) -> axum::respons
     }
 }
 
-fn read_level(
+pub(super) fn read_level(
     db: &laminar_db::LaminarDB,
     req: &SqlRequest,
 ) -> Result<laminar_db::ReadLevel, String> {
@@ -241,14 +241,18 @@ fn read_level(
         None => db.default_read_level(),
         Some("latest") => ReadLevel::Latest,
         Some("committed") => ReadLevel::Committed(CommittedRead::Latest),
+        Some("recent") => ReadLevel::Committed(CommittedRead::Recent { at_least: 0 }),
         Some(other) => {
             return Err(format!(
-                "read_level must be 'latest' or 'committed', not '{other}'"
+                "read_level must be 'latest', 'committed' or 'recent', not '{other}'"
             ))
         }
     };
     match (level, req.min_epoch) {
         (level, None) => Ok(level),
+        (ReadLevel::Committed(CommittedRead::Recent { .. }), Some(at_least)) => {
+            Ok(ReadLevel::Committed(CommittedRead::Recent { at_least }))
+        }
         (ReadLevel::Committed(_), Some(epoch)) => {
             Ok(ReadLevel::Committed(CommittedRead::AtLeast(epoch)))
         }
