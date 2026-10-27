@@ -409,11 +409,21 @@ fn collect_delivery_errors(config: &ServerConfig, errors: &mut Vec<String>) {
             errors.push("server.drain_timeout exceeds the platform clock range".to_string());
         }
         // WHY: below 100ms the capture-quorum round trip dominates the barrier.
-        if config.checkpoint.interval < Duration::from_millis(100) {
-            errors.push(format!(
-                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 100ms",
-                config.checkpoint.interval,
-            ));
+        let intervals = [
+            ("interval", Some(config.checkpoint.interval)),
+            (
+                "recent_read_interval",
+                config.checkpoint.recent_read_interval,
+            ),
+        ];
+        for (name, interval) in intervals {
+            let Some(interval) = interval else { continue };
+            if interval < Duration::from_millis(100) {
+                errors.push(format!(
+                    "mode = \"cluster\": checkpoint.{name} = {interval:?} is too tight; minimum \
+                     is 100ms",
+                ));
+            }
         }
         if checkpoint_scope != CheckpointStorageScope::ClusterShared {
             errors.push(format!(
@@ -455,6 +465,16 @@ fn collect_runtime_limit_errors(config: &ServerConfig, errors: &mut Vec<String>)
     // WHY: zero pauses barrier admission permanently and wedges checkpointing.
     if config.checkpoint.interval.is_zero() {
         errors.push("checkpoint.interval must be > 0".to_string());
+    }
+    if config
+        .checkpoint
+        .recent_read_interval
+        .is_some_and(|interval| interval.is_zero() || interval >= config.checkpoint.interval)
+    {
+        errors.push(
+            "checkpoint.recent_read_interval must be > 0 and shorter than checkpoint.interval"
+                .to_string(),
+        );
     }
     if config.checkpoint.timeout.is_zero() {
         errors.push("checkpoint.timeout must be > 0".to_string());

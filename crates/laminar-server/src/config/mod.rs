@@ -480,6 +480,10 @@ pub struct CheckpointSection {
     pub url: String,
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
+    /// While a `recent` view read waits for a newer checkpoint, the next one starts this long
+    /// after the previous one ended instead of `interval`. Unset: recent reads wait for `interval`.
+    #[serde(default, with = "humantime_serde")]
+    pub recent_read_interval: Option<Duration>,
     /// One checkpoint-attempt deadline; cluster assignment recovery phases use the same bound.
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
@@ -497,6 +501,7 @@ impl Default for CheckpointSection {
         Self {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
+            recent_read_interval: None,
             timeout: default_checkpoint_timeout(),
             storage: std::collections::HashMap::new(),
             max_node_data_bytes: None,
@@ -510,6 +515,7 @@ impl std::fmt::Debug for CheckpointSection {
         f.debug_struct("CheckpointSection")
             .field("url", &self.url)
             .field("interval", &self.interval)
+            .field("recent_read_interval", &self.recent_read_interval)
             .field("timeout", &self.timeout)
             .field(
                 "storage",

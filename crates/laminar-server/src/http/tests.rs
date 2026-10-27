@@ -831,6 +831,19 @@ async fn test_auth_with_valid_bearer_returns_200() {
 }
 
 #[tokio::test]
+async fn a_forwarded_recent_read_checkpoint_request_is_accepted() {
+    let app = build_router(test_state_with_token("supersecret-token"));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/checkpoint/expedite")
+        .header("authorization", "Bearer supersecret-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn test_auth_with_wrong_bearer_returns_401() {
     let state = test_state_with_token("supersecret-token");
     let app = build_router(state);
@@ -860,6 +873,7 @@ async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protecte
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
         ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/checkpoint/expedite"),
         ("POST", "/api/v1/pipeline/start"),
         ("POST", "/api/v1/pipeline/stop"),
         ("GET", "/ws/events"),
@@ -2760,6 +2774,7 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/pipeline/status"),
         ("GET", "/ws/events"),
         ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/checkpoint/expedite"),
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
         ("POST", "/api/v1/pipeline/stop"),

@@ -25,7 +25,7 @@ use super::catalog::{
     execute_sql, get_graph, get_stream, list_connectors, list_mvs, list_sinks, list_sources,
     list_streams,
 };
-use super::checkpoints::{cluster_checkpoints, trigger_checkpoint};
+use super::checkpoints::{cluster_checkpoints, expedite_checkpoint, trigger_checkpoint};
 use super::cluster_admin::{
     cluster_leader, cluster_nodes, cluster_status, cluster_vnodes, pipeline_status, start_pipeline,
     stop_pipeline,
@@ -64,6 +64,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/mvs", get(list_mvs))
         .route("/api/v1/connectors", get(list_connectors))
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
+        .route("/api/v1/checkpoint/expedite", post(expedite_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
         .route("/api/v1/graph", get(get_graph))
