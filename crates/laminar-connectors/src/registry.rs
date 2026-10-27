@@ -428,6 +428,20 @@ impl ConnectorRegistry {
             .recovery_identity_options(config)
     }
 
+    /// How far the upstream of the source `config` configures has been written, for reads that
+    /// must include it. `None` when its connector cannot tell.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source type is not registered or the connector rejects the
+    /// configuration.
+    pub fn source_recency(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Option<Arc<dyn crate::connector::SourceRecency>>, ConnectorError> {
+        self.create_source(config, None)?.recency(config)
+    }
+
     /// Creates a new sink connector instance.
     ///
     /// The connector type is determined by `config.connector_type()`.
