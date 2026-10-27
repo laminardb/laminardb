@@ -3,11 +3,37 @@
 use std::sync::Arc;
 
 use crate::checkpoint::{
-    CheckpointAssignmentFence, CheckpointAttempt, CommittedCheckpointIndex, LeaderProof,
+    CheckpointAssignmentFence, CheckpointAttempt, CommittedCheckpointIndex, CommittedCheckpointRef,
+    LeaderProof,
 };
 use crate::checkpoint_decision::{CheckpointDecisionStore, CheckpointOutcome, DecisionError};
 
-use super::{ClusterCheckpointAuthorityError, LeaderLeaseStore};
+use super::{AssignmentHandoffPin, ClusterCheckpointAuthorityError, LeaderLeaseStore};
+
+/// Greatest live cluster Commit, its committed checkpoint index, and the assignment handoff pin,
+/// all observed through one authority record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterCommitHead {
+    /// Greatest live cluster Commit.
+    pub outcome: CheckpointOutcome,
+    /// Committed checkpoint index loaded through the Commit's own reference.
+    pub index: CommittedCheckpointIndex,
+    handoff_pin: Option<AssignmentHandoffPin>,
+}
+
+impl ClusterCommitHead {
+    /// Checkpoint pinned for `target` in the authority record that selected this Commit.
+    #[must_use]
+    pub fn handoff_checkpoint(
+        &self,
+        target: &CheckpointAssignmentFence,
+    ) -> Option<&CommittedCheckpointRef> {
+        self.handoff_pin
+            .as_ref()
+            .filter(|pin| pin.target == *target)
+            .map(|pin| &pin.checkpoint)
+    }
+}
 
 /// Durable settlement state for one exact cluster checkpoint attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,38 +85,51 @@ impl LeaderLeaseStore {
         Ok(settlement_from_outcomes(attempt, &outcomes))
     }
 
-    /// Greatest live cluster Commit together with its validated committed checkpoint index.
+    /// Greatest live cluster Commit together with its validated committed checkpoint index and the
+    /// assignment handoff pin of the same authority record.
     ///
     /// The index is loaded through the selected Commit's own reference. A second lookup by epoch
     /// can miss a head that retention retired as soon as a newer Commit landed between the reads.
+    /// A target Commit clears the handoff pin in the write that moves the head, so a pin read from
+    /// a later record can describe a newer head than the one returned.
     ///
     /// # Errors
     /// Returns an error for an unavailable or invalid authority chain, or for a committed index
     /// that is missing or mismatched while its Commit is still the head.
     pub async fn highest_cluster_commit_with_checkpoint(
         &self,
-    ) -> Result<
-        Option<(CheckpointOutcome, CommittedCheckpointIndex)>,
-        ClusterCheckpointAuthorityError,
-    > {
+    ) -> Result<Option<ClusterCommitHead>, ClusterCheckpointAuthorityError> {
         const LOOKUP_RETRIES: usize = 3;
         let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
         for _ in 0..LOOKUP_RETRIES {
-            let Some(head) = self.highest_cluster_committed_outcome().await? else {
+            let (record, outcomes) = self.audited_cluster_outcomes().await?;
+            let Some(outcome) =
+                Self::cluster_outcome_inventory_from_audit(record.as_ref(), &outcomes)
+                    .outcomes
+                    .into_iter()
+                    .rev()
+                    .find(CheckpointOutcome::is_commit)
+            else {
                 return Ok(None);
             };
             let error = match decisions
-                .validate_committed_checkpoint_for_outcome(&head)
+                .validate_committed_checkpoint_for_outcome(&outcome)
                 .await
             {
-                Ok(index) => return Ok(Some((head, index))),
+                Ok(index) => {
+                    return Ok(Some(ClusterCommitHead {
+                        outcome,
+                        index,
+                        handoff_pin: record.and_then(|record| record.assignment_handoff_pin),
+                    }))
+                }
                 Err(error) => error,
             };
             // Cleanup deletes an index only after a newer Commit has retired it as head.
             let replaced = self
                 .highest_cluster_committed_outcome()
                 .await?
-                .is_some_and(|current| current.epoch > head.epoch);
+                .is_some_and(|current| current.epoch > outcome.epoch);
             if !replaced {
                 return Err(error.into());
             }

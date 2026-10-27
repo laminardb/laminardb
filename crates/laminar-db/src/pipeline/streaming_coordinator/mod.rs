@@ -465,7 +465,7 @@ struct CoordinatorWake {
 #[derive(Default)]
 struct CoordinatorGates {
     intake_paused: bool,
-    external_commit_backpressured: bool,
+    external_output_backpressured: bool,
 }
 
 enum CoordinatorWaitAction {

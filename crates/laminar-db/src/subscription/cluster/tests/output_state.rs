@@ -12,6 +12,7 @@ use laminar_core::state::PARTITIONING_ABI_VERSION;
 
 use super::super::{ClusterSubscriptionOutputState, OutputWriterAuthority};
 use crate::error::DbError;
+use crate::pipeline::callback::ExternalOutputPressure;
 use crate::subscription::{
     CertifiedSubscriptionFrontiers, ClusterSubscriptionError, PartitionedOutputBatch,
     PreparedSubscriptionOutput,
@@ -323,8 +324,10 @@ fn one_stream_can_use_but_not_exceed_the_process_pending_budget() {
     state.commit_cycle();
     assert!(state.retained_bytes() > 128 * MIB);
     assert!(state.retained_bytes() < 256 * MIB);
-    assert!(state.output_pressure().checkpoint_due());
-    assert!(!state.output_pressure().commit_backpressured());
+    assert_eq!(
+        state.output_pressure(),
+        ExternalOutputPressure::CheckpointDue
+    );
 
     let error = state
         .stage_cycle(
@@ -364,8 +367,7 @@ fn prepared_cut_applies_backpressure_until_commit_releases_it() {
     state
         .prepare_checkpoint(attempt, capture_partitions(&certificate, PARTITIONS, 1))
         .unwrap();
-    assert!(!state.output_pressure().checkpoint_due());
-    assert!(!state.output_pressure().commit_backpressured());
+    assert_eq!(state.output_pressure(), ExternalOutputPressure::Normal);
 
     state
         .stage_cycle(
@@ -374,13 +376,72 @@ fn prepared_cut_applies_backpressure_until_commit_releases_it() {
         )
         .unwrap();
     state.commit_cycle();
-    assert!(!state.output_pressure().checkpoint_due());
-    assert!(state.output_pressure().commit_backpressured());
+    assert_eq!(
+        state.output_pressure(),
+        ExternalOutputPressure::CommitBackpressured
+    );
 
     state.commit_checkpoint(attempt).unwrap();
-    assert!(!state.output_pressure().checkpoint_due());
-    assert!(!state.output_pressure().commit_backpressured());
+    assert_eq!(state.output_pressure(), ExternalOutputPressure::Normal);
     assert!(state.retained_bytes() < 128 * MIB);
+}
+
+#[test]
+fn unprepared_output_holds_intake_at_the_commit_high_water() {
+    const MIB: usize = 1024 * 1024;
+    const PARTITIONS: u16 = 48;
+    let first = batch(vec![7; 3 * MIB / size_of::<i64>()]);
+    let second = batch(vec![8; MIB / size_of::<i64>()]);
+    let mut certificate = (*certificate(first.schema().as_ref())).clone();
+    certificate.distribution = OutputDistribution::VnodePartitioned {
+        key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+        partition_abi: PARTITIONING_ABI_VERSION,
+        vnode_count: PARTITIONS,
+    };
+    let certificate = Arc::new(certificate);
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
+
+    state
+        .stage_cycle(
+            vec![partition_burst(&certificate, 0, PARTITIONS, &first)],
+            authority(),
+        )
+        .unwrap();
+    state.commit_cycle();
+    assert_eq!(
+        state.output_pressure(),
+        ExternalOutputPressure::CheckpointDue
+    );
+    assert!(!state.output_pressure().pauses_intake(|| false));
+
+    state
+        .stage_cycle(
+            vec![partition_burst(&certificate, 1, PARTITIONS, &second)],
+            authority(),
+        )
+        .unwrap();
+    state.commit_cycle();
+    assert!(state.retained_bytes() >= 192 * MIB);
+    assert_eq!(
+        state.output_pressure(),
+        ExternalOutputPressure::CheckpointBackpressured
+    );
+    assert!(state.output_pressure().checkpoint_due());
+    assert!(state.output_pressure().pauses_intake(|| false));
+    assert!(!state.output_pressure().pauses_intake(|| true));
+
+    let attempt = CheckpointAttempt::canonical(1);
+    state.reserve_checkpoint(attempt).unwrap();
+    state
+        .prepare_checkpoint(attempt, capture_partitions(&certificate, PARTITIONS, 2))
+        .unwrap();
+    assert_eq!(
+        state.output_pressure(),
+        ExternalOutputPressure::CommitBackpressured
+    );
+    state.commit_checkpoint(attempt).unwrap();
+    assert_eq!(state.output_pressure(), ExternalOutputPressure::Normal);
 }
 
 #[test]
@@ -404,7 +465,10 @@ fn prepared_and_open_bytes_share_the_partition_bound() {
     state
         .prepare_checkpoint(attempt, capture(&certificate, 8))
         .unwrap();
-    assert!(state.output_pressure().commit_backpressured());
+    assert_eq!(
+        state.output_pressure(),
+        ExternalOutputPressure::CommitBackpressured
+    );
 
     let error = state
         .stage_cycle(
@@ -415,6 +479,8 @@ fn prepared_and_open_bytes_share_the_partition_bound() {
     assert!(error.to_string().contains("pending partition output"));
 
     state.abort_checkpoint(attempt).unwrap();
-    assert!(state.output_pressure().checkpoint_due());
-    assert!(!state.output_pressure().commit_backpressured());
+    assert_eq!(
+        state.output_pressure(),
+        ExternalOutputPressure::CheckpointBackpressured
+    );
 }

@@ -1067,9 +1067,10 @@ pub(crate) struct OperatorGraph {
     /// operators intentionally retain node-local progress for prompt output and reclamation.
     #[cfg(feature = "cluster")]
     temporal_source_frontiers: FxHashMap<usize, InputFrontier>,
-    /// Idle per-source frontiers for bounded interval joins, capped at the committed cut.
+    /// Idle per-source frontiers for windows, aggregates, and interval joins, capped at the
+    /// committed cut.
     #[cfg(feature = "cluster")]
-    interval_idle_source_frontiers: FxHashMap<usize, InputFrontier>,
+    idle_source_frontiers: FxHashMap<usize, InputFrontier>,
     max_input_buf_batches: usize,
     max_input_buf_bytes: Option<usize>,
     backpressure_policy: BackpressurePolicy,
@@ -1186,7 +1187,7 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             temporal_source_frontiers: FxHashMap::default(),
             #[cfg(feature = "cluster")]
-            interval_idle_source_frontiers: FxHashMap::default(),
+            idle_source_frontiers: FxHashMap::default(),
             max_input_buf_batches: 0,
             max_input_buf_bytes: None,
             backpressure_policy: BackpressurePolicy::default(),
@@ -1582,7 +1583,7 @@ impl OperatorGraph {
         frontiers: &FxHashMap<Arc<str>, InputFrontier>,
     ) {
         self.temporal_source_frontiers.clear();
-        self.interval_idle_source_frontiers.clear();
+        self.idle_source_frontiers.clear();
         for &node_id in &self.source_node_ids {
             self.local_source_frontiers[node_id] = InputFrontier::default();
         }
@@ -1599,8 +1600,8 @@ impl OperatorGraph {
     /// uninitialized frontier for a source with no committed decision is deliberate: before the
     /// first durable cut, a speculative local frontier must not close temporal history.
     ///
-    /// A bounded interval join keeps active local progress, but an idle local shard closes only
-    /// to the committed cut. An idle source revives at that cut (rows below it fail source
+    /// Windows, aggregates, and bounded interval joins keep active local progress, but an idle
+    /// local shard closes only to the committed cut. An idle source revives at that cut (rows below it fail source
     /// admission), so closing on a higher speculative idle frontier would reject its on-time rows.
     #[cfg(feature = "cluster")]
     pub(crate) fn cap_join_source_frontiers(
@@ -1608,12 +1609,12 @@ impl OperatorGraph {
         mut committed_watermark: impl FnMut(&str) -> Option<i64>,
     ) {
         self.temporal_source_frontiers.clear();
-        self.interval_idle_source_frontiers.clear();
+        self.idle_source_frontiers.clear();
         for (name, &node_id) in self.source_map.iter().chain(&self.positioned_source_map) {
             let mut frontier = self.local_source_frontiers[node_id];
             let committed = committed_watermark(name);
             if frontier.idle {
-                self.interval_idle_source_frontiers.insert(
+                self.idle_source_frontiers.insert(
                     node_id,
                     InputFrontier {
                         watermark: committed,
@@ -3274,8 +3275,12 @@ impl OperatorGraph {
             )
         })?;
         let _rotation_guard = Arc::clone(rotation_fence).read_owned().await;
+        // An ownerless process never binds the replayed topology generation its graph was built
+        // for, and its zero-owner transition requires that inactive transport.
         if let Some(scope) = &self.cluster_shuffle {
-            scope.ensure_topology_current()?;
+            if !vnode_transition::shuffle_transport_is_inactive(scope) {
+                scope.ensure_topology_current()?;
+            }
         }
 
         // Waiting for assignment publication has not touched operator state. Cancellation after
@@ -3302,11 +3307,7 @@ impl OperatorGraph {
                     }
                     Some(version)
                 } else {
-                    if config.sender.assignment_version() != 0
-                        || config.receiver.assignment_version() != 0
-                        || config.sender.active_assignment_digest().is_some()
-                        || config.receiver.active_assignment_digest().is_some()
-                    {
+                    if !vnode_transition::shuffle_transport_is_inactive(config) {
                         return Err(DbError::ShuffleNotReady(
                             "zero-owner vnode transition requires inactive shuffle transport"
                                 .into(),

@@ -2848,9 +2848,7 @@ impl IntervalJoinOperator {
                         checkpoint.applied_right_idle,
                     )
                 };
-                if merged.watermark.unwrap_or(i64::MIN) != expected_watermark
-                    || merged.idle != expected_idle
-                {
+                if !Self::cut_matches(expected_watermark, expected_idle, merged, true) {
                     return Err(DbError::Checkpoint(format!(
                         "interval join [{}] donor {} portable applied frontier has no exact drained-cut evidence",
                         self.projection.op_name, restore.participant_id
@@ -4112,11 +4110,8 @@ impl IntervalJoinOperator {
         left_frontier: InputFrontier,
         right_frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        self.idle_close_ceilings = [left_frontier, right_frontier].map(|frontier| {
-            frontier
-                .idle
-                .then(|| frontier.watermark.unwrap_or(i64::MIN))
-        });
+        self.idle_close_ceilings =
+            [left_frontier, right_frontier].map(super::frontier::idle_close_ceiling);
         let scope = self.active_cluster_scope();
         let (config, assignment, peers) = match scope {
             Ok(scope) => scope,
@@ -4766,9 +4761,7 @@ impl GraphOperator for IntervalJoinOperator {
                     let queue_empty = peer_channels[port]
                         .values()
                         .all(|channel| channel.events.is_empty());
-                    if merged.watermark.unwrap_or(i64::MIN) != expected_watermark
-                        || (queue_empty && merged.idle != expected_idle)
-                    {
+                    if !Self::cut_matches(expected_watermark, expected_idle, merged, queue_empty) {
                         return Err(DbError::Checkpoint(format!(
                             "interval join [{}] restored cluster frontier is inconsistent",
                             self.projection.op_name

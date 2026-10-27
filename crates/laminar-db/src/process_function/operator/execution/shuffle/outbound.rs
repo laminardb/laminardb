@@ -166,7 +166,7 @@ impl ProcessShuffle {
             ));
         }
         let frontier = if self.last_broadcast == self.local {
-            crate::operator::frontier::normalize_restored_local_frontier(
+            crate::operator::frontier::normalize_local_frontier_without_peer_echo(
                 supplied,
                 self.local,
                 self.effective.watermark,

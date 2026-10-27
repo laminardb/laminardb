@@ -12,6 +12,20 @@ use super::{
 use crate::checkpoint::checkpoint_manifest::NodeDataObject;
 use crate::state::{DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID};
 
+const CREATE_IMMUTABLE_ATTEMPTS: u32 = 3;
+/// Longer than any healthy checkpoint write observed under load, and short enough that a
+/// retry still fits inside a 30-second checkpoint deadline.
+const CREATE_ATTEMPT_MIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const CREATE_ATTEMPT_MIN_BYTES_PER_SECOND: u64 = 4 * 1024 * 1024;
+
+pub(super) fn create_attempt_timeout(payload_bytes: usize) -> std::time::Duration {
+    let bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
+    let transfer = std::time::Duration::from_millis(
+        bytes.saturating_mul(1_000) / CREATE_ATTEMPT_MIN_BYTES_PER_SECOND,
+    );
+    transfer.max(CREATE_ATTEMPT_MIN_TIMEOUT)
+}
+
 impl ObjectStoreCheckpointStore {
     /// Create a store beneath a deployment-relative prefix.
     ///
@@ -221,28 +235,72 @@ impl ObjectStoreCheckpointStore {
         }
     }
 
+    /// Returns `false` when the object already exists; callers read it back and compare bytes.
+    ///
+    /// A request that stalls or fails in transport may still have been applied, and the store
+    /// client does not retry a non-idempotent create. The caller's content comparison makes a
+    /// repeated create safe, so each attempt is bounded and retried within the caller's deadline.
     pub(super) async fn create_immutable(
         &self,
         path: &object_store::path::Path,
         payload: PutPayload,
     ) -> Result<bool, CheckpointStoreError> {
-        let options = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        match self.store.put_opts(path, payload, options).await {
-            Ok(_) => Ok(true),
-            Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            ) => Ok(false),
-            Err(
-                object_store::Error::NotImplemented { .. }
-                | object_store::Error::NotSupported { .. },
-            ) => Err(CheckpointStoreError::Invalid(format!(
-                "object store does not support conditional create for '{path}'"
-            ))),
-            Err(error) => Err(error.into()),
+        let mut attempt_timeout = create_attempt_timeout(payload.content_length());
+        let mut attempt = 1;
+        loop {
+            let options = PutOptions {
+                mode: PutMode::Create,
+                ..PutOptions::default()
+            };
+            let created = tokio::time::timeout(
+                attempt_timeout,
+                self.store.put_opts(path, payload.clone(), options),
+            )
+            .await;
+            let retry_reason = match created {
+                Ok(Ok(_)) => return Ok(true),
+                Ok(Err(
+                    object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. },
+                )) => return Ok(false),
+                Ok(Err(
+                    object_store::Error::NotImplemented { .. }
+                    | object_store::Error::NotSupported { .. },
+                )) => {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "object store does not support conditional create for '{path}'"
+                    )));
+                }
+                Ok(Err(error @ object_store::Error::Generic { .. }))
+                    if attempt < CREATE_IMMUTABLE_ATTEMPTS =>
+                {
+                    error.to_string()
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) if attempt < CREATE_IMMUTABLE_ATTEMPTS => {
+                    format!("no response within {attempt_timeout:?}")
+                }
+                Err(_) => {
+                    return Err(CheckpointStoreError::ObjectStore(
+                        object_store::Error::Generic {
+                            store: "checkpoint store",
+                            source: format!(
+                                "conditional create for '{path}' had no response after \
+                                 {CREATE_IMMUTABLE_ATTEMPTS} attempts"
+                            )
+                            .into(),
+                        },
+                    ));
+                }
+            };
+            tracing::warn!(
+                %path,
+                attempt,
+                reason = %retry_reason,
+                "checkpoint object create did not complete; retrying"
+            );
+            attempt += 1;
+            attempt_timeout = attempt_timeout.saturating_mul(2);
         }
     }
 

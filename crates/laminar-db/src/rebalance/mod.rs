@@ -3,6 +3,7 @@
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)] // cold path
 
+mod drain_admission;
 mod head_validation;
 mod placement_metrics;
 use head_validation::{assignment_publication_error, validate_local_assignment_head};
@@ -1160,7 +1161,7 @@ impl SnapshotWatcher {
                                 // The local graph still needs the installed predecessor authority
                                 // to consume its staged vnode transition. Keep the prior audited
                                 // snapshot/certificate cached and retry this successor next tick.
-                                debug!(
+                                warn!(
                                     error = %error,
                                     version = snap.version,
                                     "snapshot watcher: successor waits for local vnode transition"
@@ -1925,7 +1926,9 @@ fn audit_materialized_recovery_with_authority<'a>(
                 snapshot.version
             ));
         }
-        let (committed_head, committed_index) = authority
+        // The head, its index, and both handoff pins come from one authority record: a target
+        // Commit clears the pin in the same write that moves the head.
+        let commit_head = authority
             .highest_cluster_commit_with_checkpoint()
             .await
             .map_err(|error| error.to_string())?
@@ -1935,16 +1938,14 @@ fn audit_materialized_recovery_with_authority<'a>(
                     snapshot.version
                 )
             })?;
+        let (committed_head, committed_index) = (&commit_head.outcome, &commit_head.index);
         let head_reference = committed_head.committed_checkpoint.clone().ok_or_else(|| {
             format!(
                 "assignment {} recovery committed head has no checkpoint reference",
                 snapshot.version
             )
         })?;
-        let pinned = authority
-            .assignment_handoff_checkpoint(&decision.target)
-            .await
-            .map_err(|error| error.to_string())?;
+        let pinned = commit_head.handoff_checkpoint(&decision.target).cloned();
 
         let recovery_checkpoint = if let Some(pinned) = pinned {
             if pinned != decision.recovery_checkpoint || head_reference != pinned {
@@ -1954,8 +1955,8 @@ fn audit_materialized_recovery_with_authority<'a>(
                 ));
             }
             let origin = validate_portable_recovery_cut(
-                &committed_head,
-                &committed_index,
+                committed_head,
+                committed_index,
                 &pinned,
                 &decision.predecessor,
                 "materialized assignment recovery",
@@ -1969,8 +1970,8 @@ fn audit_materialized_recovery_with_authority<'a>(
             // decision checkpoint may then be garbage-collected; validate and recover from the
             // exact target-fenced head instead of reopening that retired artifact.
             let origin = validate_portable_recovery_cut(
-                &committed_head,
-                &committed_index,
+                committed_head,
+                committed_index,
                 &head_reference,
                 &decision.target,
                 "consumed assignment recovery",
@@ -2007,19 +2008,15 @@ fn audit_materialized_recovery_with_authority<'a>(
                     snapshot.version
                 ));
             }
-            let successor_pin = authority
-                .assignment_handoff_checkpoint(&successor.target)
-                .await
-                .map_err(|error| error.to_string())?;
-            if successor_pin.as_ref() != Some(&head_reference) {
+            if commit_head.handoff_checkpoint(&successor.target) != Some(&head_reference) {
                 return Err(format!(
                     "assignment {} recovery checkpoint is not pinned to its exact pending successor",
                     snapshot.version
                 ));
             }
             let origin = validate_portable_recovery_cut(
-                &committed_head,
-                &committed_index,
+                committed_head,
+                committed_index,
                 &head_reference,
                 &decision.predecessor,
                 "propagated assignment recovery",
@@ -3308,8 +3305,14 @@ fn execute_graceful_rotation_owned(
         let current_owners = current
             .to_vnode_vec(registry.vnode_count())
             .map_err(|error| error.to_string())?;
-        let publication_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
         let rotate_outcome = {
+            let _checkpoints = drain_admission::hold_checkpoints_until_sink_epoch_opens(
+                &db,
+                &controller,
+                tokio::time::Instant::now() + config.checkpoint_timeout,
+            )
+            .await;
+            let publication_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
             // Assignment adoption and startup recovery create pending vnode work under this lock.
             // Keep it through the durable CAS so it cannot appear after preflight but
             // before V+1 is published. Once the recovery gate below admits publication, the
@@ -3336,53 +3339,16 @@ fn execute_graceful_rotation_owned(
                     local.version()
                 ));
             }
-            let local_vnode_state_ready = tokio::time::timeout_at(
-                publication_deadline,
-                db.local_vnode_state_is_ready(&registry, &transition.predecessor),
-            )
-            .await
-            .map_err(|_| {
-                format!(
-                    "graceful rotation from assignment {} timed out checking local vnode-state readiness",
-                    current.version
-                )
-            })?
-            .map_err(|error| error.to_string())?;
-            if !local_vnode_state_ready {
-                debug!(
-                    version = current.version,
-                    "graceful rotation deferred until local vnode state matches the predecessor"
-                );
-                return Ok(None);
-            }
-            let Some(published_fence) = controller.checkpoint_assignment_fence(current.version)
-            else {
-                debug!(
-                    version = current.version,
-                    "graceful rotation deferred until the predecessor assignment is adopted"
-                );
-                return Ok(None);
-            };
-            if published_fence != transition.predecessor {
-                return Err(format!(
-                    "graceful rotation predecessor assignment {} does not match the exact assignment-adoption certificate",
-                    current.version
-                ));
-            }
-            // This mutable report scan is a best-current preflight, not a cross-node lease. It
-            // prevents assignment chaining before every participant's initial install; a later
-            // withdrawal is contained by source drain and forced-checkpoint abort/recovery.
-            if !read_assignment_vnode_state_readiness(
+            if !drain_admission::predecessor_admits_drain(
+                &db,
                 &controller,
-                &transition.predecessor,
+                &registry,
+                current.version,
+                &transition,
                 publication_deadline,
             )
             .await?
             {
-                debug!(
-                    version = current.version,
-                    "graceful rotation deferred until every participant installs vnode state"
-                );
                 return Ok(None);
             }
             let outcome = match reconcile_drain_publication(

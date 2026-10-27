@@ -3525,6 +3525,22 @@ async fn recovery_authority_cannot_revoke_the_final_local_vnode() {
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn replacement_process_stages_and_publishes_zero_owner_topology() {
+    assert_replacement_process_publishes_zero_owner_topology(None).await;
+}
+
+/// An ownerless process never activates shuffle, so its endpoints never bind the migrated
+/// topology generation its graph replayed.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn ownerless_process_with_replayed_topology_publishes_zero_owner_topology() {
+    let replayed = laminar_core::shuffle::ShuffleTopologyFence::new(5, [5; 32]).unwrap();
+    assert_replacement_process_publishes_zero_owner_topology(Some(replayed)).await;
+}
+
+#[cfg(feature = "cluster")]
+async fn assert_replacement_process_publishes_zero_owner_topology(
+    topology: Option<laminar_core::shuffle::ShuffleTopologyFence>,
+) {
     use laminar_core::checkpoint::{
         AssignmentDrainTransition, CheckpointParticipant, PipelineIdentity,
     };
@@ -3742,8 +3758,8 @@ async fn replacement_process_stages_and_publishes_zero_owner_topology() {
         registry,
         sender,
         receiver,
-        topology: None,
         self_id,
+        topology,
     });
     graph.set_pipeline_identity(identity);
     graph.set_pending_vnode_transition_handle(Arc::clone(&db.pending_vnode_transition));

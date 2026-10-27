@@ -260,6 +260,9 @@ const RECOVERY_PREPARE_HANDOFF_LOG: &str =
 #[cfg(feature = "kafka")]
 const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fresh recovery round";
 #[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_YIELDED_LOG: &str =
+    "recovery fault inventory changed after stopped quorum; yielding stale Prepare";
+#[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_WITHOUT_START_LOG: &str =
     "Release observed without restoring its exact Start";
 #[cfg(feature = "kafka")]
@@ -370,7 +373,7 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 112] = [
     ("recovery_prepare_handoff", RECOVERY_PREPARE_HANDOFF_LOG),
     (
         "recovery_fault_inventory_changed_after_stop",
-        "recovery fault inventory changed after stopped quorum; yielding stale Prepare",
+        RECOVERY_PREPARE_YIELDED_LOG,
     ),
     ("recovery_retry_hold", RECOVERY_RETRY_HOLD_LOG),
     (
@@ -9492,6 +9495,7 @@ fn validate_recovery_checkpoint_failure_totals(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecoveryPrepareSequence {
     abandoned_rounds: u32,
+    yielded_rounds: u32,
     applied_rounds: u32,
 }
 
@@ -9500,15 +9504,49 @@ fn validate_fenced_prepare_replacement(
     leader_lines: &[&str],
     first: usize,
     second: usize,
-) -> Result<(), String> {
+) -> Result<RecoveryPrepareSequence, String> {
     let between = &leader_lines[first + 1..second];
-    let superseded = between
-        .iter()
-        .position(|line| line.contains(RECOVERY_SUPERSEDED_LOG))
-        .ok_or_else(|| {
-            "two recovery Prepare records have no intervening superseded-round fence".to_string()
-        })?;
-    if !between[superseded + 1..]
+    let position = |marker: &str| between.iter().position(|line| line.contains(marker));
+    let (fence, expected_retry_holds, sequence) = match (
+        position(RECOVERY_SUPERSEDED_LOG),
+        position(RECOVERY_PREPARE_YIELDED_LOG),
+    ) {
+        (Some(superseded), None) => (
+            superseded,
+            1,
+            RecoveryPrepareSequence {
+                abandoned_rounds: 1,
+                yielded_rounds: 0,
+                applied_rounds: 1,
+            },
+        ),
+        // A cascade fault reported after the stopped quorum: the driver yields its own Prepare
+        // without failure accounting or a retry hold, and the next round covers the late fault.
+        (None, Some(yielded)) => (
+            yielded,
+            0,
+            RecoveryPrepareSequence {
+                abandoned_rounds: 0,
+                yielded_rounds: 1,
+                applied_rounds: 1,
+            },
+        ),
+        (None, None) => {
+            return Err(
+                "two recovery Prepare records have no intervening yielded-Prepare or \
+                 superseded-round fence"
+                    .into(),
+            );
+        }
+        (Some(_), Some(_)) => {
+            return Err(
+                "two recovery Prepare records are fenced by both a superseded round and \
+                 a yielded Prepare"
+                    .into(),
+            );
+        }
+    };
+    if !between[fence + 1..]
         .iter()
         .any(|line| line.contains(RECOVERY_PREPARE_HANDOFF_LOG))
     {
@@ -9518,12 +9556,13 @@ fn validate_fenced_prepare_replacement(
         .iter()
         .filter(|line| line.contains(RECOVERY_RETRY_HOLD_LOG))
         .count();
-    if retry_holds != 1 {
+    if retry_holds != expected_retry_holds {
         return Err(format!(
-            "fenced recovery replacement recorded {retry_holds} retry holds; expected exactly one"
+            "fenced recovery replacement recorded {retry_holds} retry holds; expected \
+             {expected_retry_holds}"
         ));
     }
-    Ok(())
+    Ok(sequence)
 }
 
 #[cfg(feature = "kafka")]
@@ -9619,19 +9658,17 @@ fn validate_recovery_prepare_sequence(
     match (total_prepares, driver_handoffs, prepares.as_slice()) {
         (1, 0, [_]) => Ok(RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 1,
         }),
         (2, 0, [first, second]) => {
-            validate_fenced_prepare_replacement(&leader_lines, *first, *second)?;
-            Ok(RecoveryPrepareSequence {
-                abandoned_rounds: 1,
-                applied_rounds: 1,
-            })
+            validate_fenced_prepare_replacement(&leader_lines, *first, *second)
         }
         (2, 1, [_, ..]) => {
             validate_post_start_leadership_handoff(fault_logs, &leader_lines, &prepares)?;
             Ok(RecoveryPrepareSequence {
                 abandoned_rounds: 0,
+                yielded_rounds: 0,
                 applied_rounds: 2,
             })
         }
@@ -9819,11 +9856,13 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         .map(|log| log.matches(RECOVERY_STOPPED_LOG).count())
         .sum::<usize>();
     let applied_stopped_reports = (nodes.len() - 1) * prepare_sequence.applied_rounds as usize;
-    let maximum_stopped_reports =
-        applied_stopped_reports + (nodes.len() - 1) * prepare_sequence.abandoned_rounds as usize;
+    // The driver itself also stops for the Prepare it yielded before handing it off.
+    let maximum_stopped_reports = applied_stopped_reports
+        + (nodes.len() - 1) * prepare_sequence.abandoned_rounds as usize
+        + nodes.len() * prepare_sequence.yielded_rounds as usize;
     assert!(
         (applied_stopped_reports..=maximum_stopped_reports).contains(&stopped_reports),
-        "explicit fault recorded {stopped_reports} follower stops; expected {applied_stopped_reports} exact-quorum stops plus at most {} from a fenced abandoned round",
+        "explicit fault recorded {stopped_reports} stops; expected {applied_stopped_reports} exact-quorum stops plus at most {} from a fenced abandoned or yielded round",
         maximum_stopped_reports - applied_stopped_reports
     );
     let leader_log = std::fs::read_to_string(&nodes[evidence.recovery_leader].log_path)
@@ -16965,6 +17004,7 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&one, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 1,
         }
     );
@@ -16980,6 +17020,7 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&replacement, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 1,
+            yielded_rounds: 0,
             applied_rounds: 1,
         }
     );
@@ -16995,6 +17036,7 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&same_process_successor, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 2,
         }
     );
@@ -17007,9 +17049,62 @@ fn recovery_prepare_oracle_allows_only_fenced_transitions() {
         validate_recovery_prepare_sequence(&different_process_successor, 0).unwrap(),
         RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            yielded_rounds: 0,
             applied_rounds: 2,
         }
     );
+
+    let yielded = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_QUORUM_LOG}\n\
+             {RECOVERY_PREPARE_YIELDED_LOG} gen=1\n{RECOVERY_STOPPED_LOG} gen=1\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG} gen=1\n{RECOVERY_PREPARE_LOG} gen=2"
+        ),
+        String::new(),
+    ];
+    assert_eq!(
+        validate_recovery_prepare_sequence(&yielded, 0).unwrap(),
+        RecoveryPrepareSequence {
+            abandoned_rounds: 0,
+            yielded_rounds: 1,
+            applied_rounds: 1,
+        }
+    );
+
+    let yielded_with_retry_hold = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_YIELDED_LOG}\n{RECOVERY_RETRY_HOLD_LOG}\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert!(
+        validate_recovery_prepare_sequence(&yielded_with_retry_hold, 0)
+            .unwrap_err()
+            .contains("retry holds")
+    );
+
+    let yielded_without_handoff = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_YIELDED_LOG}\n{RECOVERY_PREPARE_LOG}"),
+        String::new(),
+    ];
+    assert!(
+        validate_recovery_prepare_sequence(&yielded_without_handoff, 0)
+            .unwrap_err()
+            .contains("direct handoff fence")
+    );
+
+    let doubly_fenced = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_SUPERSEDED_LOG} fault set changed\n\
+             {RECOVERY_PREPARE_YIELDED_LOG}\n{RECOVERY_RETRY_HOLD_LOG}\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&doubly_fenced, 0)
+        .unwrap_err()
+        .contains("both"));
 
     let unfenced = vec![
         format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_LOG}"),

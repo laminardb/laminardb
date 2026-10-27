@@ -1167,12 +1167,7 @@ impl PreparedAggVnodeTransition {
     /// Saturated accounting reports `usize::MAX`; observability never faults the data plane.
     #[cfg(feature = "cluster")]
     pub(crate) fn accounted_state_bytes(&self) -> usize {
-        let usage = self.accounted_usage();
-        if usage.is_saturated() {
-            usize::MAX
-        } else {
-            usage.total_bytes()
-        }
+        self.accounted_usage().accounted_bytes()
     }
 }
 
@@ -2010,20 +2005,15 @@ impl IncrementalAggState {
     /// overhead, transient scratch, and RSS remain outside this deterministic envelope. Overflow is
     /// clamped because metrics publication must not fault processing.
     pub(crate) fn accounted_state_bytes(&self) -> usize {
-        let usage = self
-            .vnode_states
+        self.vnode_states
             .accounted_usage()
             .saturating_add(accounting::topology_element_usage::<bool>(
                 self.checkpoint_dirty_vnodes.len(),
             ))
             .saturating_add(accounting::topology_element_usage::<u32>(
                 self.checkpoint_dirty_vnode_roster.capacity(),
-            ));
-        if usage.is_saturated() {
-            usize::MAX
-        } else {
-            usage.total_bytes()
-        }
+            ))
+            .accounted_bytes()
     }
 
     #[cfg(test)]
@@ -2333,13 +2323,16 @@ impl IncrementalAggState {
     ///
     /// The caller has already validated the complete borrowed archive and cardinality roster. The
     /// iterator deliberately yields one owned vnode image at a time; its rkyv and Arrow expansion
-    /// is consumed into private replacement state before the next vnode is requested. Publication
-    /// remains one all-vnode operation after the complete iterator succeeds.
+    /// is consumed into private replacement state before the next vnode is requested, and
+    /// `replaced` receives that state's accounted bytes first, so the caller can admit the next
+    /// decode against what is actually retained. Publication remains one all-vnode operation
+    /// after the complete iterator succeeds.
     pub(crate) fn prepare_owned_vnode_transition(
         &self,
         vnode_count: u32,
         restores: impl ExactSizeIterator<Item = Result<OwnedAggVnodeRestore, DbError>>,
         revoked: &rustc_hash::FxHashSet<u32>,
+        mut replaced: impl FnMut(usize),
     ) -> Result<PreparedAggVnodeTransition, DbError> {
         let vnode_count = self.validate_vnode_count(vnode_count)?;
         let reserve_error = |component: &str, error: std::collections::TryReserveError| {
@@ -2450,6 +2443,7 @@ impl IncrementalAggState {
                 self.emit_changelog,
             )
             .map_err(|(component, error)| reserve_error(component, error))?;
+            replaced(replacement.usage().accounted_bytes());
             // Ownership lives in the graph, not in this sparse working set. An authoritative EMPTY
             // image therefore clears any old slot without adding an inert active-roster entry.
             if !replacement.groups.is_empty() || replacement.next_output_sequence != 0 {
@@ -2489,19 +2483,9 @@ impl IncrementalAggState {
             .map_err(|error| reserve_error("replacement slot roster", error))?;
         let mut restored_replacements = restored_replacements.into_iter().peekable();
         for &vnode in &transitioned_vnodes {
-            let replacement = if restored_replacements
-                .peek()
-                .is_some_and(|(restored, _)| *restored == vnode)
-            {
-                Some(
-                    restored_replacements
-                        .next()
-                        .expect("peeked aggregate vnode replacement")
-                        .1,
-                )
-            } else {
-                None
-            };
+            let replacement = restored_replacements
+                .next_if(|(restored, _)| *restored == vnode)
+                .map(|(_, replacement)| replacement);
             replacements.push((vnode, replacement));
         }
         debug_assert!(restored_replacements.next().is_none());
@@ -2575,6 +2559,7 @@ impl IncrementalAggState {
             vnode_count,
             std::iter::once(Ok(OwnedAggVnodeRestore { vnode, state })),
             &FxHashSet::default(),
+            |_| {},
         )?;
         let retired = self.publish_prepared_vnode_transition(prepared);
         Self::finish_vnode_transition(retired);

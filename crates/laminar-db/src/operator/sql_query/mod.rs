@@ -53,6 +53,8 @@ use crate::sql_analysis::{
 mod apply_failure;
 mod batch_coalescing;
 #[cfg(feature = "cluster")]
+mod cluster_frontiers;
+#[cfg(feature = "cluster")]
 mod routing;
 #[cfg(feature = "cluster")]
 mod subscription_output;
@@ -781,6 +783,9 @@ pub(crate) struct SqlQueryOperator {
     last_broadcast: InputFrontier,
     #[cfg(feature = "cluster")]
     effective_frontier: InputFrontier,
+    /// This node's idle graph input, the committed cut, which an all-idle merge must not pass.
+    #[cfg(feature = "cluster")]
+    idle_close_ceiling: Option<i64>,
     #[cfg(feature = "cluster")]
     remote_peer_cursor: Option<u64>,
     #[cfg(feature = "cluster")]
@@ -863,6 +868,8 @@ impl SqlQueryOperator {
             last_broadcast: InputFrontier::default(),
             #[cfg(feature = "cluster")]
             effective_frontier: InputFrontier::default(),
+            #[cfg(feature = "cluster")]
+            idle_close_ceiling: Some(i64::MIN),
             #[cfg(feature = "cluster")]
             remote_peer_cursor: None,
             #[cfg(feature = "cluster")]
@@ -1423,7 +1430,7 @@ impl SqlQueryOperator {
                     ),
                     i64::MIN,
                 );
-                if merged != effective {
+                if !super::frontier::restored_frontier_matches(effective, merged) {
                     return Err(DbError::Checkpoint(format!(
                         "aggregate '{}' donor {} portable frontiers do not form one drained cut",
                         self.op_name, restore.participant_id
@@ -1790,47 +1797,13 @@ impl SqlQueryOperator {
                 self.op_name
             )));
         }
-        let normalized = super::frontier::normalize_restored_local_frontier(
+        let normalized = super::frontier::normalize_local_frontier_without_peer_echo(
             input,
             self.local_frontier,
             self.effective_frontier.watermark,
         );
         self.validate_frontier(self.local_frontier, normalized, "local")?;
         Ok(normalized)
-    }
-
-    #[cfg(feature = "cluster")]
-    fn effective_cluster_frontier(
-        &self,
-        local: InputFrontier,
-        consumed: Option<(u64, InputFrontier, bool)>,
-    ) -> Result<InputFrontier, DbError> {
-        let remote = self.peer_channels.iter().map(|(&peer, channel)| {
-            let (mut applied, pending) = if let Some((target, applied, pending)) = consumed {
-                if target == peer {
-                    (applied, pending)
-                } else {
-                    (channel.applied, !channel.events.is_empty())
-                }
-            } else {
-                (channel.applied, !channel.events.is_empty())
-            };
-            if pending {
-                applied.idle = false;
-                applied.watermark =
-                    Self::max_watermark(applied.watermark, self.effective_frontier.watermark);
-            }
-            applied
-        });
-        let merged = merge_input_frontier_iter(std::iter::once(local).chain(remote), i64::MIN);
-        self.validate_frontier(self.effective_frontier, merged, "effective")?;
-        if self.pending_cluster_input.is_some() {
-            return Ok(InputFrontier {
-                watermark: self.effective_frontier.watermark,
-                idle: false,
-            });
-        }
-        Ok(merged)
     }
 
     #[cfg(feature = "cluster")]
@@ -2096,6 +2069,7 @@ impl SqlQueryOperator {
         inputs: &[Vec<RecordBatch>],
         frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        self.idle_close_ceiling = super::frontier::idle_close_ceiling(frontier);
         let (config, assignment, peers) = match self.active_cluster_scope() {
             Ok(scope) => scope,
             Err(error) if self.pending_cluster_input.is_some() => {
@@ -3034,8 +3008,8 @@ impl GraphOperator for SqlQueryOperator {
                 })),
                 i64::MIN,
             );
-            if merged.watermark != effective_frontier.watermark
-                || (queued_remote_events == 0 && merged != effective_frontier)
+            if !super::frontier::restored_frontier_matches(effective_frontier, merged)
+                && (merged.watermark != effective_frontier.watermark || queued_remote_events == 0)
             {
                 return Err(DbError::Checkpoint(format!(
                     "aggregate '{}' restored channel frontiers do not form its effective cut",
@@ -3346,12 +3320,7 @@ impl GraphOperator for SqlQueryOperator {
         let accounted_bytes = live_bytes
             .checked_add(restore_bytes)
             .and_then(|bytes| bytes.checked_add(transition_roster_bytes))
-            .and_then(|bytes| {
-                restore_preflight
-                    .sequential_decode_bytes()
-                    .and_then(|decode| bytes.checked_add(decode))
-            })
-            .and_then(|bytes| bytes.checked_add(restore_preflight.final_state_upper_bytes()))
+            .and_then(|bytes| restore_preflight.decode_peak_bytes(bytes))
             .ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "aggregate '{}' vnode {vnode} restore accounting overflow",
@@ -3673,8 +3642,6 @@ impl GraphOperator for SqlQueryOperator {
         };
 
         let archive_profile = aggregate.vnode_archive_restore_profile();
-        let mut replacement_state_upper_bytes = 0usize;
-        let mut sequential_decode_peak_bytes = 0usize;
         for restore in transition.restores {
             let restore_preflight =
                 with_aligned_aggregate_checkpoint_bytes(restore.state, |state| {
@@ -3688,14 +3655,6 @@ impl GraphOperator for SqlQueryOperator {
                         )
                         .map(|archive| archive.restore_preflight())
                 })?;
-            replacement_state_upper_bytes = replacement_state_upper_bytes
-                .checked_add(restore_preflight.final_state_upper_bytes())
-                .ok_or_else(|| self.accounting_error())?;
-            sequential_decode_peak_bytes = sequential_decode_peak_bytes.max(
-                restore_preflight
-                    .sequential_decode_bytes()
-                    .ok_or_else(|| self.accounting_error())?,
-            );
             restored_lower_bounds.push((restore.vnode, restore_preflight.group_count()));
             preflighted.push((restore.vnode, restore.state, restore_preflight));
         }
@@ -3733,22 +3692,31 @@ impl GraphOperator for SqlQueryOperator {
                     .and_then(|channels| bytes.checked_add(channels))
             })
             .ok_or_else(|| self.accounting_error())?;
-        let decode_peak_bytes = live_bytes
+        let decode_base_bytes = live_bytes
             .checked_add(payload_phase_bytes)
             .and_then(|bytes| bytes.checked_add(internal_roster_bytes))
             .and_then(|bytes| bytes.checked_add(topology_upper_bytes))
-            .and_then(|bytes| bytes.checked_add(replacement_state_upper_bytes))
-            .and_then(|bytes| bytes.checked_add(sequential_decode_peak_bytes))
             .ok_or_else(|| self.accounting_error())?;
-        if decode_peak_bytes > self.max_managed_state_bytes {
+        if decode_base_bytes > self.max_managed_state_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
                 context: format!("aggregate '{}' transition decode", self.op_name),
-                accounted_bytes: decode_peak_bytes,
+                accounted_bytes: decode_base_bytes,
                 limit_bytes: self.max_managed_state_bytes,
             });
         }
 
+        let replaced_bytes = std::cell::Cell::new(0_usize);
         let owned_restores = preflighted.into_iter().map(|(vnode, bytes, preflight)| {
+            let decode_peak_bytes = preflight
+                .decode_peak_bytes(decode_base_bytes.saturating_add(replaced_bytes.get()))
+                .ok_or_else(|| self.accounting_error())?;
+            if decode_peak_bytes > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!("aggregate '{}' transition decode", self.op_name),
+                    accounted_bytes: decode_peak_bytes,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
             let state = with_aligned_aggregate_checkpoint_bytes(bytes, |bytes| {
                 let archive = archive_profile.preflight(
                     bytes,
@@ -3766,6 +3734,7 @@ impl GraphOperator for SqlQueryOperator {
             transition.target.vnode_count,
             owned_restores,
             transition.revoked,
+            |bytes| replaced_bytes.set(replaced_bytes.get().saturating_add(bytes)),
         )?;
         let target_peers = Self::remote_owner_peers(&assignment, config.self_id);
         let mut channels = BTreeMap::new();

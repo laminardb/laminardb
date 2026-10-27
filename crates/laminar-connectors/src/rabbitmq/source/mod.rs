@@ -16,7 +16,9 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use lapin::message::Delivery;
-use lapin::options::{BasicAckOptions, BasicConsumeOptions, BasicQosOptions, BasicRejectOptions};
+use lapin::options::{
+    BasicAckOptions, BasicCancelOptions, BasicConsumeOptions, BasicQosOptions, BasicRejectOptions,
+};
 use lapin::types::ShortString;
 use lapin::{Channel, Connection, Consumer};
 use tokio::sync::{mpsc, Notify};
@@ -55,6 +57,7 @@ pub struct RabbitMqSource {
 struct Running {
     connection: Connection,
     channel: Channel,
+    consumer_tag: ShortString,
     deliveries: mpsc::Receiver<Result<Delivery, String>>,
     reader: tokio::task::JoinHandle<()>,
     carry: Option<Delivery>,
@@ -404,6 +407,7 @@ impl RabbitMqSource {
                     parsed.queue
                 ))
             })?;
+        let consumer_tag = consumer.tag();
         let (sender, deliveries) = mpsc::channel(usize::from(parsed.prefetch));
         let guard = self.task_owner.track().ok_or_else(retired)?;
         let data_ready = Arc::clone(&self.data_ready);
@@ -414,6 +418,7 @@ impl RabbitMqSource {
         Ok(Running {
             connection,
             channel,
+            consumer_tag,
             deliveries,
             reader,
             carry: None,
@@ -472,6 +477,27 @@ enum Collected {
 }
 
 impl Running {
+    /// Cancel the consumer before the channel closes. Dropping a still-active consumer queues a
+    /// background `basic.cancel` that fails once the channel is closing, and lapin reports that
+    /// failure from `channel.close`.
+    async fn cancel_consumer(&self) -> Result<(), ConnectorError> {
+        if !self.channel.status().connected() {
+            return Ok(());
+        }
+        let cancel = self
+            .channel
+            .basic_cancel(self.consumer_tag.clone(), BasicCancelOptions::default());
+        match tokio::time::timeout(CLOSE_TIMEOUT, cancel).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(ConnectorError::ConnectionFailed(format!(
+                "RabbitMQ basic.cancel failed: {error}"
+            ))),
+            Err(_) => Err(ConnectorError::Timeout(
+                u64::try_from(CLOSE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+            )),
+        }
+    }
+
     /// Take ready deliveries within the message-count and payload-byte bounds.
     fn collect(&mut self, max_records: usize) -> Collected {
         let max_batch_bytes = self.decoder.config.max_batch_bytes;
@@ -759,8 +785,10 @@ impl SourceConnector for RabbitMqSource {
         let Some(running) = self.running.take() else {
             return Ok(());
         };
+        let cancelled = running.cancel_consumer().await;
         running.reader.abort();
-        close(&running.channel, &running.connection, CLOSE_TIMEOUT).await
+        let closed = close(&running.channel, &running.connection, CLOSE_TIMEOUT).await;
+        cancelled.and(closed)
     }
 }
 

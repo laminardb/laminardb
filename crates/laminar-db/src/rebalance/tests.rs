@@ -2201,6 +2201,180 @@ async fn active_recovery_prevents_new_drain_publication() {
     assert_eq!(controller.checkpoint_drain_transition(), None);
 }
 
+struct CommittableProbeSink;
+
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for CommittableProbeSink {
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::new(arrow::datatypes::Schema::empty())
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn graceful_rotation_holds_periodic_checkpoints_until_the_sink_epoch_opens() {
+    use crate::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
+    use laminar_connectors::connector::{
+        SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
+    };
+    use laminar_core::checkpoint::{ObjectStoreCheckpointStore, PipelineIdentity};
+    use laminar_core::checkpoint_decision::CheckpointDecisionStore;
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let peer_id = NodeId(2);
+    let self_boot = Uuid::from_u128(11);
+    let participants = vec![
+        CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: self_boot,
+        },
+        CheckpointParticipant {
+            node_id: peer_id.0,
+            boot_incarnation: Uuid::from_u128(22),
+        },
+    ];
+    let current = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, self_id]),
+            participants[..1].to_vec(),
+        )
+        .unwrap();
+    let durable = Arc::new(store());
+    durable.save_if_absent(&current).await.unwrap();
+    let controller = test_cluster_controller(self_id, self_boot, Some(Arc::clone(&durable)));
+    let _process_authority =
+        install_test_process_authority(&controller, &current.participants).await;
+    let _leader_lease = grant_test_leadership(&controller).await;
+    let registry = Arc::new(VnodeRegistry::single_owner(2, self_id));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(Arc::clone(&durable))
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+    controller.publish_checkpoint_assignment_fence(Some(current.assignment_fence().unwrap()));
+    db.publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), true)
+        .await
+        .unwrap();
+
+    let objects: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut coordinator = CheckpointCoordinator::new(
+        CheckpointConfig::default(),
+        Box::new(ObjectStoreCheckpointStore::new(
+            Arc::clone(&objects),
+            "rotation-sink-epoch",
+        )),
+    )
+    .unwrap();
+    coordinator
+        .bind_durable_decision_store(Arc::new(CheckpointDecisionStore::new(objects)))
+        .await
+        .unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let sink = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "sink".into(),
+        sink_id: Arc::from("sink"),
+        connector: Box::new(CommittableProbeSink),
+        contract: SinkContract::new(
+            SinkConsistency::CheckpointCommittable,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+        terminal_tasks: None,
+        process_authority: None,
+    });
+    coordinator.register_sink("sink", sink.clone());
+    *db.coordinator.lock().await = Some(coordinator);
+    // Recovery defers publication after the preflight, so no drain is published either way.
+    controller.set_recovering(true);
+    let rotate = |config| {
+        execute_graceful_rotation_owned(
+            Arc::clone(&db),
+            Arc::clone(&controller),
+            Arc::clone(&durable),
+            Arc::clone(&registry),
+            current.clone(),
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, peer_id]),
+            participants.clone(),
+            config,
+        )
+    };
+
+    let mut short = RebalanceConfig::test_defaults();
+    short.checkpoint_timeout = Duration::from_millis(200);
+    assert_eq!(
+        rotate(short).await,
+        Ok(None),
+        "an epoch that stays consumed defers the drain instead of failing the rotation"
+    );
+    assert!(!controller.periodic_checkpoints_held());
+
+    let waiting = tokio::spawn(rotate(RebalanceConfig::test_defaults()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !controller.periodic_checkpoints_held() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the rotation must hold periodic checkpoints while the sink epoch is consumed");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished());
+    db.coordinator
+        .lock()
+        .await
+        .as_mut()
+        .unwrap()
+        .begin_initial_epoch()
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("an open sink epoch must end the wait")
+        .unwrap();
+
+    assert_eq!(outcome, Ok(None));
+    assert!(!controller.periodic_checkpoints_held());
+    assert_eq!(durable.load().await.unwrap(), Some(current));
+    sink.rollback_epoch(1).await.unwrap();
+    sink.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
     use laminar_connectors::connector::DeliveryGuarantee;
@@ -3174,6 +3348,100 @@ async fn committed_recovery_target_audits_after_consuming_and_pruning_its_handof
     assert!(!audited.recovery_pin_is_active());
     assert_eq!(audited.handoff_checkpoint(), Some(&target_head));
     assert_eq!(audited.recovery_origin(), Some(&target_fence));
+}
+
+#[tokio::test]
+async fn recovery_audit_reads_its_handoff_pin_with_the_commit_head() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        _current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+    let _ = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await;
+    let target = durable.load().await.unwrap().unwrap();
+    let target_fence = target.assignment_fence().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let decision = authority
+        .assignment_recovery_decision(target.version)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Hold the audit on its committed-index read, after it has loaded the authority record.
+    let index_read = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("committed-checkpoints/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(0),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let reader = Arc::new(LeaderLeaseStore::new(
+        Arc::new(ReadBarrierStore {
+            inner: Arc::clone(&authority_store),
+            get: Some(Arc::clone(&index_read)),
+            stall_list: false,
+        }),
+        10,
+    ));
+    let audit = tokio::spawn({
+        let (durable, reader, target) = (Arc::clone(&durable), Arc::clone(&reader), target.clone());
+        async move { audit_materialized_recovery_with_authority(&durable, Some(&reader), &target).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), index_read.entered.notified())
+        .await
+        .expect("the recovery audit did not read the committed checkpoint index");
+
+    // The target's first Commit moves the head and clears the handoff pin in one authority write.
+    let target_head = record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &target_fence,
+        &controller.capture_leader_proof().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        authority
+            .assignment_handoff_checkpoint(&target_fence)
+            .await
+            .unwrap(),
+        None
+    );
+    index_read.release.notify_one();
+
+    let (_, audited, _) = tokio::time::timeout(Duration::from_secs(2), audit)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("a Commit landing mid-audit must not split the head from its handoff pin");
+    assert!(matches!(
+        audited,
+        AuditedRecoveryCheckpoint::Active { ref checkpoint, .. }
+            if *checkpoint == decision.recovery_checkpoint
+    ));
+    let (_, reaudited, _) =
+        audit_materialized_recovery_with_authority(&durable, Some(&authority), &target)
+            .await
+            .unwrap();
+    assert!(matches!(
+        reaudited,
+        AuditedRecoveryCheckpoint::Consumed { ref checkpoint, .. } if *checkpoint == target_head
+    ));
+    db.close();
 }
 
 fn propagated_recovery_takeover_case() -> futures::future::BoxFuture<'static, ()> {

@@ -25,7 +25,7 @@ mod history_retention;
 mod manager;
 mod release;
 
-pub use attempt_status::ClusterAttemptStatus;
+pub use attempt_status::{ClusterAttemptStatus, ClusterCommitHead};
 pub use manager::LeaderLeaseManager;
 pub use subscription_replay::{
     SubscriptionReplayPin, SubscriptionReplayPinAcquire, SUBSCRIPTION_REPLAY_PIN_RENEW_INTERVAL,

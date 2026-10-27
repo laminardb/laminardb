@@ -1377,8 +1377,8 @@ async fn join_shuffles_use_the_committed_source_frontier() {
     for (name, _, seen) in managed {
         let expected = match name {
             "temporal_join" => restored_temporal_frontier,
-            // An idle interval-join input closes only to the committed cut.
-            "interval_join" => InputFrontier {
+            // An idle window, aggregate, or interval-join input closes only to the committed cut.
+            "core_window" | "sql_aggregate" | "interval_join" => InputFrontier {
                 watermark: Some(restored_temporal_watermark),
                 idle: true,
             },
@@ -1453,10 +1453,7 @@ async fn join_shuffles_use_the_committed_source_frontier() {
         "an active-uninitialized local source must hold below an initialized cluster cut"
     );
     assert!(
-        !harness
-            .graph
-            .interval_idle_source_frontiers
-            .contains_key(&source),
+        !harness.graph.idle_source_frontiers.contains_key(&source),
         "an active local source keeps node-local interval-join progress"
     );
 
@@ -1471,7 +1468,7 @@ async fn join_shuffles_use_the_committed_source_frontier() {
         )]));
     harness.graph.cap_join_source_frontiers(|_| None);
     assert_eq!(
-        harness.graph.interval_idle_source_frontiers[&source],
+        harness.graph.idle_source_frontiers[&source],
         InputFrontier {
             watermark: None,
             idle: true,
@@ -7361,6 +7358,7 @@ async fn interval_output_admission_compacts_273_batches_without_changing_aggrega
         assert_eq!(graph.input_bufs[consumer][0].len(), buffered + 1);
         assert_eq!(results["joined"], vec![expected]);
         assert!(graph.execution_poison_reason().is_none());
+        #[cfg(debug_assertions)]
         graph.debug_assert_byte_sums();
 
         let results = graph

@@ -410,6 +410,15 @@ impl AggStateRestorePreflight {
         self.owned_state_bytes
             .checked_add(self.decode_scratch_bytes)
     }
+
+    /// Peak bytes while this vnode decodes on top of `retained` resident bytes. The final-state
+    /// bound includes decode scratch, so it is charged for one vnode at a time; vnodes already
+    /// decoded belong in `retained` at their accounted size.
+    pub(crate) fn decode_peak_bytes(self, retained: usize) -> Option<usize> {
+        self.sequential_decode_bytes()?
+            .checked_add(self.final_state_upper_bytes())?
+            .checked_add(retained)
+    }
 }
 
 fn archived_owned_state_bytes(

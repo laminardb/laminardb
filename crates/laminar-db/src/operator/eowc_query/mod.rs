@@ -1,6 +1,8 @@
 //! EOWC (Emit On Window Close) operator backed by `CoreWindowState`.
 
 #[cfg(feature = "cluster")]
+mod cluster_frontiers;
+#[cfg(feature = "cluster")]
 mod transition_validation;
 
 #[cfg(feature = "cluster")]
@@ -562,6 +564,9 @@ pub(crate) struct EowcQueryOperator {
     last_broadcast: InputFrontier,
     #[cfg(feature = "cluster")]
     effective_frontier: InputFrontier,
+    /// This node's idle graph input, the committed cut, which an all-idle merge must not pass.
+    #[cfg(feature = "cluster")]
+    idle_close_ceiling: Option<i64>,
     #[cfg(feature = "cluster")]
     remote_peer_cursor: Option<u64>,
     #[cfg(feature = "cluster")]
@@ -618,6 +623,8 @@ impl EowcQueryOperator {
             last_broadcast: InputFrontier::default(),
             #[cfg(feature = "cluster")]
             effective_frontier: InputFrontier::default(),
+            #[cfg(feature = "cluster")]
+            idle_close_ceiling: Some(i64::MIN),
             #[cfg(feature = "cluster")]
             remote_peer_cursor: None,
             #[cfg(feature = "cluster")]
@@ -1258,41 +1265,13 @@ impl EowcQueryOperator {
                 self.op_name
             )));
         }
-        let normalized = super::frontier::normalize_restored_local_frontier(
+        let normalized = super::frontier::normalize_local_frontier_without_peer_echo(
             input,
             self.local_frontier,
             self.effective_frontier.watermark,
         );
         self.validate_frontier(self.local_frontier, normalized, "local")?;
         Ok(normalized)
-    }
-
-    #[cfg(feature = "cluster")]
-    fn effective_cluster_frontier(
-        &self,
-        local: InputFrontier,
-        consumed: Option<(u64, InputFrontier, bool)>,
-    ) -> Result<InputFrontier, DbError> {
-        let peers = self.peer_channels.iter().map(|(&peer, channel)| {
-            let (mut applied, pending) = if let Some((target, applied, pending)) = consumed {
-                if target == peer {
-                    (applied, pending)
-                } else {
-                    (channel.applied, !channel.events.is_empty())
-                }
-            } else {
-                (channel.applied, !channel.events.is_empty())
-            };
-            if pending {
-                applied.idle = false;
-                applied.watermark =
-                    Self::max_watermark(applied.watermark, self.effective_frontier.watermark);
-            }
-            applied
-        });
-        let merged = merge_input_frontier_iter(std::iter::once(local).chain(peers), i64::MIN);
-        self.validate_frontier(self.effective_frontier, merged, "effective")?;
-        Ok(merged)
     }
 
     #[cfg(feature = "cluster")]
@@ -1649,6 +1628,7 @@ impl EowcQueryOperator {
         inputs: &[Vec<RecordBatch>],
         frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        self.idle_close_ceiling = super::frontier::idle_close_ceiling(frontier);
         let (config, assignment, peers) = self.active_cluster_scope()?;
         match self.finish_pending_cluster_input().await? {
             PendingEowcCompletion::Applied(output) => return Ok(output),
@@ -2319,11 +2299,11 @@ impl EowcQueryOperator {
         );
         self.validate_frontier(effective_frontier, merged, "restored effective")
             .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        if merged.watermark != effective_frontier.watermark
-            || (peer_channels
-                .values()
-                .all(|channel| channel.events.is_empty())
-                && merged != effective_frontier)
+        if !super::frontier::restored_frontier_matches(effective_frontier, merged)
+            && (merged.watermark != effective_frontier.watermark
+                || peer_channels
+                    .values()
+                    .all(|channel| channel.events.is_empty()))
         {
             return Err(DbError::Checkpoint(format!(
                 "managed CoreWindow '{}' restored channel frontier does not match its saved cut",
@@ -2469,7 +2449,7 @@ impl EowcQueryOperator {
                 applied.push(frontier);
             }
             let merged = merge_input_frontier_iter(std::iter::once(local).chain(applied), i64::MIN);
-            if merged != effective {
+            if !super::frontier::restored_frontier_matches(effective, merged) {
                 return Err(DbError::Checkpoint(format!(
                     "managed CoreWindow '{}' donor {} frontiers do not form one handoff cut",
                     self.op_name, restore.participant_id

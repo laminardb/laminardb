@@ -1,31 +1,43 @@
+#[cfg(feature = "cluster")]
+use super::drain_ownership::source_drain_awaits_intake;
 use super::{
     CoordinatorGates, CoordinatorRunState, CycleError, PipelineCallback, QueuedSourceMsg,
     StreamingCoordinator,
 };
 
 impl CoordinatorGates {
-    pub(super) fn capture(callback: &mut impl PipelineCallback, replay_pending: bool) -> Self {
-        let intake_paused = callback.intake_paused();
-        if intake_paused || replay_pending {
-            let _ = callback.is_recovering();
-        }
-        #[cfg(feature = "cluster")]
-        let external_commit_backpressured =
-            callback.external_output_pressure().commit_backpressured();
-        #[cfg(not(feature = "cluster"))]
-        let external_commit_backpressured = false;
-        Self {
-            intake_paused,
-            external_commit_backpressured,
-        }
-    }
-
     pub(super) fn compute_admitted(&self) -> bool {
-        !self.intake_paused && !self.external_commit_backpressured
+        !self.intake_paused && !self.external_output_backpressured
     }
 }
 
 impl StreamingCoordinator {
+    pub(super) fn capture_gates(&self, callback: &mut impl PipelineCallback) -> CoordinatorGates {
+        let intake_paused = callback.intake_paused();
+        if intake_paused || self.replay_pending {
+            let _ = callback.is_recovering();
+        }
+        let external_output_backpressured =
+            callback.external_output_pressure().pauses_intake(|| {
+                self.pending_barrier.active || {
+                    #[cfg(feature = "cluster")]
+                    {
+                        self.source_handles
+                            .iter()
+                            .any(|source| source_drain_awaits_intake(&source.task))
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    {
+                        false
+                    }
+                }
+            });
+        CoordinatorGates {
+            intake_paused,
+            external_output_backpressured,
+        }
+    }
+
     pub(super) async fn service_paused_intake(
         &mut self,
         callback: &mut impl PipelineCallback,
@@ -68,14 +80,15 @@ impl StreamingCoordinator {
         true
     }
 
-    pub(super) async fn service_external_commit_backpressure(
+    pub(super) async fn service_external_output_backpressure(
         &mut self,
         callback: &mut impl PipelineCallback,
         state: &mut CoordinatorRunState,
         checkpoint_control_due: bool,
     ) -> bool {
-        // The prepared cut already owns its source barriers. Keep completion, checkpoint control,
-        // and public-request lifecycle active while its asynchronous tail resolves.
+        // No unhandled source barrier exists here: a prepared cut already owns its barriers, and
+        // checkpoint backpressure lifts once a new attempt injects them. Keep completion,
+        // checkpoint control, and public-request lifecycle active until output pressure eases.
         state.barriers.clear();
         self.service_background_work(callback, state, checkpoint_control_due)
             .await

@@ -134,7 +134,7 @@ impl Checkpoint {
                 .chain(self.peers.iter().map(|(_, frontier)| (*frontier).into())),
             i64::MIN,
         );
-        if merged != effective {
+        if !crate::operator::frontier::restored_frontier_matches(effective, merged) {
             return Err(DbError::Checkpoint(
                 "process shuffle checkpoint contains an inconsistent effective frontier".into(),
             ));
