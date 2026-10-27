@@ -538,9 +538,10 @@ aggregate. `LaminarDB::query_committed` on any node reads every view at one comm
 from every node's checkpointed state. A node that takes part in no checkpoint (draining, or not
 yet assigned) learns of each new checkpoint from the cluster's checkpoint authority within about
 a second; after a topology migration it keeps the last checkpoint of its own topology until it
-runs the new one. `SELECT` of a
-view on a cluster node fails, because the node holds only its part. `SUBSCRIBE` to a view reads
-committed checkpoints in the same way, as described below.
+runs the new one. A `SELECT` over pgwire or HTTP on a cluster node reads committed checkpoints in
+the same way unless the session asks for the latest cycle, which a cluster node refuses because
+it holds only its part of each view (see section 8). `SUBSCRIBE` to a view reads committed
+checkpoints in the same way, as described below.
 
 An append-only view's interval retention follows one event-time frontier per view, committed
 with each checkpoint: the lowest frontier among the nodes whose input is active, never moving
@@ -871,9 +872,27 @@ fail with an error naming the largest view.
 
 ### 8. Committed reads see one checkpoint; `freshness` bounds how old it may be
 
-`SELECT` over materialized views reads the last completed cycle, which recovery can roll back.
-The Rust API `LaminarDB::query_committed(sql, at)` reads every view a query scans at one committed
-checkpoint instead, and returns the checkpoint's epoch and when it was taken:
+An ad-hoc `SELECT` reads each table as a snapshot, so it may join views with each other and with
+sources and reference tables; the streaming join rules apply only to named streaming queries.
+It reads views at one of two levels:
+
+- **latest**: every view after the last completed cycle, under one guard. Recovery can roll this
+  back. It is the default in embedded and single-node mode, and a cluster node refuses it.
+- **committed**: every view at one committed checkpoint, as below. It is the default on a cluster
+  node.
+
+The Rust API `LaminarDB::read(sql, level)` takes a `ReadLevel` and returns the rows with the
+committed cut it read; `LaminarDB::default_read_level()` gives the mode's default, and
+`execute` reads at the latest level. Over pgwire, `SET laminar.read_level = 'latest' |
+'committed' | 'default'` and `SET laminar.min_epoch = <n>` apply to the connection, `SHOW
+laminar.read_epoch` returns the epoch of its last committed read, and a later committed read on
+the connection never reads an earlier epoch. Over HTTP, `POST /api/v1/sql` takes `read_level`
+and `min_epoch` fields and a committed response carries `epoch`, `checkpoint_id` and
+`taken_at_ms`. Rows reach the reader in order and only as fast as it reads them; a query that
+fails part way ends with its error instead of a partial result.
+
+`LaminarDB::query_committed(sql, at)` reads every view a query scans at one committed checkpoint
+and returns the checkpoint's epoch and when it was taken:
 
 - `CommittedRead::Latest` reads the newest committed checkpoint.
 - `CommittedRead::AtLeast(epoch)` waits for a checkpoint at or after `epoch`. Pass an epoch a
@@ -894,7 +913,9 @@ Decoded checkpoint state is cached up to `materialized_view_read_cache_bytes` (2
 rejects it when checkpoints are manual or disabled, or when it is below the checkpoint interval.
 While the newest committed checkpoint is older than a view's freshness, a warning is logged and
 `mv_freshness_breaches_total{view}` counts the breach once; `mv_committed_staleness_ms` exports
-the age.
+the age. Every view in a pipeline is read at the same newest checkpoint, so that age applies to
+each of them. `mv_reads_total{level}` counts reads by level, and `mv_committed_read_age_seconds`
+records the age of the checkpoint each committed read observed.
 
 ```sql
 CREATE MATERIALIZED VIEW positions AS
