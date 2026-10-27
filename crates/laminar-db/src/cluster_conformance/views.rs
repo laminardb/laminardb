@@ -287,15 +287,11 @@ async fn read_all(db: &LaminarDB, sql: &str) -> Result<Vec<RecordBatch>, String>
     let ExecuteResult::Query(mut query) = result else {
         return Err(format!("`{sql}` did not return a query result"));
     };
-    let mut subscription = query.subscribe_raw().map_err(|e| e.to_string())?;
-    let mut batches = Vec::new();
-    loop {
-        match tokio::time::timeout(DEADLINE, subscription.recv_async()).await {
-            Ok(Ok(batch)) => batches.push(batch),
-            Ok(Err(_closed)) => return Ok(batches),
-            Err(_) => return Err(format!("`{sql}` did not close within {DEADLINE:?}")),
-        }
-    }
+    let rows = query.subscribe_raw().map_err(|e| e.to_string())?;
+    tokio::time::timeout(DEADLINE, rows.read_all())
+        .await
+        .map_err(|_| format!("`{sql}` did not close within {DEADLINE:?}"))?
+        .map_err(|e| format!("`{sql}`: {e}"))
 }
 
 async fn verdict(case: ViewCase) -> Verdict {

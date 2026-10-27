@@ -89,18 +89,16 @@ async fn select(db: &LaminarDB, view: &str) -> Rows {
     else {
         panic!("expected a query result");
     };
-    let mut batches = query.subscribe_raw().unwrap();
+    let batches = tokio::time::timeout(
+        Duration::from_secs(30),
+        query.subscribe_raw().unwrap().read_all(),
+    )
+    .await
+    .expect("query produced no result within 30 seconds")
+    .unwrap();
     let mut rows = Rows::new();
-    // An empty view's query ends without a batch.
-    let Ok(first) = tokio::time::timeout(Duration::from_secs(30), batches.recv_async())
-        .await
-        .expect("query produced no result within 30 seconds")
-    else {
-        return rows;
-    };
-    fold(&mut rows, &first);
-    while let Some(batch) = batches.poll() {
-        fold(&mut rows, &batch);
+    for batch in &batches {
+        fold(&mut rows, batch);
     }
     rows
 }

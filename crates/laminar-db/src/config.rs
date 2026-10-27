@@ -517,12 +517,12 @@ mod tests {
         let crate::ExecuteResult::Query(mut query) = result else {
             panic!("expected query");
         };
-        let mut subscription = query.subscribe_raw().unwrap();
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv_async())
-                .await
-                .unwrap()
-                .unwrap();
+        let mut rows = query.subscribe_raw().unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), rows.next_batch())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let value = output
             .column(0)
             .as_any()

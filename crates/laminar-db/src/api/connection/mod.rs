@@ -66,7 +66,17 @@ impl Connection {
                 .build()
                 .map_err(|e| ApiError::internal(format!("Runtime error: {e}")))?;
 
-            rt.block_on(self.inner.execute(sql))
+            // Tasks die with this runtime, so a query's rows are read before it is dropped.
+            rt.block_on(async {
+                let mut result = self.inner.execute(sql).await?;
+                if let crate::ExecuteResult::Query(handle) = &mut result {
+                    if let Some(rows) = handle.rows.take() {
+                        let schema = rows.schema();
+                        handle.rows = Some(crate::QueryRows::ready(schema, rows.read_all().await?));
+                    }
+                }
+                Ok(result)
+            })
         };
 
         result.map(ExecuteResult::from).map_err(ApiError::from)

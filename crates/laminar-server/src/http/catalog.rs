@@ -145,21 +145,27 @@ pub(super) async fn execute_sql(
                     let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
                     let mut total_rows = 0;
                     let mut timed_out = false;
-                    if let Ok(mut sub) = handle.subscribe_raw() {
+                    if let Ok(mut rows) = handle.subscribe_raw() {
                         // Gather one batch *past* the cap so `cap_result` can tell
                         // "exactly at the cap" (complete) from "more rows exist".
                         let collect = async {
-                            while let Ok(batch) = sub.recv_async().await {
+                            while let Some(batch) = rows.next_batch().await? {
                                 total_rows += batch.num_rows();
                                 batches.push(batch);
                                 if total_rows > MAX_SQL_RESULT_ROWS {
                                     break;
                                 }
                             }
+                            Ok::<(), laminar_db::DbError>(())
                         };
-                        timed_out = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect)
-                            .await
-                            .is_err();
+                        match tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                return error_response(StatusCode::BAD_REQUEST, e.to_string())
+                                    .into_response();
+                            }
+                            Err(_) => timed_out = true,
+                        }
                     }
                     // Trim to the cap; `over_cap` true means rows were dropped.
                     // A timeout also leaves `data` a prefix of the full result.

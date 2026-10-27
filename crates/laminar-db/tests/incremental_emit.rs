@@ -48,19 +48,14 @@ async fn read_mv(db: &LaminarDB, mv: &str) -> Vec<(i64, i64, i64)> {
     let ExecuteResult::Query(mut q) = result else {
         panic!("expected Query result");
     };
-    let mut sub = q.subscribe_raw().unwrap();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(30), sub.recv_async())
-        .await
-        .expect("materialized-view query did not produce its snapshot within 30 seconds")
-        .expect("materialized-view query disconnected before producing its snapshot");
-    let mut rows = Vec::new();
-    rows.extend(rows_of(&first));
-    for _ in 0..1024 {
-        match sub.poll() {
-            Some(batch) => rows.extend(rows_of(&batch)),
-            None => break,
-        }
-    }
+    let batches = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        q.subscribe_raw().unwrap().read_all(),
+    )
+    .await
+    .expect("materialized-view query did not produce its snapshot within 30 seconds")
+    .unwrap();
+    let mut rows: Vec<_> = batches.iter().flat_map(rows_of).collect();
     rows.sort_unstable();
     rows
 }
@@ -71,18 +66,16 @@ async fn read_query(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<i64>> {
     let ExecuteResult::Query(mut q) = result else {
         panic!("expected Query result");
     };
-    let mut sub = q.subscribe_raw().unwrap();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(30), sub.recv_async())
-        .await
-        .expect("query did not produce its snapshot within 30 seconds")
-        .expect("query disconnected before producing its snapshot");
+    let batches = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        q.subscribe_raw().unwrap().read_all(),
+    )
+    .await
+    .expect("query did not produce its snapshot within 30 seconds")
+    .unwrap();
     let mut rows = Vec::new();
-    append_i64_rows(&first, ncols, &mut rows);
-    for _ in 0..4096 {
-        match sub.poll() {
-            Some(batch) => append_i64_rows(&batch, ncols, &mut rows),
-            None => break,
-        }
+    for batch in &batches {
+        append_i64_rows(batch, ncols, &mut rows);
     }
     rows.sort();
     rows

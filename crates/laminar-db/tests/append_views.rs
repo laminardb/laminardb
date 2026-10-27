@@ -52,21 +52,16 @@ async fn first_column(db: &LaminarDB, sql: &str) -> Vec<i64> {
     let ExecuteResult::Query(mut query) = db.execute(sql).await.unwrap() else {
         panic!("expected a query result");
     };
-    let mut rows = query.subscribe_raw().unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(30), rows.recv_async())
+    let rows = query.subscribe_raw().unwrap();
+    let batches = tokio::time::timeout(Duration::from_secs(30), rows.read_all())
         .await
         .expect("query produced no result within 30 seconds")
-        .expect("query disconnected before its result");
+        .unwrap();
     let mut values = Vec::new();
-    let mut batch = Some(first);
-    for _ in 0..1024 {
-        let Some(current) = batch.take() else {
-            break;
-        };
-        let column = current.column(0);
+    for batch in &batches {
+        let column = batch.column(0);
         let column = column.as_any().downcast_ref::<Int64Array>().unwrap();
         values.extend((0..column.len()).map(|row| column.value(row)));
-        batch = rows.poll();
     }
     values.sort_unstable();
     values

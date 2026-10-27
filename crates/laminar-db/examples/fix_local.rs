@@ -121,10 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     if let ExecuteResult::Query(mut query) = db.execute("SELECT * FROM by_symbol").await? {
-        let mut results = query.subscribe_raw()?;
-        if let Ok(Ok(batch)) =
-            tokio::time::timeout(Duration::from_secs(10), results.recv_async()).await
-        {
+        let results = query.subscribe_raw()?;
+        for batch in tokio::time::timeout(Duration::from_secs(10), results.read_all()).await?? {
             for row in 0..batch.num_rows() {
                 let cells = batch
                     .columns()

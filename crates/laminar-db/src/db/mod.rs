@@ -42,7 +42,6 @@ use std::time::{Duration, Instant};
 use arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
 use laminar_core::catalog::CatalogObjectKind;
-use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
 
@@ -4812,49 +4811,16 @@ impl LaminarDB {
     ) -> ExecuteResult {
         let query_id = self.catalog.register_query(sql);
         let schema = stream.schema();
-
-        let source_cfg = streaming::SourceConfig::with_buffer_size(self.config.default_buffer_size);
-        let (source, sink) =
-            streaming::create_with_config::<crate::catalog::ArrowRecord>(source_cfg);
-
-        let subscription = sink.subscribe();
-
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        let cancel_token_clone = cancel_token.clone();
-
-        let source_clone = source.clone();
         let catalog = Arc::clone(&self.catalog);
-        let query_id_clone = query_id;
-        tokio::spawn(async move {
-            use tokio_stream::StreamExt;
-            let mut stream = stream;
-            loop {
-                tokio::select! {
-                    () = cancel_token_clone.cancelled() => {
-                        break;
-                    }
-                    result = stream.next() => {
-                        match result {
-                            Some(Ok(batch)) => {
-                                // Query output retains its own count-bound ownership, outside input push budgets.
-                                if source_clone.push(crate::catalog::ArrowRecord { batch }).is_err() {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-            drop(source_clone);
-            catalog.deactivate_query(query_id_clone);
+        let rows = crate::query_rows::QueryRows::spawn(stream, cancel_token.clone(), move || {
+            catalog.deactivate_query(query_id);
         });
-
         ExecuteResult::Query(QueryHandle {
             id: query_id,
             schema,
             sql: sql.to_string(),
-            subscription: Some(subscription),
+            rows: Some(rows),
             active: true,
             cancel_token,
         })

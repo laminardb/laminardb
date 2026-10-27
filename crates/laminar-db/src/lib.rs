@@ -114,6 +114,7 @@ mod pipeline_lifecycle;
 pub mod process_function;
 /// Deployment profiles.
 pub mod profile;
+mod query_rows;
 /// Dynamic vnode rebalance control plane.
 #[cfg(feature = "cluster")]
 pub mod rebalance;
@@ -199,6 +200,7 @@ pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use mv_store::{CommittedRead, CommittedReadError};
 pub use profile::{Profile, ProfileError};
+pub use query_rows::QueryRows;
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 pub use subscription::ClusterSubscriptionError;
 

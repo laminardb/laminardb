@@ -92,16 +92,11 @@ async fn latest_rows(db: &LaminarDB, sql: &str) -> Vec<i64> {
     let ExecuteResult::Query(mut query) = db.execute(sql).await.unwrap() else {
         panic!("expected a query result");
     };
-    let mut rows = query.subscribe_raw().unwrap();
-    let mut batches = vec![
-        tokio::time::timeout(Duration::from_secs(30), rows.recv_async())
-            .await
-            .unwrap()
-            .unwrap(),
-    ];
-    while let Some(batch) = rows.poll() {
-        batches.push(batch);
-    }
+    let rows = query.subscribe_raw().unwrap();
+    let batches = tokio::time::timeout(Duration::from_secs(30), rows.read_all())
+        .await
+        .unwrap()
+        .unwrap();
     column(&batches, 0)
 }
 

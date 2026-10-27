@@ -9658,17 +9658,8 @@ async fn test_select_from_source() {
     let result = db.execute("SELECT * FROM sensors").await.unwrap();
     match result {
         ExecuteResult::Query(mut q) => {
-            // The bridge_query_stream spawns a tokio task; yield to let it run.
-            tokio::task::yield_now().await;
-            let mut sub = q.subscribe_raw().unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let mut total_rows = 0;
-            for _ in 0..256 {
-                match sub.poll() {
-                    Some(b) => total_rows += b.num_rows(),
-                    None => break,
-                }
-            }
+            let batches = q.subscribe_raw().unwrap().read_all().await.unwrap();
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(total_rows, 2);
         }
         _ => panic!("Expected Query result from SELECT on source"),
@@ -9712,15 +9703,8 @@ async fn rejected_source_replace_preserves_existing_buffer() {
     let result = db.execute("SELECT * FROM sensors").await.unwrap();
     match result {
         ExecuteResult::Query(mut q) => {
-            let mut sub = q.subscribe_raw().unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let mut total_rows = 0;
-            for _ in 0..256 {
-                match sub.poll() {
-                    Some(b) => total_rows += b.num_rows(),
-                    None => break,
-                }
-            }
+            let batches = q.subscribe_raw().unwrap().read_all().await.unwrap();
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(
                 total_rows, 2,
                 "a rejected replacement must preserve the original source buffer"

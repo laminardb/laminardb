@@ -72,7 +72,7 @@ impl LaminarDB {
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), frame.collect())
                 .await
                 .map_err(|_| CommittedReadError::DeadlineExceeded { epoch: cut.epoch })?
-                .map_err(scan_error)?;
+                .map_err(crate::query_rows::execution_error)?;
         Ok(CommittedQuery {
             epoch: cut.epoch,
             checkpoint_id: cut.checkpoint_id,
@@ -80,17 +80,6 @@ impl LaminarDB {
             schema,
             batches,
         })
-    }
-}
-
-/// A view scan fails with a [`DbError`] that `DataFusion` carries as an external error.
-fn scan_error(error: datafusion_common::DataFusionError) -> DbError {
-    match error {
-        datafusion_common::DataFusionError::External(inner) => match inner.downcast::<DbError>() {
-            Ok(error) => *error,
-            Err(inner) => datafusion_common::DataFusionError::External(inner).into(),
-        },
-        error => error.into(),
     }
 }
 
