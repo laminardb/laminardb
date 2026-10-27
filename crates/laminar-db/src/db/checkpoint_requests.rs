@@ -7,6 +7,21 @@ use super::LaminarDB;
 #[cfg(feature = "cluster")]
 const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[cfg(feature = "cluster")]
+static FORWARD_FAILURES: crate::log_throttle::LogThrottle =
+    crate::log_throttle::LogThrottle::every(std::time::Duration::from_secs(60));
+
+#[cfg(feature = "cluster")]
+fn forward_failed(reason: &dyn std::fmt::Display) {
+    if FORWARD_FAILURES.allow() {
+        tracing::warn!(
+            %reason,
+            "a recent read could not ask the cluster leader for an early checkpoint; it waits for \
+             the checkpoint interval"
+        );
+    }
+}
+
 impl LaminarDB {
     /// Ask for the checkpoint that commits `epoch` early, for a recent read about to wait for it.
     /// A cluster follower forwards the first request for each epoch to the leader.
@@ -25,7 +40,7 @@ impl LaminarDB {
                     return;
                 }
                 Err(reason) => {
-                    tracing::debug!(%reason, "a recent read cannot ask the cluster leader for a checkpoint");
+                    forward_failed(&reason);
                     return;
                 }
             }
@@ -50,10 +65,7 @@ impl LaminarDB {
         tokio::spawn(async move {
             let client = match reqwest::Client::builder().timeout(FORWARD_TIMEOUT).build() {
                 Ok(client) => client,
-                Err(error) => {
-                    tracing::debug!(%error, "checkpoint request client failed to build");
-                    return;
-                }
+                Err(error) => return forward_failed(&error),
             };
             let mut request = client.post(format!("http://{leader}/api/v1/checkpoint/expedite"));
             if let Some(token) = &token {
@@ -64,7 +76,7 @@ impl LaminarDB {
                 .await
                 .and_then(reqwest::Response::error_for_status)
             {
-                tracing::debug!(%error, %leader, "the cluster leader did not take a recent read's checkpoint request");
+                forward_failed(&format_args!("{leader}: {error}"));
             }
         });
     }

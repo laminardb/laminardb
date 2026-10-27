@@ -184,7 +184,7 @@ impl ReadPins {
 #[derive(Debug, Default)]
 pub(crate) struct CheckpointDemand {
     requested: AtomicBool,
-    /// One past the newest epoch a read on this node asked the cluster leader for.
+    /// One past the epoch a read on this node last asked the cluster leader for.
     #[cfg(feature = "cluster")]
     forwarded: AtomicU64,
 }
@@ -205,10 +205,11 @@ impl CheckpointDemand {
 
     /// Whether a read waiting for `epoch` is the first on this node to ask the leader for it.
     /// A later read that the leader's next cut does not cover asks again for the epoch after.
+    /// Any other epoch asks again, so epochs that restart lower after a reset still reach it.
     #[cfg(feature = "cluster")]
     pub(crate) fn first_to_forward(&self, epoch: u64) -> bool {
         let past = epoch.saturating_add(1);
-        self.forwarded.fetch_max(past, Ordering::AcqRel) < past
+        self.forwarded.swap(past, Ordering::AcqRel) != past
     }
 }
 
@@ -338,16 +339,16 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
-    fn a_node_forwards_one_request_per_epoch() {
+    fn a_node_forwards_each_epoch_it_waits_for_once() {
         let demand = CheckpointDemand::default();
         assert!(demand.first_to_forward(0));
         assert!(!demand.first_to_forward(0));
         assert!(demand.first_to_forward(3));
-        assert!(
-            !demand.first_to_forward(2),
-            "the request for 3 asked for a later cut"
-        );
         assert!(!demand.first_to_forward(3));
-        assert!(demand.first_to_forward(4));
+        assert!(
+            demand.first_to_forward(1),
+            "epochs restarted lower after a reset"
+        );
+        assert!(!demand.first_to_forward(1));
     }
 }
