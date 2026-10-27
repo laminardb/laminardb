@@ -1147,7 +1147,7 @@ async fn expired_process_deadline_rejects_serving_before_async_gate_fence() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn recovering_cluster_rejects_readiness_and_serving_routes() {
+async fn recovering_cluster_serves_only_committed_reads_and_subscriptions() {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
 
     let node = laminar_core::cluster::discovery::NodeId(43);
@@ -1189,6 +1189,38 @@ async fn recovering_cluster_rejects_readiness_and_serving_routes() {
             String::from_utf8_lossy(&body)
         );
     }
+
+    // Reads and subscriptions serve committed checkpoints, which recovery never changes.
+    let sql = |sql: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/sql")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "sql": sql }).to_string()))
+            .unwrap()
+    };
+    let read = app.clone().oneshot(sql("SELECT 1 AS one")).await.unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let ddl = app
+        .clone()
+        .oneshot(sql("CREATE SOURCE recovering (id BIGINT)"))
+        .await
+        .unwrap();
+    assert_eq!(ddl.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(ddl.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("server is completing coordinated recovery"));
+    let subscribe = app
+        .oneshot(
+            Request::builder()
+                .uri("/ws/recovering")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(subscribe.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[cfg(feature = "cluster")]

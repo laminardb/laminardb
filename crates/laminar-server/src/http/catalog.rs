@@ -119,6 +119,9 @@ pub(super) async fn execute_sql(
     if is_query(&req.sql) {
         return read_sql(&state.db, &req).await;
     }
+    if let Some(reason) = state.serving_rejection() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+    }
     match state.db.execute(&req.sql).await {
         Ok(result) => {
             use laminar_db::ExecuteResult;
