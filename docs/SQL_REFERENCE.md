@@ -912,10 +912,14 @@ and returns the checkpoint's epoch and when it was taken:
   transactions, are not waited for. A view over any other source, a topic pattern, or rows pushed
   through the API fails before waiting (`0A000` over pgwire); a source that cannot be asked fails
   with `58000`; when no checkpoint holds every source within 30 seconds, the error names the
-  sources still behind (`57014`). Reference tables are looked up, not waited for.
+  sources still behind (`57014`). Reference tables are looked up, not waited for. With
+  `StreamCheckpointConfig::recent_read_interval_ms` (server `[checkpoint] recent_read_interval`),
+  shorter than the periodic interval, a read waiting for a checkpoint starts the next one that
+  long after the previous one ended instead of waiting the full interval.
 
 Such a result is never rolled back and never mixes checkpoints. It is as fresh as the checkpoint
-interval. A committed read needs checkpointing, may scan only materialized views, and holds its
+interval, or for a recent read with `recent_read_interval_ms`, that shorter interval plus one
+checkpoint. A committed read needs checkpointing, may scan only materialized views, and holds its
 checkpoint for at most 30 seconds, which also bounds the wait for `AtLeast`. A view with a
 row-count retention is not exact, because which rows the cap keeps depends on arrival order.
 Equality filters on every key column of an aggregate view read only the state of that key's

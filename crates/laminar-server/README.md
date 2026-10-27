@@ -98,6 +98,10 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # file:// until remote writer fencing lands. Startup verifies conditional puts.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
+# Optional: while a `recent` view read waits for a newer checkpoint, the next one starts this
+# long after the previous one ended instead of `interval` (shorter than `interval`; at least
+# 100ms in cluster mode). Each early checkpoint also commits exactly-once sinks.
+# recent_read_interval = "1s"
 timeout = "120s" # checkpoint deadline and per-phase cluster assignment-recovery bound
 
 # Provider features, accepted aliases, ambient identity, and native evidence:
@@ -217,6 +221,7 @@ including remote AI — runs normally.
 | GET | `/api/v1/streams` | List running streams |
 | GET | `/api/v1/streams/{name}` | Stream detail by name |
 | POST | `/api/v1/checkpoint` | Trigger immediate checkpoint |
+| POST | `/api/v1/checkpoint/expedite` | Internal: a node forwards a waiting `recent` read's request to the cluster leader, which starts the next periodic checkpoint early under `recent_read_interval` (202) |
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "...", "read_level": "committed", "min_epoch": 42}`; both read fields optional; `read_level` is `latest`, `committed` or `recent`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
@@ -232,7 +237,8 @@ including remote AI — runs normally.
 A query reads materialized views at `read_level`: `latest` (the latest completed cycle, which
 recovery may roll back), `committed` (one committed checkpoint for every view in the query) or
 `recent` (a committed checkpoint holding every record written to the views' Kafka sources before
-the request arrived, waited for up to 30 seconds before the 5s collection budget starts).
+the request arrived, waited for up to 30 seconds before the 5s collection budget starts; with
+`[checkpoint] recent_read_interval` the wait brings the next checkpoint forward).
 Omitted, it is `latest` locally and `committed` in cluster mode, where a node holds only part of
 each view. A committed or recent response adds `epoch`, `checkpoint_id` and `taken_at_ms`; pass
 the epoch back as `min_epoch` to read no earlier checkpoint. `min_epoch` without a committed or
