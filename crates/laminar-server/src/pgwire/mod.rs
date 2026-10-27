@@ -35,6 +35,7 @@ use tls::{ensure_tls_provider, load_tls_acceptor, try_reload_tls, TlsConfigPaths
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use pgwire::tokio::process_socket;
@@ -44,7 +45,7 @@ use tracing::{info, warn};
 
 use laminar_db::LaminarDB;
 
-use crate::config::Secret;
+use crate::config::{Secret, ServerSection};
 use crate::server::ServerError;
 
 use session::{classify_outcome, LaminarHandlerFactory, MAX_PENDING_PGWIRE_HANDSHAKES};
@@ -170,6 +171,65 @@ fn log_listener_mode(local_addr: SocketAddr, mode: ListenerMode, tls_min: &str, 
             mtls,
             "pgwire listening",
         );
+    }
+}
+
+/// The listener `[server]` configures, owned so it outlives the configuration.
+pub struct Listener {
+    bind: String,
+    users: HashMap<String, Secret>,
+    allow_remote: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_client_ca: Option<PathBuf>,
+    tls_min_version: TlsMinVersion,
+    max_connections: usize,
+    max_auth_failures_per_min: u32,
+}
+
+impl Listener {
+    /// `None` when `pgwire_bind` is unset.
+    pub fn from_config(server: &ServerSection) -> Option<Self> {
+        let bind = server.pgwire_bind.clone()?;
+        Some(Self {
+            bind,
+            users: server.pgwire_users.clone(),
+            allow_remote: server.pgwire_allow_remote,
+            tls_cert: server.pgwire_tls_cert.clone(),
+            tls_key: server.pgwire_tls_key.clone(),
+            tls_client_ca: server.pgwire_tls_client_ca.clone(),
+            tls_min_version: TlsMinVersion::from_config_str(&server.pgwire_tls_min_version)
+                .expect("pgwire_tls_min_version validated at config load"),
+            max_connections: server.pgwire_max_connections,
+            max_auth_failures_per_min: server.pgwire_max_auth_failures_per_min,
+        })
+    }
+
+    /// Bind and serve; aborting the returned task closes the listener and every session.
+    pub async fn serve(
+        self,
+        db: Arc<LaminarDB>,
+    ) -> Result<tokio::task::JoinHandle<()>, ServerError> {
+        let tls = match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Some(TlsPaths {
+                cert,
+                key,
+                min_version: self.tls_min_version,
+                client_ca: self.tls_client_ca.as_deref(),
+            }),
+            _ => None,
+        };
+        let (_, handle) = serve(
+            db,
+            &self.bind,
+            self.users,
+            self.allow_remote,
+            tls,
+            self.max_connections,
+            self.max_auth_failures_per_min,
+        )
+        .await?;
+        Ok(handle)
     }
 }
 
