@@ -234,14 +234,15 @@ recovery may roll back) or `committed` (one committed checkpoint for every view 
 Omitted, it is `latest` locally and `committed` in cluster mode, where a node holds only part of
 each view. A committed response adds `epoch`, `checkpoint_id` and `taken_at_ms`; pass the epoch
 back as `min_epoch` to read no earlier checkpoint. `min_epoch` without a committed level is
-rejected.
+rejected. While a cluster node completes a coordinated recovery round, it keeps answering reads and
+keeps `/ws/{name}` subscriptions open; other statements and routes answer 503 until it ends.
 
 Supported cluster DDL returns an asynchronous migration receipt. See the main
 README's [topology support and limits](../../README.md#change-a-running-clusters-topology).
 
 ## Postgres Wire Protocol
 
-When `[server].pgwire_bind` is set, the server also listens for Postgres clients over the simple and extended query protocols. A cluster node opens the listener when it starts serving and closes it, with every session, when it stops. Unlike HTTP, which answers 503 while a cluster node completes a coordinated recovery round, pgwire keeps answering committed reads then (see [Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads)):
+When `[server].pgwire_bind` is set, the server also listens for Postgres clients over the simple and extended query protocols. A cluster node opens the listener when it starts serving and closes it, with every session, when it stops. Like HTTP SQL reads and WebSocket subscriptions, it keeps answering committed reads while the node completes a coordinated recovery round (see [Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads)):
 
 - `SELECT` reads the database, with the same read levels as `POST /api/v1/sql`, chosen per connection: `SET laminar.read_level = 'latest' | 'committed' | 'default'` and `SET laminar.min_epoch = <n>`. `SHOW laminar.read_epoch` returns the epoch of the connection's last committed read, and later committed reads on the connection read no earlier epoch. Rows stream as the client reads them; statements with bind parameters are rejected (`0A000`).
 

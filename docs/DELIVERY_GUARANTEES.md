@@ -139,20 +139,18 @@ checkpoint's change, each followed by a progress frame. Folding the frames up to
 gives the rows a committed read at that epoch returns.
 
 A node fault starts a coordinated recovery round on every node, typically 10 to 50 seconds. During
-it, a cluster node:
+it, a cluster node keeps serving committed data: pgwire and `POST /api/v1/sql` answer reads, and
+open WebSocket subscriptions stay open and continue with the next checkpoint once the round ends.
+Other SQL statements and the other HTTP routes, `/ready` included, answer 503 until it ends.
 
-- keeps answering committed reads over pgwire;
-- answers `POST /api/v1/sql` with 503;
-- closes its WebSocket subscriptions at their next heartbeat, without a close frame, and refuses
-  new ones with 503.
-
-To continue a subscription without a gap, reconnect with `as_of_epoch` set to the last progress
-epoch: it restarts with the view's rows at that epoch, which equal the rows already folded, then
-continues with the changes. While that epoch is still retained the reconnect succeeds; otherwise it
-fails with 410 and the client starts again from the newest checkpoint.
+A subscription ends when its node stops. To continue it without a gap, reconnect to another node
+with `as_of_epoch` set to the last progress epoch: it restarts with the view's rows at that epoch,
+which equal the rows already folded, then continues with the changes. While that epoch is still
+retained the reconnect succeeds; otherwise it fails with 410 and the client starts again from the
+newest checkpoint.
 
 | Evidence | Mode | What it exercises |
 |---|---|---|
-| `three_node_eo_view_read_kill9_soak` | Cluster | A keyed view, a view of its rows without the key, an append view and a per-partition progress view over the Kafka input of `three_node_eo_join_kill9_soak`, through its `kill -9` and paused-leader rounds. A pgwire reader rotates across the nodes reading all four in one statement: each read must equal the views over the input prefix its progress rows show, with no gap or duplicate in any partition, the prefix never shrinks, the same epoch reads the same rows on every node, and no read is older than the session's floor. A WebSocket subscription to the keyed view, moved to another gateway after each round and resumed at its last progress epoch whenever a connection ends, must fold to the reader's rows at every epoch both saw, including each resumed snapshot. After the input stops, every node must read every produced row over pgwire and HTTP. Emulated S3 (SeaweedFS). |
+| `three_node_eo_view_read_kill9_soak` | Cluster | A keyed view, a view of its rows without the key, an append view and a per-partition progress view over the Kafka input of `three_node_eo_join_kill9_soak`, through its `kill -9` and paused-leader rounds. A pgwire reader rotates across the nodes reading all four in one statement: each read must equal the views over the input prefix its progress rows show, with no gap or duplicate in any partition, the prefix never shrinks, the same epoch reads the same rows on every node, and no read is older than the session's floor. After each pgwire session the reader also reads the node over HTTP, checked by row counts and sums; neither surface may refuse a read during recovery. A WebSocket subscription to the keyed view must stay open through each fault on another node, moves to another gateway after each round, resumes at its last progress epoch whenever a connection ends, and must fold to the reader's rows at every epoch both saw, including each resumed snapshot. After the input stops, every node must read every produced row over pgwire and HTTP. Emulated S3 (SeaweedFS). |
 | `cluster_conformance` view cases | Cluster (in-process, three nodes) | Each view case read at the default committed level on another node and subscribed before any input, compared with batch SQL. |
 | `cluster::recovery_round_tests::committed` | Cluster (two processes) | Views restored on a survivor after a node is lost, seeded by a topology migration, and handed over by a draining node. |
