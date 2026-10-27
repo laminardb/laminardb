@@ -2,8 +2,8 @@
 //! read is: the view's rows at one cut, then its change from each committed cut to the next,
 //! each closed by a progress frame. The reader holds the cut it last delivered against retention,
 //! because the next change is computed against that cut's artifacts. When this node's pipeline
-//! restarts, as a topology migration does, the reader holds that cut through the restarted
-//! pipeline's reads and continues.
+//! restarts, as a topology migration or a coordinated recovery round does, the reader waits for
+//! the restarted pipeline's reads, holds that cut through them and continues.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -163,7 +163,10 @@ async fn follow(
             cut.renew(&views, Instant::now() + PIN_DEADLINE)
                 .map_err(follow_error)?;
             if let Ok(Err(_)) = tokio::time::timeout(RENEW_INTERVAL, cuts.changed()).await {
-                views = restarted(store, &views, &mut cut).await?;
+                views = tokio::select! {
+                    views = restarted(store, &views, &mut cut) => views?,
+                    () = sender.closed() => return Ok(()),
+                };
                 cuts = views.cuts();
             }
             continue;
@@ -191,25 +194,24 @@ async fn follow(
 }
 
 /// The restarted pipeline's committed reads, once it publishes them, with `cut` held through
-/// them. A cut that retention retired while no pipeline held it ends the subscription.
+/// them. The restart may take as long as a coordinated recovery round, so the caller ends the
+/// wait only when the subscriber goes away. A cut the restarted pipeline still reports retired
+/// `PIN_DEADLINE` after it appeared ends the subscription.
 async fn restarted(
     store: &parking_lot::RwLock<MvStore>,
     stopped: &Arc<CommittedViews>,
     cut: &mut PinnedCut,
 ) -> Result<Arc<CommittedViews>, ClusterSubscriptionError> {
-    let deadline = Instant::now() + PIN_DEADLINE;
+    let mut retired_since = None;
     loop {
         let current = store.read().committed_views();
         if let Some(views) = current.filter(|views| !Arc::ptr_eq(views, stopped)) {
             match cut.renew(&views, Instant::now() + PIN_DEADLINE) {
                 Ok(()) => return Ok(views),
                 Err(DbError::CommittedRead(CommittedReadError::Retired { .. }))
-                    if Instant::now() < deadline => {}
+                    if retired_since.get_or_insert_with(Instant::now).elapsed() < PIN_DEADLINE => {}
                 Err(error) => return Err(follow_error(error)),
             }
-        }
-        if Instant::now() >= deadline {
-            return Err(ClusterSubscriptionError::BackendUnavailable);
         }
         tokio::time::sleep(RESTART_POLL).await;
     }
