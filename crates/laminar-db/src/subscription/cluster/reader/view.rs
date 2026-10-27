@@ -145,8 +145,12 @@ async fn follow(
         budget: Arc::new(Semaphore::new(MAX_GATEWAY_QUEUE_BYTES)),
         sequence: 0,
     };
+    // A slow client may hold each frame for most of the send timeout, so every delivered frame
+    // renews the hold on the cut the next change is computed against.
     for batch in snapshot {
         delivery.rows(batch, cut.epoch, true).await?;
+        cut.renew(&views, Instant::now() + PIN_DEADLINE)
+            .map_err(follow_error)?;
     }
     delivery.progress(cut.epoch, cut.checkpoint_id).await?;
     let mut cuts = views.cuts();
@@ -165,7 +169,9 @@ async fn follow(
             continue;
         }
         for reference in successors {
-            let next = views
+            cut.renew(&views, Instant::now() + PIN_DEADLINE)
+                .map_err(follow_error)?;
+            let mut next = views
                 .pin_reference(&reference, Instant::now() + PIN_DEADLINE)
                 .await
                 .map_err(follow_error)?;
@@ -175,6 +181,8 @@ async fn follow(
                 .map_err(follow_error)?
             {
                 delivery.rows(batch, next.epoch, false).await?;
+                next.renew(&views, Instant::now() + PIN_DEADLINE)
+                    .map_err(follow_error)?;
             }
             delivery.progress(next.epoch, next.checkpoint_id).await?;
             cut = next;
