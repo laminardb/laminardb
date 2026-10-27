@@ -62,12 +62,15 @@ impl CommittedStatement {
     }
 }
 
-/// The committed cut a planned statement reads.
+/// The committed checkpoint a read observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReadCut {
-    pub(crate) epoch: u64,
-    pub(crate) checkpoint_id: u64,
-    pub(crate) taken_at_ms: u64,
+pub struct ReadCut {
+    /// Epoch of the cut; pass it back as [`CommittedRead::AtLeast`] to read no earlier.
+    pub epoch: u64,
+    /// Checkpoint that committed the cut.
+    pub checkpoint_id: u64,
+    /// When the cut was taken, in Unix milliseconds; the result is as old as now minus this.
+    pub taken_at_ms: u64,
 }
 
 /// Attempts at reading views whose captured checkpoint retention moves past before it is pinned.

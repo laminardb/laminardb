@@ -78,6 +78,7 @@ impl QueryRows {
     }
 
     /// Rows that were already read to the end.
+    #[cfg(feature = "api")]
     pub(crate) fn ready(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
         let (sender, receiver) = mpsc::channel(batches.len() + 1);
         for delivery in batches

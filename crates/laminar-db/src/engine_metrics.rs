@@ -185,6 +185,10 @@ pub struct ViewMetrics {
     /// Rows append-only views dropped at ingest because they arrived behind the event-time
     /// retention horizon. A row-cap retention has no horizon and never drops here.
     pub rows_below_horizon_total: IntCounter,
+    /// Ad-hoc reads of views. Label: `level` (`latest` or `committed`).
+    pub reads_total: IntCounterVec,
+    /// Age of the committed checkpoint each committed read observed, in seconds.
+    pub committed_read_age_seconds: Histogram,
 }
 
 impl ViewMetrics {
@@ -210,6 +214,22 @@ impl ViewMetrics {
                 "Rows append-only views dropped because they arrived behind the retention horizon",
             )
             .unwrap(),
+            reads_total: IntCounterVec::new(
+                Opts::new(
+                    "mv_reads_total",
+                    "Ad-hoc reads of materialized views by read level",
+                ),
+                &["level"],
+            )
+            .unwrap(),
+            committed_read_age_seconds: Histogram::with_opts(
+                HistogramOpts::new(
+                    "mv_committed_read_age_seconds",
+                    "Age of the committed checkpoint each committed view read observed",
+                )
+                .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.updates.clone()))
@@ -226,7 +246,30 @@ impl ViewMetrics {
         registry
             .register(Box::new(metrics.rows_below_horizon_total.clone()))
             .unwrap();
+        registry
+            .register(Box::new(metrics.reads_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.committed_read_age_seconds.clone()))
+            .unwrap();
         metrics
+    }
+
+    /// Count one read, at a committed cut taken at `taken_at_ms` or at the latest cycle.
+    pub(crate) fn observe_read(&self, taken_at_ms: Option<u64>) {
+        let Some(taken_at_ms) = taken_at_ms else {
+            self.reads_total.with_label_values(&["latest"]).inc();
+            return;
+        };
+        self.reads_total.with_label_values(&["committed"]).inc();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        #[allow(clippy::cast_precision_loss)] // ages are far below 2^52 ms
+        self.committed_read_age_seconds
+            .observe(now_ms.saturating_sub(taken_at_ms) as f64 / 1_000.0);
     }
 }
 

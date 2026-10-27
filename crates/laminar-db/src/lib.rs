@@ -187,6 +187,7 @@ pub use config::{
     DEFAULT_SOURCE_QUEUE_MAX_BYTES, MAX_SOURCE_QUEUE_BYTES,
 };
 pub use db::committed_read::CommittedQuery;
+pub use db::read_level::{ReadLevel, ReadResult};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;
@@ -198,7 +199,7 @@ pub use handle::{
 };
 pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
-pub use mv_store::{CommittedRead, CommittedReadError};
+pub use mv_store::{CommittedRead, CommittedReadError, ReadCut};
 pub use profile::{Profile, ProfileError};
 pub use query_rows::QueryRows;
 pub use recovery_manager::{RecoveredState, RecoveryManager};

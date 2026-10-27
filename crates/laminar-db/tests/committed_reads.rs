@@ -9,8 +9,8 @@ use std::time::Duration;
 use arrow::array::{Array, Int64Array, RecordBatch};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{
-    CommittedQuery, CommittedRead, CommittedReadError, DbError, ExecuteResult, LaminarConfig,
-    LaminarDB,
+    CommittedQuery, CommittedRead, CommittedReadError, DbError, EngineMetrics, ExecuteResult,
+    LaminarConfig, LaminarDB, ReadLevel,
 };
 
 const EVENTS: &str = "CREATE SOURCE events (k BIGINT, v BIGINT)";
@@ -144,6 +144,51 @@ async fn committed_reads_see_only_checkpointed_rows_of_every_view() {
     )
     .await;
     assert_eq!(column(&keyed.batches, 0), [3]);
+    db.shutdown().await.unwrap();
+}
+
+/// A read names the cut it observed at a committed level and none at the latest cycle, and joins
+/// views at either level, since each view is read as a snapshot.
+#[tokio::test]
+async fn reads_report_their_cut_and_join_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = pipeline(dir.path()).await;
+    let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    db.set_engine_metrics(Arc::clone(&metrics));
+    assert_eq!(db.default_read_level(), ReadLevel::Latest);
+    push(&db, &[1, 2, 2]).await;
+    let first = checkpoint(&db).await;
+    push(&db, &[3]).await;
+
+    let join = "SELECT c.k, c.n FROM counts c JOIN tail t ON c.k = t.k";
+    let committed = db
+        .read(join, ReadLevel::Committed(CommittedRead::Latest))
+        .await
+        .unwrap();
+    assert_eq!(committed.cut.map(|cut| cut.epoch), Some(first));
+    let rows = committed.rows.read_all().await.unwrap();
+    assert_eq!(column(&rows, 0), [1, 2, 2]);
+    assert_eq!(column(&rows, 1), [1, 2, 2]);
+
+    let latest = db.read(join, ReadLevel::Latest).await.unwrap();
+    assert_eq!(latest.cut, None);
+    assert_eq!(
+        column(&latest.rows.read_all().await.unwrap(), 0),
+        [1, 2, 2, 3]
+    );
+    assert_eq!(latest_rows(&db, join).await, [1, 2, 2, 3]);
+
+    let reads = |level| metrics.views.reads_total.with_label_values(&[level]).get();
+    assert_eq!((reads("committed"), reads("latest")), (1, 1));
+    assert_eq!(
+        metrics.views.committed_read_age_seconds.get_sample_count(),
+        1
+    );
+    let error = db
+        .read("CREATE SOURCE other (k BIGINT)", ReadLevel::Latest)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DbError::InvalidOperation(_)), "{error}");
     db.shutdown().await.unwrap();
 }
 

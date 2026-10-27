@@ -39,6 +39,7 @@ pub(crate) use committed::{PinnedCut, ViewShape};
 pub(crate) use frames::RestoredView;
 pub(crate) use freshness::{spawn_monitor as spawn_freshness_monitor, FreshnessContracts};
 use multiset::MultisetState;
+pub use statement_snapshot::ReadCut;
 pub(crate) use statement_snapshot::{
     plan_committed_statement, plan_statement, read_captured, read_views, CommittedStatement,
     StatementViewSnapshot, VIEW_READ_DEADLINE,

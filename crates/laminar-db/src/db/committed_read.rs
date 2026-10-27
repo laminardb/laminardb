@@ -1,6 +1,5 @@
 //! Queries that read every materialized view at one committed checkpoint.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::RecordBatch;
@@ -64,15 +63,15 @@ impl LaminarDB {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(DbError::Shutdown);
         }
-        let (frame, cut) =
-            crate::mv_store::plan_committed_statement(&self.ctx, &self.mv_store, sql, at, deadline)
-                .await?;
-        let schema = Arc::new(frame.schema().as_arrow().clone());
-        let batches =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), frame.collect())
-                .await
-                .map_err(|_| CommittedReadError::DeadlineExceeded { epoch: cut.epoch })?
-                .map_err(crate::query_rows::execution_error)?;
+        let (cut, stream) = self.committed_stream(sql, at, deadline).await?;
+        let schema = stream.schema();
+        let batches = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            futures::TryStreamExt::try_collect::<Vec<_>>(stream),
+        )
+        .await
+        .map_err(|_| CommittedReadError::DeadlineExceeded { epoch: cut.epoch })?
+        .map_err(crate::query_rows::execution_error)?;
         Ok(CommittedQuery {
             epoch: cut.epoch,
             checkpoint_id: cut.checkpoint_id,
@@ -85,6 +84,7 @@ impl LaminarDB {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use arrow::array::{Array, Int64Array};

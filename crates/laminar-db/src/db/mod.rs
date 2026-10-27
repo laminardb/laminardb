@@ -12,6 +12,7 @@ pub(crate) mod committed_read;
 #[cfg(test)]
 mod datafusion_memory_tests;
 mod explain;
+pub(crate) mod read_level;
 mod session;
 mod source_watermarks;
 mod subscription_open;
@@ -4735,6 +4736,16 @@ impl LaminarDB {
                 }
                 StreamingStatement::DropLookupTable { name, if_exists } => {
                     return self.handle_drop_lookup_table(name, *if_exists);
+                }
+                // An ad-hoc query reads every table as a snapshot, so the streaming planner's
+                // join and window rules, which govern named streaming queries, do not apply.
+                StreamingStatement::Standard(statement)
+                    if matches!(**statement, sqlparser::ast::Statement::Query(_)) =>
+                {
+                    let sql_str = statement.to_string();
+                    let df = crate::mv_store::plan_statement(&self.ctx, &self.mv_store, &sql_str);
+                    let stream = df.await?.execute_stream().await?;
+                    return Ok(self.bridge_query_stream(sql, stream));
                 }
                 _ => {}
             }

@@ -125,6 +125,34 @@ impl ViewCase {
                     ));
                 }
             }
+            // A session that chose no level reads a cluster node at its newest committed cut.
+            let node = &cluster.dbs[1];
+            let read_at_default = node
+                .read(read, node.default_read_level())
+                .await
+                .map_err(|e| format!("{}: node 2 read `{read}`: {e}", self.name))?;
+            if read_at_default
+                .cut
+                .is_none_or(|cut| cut.epoch < checkpoint.epoch)
+            {
+                return Err(format!(
+                    "{}: node 2 read `{read}` at {:?}, not a committed cut at or after {}",
+                    self.name, read_at_default.cut, checkpoint.epoch
+                ));
+            }
+            let rows = read_at_default
+                .rows
+                .read_all()
+                .await
+                .map_err(|e| format!("{}: node 2 read `{read}`: {e}", self.name))?;
+            let observed = oracle::consolidate(&rows, OutputForm::Rows)?;
+            if observed != expected {
+                return Err(format!(
+                    "{}: node 2 read `{read}` diverges from batch ground truth; {}",
+                    self.name,
+                    oracle::diff(&expected, &observed)
+                ));
+            }
         }
         Ok(())
     }
