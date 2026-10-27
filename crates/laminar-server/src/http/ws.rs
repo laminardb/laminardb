@@ -208,20 +208,26 @@ fn ws_data_suffix(
 }
 
 fn ws_cluster_data_fields(cluster: Option<&ClusterSubscriptionFrameMetadata>) -> String {
-    let Some(ClusterSubscriptionFrameMetadata::Data {
-        stream_generation,
-        partition,
-        partition_sequence,
-        committed_epoch,
-    }) = cluster
-    else {
-        return String::new();
-    };
-    format!(
-        ",\"stream_generation\":\"{stream_generation}\",\"partition\":\"{}\",\"partition_sequence\":\"{}\",\"committed_epoch\":\"{committed_epoch}\"",
-        partition.get(),
-        partition_sequence.get(),
-    )
+    match cluster {
+        Some(ClusterSubscriptionFrameMetadata::Data {
+            stream_generation,
+            partition,
+            partition_sequence,
+            committed_epoch,
+        }) => format!(
+            ",\"stream_generation\":\"{stream_generation}\",\"partition\":\"{}\",\"partition_sequence\":\"{}\",\"committed_epoch\":\"{committed_epoch}\"",
+            partition.get(),
+            partition_sequence.get(),
+        ),
+        Some(ClusterSubscriptionFrameMetadata::ViewRows { epoch, snapshot }) => {
+            format!(",\"committed_epoch\":\"{epoch}\",\"snapshot\":{snapshot}")
+        }
+        Some(
+            ClusterSubscriptionFrameMetadata::Progress { .. }
+            | ClusterSubscriptionFrameMetadata::ViewProgress { .. },
+        )
+        | None => String::new(),
+    }
 }
 
 #[cfg(test)]

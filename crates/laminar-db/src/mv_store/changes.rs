@@ -5,16 +5,24 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "cluster")]
+use arrow::array::Array;
 use arrow::array::{Int64Array, RecordBatch};
+#[cfg(feature = "cluster")]
+use arrow::compute::interleave;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+#[cfg(feature = "cluster")]
+use arrow::row::{RowConverter, SortField};
 use laminar_core::changelog::WEIGHT_COLUMN;
+#[cfg(feature = "cluster")]
+use rustc_hash::FxHashMap;
 
 use super::admission::PreparedUpdate;
 use super::{MvEntry, MvStorageMode, MvStore, ViewRead};
 use crate::error::DbError;
 
 /// The schema subscribers of a view stored as `mode` with rows of `schema` receive.
-fn subscription_schema(schema: &SchemaRef, mode: &MvStorageMode) -> SchemaRef {
+pub(super) fn subscription_schema(schema: &SchemaRef, mode: &MvStorageMode) -> SchemaRef {
     match mode {
         MvStorageMode::AppendLog { .. } => Arc::clone(schema),
         MvStorageMode::Changelog { .. } => {
@@ -74,9 +82,73 @@ impl MvStore {
 }
 
 /// `rows` of a changelog view, each inserted once.
-fn with_unit_weights(rows: &RecordBatch, schema: SchemaRef) -> Result<RecordBatch, DbError> {
+pub(super) fn with_unit_weights(
+    rows: &RecordBatch,
+    schema: SchemaRef,
+) -> Result<RecordBatch, DbError> {
     let mut columns = rows.columns().to_vec();
     columns.push(Arc::new(Int64Array::from(vec![1; rows.num_rows()])));
     RecordBatch::try_new(schema, columns)
         .map_err(|e| DbError::Storage(format!("MV snapshot weights: {e}")))
+}
+
+/// The change from the rows of `older` to those of `newer`: each distinct row whose count
+/// differs, weighted by the difference, in `schema` (the rows' columns, then `__weight`).
+#[cfg(feature = "cluster")]
+pub(super) fn row_diff(
+    schema: &SchemaRef,
+    older: &[RecordBatch],
+    newer: &[RecordBatch],
+) -> Result<Option<RecordBatch>, DbError> {
+    let error = |e: arrow::error::ArrowError| DbError::Storage(format!("MV change: {e}"));
+    let columns = schema.fields().len() - 1;
+    let converter = RowConverter::new(
+        schema.fields()[..columns]
+            .iter()
+            .map(|field| SortField::new(field.data_type().clone()))
+            .collect(),
+    )
+    .map_err(error)?;
+    let sides: Vec<(&RecordBatch, i64)> = older
+        .iter()
+        .map(|batch| (batch, -1))
+        .chain(newer.iter().map(|batch| (batch, 1)))
+        .collect();
+    let encoded = sides
+        .iter()
+        .map(|(batch, _)| converter.convert_columns(batch.columns()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(error)?;
+    let mut counts = FxHashMap::default();
+    let mut first_seen = Vec::new();
+    for (side, rows) in encoded.iter().enumerate() {
+        for (row_index, row) in rows.iter().enumerate() {
+            let slot = *counts.entry(row).or_insert_with(|| {
+                first_seen.push(((side, row_index), 0_i64));
+                first_seen.len() - 1
+            });
+            first_seen[slot].1 += sides[side].1;
+        }
+    }
+    let (indices, weights): (Vec<_>, Vec<_>) = first_seen
+        .into_iter()
+        .filter(|(_, weight)| *weight != 0)
+        .unzip();
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    let mut arrays = (0..columns)
+        .map(|column| {
+            let sources: Vec<&dyn Array> = sides
+                .iter()
+                .map(|(batch, _)| batch.column(column).as_ref())
+                .collect();
+            interleave(&sources, &indices)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(error)?;
+    arrays.push(Arc::new(Int64Array::from(weights)));
+    RecordBatch::try_new(Arc::clone(schema), arrays)
+        .map(Some)
+        .map_err(error)
 }

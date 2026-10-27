@@ -82,6 +82,21 @@ pub enum ClusterSubscriptionFrameMetadata {
         /// Committed checkpoint identifier.
         checkpoint_id: u64,
     },
+    /// Rows of a materialized view read from the committed checkpoint at `epoch`.
+    ViewRows {
+        /// Committed checkpoint epoch.
+        epoch: u64,
+        /// Whether the rows are part of the view's rows at `epoch`, which the subscription
+        /// starts with, rather than part of its change since the previous committed checkpoint.
+        snapshot: bool,
+    },
+    /// Every change of a materialized view through this committed checkpoint was delivered.
+    ViewProgress {
+        /// Committed checkpoint epoch.
+        epoch: u64,
+        /// Committed checkpoint identifier.
+        checkpoint_id: u64,
+    },
 }
 
 /// Backward-compatible frame plus optional cluster delivery metadata.
@@ -370,6 +385,41 @@ impl SubscriptionPortal {
                 },
                 cluster: Some(ClusterSubscriptionFrameMetadata::Progress {
                     stream_generation,
+                    epoch,
+                    checkpoint_id,
+                }),
+                error_code: None,
+            },
+            ClusterReaderRead::Frame(ClusterReaderFrame::ViewRows {
+                batch,
+                delivery_sequence,
+                epoch,
+                snapshot,
+                permit,
+            }) => SubscriptionEnvelope {
+                frame: PortalFrame::Batch {
+                    batch,
+                    sequence: delivery_sequence,
+                    lease: SubscriptionFrameLease {
+                        _local_owner: None,
+                        _cluster_owner: Some(permit),
+                    },
+                },
+                cluster: Some(ClusterSubscriptionFrameMetadata::ViewRows { epoch, snapshot }),
+                error_code: None,
+            },
+            ClusterReaderRead::Frame(ClusterReaderFrame::ViewProgress {
+                delivery_sequence,
+                epoch,
+                checkpoint_id,
+            }) => SubscriptionEnvelope {
+                frame: PortalFrame::Barrier {
+                    sequence: delivery_sequence,
+                    epoch,
+                    checkpoint_id,
+                    through_sequence: delivery_sequence,
+                },
+                cluster: Some(ClusterSubscriptionFrameMetadata::ViewProgress {
                     epoch,
                     checkpoint_id,
                 }),

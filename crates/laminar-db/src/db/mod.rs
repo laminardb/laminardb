@@ -4663,7 +4663,10 @@ impl LaminarDB {
     /// a change the amount by which the change altered the row's count (a replaced row is
     /// retracted with `-1`). An append view delivers plain rows; rows leaving its retention are
     /// not changes. Outside a cluster a view subscription starts at the latest cycle and admits
-    /// only [`SubscribeStart::Tail`](crate::subscription::SubscribeStart::Tail).
+    /// only [`SubscribeStart::Tail`](crate::subscription::SubscribeStart::Tail). In a cluster it
+    /// reads committed checkpoints: the view at the newest one or at
+    /// [`SubscribeStart::AsOfEpoch`](crate::subscription::SubscribeStart::AsOfEpoch), then each
+    /// later checkpoint's change, each followed by a progress frame.
     ///
     /// # Errors
     /// `StreamNotFound` for unknown `name`; `Subscription` for unsupported cluster plans or

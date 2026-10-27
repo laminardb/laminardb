@@ -539,8 +539,8 @@ from every node's checkpointed state. A node that takes part in no checkpoint (d
 yet assigned) learns of each new checkpoint from the cluster's checkpoint authority within about
 a second; after a topology migration it keeps the last checkpoint of its own topology until it
 runs the new one. `SELECT` of a
-view on a cluster node fails, because the node holds only its part. `SUBSCRIBE` to a view is
-rejected with `[LDB-4007]` before connector I/O.
+view on a cluster node fails, because the node holds only its part. `SUBSCRIBE` to a view reads
+committed checkpoints in the same way, as described below.
 
 An append-only view's interval retention follows one event-time frontier per view, committed
 with each checkpoint: the lowest frontier among the nodes whose input is active, never moving
@@ -565,6 +565,18 @@ the latest cycle and each later cycle's change follows it; `AS OF EPOCH` on a vi
 (`0A000`), because a view subscription always starts from the view's rows. Earlier releases sent
 a changelog view's whole contents as plain rows after every cycle instead.
 
+In a cluster any node serves a subscription to any view from committed checkpoints. The snapshot
+is the view at the newest committed checkpoint, or at `AS OF EPOCH <n>` while checkpoint `n` is
+retained, and a progress frame for that epoch follows it. Each later committed checkpoint then
+delivers the view's change since the one before, followed by its own progress frame. A changelog
+view's change is netted over the whole checkpoint interval, so a row that changes and changes back
+between two checkpoints is not sent; rows within one interval arrive in no particular order. An
+append-only view delivers the rows each node appended in that interval; rows a node takes over
+from a node that left, and segments its log compaction rewrites, are not new rows. A subscription
+survives rebalancing, a node leaving, and topology migrations that keep the view. It ends with a
+typed error when a migration drops the view, or when it falls so far behind that the checkpoint
+it last delivered is no longer retained.
+
 ### SUBSCRIBE over the Postgres wire protocol
 
 When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
@@ -576,7 +588,7 @@ SUBSCRIBE <name> [AS OF EPOCH <n>] [WHERE <predicate>]
 - `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable. A view's rows arrive as described above.
 - The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. Named streams whose output schema is not resolved reject `WHERE`.
 - The query stays open until the client disconnects. Local runtimes preserve their existing delivery behaviour; cluster data becomes visible only after a complete cluster checkpoint commits.
-- Cluster `SUBSCRIBE` is supported only for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, materialized views, and uncertified plans fail before subscription backend I/O.
+- Cluster `SUBSCRIBE` is supported for materialized views, as described above, and for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, and uncertified plans fail before subscription backend I/O.
 - Every cluster server is a gateway over the same shared committed history; clients do not need to locate current vnode owners.
 - Cluster ordering is strict and contiguous within each vnode output partition. Fair gateway merging defines no order between partitions and does not imply arrival, event-time, SQL-sort, or global total order.
 - Partition sequences describe committed source-log frames. A `WHERE` predicate can remove every row from a frame, so optional frame metadata observed by a filtered client can have non-adjacent partition sequences without indicating that a matching row was skipped.
@@ -598,7 +610,8 @@ aggregate scope, history is a byte-bounded suffix of verified immutable Arrow se
 by authoritative committed checkpoint indexes in shared object storage. Object listing is never
 commit authority.
 
-WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`. Pgwire adds
+WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`; in a
+cluster, a materialized view's data frames also carry `committed_epoch` and `snapshot`. Pgwire adds
 `__laminar_kind`, `__laminar_epoch`, and `__laminar_checkpoint_id` control columns without changing
 the user data schema. Cluster progress is emitted only after the complete participant roster and
 partition-frontier vector commit. Durably record a marker after processing its preceding data, then

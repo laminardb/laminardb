@@ -589,6 +589,9 @@ async fn read_committed_epoch(
                         "unexpected benchmark progress epoch {epoch}"
                     )));
                 }
+                ClusterReaderRead::Frame(
+                    ClusterReaderFrame::ViewRows { .. } | ClusterReaderFrame::ViewProgress { .. },
+                ) => return Err(benchmark_message("a stream gateway delivered view frames")),
                 ClusterReaderRead::Terminal(error) => return Err(error.into()),
             }
         }

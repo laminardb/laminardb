@@ -563,6 +563,9 @@ async fn read_through_progress(
                 ClusterReaderRead::Frame(ClusterReaderFrame::Progress { epoch, .. }) => {
                     panic!("unexpected progress epoch {epoch}");
                 }
+                ClusterReaderRead::Frame(
+                    ClusterReaderFrame::ViewRows { .. } | ClusterReaderFrame::ViewProgress { .. },
+                ) => panic!("a stream gateway delivered view frames"),
                 ClusterReaderRead::Terminal(error) => panic!("gateway failed: {error}"),
             }
         }

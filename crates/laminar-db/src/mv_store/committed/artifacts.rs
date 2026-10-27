@@ -27,7 +27,7 @@ use crate::mv_store::{MvStorageMode, ViewKey};
 const MAX_CONCURRENT_OBJECT_READS: usize = 8;
 
 /// Digest of the frame a vnode without rows is captured as; such a frame is never loaded.
-static EMPTY_FRAME_SHA256: LazyLock<String> =
+pub(super) static EMPTY_FRAME_SHA256: LazyLock<String> =
     LazyLock::new(|| checkpoint_sha256(&EMPTY_SLICE_FRAME));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,14 +37,14 @@ enum ObjectKind {
 }
 
 /// One committed payload: a vnode frame or a log segment.
-struct Artifact<'a> {
+pub(super) struct Artifact<'a> {
     kind: ObjectKind,
     chunk: StateChunkId,
     object_length: u64,
     range: ByteRange,
-    sha256: &'a str,
+    pub(super) sha256: &'a str,
     /// The frame's vnode, or the segment's sequence.
-    position: u64,
+    pub(super) position: u64,
 }
 
 impl PinnedCut {
@@ -81,6 +81,29 @@ impl PinnedCut {
         vnode_count: u32,
         pruning: &ScanPruning,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        let wanted: Vec<_> = self
+            .view_frames(shape, key, vnode_count)?
+            .into_values()
+            .filter(|frame| frame.sha256 != EMPTY_FRAME_SHA256.as_str())
+            .filter(|frame| pruning.keeps_vnode(frame.position))
+            .collect();
+        let rows = self
+            .load(views, &shape.schema, &wanted, |frame, bytes| {
+                let vnode = u32::try_from(frame.position).unwrap_or(u32::MAX);
+                decode_view_frame(shape, vnode, vnode_count, bytes).map(|batch| vec![batch])
+            })
+            .await?;
+        Ok(rows.iter().flat_map(|rows| rows.iter().cloned()).collect())
+    }
+
+    /// The frame of every vnode of changelog view `shape` at this cut, which must list one
+    /// frame per vnode.
+    pub(super) fn view_frames(
+        &self,
+        shape: &ViewShape,
+        key: &ViewKey,
+        vnode_count: u32,
+    ) -> Result<BTreeMap<u32, Artifact<'_>>, DbError> {
         let operator_id = format!(
             "graph:{}",
             laminar_core::mv::view_result_operator(&shape.name)
@@ -106,7 +129,7 @@ impl PinnedCut {
                     sha256: &frame.sha256,
                     position: u64::from(*vnode),
                 };
-                if frames.insert(*vnode, artifact).is_some() {
+                if frames.insert(u32::from(*vnode), artifact).is_some() {
                     return Err(self.inconsistent(shape, "lists a vnode frame twice"));
                 }
             }
@@ -122,22 +145,11 @@ impl PinnedCut {
         let complete = frames.len() == usize::try_from(expected).unwrap_or(usize::MAX)
             && frames
                 .last_key_value()
-                .is_some_and(|(vnode, _)| u32::from(*vnode) + 1 == expected);
+                .is_some_and(|(vnode, _)| *vnode + 1 == expected);
         if !complete {
             return Err(self.inconsistent(shape, "does not list a frame for every vnode"));
         }
-        let wanted: Vec<_> = frames
-            .into_values()
-            .filter(|frame| frame.sha256 != EMPTY_FRAME_SHA256.as_str())
-            .filter(|frame| pruning.keeps_vnode(frame.position))
-            .collect();
-        let rows = self
-            .load(views, &shape.schema, &wanted, |frame, bytes| {
-                let vnode = u32::try_from(frame.position).unwrap_or(u32::MAX);
-                decode_view_frame(shape, vnode, vnode_count, bytes).map(|batch| vec![batch])
-            })
-            .await?;
-        Ok(rows.iter().flat_map(|rows| rows.iter().cloned()).collect())
+        Ok(frames)
     }
 
     async fn read_logs(
@@ -243,7 +255,7 @@ impl PinnedCut {
 
     /// The decoded rows of `artifacts`, in order: cached rows by digest, the rest loaded with
     /// one ranged read per object and verified before `decode` runs.
-    async fn load(
+    pub(super) async fn load(
         &self,
         views: &CommittedViews,
         schema: &SchemaRef,
@@ -353,7 +365,7 @@ async fn load_ranges(
     Ok(payloads)
 }
 
-fn view_log<'a>(manifest: &'a CheckpointManifest, view: &str) -> Option<&'a ViewLog> {
+pub(super) fn view_log<'a>(manifest: &'a CheckpointManifest, view: &str) -> Option<&'a ViewLog> {
     manifest
         .view_logs
         .binary_search_by(|log| log.view.as_str().cmp(view))
@@ -373,7 +385,7 @@ fn node_data_length(manifest: &CheckpointManifest, chunk: StateChunkId) -> Resul
         .ok_or_else(|| untracked(chunk))
 }
 
-fn segment_artifact<'a>(
+pub(super) fn segment_artifact<'a>(
     manifest: &CheckpointManifest,
     segment: &'a ViewLogSegment,
 ) -> Result<Artifact<'a>, DbError> {
@@ -406,7 +418,7 @@ fn untracked(chunk: StateChunkId) -> DbError {
     ))
 }
 
-fn decode_segment(
+pub(super) fn decode_segment(
     view: &str,
     schema: &SchemaRef,
     sequence: u64,

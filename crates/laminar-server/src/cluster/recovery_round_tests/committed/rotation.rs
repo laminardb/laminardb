@@ -1,6 +1,8 @@
 //! A draining database hands its vnodes over live: the other database takes the keyed and
 //! row-placed views' slices and adopts the append view's log, and reads every view at its next
 //! checkpoint. The drained database takes part in no later checkpoint and reads them too.
+//! Subscribers on both databases, attached before the drain, fold to the same rows: the moved
+//! slices and the adopted log are not changes.
 
 use super::scenario::{
     checkpoint, expected_views, leader, read_views, start_pair, wait_totals, Process, VIEWS,
@@ -21,6 +23,7 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
             read_views(process, &VIEWS, Some(epoch)).await?,
             expected_views(keys, 2)
         );
+        subscribe(process).await?;
     }
     for process in &mut *processes {
         process.done(&Command::Drain(8)).await?;
@@ -62,7 +65,44 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
         read_views(&mut processes[1], &VIEWS, None).await?,
         expected_views(keys, 3)
     );
+    for process in &mut *processes {
+        assert_eq!(
+            read_subscriptions(process, epoch).await?,
+            expected_views(keys, 3)
+        );
+    }
     Ok(())
+}
+
+/// The columns of each view that [`VIEWS`] reads.
+const SUBSCRIBED: [(&str, &[&str]); 3] = [
+    ("recovery_totals", &["account", "total", "n"]),
+    ("recovery_amounts", &["total"]),
+    ("recovery_rows", &["account", "amount"]),
+];
+
+async fn subscribe(process: &mut Process) -> Result<()> {
+    for (view, columns) in SUBSCRIBED {
+        let columns = columns.iter().map(|column| (*column).to_owned()).collect();
+        process
+            .done(&Command::Subscribe(view.to_owned(), columns))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn read_subscriptions(process: &mut Process, through: u64) -> Result<Vec<Vec<Vec<i64>>>> {
+    let mut read = Vec::new();
+    for (view, _) in SUBSCRIBED {
+        match process
+            .request(&Command::ReadSubscription(view.to_owned(), through))
+            .await?
+        {
+            Response::Rows(rows) => read.push(rows),
+            response => return Err(anyhow!("expected subscription rows: {response:?}")),
+        }
+    }
+    Ok(read)
 }
 
 /// Wait until both databases run an assignment in which `owner` owns every vnode.

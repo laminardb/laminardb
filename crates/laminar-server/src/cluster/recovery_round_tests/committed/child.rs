@@ -4,8 +4,16 @@ use connectors::ReplayProbe;
 use laminar_core::cluster::control::{CheckpointDecisionStore, TopologyCatalogState};
 use laminar_db::CommittedRead;
 
+/// A view subscription and the rows it has folded so far, by their kept columns.
+struct ViewSubscription {
+    columns: Vec<String>,
+    portal: laminar_db::subscription::SubscriptionPortal,
+    rows: BTreeMap<Vec<i64>, i64>,
+}
+
 struct DatabasePeer {
     peer: Peer,
+    subscriptions: BTreeMap<String, ViewSubscription>,
     probe: Arc<ReplayProbe>,
     sender: Option<Arc<ShuffleSender>>,
     registry: Option<Arc<VnodeRegistry>>,
@@ -243,6 +251,48 @@ impl DatabasePeer {
         Ok(Response::Rows(rows))
     }
 
+    async fn subscribe(&mut self, view: String, columns: Vec<String>) -> Result<()> {
+        let portal = self
+            .db()?
+            .open_subscription(&view, None, laminar_db::subscription::SubscribeStart::Tail)
+            .await?;
+        let subscription = ViewSubscription {
+            columns,
+            portal,
+            rows: BTreeMap::new(),
+        };
+        self.subscriptions.insert(view, subscription);
+        Ok(())
+    }
+
+    /// Fold `view`'s frames until its progress reaches `through`; each row repeats by its count.
+    async fn read_subscription(&mut self, view: &str, through: u64) -> Result<Response> {
+        use laminar_db::subscription::PortalFrame;
+        let subscription = self
+            .subscriptions
+            .get_mut(view)
+            .ok_or_else(|| anyhow!("no subscription to {view}"))?;
+        loop {
+            let frame = tokio::time::timeout(DEADLINE, subscription.portal.next_frame())
+                .await
+                .with_context(|| format!("{view} delivered nothing through {through}"))?
+                .ok_or_else(|| anyhow!("subscription to {view} closed"))?;
+            match frame {
+                PortalFrame::Batch { batch, .. } => fold_frame(subscription, &batch)?,
+                PortalFrame::Barrier { epoch, .. } if epoch >= through => break,
+                PortalFrame::Barrier { .. } => {}
+                other => return Err(anyhow!("subscription to {view} failed: {other:?}")),
+            }
+        }
+        let mut rows = Vec::new();
+        for (row, count) in &subscription.rows {
+            let count = usize::try_from(*count)
+                .map_err(|_| anyhow!("{view} folded to a negative count of {row:?}"))?;
+            rows.extend(std::iter::repeat_n(row.clone(), count));
+        }
+        Ok(Response::Rows(rows))
+    }
+
     async fn adopt(&self) -> Result<()> {
         let TopologyCatalogState::LegacySealed { manifest } =
             self.peer.catalog.topology_state().await?
@@ -415,6 +465,10 @@ impl DatabasePeer {
             Command::Observe => return Ok(Response::Observed(Box::new(self.observe().await?))),
             Command::Checkpoint => return self.checkpoint().await,
             Command::ReadView(sql, epoch) => return self.read_view(&sql, epoch).await,
+            Command::Subscribe(view, columns) => self.subscribe(view, columns).await?,
+            Command::ReadSubscription(view, through) => {
+                return self.read_subscription(&view, through).await
+            }
             Command::Adopt => self.adopt().await?,
             Command::Migrate(operation, statements) => self.migrate(operation, statements).await?,
             Command::Topology(operation) => return self.topology(operation).await,
@@ -485,6 +539,7 @@ pub(super) async fn run(root: &Path) -> Result<()> {
     let peer = Peer::acquire(config.node, Arc::clone(&objects), PROCESS_TTL).await?;
     let mut owner = DatabasePeer {
         peer,
+        subscriptions: BTreeMap::new(),
         probe: Arc::new(ReplayProbe::default()),
         sender: None,
         registry: None,
@@ -517,4 +572,29 @@ pub(super) async fn run(root: &Path) -> Result<()> {
             std::panic::resume_unwind(primary);
         }
     }
+}
+
+fn fold_frame(subscription: &mut ViewSubscription, batch: &arrow_array::RecordBatch) -> Result<()> {
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| anyhow!("subscription frame has no BIGINT column {name}"))
+    };
+    let kept = subscription
+        .columns
+        .iter()
+        .map(|name| column(name))
+        .collect::<Result<Vec<_>>>()?;
+    let weights = batch
+        .column_by_name("__weight")
+        .map(|_| column("__weight"))
+        .transpose()?;
+    for row in 0..batch.num_rows() {
+        let values = kept.iter().map(|column| column.value(row)).collect();
+        let weight = weights.map_or(1, |weights| weights.value(row));
+        *subscription.rows.entry(values).or_default() += weight;
+    }
+    subscription.rows.retain(|_, count| *count != 0);
+    Ok(())
 }

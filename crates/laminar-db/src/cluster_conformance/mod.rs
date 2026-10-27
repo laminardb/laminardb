@@ -245,7 +245,11 @@ async fn embedded_db(
             interval_ms: None,
             ..Default::default()
         })
-        .register_connector(source::register(sources.to_vec(), Arc::clone(polled)))
+        .register_connector(source::register(
+            sources.to_vec(),
+            Arc::clone(polled),
+            Arc::new(AtomicU64::new(u64::MAX)),
+        ))
         .build()
         .await
         .map_err(|e| e.to_string())

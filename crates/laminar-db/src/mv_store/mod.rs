@@ -34,6 +34,8 @@ pub(crate) use append_log::{spawn_compactor as spawn_log_compactor, LogRead, Vie
 use append_log::{AppendLogState, LogHorizon};
 pub(crate) use committed::CommittedViews;
 pub use committed::{CommittedRead, CommittedReadError};
+#[cfg(feature = "cluster")]
+pub(crate) use committed::{PinnedCut, ViewShape};
 pub(crate) use frames::RestoredView;
 pub(crate) use freshness::{spawn_monitor as spawn_freshness_monitor, FreshnessContracts};
 use multiset::MultisetState;

@@ -14,6 +14,9 @@ use super::oracle::{self, OutputForm};
 use super::source::FixtureSource;
 use super::tests::{events, events_in, events_with, CLOSED_TUMBLE_TRUTH, INTERVAL_JOIN};
 use super::{embedded_db, Verdict, DEADLINE, NODES, VNODES};
+use crate::subscription::{
+    ClusterSubscriptionFrameMetadata, PortalFrame, SubscribeStart, SubscriptionPortal,
+};
 use crate::{CommittedRead, ExecuteResult, LaminarDB};
 
 struct ViewCase {
@@ -56,6 +59,7 @@ impl ViewCase {
     /// Every node reads every view at the cut committed after the sources delivered, each read
     /// equals batch SQL over the complete input, and a live read of a view is refused.
     async fn check_cluster_reads(&self, cluster: &Cluster) -> Result<(), String> {
+        cluster.allowance.store(0, Ordering::Release);
         cluster
             .activate()
             .await
@@ -68,18 +72,28 @@ impl ViewCase {
                 .map(|polled| polled.load(Ordering::Acquire))
                 .sum()
         };
+        // Subscribers attach before any input, a second cut holds part of it, and the last all.
+        self.cluster_checkpoint(cluster).await?;
+        let mut subscriptions = self.subscribe(cluster, SubscribeStart::Tail).await?;
+        cluster.allowance.store(1, Ordering::Release);
+        super::wait_until(DEADLINE, || delivered() >= 1)
+            .await
+            .map_err(|()| format!("{}: cluster sources did not deliver", self.name))?;
+        let partial = self.cluster_checkpoint(cluster).await?;
+        cluster.allowance.store(u64::MAX, Ordering::Release);
         super::wait_until(DEADLINE, || delivered() >= total)
             .await
             .map_err(|()| format!("{}: cluster sources did not deliver", self.name))?;
-        let checkpoint = cluster.dbs[0]
-            .checkpoint_with_timeout(DEADLINE)
-            .await
-            .map_err(|e| format!("{}: cluster checkpoint: {e}", self.name))?;
-        if !checkpoint.success {
-            return Err(format!(
-                "{}: cluster checkpoint failed: {checkpoint:?}",
-                self.name
-            ));
+        let checkpoint = self.cluster_checkpoint(cluster).await?;
+        subscriptions.extend(
+            self.subscribe(cluster, SubscribeStart::AsOfEpoch(partial.epoch))
+                .await?
+                .into_iter()
+                .take(1),
+        );
+        for (truth, portal) in &mut subscriptions {
+            self.check_subscription(portal, truth, checkpoint.epoch)
+                .await?;
         }
         for (read, truth) in &self.reads {
             // A node holds only its part of each view, so it refuses a live read.
@@ -111,6 +125,86 @@ impl ViewCase {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn cluster_checkpoint(
+        &self,
+        cluster: &Cluster,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, String> {
+        let checkpoint = cluster.dbs[0]
+            .checkpoint_with_timeout(DEADLINE)
+            .await
+            .map_err(|e| format!("{}: cluster checkpoint: {e}", self.name))?;
+        if !checkpoint.success {
+            return Err(format!(
+                "{}: cluster checkpoint failed: {checkpoint:?}",
+                self.name
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    /// A subscription to each view a read scans whole, spread over the nodes, with the batch SQL
+    /// its rows must equal.
+    async fn subscribe(
+        &self,
+        cluster: &Cluster,
+        start: SubscribeStart,
+    ) -> Result<Vec<(&'static str, SubscriptionPortal)>, String> {
+        let mut subscriptions = Vec::new();
+        for (index, (read, truth)) in self.reads.iter().enumerate() {
+            let Some(view) = read.strip_prefix("SELECT * FROM ") else {
+                continue;
+            };
+            let portal = cluster.dbs[index % cluster.dbs.len()]
+                .open_subscription(view, None, start)
+                .await
+                .map_err(|e| format!("{}: subscribe to {view} at {start:?}: {e}", self.name))?;
+            subscriptions.push((*truth, portal));
+        }
+        Ok(subscriptions)
+    }
+
+    /// Fold everything `portal` delivers through committed epoch `through`: a snapshot, then
+    /// changes. It must equal `truth` over the complete input.
+    async fn check_subscription(
+        &self,
+        portal: &mut SubscriptionPortal,
+        truth: &str,
+        through: u64,
+    ) -> Result<(), String> {
+        let mut batches = Vec::new();
+        let mut snapshot = true;
+        loop {
+            let envelope = tokio::time::timeout(DEADLINE, portal.next_envelope())
+                .await
+                .map_err(|_| format!("{}: subscription stalled before {through}", self.name))?
+                .ok_or_else(|| format!("{}: subscription closed", self.name))?;
+            match (envelope.frame, envelope.cluster) {
+                (
+                    PortalFrame::Batch { batch, .. },
+                    Some(ClusterSubscriptionFrameMetadata::ViewRows { snapshot: rows, .. }),
+                ) => {
+                    if rows != snapshot {
+                        return Err(format!("{}: snapshot rows after a change", self.name));
+                    }
+                    batches.push(batch);
+                }
+                (PortalFrame::Barrier { epoch, .. }, _) if epoch >= through => break,
+                (PortalFrame::Barrier { .. }, _) => snapshot = false,
+                (frame, _) => return Err(format!("{}: unexpected frame {frame:?}", self.name)),
+            }
+        }
+        let observed = oracle::consolidate(&batches, OutputForm::Changelog)?;
+        let expected = oracle::ground_truth(&self.sources, truth).await?;
+        if observed != expected {
+            return Err(format!(
+                "{}: subscription through {through} diverges from batch ground truth; {}",
+                self.name,
+                oracle::diff(&expected, &observed)
+            ));
         }
         Ok(())
     }
@@ -513,5 +607,61 @@ async fn a_held_cluster_read_keeps_its_cut_from_cleanup() {
     tokio::time::timeout(DEADLINE, retired)
         .await
         .expect("cleanup retires the cut once no read holds it");
+    cluster.shutdown().await;
+}
+
+/// Each node's append log compacts while a subscriber follows the view: a checkpoint that
+/// writes a merged segment in place of its inputs adds no rows, so each appended row is received
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_view_subscription_receives_each_row_once_across_merges() {
+    const TRUTH: &str = "SELECT k, v FROM events";
+    let case = ViewCase {
+        name: "append_view_merges",
+        sources: vec![events_with("events", 0, 40)],
+        views: views(&[
+            "CREATE MATERIALIZED VIEW appended AS SELECT k, v FROM events \
+             WITH (retention = '100000 rows')",
+        ]),
+        reads: vec![("SELECT * FROM appended", TRUTH)],
+        same_cycle_invariants: vec![],
+    };
+    let Startup::Running(cluster) = Cluster::start(NODES, VNODES, &case.sources, &case.ddl()).await
+    else {
+        panic!("the append view is admitted in cluster");
+    };
+    cluster.allowance.store(0, Ordering::Release);
+    cluster.activate().await.unwrap();
+    case.cluster_checkpoint(&cluster).await.unwrap();
+    let mut subscriptions = case
+        .subscribe(&cluster, SubscribeStart::Tail)
+        .await
+        .unwrap();
+    let delivered = || -> u64 {
+        cluster
+            .polled
+            .iter()
+            .map(|polled| polled.load(Ordering::Acquire))
+            .sum()
+    };
+    // More checkpoints with new rows than one compaction block holds segments.
+    for step in 1..=12 {
+        cluster.allowance.store(step, Ordering::Release);
+        super::wait_until(DEADLINE, || delivered() >= step * NODES)
+            .await
+            .unwrap();
+        case.cluster_checkpoint(&cluster).await.unwrap();
+    }
+    cluster.allowance.store(u64::MAX, Ordering::Release);
+    let total: u64 = case.sources.iter().map(FixtureSource::batch_count).sum();
+    super::wait_until(DEADLINE, || delivered() >= total)
+        .await
+        .unwrap();
+    let last = case.cluster_checkpoint(&cluster).await.unwrap();
+    for (truth, portal) in &mut subscriptions {
+        case.check_subscription(portal, truth, last.epoch)
+            .await
+            .unwrap();
+    }
     cluster.shutdown().await;
 }

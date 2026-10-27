@@ -1346,6 +1346,56 @@ async fn committed_pairs(db: &LaminarDB, sql: &str, epoch: u64) -> Vec<(i64, i64
     pairs
 }
 
+/// The `(id, column 1)` rows a view subscription folds to through committed epoch `through`, or
+/// the code it ended with.
+async fn fold_view_subscription(
+    portal: &mut crate::subscription::SubscriptionPortal,
+    through: u64,
+) -> Result<Vec<(i64, i64)>, Option<&'static str>> {
+    use crate::subscription::PortalFrame;
+    let mut counts = std::collections::BTreeMap::<(i64, i64), i64>::new();
+    loop {
+        let envelope = tokio::time::timeout(Duration::from_secs(10), portal.next_envelope())
+            .await
+            .expect("the subscription delivers within the deadline")
+            .expect("the subscription is open");
+        match envelope.frame {
+            PortalFrame::Batch { batch, .. } => {
+                let column = |index: usize| {
+                    batch
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap()
+                        .clone()
+                };
+                let weights = batch.column_by_name("__weight").map(|weights| {
+                    weights
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap()
+                        .clone()
+                });
+                let (ids, values) = (column(0), column(1));
+                for row in 0..batch.num_rows() {
+                    *counts
+                        .entry((ids.value(row), values.value(row)))
+                        .or_default() += weights.as_ref().map_or(1, |weights| weights.value(row));
+                }
+            }
+            PortalFrame::Barrier { epoch, .. } if epoch >= through => break,
+            PortalFrame::Barrier { .. } => {}
+            PortalFrame::Error { .. } => return Err(envelope.error_code),
+            PortalFrame::Lagged(skipped) => panic!("subscription lagged by {skipped}"),
+        }
+    }
+    let mut rows = Vec::new();
+    for (row, count) in counts {
+        rows.extend(std::iter::repeat_n(row, usize::try_from(count).unwrap()));
+    }
+    Ok(rows)
+}
+
 #[tokio::test]
 async fn topology_sql_migration_adds_and_drops_materialized_views() {
     let (fixture, _) = Box::pin(preparation_fixture_with_bootstrap(
@@ -1423,6 +1473,17 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
     wait_until(old_output).await;
     let parent = Box::pin(fixture.db.checkpoint()).await.unwrap();
     assert!(parent.success, "{parent:?}");
+    let mut subscriptions = Vec::new();
+    for view in ["counts", "seen", "doomed", "doomed_seen"] {
+        let portal = Box::pin(fixture.db.open_subscription(
+            view,
+            None,
+            crate::subscription::SubscribeStart::Tail,
+        ))
+        .await
+        .unwrap();
+        subscriptions.push((view, portal));
+    }
 
     let recreate = fixture
         .db
@@ -1476,6 +1537,24 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
         read("SELECT id, value FROM added_seen").await,
         [(1, 1), (1, 1), (1, 1)]
     );
+    // A kept view's subscription follows it across the migration; a dropped view's ends.
+    for (view, portal) in &mut subscriptions {
+        let folded = Box::pin(fold_view_subscription(portal, target.epoch)).await;
+        match *view {
+            "counts" => assert_eq!(folded, Ok(vec![(1, 4), (2, 2)])),
+            "seen" => assert_eq!(
+                folded,
+                Ok(vec![(1, 1), (1, 1), (1, 1), (1, 1), (2, 1), (2, 1)])
+            ),
+            _ => assert_eq!(
+                folded,
+                Err(Some(
+                    crate::subscription::ClusterSubscriptionError::GenerationMismatch.code()
+                )),
+                "{view}"
+            ),
+        }
+    }
     for dropped in ["doomed", "doomed_seen", "doomed_spread"] {
         assert!(
             Box::pin(fixture.db.query_committed(

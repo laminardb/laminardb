@@ -53,6 +53,10 @@ enum Command {
     Checkpoint,
     /// A committed read of one view: the newest cut, or exactly this epoch.
     ReadView(String, Option<u64>),
+    /// Subscribe to a view at the newest committed cut, keeping these columns of its rows.
+    Subscribe(String, Vec<String>),
+    /// Everything a subscription received through this committed epoch, folded into rows.
+    ReadSubscription(String, u64),
     /// Adopt the sealed bootstrap catalog as topology one; leader only.
     Adopt,
     /// Submit one migration of the committed topology; leader only.

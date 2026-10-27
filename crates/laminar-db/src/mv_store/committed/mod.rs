@@ -5,6 +5,8 @@
 
 mod artifacts;
 mod cache;
+#[cfg(feature = "cluster")]
+mod changes;
 mod pruning;
 #[cfg(test)]
 mod tests;
@@ -112,6 +114,13 @@ pub(crate) struct ViewShape {
     pub(super) limits: MvLimits,
 }
 
+impl ViewShape {
+    #[cfg(feature = "cluster")]
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 impl super::MvStore {
     /// What a committed read of `name` needs, while the view is registered.
     pub(crate) fn view_shape(&self, name: &str) -> Option<ViewShape> {
@@ -140,6 +149,8 @@ pub(crate) struct CommittedViews {
 pub(crate) struct PinnedCut {
     pub(crate) epoch: u64,
     pub(crate) checkpoint_id: u64,
+    #[cfg(feature = "cluster")]
+    reference: CommittedCheckpointRef,
     /// Earliest participant capture time of the cut, in Unix milliseconds.
     pub(crate) taken_at_ms: u64,
     manifests: Arc<[CheckpointManifest]>,
@@ -158,6 +169,28 @@ enum LogFrontiers {
 }
 
 impl PinnedCut {
+    /// Hold this cut against retention until `deadline` instead.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::used_underscore_binding)] // the pin is held, never read
+    pub(crate) fn renew(
+        &mut self,
+        views: &CommittedViews,
+        deadline: Instant,
+    ) -> Result<(), DbError> {
+        match views.pins.acquire(&self.reference, deadline) {
+            PinAcquire::Acquired(pin) => {
+                self._pin = pin;
+                self.deadline = deadline;
+                Ok(())
+            }
+            PinAcquire::Pruned => Err(CommittedReadError::Retired {
+                requested: self.epoch,
+            }
+            .into()),
+            PinAcquire::Capacity => Err(CommittedReadError::PinCapacity.into()),
+        }
+    }
+
     /// The frontier `log` of `view` keeps rows against at this cut.
     pub(crate) fn log_frontier(&self, view: &str, log: &ViewLog) -> Option<i64> {
         match &self.log_frontiers {
@@ -261,12 +294,7 @@ impl CommittedViews {
             let reference = predecessor.filter(|reference| reference.epoch >= epoch);
             let reference = reference.ok_or_else(retired)?;
             if reference.epoch == epoch {
-                let PinAcquire::Acquired(pin) = self.pins.acquire(&reference, deadline) else {
-                    return Err(retired());
-                };
-                let index = self.load_index(&reference).await?.ok_or_else(retired)?;
-                let cut = CommittedCut::new(index, reference, std::iter::empty());
-                return self.pinned(&cut, pin, deadline).await;
+                return self.pin_reference(&reference, deadline).await;
             }
             predecessor = self
                 .load_index(&reference)
@@ -275,6 +303,71 @@ impl CommittedViews {
                 .predecessor;
         }
         Err(retired())
+    }
+
+    /// Pin the committed cut `reference` names.
+    pub(crate) async fn pin_reference(
+        &self,
+        reference: &CommittedCheckpointRef,
+        deadline: Instant,
+    ) -> Result<PinnedCut, DbError> {
+        let retired = || {
+            DbError::from(CommittedReadError::Retired {
+                requested: reference.epoch,
+            })
+        };
+        let pin = match self.pins.acquire(reference, deadline) {
+            PinAcquire::Acquired(pin) => pin,
+            PinAcquire::Pruned => return Err(retired()),
+            PinAcquire::Capacity => return Err(CommittedReadError::PinCapacity.into()),
+        };
+        let index = self.load_index(reference).await?.ok_or_else(retired)?;
+        let cut = CommittedCut::new(index, reference.clone(), std::iter::empty());
+        self.pinned(&cut, pin, deadline).await
+    }
+
+    /// The committed cuts after `cut`, oldest first, found by walking back from the newest.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn successors(
+        &self,
+        cut: &PinnedCut,
+    ) -> Result<Vec<CommittedCheckpointRef>, DbError> {
+        let lost = || {
+            DbError::from(CommittedReadError::Retired {
+                requested: cut.epoch,
+            })
+        };
+        let Some(latest) = self
+            .latest()
+            .filter(|latest| latest.index.epoch >= cut.epoch)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut successors = Vec::new();
+        let mut reference = latest.reference.clone();
+        let mut predecessor = latest.index.predecessor.clone();
+        while reference != cut.reference {
+            if successors.len() == MAX_EXACT_WALK || reference.epoch <= cut.epoch {
+                return Err(lost());
+            }
+            successors.push(reference);
+            reference = predecessor.take().ok_or_else(lost)?;
+            if reference != cut.reference {
+                predecessor = self
+                    .load_index(&reference)
+                    .await?
+                    .ok_or_else(lost)?
+                    .predecessor;
+            }
+        }
+        successors.reverse();
+        Ok(successors)
+    }
+
+    /// Committed cuts as this node learns of them.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cuts(&self) -> CommittedCuts {
+        self.cuts.clone()
     }
 
     async fn load_index(
@@ -350,6 +443,8 @@ impl CommittedViews {
         Ok(PinnedCut {
             epoch: cut.index.epoch,
             checkpoint_id: cut.index.checkpoint_id,
+            #[cfg(feature = "cluster")]
+            reference: cut.reference.clone(),
             taken_at_ms,
             manifests,
             log_frontiers,
