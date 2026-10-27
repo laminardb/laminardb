@@ -380,14 +380,20 @@ impl LaminarDB {
         {
             return Err(TopologyError::Fenced.into());
         }
-        // The manifest is in dependency order; retire dependents before their inputs.
+        // The manifest is in dependency order; retire dependents before their inputs. An owner's
+        // stages replay from its DDL, so they leave with it.
         for entry in superseded.into_iter().rev() {
             self.require_catalog_kind(&entry.canonical_name, entry.kind, false)?;
-            self.rollback_catalog_create(
-                &entry.canonical_name,
-                entry.kind,
-                "committed topology replacement or retirement",
-            )?;
+            let stages = self.stream_stage_targets(&entry.canonical_name);
+            let retired = std::iter::once((entry.canonical_name, entry.kind))
+                .chain(stages.into_iter().map(|stage| (stage.name, stage.kind)));
+            for (name, kind) in retired {
+                self.rollback_catalog_create(
+                    &name,
+                    kind,
+                    "committed topology replacement or retirement",
+                )?;
+            }
         }
         Ok(())
     }

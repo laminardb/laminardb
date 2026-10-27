@@ -17,9 +17,9 @@ use crate::pipeline::{ControlMutation, ControlMutationState};
 use super::control::resolve_control_ack;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct CatalogDropTarget {
-    pub(super) name: String,
-    pub(super) kind: CatalogObjectKind,
+pub(crate) struct CatalogDropTarget {
+    pub(crate) name: String,
+    pub(crate) kind: CatalogObjectKind,
 }
 
 struct StreamingDropGuard<'a> {

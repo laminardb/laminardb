@@ -1359,6 +1359,12 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
                 .into(),
             "CREATE MATERIALIZED VIEW doomed_seen AS SELECT id, value FROM trades WITH (retention = '100 rows')"
                 .into(),
+            "CREATE MATERIALIZED VIEW doomed_spread AS SELECT n, COUNT(*) AS ids FROM \
+             (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) GROUP BY n"
+                .into(),
+            "CREATE STREAM doomed_nested AS SELECT id, SUM(n) AS n FROM \
+             (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) per_id GROUP BY id"
+                .into(),
         ],
     ))
     .await;
@@ -1441,6 +1447,8 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
         vec![
             "DROP MATERIALIZED VIEW doomed".into(),
             "DROP MATERIALIZED VIEW doomed_seen".into(),
+            "DROP MATERIALIZED VIEW doomed_spread".into(),
+            "DROP STREAM doomed_nested".into(),
             "CREATE MATERIALIZED VIEW added_counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
                 .into(),
             "CREATE MATERIALIZED VIEW added_seen AS SELECT id, value FROM trades WITH (retention = '100 rows')"
@@ -1468,7 +1476,7 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
         read("SELECT id, value FROM added_seen").await,
         [(1, 1), (1, 1), (1, 1)]
     );
-    for dropped in ["doomed", "doomed_seen"] {
+    for dropped in ["doomed", "doomed_seen", "doomed_spread"] {
         assert!(
             Box::pin(fixture.db.query_committed(
                 &format!("SELECT * FROM {dropped}"),
@@ -1484,6 +1492,10 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
         .view_frontiers
         .keys()
         .all(|view| view != "doomed_seen"));
+    // A dropped owner's stages leave the running catalog with it.
+    let namespace = fixture.db.catalog_namespace.lock().clone();
+    assert!(!namespace.contains_key("doomed_spread$stage1"));
+    assert!(!namespace.contains_key("doomed_nested$stage1"));
     fixture.db.shutdown().await.unwrap();
 }
 

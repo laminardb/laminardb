@@ -157,7 +157,7 @@ impl LaminarDB {
     }
 
     /// `owner`'s stages, latest first so each is dropped before the stage it reads.
-    pub(super) fn stream_stage_targets(&self, owner: &str) -> Vec<CatalogDropTarget> {
+    pub(crate) fn stream_stage_targets(&self, owner: &str) -> Vec<CatalogDropTarget> {
         let namespace = self.catalog_namespace.lock();
         let streams = namespace
             .iter()
