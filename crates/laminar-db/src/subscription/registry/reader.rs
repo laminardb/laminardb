@@ -61,6 +61,11 @@ impl SubscriptionReader {
         }
     }
 
+    /// Sequence of the next entry this reader reads.
+    pub(in crate::subscription) const fn cursor(&self) -> u64 {
+        self.cursor
+    }
+
     pub(in crate::subscription) async fn next(&mut self) -> SubscriptionRead {
         loop {
             match self.try_read() {

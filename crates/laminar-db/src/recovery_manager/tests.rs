@@ -91,6 +91,7 @@ async fn committed_checkpoint() -> Fixture {
         channel_progress: manifest.channel_progress.clone(),
         source_watermarks: BTreeMap::from([("source".into(), 1_000)]),
         checkpoint_watermark: Some(1_000),
+        view_frontiers: Default::default(),
     };
     let (_, reference) = committed.encode_and_reference().unwrap();
     let outcome = CheckpointOutcome {
@@ -277,6 +278,7 @@ async fn cluster_recovery_selects_exact_and_newer_target_frames() {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let (_, committed_ref) = committed.encode_and_reference().unwrap();
     let outcome = CheckpointOutcome {

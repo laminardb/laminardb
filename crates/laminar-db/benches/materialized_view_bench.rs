@@ -39,9 +39,9 @@ fn materialized_views(c: &mut Criterion) {
     for width in [16, 4096] {
         let original = batch(1024, width, 'a');
         let replacement = batch(1024, width, 'b');
-        for mode in [Mode::Aggregate, Mode::Append, Mode::Upsert, Mode::Multiset] {
+        for mode in [Mode::Append, Mode::Upsert, Mode::Multiset] {
             let (seed, forward, backward) = match mode {
-                Mode::Aggregate | Mode::Append => (
+                Mode::Append => (
                     vec![original.clone()],
                     vec![replacement.clone()],
                     vec![original.clone()],
@@ -74,10 +74,7 @@ fn materialized_views(c: &mut Criterion) {
             });
             group.bench_function(format!("{mode:?}_checkpoint_1024_{width}"), |b| {
                 b.iter(|| {
-                    assert_eq!(
-                        view.checkpoint_during_update(black_box(&forward)).unwrap(),
-                        2
-                    );
+                    assert!(view.checkpoint_during_update(black_box(&forward)).unwrap() >= 2);
                     view.update(&backward).unwrap();
                 })
             });
@@ -86,5 +83,34 @@ fn materialized_views(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, materialized_views);
+/// A checkpoint after a cycle that changed 8 of 1024 rows.
+fn sparse_checkpoints(c: &mut Criterion) {
+    let mut group = c.benchmark_group("materialized_views");
+    for width in [16, 4096] {
+        let original = batch(1024, width, 'a');
+        let changed = batch(8, width, 'b');
+        let unchanged = batch(8, width, 'a');
+        for mode in [Mode::Upsert, Mode::Multiset] {
+            let (forward, backward) = match mode {
+                Mode::Upsert => (vec![weighted(&changed, 1)], vec![weighted(&unchanged, 1)]),
+                _ => (
+                    vec![weighted(&unchanged, -1), weighted(&changed, 1)],
+                    vec![weighted(&changed, -1), weighted(&unchanged, 1)],
+                ),
+            };
+            let mut view = MaterializedViewBenchmark::new(&original.schema(), mode).unwrap();
+            view.update(&[weighted(&original, 1)]).unwrap();
+            view.checkpoint_during_update(&[]).unwrap();
+            group.bench_function(format!("{mode:?}_checkpoint_8_of_1024_{width}"), |b| {
+                b.iter(|| {
+                    black_box(view.checkpoint_during_update(black_box(&forward)).unwrap());
+                    view.update(&backward).unwrap();
+                })
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, materialized_views, sparse_checkpoints);
 criterion_main!(benches);

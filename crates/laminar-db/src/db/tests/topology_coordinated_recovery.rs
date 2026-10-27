@@ -242,7 +242,7 @@ async fn held_ordinary_start(
     probe.start_release.notify_one();
 }
 
-fn request_recovery(fixture: &Fixture) {
+pub(super) fn request_recovery(fixture: &Fixture) {
     diagnostics();
     fixture.db.set_source_gate(true);
     fixture.authority.controller.set_recovering(true);

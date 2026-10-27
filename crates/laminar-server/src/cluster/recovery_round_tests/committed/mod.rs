@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use super::*;
 use laminar_core::checkpoint::{CheckpointAssignmentFence, CommittedCheckpointRef};
+use laminar_core::cluster::control::{TopologyAdmissionPhase, TopologyVersion};
 
 mod child;
 mod connectors;
+mod migration;
 mod process;
+mod rotation;
 mod scenario;
 
 const CHILD_ENV: &str = "LAMINAR_DATABASE_RECOVERY_PEER";
@@ -43,9 +46,22 @@ enum Command {
     Prefix(u64),
     HoldRecovery,
     RemoveFailedPeer(u64),
+    /// Mark a node `Draining`, so the leader moves its vnodes to the other node live.
+    Drain(u64),
     ClearProcessObservation,
     Observe,
     Checkpoint,
+    /// A committed read of one view: the newest cut, or exactly this epoch.
+    ReadView(String, Option<u64>),
+    /// Subscribe to a view at the newest committed cut, keeping these columns of its rows.
+    Subscribe(String, Vec<String>),
+    /// Everything a subscription received through this committed epoch, folded into rows.
+    ReadSubscription(String, u64),
+    /// Adopt the sealed bootstrap catalog as topology one; leader only.
+    Adopt,
+    /// Submit one migration of the committed topology; leader only.
+    Migrate(u128, Vec<String>),
+    Topology(u128),
     Release,
     Stop,
 }
@@ -69,6 +85,7 @@ struct Observation {
     intent: Option<RecoveryAnnouncement>,
     release: Option<RecoveryAnnouncement>,
     fault: Option<String>,
+    leader: bool,
     callbacks: Vec<process::Callback>,
     activity: Vec<process::ActivityRow>,
 }
@@ -87,6 +104,12 @@ enum Response {
         participants: Vec<u64>,
         channels: Vec<Vec<u8>>,
         watermark: Option<i64>,
+    },
+    Rows(Vec<Vec<i64>>),
+    Topology {
+        phase: Option<TopologyAdmissionPhase>,
+        committed: Option<TopologyVersion>,
+        active: Option<TopologyVersion>,
     },
 }
 
@@ -121,4 +144,16 @@ async fn surviving_database_recovers_lost_vnodes_and_replays_the_committed_sourc
         return;
     }
     scenario::run().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn two_databases_migrate_and_seed_views_from_the_cut() {
+    scenario::run_migration().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires loopback MinIO; set LAMINAR_PROCESS_TEST_S3_ENDPOINT and LAMINAR_PROCESS_TEST_S3_BUCKET"]
+async fn a_draining_database_hands_its_views_over_live() {
+    scenario::run_drain().await.unwrap();
 }

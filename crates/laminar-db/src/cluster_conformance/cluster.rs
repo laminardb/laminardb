@@ -21,6 +21,8 @@ pub(super) struct Cluster {
     pub dbs: Vec<Arc<LaminarDB>>,
     /// Batches each node's sources delivered, by node.
     pub polled: Vec<Arc<AtomicU64>>,
+    /// Batches each node may deliver; unlimited unless a test holds input back.
+    pub allowance: Arc<AtomicU64>,
     _controls: Vec<ClusterControl>,
     _leader_watch: watch::Sender<Option<LeaderLease>>,
 }
@@ -70,6 +72,7 @@ impl Cluster {
         let polled = (0..nodes)
             .map(|_| Arc::new(AtomicU64::new(0)))
             .collect::<Vec<_>>();
+        let allowance = Arc::new(AtomicU64::new(u64::MAX));
         let mut dbs = Vec::new();
         for (index, control) in controls.iter().enumerate() {
             let registry = Arc::new(VnodeRegistry::new_unassigned(vnodes));
@@ -93,6 +96,7 @@ impl Cluster {
                 .register_connector(source::register(
                     sources.to_vec(),
                     Arc::clone(&polled[index]),
+                    Arc::clone(&allowance),
                 ))
                 .build()
                 .await
@@ -120,6 +124,7 @@ impl Cluster {
         Startup::Running(Self {
             dbs,
             polled,
+            allowance,
             _controls: controls,
             _leader_watch: leader_watch,
         })

@@ -33,6 +33,9 @@ pub const DEFAULT_MATERIALIZED_VIEW_MAX_ROWS: usize = 1_000_000;
 /// Default retained-memory charge limit per local materialized view (256 MiB).
 pub const DEFAULT_MATERIALIZED_VIEW_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default byte budget of decoded committed view state cached for reads (256 MiB).
+pub const DEFAULT_MATERIALIZED_VIEW_READ_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
 /// Validate the live row and retained-memory limits for each local materialized view.
 ///
 /// # Errors
@@ -203,8 +206,12 @@ pub struct LaminarConfig {
     /// schema/converter/allocator overhead, snapshots and checkpoint scratch are separate.
     /// Keyed staging and input conversion have separate limits of twice this charge plus
     /// bounded staging metadata. Oversized net-neutral cycles can fail before live admission.
-    /// Append mode evicts oldest batches; an oversized single batch fails.
+    /// An append view counts the rows it holds in memory: those since the last committed
+    /// checkpoint, or its whole retained log without checkpointing. A cycle over the limit fails.
     pub materialized_view_max_bytes: usize,
+    /// Byte budget of the committed view state decoded for reads and cached by digest (default
+    /// 256 MiB), shared by every view. Zero disables the cache.
+    pub materialized_view_read_cache_bytes: usize,
     /// Maximum live rows in each reference table (default 1,000,000).
     /// Applies to embedded and single-node tables; must be nonzero.
     pub reference_table_max_rows: usize,
@@ -231,9 +238,6 @@ pub struct LaminarConfig {
     pub storage_dir: Option<PathBuf>,
     /// Checkpoint config. `None` = disabled.
     pub checkpoint: Option<StreamCheckpointConfig>,
-    /// Emit dirty-only changelogs for keyed non-windowed aggregate materialized views instead of
-    /// re-materializing every group each cycle. This is query execution policy, not checkpointing.
-    pub incremental_emit: bool,
     /// Cloud checkpoint URL, e.g. `s3://bucket/prefix`.
     pub object_store_url: Option<String>,
     /// Credential/config overrides for the object store.
@@ -370,13 +374,13 @@ impl Default for LaminarConfig {
             reference_table_max_bytes: DEFAULT_REFERENCE_TABLE_MAX_BYTES,
             materialized_view_max_rows: DEFAULT_MATERIALIZED_VIEW_MAX_ROWS,
             materialized_view_max_bytes: DEFAULT_MATERIALIZED_VIEW_MAX_BYTES,
+            materialized_view_read_cache_bytes: DEFAULT_MATERIALIZED_VIEW_READ_CACHE_BYTES,
             datafusion_memory_limit_bytes: DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES,
             default_buffer_size: 65536,
             push_source_max_bytes: laminar_core::streaming::DEFAULT_SOURCE_MAX_QUEUED_BYTES,
             default_backpressure: BackpressureStrategy::Block,
             storage_dir: None,
             checkpoint: None,
-            incremental_emit: true,
             object_store_url: None,
             object_store_options: HashMap::new(),
             http_auth_token: None,
@@ -452,7 +456,7 @@ mod tests {
             .create_mv(
                 "v",
                 batch.schema(),
-                crate::mv_store::MvStorageMode::Aggregate,
+                crate::mv_store::MvStorageMode::append_rows(1_000),
             )
             .unwrap();
         assert!(matches!(
@@ -513,12 +517,12 @@ mod tests {
         let crate::ExecuteResult::Query(mut query) = result else {
             panic!("expected query");
         };
-        let mut subscription = query.subscribe_raw().unwrap();
-        let output =
-            tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv_async())
-                .await
-                .unwrap()
-                .unwrap();
+        let mut rows = query.subscribe_raw().unwrap();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), rows.next_batch())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let value = output
             .column(0)
             .as_any()

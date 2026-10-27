@@ -148,10 +148,18 @@ async fn startup_gate_middleware(
 ) -> axum::response::Response {
     let path = req.uri().path();
     let startup_probe = matches!(path, "/health" | "/ready" | "/metrics");
-    if !startup_probe {
-        if let Some(reason) = state.serving_rejection() {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
-        }
+    // SQL reads and subscriptions keep serving through coordinated recovery; the SQL handler
+    // refuses other statements itself.
+    let committed_reads = path == "/api/v1/sql" || path.starts_with("/ws/");
+    let rejection = if startup_probe {
+        None
+    } else if committed_reads {
+        state.authority_rejection()
+    } else {
+        state.serving_rejection()
+    };
+    if let Some(reason) = rejection {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
     }
     next.run(req).await
 }

@@ -338,6 +338,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         local,
         PipelineIdentity::empty(),
         Vec::new(),
+        Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
     )
     .unwrap();
@@ -356,6 +357,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &target_owners,
         local,
         PipelineIdentity::empty(),
+        Vec::new(),
         Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
     )
@@ -377,6 +379,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         wrong_process,
         PipelineIdentity::empty(),
         Vec::new(),
+        Vec::new(),
         Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition).unwrap()),
     )
     .is_err());
@@ -390,6 +393,7 @@ fn pending_final_owner_exit_binds_exact_transition_and_process() {
         &predecessor_owners,
         local,
         PipelineIdentity::empty(),
+        Vec::new(),
         Vec::new(),
         None,
     )
@@ -956,6 +960,7 @@ async fn record_two_vnode_acquisition_checkpoint(
         channel_progress: Vec::new(),
         source_watermarks: Default::default(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let reference = authority.create_committed_checkpoint(&index).await.unwrap();
     authority
@@ -1246,6 +1251,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         &owners,
         local,
         identity.clone(),
+        Vec::new(),
         Vec::new(),
         None,
     )
@@ -2144,7 +2150,7 @@ async fn typed_namespace_rejects_every_cross_kind_create_and_drop() {
         ),
         (
             CatalogObjectKind::MaterializedView,
-            "CREATE MATERIALIZED VIEW shared AS SELECT id FROM base_input",
+            "CREATE MATERIALIZED VIEW shared AS SELECT id FROM base_input WITH (retention = '1000 rows')",
         ),
     ];
     let drops = [
@@ -4484,7 +4490,7 @@ fn assert_cancellation_test_stream_state(db: &LaminarDB, name: &str, present: bo
 const CANCELLATION_STREAM_DDL: &str =
     "CREATE STREAM cancellable AS SELECT id FROM events WITH ('retain_history' = '4mb')";
 const CANCELLATION_MV_DDL: &str =
-    "CREATE MATERIALIZED VIEW cancellable_mv AS SELECT id FROM events";
+    "CREATE MATERIALIZED VIEW cancellable_mv AS SELECT id FROM events WITH (retention = '1000 rows')";
 
 async fn create_cancellation_test_stream(
     db: &LaminarDB,
@@ -4588,7 +4594,8 @@ async fn applied_mv_create_drop_survives_lost_ack_and_persists() {
     let (control_tx, control_rx) = crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     *db.control_tx.lock() = Some(control_tx);
 
-    const CREATE: &str = "CREATE MATERIALIZED VIEW ack_mv AS SELECT id FROM events";
+    const CREATE: &str =
+        "CREATE MATERIALIZED VIEW ack_mv AS SELECT id FROM events WITH (retention = '1000 rows')";
     let caller_db = Arc::clone(&db);
     let create = tokio::spawn(async move { caller_db.execute(CREATE).await });
     let message = control_rx.recv().await.unwrap();
@@ -4782,7 +4789,7 @@ async fn hot_stream_and_mv_ddl_requires_a_live_running_control_coordinator() {
 
         for sql in [
             "CREATE STREAM blocked_stream AS SELECT id FROM events",
-            "CREATE MATERIALIZED VIEW blocked_mv AS SELECT id FROM events",
+            "CREATE MATERIALIZED VIEW blocked_mv AS SELECT id FROM events WITH (retention = '1000 rows')",
         ] {
             let error = db.execute(sql).await.unwrap_err();
             assert!(
@@ -6191,7 +6198,8 @@ async fn test_mv_emit_on_window_close_threads_through_to_registration() {
          AS SELECT sym, AVG(price) AS avg_px \
             FROM ticks \
             GROUP BY sym, tumble(ts, INTERVAL '1' MINUTE) \
-            EMIT ON WINDOW CLOSE",
+            EMIT ON WINDOW CLOSE \
+            WITH (retention = '1000 rows')",
     )
     .await
     .expect("MV creation should succeed");
@@ -6270,9 +6278,11 @@ async fn test_drop_materialized_view_not_found() {
 async fn test_create_mv_if_not_exists() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE events (id INT)").await.unwrap();
-    db.execute("CREATE MATERIALIZED VIEW my_view AS SELECT id FROM events")
-        .await
-        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW my_view AS SELECT id FROM events WITH (retention = '1000 rows')",
+    )
+    .await
+    .unwrap();
 
     // IF NOT EXISTS should succeed without error
     let result = db
@@ -6293,7 +6303,7 @@ async fn materialized_view_replace_is_rejected_before_mutating_old_definition() 
     for running in [false, true] {
         let db = LaminarDB::open().unwrap();
         db.execute("CREATE SOURCE events (id INT)").await.unwrap();
-        let original = "CREATE MATERIALIZED VIEW current_mv AS SELECT id FROM events";
+        let original = "CREATE MATERIALIZED VIEW current_mv AS SELECT id FROM events WITH (retention = '1000 rows')";
         db.execute(original).await.unwrap();
 
         let old_registry_sql = db.mv_registry.lock().get("current_mv").unwrap().sql.clone();
@@ -6376,11 +6386,7 @@ async fn materialized_view_namespace_collision_preserves_existing_provider() {
 
 #[tokio::test]
 async fn multiway_incremental_mv_is_rejected_without_partial_registration() {
-    let db = LaminarDB::open_with_config(LaminarConfig {
-        incremental_emit: true,
-        ..Default::default()
-    })
-    .unwrap();
+    let db = LaminarDB::open().unwrap();
     for source in ["ev_a", "ev_b", "ev_c"] {
         db.execute(&format!("CREATE SOURCE {source} (k BIGINT, v BIGINT)"))
             .await
@@ -7073,7 +7079,7 @@ async fn create_materialized_view_closed_admission_reply_rolls_back_local_regist
     });
 
     let error = db
-        .execute("CREATE MATERIALIZED VIEW rejected_mv AS SELECT id FROM events")
+        .execute("CREATE MATERIALIZED VIEW rejected_mv AS SELECT id FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap_err();
     close_reply.await.unwrap();
@@ -7156,7 +7162,7 @@ async fn test_show_materialized_views_with_entries() {
 async fn test_drop_mv_and_show() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE events (id INT)").await.unwrap();
-    db.execute("CREATE MATERIALIZED VIEW temp_view AS SELECT id FROM events")
+    db.execute("CREATE MATERIALIZED VIEW temp_view AS SELECT id FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap();
 
@@ -9401,6 +9407,50 @@ async fn test_retracting_temporal_filter_emits_insert_then_retract() {
     );
 }
 
+/// A view's key comes from its planned output distribution: an aggregate upserts on its group
+/// columns, a global aggregate holds one row, and a projection keeps the placement of an
+/// upstream key it forwards.
+#[tokio::test]
+async fn view_storage_follows_the_planned_output_distribution() {
+    use crate::mv_store::{MvStorageMode, ViewKey};
+
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (k BIGINT, v BIGINT)")
+        .await
+        .unwrap();
+    for (view, sql, expected) in [
+        (
+            "keyed",
+            "SELECT k, SUM(v) AS total FROM events GROUP BY k",
+            ViewKey::Keyed(vec![0]),
+        ),
+        (
+            "overall",
+            "SELECT COUNT(*) AS n FROM events",
+            ViewKey::Global,
+        ),
+        (
+            "kept_key",
+            "SELECT total, k FROM keyed WHERE total > 0",
+            ViewKey::MultisetByKey(vec![1]),
+        ),
+        (
+            "dropped_key",
+            "SELECT total FROM keyed",
+            ViewKey::MultisetByRow,
+        ),
+    ] {
+        db.execute(&format!("CREATE MATERIALIZED VIEW {view} AS {sql}"))
+            .await
+            .unwrap_or_else(|error| panic!("{view}: {error}"));
+        let mode = db.mv_store.read().storage_mode_for_test(view);
+        assert!(
+            matches!(&mode, Some(MvStorageMode::Changelog { key, .. }) if *key == expected),
+            "{view}: {mode:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn first_temporal_filter_mv_uses_multiset_storage() {
     let db = LaminarDB::open().unwrap();
@@ -9416,7 +9466,10 @@ async fn first_temporal_filter_mv_uses_multiset_storage() {
 
     assert!(matches!(
         db.mv_store.read().storage_mode_for_test("recent_mv"),
-        Some(crate::mv_store::MvStorageMode::Multiset)
+        Some(crate::mv_store::MvStorageMode::Changelog {
+            key: crate::mv_store::ViewKey::MultisetByRow,
+            ..
+        })
     ));
 }
 
@@ -9605,17 +9658,8 @@ async fn test_select_from_source() {
     let result = db.execute("SELECT * FROM sensors").await.unwrap();
     match result {
         ExecuteResult::Query(mut q) => {
-            // The bridge_query_stream spawns a tokio task; yield to let it run.
-            tokio::task::yield_now().await;
-            let mut sub = q.subscribe_raw().unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let mut total_rows = 0;
-            for _ in 0..256 {
-                match sub.poll() {
-                    Some(b) => total_rows += b.num_rows(),
-                    None => break,
-                }
-            }
+            let batches = q.subscribe_raw().unwrap().read_all().await.unwrap();
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(total_rows, 2);
         }
         _ => panic!("Expected Query result from SELECT on source"),
@@ -9659,15 +9703,8 @@ async fn rejected_source_replace_preserves_existing_buffer() {
     let result = db.execute("SELECT * FROM sensors").await.unwrap();
     match result {
         ExecuteResult::Query(mut q) => {
-            let mut sub = q.subscribe_raw().unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let mut total_rows = 0;
-            for _ in 0..256 {
-                match sub.poll() {
-                    Some(b) => total_rows += b.num_rows(),
-                    None => break,
-                }
-            }
+            let batches = q.subscribe_raw().unwrap().read_all().await.unwrap();
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             assert_eq!(
                 total_rows, 2,
                 "a rejected replacement must preserve the original source buffer"
@@ -10133,20 +10170,47 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                 .lock()
                 .contains_key("nested_aggregate$stage1"));
 
-            assert_cluster_rejection(
-                &db,
-                "rejected_append_mv",
-                "CREATE MATERIALIZED VIEW rejected_append_mv AS \
-                 SELECT id, value FROM left_events",
+            db.execute(
+                "CREATE MATERIALIZED VIEW append_view_ok AS \
+                 SELECT id, value FROM left_events WITH (retention = '1000 rows')",
             )
-            .await;
-            assert_cluster_rejection(
-                &db,
-                "rejected_global_aggregate",
-                "CREATE MATERIALIZED VIEW rejected_global_aggregate AS \
+            .await
+            .expect("each node keeps its own part of an append view's log");
+            assert!(db.mv_store.read().has_mv("append_view_ok"));
+            db.execute(
+                "CREATE MATERIALIZED VIEW global_view_ok AS \
                  SELECT SUM(value) AS total FROM left_events",
             )
+            .await
+            .expect("a global aggregate view keeps its slice on vnode 0's owner");
+            assert!(db.mv_store.read().has_mv("global_view_ok"));
+            db.execute(
+                "CREATE MATERIALIZED VIEW keyed_view_ok AS \
+                 SELECT id, SUM(value) AS total FROM left_events GROUP BY id",
+            )
+            .await
+            .unwrap();
+            db.execute("CREATE MATERIALIZED VIEW row_placed_view_ok AS SELECT total FROM keyed_view_ok")
+                .await
+                .expect("a view that drops its key routes each row to the owner of its vnode");
+            assert!(db.mv_store.read().places_by_row("row_placed_view_ok"));
+            // Routing a view's rows to their owners is one more remote exchange: a key-dropping
+            // view over three chained exchanges crosses four.
+            for chained in [
+                "CREATE MATERIALIZED VIEW by_total AS \
+                 SELECT total, COUNT(*) AS ids FROM keyed_view_ok GROUP BY total",
+                "CREATE MATERIALIZED VIEW by_ids AS \
+                 SELECT ids, COUNT(*) AS totals FROM by_total GROUP BY ids",
+            ] {
+                db.execute(chained).await.unwrap();
+            }
+            let deep = assert_cluster_rejection(
+                &db,
+                "too_deep",
+                "CREATE MATERIALIZED VIEW too_deep AS SELECT totals FROM by_ids",
+            )
             .await;
+            assert!(deep.contains("crosses 4 remote exchanges"), "{deep}");
             db.execute(
                 "CREATE STREAM projection_ok AS \
                  SELECT id, value FROM left_events WHERE value > 0",
@@ -10181,24 +10245,6 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             assert!(db.catalog.get_stream_entry("global_count_ok").is_some());
         })
         .await;
-
-    // Startup independently enforces the same invariant so an inconsistent in-memory catalog
-    // cannot bypass DDL admission.
-    let stale = one_owner_cluster().await;
-    stale
-        .mv_store
-        .write()
-        .create_mv(
-            "stale_mv",
-            Arc::new(arrow_schema::Schema::empty()),
-            crate::mv_store::MvStorageMode::append_default(),
-        )
-        .unwrap();
-    let error = stale
-        .start()
-        .await
-        .expect_err("cluster startup must reject residual materialized state");
-    assert!(error.to_string().contains("LDB-4007"), "{error}");
 
     // A cluster-capable binary may also host an independent local database. Cluster admission is
     // scoped to configured mode, while the ordinary planner retains its local join contract.
@@ -12240,7 +12286,7 @@ async fn test_mv_append_mode_queryable() {
 
     db.execute(
         "CREATE MATERIALIZED VIEW filtered AS \
-         SELECT id, value FROM events WHERE value > 10.0",
+         SELECT id, value FROM events WHERE value > 10.0 WITH (retention = '1000 rows')",
     )
     .await
     .unwrap();
@@ -12272,9 +12318,11 @@ async fn test_mv_drop_cleans_up_table() {
     db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
         .await
         .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT * FROM events")
-        .await
-        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW ev_mv AS SELECT * FROM events WITH (retention = '1000 rows')",
+    )
+    .await
+    .unwrap();
 
     assert!(db.ctx.sql("SELECT * FROM ev_mv").await.is_ok());
     assert!(db.mv_store.read().has_mv("ev_mv"));
@@ -12294,7 +12342,7 @@ async fn test_mv_empty_returns_correct_schema() {
     db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
         .await
         .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT id, value FROM events")
+    db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT id, value FROM events WITH (retention = '1000 rows')")
         .await
         .unwrap();
 
@@ -12752,7 +12800,7 @@ async fn open_subscription_with_invalid_filter_errors_at_open() {
         .unwrap();
     // Subscribe against an MV (filterable schema resolved at CREATE); a bare
     // source isn't subscribable.
-    db.execute("CREATE MATERIALIZED VIEW priced AS SELECT symbol FROM trades")
+    db.execute("CREATE MATERIALIZED VIEW priced AS SELECT symbol FROM trades WITH (retention = '1000 rows')")
         .await
         .unwrap();
 

@@ -45,8 +45,8 @@ pub(crate) struct StreamRegistration {
     pub join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
     pub has_analytic: bool,
     pub has_frame: bool,
-    /// Marks this MV to emit a dirty-only changelog into a keyed `Upsert` store. Decided at DDL
-    /// time (`incremental_emit` flag + terminal non-windowed agg); drives operator + store mode.
+    /// Marks a changelog materialized view: its stream emits weighted deltas into the view's vnode
+    /// slices. Decided at DDL time; drives the operator and the store mode.
     pub incremental: bool,
     /// Planner-owned stable output distribution for a potentially subscribable stream.
     pub subscription_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,

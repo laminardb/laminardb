@@ -33,9 +33,9 @@ runtime. Connector I/O, checkpoint persistence and sink publication run on the m
 This model applies to embedded, single-node and cluster execution.
 
 See the [cluster SQL boundary](../../docs/SQL_REFERENCE.md#cluster-sql-boundary) for
-mode-specific admission. Cluster plans deliberately reject local materialized views and
-reference-table enrichment; managed final windows and certified interval/temporal joins
-have their own admitted paths. Feature flags and checkpoints
+mode-specific admission. Cluster plans deliberately reject reference-table enrichment;
+materialized views, managed final windows and certified interval/temporal joins have their
+own admitted paths. Feature flags and checkpoints
 alone do not imply exactly-once delivery.
 
 ## Stateful process functions
@@ -216,12 +216,12 @@ These owners must be included when sizing process memory; the table quota does n
 
 Embedded and single-node databases default to **1,000,000 live rows / 256 MiB per MV**.
 Set `materialized_view_max_rows` and `materialized_view_max_bytes` through `LaminarConfig`
-or the builder. Both must be nonzero. Cluster materialized views remain rejected.
+or the builder. Both must be nonzero. A cluster node applies them to its part of each view.
 
 Aggregate snapshots and keyed upserts reject a final state above either limit. Multisets
 count distinct stored rows; their charge includes the complete encoded row and count.
-Append views retain the newest complete batches within their batch, row and byte limits,
-evicting oldest batches as before. A single oversized append batch fails admission.
+Append views count the rows waiting for the next checkpoint (the whole retained log without
+checkpointing), and a cycle that would exceed a limit fails instead of dropping rows.
 Checkpoint restore rejects over-limit images without dropping committed rows to make them fit.
 
 All affected views pass quota and multiplicity validation before a cycle changes any MV or

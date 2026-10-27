@@ -361,3 +361,78 @@ async fn unknown_protocol_or_nonbaseline_version_is_rejected() {
         Err(TopologyError::Invalid(_))
     ));
 }
+
+#[test]
+fn an_object_owns_its_stream_frame_its_result_slices_and_its_stages() {
+    let object = |name: &str, kind| ClusterTopologyObjectPlan {
+        name: name.into(),
+        kind,
+        catalog_generation: 1,
+        transition: ClusterTopologyObjectTransition::Preserve,
+        initialization: TopologyInitialization::PreserveExactCut,
+        definition_sha256: String::new(),
+        compatibility_sha256: String::new(),
+        dependencies: Vec::new(),
+        schema_sha256: None,
+        managed_state_contract: Some("contract".into()),
+    };
+    let view = object("counts", CatalogObjectKind::MaterializedView);
+    assert!(view.owns_state_frame("graph:counts"));
+    assert!(view.owns_state_frame("graph:counts::view"));
+    assert!(view.owns_state_frame("graph:counts$stage1"));
+    assert!(!view.owns_state_frame("graph:counts$stage1::view"));
+    assert!(!view.owns_state_frame("counts::view"));
+    let stream = object("counts", CatalogObjectKind::Stream);
+    assert!(stream.owns_state_frame("graph:counts"));
+    assert!(stream.owns_state_frame("graph:counts$stage2"));
+    assert!(!stream.owns_state_frame("graph:counts$stage"));
+    assert!(!stream.owns_state_frame("graph:other$stage1"));
+    assert!(!stream.owns_state_frame("graph:counts::view"));
+    assert!(!object("counts", CatalogObjectKind::Source).owns_state_frame("graph:counts"));
+}
+
+#[test]
+fn only_a_new_view_over_a_preserved_stream_or_view_seeds() {
+    let plan = |name: &str, kind, transition, dependencies: &[&str]| ClusterTopologyObjectPlan {
+        name: name.into(),
+        kind,
+        catalog_generation: 1,
+        transition,
+        initialization: TopologyInitialization::SeedFromUpstreamAtCut,
+        definition_sha256: String::new(),
+        compatibility_sha256: String::new(),
+        dependencies: dependencies.iter().map(|&name| name.into()).collect(),
+        schema_sha256: None,
+        managed_state_contract: Some("view_result_v1".into()),
+    };
+    let preserved = ClusterTopologyObjectTransition::Preserve;
+    let added = ClusterTopologyObjectTransition::AddFutureOnly;
+    let objects = [
+        plan("totals", CatalogObjectKind::Stream, preserved, &[]),
+        plan(
+            "counts",
+            CatalogObjectKind::MaterializedView,
+            preserved,
+            &[],
+        ),
+        plan("trades", CatalogObjectKind::Source, preserved, &[]),
+        plan("fresh", CatalogObjectKind::Stream, added, &[]),
+    ];
+    let view = |dependency: &str| {
+        plan(
+            "v",
+            CatalogObjectKind::MaterializedView,
+            added,
+            &[dependency],
+        )
+    };
+    assert!(view("totals").seeds_from_preserved_upstream(&objects));
+    assert!(view("counts").seeds_from_preserved_upstream(&objects));
+    assert!(!view("trades").seeds_from_preserved_upstream(&objects));
+    assert!(!view("fresh").seeds_from_preserved_upstream(&objects));
+    let stream = plan("s", CatalogObjectKind::Stream, added, &["totals"]);
+    assert!(!stream.seeds_from_preserved_upstream(&objects));
+    let mut stateless = view("totals");
+    stateless.managed_state_contract = None;
+    assert!(!stateless.seeds_from_preserved_upstream(&objects));
+}

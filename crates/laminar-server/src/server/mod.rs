@@ -203,17 +203,7 @@ pub async fn run_server(
     }
     info!("Pipeline started");
 
-    let pgwire_bind = config.server.pgwire_bind.clone();
-    let pgwire_users = config.server.pgwire_users.clone();
-    let pgwire_allow_remote = config.server.pgwire_allow_remote;
-    let pgwire_tls_cert = config.server.pgwire_tls_cert.clone();
-    let pgwire_tls_key = config.server.pgwire_tls_key.clone();
-    let pgwire_tls_client_ca = config.server.pgwire_tls_client_ca.clone();
-    let pgwire_tls_min_version =
-        crate::pgwire::TlsMinVersion::from_config_str(&config.server.pgwire_tls_min_version)
-            .expect("pgwire_tls_min_version validated at config load");
-    let pgwire_max_connections = config.server.pgwire_max_connections;
-    let pgwire_max_auth_failures = config.server.pgwire_max_auth_failures_per_min;
+    let pgwire = crate::pgwire::Listener::from_config(&config.server);
     let http_runtime = start_http_api(
         Arc::clone(&db),
         registry,
@@ -238,28 +228,9 @@ pub async fn run_server(
     };
     let mut watcher_handle = spawn_config_watcher(&app_state, config_path);
 
-    let pgwire_handle = if let Some(bind) = pgwire_bind {
-        let tls = match (&pgwire_tls_cert, &pgwire_tls_key) {
-            (Some(c), Some(k)) => Some(crate::pgwire::TlsPaths {
-                cert: c,
-                key: k,
-                min_version: pgwire_tls_min_version,
-                client_ca: pgwire_tls_client_ca.as_deref(),
-            }),
-            _ => None,
-        };
-        match crate::pgwire::serve(
-            Arc::clone(&db),
-            &bind,
-            pgwire_users,
-            pgwire_allow_remote,
-            tls,
-            pgwire_max_connections,
-            pgwire_max_auth_failures,
-        )
-        .await
-        {
-            Ok((_, h)) => Some(h),
+    let pgwire_handle = if let Some(listener) = pgwire {
+        match listener.serve(Arc::clone(&db)).await {
+            Ok(handle) => Some(handle),
             Err(e) => {
                 // Roll back: stop the HTTP server, the file watcher, and the
                 // pipeline before propagating the bind failure.

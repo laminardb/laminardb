@@ -87,6 +87,9 @@ async fn observe(
                     assert!(!identities.is_empty());
                     return identities;
                 }
+                ClusterReaderRead::Frame(
+                    ClusterReaderFrame::ViewRows { .. } | ClusterReaderFrame::ViewProgress { .. },
+                ) => panic!("a stream gateway delivered view frames"),
                 ClusterReaderRead::Terminal(error) => panic!("committed gateway failed: {error}"),
             }
         }

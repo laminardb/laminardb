@@ -3,6 +3,8 @@
 #![allow(clippy::disallowed_types)] // cold-path canonical checkpoint metadata
 
 mod participant_validation;
+mod view_frontiers;
+mod view_log_references;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,9 +18,17 @@ use super::{
 };
 use crate::state::{KeyGroupCount, LOCAL_NODE_ID};
 
+pub use view_frontiers::fold_view_frontiers;
+pub use view_log_references::{
+    adopted_view_logs, check_view_log_adoption, validate_cut_view_logs,
+    validate_departed_view_logs, AdoptedSegment, AdoptedViewLog,
+};
+
 /// Current committed-checkpoint index format.
-pub const COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 4;
+pub const COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 5;
 const LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 3;
+/// The format before committed view frontiers.
+pub(super) const SOURCE_WATERMARK_INDEX_VERSION: u32 = 4;
 
 /// Hard bound on one canonical committed-checkpoint index.
 pub const MAX_COMMITTED_CHECKPOINT_INDEX_BYTES: usize = 8 * 1024 * 1024;
@@ -257,6 +267,11 @@ pub struct CommittedCheckpointIndex {
     pub source_watermarks: BTreeMap<String, i64>,
     /// Safe event-time frontier at this cut.
     pub checkpoint_watermark: Option<i64>,
+    /// Committed event-time frontier of each append-only view in a cluster cut. Every
+    /// participant's retention follows it, so which participant holds a row never decides
+    /// whether a read keeps it. See [`fold_view_frontiers`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub view_frontiers: BTreeMap<String, i64>,
 }
 
 impl CommittedCheckpointIndex {
@@ -265,12 +280,11 @@ impl CommittedCheckpointIndex {
     /// # Errors
     /// Returns an error when the index is not a complete canonical checkpoint cut.
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(
-            self.version,
-            LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION | COMMITTED_CHECKPOINT_INDEX_VERSION
-        ) {
+        if !(LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION..=COMMITTED_CHECKPOINT_INDEX_VERSION)
+            .contains(&self.version)
+        {
             return Err(format!(
-                "unsupported committed checkpoint index version {}; expected {} or {COMMITTED_CHECKPOINT_INDEX_VERSION}",
+                "unsupported committed checkpoint index version {}; expected {}..={COMMITTED_CHECKPOINT_INDEX_VERSION}",
                 self.version, LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION
             ));
         }
@@ -356,31 +370,8 @@ impl CommittedCheckpointIndex {
             &self.channel_progress,
             self.checkpoint_watermark,
         )?;
-        if self.version == LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION {
-            if !self.source_watermarks.is_empty() {
-                return Err("legacy committed checkpoint cannot carry source watermarks".into());
-            }
-        } else {
-            validate_source_watermarks(
-                &self.source_names,
-                &self.channel_progress,
-                &self.source_watermarks,
-            )?;
-            if self.predecessor.is_none() {
-                let exact = channel_progress_frontiers_by_source(&self.channel_progress)?
-                    .into_iter()
-                    .filter_map(|(source, frontier)| {
-                        frontier.map(|frontier| (source.to_owned(), frontier))
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                if self.source_watermarks != exact {
-                    return Err(
-                        "initial committed source watermarks do not exactly match channel progress"
-                            .into(),
-                    );
-                }
-            }
-        }
+        self.validate_source_watermarks()?;
+        self.validate_view_frontiers()?;
         validate_channel_rosters(&self.source_offsets, &self.channel_progress)?;
         if self.channel_progress.iter().any(|channel| {
             self.participants
@@ -390,6 +381,35 @@ impl CommittedCheckpointIndex {
                 .is_err()
         }) {
             return Err("channel progress names a participant outside the committed cut".into());
+        }
+        Ok(())
+    }
+
+    fn validate_source_watermarks(&self) -> Result<(), String> {
+        if self.version == LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION {
+            if !self.source_watermarks.is_empty() {
+                return Err("legacy committed checkpoint cannot carry source watermarks".into());
+            }
+            return Ok(());
+        }
+        validate_source_watermarks(
+            &self.source_names,
+            &self.channel_progress,
+            &self.source_watermarks,
+        )?;
+        if self.predecessor.is_none() {
+            let exact = channel_progress_frontiers_by_source(&self.channel_progress)?
+                .into_iter()
+                .filter_map(|(source, frontier)| {
+                    frontier.map(|frontier| (source.to_owned(), frontier))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if self.source_watermarks != exact {
+                return Err(
+                    "initial committed source watermarks do not exactly match channel progress"
+                        .into(),
+                );
+            }
         }
         Ok(())
     }
@@ -430,7 +450,8 @@ impl CommittedCheckpointIndex {
         &self,
         predecessor: &CommittedCheckpointIndex,
     ) -> Result<(), String> {
-        self.validate_source_watermark_continuity(predecessor, &self.source_names)
+        self.validate_source_watermark_continuity(predecessor, &self.source_names)?;
+        self.validate_view_frontier_continuity(predecessor)
     }
 
     pub(crate) fn validate_source_watermark_continuity(
@@ -438,7 +459,7 @@ impl CommittedCheckpointIndex {
         predecessor: &CommittedCheckpointIndex,
         inherited_sources: &[String],
     ) -> Result<(), String> {
-        if self.version == COMMITTED_CHECKPOINT_INDEX_VERSION {
+        if self.version >= SOURCE_WATERMARK_INDEX_VERSION {
             let mut expected = predecessor
                 .effective_source_watermarks()?
                 .into_iter()

@@ -8,11 +8,14 @@ mod catalog_bootstrap;
 mod checkpoint_namespace;
 #[cfg(feature = "cluster")]
 mod cluster_subscription;
+pub(crate) mod committed_read;
 #[cfg(test)]
 mod datafusion_memory_tests;
 mod explain;
+pub(crate) mod read_level;
 mod session;
 mod source_watermarks;
+mod subscription_open;
 pub(crate) use source_watermarks::{RecoveredInputChannelProgress, SourceWatermarkState};
 #[cfg(feature = "cluster")]
 mod topology;
@@ -40,7 +43,6 @@ use std::time::{Duration, Instant};
 use arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
 use laminar_core::catalog::CatalogObjectKind;
-use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
 
@@ -3040,39 +3042,24 @@ impl LaminarDB {
                 } else {
                     None
                 };
-            let stopped_commit_owner_pin_is_active = if stopped_recovery_topology_common
-                && stopped_committed_owner_topology_shape
-            {
-                let expected = committed_handoff_checkpoint
-                    .as_ref()
-                    .expect("committed drain authority has a handoff checkpoint");
-                let authority = controller.checkpoint_authority().map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit checkpoint authority is unavailable: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                let pinned = tokio::time::timeout_at(
-                    deadline,
-                    authority.assignment_handoff_checkpoint(&target_fence),
-                )
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin audit timed out",
-                        snapshot.version
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin audit failed: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                pinned.as_ref() == Some(expected)
-            } else {
-                false
-            };
+            let stopped_commit_owner_pin_is_active =
+                if stopped_recovery_topology_common && stopped_committed_owner_topology_shape {
+                    assignment_authority::handoff_pin_is_active(
+                        &controller,
+                        &target_fence,
+                        committed_handoff_checkpoint
+                            .as_ref()
+                            .expect("committed drain authority has a handoff checkpoint"),
+                        &format!(
+                            "assignment {} stopped-Commit handoff-pin audit",
+                            snapshot.version
+                        ),
+                        deadline,
+                    )
+                    .await?
+                } else {
+                    false
+                };
             let stopped_recovery_topology = stopped_recovery_topology_common
                 && ((stopped_committed_topology_shape && prepared_recovery_fault_is_active)
                     || (stopped_aborted_topology_shape && stopped_abort_round.is_some())
@@ -3274,6 +3261,30 @@ impl LaminarDB {
             } else {
                 Vec::new()
             };
+            // A survivor adopts the append-view logs of participants that left, whether or not
+            // it acquires a vnode. Without a handoff cut there is nothing to adopt from, and the
+            // leader refuses a cut that loses a departed participant's segments.
+            let adopted_view_logs = match (
+                committed_handoff_checkpoint.as_ref(),
+                predecessor_fence.as_ref(),
+                guard.as_ref(),
+            ) {
+                (Some(handoff), Some(predecessor), Some(coordinator))
+                    if mode == AssignmentAdoptionMode::LiveTransition
+                        && !startup_restore_deferred
+                        && self.mv_store.read().has_append_views() =>
+                {
+                    coordinator
+                        .load_handoff_view_log_adoptions(
+                            handoff,
+                            predecessor,
+                            &target_fence,
+                            deadline,
+                        )
+                        .await?
+                }
+                _ => Vec::new(),
+            };
 
             drop(guard);
 
@@ -3376,33 +3387,19 @@ impl LaminarDB {
                 == AssignmentAdoptionMode::StoppedRecoveryTopology
                 && stopped_committed_owner_topology_shape
             {
-                let expected = committed_handoff_checkpoint
-                    .as_ref()
-                    .expect("committed drain authority has a handoff checkpoint");
-                let authority = controller.checkpoint_authority().map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit checkpoint authority changed: {error}",
+                assignment_authority::handoff_pin_is_active(
+                    &controller,
+                    &target_fence,
+                    committed_handoff_checkpoint
+                        .as_ref()
+                        .expect("committed drain authority has a handoff checkpoint"),
+                    &format!(
+                        "assignment {} stopped-Commit handoff-pin recheck",
                         snapshot.version
-                    ))
-                })?;
-                let pinned = tokio::time::timeout_at(
+                    ),
                     deadline,
-                    authority.assignment_handoff_checkpoint(&target_fence),
                 )
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin recheck timed out",
-                        snapshot.version
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-Commit handoff-pin recheck failed: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                pinned.as_ref() == Some(expected)
+                .await?
             } else {
                 true
             };
@@ -3410,33 +3407,19 @@ impl LaminarDB {
                 == AssignmentAdoptionMode::StoppedRecoveryTopology
                 && stopped_recovery_successor_topology_shape
             {
-                let expected = committed_handoff_checkpoint
-                    .as_ref()
-                    .expect("recovery successor authority has a handoff checkpoint");
-                let authority = controller.checkpoint_authority().map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-recovery checkpoint authority changed: {error}",
+                assignment_authority::handoff_pin_is_active(
+                    &controller,
+                    &target_fence,
+                    committed_handoff_checkpoint
+                        .as_ref()
+                        .expect("recovery successor authority has a handoff checkpoint"),
+                    &format!(
+                        "assignment {} stopped-recovery handoff-pin recheck",
                         snapshot.version
-                    ))
-                })?;
-                let pinned = tokio::time::timeout_at(
+                    ),
                     deadline,
-                    authority.assignment_handoff_checkpoint(&target_fence),
                 )
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-recovery handoff-pin recheck timed out",
-                        snapshot.version
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] assignment {} stopped-recovery handoff-pin recheck failed: {error}",
-                        snapshot.version
-                    ))
-                })?;
-                pinned.as_ref() == Some(expected)
+                .await?
             } else {
                 true
             };
@@ -3518,6 +3501,7 @@ impl LaminarDB {
                         local_participant,
                         pipeline_identity,
                         state_frames,
+                        adopted_view_logs,
                         final_owner_exit,
                     )?;
                 if transition.acquired_vnodes() != vnodes_requiring_restore {
@@ -4502,25 +4486,9 @@ impl LaminarDB {
                     self.handle_explain(statement).await
                 }
             }
-            StreamingStatement::CreateMaterializedView {
-                name,
-                query,
-                emit_clause,
-                or_replace,
-                if_not_exists,
-                query_sql,
-                ..
-            } => {
+            StreamingStatement::CreateMaterializedView { .. } => {
                 let result = self
-                    .handle_create_materialized_view(
-                        sql,
-                        name,
-                        query,
-                        emit_clause.clone(),
-                        *or_replace,
-                        *if_not_exists,
-                        query_sql,
-                    )
+                    .handle_create_materialized_view(sql, statement)
                     .await?;
                 if let ExecuteResult::Ddl(ref info) = result {
                     if info.applied {
@@ -4653,6 +4621,10 @@ impl LaminarDB {
 
     /// Subscribe to a named stream or materialized view.
     ///
+    /// Rows are matched to `T` by column name. A changelog view's frames carry `__weight`
+    /// (see [`Self::open_subscription`]); a `T` without that field receives retracted rows as
+    /// if they were inserted.
+    ///
     /// # Errors
     ///
     /// Returns `DbError::StreamNotFound` if the object or its output schema is unresolved.
@@ -4674,8 +4646,8 @@ impl LaminarDB {
         if crate::sql_analysis::stage_owner(name).is_some() {
             return None;
         }
-        if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
-            return Some(mv.schema);
+        if let Some(schema) = self.mv_store.read().subscription_schema(name) {
+            return Some(schema);
         }
         if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
             return Some(schema);
@@ -4685,6 +4657,16 @@ impl LaminarDB {
 
     /// Open a SUBSCRIBE portal against a named MV or resolved stream. A bare
     /// SOURCE is not subscribable (surfaced as `StreamNotFound`).
+    ///
+    /// A materialized view's portal first delivers the view's rows, then each change to them.
+    /// A changelog view's rows carry an Int64 `__weight` column: `+1` in the snapshot, and in
+    /// a change the amount by which the change altered the row's count (a replaced row is
+    /// retracted with `-1`). An append view delivers plain rows; rows leaving its retention are
+    /// not changes. Outside a cluster a view subscription starts at the latest cycle and admits
+    /// only [`SubscribeStart::Tail`](crate::subscription::SubscribeStart::Tail). In a cluster it
+    /// reads committed checkpoints: the view at the newest one or at
+    /// [`SubscribeStart::AsOfEpoch`](crate::subscription::SubscribeStart::AsOfEpoch), then each
+    /// later checkpoint's change, each followed by a progress frame.
     ///
     /// # Errors
     /// `StreamNotFound` for unknown `name`; `Subscription` for unsupported cluster plans or
@@ -4703,9 +4685,6 @@ impl LaminarDB {
         // to an orphaned log with the previous object's schema.
         let _topology = self.topology_ddl_lock.read().await;
 
-        // SUBSCRIBE to an incremental MV delivers consolidated snapshots (plain rows), not the
-        // raw `__weight` changelog.
-
         let schema = self
             .lookup_subscription_schema(name)
             .ok_or_else(|| DbError::StreamNotFound(name.to_string()))?;
@@ -4722,61 +4701,12 @@ impl LaminarDB {
                 .await;
         }
 
-        let reader =
-            self.subscription_registry
-                .subscribe(name, start)
-                .map_err(|error| match error {
-                    crate::subscription::SubscriptionOpenError::ReplayPruned {
-                        earliest_retained,
-                    } => {
-                        let requested = match start {
-                            crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
-                            crate::subscription::SubscribeStart::AfterSequence(_)
-                            | crate::subscription::SubscribeStart::Tail => 0,
-                        };
-                        DbError::SubscriptionReplayPruned {
-                            name: name.to_string(),
-                            requested,
-                            earliest_retained,
-                        }
-                    }
-                    crate::subscription::SubscriptionOpenError::SequencePruned {
-                        requested,
-                        earliest_retained,
-                    } => DbError::SubscriptionSequencePruned {
-                        name: name.to_string(),
-                        requested_sequence: requested,
-                        earliest_retained_sequence: earliest_retained,
-                    },
-                    crate::subscription::SubscriptionOpenError::SequenceNotPublished {
-                        requested,
-                        next_sequence,
-                    } => DbError::SubscriptionSequenceNotPublished {
-                        name: name.to_string(),
-                        requested_sequence: requested,
-                        next_sequence,
-                    },
-                    crate::subscription::SubscriptionOpenError::EpochNotCommitted {
-                        requested,
-                        latest_committed,
-                    } => DbError::SubscriptionEpochNotCommitted {
-                        name: name.to_string(),
-                        requested,
-                        latest_committed,
-                    },
-                    crate::subscription::SubscriptionOpenError::Capacity { attached, limit } => {
-                        DbError::Pipeline(format!(
-                            "subscriber cap reached for '{name}' ({attached}/{limit})"
-                        ))
-                    }
-                })?;
-
-        Ok(match filter {
-            Some(phys) => crate::subscription::SubscriptionPortal::open_with_filter(
-                name, schema, reader, phys,
-            ),
-            None => crate::subscription::SubscriptionPortal::open(name, schema, reader),
-        })
+        if self.mv_store.read().has_mv(name) {
+            return self
+                .open_local_view_subscription(name, schema, filter, start)
+                .await;
+        }
+        self.open_local_stream_subscription(name, schema, filter, start)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4806,6 +4736,16 @@ impl LaminarDB {
                 }
                 StreamingStatement::DropLookupTable { name, if_exists } => {
                     return self.handle_drop_lookup_table(name, *if_exists);
+                }
+                // An ad-hoc query reads every table as a snapshot, so the streaming planner's
+                // join and window rules, which govern named streaming queries, do not apply.
+                StreamingStatement::Standard(statement)
+                    if matches!(**statement, sqlparser::ast::Statement::Query(_)) =>
+                {
+                    let sql_str = statement.to_string();
+                    let df = crate::mv_store::plan_statement(&self.ctx, &self.mv_store, &sql_str);
+                    let stream = df.await?.execute_stream().await?;
+                    return Ok(self.bridge_query_stream(sql, stream));
                 }
                 _ => {}
             }
@@ -4856,17 +4796,14 @@ impl LaminarDB {
                     ));
                 }
                 let plan_sql = query_plan.statement.to_string();
-                let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
-                let df = self.ctx.execute_logical_plan(logical_plan).await?;
-                let stream = df.execute_stream().await?;
-
+                let df = crate::mv_store::plan_statement(&self.ctx, &self.mv_store, &plan_sql);
+                let stream = df.await?.execute_stream().await?;
                 Ok(self.bridge_query_stream(sql, stream))
             }
             laminar_sql::planner::StreamingPlan::Standard(stmt) => {
                 let sql_str = stmt.to_string();
-                let df = self.ctx.sql(&sql_str).await?;
-                let stream = df.execute_stream().await?;
-
+                let df = crate::mv_store::plan_statement(&self.ctx, &self.mv_store, &sql_str);
+                let stream = df.await?.execute_stream().await?;
                 Ok(self.bridge_query_stream(sql, stream))
             }
             laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
@@ -4885,49 +4822,16 @@ impl LaminarDB {
     ) -> ExecuteResult {
         let query_id = self.catalog.register_query(sql);
         let schema = stream.schema();
-
-        let source_cfg = streaming::SourceConfig::with_buffer_size(self.config.default_buffer_size);
-        let (source, sink) =
-            streaming::create_with_config::<crate::catalog::ArrowRecord>(source_cfg);
-
-        let subscription = sink.subscribe();
-
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        let cancel_token_clone = cancel_token.clone();
-
-        let source_clone = source.clone();
         let catalog = Arc::clone(&self.catalog);
-        let query_id_clone = query_id;
-        tokio::spawn(async move {
-            use tokio_stream::StreamExt;
-            let mut stream = stream;
-            loop {
-                tokio::select! {
-                    () = cancel_token_clone.cancelled() => {
-                        break;
-                    }
-                    result = stream.next() => {
-                        match result {
-                            Some(Ok(batch)) => {
-                                // Query output retains its own count-bound ownership, outside input push budgets.
-                                if source_clone.push(crate::catalog::ArrowRecord { batch }).is_err() {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-            drop(source_clone);
-            catalog.deactivate_query(query_id_clone);
+        let rows = crate::query_rows::QueryRows::spawn(stream, cancel_token.clone(), move || {
+            catalog.deactivate_query(query_id);
         });
-
         ExecuteResult::Query(QueryHandle {
             id: query_id,
             schema,
             sql: sql.to_string(),
-            subscription: Some(subscription),
+            rows: Some(rows),
             active: true,
             cancel_token,
         })

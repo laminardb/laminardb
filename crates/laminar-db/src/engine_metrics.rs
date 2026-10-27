@@ -172,6 +172,107 @@ impl ClusterSubscriptionMetrics {
     }
 }
 
+/// Materialized view results and the freshness of committed view reads.
+pub struct ViewMetrics {
+    /// Materialized view updates.
+    pub updates: IntCounter,
+    /// Approximate MV bytes stored.
+    pub bytes_stored: IntGauge,
+    /// Age of the newest committed checkpoint, which committed view reads observe.
+    pub committed_staleness_ms: IntGauge,
+    /// Times a view's committed reads became staler than its declared freshness. Label: `view`.
+    pub freshness_breaches_total: IntCounterVec,
+    /// Rows append-only views dropped at ingest because they arrived behind the event-time
+    /// retention horizon. A row-cap retention has no horizon and never drops here.
+    pub rows_below_horizon_total: IntCounter,
+    /// Ad-hoc reads of views. Label: `level` (`latest` or `committed`).
+    pub reads_total: IntCounterVec,
+    /// Age of the committed checkpoint each committed read observed, in seconds.
+    pub committed_read_age_seconds: Histogram,
+}
+
+impl ViewMetrics {
+    fn new(registry: &Registry) -> Self {
+        let metrics = Self {
+            updates: IntCounter::new("mv_updates_total", "Materialized view updates").unwrap(),
+            bytes_stored: IntGauge::new("mv_bytes_stored", "Approximate MV bytes stored").unwrap(),
+            committed_staleness_ms: IntGauge::new(
+                "mv_committed_staleness_ms",
+                "Age of the newest committed checkpoint that committed view reads observe",
+            )
+            .unwrap(),
+            freshness_breaches_total: IntCounterVec::new(
+                Opts::new(
+                    "mv_freshness_breaches_total",
+                    "Times committed view reads became staler than the view's declared freshness",
+                ),
+                &["view"],
+            )
+            .unwrap(),
+            rows_below_horizon_total: IntCounter::new(
+                "mv_rows_below_horizon_total",
+                "Rows append-only views dropped because they arrived behind the retention horizon",
+            )
+            .unwrap(),
+            reads_total: IntCounterVec::new(
+                Opts::new(
+                    "mv_reads_total",
+                    "Ad-hoc reads of materialized views by read level",
+                ),
+                &["level"],
+            )
+            .unwrap(),
+            committed_read_age_seconds: Histogram::with_opts(
+                HistogramOpts::new(
+                    "mv_committed_read_age_seconds",
+                    "Age of the committed checkpoint each committed view read observed",
+                )
+                .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
+            )
+            .unwrap(),
+        };
+        registry
+            .register(Box::new(metrics.updates.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.bytes_stored.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.committed_staleness_ms.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.freshness_breaches_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.rows_below_horizon_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.reads_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.committed_read_age_seconds.clone()))
+            .unwrap();
+        metrics
+    }
+
+    /// Count one read, at a committed cut taken at `taken_at_ms` or at the latest cycle.
+    pub(crate) fn observe_read(&self, taken_at_ms: Option<u64>) {
+        let Some(taken_at_ms) = taken_at_ms else {
+            self.reads_total.with_label_values(&["latest"]).inc();
+            return;
+        };
+        self.reads_total.with_label_values(&["committed"]).inc();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        #[allow(clippy::cast_precision_loss)] // ages are far below 2^52 ms
+        self.committed_read_age_seconds
+            .observe(now_ms.saturating_sub(taken_at_ms) as f64 / 1_000.0);
+    }
+}
+
 /// Vnode placement as this process last adopted it.
 #[cfg(feature = "cluster")]
 pub struct PlacementMetrics {
@@ -296,10 +397,8 @@ pub struct EngineMetrics {
     pub queries_cached_plan: IntCounter,
     /// Cycles skipped by backpressure.
     pub cycles_backpressured: IntCounter,
-    /// Materialized view updates.
-    pub mv_updates: IntCounter,
-    /// Approximate MV bytes stored.
-    pub mv_bytes_stored: IntGauge,
+    /// Materialized view results and committed reads.
+    pub views: ViewMetrics,
     /// Global pipeline watermark.
     pub pipeline_watermark: IntGauge,
     /// Per-source watermark (epoch-ms). Label: `source`.
@@ -455,12 +554,7 @@ impl EngineMetrics {
                 "Cycles skipped by backpressure"
             )
             .unwrap()),
-            mv_updates: reg!(
-                IntCounter::new("mv_updates_total", "Materialized view updates").unwrap()
-            ),
-            mv_bytes_stored: reg!(
-                IntGauge::new("mv_bytes_stored", "Approximate MV bytes stored").unwrap()
-            ),
+            views: ViewMetrics::new(registry),
             pipeline_watermark: reg!(IntGauge::new(
                 "pipeline_watermark",
                 "Global pipeline watermark"

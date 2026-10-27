@@ -436,6 +436,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
             .collect(),
         source_watermarks: BTreeMap::from([("events".into(), 10)]),
         checkpoint_watermark: Some(10),
+        view_frontiers: Default::default(),
     };
     let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
     authority

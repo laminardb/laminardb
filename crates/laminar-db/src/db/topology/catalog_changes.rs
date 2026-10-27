@@ -10,6 +10,30 @@ use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
 use super::{DbError, DbState, LaminarDB};
 
 pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError> {
+    let statement = parse_single(sql)?;
+    let allowed = match &statement {
+        StreamingStatement::CreateSource(_)
+        | StreamingStatement::CreateSink(_)
+        | StreamingStatement::CreateStream { .. } => true,
+        StreamingStatement::CreateMaterializedView { or_replace, .. } => !or_replace,
+        StreamingStatement::DropSource { cascade, .. }
+        | StreamingStatement::DropStream { cascade, .. }
+        | StreamingStatement::DropMaterializedView { cascade, .. }
+        | StreamingStatement::DropSink { cascade, .. } => !cascade,
+        _ => false,
+    };
+    if !allowed {
+        return Err(TopologyError::Unsupported(
+            "topology validation supports CREATE, CREATE OR REPLACE and DROP SOURCE/STREAM/SINK, \
+             CREATE and DROP MATERIALIZED VIEW, without CASCADE"
+                .into(),
+        )
+        .into());
+    }
+    Ok(statement)
+}
+
+fn parse_single(sql: &str) -> Result<StreamingStatement, DbError> {
     let mut parsed = parse_streaming_sql(sql)?;
     if parsed.len() != 1 {
         return Err(TopologyError::Invalid(
@@ -17,25 +41,9 @@ pub(super) fn parse_one_change(sql: &str) -> Result<StreamingStatement, DbError>
         )
         .into());
     }
-    let statement = parsed
+    parsed
         .pop()
-        .ok_or_else(|| TopologyError::Invalid("empty validation entry".into()))?;
-    let allowed = match &statement {
-        StreamingStatement::CreateSource(_)
-        | StreamingStatement::CreateSink(_)
-        | StreamingStatement::CreateStream { .. } => true,
-        StreamingStatement::DropSource { cascade, .. }
-        | StreamingStatement::DropStream { cascade, .. }
-        | StreamingStatement::DropSink { cascade, .. } => !cascade,
-        _ => false,
-    };
-    if !allowed {
-        return Err(TopologyError::Unsupported(
-            "topology validation supports CREATE, CREATE OR REPLACE and DROP SOURCE/STREAM/SINK without CASCADE".into(),
-        )
-        .into());
-    }
-    Ok(statement)
+        .ok_or_else(|| TopologyError::Invalid("empty validation entry".into()).into())
 }
 
 pub(super) fn statement_identity(
@@ -53,6 +61,11 @@ pub(super) fn statement_identity(
         StreamingStatement::DropSink { name, .. } => {
             Some((name, CatalogObjectKind::Sink, "DROP SINK"))
         }
+        StreamingStatement::DropMaterializedView { name, .. } => Some((
+            name,
+            CatalogObjectKind::MaterializedView,
+            "DROP MATERIALIZED VIEW",
+        )),
         _ => None,
     };
     if let Some((name, kind, operation)) = drop {
@@ -116,6 +129,7 @@ pub(super) async fn apply_catalog_changes(
             statement,
             StreamingStatement::DropSource { .. }
                 | StreamingStatement::DropStream { .. }
+                | StreamingStatement::DropMaterializedView { .. }
                 | StreamingStatement::DropSink { .. }
         ) {
             if !changed.insert(name.clone()) {
@@ -185,6 +199,15 @@ pub(super) async fn apply_catalog_changes(
                 return Err(TopologyError::Unsupported(
                     "recreation must retain the catalog kind".into(),
                 )
+                .into());
+            }
+            // A cut keys a view's committed frontier and log by name, so a view recreated in the
+            // same migration would continue the dropped view's.
+            if dropped.contains(&name) && kind == CatalogObjectKind::MaterializedView {
+                return Err(TopologyError::Unsupported(format!(
+                    "materialized view '{name}' cannot be dropped and recreated in one migration; \
+                     drop it in one migration and create it in a later one"
+                ))
                 .into());
             }
             new_objects += 1;
@@ -322,7 +345,10 @@ impl LaminarDB {
         if superseded.iter().any(|entry| {
             !matches!(
                 entry.kind,
-                CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink
+                CatalogObjectKind::Source
+                    | CatalogObjectKind::Stream
+                    | CatalogObjectKind::MaterializedView
+                    | CatalogObjectKind::Sink
             ) || if manifest
                 .entries
                 .iter()
@@ -354,14 +380,20 @@ impl LaminarDB {
         {
             return Err(TopologyError::Fenced.into());
         }
-        // The manifest is in dependency order; retire dependents before their inputs.
+        // The manifest is in dependency order; retire dependents before their inputs. An owner's
+        // stages replay from its DDL, so they leave with it.
         for entry in superseded.into_iter().rev() {
             self.require_catalog_kind(&entry.canonical_name, entry.kind, false)?;
-            self.rollback_catalog_create(
-                &entry.canonical_name,
-                entry.kind,
-                "committed topology replacement or retirement",
-            )?;
+            let stages = self.stream_stage_targets(&entry.canonical_name);
+            let retired = std::iter::once((entry.canonical_name, entry.kind))
+                .chain(stages.into_iter().map(|stage| (stage.name, stage.kind)));
+            for (name, kind) in retired {
+                self.rollback_catalog_create(
+                    &name,
+                    kind,
+                    "committed topology replacement or retirement",
+                )?;
+            }
         }
         Ok(())
     }

@@ -92,6 +92,7 @@ impl TopologyMigrationRoot {
             .collect::<Vec<_>>();
         target
             .validate_source_watermark_continuity(parent, &inherited_sources)
+            .and_then(|()| target.validate_view_frontier_continuity(parent))
             .map_err(TopologyError::Invalid)
     }
 }

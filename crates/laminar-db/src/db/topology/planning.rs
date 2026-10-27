@@ -420,12 +420,20 @@ pub(super) fn describe_catalog(
             })
             .transpose()?;
         let operator = graph.operators.get(name);
+        // Append views keep their rows in a log, not in a result node.
+        let view_result = (entry.kind == CatalogObjectKind::MaterializedView)
+            .then(|| laminar_core::mv::view_result_operator(name))
+            .filter(|operator| graph.operators.contains_key(operator));
         let operators: Vec<_> = std::iter::once(name)
+            .chain(view_result.as_ref())
             .chain(&stages)
             .map(|operator| (operator, graph.operators.get(operator)))
             .collect();
         if let Some((missing, _)) = operators.iter().find(|(_, operator)| operator.is_none()) {
-            if entry.kind == CatalogObjectKind::Stream {
+            if matches!(
+                entry.kind,
+                CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+            ) {
                 return Err(TopologyError::Invalid(format!(
                     "stream '{missing}' is absent from the physical candidate graph"
                 ))
@@ -436,12 +444,18 @@ pub(super) fn describe_catalog(
             .iter()
             .find_map(|(_, operator)| operator.and_then(|capability| capability.managed_state))
             .map(state_contract_name);
+        let seeded = if preserved {
+            Vec::new()
+        } else {
+            seeded_upstreams(name, entry.kind, &dependencies, &objects, graph)?
+        };
         if !preserved {
             for (operator_name, operator) in &operators {
                 validate_future_state_inputs(
                     operator_name,
                     *operator,
                     &dependencies,
+                    &seeded,
                     &objects,
                     graph,
                 )?;
@@ -474,6 +488,8 @@ pub(super) fn describe_catalog(
                     TopologyInitialization::PreserveExactCut
                 } else if entry.kind == CatalogObjectKind::Source {
                     TopologyInitialization::ResolveSourcePositionsOnce
+                } else if state_contract.is_some() && !seeded.is_empty() {
+                    TopologyInitialization::SeedFromUpstreamAtCut
                 } else if state_contract.is_some() {
                     TopologyInitialization::EmptyManagedStateAtCut
                 } else {
@@ -503,7 +519,7 @@ fn catalog_dependencies(
             .ok_or_else(|| TopologyError::Invalid(format!("sink '{name}' has no registration")))?
             .input
             .clone()],
-        CatalogObjectKind::Stream => {
+        CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView => {
             // A split stream's inputs are those of its stages.
             let mut references = std::collections::BTreeSet::new();
             let mut pending = vec![name.clone()];
@@ -655,10 +671,60 @@ fn classify_object_transitions(
     Ok(retired)
 }
 
+/// The changelogs a new view reads that the migration preserves. The view takes their rows at
+/// the cut before any later change, so it can apply their retractions. Each must keep those
+/// rows: as a changelog aggregate, or as a view's result.
+fn seeded_upstreams<'a>(
+    view: &str,
+    kind: CatalogObjectKind,
+    dependencies: &'a [String],
+    objects: &BTreeMap<String, ClusterTopologyObjectPlan>,
+    graph: &PlannedTopologyGraph,
+) -> Result<Vec<&'a str>, DbError> {
+    if kind != CatalogObjectKind::MaterializedView {
+        return Ok(Vec::new());
+    }
+    let mut seeded = Vec::new();
+    for dependency in dependencies {
+        let Some(object) = objects.get(dependency).filter(|object| {
+            object.transition == ClusterTopologyObjectTransition::Preserve
+                && matches!(
+                    object.kind,
+                    CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                )
+        }) else {
+            continue;
+        };
+        if !graph.schemas.get(dependency).is_some_and(|schema| {
+            schema
+                .field_with_name(laminar_core::changelog::WEIGHT_COLUMN)
+                .is_ok()
+        }) {
+            continue;
+        }
+        let keeps_rows = graph.operators.get(dependency).is_some_and(|operator| {
+            operator.managed_state == Some(ManagedStateContract::SqlAggregateV1)
+        }) || (object.kind == CatalogObjectKind::MaterializedView
+            && graph
+                .operators
+                .contains_key(&laminar_core::mv::view_result_operator(dependency)));
+        if !keeps_rows {
+            return Err(TopologyError::Unsupported(format!(
+                "new view '{view}' reads changelog '{dependency}', which keeps no rows to seed it \
+                 from; read the aggregate or view that produces them"
+            ))
+            .into());
+        }
+        seeded.push(dependency.as_str());
+    }
+    Ok(seeded)
+}
+
 fn validate_future_state_inputs(
     name: &str,
     operator: Option<&crate::operator::capability::OperatorCapability>,
     dependencies: &[String],
+    seeded: &[&str],
     objects: &BTreeMap<String, ClusterTopologyObjectPlan>,
     graph: &PlannedTopologyGraph,
 ) -> Result<(), DbError> {
@@ -677,7 +743,11 @@ fn validate_future_state_inputs(
     if operator.is_none_or(|capability| capability.managed_state.is_none()) {
         return Ok(());
     }
-    let mut pending: Vec<_> = dependencies.iter().map(String::as_str).collect();
+    let mut pending: Vec<_> = dependencies
+        .iter()
+        .map(String::as_str)
+        .filter(|dependency| !seeded.contains(dependency))
+        .collect();
     let mut visited = std::collections::BTreeSet::new();
     while let Some(dependency) = pending.pop() {
         if !visited.insert(dependency) {
@@ -711,6 +781,7 @@ const fn state_contract_name(contract: ManagedStateContract) -> &'static str {
         ManagedStateContract::BoundedIntervalJoinV3 => "bounded_interval_join_v3",
         ManagedStateContract::TemporalJoinV1 => "temporal_join_v1",
         ManagedStateContract::ProcessFunctionV1 => "process_function_v1",
+        ManagedStateContract::ViewResultV1 => "view_result_v1",
         #[cfg(test)]
         ManagedStateContract::TestVnodeStateV1 => "test_vnode_state_v1",
     }

@@ -7,11 +7,11 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::catalog::SourceEntry;
-use crate::mv_store::MvStore;
+use crate::mv_store::{CommittedStatement, MvStore, StatementViewSnapshot};
 use crate::table_store::TableStore;
 
 /// Live `DataFusion` table provider over `TableStore`; each `scan()` sees the current snapshot.
@@ -167,6 +167,10 @@ impl MvTableProvider {
             mv_store,
         }
     }
+
+    pub fn name(&self) -> &str {
+        &self.mv_name
+    }
 }
 
 #[async_trait]
@@ -183,6 +187,14 @@ impl TableProvider for MvTableProvider {
         TableType::View
     }
 
+    /// Filters prune what a committed read loads; every filter still runs over the rows read.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -190,13 +202,29 @@ impl TableProvider for MvTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        // Propagate a materialization error; an empty batch would look like a legitimately empty MV.
-        let batch = self
-            .mv_store
-            .read()
-            .to_record_batch(&self.mv_name)
-            .map_err(|e| DataFusionError::Execution(format!("MV scan '{}': {e}", self.mv_name)))?
-            .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
+        if let Some(statement) = state.config().get_extension::<CommittedStatement>() {
+            let batches = statement
+                .read(&self.mv_name, filters)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let mem_table =
+                datafusion::datasource::MemTable::try_new(self.schema.clone(), vec![batches])?;
+            return mem_table.scan(state, projection, filters, limit).await;
+        }
+        let snapshot = state.config().get_extension::<StatementViewSnapshot>();
+        let batch = match snapshot.as_ref().and_then(|views| views.get(&self.mv_name)) {
+            Some(batch) => batch.clone(),
+            // Propagate a materialization error; an empty batch would look like a legitimately empty MV.
+            None => {
+                crate::mv_store::read_views(&self.mv_store, std::slice::from_ref(&self.mv_name))
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("MV scan '{}': {e}", self.mv_name))
+                    })?
+                    .remove(&self.mv_name)
+                    .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()))
+            }
+        };
 
         let schema = batch.schema();
         let data = if batch.num_rows() > 0 {

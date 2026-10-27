@@ -261,7 +261,7 @@ async fn checkpointed_with_additions(
             CheckpointScope::Cluster,
             Some(input.assignment().clone()),
             predecessor,
-            &BTreeMap::new(),
+            &crate::checkpoint_coordinator::CommittedFrontiers::default(),
             &manifests,
             None,
             tokio::time::Instant::now() + Duration::from_secs(15),

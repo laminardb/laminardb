@@ -7,7 +7,15 @@ mod artifacts;
 mod attempt;
 mod attempt_failure;
 mod capture;
+#[cfg(feature = "cluster")]
+mod cluster_read_pin;
 mod commit_index;
+#[cfg(feature = "cluster")]
+mod committed_head;
+pub(crate) mod committed_reads;
+#[cfg(feature = "cluster")]
+pub(crate) use cluster_read_pin::start_cluster_read_pin;
+pub(crate) use commit_index::CommittedFrontiers;
 mod coordinator;
 #[cfg(feature = "cluster")]
 mod follower_completion;
@@ -28,6 +36,7 @@ pub(crate) mod sink_epoch_admission;
 mod sink_protocol;
 #[cfg(feature = "cluster")]
 pub(crate) mod subscription_output;
+mod view_log;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -61,7 +70,10 @@ pub use protocol::{CheckpointFailureDisposition, CheckpointPhase, CheckpointResu
 pub(crate) use protocol::{FollowerPrepareOutcome, PrepareQuorum, QuorumPeer};
 pub(crate) use protocol::{QuorumStage, SinkEpochPublication};
 pub use request::{CapturedStateFrame, CheckpointConfig, CheckpointRequest};
-pub(crate) use request::{ManagedVnodeOperator, ManagedVnodePlacement};
+pub(crate) use request::{
+    CapturedViewLog, CapturedViewLogSegment, ManagedVnodeOperator, ManagedVnodePlacement,
+};
+pub(crate) use retention::load_index_manifests;
 use retention::GcRequest;
 use sha2::{Digest, Sha256};
 
@@ -78,6 +90,7 @@ pub(crate) struct RegisteredSink {
 struct PackedCheckpoint {
     manifest: CheckpointManifest,
     node_data: Vec<Bytes>,
+    view_log: Vec<Bytes>,
 }
 
 #[cfg(test)]
@@ -170,6 +183,16 @@ mod subscription_output_tests;
 #[cfg(all(test, feature = "cluster"))]
 mod handoff_tests;
 
+/// Bytes of the data objects a participant writes for one checkpoint: node data and view log.
+fn data_object_bytes(manifest: &CheckpointManifest) -> u64 {
+    manifest.node_data.object_length.saturating_add(
+        manifest
+            .view_log
+            .as_ref()
+            .map_or(0, |object| object.object_length),
+    )
+}
+
 struct ActiveSinkArtifactIntents {
     attempt: CheckpointAttempt,
     by_sink: BTreeMap<String, Option<Vec<u8>>>,
@@ -191,8 +214,12 @@ pub struct CheckpointCoordinator {
     active_sink_artifact_intents: Option<ActiveSinkArtifactIntents>,
     prepared: HashMap<CheckpointAttempt, (Arc<CheckpointManifest>, Bytes)>,
     last_committed_manifest: Option<Arc<CheckpointManifest>>,
+    /// This participant's manifest in the last committed or recovered cut, whose view-log
+    /// segments the next capture retains by position. Unlike `last_committed_manifest` it
+    /// survives a reassigned recovery, which restores this participant's view logs too.
+    view_log_predecessor: Option<Arc<CheckpointManifest>>,
     last_committed_ref: Option<CommittedCheckpointRef>,
-    last_committed_source_watermarks: Option<(CommittedCheckpointRef, BTreeMap<String, i64>)>,
+    last_committed_frontiers: Option<(CommittedCheckpointRef, commit_index::CommittedFrontiers)>,
     failure_requires_recovery: bool,
     local_watermark: laminar_core::checkpoint::CheckpointWatermark,
     #[cfg(feature = "cluster")]
@@ -207,4 +234,8 @@ pub struct CheckpointCoordinator {
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     gc_requests: tokio::sync::watch::Sender<Option<GcRequest>>,
     gc_task: tokio::task::JoinHandle<()>,
+    committed_cut: committed_reads::CommittedCutSender,
+    read_pins: Arc<committed_reads::ReadPins>,
+    #[cfg(feature = "cluster")]
+    head_follower: Option<tokio::task::JoinHandle<()>>,
 }

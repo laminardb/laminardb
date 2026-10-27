@@ -343,8 +343,9 @@ the ordinary row stream.
 
 ### Nested aggregates and aggregates over a join
 
-A statement that no single operator can run is split into internal stages named
-`<stream>$stage<n>`, each admitted by the rules for its own shape in every mode:
+A `CREATE STREAM` or `CREATE MATERIALIZED VIEW` that no single operator can run is split into
+internal stages named `<name>$stage<n>`, each admitted by the rules for its own shape in every
+mode:
 
 ```sql
 -- A join stage, then a keyed aggregate over it.
@@ -362,6 +363,12 @@ SELECT trade_count, COUNT(*) AS accounts
 FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
 GROUP BY trade_count
 EMIT CHANGES;
+
+-- The same split under a view, which keeps only the outer aggregate's rows.
+CREATE MATERIALIZED VIEW trade_count_histogram AS
+SELECT trade_count, COUNT(*) AS accounts
+FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
+GROUP BY trade_count;
 ```
 
 - An aggregate over one two-way join reads a join stage that projects each input column the
@@ -371,9 +378,9 @@ EMIT CHANGES;
   An aggregating subquery emits changes, so the outer aggregate supports `COUNT`, `SUM` and `AVG`
   but not `MIN` or `MAX`. In cluster mode a windowed subquery is rejected, because cluster windows
   emit only closed windows.
-- Stages belong to their stream. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
-  `DROP STREAM` removes its stages, and no other statement may read, drop or create a
-  `$stage` name. A failed `CREATE` removes the stages it created.
+- Stages belong to their stream or view. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
+  `DROP STREAM` or `DROP MATERIALIZED VIEW` removes its stages, and no other statement may read,
+  drop or create a `$stage` name. A failed `CREATE` removes the stages it created.
 - A join of three or more inputs still needs named two-way stages: a join's output carries no
   event time, so an interval join cannot read it.
 
@@ -507,10 +514,70 @@ one statement that is split into stages; windowed joins remain rejected. A strea
 three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
 which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
 
-Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
-retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
-the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. The
-cluster admission path rejects unsupported state before connector I/O.
+Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admits:
+
+- a keyed or global aggregate view;
+- a projection or filter over such a view, keeping or dropping its key columns;
+- an append-only view: a projection over a source, a closed window, or an interval join;
+- an aggregate over one two-way join or over an aggregating or joining subquery, split into
+  stages as for a stream.
+
+Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
+moves them with their vnodes when ownership changes. A view that drops or changes its input's
+key places each row by the whole row, so the node that produces a row sends it to the node that
+owns it; that counts as one more remote exchange. Each node keeps the part of an append-only
+view's log that it produced. When a node leaves, through rebalancing or failure, another node
+takes over its log in the next checkpoint without copying it. A topology migration that adds,
+replaces or drops other objects keeps every view and its rows. A migration may also add a view
+(`CREATE MATERIALIZED VIEW`) or drop one (`DROP MATERIALIZED VIEW` without `CASCADE`), but not
+drop and recreate the same view. A new view over an existing aggregate or view starts from that
+input's rows at the migration's checkpoint, then follows its later changes; a new view over a
+source starts empty there and sees only later rows. A new view over a stream that only reshapes
+an aggregate's changes is rejected, because no node keeps that stream's rows; define it over the
+aggregate. `LaminarDB::query_committed` on any node reads every view at one committed checkpoint,
+from every node's checkpointed state. A node that takes part in no checkpoint (draining, or not
+yet assigned) learns of each new checkpoint from the cluster's checkpoint authority within about
+a second; after a topology migration it keeps the last checkpoint of its own topology until it
+runs the new one. A `SELECT` over pgwire or HTTP on a cluster node reads committed checkpoints in
+the same way unless the session asks for the latest cycle, which a cluster node refuses because
+it holds only its part of each view (see section 8). `SUBSCRIBE` to a view reads committed
+checkpoints in the same way, as described below. [Delivery guarantees](DELIVERY_GUARANTEES.md#materialized-view-reads)
+lists what a committed read guarantees and the fault soak that checks it.
+
+An append-only view's interval retention follows one event-time frontier per view, committed
+with each checkpoint: the lowest frontier among the nodes whose input is active, never moving
+back. Every node keeps the same rows, wherever they were written. A row that arrives behind that
+frontier minus the interval is dropped and counted in `mv_rows_below_horizon_total`; embedded and
+single-node runtimes count their drops the same way. A `'<n> rows'` retention applies on each
+node separately, so a cluster keeps up to `n` rows per node and may keep fewer after a node
+leaves; when a node takes over another's log, the adopted rows count as its newest. A cluster
+checkpoint retains at most 24,576 view-log segments across all nodes, an even share per node
+(8,192 each on three nodes), and a rebalance is refused before it starts when the remaining nodes
+could not take over the leaving nodes' logs within their share.
+
+A `SUBSCRIBE` to a materialized view first delivers the view's rows, then each change to them.
+A changelog view (an aggregate, or a projection or filter over one) adds an Int64 `__weight`
+column. Every snapshot row has weight 1. A change gives each row the amount by which it changed
+the row's count, so an update retracts the old row with `-1` and inserts the new one with `+1`,
+and a row whose count did not change is not sent. Adding up everything received by weight gives
+the view's current rows. An append-only view delivers plain rows: its retained rows, then each
+row it keeps. A row leaving its retention is not a change, and a row dropped behind the retention
+horizon is never delivered. In embedded and single-node runtimes the snapshot is the view after
+the latest cycle and each later cycle's change follows it; `AS OF EPOCH` on a view is rejected
+(`0A000`), because a view subscription always starts from the view's rows. Earlier releases sent
+a changelog view's whole contents as plain rows after every cycle instead.
+
+In a cluster any node serves a subscription to any view from committed checkpoints. The snapshot
+is the view at the newest committed checkpoint, or at `AS OF EPOCH <n>` while checkpoint `n` is
+retained, and a progress frame for that epoch follows it. Each later committed checkpoint then
+delivers the view's change since the one before, followed by its own progress frame. A changelog
+view's change is netted over the whole checkpoint interval, so a row that changes and changes back
+between two checkpoints is not sent; rows within one interval arrive in no particular order. An
+append-only view delivers the rows each node appended in that interval; rows a node takes over
+from a node that left, and segments its log compaction rewrites, are not new rows. A subscription
+survives rebalancing, a node leaving, and topology migrations that keep the view. It ends with a
+typed error when a migration drops the view, or when it falls so far behind that the checkpoint
+it last delivered is no longer retained.
 
 ### SUBSCRIBE over the Postgres wire protocol
 
@@ -520,10 +587,10 @@ When the server is started with `pgwire_bind` set, materialized views can be str
 SUBSCRIBE <name> [AS OF EPOCH <n>] [WHERE <predicate>]
 ```
 
-- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable.
+- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable. A view's rows arrive as described above.
 - The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. Named streams whose output schema is not resolved reject `WHERE`.
 - The query stays open until the client disconnects. Local runtimes preserve their existing delivery behaviour; cluster data becomes visible only after a complete cluster checkpoint commits.
-- Cluster `SUBSCRIBE` is supported only for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, materialized views, and uncertified plans fail before subscription backend I/O.
+- Cluster `SUBSCRIBE` is supported for materialized views, as described above, and for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, and uncertified plans fail before subscription backend I/O.
 - Every cluster server is a gateway over the same shared committed history; clients do not need to locate current vnode owners.
 - Cluster ordering is strict and contiguous within each vnode output partition. Fair gateway merging defines no order between partitions and does not imply arrival, event-time, SQL-sort, or global total order.
 - Partition sequences describe committed source-log frames. A `WHERE` predicate can remove every row from a frame, so optional frame metadata observed by a filtered client can have non-adjacent partition sequences without indicating that a matching row was skipped.
@@ -545,7 +612,8 @@ aggregate scope, history is a byte-bounded suffix of verified immutable Arrow se
 by authoritative committed checkpoint indexes in shared object storage. Object listing is never
 commit authority.
 
-WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`. Pgwire adds
+WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`; in a
+cluster, a materialized view's data frames also carry `committed_epoch` and `snapshot`. Pgwire adds
 `__laminar_kind`, `__laminar_epoch`, and `__laminar_checkpoint_id` control columns without changing
 the user data schema. Cluster progress is emitted only after the complete participant roster and
 partition-frontier vector commit. Durably record a marker after processing its preceding data, then
@@ -755,6 +823,108 @@ CREATE STREAM histogram AS SELECT n, COUNT(*) AS keys FROM per_key GROUP BY n;
 
 A server configuration or sealed cluster catalog containing this chain is rejected when it is
 replayed at startup.
+
+A non-windowed aggregate inside `CREATE MATERIALIZED VIEW` always emits its changelog, global
+aggregates included, so an aggregate or projection over a view needs no `EMIT` clause. The same
+rule makes a window or join over such a view fail, and a sink that reads the view must accept
+full changelogs.
+
+### 7. Append-only views keep rows by a declared retention
+
+A view whose query only appends rows (a projection or filter over a source, a window with `EMIT ON
+WINDOW CLOSE` or `EMIT FINAL`, or an interval join) keeps its rows as a log. With checkpointing,
+each checkpoint writes the rows appended since the previous one as one segment beside the
+checkpoint's state, memory holds only those rows, and `SELECT` reads committed segments back from
+the checkpoint store. Retention decides which rows a read returns and which segments later
+checkpoints keep:
+
+- `WITH (retention = '<interval>')`, for example `'2 hours'`: rows whose event time is at or after
+  the view's watermark minus the interval. The event-time column is the source's watermark column
+  when the query forwards it unchanged, or the window column of a windowed view, which keeps a
+  window while its end (start plus window size, or plus the gap for a session) is inside the
+  interval. A view that declares nothing keeps 1 hour.
+- `WITH (retention = '<n> rows')`: the latest `n` rows. A view without an event-time column (over
+  an interval join, or over a source without a watermark) must declare it.
+- `WITH (retention = 'unbounded')`: every row. It needs checkpointing, because without it the
+  whole log stays in memory.
+- A changelog view rejects `retention`.
+
+```sql
+CREATE MATERIALIZED VIEW minute_volume AS
+SELECT symbol, tumble(ts, INTERVAL '1' MINUTE) AS window_start, SUM(qty) AS volume
+FROM trades GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE
+WITH (retention = '6 hours');
+```
+
+Rows waiting for the next checkpoint count against `materialized_view_max_rows` and
+`materialized_view_max_bytes`, and a cycle that would exceed them fails instead of dropping rows.
+Without checkpointing the whole retained log stays in memory under the same limits. A row whose
+event time is NULL is not returned once the view has a watermark. Earlier releases kept the last
+1,000 batches of an append view instead.
+
+Each checkpoint adds at most one segment per view. After each checkpoint, a background task
+merges consecutive older segments of a view, up to 16 MiB each, into one segment without the rows
+its retention no longer keeps, and the next checkpoint writes it in their place; reads do not
+change. A view therefore keeps a few dozen segments plus about one per 8 to 16 MiB of retained
+rows, whatever its age. One checkpoint retains at most 32,768 segments across all views, so
+`unbounded` views can grow to roughly 256 to 512 GiB of encoded rows per node before checkpoints
+fail with an error naming the largest view.
+
+### 8. Committed reads see one checkpoint; `freshness` bounds how old it may be
+
+An ad-hoc `SELECT` reads each table as a snapshot, so it may join views with each other and with
+sources and reference tables; the streaming join rules apply only to named streaming queries.
+It reads views at one of two levels:
+
+- **latest**: every view after the last completed cycle, under one guard. Recovery can roll this
+  back. It is the default in embedded and single-node mode, and a cluster node refuses it.
+- **committed**: every view at one committed checkpoint, as below. It is the default on a cluster
+  node.
+
+The Rust API `LaminarDB::read(sql, level)` takes a `ReadLevel` and returns the rows with the
+committed cut it read; `LaminarDB::default_read_level()` gives the mode's default, and
+`execute` reads at the latest level. Over pgwire, `SET laminar.read_level = 'latest' |
+'committed' | 'default'` and `SET laminar.min_epoch = <n>` apply to the connection, `SHOW
+laminar.read_epoch` returns the epoch of its last committed read, and a later committed read on
+the connection never reads an earlier epoch. That floor lasts as long as the connection: after a
+pipeline is reset to an empty checkpoint store, reconnect, or committed reads wait for an epoch
+that will not come and fail after 30 seconds (`57014`). Over HTTP, `POST /api/v1/sql` takes `read_level`
+and `min_epoch` fields and a committed response carries `epoch`, `checkpoint_id` and
+`taken_at_ms`. Rows reach the reader in order and only as fast as it reads them; a query that
+fails part way ends with its error instead of a partial result.
+
+`LaminarDB::query_committed(sql, at)` reads every view a query scans at one committed checkpoint
+and returns the checkpoint's epoch and when it was taken:
+
+- `CommittedRead::Latest` reads the newest committed checkpoint.
+- `CommittedRead::AtLeast(epoch)` waits for a checkpoint at or after `epoch`. Pass an epoch a
+  previous result returned to read no earlier than it.
+- `CommittedRead::Exact(epoch)` reads that checkpoint, and fails once checkpoint cleanup retired
+  it. Cleanup keeps only the newest checkpoint and any checkpoint a read holds.
+
+Such a result is never rolled back and never mixes checkpoints. It is as fresh as the checkpoint
+interval. A committed read needs checkpointing, may scan only materialized views, and holds its
+checkpoint for at most 30 seconds, which also bounds the wait for `AtLeast`. A view with a
+row-count retention is not exact, because which rows the cap keeps depends on arrival order.
+Equality filters on every key column of an aggregate view read only the state of that key's
+vnode, and range filters on the event-time column of an append view kept by an interval or
+`unbounded` skip segments outside the range.
+Decoded checkpoint state is cached up to `materialized_view_read_cache_bytes` (256 MiB).
+
+`WITH (freshness = '<interval>')` declares the most committed reads of a view may lag. `CREATE`
+rejects it when checkpoints are manual or disabled, or when it is below the checkpoint interval.
+While the newest committed checkpoint is older than a view's freshness, a warning is logged and
+`mv_freshness_breaches_total{view}` counts the breach once; `mv_committed_staleness_ms` exports
+the age. Every view in a pipeline is read at the same newest checkpoint, so that age applies to
+each of them. `mv_reads_total{level}` counts reads by level, and `mv_committed_read_age_seconds`
+records the age of the checkpoint each committed read observed.
+
+```sql
+CREATE MATERIALIZED VIEW positions AS
+SELECT account, SUM(qty) AS qty FROM fills GROUP BY account
+WITH (freshness = '10 seconds');
+```
 
 ---
 

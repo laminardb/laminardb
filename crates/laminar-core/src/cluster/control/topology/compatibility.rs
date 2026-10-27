@@ -43,6 +43,20 @@ pub enum TopologyInitialization {
     ResolveSourcePositionsOnce,
     /// Settle old-generation state/progress/effects at the cut and omit the object from the target.
     RetireAtCut,
+    /// Initialize a new materialized view's managed state empty at the exact cut, then apply
+    /// the rows its preserved upstream changelog holds at the cut before any subsequent input.
+    SeedFromUpstreamAtCut,
+}
+
+impl TopologyInitialization {
+    /// Whether the object's managed state starts empty at the cut.
+    #[must_use]
+    pub const fn starts_empty_at_cut(self) -> bool {
+        matches!(
+            self,
+            Self::EmptyManagedStateAtCut | Self::SeedFromUpstreamAtCut
+        )
+    }
 }
 
 /// Authorization still needed before this local plan can activate a target graph.
@@ -87,6 +101,75 @@ pub struct ClusterTopologyObjectPlan {
     pub schema_sha256: Option<String>,
     /// Versioned codec name of a managed operator, absent for stateless/source/sink objects.
     pub managed_state_contract: Option<String>,
+}
+
+impl ClusterTopologyObjectPlan {
+    /// The only initialization this object's transition and kind admit.
+    fn canonical_initialization(&self) -> Result<TopologyInitialization, TopologyError> {
+        Ok(match (self.transition, self.kind) {
+            (ClusterTopologyObjectTransition::Preserve, _) => {
+                TopologyInitialization::PreserveExactCut
+            }
+            (
+                ClusterTopologyObjectTransition::Remove,
+                CatalogObjectKind::Source
+                | CatalogObjectKind::Stream
+                | CatalogObjectKind::MaterializedView
+                | CatalogObjectKind::Sink,
+            ) => TopologyInitialization::RetireAtCut,
+            (ClusterTopologyObjectTransition::Remove, _) => {
+                return Err(TopologyError::Unsupported(
+                    "only sources, streams, materialized views and sinks have a certified removal contract".into(),
+                ))
+            }
+            (_, CatalogObjectKind::Source) => TopologyInitialization::ResolveSourcePositionsOnce,
+            (_, CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView)
+                if self.managed_state_contract.is_some() =>
+            {
+                TopologyInitialization::EmptyManagedStateAtCut
+            }
+            _ => TopologyInitialization::FutureOnlyAtCut,
+        })
+    }
+
+    /// Whether this new view seeds from an upstream the migration preserves, in place of its
+    /// canonical empty start.
+    pub(super) fn seeds_from_preserved_upstream(&self, objects: &[Self]) -> bool {
+        self.initialization == TopologyInitialization::SeedFromUpstreamAtCut
+            && self.transition == ClusterTopologyObjectTransition::AddFutureOnly
+            && self.kind == CatalogObjectKind::MaterializedView
+            && self.managed_state_contract.is_some()
+            && self.dependencies.iter().any(|name| {
+                objects.iter().any(|dependency| {
+                    &dependency.name == name
+                        && dependency.transition == ClusterTopologyObjectTransition::Preserve
+                        && matches!(
+                            dependency.kind,
+                            CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                        )
+                })
+            })
+    }
+
+    /// Whether `operator_id` is a state frame of this object: a stream's operator, or a
+    /// materialized view's operator and the operator that owns its result slices, or a stage
+    /// split out of either's query.
+    #[must_use]
+    pub fn owns_state_frame(&self, operator_id: &str) -> bool {
+        let Some(operator) = operator_id.strip_prefix("graph:") else {
+            return false;
+        };
+        let operator = crate::catalog::stage_owner(operator).unwrap_or(operator);
+        match self.kind {
+            CatalogObjectKind::Stream => operator == self.name,
+            CatalogObjectKind::MaterializedView => {
+                operator == self.name
+                    || operator.strip_suffix(crate::mv::VIEW_RESULT_OPERATOR_SUFFIX)
+                        == Some(self.name.as_str())
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Effect-free candidate validation. This is neither a durable admission nor an activation receipt.
@@ -221,6 +304,11 @@ impl ClusterTopologyValidation {
                 {
                     ClusterTopologyObjectTransition::Remove
                 }
+                // A cut keys a view's frontier and log by name, so a view has no successor in the
+                // migration that retires it.
+                None if entry.kind == CatalogObjectKind::MaterializedView => {
+                    ClusterTopologyObjectTransition::Remove
+                }
                 _ => return Err(TopologyError::Invalid(
                     "target changes an incarnation without an explicit retirement/successor mapping"
                         .into(),
@@ -316,27 +404,7 @@ impl ClusterTopologyValidation {
             ));
         }
         for object in &self.objects {
-            let initialization = match (object.transition, object.kind) {
-                (ClusterTopologyObjectTransition::Preserve, _) => {
-                    TopologyInitialization::PreserveExactCut
-                }
-                (
-                    ClusterTopologyObjectTransition::Remove,
-                    CatalogObjectKind::Source | CatalogObjectKind::Stream | CatalogObjectKind::Sink,
-                ) => TopologyInitialization::RetireAtCut,
-                (ClusterTopologyObjectTransition::Remove, _) => {
-                    return Err(TopologyError::Unsupported(
-                        "only sources, streams and sinks have a certified removal contract".into(),
-                    ))
-                }
-                (_, CatalogObjectKind::Source) => {
-                    TopologyInitialization::ResolveSourcePositionsOnce
-                }
-                (_, CatalogObjectKind::Stream) if object.managed_state_contract.is_some() => {
-                    TopologyInitialization::EmptyManagedStateAtCut
-                }
-                _ => TopologyInitialization::FutureOnlyAtCut,
-            };
+            let initialization = object.canonical_initialization()?;
             if object.name.is_empty()
                 || object.name.len() > 256
                 || object.catalog_generation == 0
@@ -346,7 +414,8 @@ impl ClusterTopologyValidation {
                     .schema_sha256
                     .as_ref()
                     .is_some_and(|hash| !is_digest(hash))
-                || object.initialization != initialization
+                || (object.initialization != initialization
+                    && !object.seeds_from_preserved_upstream(&self.objects))
                 || object.dependencies.len() > 256
                 || !object.dependencies.windows(2).all(|pair| pair[0] < pair[1])
                 || object.dependencies.iter().any(|name| {
@@ -367,7 +436,10 @@ impl ClusterTopologyValidation {
                     .is_some_and(|contract| {
                         contract.is_empty()
                             || contract.len() > 128
-                            || object.kind != CatalogObjectKind::Stream
+                            || !matches!(
+                                object.kind,
+                                CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                            )
                     })
             {
                 return Err(TopologyError::Invalid(

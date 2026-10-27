@@ -6,6 +6,7 @@ mod cluster;
 mod oracle;
 mod source;
 mod tests;
+mod views;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -102,17 +103,7 @@ impl Case {
     async fn run_embedded(&self) -> Result<Result<Consolidated, String>, String> {
         let directory = tempfile::tempdir().map_err(|e| e.to_string())?;
         let polled = Arc::new(AtomicU64::new(0));
-        let db = LaminarDB::builder()
-            .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
-            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-                data_dir: Some(directory.path().into()),
-                interval_ms: None,
-                ..Default::default()
-            })
-            .register_connector(source::register(self.sources.clone(), Arc::clone(&polled)))
-            .build()
-            .await
-            .map_err(|e| e.to_string())?;
+        let db = embedded_db(&self.sources, &polled, directory.path()).await?;
         for statement in self.ddl() {
             if let Err(error) = db.execute(&statement).await {
                 let _ = db.shutdown().await;
@@ -239,6 +230,29 @@ impl Case {
         }
         Ok(())
     }
+}
+
+/// An embedded database that reads every fixture partition and checkpoints into `directory`.
+async fn embedded_db(
+    sources: &[FixtureSource],
+    polled: &Arc<AtomicU64>,
+    directory: &std::path::Path,
+) -> Result<Arc<LaminarDB>, String> {
+    LaminarDB::builder()
+        .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            data_dir: Some(directory.into()),
+            interval_ms: None,
+            ..Default::default()
+        })
+        .register_connector(source::register(
+            sources.to_vec(),
+            Arc::clone(polled),
+            Arc::new(AtomicU64::new(u64::MAX)),
+        ))
+        .build()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Whether a checkpoint flush on `db` ran past its first wave and idle confirmation, i.e. moved

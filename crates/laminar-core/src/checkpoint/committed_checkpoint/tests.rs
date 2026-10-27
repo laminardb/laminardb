@@ -47,6 +47,7 @@ fn local_index() -> CommittedCheckpointIndex {
         }],
         source_watermarks: BTreeMap::from([("source".into(), 42)]),
         checkpoint_watermark: Some(42),
+        view_frontiers: Default::default(),
     }
 }
 
@@ -100,6 +101,7 @@ fn cluster_cut() -> (CommittedCheckpointIndex, Vec<CheckpointManifest>) {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     bind_manifests(&mut index, &manifests);
     (index, manifests)
@@ -242,6 +244,51 @@ fn legacy_successor_cannot_erase_a_version_four_source_cut() {
         .validate_predecessor_index(&predecessor)
         .unwrap_err()
         .contains("version regresses"));
+}
+
+#[test]
+fn only_a_version_five_cluster_cut_carries_view_frontiers() {
+    let (mut cluster, _) = cluster_cut();
+    cluster.view_frontiers.insert("view".into(), 100);
+    cluster.validate().unwrap();
+
+    let mut source_watermark_version = cluster.clone();
+    source_watermark_version.version = SOURCE_WATERMARK_INDEX_VERSION;
+    assert!(source_watermark_version
+        .validate()
+        .unwrap_err()
+        .contains("only a version 5 cluster checkpoint"));
+    source_watermark_version.view_frontiers.clear();
+    source_watermark_version.validate().unwrap();
+
+    let mut local = local_index();
+    local.view_frontiers.insert("view".into(), 100);
+    assert!(local
+        .validate()
+        .unwrap_err()
+        .contains("only a version 5 cluster checkpoint"));
+
+    cluster.view_frontiers.insert("view".into(), i64::MIN);
+    assert!(cluster.validate().unwrap_err().contains("reserved"));
+}
+
+#[test]
+fn a_committed_view_frontier_never_regresses() {
+    let (mut predecessor, _) = cluster_cut();
+    predecessor.view_frontiers.insert("view".into(), 100);
+    let mut successor = predecessor.clone();
+    successor.epoch = 8;
+    successor.checkpoint_id = 8;
+    successor.view_frontiers.insert("view".into(), 100);
+    successor
+        .validate_predecessor_watermarks(&predecessor)
+        .unwrap();
+
+    successor.view_frontiers.insert("view".into(), 99);
+    assert!(successor
+        .validate_predecessor_watermarks(&predecessor)
+        .unwrap_err()
+        .contains("regresses"));
 }
 
 #[test]

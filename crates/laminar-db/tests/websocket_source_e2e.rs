@@ -119,7 +119,8 @@ async fn websocket_source_decodes_nested_json_into_materialized_view() {
     db.execute(
         "CREATE MATERIALIZED VIEW decoded AS \
          SELECT id, region, tags FROM feed \
-         WHERE kind = 'order' AND (status IS NULL OR status = 'open')",
+         WHERE kind = 'order' AND (status IS NULL OR status = 'open') \
+         WITH (retention = '1000 rows')",
     )
     .await
     .unwrap();

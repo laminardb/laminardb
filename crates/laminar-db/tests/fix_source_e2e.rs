@@ -183,19 +183,12 @@ async fn totals(db: &LaminarDB) -> BTreeMap<String, i64> {
     else {
         panic!("expected a query result");
     };
-    let mut subscription = query.subscribe_raw().expect("subscribe");
-    let mut rows = BTreeMap::new();
-    // An empty view answers with no batch and closes the result stream.
-    let Ok(first) = tokio::time::timeout(CONVERGE, subscription.recv_async())
+    let rows = query.subscribe_raw().expect("subscribe");
+    let batches = tokio::time::timeout(CONVERGE, rows.read_all())
         .await
         .expect("snapshot in time")
-    else {
-        return rows;
-    };
-    let mut batches = vec![first];
-    while let Some(batch) = subscription.poll() {
-        batches.push(batch);
-    }
+        .expect("query");
+    let mut rows = BTreeMap::new();
     for batch in batches {
         insert_rows(&batch, &mut rows);
     }

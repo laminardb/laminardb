@@ -508,8 +508,12 @@ impl OperatorGraph {
                 }
             };
         let mut installed = installed_state.lock();
+        // Adoption is the last fallible step, so the logs are adopted only by a transition that
+        // then publishes.
         let validation = if Self::installed_state_matches_pending(&pending, installed.as_ref()) {
-            authority.revalidate_for_publication()
+            authority
+                .revalidate_for_publication()
+                .and_then(|()| self.adopt_view_logs(pending.adopted_view_logs()))
         } else {
             Err(DbError::Checkpoint(
                 "[LDB-6051] installed predecessor binding changed before vnode publication".into(),

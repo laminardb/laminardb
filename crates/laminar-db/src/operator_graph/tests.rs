@@ -284,6 +284,55 @@ async fn rich_frontiers_exclude_idle_inputs_and_remain_monotone() {
     assert!(!graph.output_idle[output]);
 }
 
+/// An append view reports idle, and so takes no part in its committed cluster frontier, when
+/// its stream's source is idle there, as on a node holding none of the source's partitions.
+#[tokio::test]
+async fn a_sql_stream_reports_its_idle_source_frontier() {
+    let mut graph = test_graph();
+    graph.register_source_schema(
+        "events".into(),
+        Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
+    );
+    graph.add_query(
+        "positive".into(),
+        "SELECT k FROM events WHERE k > 0".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    graph.take_build_errors().unwrap();
+    let mut frontiers = FxHashMap::from_iter([(
+        Arc::from("events"),
+        InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        },
+    )]);
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.stream_frontier("positive"),
+        Some(InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        })
+    );
+
+    frontiers.get_mut("events").unwrap().idle = false;
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, Some(&frontiers))
+        .await
+        .unwrap();
+    assert_eq!(
+        graph.stream_frontier("positive").map(|f| f.idle),
+        Some(false)
+    );
+}
+
 #[tokio::test]
 async fn all_idle_frontier_respects_operator_hold() {
     let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));

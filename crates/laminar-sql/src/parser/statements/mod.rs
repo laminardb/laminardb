@@ -130,6 +130,11 @@ pub enum StreamingStatement {
         if_not_exists: bool,
         /// Raw query text between `AS` and `EMIT`.
         query_sql: String,
+        /// Declared retention from the trailing `WITH (...)`.
+        retention: Option<crate::parser::MaterializedViewRetention>,
+        /// Declared freshness from the trailing `WITH (...)`: the most a committed read of the
+        /// view may lag.
+        freshness: Option<std::time::Duration>,
     },
 
     /// `CREATE STREAM` for a named streaming pipeline.

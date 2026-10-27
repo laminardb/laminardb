@@ -266,6 +266,8 @@ fn test_create_materialized_view_statement() {
         or_replace: false,
         if_not_exists: true,
         query_sql: "SELECT COUNT(*) FROM events".to_string(),
+        retention: None,
+        freshness: None,
     };
     match stmt {
         StreamingStatement::CreateMaterializedView {

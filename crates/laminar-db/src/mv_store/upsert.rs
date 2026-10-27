@@ -1,40 +1,54 @@
-//! Keyed MV snapshots with quota-checked replacement and deletion deltas.
+//! Keyed MV snapshots with quota-checked replacement and deletion deltas, split into vnode
+//! slices placed by the view key.
 
 use super::admission::{size_overflow, MvLimits};
+use super::slices::VnodeSlices;
 use super::staging::StagingBudget;
 use super::weight_and_plain_cols;
+use crate::aggregate_state::global_aggregate_key;
 use crate::error::DbError;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::SchemaRef;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
+use laminar_core::state::KeyGroupCount;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion_common::ScalarValue;
 
+pub(super) type UpsertSlice = HashMap<OwnedRow, Vec<ScalarValue>>;
+
 /// Keyed running snapshot from a `__weight` changelog; stored rows omit the weight column.
 pub(super) struct UpsertState {
     key_cols: Vec<usize>,
-    key_converter: RowConverter,
-    pub(super) rows: HashMap<OwnedRow, Vec<ScalarValue>>,
+    /// `None` for a global aggregate, whose single row has a constant key on vnode 0.
+    key_converter: Option<RowConverter>,
+    pub(super) slices: VnodeSlices<UpsertSlice>,
+    pub(super) rows: usize,
     pub(super) approx_bytes: usize,
 }
 
 pub(super) struct UpsertDelta {
     rows: HashMap<OwnedRow, StagedRow>,
+    row_count: usize,
     bytes: usize,
 }
 
 struct StagedRow {
     values: Option<Vec<ScalarValue>>,
     bytes: usize,
+    vnode: u32,
 }
 
 const STAGED_ROW_OVERHEAD: usize =
     std::mem::size_of::<StagedRow>() - std::mem::size_of::<Vec<ScalarValue>>();
 
 impl UpsertState {
-    pub(super) fn new(schema: &SchemaRef, key_cols: &[usize]) -> Result<Self, DbError> {
+    pub(super) fn new(
+        schema: &SchemaRef,
+        key_cols: &[usize],
+        key_groups: KeyGroupCount,
+    ) -> Result<Self, DbError> {
         if key_cols
             .iter()
             .any(|&column| column >= schema.fields().len())
@@ -43,32 +57,93 @@ impl UpsertState {
                 "upsert MV key column is outside its schema".into(),
             ));
         }
-        let sort_fields: Vec<SortField> = key_cols
-            .iter()
-            .map(|&c| SortField::new(schema.field(c).data_type().clone()))
-            .collect();
-        let key_converter = RowConverter::new(sort_fields)
-            .map_err(|e| DbError::Storage(format!("upsert MV key converter: {e}")))?;
+        let key_converter = if key_cols.is_empty() {
+            None
+        } else {
+            let sort_fields: Vec<SortField> = key_cols
+                .iter()
+                .map(|&c| SortField::new(schema.field(c).data_type().clone()))
+                .collect();
+            Some(
+                RowConverter::new(sort_fields)
+                    .map_err(|e| DbError::Storage(format!("upsert MV key converter: {e}")))?,
+            )
+        };
         Ok(Self {
             key_cols: key_cols.to_vec(),
             key_converter,
-            rows: HashMap::new(),
+            slices: VnodeSlices::new(key_groups),
+            rows: 0,
             approx_bytes: 0,
         })
     }
 
-    fn keys(&self, batch: &RecordBatch, plain_cols: &[usize]) -> Result<arrow::row::Rows, DbError> {
+    fn keys(&self, batch: &RecordBatch, plain_cols: &[usize]) -> Result<Option<Rows>, DbError> {
+        let Some(converter) = &self.key_converter else {
+            return Ok(None);
+        };
         let key_arrays: Vec<ArrayRef> = self
             .key_cols
             .iter()
             .map(|&c| Arc::clone(batch.column(plain_cols[c])))
             .collect();
-        self.key_converter
+        converter
             .convert_columns(&key_arrays)
+            .map(Some)
             .map_err(|e| DbError::Storage(format!("upsert MV key conversion: {e}")))
     }
 
-    fn row_size(key: &OwnedRow, values: &Vec<ScalarValue>) -> Result<usize, DbError> {
+    fn key_at(keys: Option<&Rows>, row_idx: usize) -> OwnedRow {
+        keys.map_or_else(global_aggregate_key, |keys| keys.row(row_idx).owned())
+    }
+
+    /// The rows and bytes the slices of `vnodes` hold.
+    #[cfg(feature = "cluster")]
+    pub(super) fn slices_charge(&self, vnodes: &[u32]) -> (usize, usize) {
+        vnodes.iter().fold((0, 0), |(rows, bytes), &vnode| {
+            let (slice_rows, slice_bytes) = Self::slice_charge(self.slices.slot(vnode));
+            (rows + slice_rows, bytes.saturating_add(slice_bytes))
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn slice_charge(slice: &UpsertSlice) -> (usize, usize) {
+        let bytes = slice
+            .iter()
+            .map(|(key, values)| Self::row_size(key, values).unwrap_or(usize::MAX))
+            .fold(0, usize::saturating_add);
+        (slice.len(), bytes)
+    }
+
+    /// Empty the slices of `revoked` and move in those of `acquired` from `staged`, with their
+    /// charge. Preparation checked the result against the view limits, so this saturates
+    /// rather than fails. The next capture writes every owned vnode.
+    #[cfg(feature = "cluster")]
+    pub(super) fn exchange_slices(&mut self, revoked: &[u32], staged: &mut Self, acquired: &[u32]) {
+        for &vnode in revoked.iter().chain(acquired) {
+            let (rows, bytes) = Self::slice_charge(&std::mem::take(self.slices.slot_mut(vnode)));
+            self.rows = self.rows.saturating_sub(rows);
+            self.approx_bytes = self.approx_bytes.saturating_sub(bytes);
+        }
+        for &vnode in acquired {
+            let slice = std::mem::take(staged.slices.slot_mut(vnode));
+            let (rows, bytes) = Self::slice_charge(&slice);
+            self.rows = self.rows.saturating_add(rows);
+            self.approx_bytes = self.approx_bytes.saturating_add(bytes);
+            *self.slices.slot_mut(vnode) = slice;
+        }
+        self.slices.require_full_capture();
+    }
+
+    fn vnode_of(&self, key: &OwnedRow) -> u32 {
+        if self.key_converter.is_some() {
+            self.slices.vnode_for(key.as_ref())
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn row_size(key: &OwnedRow, values: &Vec<ScalarValue>) -> Result<usize, DbError> {
         let spare = (values.capacity() - values.len())
             .checked_mul(std::mem::size_of::<ScalarValue>())
             .ok_or_else(size_overflow)?;
@@ -79,6 +154,19 @@ impl UpsertState {
         values.iter().try_fold(base, |bytes, value| {
             bytes.checked_add(value.size()).ok_or_else(size_overflow)
         })
+    }
+
+    fn row_values(
+        batch: &RecordBatch,
+        columns: impl Iterator<Item = usize>,
+        row_idx: usize,
+    ) -> Result<Vec<ScalarValue>, DbError> {
+        columns
+            .map(|c| {
+                ScalarValue::try_from_array(batch.column(c), row_idx)
+                    .map_err(|e| DbError::Storage(format!("upsert MV scalar: {e}")))
+            })
+            .collect()
     }
 
     /// Stage `+weight` upserts and `-weight` deletes without touching live state.
@@ -106,16 +194,13 @@ impl UpsertState {
             if w == 0 {
                 continue;
             }
-            let key = keys.row(row_idx).owned();
+            let key = Self::key_at(keys.as_ref(), row_idx);
             let values = if w > 0 {
-                let mut vals = Vec::with_capacity(plain_cols.len());
-                for &c in &plain_cols {
-                    vals.push(
-                        ScalarValue::try_from_array(batch.column(c), row_idx)
-                            .map_err(|e| DbError::Storage(format!("upsert MV scalar: {e}")))?,
-                    );
-                }
-                Some(vals)
+                Some(Self::row_values(
+                    batch,
+                    plain_cols.iter().copied(),
+                    row_idx,
+                )?)
             } else {
                 None
             };
@@ -127,14 +212,25 @@ impl UpsertState {
                     .checked_add(key.as_ref().len())
                     .ok_or_else(size_overflow)?,
             };
+            // A changelog update retracts and re-inserts one key, so place each key once.
             match staged.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     budget.replace(name, Some(entry.get().bytes), Some(bytes))?;
-                    entry.insert(StagedRow { values, bytes });
+                    let vnode = entry.get().vnode;
+                    entry.insert(StagedRow {
+                        values,
+                        bytes,
+                        vnode,
+                    });
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     budget.replace(name, None, Some(bytes))?;
-                    entry.insert(StagedRow { values, bytes });
+                    let vnode = self.vnode_of(entry.key());
+                    entry.insert(StagedRow {
+                        values,
+                        bytes,
+                        vnode,
+                    });
                 }
             }
         }
@@ -152,9 +248,9 @@ impl UpsertState {
         for batch in batches {
             self.stage_batch(name, batch, &mut staged, &mut budget)?;
         }
-        let (mut rows, mut removed, mut added) = (self.rows.len(), 0usize, 0usize);
+        let (mut rows, mut removed, mut added) = (self.rows, 0usize, 0usize);
         for (key, replacement) in &staged {
-            if let Some(old) = self.rows.get(key) {
+            if let Some(old) = self.slices.slot(replacement.vnode).get(key) {
                 removed = removed
                     .checked_add(Self::row_size(key, old)?)
                     .ok_or_else(size_overflow)?;
@@ -175,25 +271,67 @@ impl UpsertState {
         limits.validate(name, rows, bytes)?;
         Ok(UpsertDelta {
             rows: staged,
+            row_count: rows,
             bytes,
         })
     }
 
-    pub(super) fn apply_prepared(&mut self, delta: UpsertDelta) {
-        for (key, replacement) in delta.rows {
-            if let Some(values) = replacement.values {
-                self.rows.insert(key, values);
-            } else {
-                self.rows.remove(&key);
+    /// The rows `delta` replaces retracted (`-1`) and the rows it writes inserted (`+1`), in the
+    /// columns of `schema`; a key whose row does not change is left out.
+    pub(super) fn changes(
+        &self,
+        delta: &UpsertDelta,
+        schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>, DbError> {
+        let mut columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); schema.fields().len() - 1];
+        let mut weights = Vec::new();
+        for (key, staged) in &delta.rows {
+            let old = self.slices.slot(staged.vnode).get(key);
+            if old == staged.values.as_ref() {
+                continue;
+            }
+            for (values, weight) in [(old, -1), (staged.values.as_ref(), 1)] {
+                let Some(values) = values else { continue };
+                for (column, value) in columns.iter_mut().zip(values) {
+                    column.push(value.clone());
+                }
+                weights.push(weight);
             }
         }
+        if weights.is_empty() {
+            return Ok(None);
+        }
+        let mut arrays = columns
+            .into_iter()
+            .map(|column| {
+                ScalarValue::iter_to_array(column)
+                    .map_err(|e| DbError::Storage(format!("upsert MV change column: {e}")))
+            })
+            .collect::<Result<Vec<ArrayRef>, _>>()?;
+        arrays.push(Arc::new(arrow::array::Int64Array::from(weights)));
+        RecordBatch::try_new(Arc::clone(schema), arrays)
+            .map(Some)
+            .map_err(|e| DbError::Storage(format!("upsert MV change batch: {e}")))
+    }
+
+    pub(super) fn apply_prepared(&mut self, delta: UpsertDelta) {
+        for (key, replacement) in delta.rows {
+            let slice = self.slices.slot_mut(replacement.vnode);
+            if let Some(values) = replacement.values {
+                slice.insert(key, values);
+            } else {
+                slice.remove(&key);
+            }
+        }
+        self.rows = delta.row_count;
         self.approx_bytes = delta.bytes;
     }
 
-    /// Restore from a materialized plain snapshot (no weight column): every row is an insert.
-    pub(super) fn load_snapshot(
+    /// Restore one vnode's committed rows (no weight column). Every row must belong to `vnode`.
+    pub(super) fn restore_slice(
         &mut self,
         name: &str,
+        vnode: u32,
         batch: &RecordBatch,
         limits: MvLimits,
     ) -> Result<(), DbError> {
@@ -203,41 +341,41 @@ impl UpsertState {
         let plain_cols: Vec<usize> = (0..batch.num_columns()).collect();
         let keys = self.keys(batch, &plain_cols)?;
         for row_idx in 0..batch.num_rows() {
-            let key = keys.row(row_idx).owned();
-            let mut vals = Vec::with_capacity(batch.num_columns());
-            for c in 0..batch.num_columns() {
-                vals.push(
-                    ScalarValue::try_from_array(batch.column(c), row_idx)
-                        .map_err(|e| DbError::Storage(format!("upsert MV restore scalar: {e}")))?,
-                );
+            let key = Self::key_at(keys.as_ref(), row_idx);
+            let placed = self.vnode_of(&key);
+            if placed != vnode {
+                return Err(DbError::Storage(format!(
+                    "upsert MV frame for vnode {vnode} holds a row placed on vnode {placed}"
+                )));
             }
-            let mut bytes = self.approx_bytes;
-            if let Some(old) = self.rows.get(&key) {
-                bytes = bytes
-                    .checked_sub(Self::row_size(&key, old)?)
-                    .ok_or_else(size_overflow)?;
+            let values = Self::row_values(batch, 0..batch.num_columns(), row_idx)?;
+            if self.slices.slot(vnode).contains_key(&key) {
+                return Err(DbError::Storage(format!(
+                    "upsert MV frame for vnode {vnode} repeats a key at row {row_idx}"
+                )));
             }
-            bytes = bytes
-                .checked_add(Self::row_size(&key, &vals)?)
+            let bytes = self
+                .approx_bytes
+                .checked_add(Self::row_size(&key, &values)?)
                 .ok_or_else(size_overflow)?;
-            let rows = self.rows.len() + usize::from(!self.rows.contains_key(&key));
+            let rows = self.rows.checked_add(1).ok_or_else(size_overflow)?;
             limits.validate(name, rows, bytes)?;
-            self.rows.insert(key, vals);
+            self.slices.slot_mut(vnode).insert(key, values);
+            self.rows = rows;
             self.approx_bytes = bytes;
         }
         Ok(())
     }
 
     pub(super) fn to_record_batch(&self, schema: &SchemaRef) -> Result<RecordBatch, DbError> {
-        if self.rows.is_empty() {
+        if self.rows == 0 {
             return Ok(RecordBatch::new_empty(schema.clone()));
         }
-        // One pass over the row map assembling all columns, rather than one full map scan per column.
+        // One pass over the row maps assembling all columns, rather than one full scan per column.
         let ncols = schema.fields().len();
-        let mut columns: Vec<Vec<ScalarValue>> = (0..ncols)
-            .map(|_| Vec::with_capacity(self.rows.len()))
-            .collect();
-        for row in self.rows.values() {
+        let mut columns: Vec<Vec<ScalarValue>> =
+            (0..ncols).map(|_| Vec::with_capacity(self.rows)).collect();
+        for row in self.slices.slots().flat_map(|(_, slice)| slice.values()) {
             for (c, col) in columns.iter_mut().enumerate() {
                 col.push(row[c].clone());
             }

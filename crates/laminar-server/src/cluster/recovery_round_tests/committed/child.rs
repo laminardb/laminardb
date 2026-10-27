@@ -1,8 +1,19 @@
 use super::*;
+use arrow_array::{Array as _, Int64Array};
 use connectors::ReplayProbe;
+use laminar_core::cluster::control::{CheckpointDecisionStore, TopologyCatalogState};
+use laminar_db::CommittedRead;
+
+/// A view subscription and the rows it has folded so far, by their kept columns.
+struct ViewSubscription {
+    columns: Vec<String>,
+    portal: laminar_db::subscription::SubscriptionPortal,
+    rows: BTreeMap<Vec<i64>, i64>,
+}
 
 struct DatabasePeer {
     peer: Peer,
+    subscriptions: BTreeMap<String, ViewSubscription>,
     probe: Arc<ReplayProbe>,
     sender: Option<Arc<ShuffleSender>>,
     registry: Option<Arc<VnodeRegistry>>,
@@ -10,6 +21,7 @@ struct DatabasePeer {
     rebalance_shutdown: CancellationToken,
     rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
     runtime: Runtime,
+    objects: Arc<dyn object_store::ObjectStore>,
     #[cfg(feature = "process-remote")]
     worker: Option<tokio::task::JoinHandle<Result<(), laminar_db::DbError>>>,
 }
@@ -94,13 +106,14 @@ impl DatabasePeer {
         let (sender, address, registry) = self
             .peer
             .initialize(
-                objects,
+                Arc::clone(&objects),
                 &config.assignment,
                 Arc::clone(&self.assignments),
                 connectors::register(
                     Arc::clone(&self.probe),
                     root.join("output.jsonl"),
                     self.runtime,
+                    objects,
                 ),
             )
             .await?;
@@ -130,12 +143,22 @@ impl DatabasePeer {
             .ok_or_else(|| anyhow!("fixture registry is absent"))?;
         let starts = self.probe.starts.lock().clone();
         let output = self.probe.output.lock().clone();
-        let handoff = if registry.assignment_version() > 1 {
-            controller
-                .checkpoint_authority()?
-                .assignment_recovery_decision(registry.assignment_version())
-                .await?
-                .map(|decision| decision.recovery_checkpoint)
+        let authority = controller.checkpoint_authority()?;
+        let version = registry.assignment_version();
+        let handoff = if version > 1 {
+            match authority.assignment_recovery_decision(version).await {
+                Ok(decision) => decision.map(|decision| decision.recovery_checkpoint),
+                // A drain, not recovery, settled a live handoff's assignment.
+                Err(_)
+                    if authority
+                        .assignment_drain_decision(version)
+                        .await?
+                        .is_some() =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             None
         };
@@ -152,6 +175,7 @@ impl DatabasePeer {
                 .map_err(anyhow::Error::msg)?,
             release: controller.latest_committed_recover_release().await?,
             fault: self.db()?.last_fault(),
+            leader: controller.is_leader(),
             callbacks: self.probe.callbacks.lock().clone(),
             activity: self.probe.activity.lock().clone(),
         })
@@ -200,11 +224,135 @@ impl DatabasePeer {
         })
     }
 
-    fn remove_failed_peer(&mut self, failed: u64) -> Result<()> {
-        if self.peer.controller.instance_id() == NodeId(failed) || !self.rebalance_tasks.is_empty()
+    async fn read_view(&self, sql: &str, epoch: Option<u64>) -> Result<Response> {
+        let at = epoch.map_or(CommittedRead::Latest, CommittedRead::Exact);
+        let read = self.db()?.query_committed(sql, at).await?;
+        let mut rows = Vec::new();
+        for batch in &read.batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .filter(|column| column.null_count() == 0)
+                        .ok_or_else(|| anyhow!("fixture views read only non-null BIGINT columns"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.extend((0..batch.num_rows()).map(|row| {
+                columns
+                    .iter()
+                    .map(|column| column.value(row))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        rows.sort_unstable();
+        Ok(Response::Rows(rows))
+    }
+
+    async fn subscribe(&mut self, view: String, columns: Vec<String>) -> Result<()> {
+        let portal = self
+            .db()?
+            .open_subscription(&view, None, laminar_db::subscription::SubscribeStart::Tail)
+            .await?;
+        let subscription = ViewSubscription {
+            columns,
+            portal,
+            rows: BTreeMap::new(),
+        };
+        self.subscriptions.insert(view, subscription);
+        Ok(())
+    }
+
+    /// Fold `view`'s frames until its progress reaches `through`; each row repeats by its count.
+    async fn read_subscription(&mut self, view: &str, through: u64) -> Result<Response> {
+        use laminar_db::subscription::PortalFrame;
+        let subscription = self
+            .subscriptions
+            .get_mut(view)
+            .ok_or_else(|| anyhow!("no subscription to {view}"))?;
+        loop {
+            let frame = tokio::time::timeout(DEADLINE, subscription.portal.next_frame())
+                .await
+                .with_context(|| format!("{view} delivered nothing through {through}"))?
+                .ok_or_else(|| anyhow!("subscription to {view} closed"))?;
+            match frame {
+                PortalFrame::Batch { batch, .. } => fold_frame(subscription, &batch)?,
+                PortalFrame::Barrier { epoch, .. } if epoch >= through => break,
+                PortalFrame::Barrier { .. } => {}
+                other => return Err(anyhow!("subscription to {view} failed: {other:?}")),
+            }
+        }
+        let mut rows = Vec::new();
+        for (row, count) in &subscription.rows {
+            let count = usize::try_from(*count)
+                .map_err(|_| anyhow!("{view} folded to a negative count of {row:?}"))?;
+            rows.extend(std::iter::repeat_n(row.clone(), count));
+        }
+        Ok(Response::Rows(rows))
+    }
+
+    async fn adopt(&self) -> Result<()> {
+        let TopologyCatalogState::LegacySealed { manifest } =
+            self.peer.catalog.topology_state().await?
+        else {
+            return Err(anyhow!("fixture adopts only its sealed bootstrap catalog"));
+        };
+        let deployment = CheckpointDecisionStore::new(Arc::clone(&self.objects))
+            .load_deployment_id()
+            .await?
+            .ok_or_else(|| anyhow!("fixture deployment is absent"))?;
+        self.db()?
+            .adopt_cluster_topology(&laminar_db::ClusterTopologyAdoptionRequest {
+                operation_id: Uuid::new_v4().try_into()?,
+                expected_manifest: manifest,
+                expected_deployment_id: deployment,
+                coordinated_upgrade_complete: true,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn migrate(&self, operation: u128, statements: Vec<String>) -> Result<()> {
+        let parent = self
+            .db()?
+            .cluster_topology_status()
+            .await?
+            .committed_version
+            .ok_or_else(|| anyhow!("fixture migrates only an adopted topology"))?;
+        self.db()?
+            .submit_cluster_topology_change(&laminar_db::ClusterTopologyRequest {
+                operation_id: Uuid::from_u128(operation).try_into()?,
+                expected_parent_version: parent,
+                statements,
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn topology(&self, operation: u128) -> Result<Response> {
+        let db = self.db()?;
+        let phase = db
+            .cluster_topology_operation_status(Uuid::from_u128(operation).try_into()?)
+            .await?
+            .map(|status| status.phase);
+        let status = db.cluster_topology_status().await?;
+        Ok(Response::Topology {
+            phase,
+            committed: status.committed_version,
+            active: status.locally_active_version,
+        })
+    }
+
+    /// Start rebalancing after one membership change: `node` failed and left the membership,
+    /// or it is `Draining` and hands its vnodes over live.
+    fn change_membership(&mut self, node: u64, state: Option<NodeState>) -> Result<()> {
+        if (state.is_none() && self.peer.controller.instance_id() == NodeId(node))
+            || !self.rebalance_tasks.is_empty()
         {
             return Err(anyhow!(
-                "fixture accepts one failed-peer transition on the survivor"
+                "fixture accepts one membership change, and a failed peer only on the survivor"
             ));
         }
         let db = Arc::clone(self.db()?);
@@ -216,7 +364,13 @@ impl DatabasePeer {
         self.peer._membership.send(
             membership()
                 .into_iter()
-                .filter(|member| member.id != NodeId(failed))
+                .filter_map(|mut member| {
+                    if member.id != NodeId(node) {
+                        return Some(member);
+                    }
+                    member.state = state?;
+                    Some(member)
+                })
                 .collect(),
         )?;
         let config = laminar_db::rebalance::RebalanceConfig::test_defaults();
@@ -258,6 +412,11 @@ impl DatabasePeer {
                     // Split into a stage and an owner, so both take over the lost vnodes.
                     "CREATE STREAM recovery_output AS SELECT account, SUM(total) AS total FROM (SELECT account, SUM(amount) AS total FROM recovery_input GROUP BY account) per_account GROUP BY account".into(),
                     "CREATE SINK recovery_probe FROM recovery_output INTO \"recovery-output-probe\" ('fixture' = 'bounded-replay-v1')".into(),
+                    // A keyed view, a view placed by its full row, and an append view: the
+                    // survivor restores the first two's lost slices and adopts the third's log.
+                    "CREATE MATERIALIZED VIEW recovery_totals AS SELECT account, SUM(amount) AS total, COUNT(*) AS n FROM recovery_input GROUP BY account".into(),
+                    "CREATE MATERIALIZED VIEW recovery_amounts AS SELECT total FROM recovery_totals".into(),
+                    "CREATE MATERIALIZED VIEW recovery_rows AS SELECT account, amount, ts FROM recovery_input WITH (retention = '1 hour')".into(),
                 ];
                 self.db()?.execute_cluster_bootstrap_batch(&ddl).await?;
             }
@@ -300,10 +459,19 @@ impl DatabasePeer {
                 self.probe.output.lock().clear();
                 self.clear_process_observation();
             }
-            Command::RemoveFailedPeer(failed) => self.remove_failed_peer(failed)?,
+            Command::RemoveFailedPeer(failed) => self.change_membership(failed, None)?,
+            Command::Drain(node) => self.change_membership(node, Some(NodeState::Draining))?,
             Command::ClearProcessObservation => self.clear_process_observation(),
             Command::Observe => return Ok(Response::Observed(Box::new(self.observe().await?))),
             Command::Checkpoint => return self.checkpoint().await,
+            Command::ReadView(sql, epoch) => return self.read_view(&sql, epoch).await,
+            Command::Subscribe(view, columns) => self.subscribe(view, columns).await?,
+            Command::ReadSubscription(view, through) => {
+                return self.read_subscription(&view, through).await
+            }
+            Command::Adopt => self.adopt().await?,
+            Command::Migrate(operation, statements) => self.migrate(operation, statements).await?,
+            Command::Topology(operation) => return self.topology(operation).await,
             Command::Release => self.probe.hold.store(false, Ordering::Release),
             Command::Stop => return Err(anyhow!("the peer lifecycle owns Stop")),
         }
@@ -371,6 +539,7 @@ pub(super) async fn run(root: &Path) -> Result<()> {
     let peer = Peer::acquire(config.node, Arc::clone(&objects), PROCESS_TTL).await?;
     let mut owner = DatabasePeer {
         peer,
+        subscriptions: BTreeMap::new(),
         probe: Arc::new(ReplayProbe::default()),
         sender: None,
         registry: None,
@@ -378,6 +547,7 @@ pub(super) async fn run(root: &Path) -> Result<()> {
         rebalance_shutdown: CancellationToken::new(),
         rebalance_tasks: Vec::new(),
         runtime: config.runtime,
+        objects: Arc::clone(&objects),
         #[cfg(feature = "process-remote")]
         worker: None,
     };
@@ -402,4 +572,29 @@ pub(super) async fn run(root: &Path) -> Result<()> {
             std::panic::resume_unwind(primary);
         }
     }
+}
+
+fn fold_frame(subscription: &mut ViewSubscription, batch: &arrow_array::RecordBatch) -> Result<()> {
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| anyhow!("subscription frame has no BIGINT column {name}"))
+    };
+    let kept = subscription
+        .columns
+        .iter()
+        .map(|name| column(name))
+        .collect::<Result<Vec<_>>>()?;
+    let weights = batch
+        .column_by_name("__weight")
+        .map(|_| column("__weight"))
+        .transpose()?;
+    for row in 0..batch.num_rows() {
+        let values = kept.iter().map(|column| column.value(row)).collect();
+        let weight = weights.map_or(1, |weights| weights.value(row));
+        *subscription.rows.entry(values).or_default() += weight;
+    }
+    subscription.rows.retain(|_, count| *count != 0);
+    Ok(())
 }

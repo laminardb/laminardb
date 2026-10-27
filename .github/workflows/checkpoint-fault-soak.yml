@@ -206,6 +206,24 @@ jobs:
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
+          - label: Cluster EO materialized view reads (gossip)
+            test: three_node_eo_view_read_kill9_soak
+            features: cluster,aws,kafka,delta-lake-s3
+            delivery: eo
+            topology: cluster-views
+            discovery: gossip
+            emulator: "1"
+            # The EO join workload plus four views read over pgwire on every node and a view
+            # subscription, through every kill and paused-leader round. This job certifies the
+            # view read path, not the retained-state profile the EO job covers. Each read holds
+            # the keyed view, so the key count bounds read cost.
+            checkpoint_ms: "10000"
+            rps: "120"
+            keys: "4096"
+            min_live_state_bytes: "0"
+            visibility_ms: "120000"
+            slo_mode: observe
+            visibility_slo_mode: observe
           - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3,iceberg
@@ -456,7 +474,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --profile soak -p laminar-server --bin laminardb --no-default-features --features cluster,aws,process-remote cluster::recovery_round_tests::committed:: -- --ignored --nocapture --test-threads=1 --color never 2>&1 | tee process-node-loss.log
-          grep -Eq '^test result: ok\. 3 passed; 0 failed;' process-node-loss.log
+          grep -Eq '^test result: ok\. 5 passed; 0 failed;' process-node-loss.log
           cargo test --profile soak -p laminar-db --lib --no-default-features --features cluster,process-remote process_function::operator::execution::tests::shuffle::committed::peers::independent_owners_restore_the_committed_cut_after_host_loss_and_rescale -- --exact --ignored --nocapture --color never 2>&1 | tee process-owner-transfer.log
           grep -Eq '^test result: ok\. 1 passed; 0 failed;' process-owner-transfer.log
         env:

@@ -686,16 +686,6 @@ impl LaminarDB {
         startup_runtime: RuntimeMode,
     ) -> Result<Option<Arc<dyn object_store::ObjectStore>>, DbError> {
         #[cfg(feature = "cluster")]
-        if startup_runtime == RuntimeMode::Cluster
-            && (!self.mv_registry.lock().is_empty() || !self.mv_store.read().is_empty())
-        {
-            return Err(DbError::InvalidOperation(format!(
-                "[{}] cluster startup found materialized state without a planner-certified distribution and assignment-fenced checkpoint/read lifecycle",
-                laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
-            )));
-        }
-
-        #[cfg(feature = "cluster")]
         let has_injected_decision_store = self.decision_store.lock().is_some();
         #[cfg(not(feature = "cluster"))]
         let has_injected_decision_store = false;

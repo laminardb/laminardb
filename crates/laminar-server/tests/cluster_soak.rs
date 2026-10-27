@@ -32,6 +32,8 @@
 //!   --test cluster_soak single_node_alo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3,iceberg \
 //!   --test cluster_soak three_node_eo_join_kill9_soak -- --ignored --nocapture
+//! cargo test --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka,delta-lake-s3 \
+//!   --test cluster_soak three_node_eo_view_read_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster,kafka,delta-lake-s3 \
 //!   --test cluster_soak single_node_eo_join_kill9_soak -- --ignored --nocapture
 //! cargo test --profile soak -p laminar-server --no-default-features --features cluster \
@@ -115,6 +117,9 @@ mod topology_cut;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology_migration.rs"]
 mod topology_migration;
+#[cfg(feature = "kafka")]
+#[path = "cluster_soak/view_reads.rs"]
+mod view_reads;
 #[cfg(feature = "kafka")]
 mod workload_qualification;
 
@@ -5565,7 +5570,12 @@ fn run_cluster_subscription_observer(
             .checked_add(1)
             .ok_or_else(|| "subscription gateway cursor overflow".to_string())?;
         let resume_epoch = load_subscription_progress(progress_path)?;
-        let Some(mut socket) = connect_cluster_subscription_gateway(gateway, resume_epoch)? else {
+        let Some(mut socket) = connect_cluster_subscription_gateway(
+            CLUSTER_SUBSCRIPTION_SOAK_STREAM,
+            gateway,
+            resume_epoch,
+        )?
+        else {
             std::thread::sleep(Duration::from_millis(100));
             continue;
         };
@@ -5595,6 +5605,7 @@ fn run_cluster_subscription_observer(
 
 #[cfg(feature = "kafka")]
 fn connect_cluster_subscription_gateway(
+    name: &str,
     gateway: usize,
     resume_epoch: Option<u64>,
 ) -> Result<Option<tungstenite::WebSocket<TcpStream>>, String> {
@@ -5616,9 +5627,7 @@ fn connect_cluster_subscription_gateway(
         .set_nodelay(true)
         .map_err(|error| format!("set subscription socket nodelay: {error}"))?;
     let replay = resume_epoch.map_or_else(String::new, |epoch| format!("&as_of_epoch={epoch}"));
-    let request = format!(
-        "ws://127.0.0.1:{port}/ws/{CLUSTER_SUBSCRIPTION_SOAK_STREAM}?token={SOAK_CONSOLE_TOKEN}{replay}"
-    );
+    let request = format!("ws://127.0.0.1:{port}/ws/{name}?token={SOAK_CONSOLE_TOKEN}{replay}");
     match tungstenite::client(request, stream) {
         Ok((socket, response)) if response.status().as_u16() == 101 => Ok(Some(socket)),
         Ok((_, response)) => Err(format!(
@@ -11204,9 +11213,10 @@ fn write_config(
     sink: &str,
     matrix_sinks: &str,
     extra_workload: &str,
+    root: &str,
 ) -> PathBuf {
     let toml = format!(
-        r#"{node}
+        r#"{root}{node}
 # Guaranteed delivery uses engine-owned vnode assignment. The group ID below is only the
 # advisory broker-offset namespace; LaminarDB checkpoints remain the recovery authority.
 {workload}
@@ -11290,6 +11300,7 @@ node_id = "n{id}"
 [server]
 mode = "cluster"
 bind = "127.0.0.1:{http}"
+pgwire_bind = "127.0.0.1:{pgwire}"
 delivery = "{delivery}"
 key_groups = {key_groups}
 console_token = "{SOAK_CONSOLE_TOKEN}"
@@ -11312,6 +11323,7 @@ timeout = "{checkpoint_timeout}"
 
 "#,
         seeds = seeds.join(", "),
+        pgwire = view_reads::pgwire_port(id),
         url = checkpoint_url,
         delivery = delivery.server_value(),
         source_idle_timeout_secs = SOAK_SOURCE_IDLE_TIMEOUT.as_secs(),
@@ -13841,7 +13853,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
 #[ignore = "spawns 3 real laminardb processes; run with --ignored"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false, None);
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, ReaderLeg::None, None);
 }
 
 #[test]
@@ -13850,7 +13862,7 @@ fn three_node_alo_join_kill9_soak() {
 fn three_node_alo_legacy_topology_adoption_restart_soak() {
     run_three_node_join_kill9_soak_with_adoption(
         JoinDelivery::AtLeastOnce,
-        false,
+        ReaderLeg::None,
         None,
         true,
         false,
@@ -13864,7 +13876,7 @@ fn three_node_alo_legacy_topology_adoption_restart_soak() {
 fn three_node_alo_topology_cut_abort_restart_soak() {
     run_three_node_join_kill9_soak_with_adoption(
         JoinDelivery::AtLeastOnce,
-        false,
+        ReaderLeg::None,
         None,
         true,
         true,
@@ -13878,7 +13890,7 @@ fn three_node_alo_topology_cut_abort_restart_soak() {
 fn three_node_alo_public_topology_migration_restart_soak() {
     run_three_node_join_kill9_soak_with_adoption(
         JoinDelivery::AtLeastOnce,
-        false,
+        ReaderLeg::None,
         None,
         true,
         false,
@@ -13890,32 +13902,54 @@ fn three_node_alo_public_topology_migration_restart_soak() {
 #[ignore = "spawns 3 real laminardb processes with a durable WebSocket subscription"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_cluster_subscription_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, true, None);
+    run_three_node_join_kill9_soak(
+        JoinDelivery::AtLeastOnce,
+        ReaderLeg::StreamSubscription,
+        None,
+    );
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with Kafka and Delta S3; run with --ignored"]
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn three_node_eo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, false, None);
+    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, ReaderLeg::None, None);
+}
+
+#[test]
+#[ignore = "spawns 3 real laminardb processes with Kafka and Delta S3, reading materialized views through every fault"]
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn three_node_eo_view_read_kill9_soak() {
+    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, ReaderLeg::Views, None);
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes and injects a follower checkpoint fault"]
 #[cfg(feature = "kafka")]
 fn three_node_follower_checkpoint_fault_recovery_release_regression() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false, Some("follower"));
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, ReaderLeg::None, Some("follower"));
+}
+
+/// The reader a three-node soak runs beside its fault rounds.
+#[cfg(feature = "kafka")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReaderLeg {
+    None,
+    /// A durable WebSocket subscription to `soak_subscription_aggregate`.
+    StreamSubscription,
+    /// Committed reads of materialized views and a view subscription (`view_reads`).
+    Views,
 }
 
 #[cfg(feature = "kafka")]
 fn run_three_node_join_kill9_soak(
     delivery: JoinDelivery,
-    subscription_soak: bool,
+    reader: ReaderLeg,
     forced_fault_role: Option<&str>,
 ) {
     run_three_node_join_kill9_soak_with_adoption(
         delivery,
-        subscription_soak,
+        reader,
         forced_fault_role,
         false,
         false,
@@ -13926,7 +13960,7 @@ fn run_three_node_join_kill9_soak(
 #[cfg(feature = "kafka")]
 fn run_three_node_join_kill9_soak_with_adoption(
     delivery: JoinDelivery,
-    subscription_soak: bool,
+    reader: ReaderLeg,
     forced_fault_role: Option<&str>,
     adopt_legacy: bool,
     prepare_topology_cut: bool,
@@ -14185,9 +14219,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
     let log_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
     std::fs::create_dir(&log_dir).expect("create exclusive cluster soak log directory");
     eprintln!("soak: node logs in {}", log_dir.display());
-    let subscription_workload = subscription_soak
+    let subscription_workload = (reader == ReaderLeg::StreamSubscription)
         .then(cluster_subscription_workload_config)
         .unwrap_or_default();
+    let views_config = if reader == ReaderLeg::Views {
+        view_reads::views_config(kafka_partitions)
+    } else {
+        String::new()
+    };
 
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
@@ -14213,6 +14252,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 &sink_config,
                 &matrix_sink_config,
                 subscription_workload,
+                &views_config,
             ),
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
@@ -14324,12 +14364,15 @@ fn run_three_node_join_kill9_soak_with_adoption(
         Instant::now() + Duration::from_secs(10),
         "stable startup",
     );
-    let mut subscription_observer = subscription_soak.then(|| {
+    let mut subscription_observer = (reader == ReaderLeg::StreamSubscription).then(|| {
         let mut observer = ClusterSubscriptionObserver::spawn(
             dir.path().join("cluster-subscription-progress.log"),
         );
         observer.wait_until_attached(Duration::from_secs(30));
         observer
+    });
+    let mut view_soak = (reader == ReaderLeg::Views).then(|| {
+        view_reads::ViewSoak::start(kafka_partitions, join_keys, zipf_milli, recovery_ceiling)
     });
     latest_checkpoint = assert_temporal_idle_checkpoint(
         &mut nodes,
@@ -14608,6 +14651,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
         let prior_release = migration_probe
             .as_ref()
             .and_then(topology_migration::MigrationProbe::recovery_release);
+        if let Some(views) = view_soak.as_mut() {
+            views.before_fault(victim);
+        }
         let paused = fault.deliver(&mut nodes[victim]);
         if paused.is_some() {
             pauses += 1;
@@ -14802,6 +14848,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
             "soak round {round}: node {victim} rejoined and resumed durable work with exact local assignment evidence in {rejoin_elapsed:?}"
         );
         local_convergence = rejoined_convergence;
+        if let Some(views) = view_soak.as_mut() {
+            views.after_round(latest_checkpoint.epoch, recovery_ceiling);
+        }
         if let Some(probe) = migration_probe.as_mut() {
             probe.assert_rescaled_output(
                 &mut nodes[..],
@@ -15287,6 +15336,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
             observation.last_progress_epoch,
             observation.used_gateways,
             observation.observed_partitions.len(),
+        );
+    }
+    if let Some(views) = view_soak.take() {
+        views.finish(
+            &nodes,
+            latest_checkpoint.epoch,
+            &produced_prefix,
+            recovery_ceiling,
         );
     }
     #[cfg(feature = "delta-lake-s3")]
@@ -19342,8 +19399,18 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
         "",
         "",
         "",
+        &view_reads::views_config(4),
     );
     let config = std::fs::read_to_string(path).unwrap();
+    let parsed: toml::Table = config.parse().unwrap();
+    assert!(parsed["sql"]
+        .as_str()
+        .unwrap()
+        .contains("CREATE MATERIALIZED VIEW soak_view_rows"));
+    assert_eq!(
+        parsed["server"]["pgwire_bind"].as_str(),
+        Some(format!("127.0.0.1:{}", view_reads::pgwire_port(0)).as_str())
+    );
     let (_, checkpoint_and_later) = config.split_once("[checkpoint]").unwrap();
     let (checkpoint, _) = checkpoint_and_later
         .split_once("[checkpoint.storage]")

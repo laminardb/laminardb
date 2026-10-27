@@ -44,12 +44,23 @@ fn event_batch(rows: impl Iterator<Item = (i64, i64, i64)>) -> RecordBatch {
 }
 
 /// Deterministic input spread over every partition; `seed` decorrelates two sources.
-fn events(name: &'static str, seed: i64) -> FixtureSource {
+pub(super) fn events(name: &'static str, seed: i64) -> FixtureSource {
     events_with(name, seed, BATCHES_PER_PARTITION)
 }
 
-fn events_with(name: &'static str, seed: i64, batches: i64) -> FixtureSource {
-    let partitions = (0..PARTITIONS)
+pub(super) fn events_with(name: &'static str, seed: i64, batches: i64) -> FixtureSource {
+    events_in(name, seed, PARTITIONS, batches)
+}
+
+/// [`events_with`] over `partitions` partitions; with fewer partitions than nodes, some nodes
+/// own none.
+pub(super) fn events_in(
+    name: &'static str,
+    seed: i64,
+    partitions: i64,
+    batches: i64,
+) -> FixtureSource {
+    let partitions = (0..partitions)
         .map(|partition| {
             (0..batches)
                 .map(|batch| {
@@ -93,7 +104,7 @@ async fn verdict(case: Case) -> Verdict {
     }
 }
 
-fn assert_rejected(verdict: Verdict, reason: &str) {
+pub(super) fn assert_rejected(verdict: Verdict, reason: &str) {
     match verdict {
         Verdict::Rejected(message) => assert!(message.contains(reason), "{message}"),
         other => panic!("expected cluster rejection containing {reason:?}, got {other:?}"),
@@ -309,7 +320,7 @@ async fn aggregate_over_running_state_stream_is_unsupported_everywhere() {
 
 /// Every partition spans event times 1.000 s to 1.470 s, so the final watermark closes the
 /// 100 ms windows that end at or before 1.400 s.
-const CLOSED_TUMBLE_TRUTH: &str =
+pub(super) const CLOSED_TUMBLE_TRUTH: &str =
     "SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, \
      COUNT(*) AS n, SUM(v) AS s FROM events \
      WHERE ts < CAST(1400000 AS TIMESTAMP(6)) \
@@ -374,7 +385,7 @@ async fn window_over_append_only_stream_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
-const INTERVAL_JOIN: &str = "SELECT o.k AS k, o.v AS ov, p.v AS pv FROM orders o \
+pub(super) const INTERVAL_JOIN: &str = "SELECT o.k AS k, o.v AS ov, p.v AS pv FROM orders o \
      INNER JOIN payments p ON o.k = p.k \
      AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND";
 

@@ -1,6 +1,6 @@
-//! Statement splitting: a stream query whose shape no single managed operator executes — an
-//! aggregate over a join, or an aggregate over an aggregating or joining subquery — is rewritten
-//! into internal named stages that each admit and execute as an ordinary stream.
+//! Statement splitting: a stream or view query whose shape no single managed operator executes —
+//! an aggregate over a join, or an aggregate over an aggregating or joining subquery — is
+//! rewritten into internal named stages that each admit and execute as an ordinary stream.
 //!
 //! INVARIANT: stage names are `<owner>$stage<n>` in creation order. Stage `n` reads only catalog
 //! objects and stages below `n`; the owner's own query reads only its stages.
@@ -16,7 +16,9 @@ use sqlparser::ast::{
 use super::ast::parse_standard_query;
 use crate::error::DbError;
 
-const STAGE_MARKER: &str = "$stage";
+pub(crate) use laminar_core::catalog::stage_owner;
+use laminar_core::catalog::STAGE_MARKER;
+
 /// Each stage is a stream operator; deeper nesting is a query to write as named streams.
 const MAX_STAGES: usize = 8;
 
@@ -34,13 +36,6 @@ pub(crate) struct SplitQuery {
     pub(crate) stages: Vec<StageQuery>,
     /// The owner's query over its stages.
     pub(crate) query_sql: String,
-}
-
-/// The stream that owns `name` when `name` is an internal stage.
-pub(crate) fn stage_owner(name: &str) -> Option<&str> {
-    let (owner, index) = name.rsplit_once(STAGE_MARKER)?;
-    (!owner.is_empty() && !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
-        .then_some(owner)
 }
 
 /// `owner`'s stages among `names`, in creation order.
@@ -414,15 +409,6 @@ mod tests {
         split_stream_query("out", sql, &|name| {
             matches!(name, "count" | "sum" | "avg" | "min" | "max")
         })
-    }
-
-    #[test]
-    fn stage_names_round_trip_to_their_owner() {
-        assert_eq!(stage_owner("out$stage1"), Some("out"));
-        assert_eq!(stage_owner("a$stage2$stage12"), Some("a$stage2"));
-        for name in ["out", "$stage1", "out$stage", "out$stagex", "out$stage1a"] {
-            assert_eq!(stage_owner(name), None, "{name}");
-        }
     }
 
     #[test]

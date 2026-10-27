@@ -14,12 +14,17 @@ use crate::state::{
 };
 
 mod sink_artifacts;
+mod view_log;
 pub use sink_artifacts::{
     checkpoint_artifact_intent_sha256, PreparedSinkArtifactIntent, PreparedSinkDescriptor,
 };
+pub use view_log::{
+    view_log_segment_limit, EventTimeBounds, ViewLog, ViewLogSegment,
+    MAX_CLUSTER_VIEW_LOG_SEGMENTS, MAX_VIEW_LOG_SEGMENTS,
+};
 
 /// Current checkpoint manifest format. Every other version is rejected.
-pub const CHECKPOINT_MANIFEST_VERSION: u32 = 10;
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 11;
 
 /// Canonical pipeline-identity payload version.
 pub const PIPELINE_IDENTITY_VERSION: u16 = 8;
@@ -218,7 +223,7 @@ pub struct CheckpointManifest {
     pub checkpoint_watermark: Option<i64>,
     /// Canonically ordered per-channel watermarks and idle/uninitialized states.
     pub channel_progress: Vec<ChannelProgress>,
-    /// The only data object written by this node for this checkpoint.
+    /// The state data object written by this node for this checkpoint.
     pub node_data: NodeDataObject,
     /// Canonically ordered complete logical state inventory.
     pub state_frames: Vec<StateFrame>,
@@ -232,6 +237,13 @@ pub struct CheckpointManifest {
     /// Participant-local subscription output ranges and immutable segment references.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_output: Option<NodeSubscriptionManifest>,
+    /// The view-log object this node wrote for this checkpoint, at the `node_data` chunk
+    /// identity; `None` when no view appended rows.
+    pub view_log: Option<NodeDataObject>,
+    /// Canonically ordered append-only view logs retained at this cut.
+    pub view_logs: Vec<ViewLog>,
+    /// Canonically ordered older view-log objects retained by `view_logs`.
+    pub referenced_view_logs: Vec<ReferencedStateChunk>,
 }
 
 /// Errors found during manifest validation.
@@ -298,6 +310,9 @@ impl CheckpointManifest {
             sink_artifact_intents: Vec::new(),
             referenced_chunks: Vec::new(),
             subscription_output: None,
+            view_log: None,
+            view_logs: Vec::new(),
+            referenced_view_logs: Vec::new(),
         }
     }
 
@@ -307,7 +322,7 @@ impl CheckpointManifest {
         self.node_data.chunk.participant_id = participant_id;
     }
 
-    /// Validate the exact v10 recovery contract.
+    /// Validate the exact v11 recovery contract.
     #[must_use]
     pub fn validate(
         &self,
@@ -614,6 +629,7 @@ fn validate_topology(
     if let Some(message) = subscription_output_validation_error(manifest) {
         error(message);
     }
+    view_log::validate_view_logs(manifest, error);
 }
 
 fn validate_cluster_topology(

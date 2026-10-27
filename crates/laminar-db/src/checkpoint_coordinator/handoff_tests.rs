@@ -154,6 +154,7 @@ async fn handoff_fixture() -> HandoffFixture {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
     let manifest_bytes = index

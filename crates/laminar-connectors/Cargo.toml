@@ -157,8 +157,7 @@ default = [
 ]
 testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest", "dep:zstd", "changelog-collapse"]
-# zstd record compression in librdkafka. zstd-sys generates its bindings with bindgen, so this
-# build additionally needs libclang.
+# zstd record compression in librdkafka.
 kafka-zstd = ["kafka", "rdkafka/zstd"]
 postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:webpki-roots", "changelog-collapse"]
