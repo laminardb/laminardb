@@ -2347,6 +2347,38 @@ async fn manual_checkpoint_before_start_fails_closed() {
     );
 }
 
+#[tokio::test]
+async fn recent_read_checkpoints_need_a_shorter_periodic_interval() {
+    for (interval_ms, recent_read_interval_ms) in
+        [(None, 100), (Some(1_000), 0), (Some(1_000), 1_000)]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LaminarDB::open_with_config(LaminarConfig {
+            storage_dir: Some(dir.path().to_path_buf()),
+            checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms,
+                recent_read_interval_ms: Some(recent_read_interval_ms),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        for statement in [
+            "CREATE SOURCE events (k BIGINT)",
+            "CREATE STREAM keys AS SELECT k FROM events",
+        ] {
+            db.execute(statement).await.unwrap();
+        }
+        let error = db.start().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("recent-read checkpoint interval"),
+            "{interval_ms:?}/{recent_read_interval_ms}: {error}"
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn admitted_manual_checkpoint_wait_is_bounded_until_exact_attempt_reservation() {
     let db = LaminarDB::open_with_config(LaminarConfig {

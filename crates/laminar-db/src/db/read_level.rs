@@ -158,7 +158,12 @@ impl LaminarDB {
     ) -> Result<PinnedCut, DbError> {
         let arrived = Instant::now();
         let pinned = match self.recency_targets(scanned, deadline).await {
-            Ok(targets) => views.pin_covering(&targets, at_least, deadline).await,
+            Ok(targets) => {
+                let expedite = |epoch| self.expedite_checkpoint(epoch);
+                views
+                    .pin_covering(&targets, at_least, deadline, &expedite)
+                    .await
+            }
             Err(error) => Err(error),
         };
         if let Some(metrics) = self.engine_metrics.lock().as_ref() {

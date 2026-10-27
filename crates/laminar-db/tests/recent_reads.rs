@@ -1,6 +1,7 @@
 //! Recent reads through Kafka: a read waits for the first committed checkpoint that holds every
 //! record its views' sources had upstream when it arrived, so a client reads its own writes,
-//! past transaction markers and without waiting for an open transaction.
+//! past transaction markers and without waiting for an open transaction. A waiting read brings
+//! the next periodic checkpoint forward when the configuration allows it.
 //!
 //! It skips when the default local address is absent, but a configured `LAMINAR_KAFKA_BROKERS`
 //! must be reachable. Run with:
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
+use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{
     CommittedQuery, CommittedRead, CommittedReadError, DbError, EngineMetrics, LaminarConfig,
     LaminarDB,
@@ -89,13 +91,22 @@ fn produce(producer: &BaseProducer, topic: &str, ids: std::ops::Range<i64>) {
     producer.flush(Duration::from_secs(10)).expect("flush");
 }
 
-async fn open(brokers: &str, topic: &str, storage: &std::path::Path) -> Arc<LaminarDB> {
+fn manual() -> StreamCheckpointConfig {
+    StreamCheckpointConfig {
+        interval_ms: None,
+        ..Default::default()
+    }
+}
+
+async fn open(
+    brokers: &str,
+    topic: &str,
+    storage: &std::path::Path,
+    checkpoint: StreamCheckpointConfig,
+) -> Arc<LaminarDB> {
     let db = LaminarDB::open_with_config(LaminarConfig {
         storage_dir: Some(storage.to_path_buf()),
-        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
-            interval_ms: None,
-            ..Default::default()
-        }),
+        checkpoint: Some(checkpoint),
         ..LaminarConfig::default()
     })
     .expect("open");
@@ -157,7 +168,7 @@ async fn a_recent_read_holds_every_record_written_before_it() {
     };
     let topic = create_topic(&brokers).await;
     let dir = tempfile::tempdir().unwrap();
-    let db = open(&brokers, &topic, dir.path()).await;
+    let db = open(&brokers, &topic, dir.path(), manual()).await;
     let metrics = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
     db.set_engine_metrics(Arc::clone(&metrics));
     let plain = producer(&brokers, false);
@@ -208,7 +219,7 @@ async fn a_recent_read_passes_transaction_markers_and_skips_open_transactions() 
     };
     let topic = create_topic(&brokers).await;
     let dir = tempfile::tempdir().unwrap();
-    let db = open(&brokers, &topic, dir.path()).await;
+    let db = open(&brokers, &topic, dir.path(), manual()).await;
 
     let committed = producer(&brokers, true);
     committed.begin_transaction().unwrap();
@@ -238,7 +249,7 @@ async fn a_recent_read_waits_only_for_the_sources_behind_its_views() {
     };
     let topic = create_topic(&brokers).await;
     let dir = tempfile::tempdir().unwrap();
-    let db = open(&brokers, &topic, dir.path()).await;
+    let db = open(&brokers, &topic, dir.path(), manual()).await;
     produce(&producer(&brokers, false), &topic, 0..5);
 
     // `pushed` has no upstream to ask, so it is not part of a read of `totals`.
@@ -254,5 +265,36 @@ async fn a_recent_read_waits_only_for_the_sources_behind_its_views() {
         ),
         "{error}"
     );
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_waiting_recent_read_brings_the_next_periodic_checkpoint_forward() {
+    let Some(brokers) = broker() else {
+        eprintln!("skipping: no Kafka broker at {DEFAULT_BROKERS}");
+        return;
+    };
+    let topic = create_topic(&brokers).await;
+    let dir = tempfile::tempdir().unwrap();
+    // No periodic checkpoint is due within the read deadline; only the reads' requests are.
+    let checkpoint = StreamCheckpointConfig {
+        interval_ms: Some(600_000),
+        recent_read_interval_ms: Some(100),
+        ..Default::default()
+    };
+    let db = open(&brokers, &topic, dir.path(), checkpoint).await;
+    let plain = producer(&brokers, false);
+
+    let mut epoch = 0;
+    for written in [10, 20, 30] {
+        produce(&plain, &topic, written - 10..written);
+        let read = db
+            .query_committed(TOTAL, CommittedRead::Recent { at_least: 0 })
+            .await
+            .unwrap();
+        assert_eq!(total(&read), written);
+        assert!(read.epoch > epoch);
+        epoch = read.epoch;
+    }
     db.shutdown().await.unwrap();
 }

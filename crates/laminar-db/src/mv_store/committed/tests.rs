@@ -667,7 +667,9 @@ async fn a_recent_read_waits_for_a_cut_that_holds_every_source() {
         ._cuts
         .send_replace(Some(Arc::new(with_events(&synthesized, 1, None))));
     let targets = targets(5);
-    let read = synthesized.views.pin_covering(&targets, 0, deadline());
+    let read = synthesized
+        .views
+        .pin_covering(&targets, 0, deadline(), &|_| {});
     tokio::pin!(read);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut read)
@@ -681,7 +683,12 @@ async fn a_recent_read_waits_for_a_cut_that_holds_every_source() {
     synthesized
         ._cuts
         .send_replace(Some(Arc::new(with_events(&synthesized, 2, Some("4")))));
-    let error = refused(synthesized.views.pin_covering(&targets, 0, soon()).await);
+    let error = refused(
+        synthesized
+            .views
+            .pin_covering(&targets, 0, soon(), &|_| {})
+            .await,
+    );
     assert!(
         matches!(
             &error,
@@ -698,7 +705,12 @@ async fn a_recent_read_composes_with_its_floor_and_reports_probe_failures() {
     synthesized
         ._cuts
         .send_replace(Some(Arc::new(with_events(&synthesized, 2, Some("5")))));
-    let error = refused(synthesized.views.pin_covering(&targets(5), 3, soon()).await);
+    let error = refused(
+        synthesized
+            .views
+            .pin_covering(&targets(5), 3, soon(), &|_| {})
+            .await,
+    );
     assert!(
         matches!(
             error,
@@ -712,7 +724,7 @@ async fn a_recent_read_composes_with_its_floor_and_reports_probe_failures() {
     assert_eq!(
         synthesized
             .views
-            .pin_covering(&targets(5), 2, soon())
+            .pin_covering(&targets(5), 2, soon(), &|_| {})
             .await
             .unwrap()
             .epoch,
@@ -725,12 +737,63 @@ async fn a_recent_read_composes_with_its_floor_and_reports_probe_failures() {
         laminar_core::checkpoint::ConnectorCheckpoint::new(),
     );
     synthesized._cuts.send_replace(Some(Arc::new(unreadable)));
-    let error = refused(synthesized.views.pin_covering(&targets(5), 0, soon()).await);
+    let error = refused(
+        synthesized
+            .views
+            .pin_covering(&targets(5), 0, soon(), &|_| {})
+            .await,
+    );
     assert!(
         matches!(
             &error,
             DbError::CommittedRead(CommittedReadError::RecencyProbe { input, .. }) if input == "events"
         ),
         "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_recent_read_asks_for_each_epoch_it_waits_for() {
+    let synthesized = synthesized_cut().await;
+    let original = with_events(&synthesized, 2, Some("5"));
+    synthesized
+        ._cuts
+        .send_replace(Some(Arc::new(with_events(&synthesized, 1, Some("4")))));
+    let asked = parking_lot::Mutex::new(Vec::new());
+    let expedite = |epoch| asked.lock().push(epoch);
+    let waiting = targets(5);
+    let read = synthesized
+        .views
+        .pin_covering(&waiting, 0, deadline(), &expedite);
+    tokio::pin!(read);
+    assert!(tokio::time::timeout(Duration::from_millis(100), &mut read)
+        .await
+        .is_err());
+    assert_eq!(
+        *asked.lock(),
+        [2],
+        "a cut that does not hold the read asks for the next"
+    );
+    synthesized._cuts.send_replace(Some(Arc::new(original)));
+    assert_eq!(read.await.unwrap().epoch, 2);
+
+    let held = synthesized
+        .views
+        .pin_covering(&targets(5), 0, deadline(), &expedite)
+        .await
+        .unwrap();
+    assert_eq!(held.epoch, 2);
+    assert_eq!(*asked.lock(), [2], "the newest cut held the read");
+
+    refused(
+        synthesized
+            .views
+            .pin_covering(&targets(5), 4, soon(), &expedite)
+            .await,
+    );
+    assert_eq!(
+        *asked.lock(),
+        [2, 4],
+        "a floor not yet committed is asked for"
     );
 }

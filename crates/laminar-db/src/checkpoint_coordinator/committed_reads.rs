@@ -1,6 +1,10 @@
-//! Committed cuts as in-process readers see them, and the pins that hold a cut against local
-//! checkpoint retention while a read loads its artifacts.
+//! Committed cuts as in-process readers see them, the pins that hold a cut against local
+//! checkpoint retention while a read loads its artifacts, and the demand of reads waiting for a
+//! newer cut.
 
+#[cfg(feature = "cluster")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -176,6 +180,38 @@ impl ReadPins {
     }
 }
 
+/// Reads waiting for a cut that has not committed, asking for the next periodic checkpoint early.
+#[derive(Debug, Default)]
+pub(crate) struct CheckpointDemand {
+    requested: AtomicBool,
+    /// One past the newest epoch a read on this node asked the cluster leader for.
+    #[cfg(feature = "cluster")]
+    forwarded: AtomicU64,
+}
+
+impl CheckpointDemand {
+    pub(crate) fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    /// A checkpoint reserved now injects its barriers after every request so far.
+    pub(crate) fn clear(&self) {
+        self.requested.store(false, Ordering::Release);
+    }
+
+    /// Whether a read waiting for `epoch` is the first on this node to ask the leader for it.
+    /// A later read that the leader's next cut does not cover asks again for the epoch after.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn first_to_forward(&self, epoch: u64) -> bool {
+        let past = epoch.saturating_add(1);
+        self.forwarded.fetch_max(past, Ordering::AcqRel) < past
+    }
+}
+
 impl CheckpointCoordinator {
     /// Readers of committed cuts: the latest cut and the pins retention honours.
     pub(crate) fn committed_reads(&self) -> (CommittedCuts, Arc<ReadPins>) {
@@ -298,5 +334,20 @@ mod tests {
             pins.acquire(&cut(1), later(60)),
             PinAcquire::Capacity
         ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn a_node_forwards_one_request_per_epoch() {
+        let demand = CheckpointDemand::default();
+        assert!(demand.first_to_forward(0));
+        assert!(!demand.first_to_forward(0));
+        assert!(demand.first_to_forward(3));
+        assert!(
+            !demand.first_to_forward(2),
+            "the request for 3 asked for a later cut"
+        );
+        assert!(!demand.first_to_forward(3));
+        assert!(demand.first_to_forward(4));
     }
 }

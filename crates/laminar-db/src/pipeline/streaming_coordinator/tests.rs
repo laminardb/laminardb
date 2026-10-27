@@ -2162,6 +2162,7 @@ fn test_coordinator(
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule,
+            recent_read_checkpoints: None,
             delivery_guarantee,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -3715,6 +3716,65 @@ async fn topology_submission_hold_defers_only_periodic_admission() {
         .await
         .expect("manual checkpoints must ignore the topology submission hold");
     assert!(admission.manual);
+}
+
+#[tokio::test]
+async fn a_waiting_recent_read_brings_the_periodic_checkpoint_forward() {
+    let demand =
+        Arc::new(crate::checkpoint_coordinator::committed_reads::CheckpointDemand::default());
+    let interval = Duration::from_millis(200);
+    let mut coordinator = admission_coordinator(Vec::new());
+    coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(Duration::from_secs(60));
+    coordinator.config.recent_read_checkpoints =
+        Some(crate::pipeline::config::RecentReadCheckpoints {
+            interval,
+            demand: Arc::clone(&demand),
+        });
+    coordinator.last_checkpoint = Instant::now() - interval;
+    let mut callback = MockCallback::new();
+    assert!(coordinator
+        .checkpoint_admission(&mut callback)
+        .await
+        .is_none());
+
+    demand.request();
+    callback.periodic_checkpoints_held = true;
+    assert!(
+        coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none(),
+        "a topology hold defers it like any periodic cut"
+    );
+    callback.periodic_checkpoints_held = false;
+    callback.runtime.leader = false;
+    assert!(
+        coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none(),
+        "only the leader starts checkpoints"
+    );
+    callback.runtime.leader = true;
+    coordinator.last_checkpoint = Instant::now();
+    assert!(
+        coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none(),
+        "it waits its interval after the last checkpoint ended"
+    );
+
+    coordinator.last_checkpoint = Instant::now() - interval;
+    let attempt = CheckpointAttempt::new(16, 16);
+    callback.attempt_to_reserve = attempt;
+    callback.barrier_outcome = Some(BarrierOutcome::Async);
+    coordinator.maybe_checkpoint(&mut callback).await;
+    assert_eq!(callback.reserve_calls, 1);
+    assert!(
+        !demand.requested(),
+        "the reserved checkpoint's barriers follow every request so far"
+    );
 }
 
 #[tokio::test]
@@ -10091,6 +10151,7 @@ async fn test_coordinator_direct_channel() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -10550,6 +10611,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -10842,6 +10904,7 @@ async fn test_barrier_excludes_post_barrier_data() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -11032,6 +11095,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,
@@ -11471,6 +11535,7 @@ async fn test_drain_skip_under_backpressure() {
             source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
+            recent_read_checkpoints: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             checkpoint_timeout: Duration::from_secs(30),
             cycle_budget_ns: 10_000_000,

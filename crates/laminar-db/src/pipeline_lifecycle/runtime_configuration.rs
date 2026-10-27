@@ -5,6 +5,7 @@ use std::time::Duration;
 use laminar_connectors::connector::SourceReplayOrder;
 
 use super::{DbError, LaminarDB, PipelineWatermarks, TrackedSourceRegistration};
+use crate::pipeline::config::RecentReadCheckpoints;
 use crate::pipeline::{CheckpointSchedule, PipelineConfig};
 
 impl LaminarDB {
@@ -28,6 +29,7 @@ impl LaminarDB {
                 Duration::from_millis(1)
             },
             checkpoint_schedule,
+            recent_read_checkpoints: self.recent_read_checkpoints(checkpoint_schedule)?,
             batch_window: self
                 .config
                 .pipeline_batch_window
@@ -49,6 +51,36 @@ impl LaminarDB {
         };
         configure_replay_batch_cuts(sources, watermarks, &mut config)?;
         Ok(config)
+    }
+
+    fn recent_read_checkpoints(
+        &self,
+        schedule: CheckpointSchedule,
+    ) -> Result<Option<RecentReadCheckpoints>, DbError> {
+        let Some(interval_ms) = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.recent_read_interval_ms)
+        else {
+            return Ok(None);
+        };
+        let interval = Duration::from_millis(interval_ms);
+        if interval.is_zero()
+            || schedule
+                .periodic_interval()
+                .is_none_or(|periodic| interval >= periodic)
+        {
+            return Err(DbError::Config(
+                "the recent-read checkpoint interval must be greater than zero and shorter than \
+                 the periodic checkpoint interval"
+                    .into(),
+            ));
+        }
+        Ok(Some(RecentReadCheckpoints {
+            interval,
+            demand: self.mv_store.read().checkpoint_demand(),
+        }))
     }
 }
 

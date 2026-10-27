@@ -58,17 +58,22 @@ impl RecencyTargets {
 impl CommittedViews {
     /// Pin the newest committed cut at or after `at_least` that holds every target, waiting for
     /// one until `deadline`. Positions only grow, so a source one cut holds is held by every
-    /// later cut and is not checked again.
+    /// later cut and is not checked again. Before waiting for an epoch that has not committed,
+    /// the read calls `expedite` with it.
     pub(crate) async fn pin_covering(
         &self,
         targets: &RecencyTargets,
         at_least: u64,
         deadline: Instant,
+        expedite: &(dyn Fn(u64) + Sync),
     ) -> Result<PinnedCut, DbError> {
         let mut covered = vec![false; targets.targets.len()];
         let mut next = at_least;
         // Each pass needs a newer cut than the last, so the deadline ends the loop.
         loop {
+            if self.latest().is_none_or(|cut| cut.index.epoch < next) {
+                expedite(next);
+            }
             let cut = match self.await_epoch(Some(next), deadline).await {
                 Ok(cut) => cut,
                 Err(floor_not_committed) if next == at_least && at_least > 0 => {
