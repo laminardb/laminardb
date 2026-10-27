@@ -167,6 +167,10 @@ pub struct ServerSection {
     /// Retained-memory charge limit per local MV; must be nonzero.
     #[serde(default = "default_materialized_view_max_bytes")]
     pub materialized_view_max_bytes: usize,
+    /// Byte budget of committed view state decoded for reads and cached by digest; zero
+    /// disables the cache.
+    #[serde(default = "default_materialized_view_read_cache_bytes")]
+    pub materialized_view_read_cache_bytes: usize,
     /// Pipeline-wide charged-byte budget for managed operator state (keyed aggregates, windows,
     /// joins). `None` uses 256 MiB; configured budgets must be greater than zero.
     #[serde(default)]
@@ -259,6 +263,7 @@ impl Default for ServerSection {
             reference_table_max_bytes: default_reference_table_max_bytes(),
             materialized_view_max_rows: default_materialized_view_max_rows(),
             materialized_view_max_bytes: default_materialized_view_max_bytes(),
+            materialized_view_read_cache_bytes: default_materialized_view_read_cache_bytes(),
             pipeline_max_managed_state_bytes: None,
             pipeline_max_input_buf_batches: None,
             pipeline_max_input_buf_bytes: None,
@@ -292,6 +297,7 @@ impl ServerSection {
             .reference_table_max_bytes(self.reference_table_max_bytes)
             .materialized_view_max_rows(self.materialized_view_max_rows)
             .materialized_view_max_bytes(self.materialized_view_max_bytes)
+            .materialized_view_read_cache_bytes(self.materialized_view_read_cache_bytes)
             .datafusion_memory_limit_bytes(self.datafusion_memory_limit_bytes)
             .source_queue_max_bytes(self.source_queue_max_bytes);
         if let Some(bytes) = self.pipeline_max_managed_state_bytes {
@@ -396,6 +402,10 @@ fn default_materialized_view_max_rows() -> usize {
 
 fn default_materialized_view_max_bytes() -> usize {
     laminar_db::DEFAULT_MATERIALIZED_VIEW_MAX_BYTES
+}
+
+fn default_materialized_view_read_cache_bytes() -> usize {
+    laminar_db::DEFAULT_MATERIALIZED_VIEW_READ_CACHE_BYTES
 }
 
 fn default_reference_table_max_bytes() -> usize {

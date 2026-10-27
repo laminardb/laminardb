@@ -1917,13 +1917,19 @@ fn materialized_view_memory_limits_parse_and_validate() {
             .to_string()
             .contains("materialized_view"));
     }
+    assert_eq!(
+        default.server.materialized_view_read_cache_bytes,
+        laminar_db::DEFAULT_MATERIALIZED_VIEW_READ_CACHE_BYTES
+    );
     let configured: ServerConfig = toml::from_str(
-        "[server]\nmaterialized_view_max_rows = 42\nmaterialized_view_max_bytes = 8192",
+        "[server]\nmaterialized_view_max_rows = 42\nmaterialized_view_max_bytes = 8192\n\
+         materialized_view_read_cache_bytes = 0",
     )
     .unwrap();
     validate_config(&configured).unwrap();
     assert_eq!(configured.server.materialized_view_max_rows, 42);
     assert_eq!(configured.server.materialized_view_max_bytes, 8192);
+    assert_eq!(configured.server.materialized_view_read_cache_bytes, 0);
 }
 
 #[tokio::test]

@@ -37,6 +37,13 @@ struct SinkResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct SqlRequest {
     sql: String,
+    /// How a query reads materialized views: `latest` or `committed`. Omitted, it is the
+    /// database's default: latest locally, committed on a cluster node.
+    #[serde(default)]
+    read_level: Option<String>,
+    /// The earliest epoch a committed query may read.
+    #[serde(default)]
+    min_epoch: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,10 +60,21 @@ struct SqlResponse {
     /// when the result is complete.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
+    /// The committed checkpoint a committed query read.
+    #[serde(flatten)]
+    cut: Option<CutResponse>,
     /// Durable admission receipt; its phase distinguishes Commit from actual target Release.
     #[cfg(feature = "cluster")]
     #[serde(skip_serializing_if = "Option::is_none")]
     topology_operation: Option<Box<laminar_core::cluster::control::TopologyAdmissionStatus>>,
+}
+
+/// Epoch, checkpoint and capture time (Unix milliseconds) of a committed read.
+#[derive(Debug, Serialize)]
+struct CutResponse {
+    epoch: u64,
+    checkpoint_id: u64,
+    taken_at_ms: u64,
 }
 
 /// Trim `batches` to at most `cap` rows, returning the trimmed batches and
@@ -98,6 +116,9 @@ pub(super) async fn execute_sql(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SqlRequest>,
 ) -> impl IntoResponse {
+    if is_query(&req.sql) {
+        return read_sql(&state.db, &req).await;
+    }
     match state.db.execute(&req.sql).await {
         Ok(result) => {
             use laminar_db::ExecuteResult;
@@ -108,6 +129,7 @@ pub(super) async fn execute_sql(
                     rows_affected: None,
                     data: None,
                     truncated: false,
+                    cut: None,
                     #[cfg(feature = "cluster")]
                     topology_operation: info.topology_operation,
                 },
@@ -117,6 +139,7 @@ pub(super) async fn execute_sql(
                     rows_affected: Some(n),
                     data: None,
                     truncated: false,
+                    cut: None,
                     #[cfg(feature = "cluster")]
                     topology_operation: None,
                 },
@@ -137,52 +160,25 @@ pub(super) async fn execute_sql(
                         rows_affected: None,
                         data: Some(data),
                         truncated: false,
+                        cut: None,
                         #[cfg(feature = "cluster")]
                         topology_operation: None,
                     }
                 }
                 ExecuteResult::Query(mut handle) => {
-                    let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
-                    let mut total_rows = 0;
-                    let mut timed_out = false;
-                    if let Ok(mut rows) = handle.subscribe_raw() {
-                        // Gather one batch *past* the cap so `cap_result` can tell
-                        // "exactly at the cap" (complete) from "more rows exist".
-                        let collect = async {
-                            while let Some(batch) = rows.next_batch().await? {
-                                total_rows += batch.num_rows();
-                                batches.push(batch);
-                                if total_rows > MAX_SQL_RESULT_ROWS {
-                                    break;
-                                }
-                            }
-                            Ok::<(), laminar_db::DbError>(())
-                        };
-                        match tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => {
-                                return error_response(StatusCode::BAD_REQUEST, e.to_string())
-                                    .into_response();
-                            }
-                            Err(_) => timed_out = true,
-                        }
-                    }
-                    // Trim to the cap; `over_cap` true means rows were dropped.
-                    // A timeout also leaves `data` a prefix of the full result.
-                    let (batches, over_cap) = cap_result(batches, MAX_SQL_RESULT_ROWS);
-                    let raw_data = if batches.is_empty() {
-                        serde_json::value::RawValue::from_string("[]".to_string()).ok()
-                    } else {
-                        batches_to_json_raw(&batches).ok()
+                    let Ok(rows) = handle.subscribe_raw() else {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "query rows were already taken".to_string(),
+                        )
+                        .into_response();
                     };
-                    SqlResponse {
-                        result_type: "query".to_string(),
-                        object_name: None,
-                        rows_affected: None,
-                        data: raw_data,
-                        truncated: over_cap || timed_out,
-                        #[cfg(feature = "cluster")]
-                        topology_operation: None,
+                    match query_response(rows, None).await {
+                        Ok(response) => response,
+                        Err(e) => {
+                            return error_response(StatusCode::BAD_REQUEST, e.to_string())
+                                .into_response()
+                        }
                     }
                 }
             };
@@ -206,6 +202,105 @@ pub(super) async fn execute_sql(
             error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
     }
+}
+
+/// One query, which reads views at the request's level; everything else goes through `execute`.
+fn is_query(sql: &str) -> bool {
+    use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
+    matches!(
+        parse_streaming_sql(sql).as_deref(),
+        Ok([StreamingStatement::Standard(statement)])
+            if matches!(**statement, sqlparser::ast::Statement::Query(_))
+    )
+}
+
+async fn read_sql(db: &laminar_db::LaminarDB, req: &SqlRequest) -> axum::response::Response {
+    let level = match read_level(db, req) {
+        Ok(level) => level,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let read = match db.read(&req.sql, level).await {
+        Ok(read) => read,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+    match query_response(read.rows, read.cut).await {
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
+fn read_level(
+    db: &laminar_db::LaminarDB,
+    req: &SqlRequest,
+) -> Result<laminar_db::ReadLevel, String> {
+    use laminar_db::{CommittedRead, ReadLevel};
+    let level = match req.read_level.as_deref() {
+        None => db.default_read_level(),
+        Some("latest") => ReadLevel::Latest,
+        Some("committed") => ReadLevel::Committed(CommittedRead::Latest),
+        Some(other) => {
+            return Err(format!(
+                "read_level must be 'latest' or 'committed', not '{other}'"
+            ))
+        }
+    };
+    match (level, req.min_epoch) {
+        (level, None) => Ok(level),
+        (ReadLevel::Committed(_), Some(epoch)) => {
+            Ok(ReadLevel::Committed(CommittedRead::AtLeast(epoch)))
+        }
+        (ReadLevel::Latest, Some(_)) => Err("min_epoch applies only to committed reads".into()),
+    }
+}
+
+/// Up to `MAX_SQL_RESULT_ROWS` of `rows`, gathered within `SQL_RESULT_TIMEOUT`.
+async fn query_response(
+    mut rows: laminar_db::QueryRows,
+    cut: Option<laminar_db::ReadCut>,
+) -> Result<SqlResponse, laminar_db::DbError> {
+    let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
+    let mut total_rows = 0;
+    // Gather one batch *past* the cap so `cap_result` can tell
+    // "exactly at the cap" (complete) from "more rows exist".
+    let collect = async {
+        while let Some(batch) = rows.next_batch().await? {
+            total_rows += batch.num_rows();
+            batches.push(batch);
+            if total_rows > MAX_SQL_RESULT_ROWS {
+                break;
+            }
+        }
+        Ok::<(), laminar_db::DbError>(())
+    };
+    let timed_out = match tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await {
+        Ok(collected) => {
+            collected?;
+            false
+        }
+        Err(_) => true,
+    };
+    // Trim to the cap; `over_cap` true means rows were dropped.
+    // A timeout also leaves `data` a prefix of the full result.
+    let (batches, over_cap) = cap_result(batches, MAX_SQL_RESULT_ROWS);
+    let data = if batches.is_empty() {
+        serde_json::value::RawValue::from_string("[]".to_string()).ok()
+    } else {
+        batches_to_json_raw(&batches).ok()
+    };
+    Ok(SqlResponse {
+        result_type: "query".to_string(),
+        object_name: None,
+        rows_affected: None,
+        data,
+        truncated: over_cap || timed_out,
+        cut: cut.map(|cut| CutResponse {
+            epoch: cut.epoch,
+            checkpoint_id: cut.checkpoint_id,
+            taken_at_ms: cut.taken_at_ms,
+        }),
+        #[cfg(feature = "cluster")]
+        topology_operation: None,
+    })
 }
 
 pub(super) async fn list_sources(State(state): State<Arc<AppState>>) -> impl IntoResponse {

@@ -1705,6 +1705,122 @@ async fn exec_sql(app: &Router, sql: &str) {
     assert_eq!(resp.status(), StatusCode::OK, "exec failed: {sql}");
 }
 
+/// POST `body` to `/api/v1/sql` and return the status and JSON response.
+async fn post_sql(app: &Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/sql")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// A query reads views at the request's level: latest by default, or the committed checkpoint,
+/// whose epoch, checkpoint and capture time the response reports.
+#[tokio::test]
+async fn sql_queries_read_views_at_the_requested_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(laminar_db::LaminarConfig {
+        storage_dir: Some(dir.path().to_path_buf()),
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..laminar_core::streaming::StreamCheckpointConfig::default()
+        }),
+        ..laminar_db::LaminarConfig::default()
+    })
+    .unwrap();
+    let state = test_state_with_db(Arc::clone(&db));
+    let app = build_router(state);
+    exec_sql(&app, "CREATE SOURCE events (id BIGINT)").await;
+    exec_sql(
+        &app,
+        "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM events GROUP BY id",
+    )
+    .await;
+    db.start().await.unwrap();
+    let push = |id: i64| {
+        let batch = arrow_array::RecordBatch::try_from_iter_with_nullable(vec![(
+            "id",
+            Arc::new(arrow_array::Int64Array::from(vec![id])) as arrow_array::ArrayRef,
+            true,
+        )])
+        .unwrap();
+        db.source_untyped("events")
+            .unwrap()
+            .push_arrow(batch)
+            .unwrap();
+    };
+    let query = "SELECT id FROM counts ORDER BY id";
+    let read = |level: serde_json::Value| {
+        let app = &app;
+        async move {
+            let mut body = serde_json::json!({ "sql": query });
+            body.as_object_mut()
+                .unwrap()
+                .extend(level.as_object().unwrap().clone());
+            post_sql(app, body).await
+        }
+    };
+
+    push(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (_, response) = read(serde_json::json!({})).await;
+        // Int64 values are JSON strings, which keep their precision.
+        if response["data"] == serde_json::json!([{ "id": "1" }]) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "row 1 never arrived: {response}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let epoch = db.checkpoint().await.unwrap().epoch;
+    push(2);
+    while read(serde_json::json!({})).await.1["data"]
+        .as_array()
+        .unwrap()
+        .len()
+        < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "row 2 never arrived"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let (status, latest) = read(serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(latest.get("epoch").is_none(), "{latest}");
+    let (status, committed) = read(serde_json::json!({ "read_level": "committed" })).await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert_eq!(committed["data"], serde_json::json!([{ "id": "1" }]));
+    assert_eq!(committed["epoch"], epoch);
+    assert!(committed["checkpoint_id"].is_u64() && committed["taken_at_ms"].is_u64());
+
+    let (status, at_least) =
+        read(serde_json::json!({ "read_level": "committed", "min_epoch": epoch })).await;
+    assert_eq!(
+        (status, at_least["epoch"].clone()),
+        (StatusCode::OK, epoch.into())
+    );
+    for invalid in [
+        serde_json::json!({ "read_level": "eventual" }),
+        serde_json::json!({ "min_epoch": epoch }),
+    ] {
+        assert_eq!(read(invalid).await.0, StatusCode::BAD_REQUEST);
+    }
+    db.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn test_list_mvs_empty() {
     let state = test_state();

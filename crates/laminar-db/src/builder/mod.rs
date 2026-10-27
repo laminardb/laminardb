@@ -432,6 +432,14 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Set the byte budget of committed view state decoded for reads and cached by digest
+    /// (default 256 MiB). Zero disables the cache.
+    #[must_use]
+    pub fn materialized_view_read_cache_bytes(mut self, bytes: usize) -> Self {
+        self.config.materialized_view_read_cache_bytes = bytes;
+        self
+    }
+
     /// Per-port operator input-buffer cap in batches (default 256).
     #[must_use]
     pub fn pipeline_max_input_buf_batches(mut self, batches: usize) -> Self {
