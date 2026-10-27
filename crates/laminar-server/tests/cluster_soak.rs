@@ -3224,7 +3224,38 @@ impl Drop for Node {
 struct ProducerGuard {
     stop: Arc<AtomicBool>,
     enqueued: Arc<AtomicU64>,
+    acknowledged: Arc<AcknowledgedIds>,
     handle: Option<JoinHandle<ProducedPrefix>>,
+}
+
+/// The highest `join_left` id the broker has acknowledged on each Kafka partition.
+#[cfg(feature = "kafka")]
+struct AcknowledgedIds {
+    /// Per partition, that id plus one; zero while none is acknowledged.
+    next: Vec<AtomicU64>,
+}
+
+#[cfg(feature = "kafka")]
+impl AcknowledgedIds {
+    fn new(partitions: i32) -> Self {
+        let partitions = usize::try_from(partitions).expect("positive Kafka partition count");
+        Self {
+            next: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record(&self, partition: i32, id: u64) {
+        let partition = usize::try_from(partition).expect("non-negative Kafka partition");
+        self.next[partition].fetch_max(id + 1, Ordering::AcqRel);
+    }
+
+    /// Each partition's highest acknowledged id, in the shape of a view read's prefix.
+    fn snapshot(&self) -> Vec<Option<u64>> {
+        self.next
+            .iter()
+            .map(|next| next.load(Ordering::Acquire).checked_sub(1))
+            .collect()
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -5197,8 +5228,10 @@ impl ProducerGuard {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let enqueued = Arc::new(AtomicU64::new(0));
+        let acknowledged = Arc::new(AcknowledgedIds::new(partitions));
         let producer_stop = Arc::clone(&stop);
         let producer_enqueued = Arc::clone(&enqueued);
+        let producer_acknowledged = Arc::clone(&acknowledged);
         let handle = std::thread::spawn(move || {
             produce_join_inputs(
                 &brokers,
@@ -5211,17 +5244,23 @@ impl ProducerGuard {
                 timestamp_floor_ms,
                 &producer_stop,
                 &producer_enqueued,
+                &producer_acknowledged,
             )
         });
         Self {
             stop,
             enqueued,
+            acknowledged,
             handle: Some(handle),
         }
     }
 
     fn enqueued(&self) -> u64 {
         self.enqueued.load(Ordering::Acquire)
+    }
+
+    fn acknowledged(&self) -> Arc<AcknowledgedIds> {
+        Arc::clone(&self.acknowledged)
     }
 
     fn assert_running(&mut self) {
@@ -14372,7 +14411,14 @@ fn run_three_node_join_kill9_soak_with_adoption(
         observer
     });
     let mut view_soak = (reader == ReaderLeg::Views).then(|| {
-        view_reads::ViewSoak::start(kafka_partitions, join_keys, zipf_milli, recovery_ceiling)
+        view_reads::ViewSoak::start(
+            kafka_partitions,
+            join_keys,
+            zipf_milli,
+            producer.acknowledged(),
+            Duration::from_millis(interval_ms),
+            recovery_ceiling,
+        )
     });
     latest_checkpoint = assert_temporal_idle_checkpoint(
         &mut nodes,
@@ -16220,6 +16266,7 @@ fn produce_join_inputs(
     timestamp_floor_ms: u64,
     stop: &AtomicBool,
     enqueued_count: &AtomicU64,
+    acknowledged: &AcknowledgedIds,
 ) -> ProducedPrefix {
     use futures::stream::{FuturesUnordered, StreamExt as _};
     use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -16354,7 +16401,13 @@ fn produce_join_inputs(
                         .partition(partition),
                 )
                 .unwrap_or_else(|(error, _)| panic!("right Kafka enqueue failed: {error}"));
-            left_deliveries.push(left_delivery);
+            left_deliveries.push(async move {
+                let delivery = left_delivery.await;
+                if let Ok(Ok(delivery)) = &delivery {
+                    acknowledged.record(delivery.partition, n);
+                }
+                delivery
+            });
             right_deliveries.push(right_delivery);
             inputs.push(JoinInput {
                 id: n,

@@ -213,10 +213,11 @@ jobs:
             topology: cluster-views
             discovery: gossip
             emulator: "1"
-            # The EO join workload plus four views read over pgwire on every node and a view
-            # subscription, through every kill and paused-leader round. This job certifies the
-            # view read path, not the retained-state profile the EO job covers. Each read holds
-            # the keyed view, so the key count bounds read cost.
+            # The EO join workload plus four views read over pgwire on every node, at the
+            # committed and recent levels, and a view subscription, through every kill and
+            # paused-leader round. This job certifies the view read path, not the retained-state
+            # profile the EO job covers. Each read holds the keyed view, so the key count bounds
+            # read cost.
             checkpoint_ms: "10000"
             rps: "120"
             keys: "4096"
