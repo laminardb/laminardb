@@ -553,7 +553,17 @@ checkpoint retains at most 24,576 view-log segments across all nodes, an even sh
 (8,192 each on three nodes), and a rebalance is refused before it starts when the remaining nodes
 could not take over the leaving nodes' logs within their share.
 
-The materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes.
+A `SUBSCRIBE` to a materialized view first delivers the view's rows, then each change to them.
+A changelog view (an aggregate, or a projection or filter over one) adds an Int64 `__weight`
+column. Every snapshot row has weight 1. A change gives each row the amount by which it changed
+the row's count, so an update retracts the old row with `-1` and inserts the new one with `+1`,
+and a row whose count did not change is not sent. Adding up everything received by weight gives
+the view's current rows. An append-only view delivers plain rows: its retained rows, then each
+row it keeps. A row leaving its retention is not a change, and a row dropped behind the retention
+horizon is never delivered. In embedded and single-node runtimes the snapshot is the view after
+the latest cycle and each later cycle's change follows it; `AS OF EPOCH` on a view is rejected
+(`0A000`), because a view subscription always starts from the view's rows. Earlier releases sent
+a changelog view's whole contents as plain rows after every cycle instead.
 
 ### SUBSCRIBE over the Postgres wire protocol
 
@@ -563,7 +573,7 @@ When the server is started with `pgwire_bind` set, materialized views can be str
 SUBSCRIBE <name> [AS OF EPOCH <n>] [WHERE <predicate>]
 ```
 
-- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable.
+- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable. A view's rows arrive as described above.
 - The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. Named streams whose output schema is not resolved reject `WHERE`.
 - The query stays open until the client disconnects. Local runtimes preserve their existing delivery behaviour; cluster data becomes visible only after a complete cluster checkpoint commits.
 - Cluster `SUBSCRIBE` is supported only for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, materialized views, and uncertified plans fail before subscription backend I/O.

@@ -83,30 +83,42 @@ pub(crate) async fn read_views(
     store: &parking_lot::RwLock<MvStore>,
     views: &[String],
 ) -> Result<HashMap<String, RecordBatch>, DbError> {
+    let (views, ()) = read_captured(store, &views.join(", "), |guard| {
+        let mut captured = Vec::with_capacity(views.len());
+        for view in views {
+            if let Some(read) = guard.read(view)? {
+                captured.push((view.clone(), read));
+            }
+        }
+        Ok((captured, ()))
+    })
+    .await?;
+    Ok(views)
+}
+
+/// Read what `capture` captures under one store read guard, with what it takes beside the
+/// views under that guard, as [`read_views`] does. A capture whose checkpoint retention moved
+/// past is dropped and taken again.
+pub(crate) async fn read_captured<T>(
+    store: &parking_lot::RwLock<MvStore>,
+    described: &str,
+    mut capture: impl FnMut(&MvStore) -> Result<(Vec<(String, ViewRead)>, T), DbError>,
+) -> Result<(HashMap<String, RecordBatch>, T), DbError> {
     let mut attempt = 1;
     loop {
-        let captured = {
-            let guard = store.read();
-            let mut captured = Vec::with_capacity(views.len());
-            for view in views {
-                if let Some(read) = guard.read(view)? {
-                    captured.push((view.clone(), read));
-                }
-            }
-            captured
-        };
+        let (captured, taken) = capture(&store.read())?;
         match materialize(captured, Instant::now() + VIEW_READ_DEADLINE).await {
-            Ok(views) => return Ok(views),
+            Ok(views) => return Ok((views, taken)),
             Err(LogReadError::Failed(error)) => return Err(error),
             Err(LogReadError::Retired) if attempt < VIEW_READ_ATTEMPTS => {
+                drop(taken);
                 tokio::time::sleep(VIEW_READ_RETRY_DELAY * attempt).await;
                 attempt += 1;
             }
             Err(LogReadError::Retired) => {
                 return Err(DbError::MaterializedView(format!(
-                    "materialized views [{}] were checkpointed {VIEW_READ_ATTEMPTS} times while \
-                     being read; retry the statement",
-                    views.join(", ")
+                    "materialized views [{described}] were checkpointed {VIEW_READ_ATTEMPTS} \
+                     times while being read; retry the statement"
                 )))
             }
         }

@@ -126,6 +126,13 @@ struct LogBatchRef<'a> {
     bytes: usize,
 }
 
+impl<'a> LogUpdate<'a> {
+    /// The batches the cycle appends: none wholly behind the retention horizon.
+    pub(super) fn appended(&self) -> impl Iterator<Item = &'a RecordBatch> + '_ {
+        self.incoming.iter().map(|incoming| incoming.batch)
+    }
+}
+
 /// One view's log at a checkpoint barrier; its new rows are encoded off the cycle.
 pub(crate) struct ViewLogCapture {
     pub(crate) next_sequence: u64,

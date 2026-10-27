@@ -105,7 +105,8 @@ fn schema_mismatches_are_rejected_before_any_view_changes() {
             assert!(matches!(
                 store.update_views(
                     [("first", first.as_slice()), ("second", second.as_slice())],
-                    false
+                    false,
+                    |_| false
                 ),
                 Err(DbError::MaterializedView(_))
             ));
@@ -162,7 +163,8 @@ fn keyed_staging_is_bounded_across_batches_even_when_final_state_would_fit() {
                 matches!(
                     store.update_views(
                         [("first", first.as_slice()), ("second", updates.as_slice())],
-                        false
+                        false,
+                        |_| false
                     ),
                     Err(DbError::MaterializedViewQuotaExceeded { .. })
                 ),
@@ -635,7 +637,8 @@ fn publication_preflight_rejects_multiset_expansion_before_applying_other_view()
     assert!(store
         .update_views(
             [("first", first.as_slice()), ("second", second.as_slice())],
-            false
+            false,
+            |_| false
         )
         .is_err());
     assert!(ids(&store, "first").is_empty());

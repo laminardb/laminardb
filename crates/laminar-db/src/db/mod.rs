@@ -14,6 +14,7 @@ mod datafusion_memory_tests;
 mod explain;
 mod session;
 mod source_watermarks;
+mod subscription_open;
 pub(crate) use source_watermarks::{RecoveredInputChannelProgress, SourceWatermarkState};
 #[cfg(feature = "cluster")]
 mod topology;
@@ -4620,6 +4621,10 @@ impl LaminarDB {
 
     /// Subscribe to a named stream or materialized view.
     ///
+    /// Rows are matched to `T` by column name. A changelog view's frames carry `__weight`
+    /// (see [`Self::open_subscription`]); a `T` without that field receives retracted rows as
+    /// if they were inserted.
+    ///
     /// # Errors
     ///
     /// Returns `DbError::StreamNotFound` if the object or its output schema is unresolved.
@@ -4641,8 +4646,8 @@ impl LaminarDB {
         if crate::sql_analysis::stage_owner(name).is_some() {
             return None;
         }
-        if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
-            return Some(mv.schema);
+        if let Some(schema) = self.mv_store.read().subscription_schema(name) {
+            return Some(schema);
         }
         if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
             return Some(schema);
@@ -4652,6 +4657,13 @@ impl LaminarDB {
 
     /// Open a SUBSCRIBE portal against a named MV or resolved stream. A bare
     /// SOURCE is not subscribable (surfaced as `StreamNotFound`).
+    ///
+    /// A materialized view's portal first delivers the view's rows, then each change to them.
+    /// A changelog view's rows carry an Int64 `__weight` column: `+1` in the snapshot, and in
+    /// a change the amount by which the change altered the row's count (a replaced row is
+    /// retracted with `-1`). An append view delivers plain rows; rows leaving its retention are
+    /// not changes. Outside a cluster a view subscription starts at the latest cycle and admits
+    /// only [`SubscribeStart::Tail`](crate::subscription::SubscribeStart::Tail).
     ///
     /// # Errors
     /// `StreamNotFound` for unknown `name`; `Subscription` for unsupported cluster plans or
@@ -4670,9 +4682,6 @@ impl LaminarDB {
         // to an orphaned log with the previous object's schema.
         let _topology = self.topology_ddl_lock.read().await;
 
-        // SUBSCRIBE to an incremental MV delivers consolidated snapshots (plain rows), not the
-        // raw `__weight` changelog.
-
         let schema = self
             .lookup_subscription_schema(name)
             .ok_or_else(|| DbError::StreamNotFound(name.to_string()))?;
@@ -4689,61 +4698,12 @@ impl LaminarDB {
                 .await;
         }
 
-        let reader =
-            self.subscription_registry
-                .subscribe(name, start)
-                .map_err(|error| match error {
-                    crate::subscription::SubscriptionOpenError::ReplayPruned {
-                        earliest_retained,
-                    } => {
-                        let requested = match start {
-                            crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
-                            crate::subscription::SubscribeStart::AfterSequence(_)
-                            | crate::subscription::SubscribeStart::Tail => 0,
-                        };
-                        DbError::SubscriptionReplayPruned {
-                            name: name.to_string(),
-                            requested,
-                            earliest_retained,
-                        }
-                    }
-                    crate::subscription::SubscriptionOpenError::SequencePruned {
-                        requested,
-                        earliest_retained,
-                    } => DbError::SubscriptionSequencePruned {
-                        name: name.to_string(),
-                        requested_sequence: requested,
-                        earliest_retained_sequence: earliest_retained,
-                    },
-                    crate::subscription::SubscriptionOpenError::SequenceNotPublished {
-                        requested,
-                        next_sequence,
-                    } => DbError::SubscriptionSequenceNotPublished {
-                        name: name.to_string(),
-                        requested_sequence: requested,
-                        next_sequence,
-                    },
-                    crate::subscription::SubscriptionOpenError::EpochNotCommitted {
-                        requested,
-                        latest_committed,
-                    } => DbError::SubscriptionEpochNotCommitted {
-                        name: name.to_string(),
-                        requested,
-                        latest_committed,
-                    },
-                    crate::subscription::SubscriptionOpenError::Capacity { attached, limit } => {
-                        DbError::Pipeline(format!(
-                            "subscriber cap reached for '{name}' ({attached}/{limit})"
-                        ))
-                    }
-                })?;
-
-        Ok(match filter {
-            Some(phys) => crate::subscription::SubscriptionPortal::open_with_filter(
-                name, schema, reader, phys,
-            ),
-            None => crate::subscription::SubscriptionPortal::open(name, schema, reader),
-        })
+        if self.mv_store.read().has_mv(name) {
+            return self
+                .open_local_view_subscription(name, schema, filter, start)
+                .await;
+        }
+        self.open_local_stream_subscription(name, schema, filter, start)
     }
 
     #[allow(clippy::too_many_lines)]

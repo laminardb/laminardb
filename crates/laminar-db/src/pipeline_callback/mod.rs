@@ -5070,92 +5070,42 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         {
             return Ok(());
         }
+        let fault = |reason: String| {
+            set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
+            crate::pipeline::CycleError::Recovery(reason)
+        };
         let mut store = self.mv_store.write();
         store.advance_view_frontiers(|view| self.graph.stream_frontier(view));
-        store
+        let changes = store
             .update_views(
                 results
                     .iter()
                     .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
                 self.graph.routes_views_by_row(),
+                |view| self.subscription_registry.subscriber_count(view) > 0,
             )
-            .map_err(|error| {
-                let reason = format!("materialized-view cycle preflight failed: {error}");
-                set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                crate::pipeline::CycleError::Recovery(reason)
-            })?;
-        let mut updates = 0u64;
-        // Snapshot broadcast is deferred past the write lock (rematerialize is O(rows) and would
-        // otherwise block SELECT readers on the store-wide lock).
-        let mut changelog_broadcasts: Vec<Arc<str>> = Vec::new();
-        for (stream_name, batches) in results {
-            if !store.has_mv(stream_name) {
-                continue;
-            }
-            // A changelog MV (batches carry `__weight`) must not put the raw Z-set changelog on the
-            // SUBSCRIBE wire â€” subscribers get plain rows. Apply to the store, then broadcast the
-            // consolidated snapshot instead (only when someone is listening). A full-emit MV keeps
-            // forwarding its per-cycle batch verbatim (that batch already IS its full state).
-            let changelog = batches.iter().any(|b| {
-                b.num_rows() > 0
-                    && b.schema()
-                        .index_of(laminar_core::changelog::WEIGHT_COLUMN)
-                        .is_ok()
-            });
-            let row_batches = batches.iter().filter(|b| b.num_rows() > 0).count() as u64;
-            if row_batches > 0 {
-                updates += row_batches;
-                if !changelog {
-                    for batch in batches {
-                        if batch.num_rows() > 0 {
-                            self.subscription_registry
-                                .send_batch(stream_name, batch.clone())
-                                .map_err(|error| {
-                                    let reason = format!(
-                                        "materialized-view subscription publication for '{stream_name}' failed: {error}"
-                                    );
-                                    set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                                    crate::pipeline::CycleError::Recovery(reason)
-                                })?;
-                        }
-                    }
-                }
-            }
-            if changelog && self.subscription_registry.subscriber_count(stream_name) > 0 {
-                changelog_broadcasts.push(Arc::clone(stream_name));
-            }
+            .map_err(|error| fault(format!("materialized-view cycle preflight failed: {error}")))?;
+        // Published under the write guard: a subscriber captures its snapshot under the read
+        // guard, so each change is in its snapshot or after its cursor, never both.
+        for (view, change) in changes {
+            self.subscription_registry
+                .send_batch(view, change)
+                .map_err(|error| {
+                    fault(format!(
+                        "materialized-view subscription publication for '{view}' failed: {error}"
+                    ))
+                })?;
         }
+        let updates = results
+            .iter()
+            .filter(|(name, _)| store.has_mv(name))
+            .flat_map(|(_, batches)| batches)
+            .filter(|batch| batch.num_rows() > 0)
+            .count() as u64;
         if updates > 0 {
             self.prom.views.updates.inc_by(updates);
             let bytes = i64::try_from(store.total_bytes()).unwrap_or(i64::MAX);
             self.prom.views.bytes_stored.set(bytes);
-        }
-        drop(store);
-
-        if !changelog_broadcasts.is_empty() {
-            let store = self.mv_store.read();
-            for stream_name in changelog_broadcasts {
-                match store.to_record_batch(&stream_name) {
-                    Ok(Some(snap)) => self
-                        .subscription_registry
-                        .send_batch(&stream_name, snap)
-                        .map_err(|error| {
-                            let reason = format!(
-                                "materialized-view snapshot publication for '{stream_name}' failed: {error}"
-                            );
-                            set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                            crate::pipeline::CycleError::Recovery(reason)
-                        })?,
-                    Ok(None) => {}
-                    Err(error) => {
-                        let reason = format!(
-                            "materialized-view snapshot materialization for '{stream_name}' failed: {error}"
-                        );
-                        set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                        return Err(crate::pipeline::CycleError::Recovery(reason));
-                    }
-                }
-            }
         }
         Ok(())
     }

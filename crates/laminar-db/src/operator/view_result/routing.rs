@@ -229,7 +229,8 @@ fn apply(
 ) -> Result<(), DbError> {
     store
         .write()
-        .update_views(std::iter::once((view, batches)), false)
+        .update_views(std::iter::once((view, batches)), false, |_| false)
+        .map(drop)
         .map_err(|error| {
             DbError::StatefulOperatorPartialApply(format!(
                 "view '{view}' could not apply routed rows; recovery from the committed \

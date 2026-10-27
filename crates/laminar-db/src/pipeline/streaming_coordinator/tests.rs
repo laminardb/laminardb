@@ -1543,6 +1543,7 @@ impl PipelineCallback for MockCallback {
                         .iter()
                         .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
                     false,
+                    |_| false,
                 )
                 .map_err(|error| CycleError::Recovery(error.to_string()))?;
         }

@@ -401,6 +401,32 @@ impl MultisetState {
         })
     }
 
+    /// Each row whose multiplicity `delta` changes, weighted by the change, in the columns of
+    /// `schema`.
+    pub(super) fn changes(
+        &self,
+        delta: &MultisetDelta,
+        schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>, DbError> {
+        let mut rows = Vec::new();
+        let mut weights = Vec::new();
+        for (key, count, vnode) in &delta.counts {
+            let old = self.slices.slot(*vnode).get(key).copied().unwrap_or(0);
+            if *count != old {
+                rows.push(key.row());
+                weights.push(count - old);
+            }
+        }
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut arrays = decode_rows(&self.row_converter, schema, rows)?;
+        arrays.push(Arc::new(Int64Array::from(weights)));
+        RecordBatch::try_new(Arc::clone(schema), arrays)
+            .map(Some)
+            .map_err(|e| DbError::Storage(format!("multiset MV change batch: {e}")))
+    }
+
     pub(super) fn apply_prepared(&mut self, delta: MultisetDelta) {
         for (key, count, vnode) in delta.counts {
             let slice = self.slices.slot_mut(vnode);

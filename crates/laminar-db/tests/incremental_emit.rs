@@ -6,7 +6,7 @@
 //!    maintained from the operator's dirty-only changelog), and
 //! 2. survives checkpoint → restart with a correct snapshot, and
 //! 3. feeds downstream consumers of its changelog — chained agg/projection MVs, capability-aware
-//!    sinks (upsert/changelog-capable), and SUBSCRIBE (plain consolidated snapshots) — while still
+//!    sinks (upsert/changelog-capable), and SUBSCRIBE (its rows, then weighted changes) — while still
 //!    rejecting shapes it can't net (e.g. an arbitrary join, a non-capable sink), and
 //! 4. serves `SELECT` from the latest cycle, which a restart can roll back.
 
@@ -559,10 +559,11 @@ async fn changelog_joins_are_rejected_at_ddl() {
     }
 }
 
-/// SUBSCRIBE to an incremental MV delivers plain consolidated snapshots for updates emitted after
-/// a Tail subscriber attaches, never the raw `__weight` changelog.
+/// SUBSCRIBE to an incremental MV delivers the view's rows at attach, then each cycle's change:
+/// an update retracts the key's old row and inserts its new one, and untouched keys are not
+/// repeated.
 #[tokio::test]
-async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
+async fn subscribe_to_incremental_mv_delivers_changes() {
     use laminar_db::subscription::{PortalFrame, SubscribeStart};
     let dir = tempfile::tempdir().unwrap();
     let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
@@ -574,56 +575,42 @@ async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
     let mut portal = db
         .open_subscription("agg", None, SubscribeStart::Tail)
         .await
-        .expect("SUBSCRIBE to an incremental MV is now allowed");
-    // The wire schema is the plain MV schema — no `__weight`.
-    assert!(
-        portal.schema().index_of("__weight").is_err(),
-        "SUBSCRIBE wire schema must be plain rows"
-    );
+        .unwrap();
+    assert!(portal.schema().index_of("__weight").is_ok());
+
+    let mut next_change = async || loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), portal.next_frame())
+            .await
+            .expect("a frame within the deadline")
+            .expect("a portal frame");
+        match frame {
+            PortalFrame::Batch { batch, .. } => {
+                let weights = batch
+                    .column_by_name("__weight")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone();
+                let mut rows: Vec<_> = rows_of(&batch)
+                    .into_iter()
+                    .zip(weights.values().iter().copied())
+                    .collect();
+                rows.sort_unstable();
+                return rows;
+            }
+            PortalFrame::Barrier { .. } => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    };
 
     source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), portal.next_frame())
-        .await
-        .expect("a frame within the deadline")
-        .expect("a portal frame");
-    let PortalFrame::Batch { batch: b, .. } = frame else {
-        panic!("expected a Batch frame, got {frame:?}");
-    };
-    assert!(
-        b.schema().index_of("__weight").is_err(),
-        "snapshot batch must be plain rows (no __weight)"
-    );
-    assert_eq!(
-        rows_of(&b),
-        vec![(1, 10, 1), (2, 20, 1)],
-        "post-attach snapshot"
-    );
+    let mut inserted = next_change().await;
+    inserted.sort_unstable();
+    assert_eq!(inserted, vec![((1, 10, 1), 1), ((2, 20, 1), 1)]);
 
-    // A change arrives as a fresh consolidated snapshot (k1: 10 -> 15) that also repeats the
-    // untouched k2, not as a delta.
     source.push_arrow(batch(&[1], &[5])).unwrap();
-    let mut saw_update = false;
-    for _ in 0..20 {
-        match tokio::time::timeout(std::time::Duration::from_secs(3), portal.next_frame()).await {
-            Ok(Some(PortalFrame::Batch { batch: b, .. })) => {
-                if rows_of(&b).iter().any(|&(k, t, _)| k == 1 && t == 15) {
-                    assert_eq!(rows_of(&b), vec![(1, 15, 2), (2, 20, 1)]);
-                    saw_update = true;
-                    break;
-                }
-            }
-            Ok(Some(PortalFrame::Barrier { .. })) => {}
-            Ok(Some(PortalFrame::Lagged(n))) => panic!("subscriber lagged by {n} messages"),
-            Ok(Some(PortalFrame::Error { message })) => {
-                panic!("subscription failed: {message}")
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    assert!(
-        saw_update,
-        "subscriber must receive the updated snapshot k1=15"
-    );
+    assert_eq!(next_change().await, vec![((1, 10, 1), -1), ((1, 15, 2), 1)]);
     portal.close();
     db.shutdown().await.unwrap();
 }

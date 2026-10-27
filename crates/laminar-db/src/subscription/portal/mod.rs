@@ -1,5 +1,6 @@
 //! Per-subscriber cursor over the shared subscription log.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -107,12 +108,14 @@ impl SubscriptionEnvelope {
 /// One frame emitted toward the wire.
 #[derive(Debug, Clone)]
 pub enum PortalFrame {
-    /// Rows produced in a cycle.
+    /// Rows produced in a cycle, or part of a materialized view's rows when the subscription
+    /// attached.
     Batch {
         /// Arrow rows in the shared-log entry.
         batch: RecordBatch,
         /// Portal-local delivery sequence. In cluster mode this is neither durable nor global;
-        /// use [`ClusterSubscriptionFrameMetadata::Data`] for partition identity.
+        /// use [`ClusterSubscriptionFrameMetadata::Data`] for partition identity. A local view
+        /// snapshot frame carries the sequence of the first change after it.
         sequence: u64,
         /// Internal process-memory ownership token.
         #[doc(hidden)]
@@ -145,6 +148,8 @@ pub enum PortalFrame {
 pub struct SubscriptionPortal {
     name: String,
     schema: SchemaRef,
+    /// A local view subscription's rows at attach, delivered before any change.
+    snapshot: VecDeque<RecordBatch>,
     reader: Option<PortalReader>,
     closed: bool,
     filter: Option<Arc<dyn PhysicalExpr>>,
@@ -168,6 +173,22 @@ impl SubscriptionPortal {
         Self::new_inner(name, schema, reader, Some(filter))
     }
 
+    /// A subscription to a materialized view: `snapshot` holds its rows at attach, and `reader`
+    /// is positioned at the first change after them.
+    pub(crate) fn open_view(
+        name: impl Into<String>,
+        schema: SchemaRef,
+        snapshot: RecordBatch,
+        reader: SubscriptionReader,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        let mut portal = Self::new_inner(name, schema, reader, filter);
+        if snapshot.num_rows() > 0 {
+            portal.snapshot.push_back(snapshot);
+        }
+        portal
+    }
+
     fn new_inner(
         name: impl Into<String>,
         schema: SchemaRef,
@@ -177,6 +198,7 @@ impl SubscriptionPortal {
         Self {
             name: name.into(),
             schema,
+            snapshot: VecDeque::new(),
             reader: Some(PortalReader::Local(reader)),
             closed: false,
             filter,
@@ -193,6 +215,7 @@ impl SubscriptionPortal {
         Self {
             name: name.into(),
             schema,
+            snapshot: VecDeque::new(),
             reader: Some(PortalReader::Cluster(reader)),
             closed: false,
             filter,
@@ -215,6 +238,9 @@ impl SubscriptionPortal {
         if self.closed {
             return None;
         }
+        if let Some(envelope) = self.next_snapshot_envelope() {
+            return Some(envelope);
+        }
 
         loop {
             let read = self.reader.as_mut()?.next().await;
@@ -234,6 +260,9 @@ impl SubscriptionPortal {
         if self.closed {
             return None;
         }
+        if let Some(envelope) = self.next_snapshot_envelope() {
+            return Some(envelope);
+        }
 
         loop {
             let read = self.reader.as_mut()?.try_next()?;
@@ -241,6 +270,27 @@ impl SubscriptionPortal {
                 return Some(frame);
             }
         }
+    }
+
+    fn next_snapshot_envelope(&mut self) -> Option<SubscriptionEnvelope> {
+        while let Some(batch) = self.snapshot.pop_front() {
+            let Some(PortalReader::Local(reader)) = &self.reader else {
+                return None;
+            };
+            let frame = PortalFrame::Batch {
+                batch,
+                sequence: reader.cursor(),
+                lease: SubscriptionFrameLease {
+                    _local_owner: None,
+                    #[cfg(feature = "cluster")]
+                    _cluster_owner: None,
+                },
+            };
+            if let Some(envelope) = self.process_envelope(SubscriptionEnvelope::local(frame)) {
+                return Some(envelope);
+            }
+        }
+        None
     }
 
     fn process_read(&mut self, read: PortalRead) -> Option<SubscriptionEnvelope> {
@@ -410,6 +460,7 @@ impl SubscriptionPortal {
     /// Stop reading and release the subscriber registration. Idempotent.
     pub fn close(&mut self) {
         self.closed = true;
+        self.snapshot.clear();
         self.reader = None;
     }
 

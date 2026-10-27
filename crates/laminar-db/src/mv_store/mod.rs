@@ -17,6 +17,7 @@ use crate::operator_graph::InputFrontier;
 
 mod admission;
 mod append_log;
+mod changes;
 mod checkpoint;
 mod committed;
 mod frames;
@@ -37,7 +38,7 @@ pub(crate) use frames::RestoredView;
 pub(crate) use freshness::{spawn_monitor as spawn_freshness_monitor, FreshnessContracts};
 use multiset::MultisetState;
 pub(crate) use statement_snapshot::{
-    plan_committed_statement, plan_statement, read_views, CommittedStatement,
+    plan_committed_statement, plan_statement, read_captured, read_views, CommittedStatement,
     StatementViewSnapshot, VIEW_READ_DEADLINE,
 };
 #[cfg(feature = "cluster")]
@@ -380,13 +381,16 @@ impl MvStore {
     /// Callers supply each view once. Prepared batch updates borrow input; keyed
     /// updates own only their existing staged deltas, never a clone of the live row map.
     /// With `routed_by_row`, views placed by their full row are skipped: in a cluster their
-    /// result nodes route those rows to their owners.
+    /// result nodes route those rows to their owners. Returns the change to each view that
+    /// `observed` names, as its subscribers receive it.
     pub fn update_views<'a>(
         &mut self,
         results: impl IntoIterator<Item = (&'a str, &'a [RecordBatch])>,
         routed_by_row: bool,
-    ) -> Result<(), DbError> {
+        observed: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(&'a str, RecordBatch)>, DbError> {
         let mut prepared = smallvec::SmallVec::<[(&str, PreparedUpdate<'_>); 4]>::new();
+        let mut changes = Vec::new();
         for (name, batches) in results {
             if let Some(entry) = self
                 .entries
@@ -400,6 +404,14 @@ impl MvStore {
                     true,
                     self.horizon_drops.as_ref(),
                 )?;
+                if observed(name) {
+                    changes.extend(
+                        entry
+                            .changes(&update)?
+                            .into_iter()
+                            .map(|batch| (name, batch)),
+                    );
+                }
                 prepared.push((name, update));
             }
         }
@@ -408,7 +420,7 @@ impl MvStore {
                 entry.apply_prepared(update);
             }
         }
-        Ok(())
+        Ok(changes)
     }
 
     /// Advance each append view's frontier to its stream's output frontier, and in a cluster
@@ -439,6 +451,7 @@ impl MvStore {
 
     /// A changelog view's rows, or an append view's rows while none are committed. An append
     /// view with committed segments is read with [`Self::read`].
+    #[cfg(any(test, feature = "benchmark-internals"))]
     pub fn to_record_batch(&self, name: &str) -> Result<Option<RecordBatch>, DbError> {
         self.entries
             .get(name)

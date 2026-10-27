@@ -86,15 +86,20 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
         assert_eq!(callback.prom.views.updates.get(), 2);
         for portal in &mut portals {
             let Some(PortalFrame::Batch { batch, .. }) = portal.try_next_frame() else {
-                panic!("successful cycle must publish plain rows")
+                panic!("successful cycle must publish its change")
             };
-            assert_eq!(batch.num_columns(), 1);
-            let expected = if matches!(mode, MvStorageMode::Changelog { .. }) {
+            let weighted = matches!(mode, MvStorageMode::Changelog { .. });
+            assert_eq!(batch.num_columns(), 1 + usize::from(weighted));
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
                 2
-            } else {
-                1
-            };
-            assert_eq!(batch.num_rows(), expected);
+            );
         }
     }
 }

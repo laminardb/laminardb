@@ -252,25 +252,43 @@ async fn bounded_subscribe_with_unknown_filter_column_returns_pg_error() {
 
 #[tokio::test]
 async fn subscribe_as_of_uncommitted_returns_pg_error() {
-    // No checkpoint has committed on `prices`, so a future AS OF cut must
-    // be distinguished from pruned history.
-    let (addr, handle) = spawn_server().await;
-    let mut client = connect(addr).await;
-    let tx = client.transaction().await.expect("BEGIN");
-    let stmt = tx
-        .prepare("SUBSCRIBE prices AS OF EPOCH 1")
+    // No checkpoint has committed on the stream, so a future AS OF cut must be distinguished
+    // from pruned history. A view subscription starts from the view's rows, so it refuses AS OF.
+    let db = LaminarDB::open().expect("db opens");
+    for ddl in [
+        "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)",
+        "CREATE STREAM quotes AS SELECT symbol, price FROM trades",
+        "CREATE MATERIALIZED VIEW prices AS \
+         SELECT symbol, price FROM trades WITH (retention = '1000 rows')",
+    ] {
+        db.execute(ddl).await.expect("ddl");
+    }
+    db.start().await.expect("db starts");
+    let (addr, handle) = super::serve(db, "127.0.0.1:0", HashMap::new(), false, None, 256, 10)
         .await
-        .expect("prepare");
-    let portal = tx.bind(&stmt, &[]).await.expect("bind");
-
-    let err = tx.query_portal(&portal, 1).await.expect_err("must fail");
-    let db_err = err.as_db_error().expect("typed PG error");
-    assert_eq!(db_err.code().code(), "22023");
-    assert!(
-        db_err.message().contains("not committed"),
-        "message: {}",
-        db_err.message()
-    );
+        .expect("pgwire serve");
+    let mut client = connect(addr).await;
+    for (sql, code, message) in [
+        ("SUBSCRIBE quotes AS OF EPOCH 1", "22023", "not committed"),
+        (
+            "SUBSCRIBE prices AS OF EPOCH 1",
+            "0A000",
+            "subscribe from the tail",
+        ),
+    ] {
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx.prepare(sql).await.expect("prepare");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind");
+        let err = tx.query_portal(&portal, 1).await.expect_err("must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), code, "{sql}: {}", db_err.message());
+        assert!(
+            db_err.message().contains(message),
+            "{sql}: {}",
+            db_err.message()
+        );
+        drop(tx);
+    }
 
     handle.abort();
 }

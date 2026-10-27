@@ -276,6 +276,44 @@ impl UpsertState {
         })
     }
 
+    /// The rows `delta` replaces retracted (`-1`) and the rows it writes inserted (`+1`), in the
+    /// columns of `schema`; a key whose row does not change is left out.
+    pub(super) fn changes(
+        &self,
+        delta: &UpsertDelta,
+        schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>, DbError> {
+        let mut columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); schema.fields().len() - 1];
+        let mut weights = Vec::new();
+        for (key, staged) in &delta.rows {
+            let old = self.slices.slot(staged.vnode).get(key);
+            if old == staged.values.as_ref() {
+                continue;
+            }
+            for (values, weight) in [(old, -1), (staged.values.as_ref(), 1)] {
+                let Some(values) = values else { continue };
+                for (column, value) in columns.iter_mut().zip(values) {
+                    column.push(value.clone());
+                }
+                weights.push(weight);
+            }
+        }
+        if weights.is_empty() {
+            return Ok(None);
+        }
+        let mut arrays = columns
+            .into_iter()
+            .map(|column| {
+                ScalarValue::iter_to_array(column)
+                    .map_err(|e| DbError::Storage(format!("upsert MV change column: {e}")))
+            })
+            .collect::<Result<Vec<ArrayRef>, _>>()?;
+        arrays.push(Arc::new(arrow::array::Int64Array::from(weights)));
+        RecordBatch::try_new(Arc::clone(schema), arrays)
+            .map(Some)
+            .map_err(|e| DbError::Storage(format!("upsert MV change batch: {e}")))
+    }
+
     pub(super) fn apply_prepared(&mut self, delta: UpsertDelta) {
         for (key, replacement) in delta.rows {
             let slice = self.slices.slot_mut(replacement.vnode);
