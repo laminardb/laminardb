@@ -150,8 +150,10 @@ async fn startup_gate_middleware(
     let path = req.uri().path();
     let startup_probe = matches!(path, "/health" | "/ready" | "/metrics");
     // SQL reads and subscriptions keep serving through coordinated recovery; the SQL handler
-    // refuses other statements itself.
-    let committed_reads = path == "/api/v1/sql" || path.starts_with("/ws/");
+    // refuses other statements itself. A recent read waiting across the round asks for its
+    // checkpoint then too; no checkpoint starts before the round ends.
+    let committed_reads =
+        path == "/api/v1/sql" || path.starts_with("/ws/") || path == "/api/v1/checkpoint/expedite";
     let rejection = if startup_probe {
         None
     } else if committed_reads {

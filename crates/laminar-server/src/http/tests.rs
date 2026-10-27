@@ -1161,7 +1161,7 @@ async fn expired_process_deadline_rejects_serving_before_async_gate_fence() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn recovering_cluster_serves_only_committed_reads_and_subscriptions() {
+async fn recovering_cluster_serves_only_committed_reads_subscriptions_and_checkpoint_requests() {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
 
     let node = laminar_core::cluster::discovery::NodeId(43);
@@ -1226,6 +1226,7 @@ async fn recovering_cluster_serves_only_committed_reads_and_subscriptions() {
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("server is completing coordinated recovery"));
     let subscribe = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/ws/recovering")
@@ -1235,6 +1236,17 @@ async fn recovering_cluster_serves_only_committed_reads_and_subscriptions() {
         .await
         .unwrap();
     assert_ne!(subscribe.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let expedite = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/checkpoint/expedite")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expedite.status(), StatusCode::ACCEPTED);
 }
 
 #[cfg(feature = "cluster")]
