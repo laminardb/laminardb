@@ -12,6 +12,7 @@
 mod cursor;
 mod dispatch;
 mod encoding;
+mod select;
 mod session;
 mod subscription;
 mod tls;

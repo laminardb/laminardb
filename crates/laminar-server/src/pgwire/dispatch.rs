@@ -27,7 +27,8 @@ use laminar_db::LaminarDB;
 use super::cursor::{
     fetch_direction_count, handle_close, handle_declare_cursor, handle_fetch, ConnState,
 };
-use super::encoding::{record_batch_response, text_response};
+use super::encoding::{field_infos, record_batch_response, text_response};
+use super::select::{read_error, read_session, select_response, session_statement};
 use super::session::LaminarPgwireHandler;
 use super::subscription::{
     ensure_cached_subscription_schema, subscription_field_infos, subscription_open_error,
@@ -58,6 +59,7 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
         }
         let state = self.conn_state(client);
         state.prune_dead();
+        let read = read_session(client);
         let mut in_transaction = !matches!(
             client.transaction_status(),
             pgwire::messages::response::TransactionStatus::Idle
@@ -107,8 +109,13 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
                             "current transaction is aborted; commands are ignored until ROLLBACK",
                         ));
                     }
-                    let response =
-                        standard_or_cursor_response(&self.db, &state, *s, in_transaction)?;
+                    let response = if let Some(response) = session_statement(&self.db, &read, &s) {
+                        response?
+                    } else if is_read(&s) {
+                        select_response(&self.db, &read, &s.to_string(), None, None).await?
+                    } else {
+                        standard_or_cursor_response(&self.db, &state, *s, in_transaction)?
+                    };
                     if starts_transaction {
                         in_transaction = true;
                     } else if ends_transaction {
@@ -188,7 +195,7 @@ pub(super) fn standard_response(db: &LaminarDB, stmt: Statement) -> PgWireResult
         Statement::Commit { .. } => Ok(Response::TransactionEnd(Tag::new("COMMIT"))),
         Statement::Rollback { .. } => Ok(Response::TransactionEnd(Tag::new("ROLLBACK"))),
         Statement::Set(s) => apply_set(db, s),
-        Statement::Query(q) => driver_select_response(*q),
+        Statement::Query(q) => driver_select_response(&q).ok_or_else(unsupported_select),
         Statement::Insert { .. }
         | Statement::Update { .. }
         | Statement::Delete { .. }
@@ -205,30 +212,34 @@ pub(super) fn standard_response(db: &LaminarDB, stmt: Statement) -> PgWireResult
     }
 }
 
-/// Handle the `SELECT`s drivers issue at connect time. Single literal,
-/// `SELECT version()`, and `SELECT current_schema()` are answered inline.
-/// Anything else is rejected — real queries belong on `/api/v1/sql`.
-fn driver_select_response(query: sqlparser::ast::Query) -> PgWireResult<Response> {
-    let SetExpr::Select(select) = *query.body else {
-        return Err(unsupported_select());
+/// A query this connection answers by reading the database rather than inline.
+pub(super) fn is_read(statement: &Statement) -> bool {
+    matches!(statement, Statement::Query(query) if driver_select_response(query).is_none())
+}
+
+/// Answer the `SELECT`s drivers issue at connect time inline: a single literal, `SELECT
+/// version()`, `SELECT current_schema()` and similar builtins. `None` for any other query.
+fn driver_select_response(query: &sqlparser::ast::Query) -> Option<Response> {
+    let SetExpr::Select(select) = &*query.body else {
+        return None;
     };
     if select.projection.len() != 1 || !select.from.is_empty() || select.selection.is_some() {
-        return Err(unsupported_select());
+        return None;
     }
     let SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
-        return Err(unsupported_select());
+        return None;
     };
 
     match expr {
         Expr::Value(v) => match &v.value {
             sqlparser::ast::Value::Number(n, _) => {
-                let parsed: i32 = n.parse().map_err(|_| unsupported_select())?;
-                Ok(text_response("?column?", Type::INT4, parsed.to_string()))
+                let parsed: i32 = n.parse().ok()?;
+                Some(text_response("?column?", Type::INT4, parsed.to_string()))
             }
             sqlparser::ast::Value::SingleQuotedString(s) => {
-                Ok(text_response("?column?", Type::VARCHAR, s.clone()))
+                Some(text_response("?column?", Type::VARCHAR, s.clone()))
             }
-            _ => Err(unsupported_select()),
+            _ => None,
         },
         Expr::Function(func) => {
             // Only no-arg builtins. `func.args` is `FunctionArguments::None`
@@ -236,7 +247,7 @@ fn driver_select_response(query: sqlparser::ast::Query) -> PgWireResult<Response
             if !matches!(func.args, FunctionArguments::List(ref a) if a.args.is_empty())
                 && !matches!(func.args, FunctionArguments::None)
             {
-                return Err(unsupported_select());
+                return None;
             }
             let name = func.name.to_string().to_ascii_lowercase();
             let (col, ty, value) = match name.as_str() {
@@ -254,19 +265,16 @@ fn driver_select_response(query: sqlparser::ast::Query) -> PgWireResult<Response
                 "current_user" | "session_user" | "user" => {
                     ("current_user", Type::VARCHAR, "laminar".to_string())
                 }
-                _ => return Err(unsupported_select()),
+                _ => return None,
             };
-            Ok(text_response(col, ty, value))
+            Some(text_response(col, ty, value))
         }
-        _ => Err(unsupported_select()),
+        _ => None,
     }
 }
 
 fn unsupported_select() -> PgWireError {
-    user_error(
-        "0A000",
-        "pgwire SELECT is limited to literals and connect-time builtins; use HTTP /api/v1/sql",
-    )
+    user_error("XX000", "a database read reached the inline driver handler")
 }
 
 /// `SET` handling. We thread plain `SET name = value` to the engine's
@@ -341,6 +349,11 @@ pub enum LaminarStmt {
         schema: arrow_schema::SchemaRef,
     },
     Show(ShowCommand),
+    /// A query read from the database, with the schema `Describe` reports.
+    Select {
+        sql: String,
+        schema: arrow_schema::SchemaRef,
+    },
     Standard(Box<Statement>),
 }
 
@@ -392,6 +405,19 @@ impl QueryParser for LaminarQueryParser {
                 })
             }
             StreamingStatement::Show(cmd) => Ok(LaminarStmt::Show(cmd)),
+            StreamingStatement::Standard(s) if is_read(&s) => {
+                let (schema, parameters) = self.db.read_schema(sql).await.map_err(read_error)?;
+                if parameters > 0 {
+                    return Err(user_error(
+                        "0A000",
+                        "pgwire SELECT does not bind parameters; inline the values",
+                    ));
+                }
+                Ok(LaminarStmt::Select {
+                    sql: sql.to_owned(),
+                    schema,
+                })
+            }
             StreamingStatement::Standard(s) => Ok(LaminarStmt::Standard(s)),
             other => Err(user_error(
                 "0A000",
@@ -423,6 +449,7 @@ impl QueryParser for LaminarQueryParser {
                 }
                 Ok(subscription_field_infos(schema, column_format))
             }
+            LaminarStmt::Select { schema, .. } => Ok(field_infos(schema, column_format)),
             LaminarStmt::Show(_) | LaminarStmt::Standard(_) => Ok(Vec::new()),
         }
     }
@@ -441,7 +468,7 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         max_rows: usize,
     ) -> PgWireResult<Response>
@@ -484,7 +511,24 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
                 ))
             }
             LaminarStmt::Show(cmd) => engine_metadata_response(&self.db, &show_sql(cmd)).await,
-            LaminarStmt::Standard(s) => standard_response(&self.db, *s.clone()),
+            LaminarStmt::Select { sql, schema } => {
+                let read = read_session(client);
+                select_response(
+                    &self.db,
+                    &read,
+                    sql,
+                    Some(&portal.result_column_format),
+                    Some(schema),
+                )
+                .await
+            }
+            LaminarStmt::Standard(s) => {
+                let read = read_session(client);
+                match session_statement(&self.db, &read, s) {
+                    Some(response) => response,
+                    None => standard_response(&self.db, *s.clone()),
+                }
+            }
         }
     }
 }

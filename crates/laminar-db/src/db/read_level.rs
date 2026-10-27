@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use arrow::datatypes::SchemaRef;
 use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
 
 use super::LaminarDB;
@@ -81,6 +82,21 @@ impl LaminarDB {
             }
         };
         Ok(result)
+    }
+
+    /// The schema of the rows [`Self::read`] returns for `sql` and the parameter count it
+    /// declares, planned without reading any table.
+    ///
+    /// # Errors
+    /// [`DbError::InvalidOperation`] if `sql` is not one query; any planning error of `sql`.
+    pub async fn read_schema(&self, sql: &str) -> Result<(SchemaRef, usize), DbError> {
+        ensure_query(sql)?;
+        let plan = self.ctx.state().create_logical_plan(sql).await?;
+        let parameters = plan.get_parameter_types()?.len();
+        Ok((
+            std::sync::Arc::new(plan.schema().as_arrow().clone()),
+            parameters,
+        ))
     }
 
     /// Plan `sql` at the committed cut `at` resolves to and load its views.
