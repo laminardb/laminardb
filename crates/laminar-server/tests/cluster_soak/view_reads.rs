@@ -60,13 +60,11 @@ FROM soak_view_counts \
 UNION ALL SELECT 'r', COUNT(*) AS a, SUM(id) AS b, SUM(join_key) AS c, CAST(NULL AS BIGINT) AS d \
 FROM soak_view_rows";
 /// Committed-read errors HTTP answers with 400 while a node catches up, as pgwire's retryable
-/// SQLSTATEs below.
-const RETRYABLE_HTTP_ERRORS: [&str; 6] = [
-    "has not committed",
+/// SQLSTATEs below. A read that reaches its deadline answers 504.
+const RETRYABLE_HTTP_ERRORS: [&str; 4] = [
     "no checkpoint has committed",
     "is not retained",
     "hold checkpoints",
-    "passed its deadline",
     "has no committed state",
 ];
 /// SQLSTATEs a committed read can return while the cluster recovers: no committed cut yet or the
@@ -382,6 +380,7 @@ fn http_read(node: usize, floor: u64, oracle: &mut ViewOracle) -> Result<u64, Re
             )))
         }
         503 => return Err(ReadFailure::Retryable("http 503".to_owned())),
+        504 => return Err(ReadFailure::Retryable("http 504".to_owned())),
         400 if RETRYABLE_HTTP_ERRORS
             .iter()
             .any(|error| response.contains(error)) =>
