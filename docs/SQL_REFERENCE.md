@@ -875,17 +875,20 @@ fail with an error naming the largest view.
 
 An ad-hoc `SELECT` reads each table as a snapshot, so it may join views with each other and with
 sources and reference tables; the streaming join rules apply only to named streaming queries.
-It reads views at one of two levels:
+It reads views at one of three levels:
 
 - **latest**: every view after the last completed cycle, under one guard. Recovery can roll this
   back. It is the default in embedded and single-node mode, and a cluster node refuses it.
 - **committed**: every view at one committed checkpoint, as below. It is the default on a cluster
   node.
+- **recent**: a committed read that waits for a checkpoint holding every record written to the
+  views' Kafka sources before the read arrived, so a client reads its own writes; see
+  `CommittedRead::Recent` below.
 
 The Rust API `LaminarDB::read(sql, level)` takes a `ReadLevel` and returns the rows with the
 committed cut it read; `LaminarDB::default_read_level()` gives the mode's default, and
 `execute` reads at the latest level. Over pgwire, `SET laminar.read_level = 'latest' |
-'committed' | 'default'` and `SET laminar.min_epoch = <n>` apply to the connection, `SHOW
+'committed' | 'recent' | 'default'` and `SET laminar.min_epoch = <n>` apply to the connection, `SHOW
 laminar.read_epoch` returns the epoch of its last committed read, and a later committed read on
 the connection never reads an earlier epoch. That floor lasts as long as the connection: after a
 pipeline is reset to an empty checkpoint store, reconnect, or committed reads wait for an epoch
@@ -902,6 +905,14 @@ and returns the checkpoint's epoch and when it was taken:
   previous result returned to read no earlier than it.
 - `CommittedRead::Exact(epoch)` reads that checkpoint, and fails once checkpoint cleanup retired
   it. Cleanup keeps only the newest checkpoint and any checkpoint a read holds.
+- `CommittedRead::Recent { at_least }` asks each source behind the scanned views, through streams
+  and views of views, how far its upstream has been written when the read arrives, then reads the
+  newest checkpoint at or after `at_least` (0 for none) that holds all of it. Kafka sources with a
+  topic list can answer: transaction markers, and under `read_committed` open or aborted
+  transactions, are not waited for. A view over any other source, a topic pattern, or rows pushed
+  through the API fails before waiting (`0A000` over pgwire); a source that cannot be asked fails
+  with `58000`; when no checkpoint holds every source within 30 seconds, the error names the
+  sources still behind (`57014`). Reference tables are looked up, not waited for.
 
 Such a result is never rolled back and never mixes checkpoints. It is as fresh as the checkpoint
 interval. A committed read needs checkpointing, may scan only materialized views, and holds its
@@ -917,8 +928,10 @@ rejects it when checkpoints are manual or disabled, or when it is below the chec
 While the newest committed checkpoint is older than a view's freshness, a warning is logged and
 `mv_freshness_breaches_total{view}` counts the breach once; `mv_committed_staleness_ms` exports
 the age. Every view in a pipeline is read at the same newest checkpoint, so that age applies to
-each of them. `mv_reads_total{level}` counts reads by level, and `mv_committed_read_age_seconds`
-records the age of the checkpoint each committed read observed.
+each of them. `mv_reads_total{level}` counts reads by level (`latest`, `committed` or `recent`),
+`mv_committed_read_age_seconds` records the age of the checkpoint each committed or recent read
+observed, `mv_recent_read_wait_seconds` how long each recent read waited for its checkpoint, and
+`mv_recency_probe_failures_total{source}` the sources that could not be asked.
 
 ```sql
 CREATE MATERIALIZED VIEW positions AS

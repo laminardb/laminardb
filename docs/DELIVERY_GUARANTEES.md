@@ -125,6 +125,7 @@ read level (`ReadLevel` embedded, `laminar.read_level` over pgwire, `read_level`
 |---|---|---|
 | `latest` | Default. The latest completed cycle. Recovery can roll it back, so a later read can show less input than an earlier one. | Rejected: a node holds only its part of each view. |
 | `committed` | Every view the statement reads, at one committed checkpoint. | Default. The same, on any node, from every node's checkpointed state. |
+| `recent` | A committed read at a checkpoint that holds every record the views' sources had upstream when the read arrived. | The same, on any node. |
 
 A committed read:
 
@@ -134,6 +135,18 @@ A committed read:
   the one before;
 - is as fresh as the checkpoint interval plus the time to commit a checkpoint.
 
+A recent read gives read-your-writes through Kafka: a record the producer had acknowledged before
+the read arrived is in the result, and later records may be too. When the read arrives it asks
+each Kafka source behind the views it reads, through streams and views of views, how far its
+topics have been written, then reads the newest committed checkpoint whose positions reach that
+far. Transaction markers, and under the default `read_committed` isolation the records of open or
+aborted transactions, are not waited for. When no checkpoint holds them yet, the read waits for
+one, usually up to a checkpoint interval plus the commit, longer while a source lags behind its
+topics, and fails after 30 seconds instead of returning an older checkpoint. Only Kafka sources
+with a topic list can report how far they have been written: a view whose input includes another
+connector, a Kafka topic pattern, or rows pushed through the API refuses a recent read before
+waiting. Reference tables are looked up, not waited for.
+
 `SUBSCRIBE` to a view in a cluster delivers its rows at a committed checkpoint, then each later
 checkpoint's change, each followed by a progress frame. Folding the frames up to a progress frame
 gives the rows a committed read at that epoch returns.
@@ -142,6 +155,8 @@ A node fault starts a coordinated recovery round on every node, typically 10 to 
 it, a cluster node keeps serving committed data: pgwire and `POST /api/v1/sql` answer reads, and
 open WebSocket subscriptions stay open and continue with the next checkpoint once the round ends.
 Other SQL statements and the other HTTP routes, `/ready` included, answer 503 until it ends.
+No checkpoint commits during the round, so a recent read issued then waits for it to end or fails
+at its deadline.
 
 A subscription ends when its node stops. To continue it without a gap, reconnect to another node
 with `as_of_epoch` set to the last progress epoch: it restarts with the view's rows at that epoch,
