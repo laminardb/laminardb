@@ -206,6 +206,24 @@ jobs:
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
+          - label: Cluster EO materialized view reads (gossip)
+            test: three_node_eo_view_read_kill9_soak
+            features: cluster,aws,kafka,delta-lake-s3
+            delivery: eo
+            topology: cluster-views
+            discovery: gossip
+            emulator: "1"
+            # The EO join workload plus four views read over pgwire on every node and a view
+            # subscription, through every kill and paused-leader round. This job certifies the
+            # view read path, not the retained-state profile the EO job covers. Each read holds
+            # the keyed view, so the key count bounds read cost.
+            checkpoint_ms: "10000"
+            rps: "120"
+            keys: "4096"
+            min_live_state_bytes: "0"
+            visibility_ms: "120000"
+            slo_mode: observe
+            visibility_slo_mode: observe
           - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3,iceberg
