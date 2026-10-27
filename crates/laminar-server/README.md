@@ -236,8 +236,11 @@ the request arrived, waited for up to 30 seconds before the 5s collection budget
 Omitted, it is `latest` locally and `committed` in cluster mode, where a node holds only part of
 each view. A committed or recent response adds `epoch`, `checkpoint_id` and `taken_at_ms`; pass
 the epoch back as `min_epoch` to read no earlier checkpoint. `min_epoch` without a committed or
-recent level is rejected. A recent read of a view over a source that cannot report how far it has
-been written fails with 400; see [Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads). While a cluster node completes a coordinated recovery round, it keeps answering reads and
+recent level is rejected. A read that passes its 30 second deadline (a `min_epoch` that never
+commits, or no checkpoint yet holding a recent read's records) answers 504; a recent read whose
+source cannot be asked how far it has been written answers 502; other read errors, including a
+recent read of a view over a source that cannot report it, answer 400. See
+[Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads). While a cluster node completes a coordinated recovery round, it keeps answering reads and
 keeps `/ws/{name}` subscriptions open; other statements and routes answer 503 until it ends.
 
 Supported cluster DDL returns an asynchronous migration receipt. See the main

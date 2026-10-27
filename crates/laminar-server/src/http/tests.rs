@@ -1753,6 +1753,58 @@ async fn post_sql(app: &Router, body: serde_json::Value) -> (StatusCode, serde_j
     (status, serde_json::from_slice(&body).unwrap())
 }
 
+#[test]
+fn read_errors_separate_deadlines_and_unreachable_sources_from_bad_requests() {
+    use super::catalog::read_status;
+    use laminar_db::{CommittedReadError, DbError};
+    for (error, status) in [
+        (
+            CommittedReadError::NotRecent {
+                latest: Some(3),
+                uncovered: vec!["orders".into()],
+            },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::DeadlineExceeded { epoch: 3 },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::NotCommitted {
+                requested: Some(4),
+                latest: Some(3),
+            },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::RecencyProbe {
+                input: "orders".into(),
+                reason: "broker unreachable".into(),
+            },
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            CommittedReadError::RecencyUnsupported {
+                input: "orders".into(),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            CommittedReadError::NotCommitted {
+                requested: None,
+                latest: None,
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            read_status(&DbError::CommittedRead(error.clone())),
+            status,
+            "{error}"
+        );
+    }
+}
+
 /// A query reads views at the request's level: latest by default, or the committed checkpoint,
 /// whose epoch, checkpoint and capture time the response reports. A recent read takes
 /// `min_epoch` as its floor, and refuses a view over a pushed source, which has no upstream to ask.

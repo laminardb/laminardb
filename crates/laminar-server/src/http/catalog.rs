@@ -224,11 +224,28 @@ async fn read_sql(db: &laminar_db::LaminarDB, req: &SqlRequest) -> axum::respons
     };
     let read = match db.read(&req.sql, level).await {
         Ok(read) => read,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => return error_response(read_status(&e), e.to_string()).into_response(),
     };
     match query_response(read.rows, read.cut).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => error_response(read_status(&e), e.to_string()).into_response(),
+    }
+}
+
+/// A read that reached its deadline is 504 and one whose source could not be asked how far it
+/// has been written is 502, so a client can tell a retry from a bad request.
+pub(super) fn read_status(error: &laminar_db::DbError) -> StatusCode {
+    use laminar_db::{CommittedReadError, DbError};
+    match error {
+        DbError::CommittedRead(
+            CommittedReadError::NotRecent { .. }
+            | CommittedReadError::DeadlineExceeded { .. }
+            | CommittedReadError::NotCommitted {
+                requested: Some(_), ..
+            },
+        ) => StatusCode::GATEWAY_TIMEOUT,
+        DbError::CommittedRead(CommittedReadError::RecencyProbe { .. }) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_REQUEST,
     }
 }
 
