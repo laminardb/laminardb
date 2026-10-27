@@ -7,12 +7,13 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema};
 
 use laminar_core::catalog::CatalogObjectKind;
-use laminar_sql::parser::{MaterializedViewRetention, StreamingStatement};
+use laminar_sql::parser::{EmitClause, MaterializedViewRetention, StreamingStatement};
 
 use crate::db::{canonical_object_name, exact_table_reference, LaminarDB};
 use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 use crate::pipeline::{ControlMutation, ControlMutationState};
+use crate::sql_analysis::SplitQuery;
 
 use super::catalog::{reject_reserved_namespace, reject_stage_reads, CatalogNameReservation};
 use super::cluster_checks::{ChangelogInputKind, IntervalTopologyCandidate};
@@ -20,6 +21,7 @@ use super::control::resolve_control_ack;
 use super::stream::{
     query_inputs_registered, validate_managed_aggregate_admission, PlannedStreamingQuery,
 };
+use super::stream_stages::parse_split_owner;
 
 /// What a view's stream emits into its store.
 #[derive(Clone, Copy)]
@@ -28,6 +30,18 @@ enum ViewOutput {
     Changelog { aggregate: bool },
     /// Append-only rows with bounded retention.
     Append,
+}
+
+/// A view's statement as its stream executes it: over its stages when the statement split.
+struct ViewDefinition<'a> {
+    ddl: &'a str,
+    name: &'a sqlparser::ast::ObjectName,
+    query: &'a StreamingStatement,
+    emit_clause: Option<&'a EmitClause>,
+    query_sql: &'a str,
+    /// The sources and views the statement reads, through its stages too.
+    sources: Vec<String>,
+    retention: Option<&'a MaterializedViewRetention>,
 }
 
 struct MaterializedViewCreateGuard<'a> {
@@ -90,7 +104,17 @@ impl LaminarDB {
                     .into(),
             ));
         }
-        Self::reject_interval_output_subquery(&name_str, query_sql)?;
+        let split = self.split_stream_query(&name_str, query_sql)?;
+        let owner = split
+            .as_ref()
+            .map(|split| parse_split_owner(&name_str, split, emit_clause.as_ref()))
+            .transpose()?;
+        let (owner_query, owner_sql) = owner
+            .as_ref()
+            .map_or((&**query, query_sql.as_str()), |(query, sql)| {
+                (query, sql.as_str())
+            });
+        Self::reject_interval_output_subquery(&name_str, owner_sql)?;
         if let Some(freshness) = freshness {
             self.admit_view_freshness(&name_str, *freshness)?;
         }
@@ -109,18 +133,17 @@ impl LaminarDB {
             }));
         };
 
-        let (planned, interval_topology) = self
-            .validate_mv_admission(name, query, emit_clause.clone(), query_sql)
+        let view = ViewDefinition {
+            ddl: sql,
+            name,
+            query: owner_query,
+            emit_clause: emit_clause.as_ref(),
+            query_sql: owner_sql,
+            sources: self.collect_mv_sources(query_sql, &name_str),
+            retention: retention.as_ref(),
+        };
+        self.create_view(view, &name_str, split.as_ref(), reservation)
             .await?;
-        self.register_and_admit_mv(
-            sql,
-            &name_str,
-            reservation,
-            (planned, interval_topology),
-            query_sql,
-            retention.as_ref(),
-        )
-        .await?;
         if let Some(freshness) = freshness {
             self.mv_store
                 .read()
@@ -135,6 +158,43 @@ impl LaminarDB {
             topology_operation: None,
             applied: true,
         }))
+    }
+
+    /// Creates the view, after its stages when its statement split; on failure the created
+    /// stages are dropped.
+    async fn create_view(
+        &self,
+        view: ViewDefinition<'_>,
+        name: &str,
+        split: Option<&SplitQuery>,
+        reservation: CatalogNameReservation<'_>,
+    ) -> Result<(), DbError> {
+        let Some(split) = split else {
+            return self.create_view_object(view, name, reservation).await;
+        };
+        let created = match self.create_stages(name, split).await {
+            Ok(()) => self.create_view_object(view, name, reservation).await,
+            Err(error) => Err(error),
+        };
+        self.drop_stages_on_failure(name, created).await
+    }
+
+    async fn create_view_object(
+        &self,
+        view: ViewDefinition<'_>,
+        name: &str,
+        reservation: CatalogNameReservation<'_>,
+    ) -> Result<(), DbError> {
+        let planned = self
+            .validate_mv_admission(
+                view.name,
+                view.query,
+                view.emit_clause.cloned(),
+                view.query_sql,
+            )
+            .await?;
+        self.register_and_admit_mv(view, name, reservation, planned)
+            .await
     }
 
     /// A view may promise committed reads no fresher than the checkpoint cadence that commits
@@ -220,13 +280,18 @@ impl LaminarDB {
     /// admission acknowledgement resolves.
     async fn register_and_admit_mv(
         &self,
-        sql: &str,
+        view: ViewDefinition<'_>,
         name_str: &str,
         mut reservation: CatalogNameReservation<'_>,
         (planned, interval_topology): (PlannedStreamingQuery, IntervalTopologyCandidate),
-        query_sql: &str,
-        retention: Option<&MaterializedViewRetention>,
     ) -> Result<(), DbError> {
+        let ViewDefinition {
+            ddl: sql,
+            query_sql,
+            sources,
+            retention,
+            ..
+        } = view;
         let candidate = planned.candidate_registration(name_str, query_sql);
         let PlannedStreamingQuery {
             emit_clause: plan_emit,
@@ -247,7 +312,6 @@ impl LaminarDB {
         )
         .await?;
         let schema = self.resolve_mv_schema(&query_sql).await?;
-        let sources = self.collect_mv_sources(&query_sql, name_str);
 
         {
             let mv =

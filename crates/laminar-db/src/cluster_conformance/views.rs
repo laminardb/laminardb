@@ -334,6 +334,31 @@ async fn interval_join_view_matches_batch_sql_in_cluster() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// Views that aggregate over an aggregating subquery or over an interval join split into internal
+/// stages that execute as streams; each view keeps only its outer aggregate's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_views_match_batch_sql_in_cluster() {
+    const HISTOGRAM: &str = "SELECT n, COUNT(*) AS key_count FROM \
+         (SELECT k, COUNT(*) AS n FROM orders GROUP BY k) GROUP BY n";
+    const JOINED_TOTALS: &str = "SELECT o.k AS k, COUNT(*) AS n, SUM(p.v) AS s FROM orders o \
+         INNER JOIN payments p ON o.k = p.k \
+         AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND GROUP BY o.k";
+    let case = ViewCase {
+        name: "split_views",
+        sources: vec![events("orders", 0), events("payments", 3)],
+        views: vec![
+            format!("CREATE MATERIALIZED VIEW histogram AS {HISTOGRAM}"),
+            format!("CREATE MATERIALIZED VIEW joined_totals AS {JOINED_TOTALS}"),
+        ],
+        reads: vec![
+            ("SELECT * FROM histogram", HISTOGRAM),
+            ("SELECT * FROM joined_totals", JOINED_TOTALS),
+        ],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Two partitions over three nodes leave node 3 without input, so its view is idle and takes no
 /// part in the view's committed frontier. Every node keeps exactly the rows at or after that one
 /// frontier minus the interval, wherever they were written, and refuses a live read of its part.

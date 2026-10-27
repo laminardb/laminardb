@@ -116,7 +116,7 @@ impl LaminarDB {
         let name_str = canonical_object_name(name)?;
         if let Some(owner) = crate::sql_analysis::stage_owner(&name_str) {
             return Err(DbError::InvalidOperation(format!(
-                "'{name_str}' is an internal stage of stream '{owner}'; drop '{owner}' instead"
+                "'{name_str}' is an internal stage of '{owner}'; drop '{owner}' instead"
             )));
         }
         if self
@@ -326,7 +326,12 @@ impl LaminarDB {
         });
         let stages: Vec<_> = result
             .iter()
-            .filter(|target| target.kind == CatalogObjectKind::Stream)
+            .filter(|target| {
+                matches!(
+                    target.kind,
+                    CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView
+                )
+            })
             .flat_map(|target| self.stream_stage_targets(&target.name))
             .collect();
         result.extend(

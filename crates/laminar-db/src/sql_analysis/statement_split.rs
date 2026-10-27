@@ -1,6 +1,6 @@
-//! Statement splitting: a stream query whose shape no single managed operator executes — an
-//! aggregate over a join, or an aggregate over an aggregating or joining subquery — is rewritten
-//! into internal named stages that each admit and execute as an ordinary stream.
+//! Statement splitting: a stream or view query whose shape no single managed operator executes —
+//! an aggregate over a join, or an aggregate over an aggregating or joining subquery — is
+//! rewritten into internal named stages that each admit and execute as an ordinary stream.
 //!
 //! INVARIANT: stage names are `<owner>$stage<n>` in creation order. Stage `n` reads only catalog
 //! objects and stages below `n`; the owner's own query reads only its stages.

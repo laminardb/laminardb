@@ -343,8 +343,9 @@ the ordinary row stream.
 
 ### Nested aggregates and aggregates over a join
 
-A statement that no single operator can run is split into internal stages named
-`<stream>$stage<n>`, each admitted by the rules for its own shape in every mode:
+A `CREATE STREAM` or `CREATE MATERIALIZED VIEW` that no single operator can run is split into
+internal stages named `<name>$stage<n>`, each admitted by the rules for its own shape in every
+mode:
 
 ```sql
 -- A join stage, then a keyed aggregate over it.
@@ -362,6 +363,12 @@ SELECT trade_count, COUNT(*) AS accounts
 FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
 GROUP BY trade_count
 EMIT CHANGES;
+
+-- The same split under a view, which keeps only the outer aggregate's rows.
+CREATE MATERIALIZED VIEW trade_count_histogram AS
+SELECT trade_count, COUNT(*) AS accounts
+FROM (SELECT account_id, COUNT(*) AS trade_count FROM trades GROUP BY account_id)
+GROUP BY trade_count;
 ```
 
 - An aggregate over one two-way join reads a join stage that projects each input column the
@@ -371,9 +378,9 @@ EMIT CHANGES;
   An aggregating subquery emits changes, so the outer aggregate supports `COUNT`, `SUM` and `AVG`
   but not `MIN` or `MAX`. In cluster mode a windowed subquery is rejected, because cluster windows
   emit only closed windows.
-- Stages belong to their stream. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
-  `DROP STREAM` removes its stages, and no other statement may read, drop or create a
-  `$stage` name. A failed `CREATE` removes the stages it created.
+- Stages belong to their stream or view. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
+  `DROP STREAM` or `DROP MATERIALIZED VIEW` removes its stages, and no other statement may read,
+  drop or create a `$stage` name. A failed `CREATE` removes the stages it created.
 - A join of three or more inputs still needs named two-way stages: a join's output carries no
   event time, so an interval join cannot read it.
 
@@ -511,7 +518,9 @@ Cluster `CREATE MATERIALIZED VIEW` admits the query shapes `CREATE STREAM` admit
 
 - a keyed or global aggregate view;
 - a projection or filter over such a view, keeping or dropping its key columns;
-- an append-only view: a projection over a source, a closed window, or an interval join.
+- an append-only view: a projection over a source, a closed window, or an interval join;
+- an aggregate over one two-way join or over an aggregating or joining subquery, split into
+  stages as for a stream.
 
 Each node keeps the result rows of the vnodes it owns, checkpoints them with the aggregate, and
 moves them with their vnodes when ownership changes. A view that drops or changes its input's

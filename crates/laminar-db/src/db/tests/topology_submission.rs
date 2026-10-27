@@ -1208,6 +1208,9 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
             "CREATE STREAM nested AS SELECT id, SUM(n) AS n FROM \
              (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) per_id GROUP BY id"
                 .into(),
+            "CREATE MATERIALIZED VIEW sizes AS SELECT n, COUNT(*) AS ids FROM \
+             (SELECT id, COUNT(*) AS n FROM trades GROUP BY id) GROUP BY n"
+                .into(),
         ],
     ))
     .await;
@@ -1270,6 +1273,11 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
         committed_counts(&fixture.db, parent.epoch).await,
         [(1, 1), (2, 2)].into()
     );
+    let sizes = "SELECT n, ids FROM sizes";
+    assert_eq!(
+        committed_pairs(&fixture.db, sizes, parent.epoch).await,
+        [(1, 1), (2, 1)]
+    );
     let parent_identity = latest_index(&fixture).await.pipeline_identity;
 
     let request = request(1302, independent_pipeline());
@@ -1304,6 +1312,10 @@ async fn topology_sql_migration_keeps_a_materialized_view_and_checkpoints_its_ro
     assert_eq!(
         committed_counts(&fixture.db, target.epoch).await,
         [(1, 4), (2, 2)].into()
+    );
+    assert_eq!(
+        committed_pairs(&fixture.db, sizes, target.epoch).await,
+        [(2, 1), (4, 1)]
     );
     fixture.db.shutdown().await.unwrap();
 }
@@ -1575,6 +1587,10 @@ async fn seeded_views_after_migration(recover_from_root: bool) {
                 .into(),
             "CREATE MATERIALIZED VIEW running AS SELECT id, total FROM totals".into(),
             "CREATE MATERIALIZED VIEW sizes AS SELECT n, n * 10 AS tens FROM counts".into(),
+            // Split: the stage reads the kept view and is seeded from it.
+            "CREATE MATERIALIZED VIEW spread AS SELECT ids, COUNT(*) AS ns FROM \
+             (SELECT n, COUNT(*) AS ids FROM counts GROUP BY n) GROUP BY ids"
+                .into(),
         ],
     );
     Box::pin(fixture.db.submit_cluster_topology_change(&request))
@@ -1613,6 +1629,7 @@ async fn seeded_views_after_migration(recover_from_root: bool) {
         [(1, 4), (2, 2)]
     );
     assert_eq!(read("SELECT n, tens FROM sizes").await, [(2, 20), (4, 40)]);
+    assert_eq!(read("SELECT ids, ns FROM spread").await, [(1, 2)]);
 
     // The target checkpoint holds the seeded rows, so recovering from it seeds nothing again.
     let prior_starts = probe.starts.lock().len();
@@ -1631,5 +1648,6 @@ async fn seeded_views_after_migration(recover_from_root: bool) {
         read("SELECT n, ids FROM by_n").await,
         [(2, 1), (3, 1), (4, 1)]
     );
+    assert_eq!(read("SELECT ids, ns FROM spread").await, [(1, 3)]);
     fixture.db.shutdown().await.unwrap();
 }
