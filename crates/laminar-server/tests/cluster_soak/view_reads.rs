@@ -12,11 +12,15 @@
 //! nodes through every `kill -9` and paused-leader round. Each read must equal the views computed
 //! from the input prefix its own progress rows describe, the prefix must never shrink, the same
 //! epoch must read the same rows on every node, and every epoch must be at least the floor the
-//! session set. A WebSocket subscriber folds `soak_view_keys` across gateway changes; its fold at
-//! each progress epoch must equal the reader's rows at that epoch. After the input stops, every
-//! node must read every produced row at the final cut, over pgwire and HTTP.
+//! session set. After each pgwire session the reader reads the same node over HTTP, checked by
+//! row counts and sums. Neither may be refused during coordinated recovery. A WebSocket
+//! subscriber folds `soak_view_keys`; its fold at each progress epoch must equal the reader's rows
+//! at that epoch, a subscription open on a node a fault spares must outlive the round, and a
+//! connection that ends resumes at its last progress epoch. After the input stops, every node must
+//! read every produced row at the final cut, over pgwire and HTTP.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,7 +31,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     connect_cluster_subscription_gateway, subscription_websocket_error_is_retryable, wait_for,
-    Node, ProducedPrefix, ZipfSampler, BASE_PORT, NODES,
+    Node, ProducedPrefix, ZipfSampler, BASE_PORT, NODES, SOAK_CONSOLE_TOKEN,
 };
 
 const PGWIRE_PORT_OFFSET: u16 = 200;
@@ -45,6 +49,26 @@ UNION ALL SELECT 'c', n, max_id, CAST(NULL AS BIGINT) AS c, CAST(NULL AS BIGINT)
 FROM soak_view_counts \
 UNION ALL SELECT 'r', id, join_key, CAST(NULL AS BIGINT) AS c, CAST(NULL AS BIGINT) AS d \
 FROM soak_view_rows";
+/// The same views over HTTP, within its 1,000-row cap: the progress rows and each other view's
+/// row count and sums.
+const HTTP_READ_SQL: &str = "\
+SELECT 'p' AS kind, part AS a, n AS b, max_id AS c, id_sum AS d FROM soak_view_progress \
+UNION ALL SELECT 'k', COUNT(*) AS a, SUM(n) AS b, SUM(max_id) AS c, CAST(NULL AS BIGINT) AS d \
+FROM soak_view_keys \
+UNION ALL SELECT 'c', COUNT(*) AS a, SUM(n) AS b, SUM(max_id) AS c, CAST(NULL AS BIGINT) AS d \
+FROM soak_view_counts \
+UNION ALL SELECT 'r', COUNT(*) AS a, SUM(id) AS b, SUM(join_key) AS c, CAST(NULL AS BIGINT) AS d \
+FROM soak_view_rows";
+/// Committed-read errors HTTP answers with 400 while a node catches up, as pgwire's retryable
+/// SQLSTATEs below.
+const RETRYABLE_HTTP_ERRORS: [&str; 6] = [
+    "has not committed",
+    "no checkpoint has committed",
+    "is not retained",
+    "hold checkpoints",
+    "passed its deadline",
+    "has no committed state",
+];
 /// SQLSTATEs a committed read can return while the cluster recovers: no committed cut yet or the
 /// view not yet in it, the floor not committed in time, shutdown, a retired cut, pin capacity.
 const RETRYABLE_SQLSTATES: [&str; 5] = ["55000", "57014", "57P01", "22023", "53000"];
@@ -314,11 +338,143 @@ async fn read_once(client: &tokio_postgres::Client) -> Result<(u64, ViewRows), R
     Ok((epoch, rows))
 }
 
+/// Row count and sums of `soak_view_keys`, `soak_view_counts` and `soak_view_rows`.
+type ViewSums = [(u64, u64, u64); 3];
+
+fn view_sums(rows: &ViewRows) -> ViewSums {
+    let keys = rows.keys.values();
+    let counts = rows.counts.iter();
+    [
+        (
+            rows.keys.len() as u64,
+            keys.clone().map(|value| value.0).sum(),
+            keys.map(|value| value.1).sum(),
+        ),
+        counts
+            .clone()
+            .fold((0, 0, 0), |sums, (&(n, max_id), &count)| {
+                (sums.0 + count, sums.1 + n * count, sums.2 + max_id * count)
+            }),
+        (
+            rows.rows.len() as u64,
+            rows.rows.keys().sum(),
+            rows.rows.values().sum(),
+        ),
+    ]
+}
+
+/// One committed read over `POST /api/v1/sql`, checked like a pgwire read but by row counts and
+/// sums. Returns the epoch it read.
+fn http_read(node: usize, floor: u64, oracle: &mut ViewOracle) -> Result<u64, ReadFailure> {
+    let body = serde_json::json!({
+        "sql": HTTP_READ_SQL,
+        "read_level": "committed",
+        "min_epoch": floor,
+    })
+    .to_string();
+    let (status, response) = http_post(node, "/api/v1/sql", &body)
+        .map_err(|_| ReadFailure::Retryable("http connection".to_owned()))?;
+    match status {
+        200 => {}
+        503 if response.contains("coordinated recovery") => {
+            return Err(ReadFailure::Fatal(format!(
+                "node{node} refused an HTTP committed read during coordinated recovery: {response}"
+            )))
+        }
+        503 => return Err(ReadFailure::Retryable("http 503".to_owned())),
+        400 if RETRYABLE_HTTP_ERRORS
+            .iter()
+            .any(|error| response.contains(error)) =>
+        {
+            return Err(ReadFailure::Retryable("http catching up".to_owned()))
+        }
+        _ => {
+            return Err(ReadFailure::Fatal(format!(
+                "node{node} HTTP committed read failed with {status}: {response}"
+            )))
+        }
+    }
+    let fatal = |error: String| ReadFailure::Fatal(format!("node{node} HTTP read: {error}"));
+    let response: serde_json::Value =
+        serde_json::from_str(&response).map_err(|error| fatal(error.to_string()))?;
+    let epoch = json_u64(&response, "epoch").map_err(fatal)?;
+    if epoch < floor {
+        return Err(fatal(format!("epoch {epoch} below the floor {floor}")));
+    }
+    let column = |row: &serde_json::Value, field: &str| {
+        if row.get(field).is_some_and(serde_json::Value::is_null) {
+            Ok(0)
+        } else {
+            json_u64(row, field)
+        }
+    };
+    let mut progress = ViewRows::default();
+    let mut sums = [(0, 0, 0); 3];
+    for row in response["data"].as_array().into_iter().flatten() {
+        let values = (
+            column(row, "a").map_err(fatal)?,
+            column(row, "b").map_err(fatal)?,
+            column(row, "c").map_err(fatal)?,
+        );
+        match row["kind"].as_str() {
+            Some("p") => {
+                let id_sum = u128::from(column(row, "d").map_err(fatal)?);
+                progress
+                    .progress
+                    .insert(values.0, (values.1, values.2, id_sum));
+            }
+            Some("k") => sums[0] = values,
+            Some("c") => sums[1] = values,
+            Some("r") => sums[2] = values,
+            kind => return Err(fatal(format!("unknown row kind {kind:?}"))),
+        }
+    }
+    let prefix = oracle
+        .prefix(&progress)
+        .map_err(|error| fatal(format!("epoch {epoch}: {error}")))?;
+    let expected = view_sums(&oracle.expected(&prefix));
+    if sums != expected {
+        return Err(fatal(format!(
+            "epoch {epoch}: view sums {sums:?} differ from batch SQL over the read's input prefix \
+             {expected:?}"
+        )));
+    }
+    Ok(epoch)
+}
+
+fn http_post(node: usize, path: &str, body: &str) -> std::io::Result<(u16, String)> {
+    let port = BASE_PORT + u16::try_from(node).expect("soak node id fits u16");
+    let mut stream = TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        CONNECT_TIMEOUT,
+    )?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(CONNECT_TIMEOUT))?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {SOAK_CONSOLE_TOKEN}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| std::io::Error::other("HTTP response without a body"))?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| std::io::Error::other("HTTP response without a status"))?;
+    Ok((status, body.to_owned()))
+}
+
 /// What the reader observed, shared with the soak thread.
 #[derive(Default)]
 struct ReadEvidence {
     floor: u64,
     reads_by_node: [u64; NODES],
+    http_reads_by_node: [u64; NODES],
     retried: BTreeMap<String, u64>,
     last_prefix: Option<(u64, Vec<Option<u64>>)>,
     read_digests: BTreeMap<u64, [u8; 32]>,
@@ -413,13 +569,20 @@ fn run_reader(
     while !stop.load(Ordering::Acquire) {
         let node = sessions % NODES;
         sessions += 1;
-        match runtime.block_on(read_session(node, stop, evidence, &mut oracle)) {
-            Ok(()) => {}
-            Err(ReadFailure::Retryable(reason)) => {
-                *evidence.lock().retried.entry(reason).or_insert(0) += 1;
-                std::thread::sleep(Duration::from_millis(200));
+        let pgwire = runtime.block_on(read_session(node, stop, evidence, &mut oracle));
+        let floor = evidence.lock().floor;
+        let http = http_read(node, floor, &mut oracle).map(|_| {
+            evidence.lock().http_reads_by_node[node] += 1;
+        });
+        for result in [pgwire, http] {
+            match result {
+                Ok(()) => {}
+                Err(ReadFailure::Retryable(reason)) => {
+                    *evidence.lock().retried.entry(reason).or_insert(0) += 1;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(ReadFailure::Fatal(error)) => return Err(error),
             }
-            Err(ReadFailure::Fatal(error)) => return Err(error),
         }
     }
     Ok(())
@@ -431,6 +594,10 @@ struct SubscriptionEvidence {
     progress: BTreeMap<u64, [u8; 32]>,
     gateways: BTreeSet<usize>,
     connections: u64,
+    /// The open connection's number and gateway.
+    open: Option<(u64, usize)>,
+    /// Each connection's last progress epoch.
+    last_progress: BTreeMap<u64, u64>,
     /// Connections that started at the previous connection's last progress epoch.
     resumed: u64,
     /// Resumes refused because that epoch was no longer retained (410), restarted at the tail.
@@ -543,6 +710,7 @@ impl Fold {
 /// Folds one gateway connection until the soak rotates it, a stop, or a transport failure.
 fn consume_view_gateway(
     socket: &mut tungstenite::WebSocket<TcpStream>,
+    connection: u64,
     stop: &AtomicBool,
     evidence: &parking_lot::Mutex<SubscriptionEvidence>,
 ) -> Result<(), String> {
@@ -582,7 +750,9 @@ fn consume_view_gateway(
             Some("data") => fold.data(&frame)?,
             Some("progress") => {
                 let (epoch, keys) = fold.progress(&frame)?;
-                let existing = *evidence.lock().progress.entry(epoch).or_insert(keys);
+                let mut evidence = evidence.lock();
+                evidence.last_progress.insert(connection, epoch);
+                let existing = *evidence.progress.entry(epoch).or_insert(keys);
                 if existing != keys {
                     return Err(format!(
                         "two view subscriptions folded different rows at epoch {epoch}"
@@ -600,8 +770,8 @@ fn run_subscriber(
     evidence: &parking_lot::Mutex<SubscriptionEvidence>,
 ) -> Result<(), String> {
     let mut attempts = 0usize;
-    // A gateway closes its subscriptions during coordinated recovery, so each connection resumes
-    // at the last progress epoch; its snapshot there must equal the fold the last one reached.
+    // A connection that ends (its gateway stopped, or the soak rotated it) resumes at the last
+    // progress epoch; its snapshot there must equal the fold the last one reached.
     let mut tail = false;
     while !stop.load(Ordering::Acquire) {
         let gateway = attempts % NODES;
@@ -632,15 +802,20 @@ fn run_subscriber(
             continue;
         };
         tail = false;
-        {
+        let connection = {
             let mut evidence = evidence.lock();
             evidence.gateways.insert(gateway);
             evidence.connections += 1;
             evidence.resumed += u64::from(resume.is_some());
-        }
-        match consume_view_gateway(&mut socket, stop, evidence) {
+            evidence.open = Some((evidence.connections, gateway));
+            evidence.connections
+        };
+        let result = consume_view_gateway(&mut socket, connection, stop, evidence);
+        let mut evidence = evidence.lock();
+        evidence.open = None;
+        match result {
             Ok(()) => {}
-            Err(error) if error.starts_with("retryable") => evidence.lock().retry(&error),
+            Err(error) if error.starts_with("retryable") => evidence.retry(&error),
             Err(error) => return Err(error),
         }
     }
@@ -724,6 +899,10 @@ pub(super) struct ViewSoak {
     zipf_milli: u64,
     reader: Observer<ReadEvidence>,
     subscriber: Observer<SubscriptionEvidence>,
+    /// The subscription connection open on a node the current round's fault spares.
+    spared: Option<u64>,
+    /// Rounds whose spared subscription delivered the recovered checkpoint.
+    spanned: u64,
 }
 
 impl ViewSoak {
@@ -743,6 +922,8 @@ impl ViewSoak {
                 run_reader(stop, evidence, oracle)
             }),
             subscriber: Observer::spawn("view-soak-subscriber", run_subscriber),
+            spared: None,
+            spanned: 0,
         };
         soak.reader
             .wait_until("a first committed view read", window, |evidence| {
@@ -755,8 +936,21 @@ impl ViewSoak {
         soak
     }
 
-    /// After a fault round: both observers are healthy and have reached the recovered cut. The
-    /// subscription then moves to the next gateway.
+    /// Remember the subscription open on a node the fault spares; it must outlive the round.
+    pub(super) fn before_fault(&mut self, victim: usize) {
+        self.subscriber.assert_running();
+        self.spared = self
+            .subscriber
+            .evidence
+            .lock()
+            .open
+            .filter(|(_, gateway)| *gateway != victim)
+            .map(|(connection, _)| connection);
+    }
+
+    /// After a fault round: both observers are healthy and have reached the recovered cut, and a
+    /// subscription that was open on a spared node delivered it. The subscription then moves to
+    /// the next gateway.
     pub(super) fn after_round(&mut self, epoch: u64, window: Duration) {
         self.reader.wait_until(
             "a committed view read after the round",
@@ -774,15 +968,27 @@ impl ViewSoak {
             },
         );
         let mut subscription = self.subscriber.evidence.lock();
+        if let Some(connection) = self.spared.take() {
+            let delivered = subscription.last_progress.get(&connection).copied();
+            assert!(
+                delivered.is_some_and(|delivered| delivered >= epoch),
+                "the view subscription open on a surviving node ended during the round: \
+                 connection {connection} last delivered {delivered:?}, recovered epoch {epoch}"
+            );
+            self.spanned += 1;
+        }
         subscription.rotate = true;
         let reads = self.reader.evidence.lock();
         eprintln!(
-            "soak: view reads through epoch {} ({:?} per node; retried {:?}); subscription \
-             connections {} ({} resumed, {} resumes lost; retried {:?})",
+            "soak: view reads through epoch {} (pgwire {:?}, HTTP {:?} per node; retried {:?}); \
+             subscription connections {} ({} kept open through a fault, {} resumed, {} resumes \
+             lost; retried {:?})",
             reads.floor,
             reads.reads_by_node,
+            reads.http_reads_by_node,
             reads.retried,
             subscription.connections,
+            self.spanned,
             subscription.resumed,
             subscription.resume_lost,
             subscription.retried
@@ -833,8 +1039,16 @@ impl ViewSoak {
             reads.reads_by_node
         );
         assert!(
-            subscription.resumed > 0,
-            "no view subscription resumed at its last progress epoch"
+            subscription.resumed > 0 && self.spanned > 0,
+            "the view subscription must resume at its last progress epoch and stay open through \
+             a fault on another node: {} resumed, {} kept open",
+            subscription.resumed,
+            self.spanned
+        );
+        assert!(
+            reads.http_reads_by_node.iter().all(|reads| *reads > 0),
+            "every node must serve HTTP committed view reads: {:?}",
+            reads.http_reads_by_node
         );
         assert!(
             shared.len() >= 2 && subscription.gateways.len() == NODES,
@@ -853,15 +1067,17 @@ impl ViewSoak {
         }
         eprintln!(
             "soak: view oracle verified through epoch {epoch}: {} committed reads across {} \
-             epochs ({:?} per node, retried {:?}); subscription folded {} epochs over {} \
-             connections ({} resumed, {} resumes lost, retried {:?}), {} epochs shared with the \
-             reader",
+             epochs ({:?} per node, {:?} HTTP reads, retried {:?}); subscription folded {} epochs \
+             over {} connections ({} kept open through a fault, {} resumed, {} resumes lost, \
+             retried {:?}), {} epochs shared with the reader",
             reads.reads_by_node.iter().sum::<u64>(),
             reads.read_digests.len(),
             reads.reads_by_node,
+            reads.http_reads_by_node,
             reads.retried,
             subscription.progress.len(),
             subscription.connections,
+            self.spanned,
             subscription.resumed,
             subscription.resume_lost,
             subscription.retried,

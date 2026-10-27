@@ -14651,6 +14651,9 @@ fn run_three_node_join_kill9_soak_with_adoption(
         let prior_release = migration_probe
             .as_ref()
             .and_then(topology_migration::MigrationProbe::recovery_release);
+        if let Some(views) = view_soak.as_mut() {
+            views.before_fault(victim);
+        }
         let paused = fault.deliver(&mut nodes[victim]);
         if paused.is_some() {
             pauses += 1;
