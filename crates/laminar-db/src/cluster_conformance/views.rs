@@ -153,6 +153,22 @@ impl ViewCase {
                     oracle::diff(&expected, &observed)
                 ));
             }
+            // The replayed catalog leads a recent read to its sources, which report no upstream.
+            let recent = node
+                .query_committed(read, CommittedRead::Recent { at_least: 0 })
+                .await;
+            let reached_source = matches!(
+                &recent,
+                Err(crate::DbError::CommittedRead(
+                    crate::CommittedReadError::RecencyUnsupported { input }
+                )) if self.sources.iter().any(|source| source.name == input)
+            );
+            if !reached_source {
+                return Err(format!(
+                    "{}: node 2 recent `{read}` did not reach its sources: {recent:?}",
+                    self.name
+                ));
+            }
         }
         Ok(())
     }

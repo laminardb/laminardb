@@ -75,11 +75,16 @@ impl CommittedViews {
                     return Err(floor_not_committed)
                 }
                 Err(_) => {
+                    let uncovered = targets.uncovered(&covered);
+                    // Every source was held, but no cut holding them could be pinned.
+                    if uncovered.is_empty() {
+                        return Err(CommittedReadError::DeadlineExceeded { epoch: next - 1 }.into());
+                    }
                     return Err(CommittedReadError::NotRecent {
                         latest: self.latest().map(|cut| cut.index.epoch),
-                        uncovered: targets.uncovered(&covered),
+                        uncovered,
                     }
-                    .into())
+                    .into());
                 }
             };
             next = cut.index.epoch + 1;
