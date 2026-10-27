@@ -185,10 +185,15 @@ pub struct ViewMetrics {
     /// Rows append-only views dropped at ingest because they arrived behind the event-time
     /// retention horizon. A row-cap retention has no horizon and never drops here.
     pub rows_below_horizon_total: IntCounter,
-    /// Ad-hoc reads of views. Label: `level` (`latest` or `committed`).
+    /// Ad-hoc reads of views. Label: `level` (`latest`, `committed` or `recent`).
     pub reads_total: IntCounterVec,
-    /// Age of the committed checkpoint each committed read observed, in seconds.
+    /// Age of the committed checkpoint each committed or recent read observed, in seconds.
     pub committed_read_age_seconds: Histogram,
+    /// How long each recent read waited for a committed checkpoint holding what its sources had
+    /// upstream when it arrived, in seconds.
+    pub recent_read_wait_seconds: Histogram,
+    /// Times a source could not report its upstream position to a recent read. Label: `source`.
+    pub recency_probe_failures_total: IntCounterVec,
 }
 
 impl ViewMetrics {
@@ -230,6 +235,23 @@ impl ViewMetrics {
                 .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
             )
             .unwrap(),
+            recent_read_wait_seconds: Histogram::with_opts(
+                HistogramOpts::new(
+                    "mv_recent_read_wait_seconds",
+                    "Time each recent view read waited for a committed checkpoint holding what \
+                     its sources had upstream when it arrived",
+                )
+                .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
+            )
+            .unwrap(),
+            recency_probe_failures_total: IntCounterVec::new(
+                Opts::new(
+                    "mv_recency_probe_failures_total",
+                    "Times a source could not report its upstream position to a recent view read",
+                ),
+                &["source"],
+            )
+            .unwrap(),
         };
         registry
             .register(Box::new(metrics.updates.clone()))
@@ -252,16 +274,22 @@ impl ViewMetrics {
         registry
             .register(Box::new(metrics.committed_read_age_seconds.clone()))
             .unwrap();
+        registry
+            .register(Box::new(metrics.recent_read_wait_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(metrics.recency_probe_failures_total.clone()))
+            .unwrap();
         metrics
     }
 
-    /// Count one read, at a committed cut taken at `taken_at_ms` or at the latest cycle.
-    pub(crate) fn observe_read(&self, taken_at_ms: Option<u64>) {
+    /// Count one read at `level`, at a committed cut taken at `taken_at_ms` or at the latest
+    /// cycle.
+    pub(crate) fn observe_read(&self, level: &str, taken_at_ms: Option<u64>) {
+        self.reads_total.with_label_values(&[level]).inc();
         let Some(taken_at_ms) = taken_at_ms else {
-            self.reads_total.with_label_values(&["latest"]).inc();
             return;
         };
-        self.reads_total.with_label_values(&["committed"]).inc();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| {

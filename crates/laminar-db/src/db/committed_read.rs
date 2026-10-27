@@ -31,20 +31,24 @@ impl LaminarDB {
     /// The result never mixes checkpoints and is never rolled back, and a later
     /// [`CommittedRead::Latest`] read on this database never sees an earlier epoch. It is as fresh
     /// as the checkpoint cadence. Pass a returned epoch back as [`CommittedRead::AtLeast`] to read
-    /// no earlier than a previous result. An append view with a row-count retention is not exact:
-    /// which rows a cap keeps depends on arrival order.
+    /// no earlier than a previous result. [`CommittedRead::Recent`] waits until the newest cut
+    /// holds every record the views' sources had upstream when the read arrived, so a client
+    /// reads what it wrote to a source; every source behind the views must report its upstream
+    /// position (reference tables are looked up and are not waited for). An append view with a
+    /// row-count retention is not exact: which rows a cap keeps depends on arrival order.
     ///
     /// The statement may scan only materialized views. The checkpoint is held against retention
     /// for at most 30 seconds, which bounds the read, including any wait for
-    /// [`CommittedRead::AtLeast`]. A cluster node reads every participant's committed state, so
+    /// [`CommittedRead::AtLeast`] or [`CommittedRead::Recent`]. A cluster node reads every participant's committed state, so
     /// any node serves any view; it reads only cuts at or after the durable pin it holds. A node
     /// outside the checkpoint participants (draining, or not yet assigned) learns of each cut of
     /// its own topology from the cluster authority within about a second.
     ///
     /// # Errors
     /// [`DbError::CommittedRead`] when checkpointing is disabled, the requested epoch has not
-    /// committed in time or is no longer retained, the statement scans live state, or the read
-    /// passes its deadline; any planning or execution error of `sql`.
+    /// committed in time or is no longer retained, the statement scans live state, a recent
+    /// read's source cannot report or failed to report its upstream position, or the read passes
+    /// its deadline; any planning or execution error of `sql`.
     pub async fn query_committed(
         &self,
         sql: &str,

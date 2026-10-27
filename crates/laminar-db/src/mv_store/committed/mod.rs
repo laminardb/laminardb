@@ -8,6 +8,7 @@ mod cache;
 #[cfg(feature = "cluster")]
 mod changes;
 mod pruning;
+mod recency;
 #[cfg(test)]
 mod tests;
 
@@ -28,6 +29,7 @@ use crate::checkpoint_coordinator::committed_reads::{
 };
 use crate::error::DbError;
 use cache::ArtifactCache;
+pub(crate) use recency::RecencyTargets;
 
 /// Attempts at pinning the newest cut while retention retires the ones a read resolved.
 const PIN_ATTEMPTS: u32 = 4;
@@ -44,6 +46,13 @@ pub enum CommittedRead {
     AtLeast(u64),
     /// Exactly this epoch, while retention keeps it.
     Exact(u64),
+    /// The newest committed cut, at or after `at_least`, that holds every record each source
+    /// behind the read's views could see upstream when the read arrived; it may hold later
+    /// records too. The read waits for it until its deadline.
+    Recent {
+        /// The oldest epoch the read accepts; `0` for none.
+        at_least: u64,
+    },
 }
 
 /// Why a committed read could not be served.
@@ -89,6 +98,31 @@ pub enum CommittedReadError {
         /// The scanned table.
         table: String,
     },
+    /// An input behind the read's views cannot report how far its upstream has been written.
+    #[error(
+        "'{input}' cannot report how far its upstream has been written; read it without recency"
+    )]
+    RecencyUnsupported {
+        /// The source, or the input that is not a source.
+        input: String,
+    },
+    /// A source could not report how far its upstream has been written, or whether a cut holds
+    /// it.
+    #[error("source '{input}' could not report its upstream position: {reason}")]
+    RecencyProbe {
+        /// The source.
+        input: String,
+        /// What failed.
+        reason: String,
+    },
+    /// No committed cut held every source's upstream records before the read's deadline.
+    #[error("{}", not_recent(*latest, uncovered))]
+    NotRecent {
+        /// The newest committed epoch, if any.
+        latest: Option<u64>,
+        /// The sources no cut checked before the deadline held.
+        uncovered: Vec<String>,
+    },
 }
 
 fn not_committed(requested: Option<u64>, latest: Option<u64>) -> String {
@@ -97,6 +131,15 @@ fn not_committed(requested: Option<u64>, latest: Option<u64>) -> String {
         Some(epoch) => format!("epoch {epoch} has not committed; the newest is {latest}"),
         None => "no checkpoint has committed yet".to_owned(),
     }
+}
+
+fn not_recent(latest: Option<u64>, uncovered: &[String]) -> String {
+    let latest = latest.map_or_else(|| "none".to_owned(), |epoch| epoch.to_string());
+    format!(
+        "no committed cut held what sources [{}] had upstream when the read arrived; the newest \
+         is {latest}",
+        uncovered.join(", ")
+    )
 }
 
 impl From<CommittedReadError> for DbError {
@@ -230,6 +273,11 @@ impl CommittedViews {
         let wait_for = match at {
             CommittedRead::Latest => None,
             CommittedRead::AtLeast(epoch) | CommittedRead::Exact(epoch) => Some(epoch),
+            CommittedRead::Recent { .. } => {
+                return Err(DbError::InvalidOperation(
+                    "a recent read needs the upstream positions of its sources".into(),
+                ))
+            }
         };
         let latest = self.await_epoch(wait_for, deadline).await?;
         if let CommittedRead::Exact(epoch) = at {

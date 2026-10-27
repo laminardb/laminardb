@@ -9,12 +9,13 @@ use arrow::array::RecordBatch;
 use datafusion::catalog::default_table_source::source_as_provider;
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 use datafusion_common::tree_node::TreeNodeRecursion;
 
 use super::append_log::LogReadError;
-use super::committed::{CommittedRead, CommittedReadError, CommittedViews, PinnedCut, ViewShape};
+use super::committed::{CommittedReadError, CommittedViews, PinnedCut, ViewShape};
 use super::{MvStore, ViewRead};
 use crate::error::DbError;
 use crate::table_provider::MvTableProvider;
@@ -65,7 +66,7 @@ impl CommittedStatement {
 /// The committed checkpoint a read observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadCut {
-    /// Epoch of the cut; pass it back as [`CommittedRead::AtLeast`] to read no earlier.
+    /// Epoch of the cut; pass it back as [`super::CommittedRead::AtLeast`] to read no earlier.
     pub epoch: u64,
     /// Checkpoint that committed the cut.
     pub checkpoint_id: u64,
@@ -174,17 +175,19 @@ pub(crate) async fn plan_statement(
     Ok(DataFrame::new(state, plan))
 }
 
-/// Plan the query `sql` so that every materialized view it scans reads the committed cut `at`
-/// resolves to. The cut stays pinned until the returned frame and every stream executed from it
-/// are dropped, or until `deadline`.
+/// A query planned to read its materialized views at a committed cut not yet chosen.
+pub(crate) struct CommittedPlan {
+    state: SessionState,
+    plan: LogicalPlan,
+    views: Vec<String>,
+}
+
+/// Plan the query `sql` to read every materialized view it scans at one committed cut.
 pub(crate) async fn plan_committed_statement(
     ctx: &SessionContext,
-    store: &parking_lot::RwLock<MvStore>,
     sql: &str,
-    at: CommittedRead,
-    deadline: Instant,
-) -> Result<(DataFrame, ReadCut), DbError> {
-    let mut state = ctx.state();
+) -> Result<CommittedPlan, DbError> {
+    let state = ctx.state();
     let plan = state.create_logical_plan(sql).await?;
     if matches!(plan, LogicalPlan::Ddl(_) | LogicalPlan::Statement(_)) {
         return Err(DbError::InvalidOperation(
@@ -195,28 +198,49 @@ pub(crate) async fn plan_committed_statement(
     if let Some(table) = scanned.live.into_iter().next() {
         return Err(CommittedReadError::LiveTable { table }.into());
     }
-    let views = store
-        .read()
-        .committed_views()
-        .ok_or(CommittedReadError::CheckpointingDisabled)?;
-    let cut = views.pin(at, deadline).await?;
-    let shapes = {
-        let guard = store.read();
-        scanned
-            .views
-            .iter()
-            .filter_map(|view| Some((view.clone(), guard.view_shape(view)?)))
-            .collect()
-    };
-    let read_cut = ReadCut {
-        epoch: cut.epoch,
-        checkpoint_id: cut.checkpoint_id,
-        taken_at_ms: cut.taken_at_ms,
-    };
-    state
-        .config_mut()
-        .set_extension(Arc::new(CommittedStatement { views, cut, shapes }));
-    Ok((DataFrame::new(state, plan), read_cut))
+    Ok(CommittedPlan {
+        state,
+        plan,
+        views: scanned.views,
+    })
+}
+
+impl CommittedPlan {
+    /// The materialized views the query scans, sorted and distinct.
+    pub(crate) fn views(&self) -> &[String] {
+        &self.views
+    }
+
+    /// Read every view at `cut`, which stays pinned until the returned frame and every stream
+    /// executed from it are dropped, or until its deadline.
+    pub(crate) fn at_cut(
+        self,
+        store: &parking_lot::RwLock<MvStore>,
+        views: Arc<CommittedViews>,
+        cut: PinnedCut,
+    ) -> (DataFrame, ReadCut) {
+        let Self {
+            mut state,
+            plan,
+            views: scanned,
+        } = self;
+        let shapes = {
+            let guard = store.read();
+            scanned
+                .iter()
+                .filter_map(|view| Some((view.clone(), guard.view_shape(view)?)))
+                .collect()
+        };
+        let read_cut = ReadCut {
+            epoch: cut.epoch,
+            checkpoint_id: cut.checkpoint_id,
+            taken_at_ms: cut.taken_at_ms,
+        };
+        state
+            .config_mut()
+            .set_extension(Arc::new(CommittedStatement { views, cut, shapes }));
+        (DataFrame::new(state, plan), read_cut)
+    }
 }
 
 /// Tables a plan scans: sorted, distinct materialized views, including subqueries and views

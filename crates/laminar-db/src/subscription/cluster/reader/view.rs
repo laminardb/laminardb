@@ -127,7 +127,10 @@ fn open_error(error: DbError) -> DbError {
         | CommittedReadError::CheckpointingDisabled
         | CommittedReadError::PinCapacity
         | CommittedReadError::DeadlineExceeded { .. }
-        | CommittedReadError::LiveTable { .. } => ClusterSubscriptionError::BackendUnavailable,
+        | CommittedReadError::LiveTable { .. }
+        | CommittedReadError::RecencyUnsupported { .. }
+        | CommittedReadError::RecencyProbe { .. }
+        | CommittedReadError::NotRecent { .. } => ClusterSubscriptionError::BackendUnavailable,
     }
     .into()
 }

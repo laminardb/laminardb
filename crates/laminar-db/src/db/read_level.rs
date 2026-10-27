@@ -1,14 +1,20 @@
 //! Ad-hoc queries that read materialized views at a level the session chose: after the latest
-//! completed cycle, or at one committed checkpoint.
+//! completed cycle, or at one committed checkpoint, possibly the first to hold what the views'
+//! sources had upstream when the read arrived.
 
+use std::collections::{BTreeMap, HashSet};
 use std::time::Instant;
 
 use arrow::datatypes::SchemaRef;
+use laminar_connectors::config::ConnectorConfig;
 use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
 
 use super::LaminarDB;
 use crate::error::DbError;
-use crate::mv_store::{CommittedRead, CommittedReadError, ReadCut, VIEW_READ_DEADLINE};
+use crate::mv_store::{
+    CommittedRead, CommittedReadError, CommittedViews, PinnedCut, ReadCut, RecencyTargets,
+    VIEW_READ_DEADLINE,
+};
 use crate::query_rows::{execution_error, QueryRows};
 
 /// How an ad-hoc query reads the materialized views it scans.
@@ -64,7 +70,7 @@ impl LaminarDB {
                 let frame = crate::mv_store::plan_statement(&self.ctx, &self.mv_store, sql).await?;
                 let stream = frame.execute_stream().await.map_err(execution_error)?;
                 if let Some(metrics) = self.engine_metrics.lock().as_ref() {
-                    metrics.views.observe_read(None);
+                    metrics.views.observe_read("latest", None);
                 }
                 ReadResult {
                     cut: None,
@@ -112,9 +118,21 @@ impl LaminarDB {
         ),
         DbError,
     > {
-        let (frame, cut) =
-            crate::mv_store::plan_committed_statement(&self.ctx, &self.mv_store, sql, at, deadline)
-                .await?;
+        let planned = crate::mv_store::plan_committed_statement(&self.ctx, sql).await?;
+        let views = self
+            .mv_store
+            .read()
+            .committed_views()
+            .ok_or(CommittedReadError::CheckpointingDisabled)?;
+        let (level, cut) = match at {
+            CommittedRead::Recent { at_least } => (
+                "recent",
+                self.pin_recent(&views, planned.views(), at_least, deadline)
+                    .await?,
+            ),
+            at => ("committed", views.pin(at, deadline).await?),
+        };
+        let (frame, cut) = planned.at_cut(&self.mv_store, views, cut);
         // View scans load their artifacts while the plan is built.
         let stream = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
@@ -124,9 +142,128 @@ impl LaminarDB {
         .map_err(|_| CommittedReadError::DeadlineExceeded { epoch: cut.epoch })?
         .map_err(execution_error)?;
         if let Some(metrics) = self.engine_metrics.lock().as_ref() {
-            metrics.views.observe_read(Some(cut.taken_at_ms));
+            metrics.views.observe_read(level, Some(cut.taken_at_ms));
         }
         Ok((cut, stream))
+    }
+
+    /// Pin the newest committed cut at or after `at_least` that holds what every source behind
+    /// `scanned` had upstream when this was called.
+    async fn pin_recent(
+        &self,
+        views: &CommittedViews,
+        scanned: &[String],
+        at_least: u64,
+        deadline: Instant,
+    ) -> Result<PinnedCut, DbError> {
+        let arrived = Instant::now();
+        let pinned = match self.recency_targets(scanned, deadline).await {
+            Ok(targets) => views.pin_covering(&targets, at_least, deadline).await,
+            Err(error) => Err(error),
+        };
+        if let Some(metrics) = self.engine_metrics.lock().as_ref() {
+            match &pinned {
+                Ok(_) => metrics
+                    .views
+                    .recent_read_wait_seconds
+                    .observe(arrived.elapsed().as_secs_f64()),
+                Err(DbError::CommittedRead(CommittedReadError::RecencyProbe { input, .. })) => {
+                    metrics
+                        .views
+                        .recency_probe_failures_total
+                        .with_label_values(&[input])
+                        .inc();
+                }
+                Err(_) => {}
+            }
+        }
+        pinned
+    }
+
+    /// Each source behind `views`, with its upstream's end now.
+    async fn recency_targets(
+        &self,
+        views: &[String],
+        deadline: Instant,
+    ) -> Result<RecencyTargets, DbError> {
+        let probe_failed = |source: &str, reason: String| CommittedReadError::RecencyProbe {
+            input: source.to_owned(),
+            reason,
+        };
+        let mut probes = Vec::new();
+        for (source, config) in self.view_lineage(views)? {
+            let probe = self
+                .connector_registry
+                .source_recency(&config)
+                .map_err(|error| probe_failed(&source, error.to_string()))?
+                .ok_or_else(|| CommittedReadError::RecencyUnsupported {
+                    input: source.clone(),
+                })?;
+            probes.push((source, probe));
+        }
+        let ends = probes.into_iter().map(|(source, probe)| async move {
+            let end = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                probe.upstream_end(deadline),
+            )
+            .await;
+            match end {
+                Ok(Ok(end)) => Ok((source, end)),
+                Ok(Err(error)) => Err(probe_failed(&source, error.to_string())),
+                Err(_) => Err(probe_failed(
+                    &source,
+                    "no answer before the read's deadline".into(),
+                )),
+            }
+        });
+        Ok(RecencyTargets::new(
+            futures::future::try_join_all(ends).await?,
+        ))
+    }
+
+    /// The connector configuration of every source whose records reach `views`, through the
+    /// streams, stages and views between them. A table is looked up rather than read through an
+    /// input, so it adds no source.
+    fn view_lineage(&self, views: &[String]) -> Result<BTreeMap<String, ConnectorConfig>, DbError> {
+        use laminar_core::catalog::CatalogObjectKind;
+        let unsupported = |input: String| CommittedReadError::RecencyUnsupported { input };
+        let kinds = self.catalog_namespace.lock().clone();
+        let mut sources = BTreeMap::new();
+        {
+            let manager = self.connector_manager.lock();
+            let mut pending = views.to_vec();
+            let mut visited = HashSet::new();
+            // Each catalog name is expanded once.
+            while let Some(name) = pending.pop() {
+                if !visited.insert(name.clone()) {
+                    continue;
+                }
+                match kinds.get(&name) {
+                    Some(CatalogObjectKind::Stream | CatalogObjectKind::MaterializedView) => {
+                        let stream = manager.streams().get(&name);
+                        let stream = stream.ok_or_else(|| unsupported(name.clone()))?;
+                        pending.extend(crate::sql_analysis::extract_table_references(
+                            &stream.query_sql,
+                        ));
+                    }
+                    Some(CatalogObjectKind::Source) => {
+                        let source = manager.sources().get(&name);
+                        let source = source.filter(|source| source.connector_type.is_some());
+                        let source = source.ok_or_else(|| unsupported(name.clone()))?.clone();
+                        sources.insert(name, source);
+                    }
+                    Some(CatalogObjectKind::Table | CatalogObjectKind::LookupTable) => {}
+                    Some(CatalogObjectKind::Sink) | None => return Err(unsupported(name).into()),
+                }
+            }
+        }
+        sources
+            .into_iter()
+            .map(|(name, registration)| {
+                let config = self.build_registered_source_config(&name, &registration)?;
+                Ok((name, config))
+            })
+            .collect()
     }
 
     fn spawn_rows(
@@ -163,5 +300,53 @@ fn ensure_query(sql: &str) -> Result<(), DbError> {
         _ => Err(DbError::InvalidOperation(
             "a read must be exactly one query".into(),
         )),
+    }
+}
+
+#[cfg(all(test, feature = "kafka"))]
+mod tests {
+    use super::*;
+    use crate::config::LaminarConfig;
+
+    #[tokio::test]
+    async fn lineage_follows_streams_stages_and_views_to_their_sources() {
+        let db = LaminarDB::open_with_config(LaminarConfig::default()).unwrap();
+        for sql in [
+            "CREATE SOURCE orders (k BIGINT, v BIGINT) FROM KAFKA (\
+             'bootstrap.servers' = '127.0.0.1:1', 'topic' = 'orders', 'group.id' = 'lineage') \
+             FORMAT JSON",
+            "CREATE SOURCE pushed (k BIGINT)",
+            "CREATE TABLE dims (k BIGINT PRIMARY KEY, name VARCHAR)",
+            "CREATE STREAM doubled AS SELECT k, v * 2 AS v FROM orders",
+            "CREATE MATERIALIZED VIEW sums AS SELECT k, SUM(v) AS total FROM doubled GROUP BY k",
+            "CREATE MATERIALIZED VIEW big AS SELECT k FROM sums WHERE total > 10",
+            "CREATE MATERIALIZED VIEW spread AS SELECT n, COUNT(*) AS keys \
+             FROM (SELECT k, COUNT(*) AS n FROM orders GROUP BY k) GROUP BY n",
+            "CREATE MATERIALIZED VIEW named AS SELECT s.k, s.total, d.name FROM sums s \
+             JOIN dims d ON s.k = d.k",
+            "CREATE MATERIALIZED VIEW pushed_counts AS SELECT k, COUNT(*) AS n FROM pushed GROUP BY k",
+        ] {
+            db.execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        let lineage = |views: &[&str]| {
+            let views: Vec<String> = views.iter().map(|view| (*view).to_owned()).collect();
+            db.view_lineage(&views)
+                .map(|sources| sources.into_keys().collect::<Vec<_>>())
+        };
+        assert_eq!(lineage(&["big"]).unwrap(), ["orders"]);
+        assert_eq!(lineage(&["spread"]).unwrap(), ["orders"]);
+        assert_eq!(lineage(&["named"]).unwrap(), ["orders"]);
+        assert!(lineage(&[]).unwrap().is_empty());
+        let refused = lineage(&["big", "pushed_counts"]);
+        assert!(
+            matches!(
+                &refused,
+                Err(DbError::CommittedRead(CommittedReadError::RecencyUnsupported { input }))
+                    if input == "pushed"
+            ),
+            "{refused:?}"
+        );
     }
 }

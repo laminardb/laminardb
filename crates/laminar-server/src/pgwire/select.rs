@@ -289,9 +289,12 @@ pub(super) fn read_error(error: DbError) -> PgWireError {
             CommittedReadError::NotCommitted {
                 requested: Some(_), ..
             }
-            | CommittedReadError::DeadlineExceeded { .. } => "57014",
+            | CommittedReadError::DeadlineExceeded { .. }
+            | CommittedReadError::NotRecent { .. } => "57014",
             CommittedReadError::Retired { .. } => "22023",
-            CommittedReadError::LiveTable { .. } => "0A000",
+            CommittedReadError::LiveTable { .. }
+            | CommittedReadError::RecencyUnsupported { .. } => "0A000",
+            CommittedReadError::RecencyProbe { .. } => "58000",
             CommittedReadError::PinCapacity => "53000",
         },
         DbError::DataFusion(error) if error.to_string().contains("not found") => "42P01",
