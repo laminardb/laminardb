@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use futures::{stream, StreamExt};
 use pgwire::api::portal::Format;
-use pgwire::api::results::{FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::Type;
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
@@ -156,14 +156,7 @@ pub(super) fn session_statement(
             )
         }
         Statement::ShowVariable { variable } => {
-            let name = variable
-                .iter()
-                .map(|part| part.value.to_ascii_lowercase())
-                .collect::<Vec<_>>()
-                .join(".");
-            if !name.starts_with("laminar.") {
-                return None;
-            }
+            let name = setting_name(variable)?;
             Some(
                 session
                     .show(db, &name)
@@ -172,6 +165,31 @@ pub(super) fn session_statement(
         }
         _ => None,
     }
+}
+
+/// The column `SHOW` of a `laminar.*` setting returns, which `Describe` reports; `None` for any
+/// other statement.
+pub(super) fn setting_fields(statement: &Statement) -> Option<Vec<FieldInfo>> {
+    let Statement::ShowVariable { variable } = statement else {
+        return None;
+    };
+    let name = setting_name(variable)?;
+    Some(vec![FieldInfo::new(
+        name,
+        None,
+        None,
+        Type::VARCHAR,
+        FieldFormat::Text,
+    )])
+}
+
+fn setting_name(variable: &[sqlparser::ast::Ident]) -> Option<String> {
+    let name = variable
+        .iter()
+        .map(|part| part.value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(".");
+    name.starts_with("laminar.").then_some(name)
 }
 
 fn setting_value(value: &Expr) -> String {

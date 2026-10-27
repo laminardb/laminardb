@@ -409,6 +409,11 @@ async fn select_reads_views_at_the_connection_read_level() {
         simple_column(&client, "SHOW laminar.read_epoch").await,
         [epoch.to_string()]
     );
+    let shown = client
+        .query_one("SHOW laminar.read_epoch", &[])
+        .await
+        .expect("extended SHOW");
+    assert_eq!(shown.get::<_, String>(0), epoch.to_string());
     assert_eq!(
         simple_column(&client, "SHOW laminar.read_level").await,
         ["committed"]

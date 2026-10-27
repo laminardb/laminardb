@@ -28,7 +28,7 @@ use super::cursor::{
     fetch_direction_count, handle_close, handle_declare_cursor, handle_fetch, ConnState,
 };
 use super::encoding::{field_infos, record_batch_response, text_response};
-use super::select::{read_error, read_session, select_response, session_statement};
+use super::select::{read_error, read_session, select_response, session_statement, setting_fields};
 use super::session::LaminarPgwireHandler;
 use super::subscription::{
     ensure_cached_subscription_schema, subscription_field_infos, subscription_open_error,
@@ -450,7 +450,8 @@ impl QueryParser for LaminarQueryParser {
                 Ok(subscription_field_infos(schema, column_format))
             }
             LaminarStmt::Select { schema, .. } => Ok(field_infos(schema, column_format)),
-            LaminarStmt::Show(_) | LaminarStmt::Standard(_) => Ok(Vec::new()),
+            LaminarStmt::Standard(s) => Ok(setting_fields(s).unwrap_or_default()),
+            LaminarStmt::Show(_) => Ok(Vec::new()),
         }
     }
 }
