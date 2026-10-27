@@ -145,6 +145,20 @@ format = "json"
 topic = "avg-prices"
 ```
 
+Materialized views have no structured section. Declare them, and any other DDL, in the top-level
+`sql` key, which must come before the first `[table]`. It runs after the structured sections, and
+in a cluster it is part of the startup catalog every node must agree on:
+
+```toml
+sql = """
+CREATE MATERIALIZED VIEW trade_counts AS
+SELECT symbol, COUNT(*) AS trades FROM trades GROUP BY symbol;
+"""
+
+[server]
+# ...
+```
+
 ## AI Functions
 
 SQL functions (`ai_classify`, `ai_sentiment`, `ai_embed`, `ai_complete`, …) run a
@@ -227,11 +241,11 @@ README's [topology support and limits](../../README.md#change-a-running-clusters
 
 ## Postgres Wire Protocol
 
-When `[server].pgwire_bind` is set, the server also listens for Postgres clients over the simple and extended query protocols:
+When `[server].pgwire_bind` is set, the server also listens for Postgres clients over the simple and extended query protocols. A cluster node opens the listener when it starts serving and closes it, with every session, when it stops. Unlike HTTP, which answers 503 while a cluster node completes a coordinated recovery round, pgwire keeps answering committed reads then (see [Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads)):
 
 - `SELECT` reads the database, with the same read levels as `POST /api/v1/sql`, chosen per connection: `SET laminar.read_level = 'latest' | 'committed' | 'default'` and `SET laminar.min_epoch = <n>`. `SHOW laminar.read_epoch` returns the epoch of the connection's last committed read, and later committed reads on the connection read no earlier epoch. Rows stream as the client reads them; statements with bind parameters are rejected (`0A000`).
 
-- `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
+- `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for materialized views and certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
 - `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect. `SET` of names outside `laminar.*` changes database-wide session properties, not the connection's.
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
@@ -405,8 +419,8 @@ startup, restore or during a cycle; its accounting is a lower bound and is not R
 each node charges only the vnodes it owns, so rescaling changes per-node state but a single hot
 key still lands on one owner. Recovery and reassignment stage restored frames against the same
 budget, so leave headroom for restore. Shuffle queues have fixed per-peer and per-node byte
-budgets that are not configurable. Reference tables and materialized views are local only;
-cluster plans requiring them remain rejected.
+budgets that are not configurable. Reference tables are local only; cluster plans requiring
+them remain rejected.
 
 For a production deployment, start with a representative peak workload and a durable checkpoint
 location. Record **peak process/container RSS**, source lag, cycle backpressure, graph input bytes,
@@ -452,10 +466,10 @@ Cluster reference-table admission remains restricted. See the
 for shared Arrow buffers, external ownership, checkpoint captures and memory headroom.
 
 `server.materialized_view_max_rows` and `server.materialized_view_max_bytes` apply to every
-local MV storage mode. Both must be nonzero. Aggregate, upsert and multiset growth fails
-before any affected MV changes or publishes cycle output. Append storage evicts oldest
-complete batches, but rejects a single batch that cannot fit. Restore fails instead of
-truncating committed state. Cluster MV admission remains rejected. See the
+local MV storage mode, and on a cluster node to its part of each view. Both must be nonzero.
+Aggregate, upsert and multiset growth fails before any affected MV changes or publishes cycle
+output. Append views count the rows waiting for the next checkpoint and fail instead of dropping
+rows. Restore fails instead of truncating committed state. See the
 [MV accounting and publication scope](../laminar-db/README.md#materialized-view-memory-limits).
 
 ## Tuning the Allocator (`MALLOC_CONF`)

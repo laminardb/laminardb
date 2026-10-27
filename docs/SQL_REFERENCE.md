@@ -541,7 +541,8 @@ a second; after a topology migration it keeps the last checkpoint of its own top
 runs the new one. A `SELECT` over pgwire or HTTP on a cluster node reads committed checkpoints in
 the same way unless the session asks for the latest cycle, which a cluster node refuses because
 it holds only its part of each view (see section 8). `SUBSCRIBE` to a view reads committed
-checkpoints in the same way, as described below.
+checkpoints in the same way, as described below. [Delivery guarantees](DELIVERY_GUARANTEES.md#materialized-view-reads)
+lists what a committed read guarantees and the fault soak that checks it.
 
 An append-only view's interval retention follows one event-time frontier per view, committed
 with each checkpoint: the lowest frontier among the nodes whose input is active, never moving

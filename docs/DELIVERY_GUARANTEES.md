@@ -113,3 +113,46 @@ evidence behind each admitted exactly-once composition and exactly what that evi
 | Kafka → Delta Lake append | Embedded / single-node | `single_node_eo_join_kill9_soak`: repeated `kill -9` of the server inside checkpoints; frozen-input oracles require every output row exactly once. Emulated S3 (SeaweedFS). |
 | Kafka → Kafka | Embedded / single-node | `crates/laminar-connectors/tests/kafka_exactly_once.rs`, `crates/laminar-db/tests/kafka_exactly_once_e2e.rs` |
 | FIX → Delta Lake append | Embedded / single-node | `crates/laminar-db/tests/fix_source_exactly_once.rs` |
+
+## Materialized view reads
+
+A materialized view is not a sink, so the pipeline's delivery guarantee does not describe it.
+Checkpoints restore view state together with source positions, so in every mode a committed view
+holds each input row once, under at-least-once delivery as well. What a reader sees depends on the
+read level (`ReadLevel` embedded, `laminar.read_level` over pgwire, `read_level` over HTTP):
+
+| Read level | Embedded / single-node | Cluster |
+|---|---|---|
+| `latest` | Default. The latest completed cycle. Recovery can roll it back, so a later read can show less input than an earlier one. | Rejected: a node holds only its part of each view. |
+| `committed` | Every view the statement reads, at one committed checkpoint. | Default. The same, on any node, from every node's checkpointed state. |
+
+A committed read:
+
+- equals the view's query over the input each source had delivered at that checkpoint;
+- reads every view in one statement, a join or union of views included, at the same checkpoint;
+- is never rolled back. With `min_epoch`, and on one pgwire connection, a read is never older than
+  the one before;
+- is as fresh as the checkpoint interval plus the time to commit a checkpoint.
+
+`SUBSCRIBE` to a view in a cluster delivers its rows at a committed checkpoint, then each later
+checkpoint's change, each followed by a progress frame. Folding the frames up to a progress frame
+gives the rows a committed read at that epoch returns.
+
+A node fault starts a coordinated recovery round on every node, typically 10 to 50 seconds. During
+it, a cluster node:
+
+- keeps answering committed reads over pgwire;
+- answers `POST /api/v1/sql` with 503;
+- closes its WebSocket subscriptions at their next heartbeat, without a close frame, and refuses
+  new ones with 503.
+
+To continue a subscription without a gap, reconnect with `as_of_epoch` set to the last progress
+epoch: it restarts with the view's rows at that epoch, which equal the rows already folded, then
+continues with the changes. While that epoch is still retained the reconnect succeeds; otherwise it
+fails with 410 and the client starts again from the newest checkpoint.
+
+| Evidence | Mode | What it exercises |
+|---|---|---|
+| `three_node_eo_view_read_kill9_soak` | Cluster | A keyed view, a view of its rows without the key, an append view and a per-partition progress view over the Kafka input of `three_node_eo_join_kill9_soak`, through its `kill -9` and paused-leader rounds. A pgwire reader rotates across the nodes reading all four in one statement: each read must equal the views over the input prefix its progress rows show, with no gap or duplicate in any partition, the prefix never shrinks, the same epoch reads the same rows on every node, and no read is older than the session's floor. A WebSocket subscription to the keyed view, moved to another gateway after each round and resumed at its last progress epoch whenever a connection ends, must fold to the reader's rows at every epoch both saw, including each resumed snapshot. After the input stops, every node must read every produced row over pgwire and HTTP. Emulated S3 (SeaweedFS). |
+| `cluster_conformance` view cases | Cluster (in-process, three nodes) | Each view case read at the default committed level on another node and subscribed before any input, compared with batch SQL. |
+| `cluster::recovery_round_tests::committed` | Cluster (two processes) | Views restored on a survivor after a node is lost, seeded by a topology migration, and handed over by a draining node. |

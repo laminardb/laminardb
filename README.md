@@ -196,7 +196,7 @@ Kafka and LaminarDB v0.33.0 on a private Docker network.
 |---|---|
 | Embedded | Run LaminarDB inside a Rust program with the `laminar-db` crate. Checkpoints go to a local directory. |
 | Single-node server | Run one server with HTTP, WebSocket subscriptions, optional Postgres-compatible connections, and local checkpoints. |
-| Cluster | Run multiple servers with a shared checkpoint store. Sources must be Kafka, materialized views and AI functions are rejected, and cluster SQL is narrower than single-node SQL. |
+| Cluster | Run multiple servers with a shared checkpoint store. Sources must be Kafka, AI functions are rejected, and cluster SQL is narrower than single-node SQL. Any node reads materialized views at a committed checkpoint. |
 
 Client libraries are released separately from the engine and lag behind it:
 
@@ -291,7 +291,7 @@ and allocator settings in detail.
 |---|---|
 | `CREATE SOURCE` | Defines incoming data. |
 | `CREATE STREAM` | Runs a continuous SQL query over incoming data. |
-| `CREATE MATERIALIZED VIEW` | Keeps a queryable result in embedded or single-node mode. |
+| `CREATE MATERIALIZED VIEW` | Keeps a queryable result. In a cluster, each node keeps its part, and a query on any node reads the whole view at a committed checkpoint. |
 | `CREATE SINK` | Sends a stream to an external system. |
 | `SUBSCRIBE` | Sends live results of a stream or materialized view over WebSocket (`/ws/{name}`), or through a Postgres-protocol cursor or bounded portal. HTTP SQL rejects it. |
 
