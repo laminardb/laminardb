@@ -80,6 +80,8 @@ impl CheckpointCoordinator {
             gc_requests,
             gc_task,
             committed_cut: tokio::sync::watch::Sender::new(None),
+            #[cfg(feature = "cluster")]
+            head_follower: None,
             read_pins,
         })
     }
@@ -294,6 +296,10 @@ impl std::fmt::Debug for CheckpointCoordinator {
 impl Drop for CheckpointCoordinator {
     fn drop(&mut self) {
         self.gc_task.abort();
+        #[cfg(feature = "cluster")]
+        if let Some(follower) = &self.head_follower {
+            follower.abort();
+        }
     }
 }
 

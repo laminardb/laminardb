@@ -10,6 +10,8 @@ mod capture;
 #[cfg(feature = "cluster")]
 mod cluster_read_pin;
 mod commit_index;
+#[cfg(feature = "cluster")]
+mod committed_head;
 pub(crate) mod committed_reads;
 #[cfg(feature = "cluster")]
 pub(crate) use cluster_read_pin::start_cluster_read_pin;
@@ -232,6 +234,8 @@ pub struct CheckpointCoordinator {
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     gc_requests: tokio::sync::watch::Sender<Option<GcRequest>>,
     gc_task: tokio::task::JoinHandle<()>,
-    committed_cut: tokio::sync::watch::Sender<Option<Arc<committed_reads::CommittedCut>>>,
+    committed_cut: committed_reads::CommittedCutSender,
     read_pins: Arc<committed_reads::ReadPins>,
+    #[cfg(feature = "cluster")]
+    head_follower: Option<tokio::task::JoinHandle<()>>,
 }

@@ -535,8 +535,10 @@ input's rows at the migration's checkpoint, then follows its later changes; a ne
 source starts empty there and sees only later rows. A new view over a stream that only reshapes
 an aggregate's changes is rejected, because no node keeps that stream's rows; define it over the
 aggregate. `LaminarDB::query_committed` on any node reads every view at one committed checkpoint,
-from every node's checkpointed state; a node that owns no vnodes (draining, or not yet assigned)
-learns of no later checkpoint, so it keeps reading the last one it took part in. `SELECT` of a
+from every node's checkpointed state. A node that takes part in no checkpoint (draining, or not
+yet assigned) learns of each new checkpoint from the cluster's checkpoint authority within about
+a second; after a topology migration it keeps the last checkpoint of its own topology until it
+runs the new one. `SELECT` of a
 view on a cluster node fails, because the node holds only its part. `SUBSCRIBE` to a view is
 rejected with `[LDB-4007]` before connector I/O.
 

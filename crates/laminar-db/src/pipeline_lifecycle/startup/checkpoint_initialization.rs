@@ -243,7 +243,10 @@ impl LaminarDB {
             };
             self.start_committed_view_reads(&coord, reader_store, &ds);
             #[cfg(feature = "cluster")]
-            self.start_node_read_pin(&coord).await?;
+            {
+                self.start_node_read_pin(&coord).await?;
+                coord.follow_committed_head()?;
+            }
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 

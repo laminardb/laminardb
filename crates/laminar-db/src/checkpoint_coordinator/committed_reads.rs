@@ -44,6 +44,23 @@ impl CommittedCut {
 /// The latest committed cut, replaced as each checkpoint commits or recovery installs one.
 pub(crate) type CommittedCuts = tokio::sync::watch::Receiver<Option<Arc<CommittedCut>>>;
 
+pub(super) type CommittedCutSender = tokio::sync::watch::Sender<Option<Arc<CommittedCut>>>;
+
+/// Publish `cut` unless a newer cut is already published, so readers never see the committed
+/// head move back.
+pub(super) fn publish_unless_older(cuts: &CommittedCutSender, cut: Arc<CommittedCut>) {
+    cuts.send_if_modified(|current| {
+        if current
+            .as_ref()
+            .is_some_and(|current| current.index.epoch > cut.index.epoch)
+        {
+            return false;
+        }
+        *current = Some(cut);
+        true
+    });
+}
+
 /// Committed cuts that in-process reads hold against local retention. Retention protects the
 /// oldest unexpired pin older than the cut it was asked to keep, and raises a floor below which no
 /// read may pin, so a pinned cut is never retired before its deadline.
@@ -166,7 +183,12 @@ impl CheckpointCoordinator {
     }
 
     pub(super) fn publish_committed_cut(&self, cut: Option<CommittedCut>) {
-        self.committed_cut.send_replace(cut.map(Arc::new));
+        match cut {
+            Some(cut) => publish_unless_older(&self.committed_cut, Arc::new(cut)),
+            None => {
+                self.committed_cut.send_replace(None);
+            }
+        }
     }
 }
 
@@ -220,6 +242,47 @@ mod tests {
             panic!("an unretired cut can be pinned");
         };
         assert_eq!(pins.reserve_floor(cut(5)).epoch, 5);
+    }
+
+    fn committed(epoch: u64) -> Arc<CommittedCut> {
+        let index = CommittedCheckpointIndex {
+            version: laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION,
+            deployment_id: String::new(),
+            pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+            epoch,
+            checkpoint_id: epoch,
+            scope: laminar_core::checkpoint::CheckpointScope::Cluster,
+            vnode_count: 1,
+            assignment_fence: None,
+            reassignment_portable: true,
+            predecessor: None,
+            participants: Vec::new(),
+            source_names: Vec::new(),
+            source_offsets: Default::default(),
+            channel_progress: Vec::new(),
+            source_watermarks: Default::default(),
+            checkpoint_watermark: None,
+            view_frontiers: Default::default(),
+        };
+        Arc::new(CommittedCut::new(index, cut(epoch), std::iter::empty()))
+    }
+
+    #[test]
+    fn the_published_cut_never_moves_back() {
+        let cuts = CommittedCutSender::new(None);
+        let mut readers = cuts.subscribe();
+        let epoch = |readers: &CommittedCuts| readers.borrow().as_ref().map(|cut| cut.index.epoch);
+        publish_unless_older(&cuts, committed(5));
+        assert_eq!(epoch(&readers), Some(5));
+        readers.mark_unchanged();
+        publish_unless_older(&cuts, committed(4));
+        assert!(!readers.has_changed().unwrap());
+        assert_eq!(epoch(&readers), Some(5));
+        let equal = committed(5);
+        publish_unless_older(&cuts, Arc::clone(&equal));
+        assert!(Arc::ptr_eq(readers.borrow().as_ref().unwrap(), &equal));
+        publish_unless_older(&cuts, committed(6));
+        assert_eq!(epoch(&readers), Some(6));
     }
 
     #[test]

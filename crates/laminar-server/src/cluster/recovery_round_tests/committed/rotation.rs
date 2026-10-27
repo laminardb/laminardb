@@ -1,6 +1,6 @@
 //! A draining database hands its vnodes over live: the other database takes the keyed and
 //! row-placed views' slices and adopts the append view's log, and reads every view at its next
-//! checkpoint.
+//! checkpoint. The drained database takes part in no later checkpoint and reads them too.
 
 use super::scenario::{
     checkpoint, expected_views, leader, read_views, start_pair, wait_totals, Process, VIEWS,
@@ -26,13 +26,21 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
         process.done(&Command::Drain(8)).await?;
     }
     wait_owned_by(processes, 7).await?;
+    let fence = processes[1].observe().await?.assignment;
+    assert_eq!(
+        fence.map(|fence| fence.participant_ids()),
+        Some(vec![7]),
+        "node 8 is no longer a checkpoint participant"
+    );
     // Before any later input, node 7 holds node 8's rows only through the moved slices and log.
     let after = leader(processes).await?;
     let epoch = checkpoint(&mut processes[after], &[7]).await?;
-    assert_eq!(
-        read_views(&mut processes[0], &VIEWS, Some(epoch)).await?,
-        expected_views(keys, 2)
-    );
+    for process in &mut *processes {
+        assert_eq!(
+            read_views(process, &VIEWS, Some(epoch)).await?,
+            expected_views(keys, 2)
+        );
+    }
     for process in &mut *processes {
         process.done(&Command::Prefix(3)).await?;
     }
@@ -43,10 +51,15 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     .await?;
     let after = leader(processes).await?;
     let epoch = checkpoint(&mut processes[after], &[7]).await?;
-    // Node 8 owns no vnodes now and takes part in no later checkpoint, so it never learns of
-    // this one; only node 7 can read it.
+    // Node 8 learns of node 7's checkpoints from the authority's committed head.
+    for process in &mut *processes {
+        assert_eq!(
+            read_views(process, &VIEWS, Some(epoch)).await?,
+            expected_views(keys, 3)
+        );
+    }
     assert_eq!(
-        read_views(&mut processes[0], &VIEWS, Some(epoch)).await?,
+        read_views(&mut processes[1], &VIEWS, None).await?,
         expected_views(keys, 3)
     );
     Ok(())
