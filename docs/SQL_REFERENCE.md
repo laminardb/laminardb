@@ -886,7 +886,9 @@ committed cut it read; `LaminarDB::default_read_level()` gives the mode's defaul
 `execute` reads at the latest level. Over pgwire, `SET laminar.read_level = 'latest' |
 'committed' | 'default'` and `SET laminar.min_epoch = <n>` apply to the connection, `SHOW
 laminar.read_epoch` returns the epoch of its last committed read, and a later committed read on
-the connection never reads an earlier epoch. Over HTTP, `POST /api/v1/sql` takes `read_level`
+the connection never reads an earlier epoch. That floor lasts as long as the connection: after a
+pipeline is reset to an empty checkpoint store, reconnect, or committed reads wait for an epoch
+that will not come and fail after 30 seconds (`57014`). Over HTTP, `POST /api/v1/sql` takes `read_level`
 and `min_epoch` fields and a committed response carries `epoch`, `checkpoint_id` and
 `taken_at_ms`. Rows reach the reader in order and only as fast as it reads them; a query that
 fails part way ends with its error instead of a partial result.
