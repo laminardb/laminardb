@@ -43,6 +43,8 @@
 //! Environment knobs:
 //! - `LAMINAR_SOAK_SECONDS`      steady-soak duration after fault rounds (default 90)
 //! - `LAMINAR_SOAK_INTERVAL_MS`  checkpoint cadence (default 500; minimum 100)
+//! - `LAMINAR_SOAK_RECENT_READ_INTERVAL_MS`  optional cluster `[checkpoint] recent_read_interval`:
+//!   a waiting recent view read brings the next checkpoint forward to this gap
 //! - `LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS`  optional bounded end-to-end checkpoint-attempt timeout;
 //!   it must remain below the configured recovery ceiling
 //! - `LAMINAR_SOAK_CHECKPOINT_SLO_MODE`  `certify` (default) enforces the checkpoint latency
@@ -11289,6 +11291,19 @@ fn write_config(
     path
 }
 
+/// `[checkpoint] recent_read_interval` for cluster members, when the soak sets one.
+#[cfg(feature = "kafka")]
+fn soak_recent_read_interval() -> Option<Duration> {
+    // CI jobs without the matrix field pass an empty value.
+    let value = std::env::var("LAMINAR_SOAK_RECENT_READ_INTERVAL_MS")
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    let millis = value.parse().unwrap_or_else(|error| {
+        panic!("LAMINAR_SOAK_RECENT_READ_INTERVAL_MS={value:?} is not a valid u64: {error}")
+    });
+    Some(Duration::from_millis(millis))
+}
+
 /// The `[server]`, `[discovery]`, and `[checkpoint]` sections of one three-node soak member.
 #[cfg(feature = "kafka")]
 fn cluster_node_config(
@@ -11332,6 +11347,10 @@ fn cluster_node_config(
         "LAMINAR_SOAK_DISCOVERY must be 'gossip' or 'static', got {discovery:?}"
     );
 
+    let recent_read_interval = soak_recent_read_interval()
+        .map(|interval| format!("recent_read_interval = \"{}ms\"\n", interval.as_millis()))
+        .unwrap_or_default();
+
     format!(
         r#"
 node_id = "n{id}"
@@ -11355,7 +11374,7 @@ advertise_host = "127.0.0.1"
 [checkpoint]
 url = "{url}"
 interval = "{interval_ms}ms"
-timeout = "{checkpoint_timeout}"
+{recent_read_interval}timeout = "{checkpoint_timeout}"
 
 [checkpoint.storage]
 {storage}
@@ -14417,6 +14436,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
             zipf_milli,
             producer.acknowledged(),
             Duration::from_millis(interval_ms),
+            soak_recent_read_interval(),
             recovery_ceiling,
         )
     });

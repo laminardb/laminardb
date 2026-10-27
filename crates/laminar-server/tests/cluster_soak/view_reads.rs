@@ -1028,6 +1028,9 @@ pub(super) struct ViewSoak {
     spared: Option<u64>,
     /// Rounds whose spared subscription delivered the recovered checkpoint.
     spanned: u64,
+    /// With `recent_read_interval` set, the median recent read with the input live must wait
+    /// less than this, half the checkpoint interval; at the cadence alone it waits about that.
+    expedited_median: Option<Duration>,
 }
 
 impl ViewSoak {
@@ -1039,6 +1042,7 @@ impl ViewSoak {
         zipf_milli: u64,
         acknowledged: Arc<AcknowledgedIds>,
         checkpoint_interval: Duration,
+        recent_read_interval: Option<Duration>,
         window: Duration,
     ) -> Self {
         let oracle = ViewOracle::new(partitions, key_count, zipf_milli);
@@ -1064,6 +1068,7 @@ impl ViewSoak {
             subscriber: Observer::spawn("view-soak-subscriber", run_subscriber),
             spared: None,
             spanned: 0,
+            expedited_median: recent_read_interval.map(|_| checkpoint_interval / 2),
         };
         for (reader, what) in [
             (&mut soak.reader, "a first committed view read"),
@@ -1094,7 +1099,7 @@ impl ViewSoak {
 
     /// After a fault round: every observer is healthy and has reached the recovered cut, and a
     /// subscription that was open on a spared node delivered it. The subscription then moves to
-    /// the next gateway.
+    /// the next gateway before this returns.
     pub(super) fn after_round(&mut self, epoch: u64, window: Duration) {
         for (reader, what) in [
             (&mut self.reader, "a committed view read after the round"),
@@ -1122,7 +1127,20 @@ impl ViewSoak {
             );
             self.spanned += 1;
         }
+        let rotated = subscription.connections;
         subscription.rotate = true;
+        drop(subscription);
+        // The next fault may follow at once, and must not take the connection about to move as
+        // the one it spares.
+        self.subscriber.wait_until(
+            "the view subscription on the next gateway",
+            window,
+            |evidence| {
+                evidence
+                    .open
+                    .is_some_and(|(connection, _)| connection > rotated)
+            },
+        );
         for (level, reader) in [("committed", &self.reader), ("recent", &self.recent)] {
             let reads = reader.evidence.lock();
             eprintln!(
@@ -1137,6 +1155,7 @@ impl ViewSoak {
                 reads.retried,
             );
         }
+        let subscription = self.subscriber.evidence.lock();
         eprintln!(
             "soak: view subscription connections {} ({} kept open through a fault, {} resumed, {} \
              resumes lost; retried {:?})",
@@ -1203,6 +1222,21 @@ impl ViewSoak {
             differing.is_empty(),
             "recent and committed reads of the same epochs read different rows: {differing:?}"
         );
+        if let Some(bound) = self.expedited_median {
+            let mut live: Vec<Duration> = recent
+                .waits
+                .iter()
+                .chain(&recent.http_waits)
+                .copied()
+                .collect();
+            live.sort_unstable();
+            let median = live.get(live.len() / 2).copied();
+            assert!(
+                median.is_some_and(|median| median < bound),
+                "with recent_read_interval set, the median recent read with the input live waited \
+                 {median:?}, not under {bound:?}: waiting reads did not bring checkpoints forward"
+            );
+        }
         for (level, reads) in [("committed", &reads), ("recent", &recent)] {
             assert!(
                 reads.reads_by_node.iter().all(|reads| *reads > 0)
