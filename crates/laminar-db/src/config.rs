@@ -227,7 +227,7 @@ pub struct LaminarConfig {
     pub datafusion_memory_limit_bytes: usize,
     /// Streaming channel buffer size.
     pub default_buffer_size: usize,
-    /// Per-source Arrow-byte limit for in-process push rings and queued broadcast data.
+    /// Per-source Arrow-byte limit for in-process push queues, held until the pipeline reads.
     /// Each source's snapshot history has a separate cap of the same size (default 64 MiB).
     /// Applies to typed handles after Arrow conversion. Caller-held batches, conversion
     /// scratch, query snapshots and downstream buffers are outside these two limits.

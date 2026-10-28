@@ -120,15 +120,19 @@ limit does not establish a whole-process RSS envelope.
 
 ## Embedded push source limits
 
-Each registered in-process source has a **64 MiB** Arrow-byte cap shared by its input ring
-and queued broadcast references. Set `LaminarConfig::push_source_max_bytes` or
+Each registered in-process source has a **64 MiB** Arrow-byte cap for batches queued until
+the pipeline receives them. Set `LaminarConfig::push_source_max_bytes` or
 `LaminarDB::builder().push_source_max_bytes(bytes)` to change it. Zero and values above
 `laminar_core::streaming::MAX_SOURCE_QUEUED_BYTES` fail DB construction. This covers typed
 `SourceHandle` pushes after Arrow conversion, raw pushes, SQL inserts and API writers.
 Multiple handles for the same source share the cap; separate sources have separate caps.
 The setting does not change cluster SQL or delivery admission.
 
-Pushes reject immediately on count or byte saturation (`StreamingError::ChannelFull`),
+Accepted pushes are never dropped from the queue. They wait there until the running pipeline
+reads them, including pushes made before `start()` or while the pipeline is stopped, so a source
+that no running pipeline reads fills its queue and then rejects. Rows the pipeline has already
+read follow its delivery guarantee: this source is not replayable, so a restart can lose them. Pushes reject immediately on count
+or byte saturation (`StreamingError::ChannelFull`),
 or reject a batch larger than the entire budget (`BatchTooLarge`). Rejected batches do not
 advance the source sequence or change snapshot history. Typed `push_batch` reports the number
 of records admitted before its first failed conversion chunk. `is_backpressured` includes
@@ -136,9 +140,9 @@ byte saturation. Writer `flush` remains a no-op; it does not drain or release qu
 
 Each source's snapshot history has an **independent cap of the same size** plus its existing
 batch-count limit. Successful pushes evict the oldest history until both bounds fit; this
-does not discard queued input. Arrow reservations follow broadcast retention until delivery,
-eviction or subscriber drop. Snapshot readers take ownership of their returned batch references,
-which can outlive history eviction. Existing broadcast lag semantics are unchanged.
+does not discard queued input. Queue reservations last until the pipeline receives the batch.
+Snapshot readers take ownership of their returned batch references, which can outlive history
+eviction.
 
 The two caps measure retained Arrow storage using the
 [core admission contract](../laminar-core/README.md#in-process-source-admission). Each concurrent

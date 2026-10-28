@@ -107,8 +107,7 @@ fn bench_accepted_push(c: &mut Criterion) {
             let label = if typed { "typed" } else { "arrow" };
             group.throughput(Throughput::Elements(if typed { 32 } else { 32 * 256 }));
             group.bench_function(format!("{label}_{width}"), |b| {
-                let (source, sink) = streaming::create::<Payload>(64);
-                let mut subscription = sink.subscribe();
+                let (source, mut sink) = streaming::create::<Payload>(64);
                 b.iter(|| {
                     for _ in 0..32 {
                         if typed {
@@ -119,7 +118,7 @@ fn bench_accepted_push(c: &mut Criterion) {
                     }
                     rt.block_on(async {
                         for _ in 0..32 {
-                            let output = subscription.recv_async().await.unwrap();
+                            let output = sink.recv_async().await.unwrap();
                             assert_eq!(output.num_rows(), if typed { 1 } else { 256 });
                             black_box(output);
                         }
@@ -147,13 +146,12 @@ fn bench_source_push(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     let config = SourceConfig::with_buffer_size(65536);
-    let (source, sink) = streaming::create_with_config::<BenchEvent>(config);
-    let mut sub = sink.subscribe();
+    let (source, mut sink) = streaming::create_with_config::<BenchEvent>(config);
 
     let mut id = 0i64;
     group.bench_function("single_record", |b| {
         b.iter(|| {
-            let _ = sub.poll();
+            let _ = sink.poll();
             let result = source.try_push(black_box(make_event(id)));
             id += 1;
             black_box(result)
@@ -180,11 +178,10 @@ fn bench_source_push_arrow(c: &mut Criterion) {
             BenchmarkId::new("batch", batch_size),
             &batch_size,
             |b, &size| {
-                let (source, sink) = streaming::create::<BenchEvent>(65536);
-                let mut sub = sink.subscribe();
+                let (source, mut sink) = streaming::create::<BenchEvent>(65536);
                 let batch = make_batch(size);
                 b.iter(|| {
-                    let _ = sub.poll();
+                    let _ = sink.poll();
                     let result = source.push_arrow(black_box(batch.clone()));
                     black_box(result)
                 })
@@ -212,10 +209,9 @@ fn bench_source_push_batch_drain(c: &mut Criterion) {
             BenchmarkId::new("drain", batch_size),
             &batch_size,
             |b, &size| {
-                let (source, sink) = streaming::create::<BenchEvent>(65536);
-                let mut sub = sink.subscribe();
+                let (source, mut sink) = streaming::create::<BenchEvent>(65536);
                 b.iter(|| {
-                    while sub.poll().is_some() {}
+                    while sink.poll().is_some() {}
                     let events: Vec<BenchEvent> = (0..size as i64).map(make_event).collect();
                     let pushed = source.push_batch_drain(black_box(events.into_iter()));
                     black_box(pushed)
@@ -240,15 +236,14 @@ fn bench_end_to_end(c: &mut Criterion) {
     let mut group = c.benchmark_group("streaming_end_to_end");
     group.throughput(Throughput::Elements(1));
 
-    let (source, sink) = streaming::create::<BenchEvent>(65536);
-    let mut sub = sink.subscribe();
+    let (source, mut sink) = streaming::create::<BenchEvent>(65536);
 
     let mut id = 0i64;
     group.bench_function("push_poll", |b| {
         b.iter(|| {
             let _ = source.push(make_event(id));
             id += 1;
-            black_box(sub.poll())
+            black_box(sink.poll())
         })
     });
 
@@ -272,14 +267,13 @@ fn bench_end_to_end_throughput(c: &mut Criterion) {
             BenchmarkId::new("push_poll_each", batch_size),
             &batch_size,
             |b, &size| {
-                let (source, sink) = streaming::create::<BenchEvent>(65536);
-                let mut sub = sink.subscribe();
+                let (source, mut sink) = streaming::create::<BenchEvent>(65536);
                 b.iter(|| {
                     for i in 0..size as i64 {
                         let _ = source.try_push(make_event(i));
                     }
                     let mut count = 0;
-                    while let Some(batch) = sub.poll() {
+                    while let Some(batch) = sink.poll() {
                         black_box(batch);
                         count += 1;
                     }

@@ -9,7 +9,7 @@ use arrow::datatypes::SchemaRef;
 use tokio::sync::Semaphore;
 
 use super::arrow_admission::QueuedArrowBatch;
-use super::channel::{channel_with_config, Producer};
+use super::channel::{channel_with_config, AsyncConsumer, Producer};
 use super::config::SourceConfig;
 use super::error::{StreamingError, TryPushError};
 use super::sink::Sink;
@@ -50,13 +50,21 @@ pub trait Record: Clone + Send + Sized + 'static {
 }
 
 /// Internal message type that wraps records and control signals.
-#[derive(Clone)]
 pub(crate) enum SourceMessage<T> {
     /// A data record.
     Record(T),
 
     /// A batch of Arrow records.
-    Batch(Arc<QueuedArrowBatch>),
+    Batch(QueuedArrowBatch),
+}
+
+impl<T: Record> SourceMessage<T> {
+    pub(crate) fn into_batch(self) -> RecordBatch {
+        match self {
+            Self::Record(record) => record.to_record_batch(),
+            Self::Batch(batch) => batch.into_batch(),
+        }
+    }
 }
 
 /// Shared state for watermark tracking.
@@ -139,7 +147,7 @@ struct SourceInner<T: Record> {
 
 /// A streaming data source. Cloneable for multi-producer use.
 ///
-/// Arrow pushes share a byte budget across the input ring and queued broadcast references.
+/// Arrow pushes share one byte budget, held by each batch until the sink receives it.
 /// Generic record pushes are count bounded only; arbitrary `T` heap storage is not measured.
 pub struct Source<T: Record> {
     inner: Arc<SourceInner<T>>,
@@ -148,10 +156,12 @@ pub struct Source<T: Record> {
 impl<T: Record> Source<T> {
     /// Creates a new Source/Sink pair.
     pub(crate) fn new(config: SourceConfig) -> (Self, Sink<T>) {
-        Self::new_with_drain(config, true)
+        let (source, consumer) = Self::with_consumer(config);
+        let sink = Sink::new(consumer, source.schema());
+        (source, sink)
     }
 
-    fn new_with_drain(config: SourceConfig, start_drain: bool) -> (Self, Sink<T>) {
+    fn with_consumer(config: SourceConfig) -> (Self, AsyncConsumer<SourceMessage<T>>) {
         let channel_config = config.channel;
         let (producer, consumer) = channel_with_config::<SourceMessage<T>>(&channel_config);
 
@@ -166,22 +176,14 @@ impl<T: Record> Source<T> {
             )),
             max_queued_bytes: config.max_queued_bytes,
             watermark: SourceWatermark::new(),
-            schema: schema.clone(),
+            schema,
             name: config.name,
             sequence: Arc::new(AtomicU64::new(0)),
             event_time_column: OnceLock::new(),
             max_out_of_orderness: OnceLock::new(),
         });
 
-        let source = Self { inner };
-        let sink = if start_drain {
-            Sink::new(consumer, schema)
-        } else {
-            drop(consumer);
-            Sink::schema_only(schema)
-        };
-
-        (source, sink)
+        (Self { inner }, consumer)
     }
 
     /// Pushes a record. Non-blocking — returns `ChannelFull` if the buffer is full.
@@ -189,7 +191,7 @@ impl<T: Record> Source<T> {
     /// # Errors
     ///
     /// Returns `StreamingError::ChannelFull` if the count buffer is full, or
-    /// `StreamingError::Disconnected` if the drain task has closed.
+    /// `StreamingError::Disconnected` if the sink has been dropped.
     pub fn push(&self, record: T) -> Result<(), StreamingError> {
         self.try_push(record).map_err(|error| error.error)
     }
@@ -248,15 +250,15 @@ impl<T: Record> Source<T> {
     ///
     /// This is more efficient than pushing individual records when you
     /// already have data in Arrow format.
-    /// The nonblocking reservation covers retained Arrow storage through broadcast delivery.
-    /// It releases on failed admission, eviction, subscriber drop or transfer to the last
-    /// subscriber. Returned batches and downstream retention have separate owners.
+    /// The nonblocking reservation covers retained Arrow storage until the sink receives the
+    /// batch, and releases on failed admission. Received batches and downstream retention have
+    /// separate owners.
     ///
     /// # Errors
     ///
     /// Returns `StreamingError::SchemaMismatch` if the batch schema doesn't match.
     /// Returns `StreamingError::BatchTooLarge` if this batch exceeds the whole byte budget,
-    /// `ChannelFull` on count/byte saturation, `Disconnected` if the drain task has closed,
+    /// `ChannelFull` on count/byte saturation, `Disconnected` if the sink has been dropped,
     /// or `InvalidConfig` for an invalid byte limit. Failures do not advance the sequence.
     pub fn push_arrow(&self, batch: RecordBatch) -> Result<(), StreamingError> {
         // Validate schema matches (skip for type-erased sources with empty schema)
@@ -303,7 +305,7 @@ impl<T: Record> Source<T> {
     pub fn watermark(&self, timestamp: i64) {
         // The shared atomic is the authoritative watermark: the pipeline's
         // watermark UDF, late-row filter, and checkpoint registration all
-        // read it via `watermark_atomic()`. Subscribers receive data only,
+        // read it via `watermark_atomic()`. The sink receives data only,
         // so there is no in-band watermark message to emit.
         self.inner.watermark.update(timestamp);
     }
@@ -336,8 +338,7 @@ impl<T: Record> Source<T> {
         self.inner.name.as_deref()
     }
 
-    /// Returns true if the drain task has closed its input receiver.
-    /// Dropping only the sink preserves the drain task for pending subscriptions.
+    /// Returns true once the sink has been dropped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.inner.producer.is_closed()
@@ -355,8 +356,8 @@ impl<T: Record> Source<T> {
         self.inner.producer.capacity()
     }
 
-    /// Charged Arrow bytes retained in the input ring or broadcast, across all producers.
-    /// Generic records and batches already returned to callers are excluded.
+    /// Charged Arrow bytes queued for the sink, across all producers.
+    /// Generic records and batches the sink has received are excluded.
     #[must_use]
     pub fn queued_arrow_bytes(&self) -> usize {
         self.inner
@@ -471,14 +472,14 @@ pub fn create_with_config<T: Record>(config: SourceConfig) -> (Source<T>, Sink<T
     Source::new(config)
 }
 
-/// Creates schema-planning endpoints without a drain task or a Tokio runtime.
+/// Creates a schema-planning source without a sink.
 ///
 /// The source is disconnected immediately and rejects all input. This is only for private,
 /// unstarted catalogs used to compile schemas; it cannot execute or publish streaming data.
 #[cfg(feature = "cluster")]
 #[must_use]
-pub fn create_for_schema_planning<T: Record>(config: SourceConfig) -> (Source<T>, Sink<T>) {
-    Source::new_with_drain(config, false)
+pub fn create_for_schema_planning<T: Record>(config: SourceConfig) -> Source<T> {
+    Source::with_consumer(config).0
 }
 
 #[cfg(test)]
