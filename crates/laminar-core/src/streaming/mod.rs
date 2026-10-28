@@ -1,4 +1,4 @@
-//! In-memory streaming API — Source, Sink, Subscription with broadcast fan-out.
+//! In-memory streaming API — a bounded Source queue drained by its single Sink.
 
 mod arrow_admission;
 pub mod channel;
@@ -7,7 +7,6 @@ pub mod config;
 pub mod error;
 pub mod sink;
 pub mod source;
-pub mod subscription;
 
 pub use arrow_admission::{
     retained_arrow_bytes, validate_source_max_queued_bytes, DEFAULT_SOURCE_MAX_QUEUED_BYTES,
@@ -21,4 +20,3 @@ pub use sink::Sink;
 #[cfg(feature = "cluster")]
 pub use source::create_for_schema_planning;
 pub use source::{create, create_with_config, Record, Source};
-pub use subscription::Subscription;

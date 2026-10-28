@@ -394,12 +394,7 @@ impl LaminarDB {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(name) {
-                let subscription = entry.sink.subscribe();
-                let connector = crate::catalog_connector::CatalogSourceConnector::new(
-                    subscription,
-                    entry.schema.clone(),
-                    entry.data_notify(),
-                );
+                let connector = crate::catalog_connector::CatalogSourceConnector::new(&entry)?;
                 let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                     Arc::<str>::from(format!("source:{name}")),
                     connector.terminal_task_tracker(),
@@ -441,12 +436,7 @@ impl LaminarDB {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(&name) {
-                let subscription = entry.sink.subscribe();
-                let connector = crate::catalog_connector::CatalogSourceConnector::new(
-                    subscription,
-                    entry.schema.clone(),
-                    entry.data_notify(),
-                );
+                let connector = crate::catalog_connector::CatalogSourceConnector::new(&entry)?;
                 let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                     Arc::<str>::from(format!("source:{name}")),
                     connector.terminal_task_tracker(),

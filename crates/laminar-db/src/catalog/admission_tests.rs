@@ -76,7 +76,7 @@ async fn byte_rejection_preserves_sequence_snapshot_and_wakeup() {
     let batch = Payload("a".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     entry.push_and_buffer(batch.clone()).unwrap();
     entry.data_notify.notified().await;
     assert_eq!(
@@ -90,7 +90,7 @@ async fn byte_rejection_preserves_sequence_snapshot_and_wakeup() {
             .await
             .is_err()
     );
-    subscription.recv_async().await.unwrap();
+    ingress.poll().unwrap();
     let next = Payload("b".repeat(4096)).to_record_batch();
     entry.push_and_buffer(next.clone()).unwrap();
     assert_eq!(entry.source.sequence(), 2);
@@ -98,19 +98,19 @@ async fn byte_rejection_preserves_sequence_snapshot_and_wakeup() {
 }
 
 #[tokio::test]
-async fn snapshot_history_evicts_by_bytes_after_broadcast_releases_input() {
+async fn snapshot_history_evicts_by_bytes_after_the_bridge_receives_input() {
     let batch = Payload("a".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes * 2);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     entry.push_and_buffer(batch.clone()).unwrap();
-    subscription.recv_async().await.unwrap();
+    ingress.poll().unwrap();
     let external_snapshot = entry.snapshot();
     for value in ["b", "c", "d"] {
         entry
             .push_and_buffer(Payload(value.repeat(4096)).to_record_batch())
             .unwrap();
-        subscription.recv_async().await.unwrap();
+        ingress.poll().unwrap();
         assert!(
             entry
                 .snapshot()
@@ -134,7 +134,7 @@ async fn concurrent_db_handles_cannot_oversubscribe_or_publish_rejected_snapshot
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes * 4);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     let accepted = std::thread::scope(|scope| {
         let producers: Vec<_> = (0..16)
             .map(|index| {
@@ -158,7 +158,7 @@ async fn concurrent_db_handles_cannot_oversubscribe_or_publish_rejected_snapshot
     assert_eq!(entry.source.queued_arrow_bytes(), bytes * 4);
     let snapshot = entry.snapshot();
     for expected in snapshot {
-        assert_eq!(subscription.recv_async().await.unwrap(), expected);
+        assert_eq!(ingress.poll().unwrap(), expected);
     }
     assert_eq!(entry.source.queued_arrow_bytes(), 0);
 }
@@ -229,7 +229,7 @@ async fn writer_flush_and_close_do_not_release_queued_input_early() {
     let batch = Payload("x".repeat(4096)).to_record_batch();
     let bytes = retained_arrow_bytes(&batch);
     let entry = entry(bytes);
-    let mut subscription = entry.sink.subscribe();
+    let mut ingress = entry.lease_ingress().unwrap();
     let mut writer = crate::api::Writer::new(crate::UntypedSourceHandle::new(Arc::clone(&entry)));
     writer.write(batch.clone()).unwrap();
     writer.flush().unwrap();
@@ -237,7 +237,7 @@ async fn writer_flush_and_close_do_not_release_queued_input_early() {
     assert_eq!(entry.source.queued_arrow_bytes(), bytes);
     writer.close().unwrap();
     assert_eq!(entry.source.queued_arrow_bytes(), bytes);
-    subscription.recv_async().await.unwrap();
+    ingress.poll().unwrap();
     assert_eq!(entry.source.queued_arrow_bytes(), 0);
     assert_eq!(entry.snapshot().len(), 1);
 }

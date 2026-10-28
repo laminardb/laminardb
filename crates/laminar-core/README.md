@@ -8,7 +8,7 @@ Core streaming engine for LaminarDB: operators, checkpoint barriers, and streami
 |--------|---------|
 | `operator` | Window assigners, table cache, changelog/Z-set types |
 | `time` | Event time extraction, watermark generators |
-| `streaming` | Source/Sink/Subscription API backed by crossfire channels |
+| `streaming` | Bounded Source queue with one Sink consumer, backed by crossfire channels |
 | `checkpoint` | Barrier protocol for consistent snapshots |
 | `lookup` | Lookup table trait, predicate pushdown, in-memory cache |
 | `mv` | Cascading materialized views |
@@ -21,17 +21,17 @@ Core streaming engine for LaminarDB: operators, checkpoint barriers, and streami
 
 `Source::push_arrow` has a **64 MiB** retained-Arrow-byte limit by default, configured by
 `SourceConfig::max_queued_bytes`. Cloned producers share it. A reservation follows each
-accepted batch through the input ring and queued broadcast references. It releases on
-failed admission, broadcast eviction, subscriber drop, or delivery to the last subscriber.
-`queued_arrow_bytes()` reports this charge. Batches returned to callers have separate ownership.
-If the drain task is cancelled, Crossfire retains unread ring values and their charges until
-the last producer handle drops; further pushes return `Disconnected`.
+accepted batch until the source's single `Sink` receives it, and releases on failed
+admission. `queued_arrow_bytes()` reports this charge. Batches returned to callers have
+separate ownership. If the sink is dropped, Crossfire retains unread queue values and their
+charges until the last producer handle drops; further pushes return `Disconnected`.
 
 Pushes never wait for queue capacity. `ChannelFull` reports count or byte saturation;
 `BatchTooLarge { bytes, limit }` rejects a batch larger than the whole budget, and
-`Disconnected` reports a closed drain task. Rejection leaves sequence and watermark unchanged.
+`Disconnected` reports a dropped sink. Rejection leaves sequence and watermark unchanged.
 Constructors remain infallible; zero or limits above `MAX_SOURCE_QUEUED_BYTES` make Arrow
-pushes return `InvalidConfig`. Count limits and existing broadcast lag/eviction behavior remain.
+pushes return `InvalidConfig`. A slow sink never loses accepted messages: they stay queued
+and producers see `ChannelFull`.
 
 Charges use Arrow-reported retained array storage plus batch/column descriptors, including
 backing buffers of slices, nested arrays and views. Aliased buffers are charged independently.
