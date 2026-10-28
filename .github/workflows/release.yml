@@ -55,6 +55,16 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   # ============================================
+  # Certify Delivery Guarantees
+  # ============================================
+  # Cluster exactly-once is admitted from sink configuration alone; these kill-9 and
+  # paused-leader soaks on the tagged commit are its evidence, so the release waits for them.
+  soak:
+    name: Fault soak
+    needs: verify
+    uses: ./.github/workflows/checkpoint-fault-soak.yml
+
+  # ============================================
   # Build Release Artifacts
   # ============================================
   build:
@@ -242,7 +252,7 @@ jobs:
   # ============================================
   release:
     name: Create Release
-    needs: [verify, build]
+    needs: [verify, build, soak]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
