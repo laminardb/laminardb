@@ -2415,59 +2415,6 @@ async fn test_cascaded_avg_over_changelog() {
     );
 }
 
-fn round_trip(sv: &ScalarValue) -> ScalarValue {
-    let bytes = scalars_to_ipc(std::slice::from_ref(sv)).unwrap();
-    let back = ipc_to_scalars(&bytes).unwrap();
-    assert_eq!(back.len(), 1);
-    back.into_iter().next().unwrap()
-}
-
-#[test]
-fn scalar_ipc_round_trip() {
-    // Arrow IPC preserves exact type — no widening, unlike the old JSON path.
-    assert_eq!(round_trip(&ScalarValue::Null), ScalarValue::Null);
-    assert_eq!(
-        round_trip(&ScalarValue::Boolean(Some(true))),
-        ScalarValue::Boolean(Some(true)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Int64(Some(-42))),
-        ScalarValue::Int64(Some(-42)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Float64(Some(2.72))),
-        ScalarValue::Float64(Some(2.72)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Utf8(Some("hello".into()))),
-        ScalarValue::Utf8(Some("hello".into())),
-    );
-    let tz: Option<Arc<str>> = Some(Arc::from("UTC"));
-    assert_eq!(
-        round_trip(&ScalarValue::TimestampNanosecond(
-            Some(1_000_000),
-            tz.clone()
-        )),
-        ScalarValue::TimestampNanosecond(Some(1_000_000), tz),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Date32(Some(19000))),
-        ScalarValue::Date32(Some(19000)),
-    );
-    assert_eq!(
-        round_trip(&ScalarValue::Date64(Some(1_700_000_000_000))),
-        ScalarValue::Date64(Some(1_700_000_000_000)),
-    );
-}
-
-#[test]
-fn binary_scalar_roundtrips_exactly() {
-    // Under the old serde_json path, Binary was string-coerced via the
-    // "STR" fallback. Arrow IPC preserves Binary natively.
-    let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
-    assert_eq!(round_trip(&sv), sv);
-}
-
 /// Registers `fills (symbol, kind, qty DECIMAL(18, 8), px DOUBLE)` and returns three rows:
 /// a fill of 1.5 at 2.5, a non-fill of 2 at 3.0, and a fill of 0.5 at 1.0.
 pub(crate) fn mixed_type_fills(ctx: &SessionContext) -> RecordBatch {

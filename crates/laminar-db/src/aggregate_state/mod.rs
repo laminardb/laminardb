@@ -33,7 +33,6 @@ mod global;
 mod keys;
 #[cfg(feature = "cluster")]
 mod output_sequence;
-mod scalar_ipc;
 #[cfg(feature = "cluster")]
 mod seeding;
 mod vnode_state;
@@ -41,8 +40,8 @@ pub(crate) use checkpoints::AggStateArchiveRestoreProfile;
 #[cfg(feature = "cluster")]
 pub(crate) use checkpoints::AggStateRestorePreflight;
 pub(crate) use checkpoints::{
-    query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, GroupCheckpoint,
-    WindowCheckpoint,
+    arrays_to_ipc_bounded, encode_accumulator_states, encode_group_keys, query_fingerprint,
+    query_fingerprint_with_config, AggStateCheckpoint, EncodeBudget,
 };
 #[cfg(test)]
 pub(crate) use compile::expr_to_sql;
@@ -54,12 +53,7 @@ pub(crate) use compile::{
 pub(crate) use concrete::{ConcreteAggregateState, ConcreteInputMode};
 #[cfg(feature = "cluster")]
 pub(crate) use emission::PreparedAggregateEmission;
-pub(crate) use keys::{
-    global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row,
-};
-#[cfg(test)]
-pub(crate) use scalar_ipc::scalars_to_ipc;
-pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc_bounded};
+pub(crate) use keys::global_aggregate_key;
 use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 
 /// Builds the per-window result batch for one closed window.
@@ -265,26 +259,6 @@ fn require_managed_checkpoint_scalar_type(
     }
 }
 
-fn arrays_to_ipc_bounded(arrays: &[ArrayRef], max_bytes: usize) -> Result<Vec<u8>, DbError> {
-    if arrays.is_empty() {
-        return Ok(Vec::new());
-    }
-    let fields: Vec<Arc<Field>> = arrays
-        .iter()
-        .enumerate()
-        .map(|(i, a)| Arc::new(Field::new(format!("c{i}"), a.data_type().clone(), true)))
-        .collect();
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, arrays.to_vec())
-        .map_err(|e| DbError::Pipeline(format!("columnar batch build: {e}")))?;
-    laminar_core::serialization::serialize_batches_stream_bounded(
-        batch.schema().as_ref(),
-        std::iter::once(&batch),
-        max_bytes,
-    )
-    .map_err(|e| DbError::Pipeline(format!("columnar IPC encode: {e}")))
-}
-
 struct CapturedAggregateGroup {
     key: arrow::row::OwnedRow,
     accumulator_states: Vec<Vec<ScalarValue>>,
@@ -399,196 +373,23 @@ impl AggregateVnodeCheckpointCapture {
     }
 
     pub(crate) fn encode(self, max_working_bytes: usize) -> Result<AggStateCheckpoint, DbError> {
-        fn checked_product(left: usize, right: usize, component: &str) -> Result<usize, DbError> {
-            left.checked_mul(right).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} checkpoint accounting overflow"
-                ))
-            })
-        }
-
-        fn checked_sum(
-            values: impl IntoIterator<Item = usize>,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            values.into_iter().try_fold(0usize, |total, value| {
-                total.checked_add(value).ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "aggregate {component} checkpoint accounting overflow"
-                    ))
-                })
-            })
-        }
-
-        fn array_scratch_bytes<'a>(
-            values: impl IntoIterator<Item = &'a ScalarValue>,
-            rows: usize,
-            columns: usize,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            let payload = checked_sum(values.into_iter().map(ScalarValue::size), component)?;
-            let copied_payload = checked_product(payload, 2, component)?;
-            let cell_overhead = checked_product(rows, columns, component)
-                .and_then(|cells| checked_product(cells, 32, component))?;
-            checked_sum(
-                [
-                    copied_payload,
-                    cell_overhead,
-                    checked_product(columns, std::mem::size_of::<ArrayRef>(), component)?,
-                ],
-                component,
-            )
-        }
-
-        fn row_scratch_bytes(
-            payload_bytes: usize,
-            rows: usize,
-            columns: usize,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            checked_sum(
-                [
-                    checked_product(payload_bytes, 2, component)?,
-                    checked_product(rows, columns, component)
-                        .and_then(|cells| checked_product(cells, 32, component))?,
-                    checked_product(columns, std::mem::size_of::<ArrayRef>(), component)?,
-                ],
-                component,
-            )
-        }
-
-        fn transient_limit(
-            remaining: usize,
-            scratch: usize,
-            component: &str,
-        ) -> Result<usize, DbError> {
-            remaining.checked_sub(scratch).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} scratch space exceeded its cumulative checkpoint byte limit"
-                ))
-            })
-        }
-
-        fn retain_roster<T>(
-            remaining: &mut usize,
-            capacity: usize,
-            component: &str,
-        ) -> Result<(), DbError> {
-            let bytes = checked_product(capacity, std::mem::size_of::<T>(), component)?;
-            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} exceeded its cumulative checkpoint byte limit"
-                ))
-            })?;
-            Ok(())
-        }
-
-        fn retain_encoded(
-            remaining: &mut usize,
-            encoded: Vec<u8>,
-            component: &str,
-        ) -> Result<Vec<u8>, DbError> {
-            *remaining = remaining.checked_sub(encoded.capacity()).ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "aggregate {component} exceeded its cumulative checkpoint byte limit"
-                ))
-            })?;
-            Ok(encoded)
-        }
-
-        let mut remaining = max_working_bytes;
-        let keys_ipc = if self.groups.is_empty() || self.group_types.is_empty() {
-            Vec::new()
-        } else {
-            let key_payload = checked_sum(
-                self.groups.iter().map(|group| group.key.as_ref().len()),
-                "group keys",
-            )?;
-            let scratch = row_scratch_bytes(
-                key_payload,
-                self.groups.len(),
-                self.group_types.len(),
-                "group keys",
-            )?;
-            let encode_limit = transient_limit(remaining, scratch, "group keys")?;
-            let arrays = self
-                .row_converter
-                .convert_rows(self.groups.iter().map(|group| group.key.row()))
-                .map_err(|error| {
-                    DbError::Checkpoint(format!("aggregate group key array build: {error}"))
-                })?;
-            let encoded = arrays_to_ipc_bounded(&arrays, encode_limit)?;
-            retain_encoded(&mut remaining, encoded, "group keys")?
-        };
-
-        let accumulator_count = self
-            .groups
-            .first()
-            .map_or(0, |group| group.accumulator_states.len());
-        if self
-            .groups
-            .iter()
-            .any(|group| group.accumulator_states.len() != accumulator_count)
-        {
-            return Err(DbError::Checkpoint(
-                "aggregate checkpoint capture has inconsistent accumulator arity".into(),
-            ));
-        }
-
-        retain_roster::<Vec<u8>>(
-            &mut remaining,
-            accumulator_count,
-            "accumulator state roster",
+        let mut budget = EncodeBudget::new(max_working_bytes, "aggregate");
+        let keys_ipc = encode_group_keys(
+            &self.row_converter,
+            self.group_types.len(),
+            self.groups.iter().map(|group| &group.key),
+            &mut budget,
         )?;
-        let mut acc_state_ipc = Vec::with_capacity(accumulator_count);
-        for accumulator_index in 0..accumulator_count {
-            let arity = self
-                .groups
-                .first()
-                .map_or(0, |group| group.accumulator_states[accumulator_index].len());
-            if self
+        let acc_state_ipc = encode_accumulator_states(
+            &self
                 .groups
                 .iter()
-                .any(|group| group.accumulator_states[accumulator_index].len() != arity)
-            {
-                return Err(DbError::Checkpoint(
-                    "aggregate checkpoint capture has inconsistent state arity".into(),
-                ));
-            }
-            let scratch = array_scratch_bytes(
-                self.groups
-                    .iter()
-                    .flat_map(|group| group.accumulator_states[accumulator_index].iter()),
-                self.groups.len(),
-                arity,
-                "accumulator state",
-            )?;
-            let encode_limit = transient_limit(remaining, scratch, "accumulator state")?;
-            let mut columns = Vec::with_capacity(arity);
-            for column in 0..arity {
-                columns.push(
-                    ScalarValue::iter_to_array(
-                        self.groups.iter().map(|group| {
-                            group.accumulator_states[accumulator_index][column].clone()
-                        }),
-                    )
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aggregate accumulator state array build: {error}"
-                        ))
-                    })?,
-                );
-            }
-            let encoded = arrays_to_ipc_bounded(&columns, encode_limit)?;
-            acc_state_ipc.push(retain_encoded(
-                &mut remaining,
-                encoded,
-                "accumulator state",
-            )?);
-        }
+                .map(|group| group.accumulator_states.as_slice()),
+            &mut budget,
+        )?;
 
-        retain_roster::<i64>(&mut remaining, self.groups.len(), "last-updated roster")?;
-        retain_roster::<i64>(&mut remaining, self.groups.len(), "input-weight roster")?;
+        budget.retain_roster::<i64>(self.groups.len(), "last-updated roster")?;
+        budget.retain_roster::<i64>(self.groups.len(), "input-weight roster")?;
         let input_weights = self
             .groups
             .iter()
@@ -607,18 +408,17 @@ impl AggregateVnodeCheckpointCapture {
         };
         let emitted_count = emitted().count();
         let emitted_arity = emitted().next().map_or(0, Vec::len);
-        retain_roster::<u32>(&mut remaining, emitted_count, "changelog roster")?;
-        let scratch = array_scratch_bytes(
-            emitted().flatten(),
-            emitted_count,
-            emitted_arity,
+        budget.retain_roster::<u32>(emitted_count, "changelog roster")?;
+        let payload = budget.sum(
+            emitted().flatten().map(ScalarValue::size),
             "changelog values",
         )?;
-        let encode_limit = transient_limit(remaining, scratch, "changelog values")?;
+        let scratch =
+            budget.array_scratch(payload, emitted_count, emitted_arity, "changelog values")?;
+        let encode_limit = budget.transient_limit(scratch, "changelog values")?;
         let (emitted_groups, emitted_columns) = self.emitted_columns(emitted_arity)?;
         let emitted_values_ipc = arrays_to_ipc_bounded(&emitted_columns, encode_limit)?;
-        let emitted_values_ipc =
-            retain_encoded(&mut remaining, emitted_values_ipc, "changelog values")?;
+        let emitted_values_ipc = budget.retain_encoded(emitted_values_ipc, "changelog values")?;
 
         let checkpoint = AggStateCheckpoint {
             fingerprint: self.fingerprint,

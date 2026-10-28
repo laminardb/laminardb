@@ -926,7 +926,7 @@ fn test_core_window_checkpoint_roundtrip() {
     let cp = checkpoint_all(&mut state);
     assert_eq!(
         cp.iter()
-            .map(|(_, checkpoint)| checkpoint.windows.len())
+            .map(|(_, checkpoint)| checkpoint.window_starts.len())
             .sum::<usize>(),
         2
     );
@@ -1554,7 +1554,7 @@ fn test_hopping_checkpoint_roundtrip() {
     assert!(cp.iter().all(|(_, checkpoint)| checkpoint.window_type == 2));
     assert!(cp
         .iter()
-        .any(|(_, checkpoint)| !checkpoint.windows.is_empty()));
+        .any(|(_, checkpoint)| !checkpoint.window_starts.is_empty()));
 
     let mut state2 = make_hopping_core_window_state(4000, 2000);
     restore_all(&mut state2, cp).unwrap();
@@ -1592,7 +1592,7 @@ fn test_session_checkpoint_roundtrip() {
     assert!(cp.iter().all(|(_, checkpoint)| checkpoint.window_type == 3));
     assert!(cp
         .iter()
-        .any(|(_, checkpoint)| !checkpoint.session_state.is_empty()));
+        .any(|(_, checkpoint)| !checkpoint.group_session_ends.is_empty()));
 
     let mut state2 = make_session_core_window_state(3000);
     restore_all(&mut state2, cp).unwrap();
@@ -2016,4 +2016,202 @@ async fn compiled_window_pre_aggregation_coerces_mixed_operand_types() {
     );
     let px_milli = emitted[0].column_by_name("px_milli").unwrap();
     assert_eq!(px_milli.as_primitive::<Float64Type>().value(0), 3000.0);
+}
+
+fn restore_one(
+    mut state: CoreWindowState,
+    vnode: u32,
+    checkpoint: CoreWindowVnodeCheckpoint,
+) -> Result<(), DbError> {
+    let vnode_count = u32::from(state.key_group_count());
+    state.restore_high_watermark_ms(checkpoint.frontier_floor_ms)?;
+    state.restore_vnode(vnode, vnode_count, checkpoint)
+}
+
+fn only_populated_vnode(
+    checkpoints: Vec<(u32, CoreWindowVnodeCheckpoint)>,
+) -> (u32, CoreWindowVnodeCheckpoint) {
+    let mut populated = checkpoints.into_iter().filter(|(_, checkpoint)| {
+        !checkpoint.window_starts.is_empty() || !checkpoint.group_session_ends.is_empty()
+    });
+    let only = populated.next().unwrap();
+    assert!(populated.next().is_none());
+    only
+}
+
+#[test]
+fn fixed_window_frame_rejects_non_canonical_rosters() {
+    let mut state = make_core_window_state(1000);
+    let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![100, 1500]);
+    state.update_batch(&batch).unwrap();
+    let (vnode, checkpoint) = only_populated_vnode(checkpoint_all(&mut state));
+    assert_eq!(checkpoint.window_starts, [0, 1000]);
+    assert_eq!(checkpoint.window_group_ends, [1, 2]);
+    assert_eq!(checkpoint.acc_state_ipc.len(), 1);
+
+    let vnode_count = u32::from(state.key_group_count());
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint).unwrap();
+    assert!(state
+        .preflight_vnode_bytes(vnode, vnode_count, &archive)
+        .is_ok());
+    // Restore rejects every edit; returns whether the archive preflight also rejects it.
+    let preflight_rejects = |edit: fn(&mut CoreWindowVnodeCheckpoint), expected: &str| {
+        let mut corrupt = checkpoint.clone();
+        edit(&mut corrupt);
+        let error = restore_one(make_core_window_state(1000), vnode, corrupt.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{expected}: {error}");
+        let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&corrupt).unwrap();
+        state
+            .preflight_vnode_bytes(vnode, vnode_count, &archive)
+            .is_err()
+    };
+
+    for (edit, expected) in [
+        (
+            (|frame| frame.window_group_ends = vec![0, 2]) as fn(&mut CoreWindowVnodeCheckpoint),
+            "non-canonical",
+        ),
+        (|frame| frame.window_starts = vec![1000, 0], "non-canonical"),
+        (|frame| frame.group_session_ends = vec![1], "non-canonical"),
+        (
+            |frame| frame.acc_state_ipc.clear(),
+            "non-canonical state payloads",
+        ),
+        (
+            |frame| frame.keys_ipc.clear(),
+            "non-canonical state payloads",
+        ),
+    ] {
+        assert!(preflight_rejects(edit, expected), "{expected}");
+    }
+    // Duplicate keys and batch row counts are only visible in the decoded batches.
+    assert!(!preflight_rejects(
+        |frame| {
+            frame.window_starts = vec![0];
+            frame.window_group_ends = vec![2];
+        },
+        "duplicate group key",
+    ));
+    assert!(!preflight_rejects(
+        |frame| frame.window_group_ends = vec![1, 3],
+        "expected 3"
+    ));
+}
+
+#[test]
+fn session_frame_rejects_mismatched_interval_rosters() {
+    let mut state = make_session_core_window_state(3000);
+    let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 9000]);
+    state.update_batch(&batch).unwrap();
+    let (vnode, checkpoint) = only_populated_vnode(checkpoint_all(&mut state));
+    assert_eq!(checkpoint.group_session_ends, [2]);
+    assert_eq!(checkpoint.session_starts, [1000, 9000]);
+    assert_eq!(checkpoint.session_starts.capacity(), 2);
+    assert_eq!(checkpoint.session_ends.capacity(), 2);
+    assert!(checkpoint.window_starts.is_empty());
+
+    for (edit, expected) in [
+        (
+            (|frame| {
+                frame.session_ends.pop();
+            }) as fn(&mut CoreWindowVnodeCheckpoint),
+            "non-canonical session interval roster",
+        ),
+        (
+            |frame| frame.session_starts[1] = 2000,
+            "not strictly ordered and disjoint",
+        ),
+        (
+            |frame| frame.group_session_ends = vec![1, 1],
+            "non-canonical",
+        ),
+        (
+            |frame| frame.window_starts = vec![0],
+            "non-canonical fixed-window roster",
+        ),
+    ] {
+        let mut corrupt = checkpoint.clone();
+        edit(&mut corrupt);
+        let error = restore_one(make_session_core_window_state(3000), vnode, corrupt)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+    restore_one(make_session_core_window_state(3000), vnode, checkpoint).unwrap();
+}
+
+/// A window without GROUP BY keeps no key batch, and AVG's two-column state round-trips.
+#[tokio::test]
+async fn global_window_frame_restores_multi_column_state() {
+    use std::time::Duration;
+
+    let (ctx, schema) = sql_window_context();
+    let config = WindowOperatorConfig {
+        window_type: WindowType::Tumbling,
+        time_column: "ts".to_string(),
+        size: Duration::from_secs(1),
+        slide: None,
+        gap: None,
+        offset_ms: 0,
+        allowed_lateness: Duration::ZERO,
+        emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+        late_data_side_output: None,
+    };
+    let sql = "SELECT TUMBLE(ts, INTERVAL '1' SECOND) AS window_start, \
+               SUM(amount) AS total, AVG(amount) AS mean \
+               FROM events GROUP BY TUMBLE(ts, INTERVAL '1' SECOND)";
+    let build = || async {
+        CoreWindowState::try_from_sql(&ctx, sql, &config, None, key_groups())
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let mut state = build().await;
+    let input = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["A", "B", "C"])),
+            Arc::new(Int64Array::from(vec![2, 4, 9])),
+            Arc::new(Int64Array::from(vec![100, 200, 1500])),
+        ],
+    )
+    .unwrap();
+    let projected = state
+        .compiled_projection()
+        .unwrap()
+        .evaluate(&input)
+        .unwrap();
+    state.update_batch(&projected).unwrap();
+
+    let (vnode, checkpoint) = only_populated_vnode(checkpoint_all(&mut state));
+    assert_eq!(checkpoint.window_group_ends, [1, 2]);
+    assert!(checkpoint.keys_ipc.is_empty());
+    assert_eq!(checkpoint.acc_state_ipc.len(), 2);
+
+    let mut restored = build().await;
+    let vnode_count = u32::from(restored.key_group_count());
+    restored
+        .restore_high_watermark_ms(checkpoint.frontier_floor_ms)
+        .unwrap();
+    restored
+        .restore_vnode(vnode, vnode_count, checkpoint)
+        .unwrap();
+    let windows = restored
+        .close_windows(2000)
+        .unwrap()
+        .into_iter()
+        .map(|batch| {
+            let mean = batch
+                .column_by_name("mean")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .value(0);
+            (sum_total(&batch), mean)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(windows, [(6, 3.0), (9, 9.0)]);
 }

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Int64Array, RecordBatch};
+use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{CommittedRead, LaminarConfig, LaminarDB};
 
@@ -19,7 +19,7 @@ const BATCH_PERIOD: Duration = Duration::from_millis(10);
 const KEYS: u64 = 50_000;
 const CADENCES_MS: [u64; 3] = [1_000, 500, 100];
 
-const VIEWS: [&str; 5] = [
+const VIEWS: [&str; 7] = [
     "CREATE MATERIALIZED VIEW by_key AS SELECT k, COUNT(*) AS n, SUM(v) AS total \
      FROM events GROUP BY k",
     "CREATE MATERIALIZED VIEW by_bucket AS SELECT b, COUNT(*) AS n FROM events GROUP BY b",
@@ -28,6 +28,11 @@ const VIEWS: [&str; 5] = [
      WITH (retention = '200000 rows')",
     "CREATE MATERIALIZED VIEW large AS SELECT k, v FROM events WHERE v > 500 \
      WITH (retention = '100000 rows')",
+    "CREATE MATERIALIZED VIEW per_minute AS SELECT k, tumble(ts, INTERVAL '1' MINUTE) AS w, \
+     COUNT(*) AS n, SUM(v) AS total FROM events \
+     GROUP BY k, tumble(ts, INTERVAL '1' MINUTE) EMIT ON WINDOW CLOSE",
+    "CREATE MATERIALIZED VIEW sessions AS SELECT k, SESSION(ts, INTERVAL '30' SECOND) AS w, \
+     COUNT(*) AS n FROM events GROUP BY k, SESSION(ts, INTERVAL '30' SECOND) EMIT ON WINDOW CLOSE",
 ];
 
 fn now_ms() -> u64 {
@@ -40,7 +45,8 @@ fn now_ms() -> u64 {
     .unwrap()
 }
 
-/// A deterministic batch of `ROWS_PER_BATCH` rows spread over `KEYS` keys.
+/// A deterministic batch of `ROWS_PER_BATCH` rows spread over `KEYS` keys. Batch `n` is stamped
+/// `n` × `BATCH_PERIOD` after the epoch, so a run stays inside the first one-minute window.
 fn batch(sequence: u64) -> RecordBatch {
     let rows = 0..ROWS_PER_BATCH as u64;
     let keys: Vec<i64> = rows
@@ -51,10 +57,20 @@ fn batch(sequence: u64) -> RecordBatch {
         .map(|row| i64::try_from((sequence + row) % 1_000).unwrap())
         .collect();
     let buckets: Vec<i64> = keys.iter().map(|key| key % 64).collect();
+    let event_us =
+        i64::try_from(sequence * u64::try_from(BATCH_PERIOD.as_micros()).unwrap()).unwrap();
     RecordBatch::try_from_iter_with_nullable(vec![
         ("k", Arc::new(Int64Array::from(keys)) as _, true),
         ("v", Arc::new(Int64Array::from(values)) as _, true),
         ("b", Arc::new(Int64Array::from(buckets)) as _, true),
+        (
+            "ts",
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                event_us;
+                ROWS_PER_BATCH
+            ])) as _,
+            true,
+        ),
     ])
     .unwrap()
 }
@@ -77,9 +93,12 @@ async fn measure(cadence_ms: u64) {
         ..LaminarConfig::default()
     })
     .unwrap();
-    db.execute("CREATE SOURCE events (k BIGINT, v BIGINT, b BIGINT)")
-        .await
-        .unwrap();
+    db.execute(
+        "CREATE SOURCE events (k BIGINT, v BIGINT, b BIGINT, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
     for view in VIEWS {
         db.execute(view).await.unwrap();
     }

@@ -1,6 +1,5 @@
-//! Serializable checkpoint shapes for aggregate and window state.
-//!
-//! `AggStateCheckpoint` is columnar; `GroupCheckpoint` (window/EOWC) holds one-row IPC tuples.
+//! Serializable checkpoint shapes for aggregate state and the columnar encoding shared with
+//! window state.
 
 use arrow::datatypes::Schema;
 use xxhash_rust::xxh3::Xxh3;
@@ -8,11 +7,15 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::error::DbError;
 
 mod archive;
+mod columnar;
 mod ipc;
 
 pub(crate) use archive::AggStateArchiveRestoreProfile;
 #[cfg(feature = "cluster")]
 pub(crate) use archive::AggStateRestorePreflight;
+pub(crate) use columnar::{
+    arrays_to_ipc_bounded, encode_accumulator_states, encode_group_keys, EncodeBudget,
+};
 #[cfg(all(test, feature = "cluster"))]
 use ipc::preflight_scalar_ipc_restore;
 
@@ -25,12 +28,6 @@ const RESTORE_IPC_EXPANSION_FACTOR: usize = 8;
 const RESTORE_ROW_SCRATCH_CHARGE: usize = 2_048;
 const RESTORE_CELL_SCRATCH_CHARGE: usize = 64;
 const MAX_ACCUMULATOR_STATE_COLUMNS: usize = 2;
-
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct GroupCheckpoint {
-    pub key: Vec<u8>,
-    pub acc_states: Vec<Vec<u8>>,
-}
 
 /// Columnar running-aggregate state: all keys in one IPC batch, each accumulator's
 /// state across all groups in one IPC batch. Row `j` of `keys_ipc`, every
@@ -90,12 +87,6 @@ struct IpcRestorePreflight {
     dictionary_rows: usize,
     dictionary_body_bytes: usize,
     shared_payload_bytes: usize,
-}
-
-#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub(crate) struct WindowCheckpoint {
-    pub window_start: i64,
-    pub groups: Vec<GroupCheckpoint>,
 }
 
 /// Stable hash of the state-producing SQL and output schema; invalidates state on query change.
