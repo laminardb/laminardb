@@ -19,6 +19,13 @@ const PROCESS_SUBSCRIPTION_BYTES: usize = 256 * 1024 * 1024;
 
 static PROCESS_SUBSCRIPTION_BUDGET: OnceLock<Arc<SubscriptionMemoryBudget>> = OnceLock::new();
 
+/// Bytes the process's local subscription logs currently hold against their shared budget.
+pub(crate) fn process_subscription_log_bytes() -> usize {
+    PROCESS_SUBSCRIPTION_BUDGET
+        .get()
+        .map_or(0, |budget| budget.used())
+}
+
 pub(super) struct ReservedMarker {
     log: Arc<StreamLog>,
     through_sequence: u64,

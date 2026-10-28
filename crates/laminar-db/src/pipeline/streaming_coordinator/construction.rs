@@ -23,10 +23,11 @@ struct PreparedSourceSet {
     committed_offsets: Vec<Option<SourceCheckpoint>>,
 }
 impl StreamingCoordinator {
-    pub(crate) fn observe_source_queue_metrics(&self, metrics: &crate::EngineMetrics) {
-        metrics
-            .source_queue
-            .observe(&self.rx, self.config.source_queue_max_bytes);
+    pub(crate) fn observe_flow_metrics(&self, metrics: &crate::EngineMetrics) {
+        metrics.flow.coordinator.observe(
+            self.rx.observation(self.config.source_queue_max_bytes),
+            Arc::clone(&self.intake_stats),
+        );
     }
 
     pub(super) fn admit_public_source_shapes(
@@ -748,6 +749,7 @@ impl StreamingCoordinator {
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
             public_generation: None,
+            intake_stats: Arc::default(),
             #[cfg(feature = "cluster")]
             process_authority: source_process_authority,
         })

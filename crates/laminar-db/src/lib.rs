@@ -80,6 +80,7 @@ mod core_window_state;
 mod db;
 /// Prometheus metrics for the streaming engine.
 pub mod engine_metrics;
+mod flow_metrics;
 // Reopened `impl LaminarDB` modules — split from db.rs
 /// FFI-friendly API for language bindings.
 ///

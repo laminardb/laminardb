@@ -1153,6 +1153,74 @@ async fn sealed_write_waits_through_begin_until_successor_group_publication() {
     handle.close().await.unwrap();
 }
 
+fn sink_metric(registry: &prometheus::Registry, name: &str) -> prometheus::proto::Metric {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .and_then(|family| family.get_metric().first().cloned())
+        .unwrap_or_else(|| panic!("missing metric {name}"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn epoch_gate_waits_are_observed_only_while_the_gate_is_closed() {
+    let (sink, _writes, _flushes) = CountingSink::new();
+    let (event_tx, _event_rx) =
+        laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+        name: "gate-metrics".into(),
+        sink_id: Arc::from("gate-metrics"),
+        connector: Box::new(sink),
+        contract: checkpoint_committable_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_millis(25),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+    let registry = prometheus::Registry::new();
+    let metrics = crate::EngineMetrics::new(&registry);
+    handle.install_flow_metrics(metrics.flow.sink("gate-metrics"));
+    let gate_waits = || {
+        sink_metric(&registry, "sink_epoch_gate_wait_seconds")
+            .get_histogram()
+            .get_sample_count()
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    handle.begin_epoch_until(7, deadline).await.unwrap();
+    let initial = handle.begun_epoch_admission(7).unwrap();
+    handle.publish_open_epoch(initial).unwrap();
+    handle.write_batch(test_batch()).await.unwrap();
+    handle.sync().await.unwrap();
+    assert_eq!(gate_waits(), 0);
+
+    handle.seal_epoch_until(initial, deadline).await.unwrap();
+    let pending = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.write_batch(test_batch()).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!pending.is_finished());
+    handle.begin_epoch_until(19, deadline).await.unwrap();
+    handle
+        .publish_open_epoch(handle.begun_epoch_admission(19).unwrap())
+        .unwrap();
+    pending.await.unwrap().unwrap();
+    handle.sync().await.unwrap();
+    assert_eq!(gate_waits(), 1);
+    assert_eq!(
+        sink_metric(&registry, "sink_command_queue_depth")
+            .get_gauge()
+            .value(),
+        0.0
+    );
+    handle.close().await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn actor_rejects_private_write_after_successful_pre_commit() {
     let (sink, writes, _flushes) = CountingSink::new();
@@ -2188,6 +2256,7 @@ async fn write_enqueue_timeout_poison_rejects_checkpoint_flush() {
         event_tx,
         epoch_poisoned: Arc::clone(&epoch_poisoned),
         epoch_gate: None,
+        flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2269,6 +2338,7 @@ async fn cancelled_actor_is_retained_until_uncooperative_join_is_terminal() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2339,6 +2409,7 @@ async fn connector_child_task_holds_replacement_fence_after_actor_exit() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2464,6 +2535,7 @@ async fn cancelled_terminal_supervisor_cannot_publish_false_terminal() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2535,6 +2607,7 @@ async fn close_driver_panic_is_sticky_but_terminal_proof_remains_observable() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2626,6 +2699,7 @@ async fn test_sink_task_channel_closed_emits_event() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };

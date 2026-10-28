@@ -21,4 +21,6 @@ pub use portal::{
     SubscriptionPortal,
 };
 pub use registry::SubscribeStart;
-pub(crate) use registry::{SubscriptionOpenError, SubscriptionReader, SubscriptionRegistry};
+pub(crate) use registry::{
+    process_subscription_log_bytes, SubscriptionOpenError, SubscriptionReader, SubscriptionRegistry,
+};

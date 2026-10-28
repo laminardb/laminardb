@@ -36,6 +36,7 @@ use laminar_sql::translator::{
 };
 
 mod catalog_context;
+mod cold_metrics;
 mod input_admission;
 mod process;
 #[cfg(feature = "cluster")]
@@ -51,6 +52,8 @@ mod execution_poison;
 mod subscription_output;
 #[cfg(feature = "cluster")]
 mod vnode_transition;
+
+pub(crate) use cold_metrics::VnodeLoad;
 
 /// Cached retained managed-state accounting reported by one operator.
 ///
@@ -343,6 +346,12 @@ pub(crate) trait GraphOperator: Send {
     /// cached counters is permitted. Operators without managed accounting return `None`, which is
     /// also the admission-neutral default.
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        None
+    }
+
+    /// Spread of the operator's accounted state over its vnodes, from cached counters, under
+    /// the same rule as [`Self::managed_state_accounting`]. `None` means no per-vnode state.
+    fn vnode_load(&self) -> Option<VnodeLoad> {
         None
     }
 
@@ -3760,71 +3769,6 @@ impl OperatorGraph {
             break;
         }
         Ok(())
-    }
-
-    fn sample_buffer_stats(&mut self) {
-        self.stats_tick = self.stats_tick.wrapping_add(1);
-        if !self.stats_tick.is_multiple_of(STATS_SAMPLE_INTERVAL) {
-            return;
-        }
-        self.publish_buffer_stats();
-    }
-
-    fn publish_buffer_stats(&mut self) {
-        if let Some(ref prom) = self.prom {
-            for (id, ports) in self.input_buf_bytes.iter().enumerate() {
-                if self.nodes[id].removed {
-                    continue;
-                }
-                let total: usize = ports.iter().sum();
-                prom.input_buf_bytes
-                    .with_label_values(&[&self.nodes[id].name])
-                    .set(i64::try_from(total).unwrap_or(i64::MAX));
-            }
-            for (id, node) in self.nodes.iter().enumerate() {
-                if node.removed {
-                    for phase in ["live", "prepared", "retired"] {
-                        let _ = prom
-                            .managed_state_accounted_bytes
-                            .remove_label_values(&[&node.name, phase]);
-                    }
-                    self.managed_state_accounting_peaks[id] =
-                        ManagedStateAccountingSnapshot::default();
-                    continue;
-                }
-                let Some(mut accounting) = node.operator.managed_state_accounting() else {
-                    continue;
-                };
-                let peaks = std::mem::take(&mut self.managed_state_accounting_peaks[id]);
-                accounting.prepared = accounting.prepared.max(peaks.prepared);
-                accounting.retired = accounting.retired.max(peaks.retired);
-                for (phase, bytes) in [
-                    ("live", accounting.live),
-                    ("prepared", accounting.prepared),
-                    ("retired", accounting.retired),
-                ] {
-                    prom.managed_state_accounted_bytes
-                        .with_label_values(&[&node.name, phase])
-                        .set(i64::try_from(bytes).unwrap_or(i64::MAX));
-                }
-            }
-        }
-    }
-
-    /// Retain transient managed-state ownership until the next cold metrics sample.
-    ///
-    /// This performs no Prometheus work and is called only from vnode lifecycle paths.
-    #[cfg(feature = "cluster")]
-    fn observe_managed_state_accounting(&mut self, node_indices: &[usize]) {
-        for &node_idx in node_indices {
-            let node = &self.nodes[node_idx];
-            if node.removed {
-                continue;
-            }
-            if let Some(accounting) = node.operator.managed_state_accounting() {
-                self.managed_state_accounting_peaks[node_idx].observe_transient(accounting);
-            }
-        }
     }
 
     #[cfg(feature = "cluster")]

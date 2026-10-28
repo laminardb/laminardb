@@ -62,7 +62,7 @@ impl LaminarDB {
         .with_checkpoint_complete_rx(checkpoint_complete_rx)
         .with_checkpoint_admission(checkpoint_in_flight);
         if let Some(metrics) = self.engine_metrics() {
-            coordinator.observe_source_queue_metrics(&metrics);
+            coordinator.observe_flow_metrics(&metrics);
         }
         Ok((coordinator, callback))
     }

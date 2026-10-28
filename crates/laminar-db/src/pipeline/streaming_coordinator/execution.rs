@@ -409,7 +409,7 @@ impl StreamingCoordinator {
             // transient close/reopen cannot silently lose it. A fenced shutdown still discards
             // all open-epoch data below, where recovery owns the rewind.
             let intake_blocked = gates.intake_paused || callback.intake_paused();
-            self.observe_intake_gate_for_checkpoint_cadence(&mut state, intake_blocked);
+            self.observe_intake_gates(&mut state, &gates, intake_blocked);
             if intake_blocked {
                 if !self
                     .service_paused_intake(&mut callback, &mut state, msg)
@@ -481,9 +481,7 @@ impl StreamingCoordinator {
             // `is_backpressured()` bumps a counter, so call it only on active wakeups rather than
             // idle timeouts.
             let backpressured = had_data && callback.is_backpressured();
-            if backpressured {
-                tracing::debug!("operator graph backpressured — skipping drain");
-            }
+            self.observe_port_backpressure(backpressured);
             while !self.replay_pending
                 && !backpressured
                 && drain_count < MAX_DRAIN_PER_CYCLE

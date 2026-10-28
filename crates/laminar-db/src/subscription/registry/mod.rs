@@ -16,7 +16,7 @@ use tokio::sync::watch;
 mod lifecycle;
 mod reader;
 
-pub(crate) use lifecycle::SubscriptionRegistry;
+pub(crate) use lifecycle::{process_subscription_log_bytes, SubscriptionRegistry};
 pub(super) use reader::SubscriptionRead;
 pub(crate) use reader::SubscriptionReader;
 #[cfg(test)]
@@ -104,7 +104,6 @@ impl SubscriptionMemoryBudget {
         debug_assert!(released.is_ok(), "subscription memory released twice");
     }
 
-    #[cfg(test)]
     fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }

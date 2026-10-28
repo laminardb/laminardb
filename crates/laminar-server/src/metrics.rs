@@ -80,6 +80,12 @@ mod tests {
         assert!(text.contains("laminardb_events_ingested_total"));
         assert!(text.contains("laminardb_events_emitted_total"));
         assert!(text.contains("laminardb_cycles_total"));
+        // Scrape-time collectors take the prefix and constant labels like registered metrics.
+        assert!(text.contains(
+            r#"laminardb_intake_paused_seconds_total{reason="fence",instance="test",pipeline="smoke"}"#
+        ));
+        assert!(text.contains("laminardb_source_queue_reserved_bytes"));
+        assert!(text.contains("laminardb_subscription_log_bytes"));
     }
 
     #[test]
