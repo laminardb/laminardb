@@ -137,7 +137,9 @@ pub struct SourceEntry {
     /// Whether this source uses `PROCTIME()` watermarks.
     pub is_processing_time: std::sync::atomic::AtomicBool,
     pub(crate) source: streaming::Source<ArrowRecord>,
-    pub(crate) sink: streaming::Sink<ArrowRecord>,
+    /// The queue's single consumer while no pipeline bridge holds it; `None` while leased
+    /// and in schema-planning catalogs.
+    ingress: parking_lot::Mutex<Option<streaming::Sink<ArrowRecord>>>,
     buffer: parking_lot::Mutex<SnapshotRing>,
     /// Wakeup handle for `db.insert()` event-driven notification.
     data_notify: Arc<Notify>,
@@ -174,12 +176,47 @@ impl SourceEntry {
         Arc::clone(&self.data_notify)
     }
 
+    /// Leases the queue consumer to one pipeline bridge until the lease drops.
+    pub(crate) fn lease_ingress(self: &Arc<Self>) -> Result<IngressLease, crate::DbError> {
+        let sink = self.ingress.lock().take().ok_or_else(|| {
+            crate::DbError::Pipeline(format!(
+                "source '{}' input queue is already consumed by another pipeline bridge",
+                self.name
+            ))
+        })?;
+        Ok(IngressLease {
+            entry: Arc::clone(self),
+            sink: Some(sink),
+        })
+    }
+
     pub(crate) fn is_backpressured(&self) -> bool {
         crate::metrics::is_backpressured(self.source.pending(), self.source.capacity())
             || crate::metrics::is_backpressured(
                 self.source.queued_arrow_bytes(),
                 self.source.max_queued_bytes(),
             )
+    }
+}
+
+/// A source queue consumer leased to one pipeline bridge. Dropping the lease returns the
+/// consumer with any undelivered batches still queued, so the next bridge receives them.
+pub(crate) struct IngressLease {
+    entry: Arc<SourceEntry>,
+    sink: Option<streaming::Sink<ArrowRecord>>,
+}
+
+impl IngressLease {
+    pub(crate) fn poll(&mut self) -> Option<RecordBatch> {
+        self.sink.as_mut().and_then(streaming::Sink::poll)
+    }
+}
+
+impl Drop for IngressLease {
+    fn drop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            *self.entry.ingress.lock() = Some(sink);
+        }
     }
 }
 
@@ -312,13 +349,20 @@ impl SourceCatalog {
         };
 
         #[cfg(feature = "cluster")]
-        let (source, sink) = if self.topology_planning {
-            streaming::create_for_schema_planning::<ArrowRecord>(config)
+        let (source, ingress) = if self.topology_planning {
+            (
+                streaming::create_for_schema_planning::<ArrowRecord>(config),
+                None,
+            )
         } else {
-            streaming::create_with_config::<ArrowRecord>(config)
+            let (source, sink) = streaming::create_with_config::<ArrowRecord>(config);
+            (source, Some(sink))
         };
         #[cfg(not(feature = "cluster"))]
-        let (source, sink) = streaming::create_with_config::<ArrowRecord>(config);
+        let (source, ingress) = {
+            let (source, sink) = streaming::create_with_config::<ArrowRecord>(config);
+            (source, Some(sink))
+        };
 
         let entry = Arc::new(SourceEntry {
             name: name.to_string(),
@@ -329,7 +373,7 @@ impl SourceCatalog {
             max_out_of_orderness,
             is_processing_time: std::sync::atomic::AtomicBool::new(false),
             source,
-            sink,
+            ingress: parking_lot::Mutex::new(ingress),
             buffer: parking_lot::Mutex::new(SnapshotRing::new(
                 buf_size,
                 self.push_source_max_bytes,
