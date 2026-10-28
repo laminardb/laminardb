@@ -276,7 +276,7 @@ the server's `/metrics` endpoint adds the `laminardb_` prefix.
 | Intake fences (recovery, vnode transition, handoff) | all | — | intake waits | `intake_paused_seconds_total{reason="fence"}` |
 | Graph input ports | all | `pipeline_max_input_buf_batches` (256); `pipeline_max_input_buf_bytes` (unset) | operator output follows `BackpressurePolicy`; source input that does not fit halts the pipeline (see [graph input limits](#graph-input-limits)) | `input_buf_bytes{stream}`, `shed_records_total{stream}` |
 | Managed operator state | all | `pipeline_max_managed_state_bytes` (256 MiB, a lower-bound charge); 1,000,000 groups per aggregate | the budget halts the pipeline; the group cap fails the cycle | `managed_state_accounted_bytes`, `managed_state_budget_ratio`, `vnode_state_bytes_max`, `vnode_state_bytes_mean`, `vnode_groups_max`, `vnode_hottest` |
-| Shuffle between nodes | cluster | 256 frames, 32 MiB per peer and 128 MiB per node, each direction | the sending operator waits; gRPC flow control pushes back | `aggregate_shuffle_rows_total{operator,form}` |
+| Shuffle between nodes | cluster | 256 frames, 32 MiB per peer and 128 MiB per node, each direction | the sending operator waits; gRPC flow control pushes back | `shuffle_send_wait_seconds_total{peer}`, `shuffle_sent_bytes_total{peer}`, `shuffle_sent_rows_total{peer}`, `shuffle_budget_used_bytes{direction}`, `aggregate_shuffle_rows_total{operator,form}` |
 | Materialized views | all | 1,000,000 rows and 256 MiB per view | the cycle fails and faults the pipeline, leaving source cursors uncommitted (see [materialized-view memory limits](#materialized-view-memory-limits)) | — |
 | Sink command queue and epoch gate | all | 32 commands per sink; a checkpoint-committable sink accepts writes only in an open epoch | the coordinator waits; the write timeout starts once the epoch is open | `sink_command_queue_depth{sink}`, `sink_epoch_gate_wait_seconds{sink}` |
 | Local subscriptions | embedded, single-node | per-log byte caps; 256 MiB per process | a slow reader gets `Lagged` and is closed | `subscription_log_bytes` |
@@ -298,6 +298,13 @@ ties going to the lowest id. Window operators count a key once per open window o
 `aggregate_shuffle_rows_total` counts, per aggregate, the rows owned by another node
 (`form="input"`) and the rows sent for them (`form="sent"`). They are equal for keyed
 aggregates; a global aggregate sends one partial row per batch.
+
+`shuffle_send_wait_seconds_total` is the time sends to a peer waited for byte budget or a queue
+slot. Sends to one peer take turns and the turn is not counted, so the series tracks how long the
+peer's stream was blocked. The sent series count Arrow IPC data frames queued to the peer;
+frontiers and barriers are excluded. `shuffle_budget_used_bytes` reads the node's 128 MiB data
+budget in each direction. Inbound bytes stay held until the operator reading the frame has
+consumed it, so a value near the cap means this node consumes slower than its peers send.
 
 ## Feature Flags
 
