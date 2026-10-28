@@ -45,7 +45,8 @@ fn now_ms() -> u64 {
     .unwrap()
 }
 
-/// A deterministic batch of `ROWS_PER_BATCH` rows spread over `KEYS` keys, stamped now.
+/// A deterministic batch of `ROWS_PER_BATCH` rows spread over `KEYS` keys. Batch `n` is stamped
+/// `n` × `BATCH_PERIOD` after the epoch, so a run stays inside the first one-minute window.
 fn batch(sequence: u64) -> RecordBatch {
     let rows = 0..ROWS_PER_BATCH as u64;
     let keys: Vec<i64> = rows
@@ -56,7 +57,8 @@ fn batch(sequence: u64) -> RecordBatch {
         .map(|row| i64::try_from((sequence + row) % 1_000).unwrap())
         .collect();
     let buckets: Vec<i64> = keys.iter().map(|key| key % 64).collect();
-    let now_us = i64::try_from(now_ms()).unwrap() * 1_000;
+    let event_us =
+        i64::try_from(sequence * u64::try_from(BATCH_PERIOD.as_micros()).unwrap()).unwrap();
     RecordBatch::try_from_iter_with_nullable(vec![
         ("k", Arc::new(Int64Array::from(keys)) as _, true),
         ("v", Arc::new(Int64Array::from(values)) as _, true),
@@ -64,7 +66,7 @@ fn batch(sequence: u64) -> RecordBatch {
         (
             "ts",
             Arc::new(TimestampMicrosecondArray::from(vec![
-                now_us;
+                event_us;
                 ROWS_PER_BATCH
             ])) as _,
             true,
