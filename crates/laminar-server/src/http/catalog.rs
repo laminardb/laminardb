@@ -37,11 +37,11 @@ struct SinkResponse {
 #[derive(Debug, Deserialize)]
 pub(super) struct SqlRequest {
     sql: String,
-    /// How a query reads materialized views: `latest` or `committed`. Omitted, it is the
-    /// database's default: latest locally, committed on a cluster node.
+    /// How a query reads materialized views: `latest`, `committed` or `recent`. Omitted, it is
+    /// the database's default: latest locally, committed on a cluster node.
     #[serde(default)]
     read_level: Option<String>,
-    /// The earliest epoch a committed query may read.
+    /// The earliest epoch a committed or recent query may read.
     #[serde(default)]
     min_epoch: Option<u64>,
 }
@@ -224,15 +224,32 @@ async fn read_sql(db: &laminar_db::LaminarDB, req: &SqlRequest) -> axum::respons
     };
     let read = match db.read(&req.sql, level).await {
         Ok(read) => read,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => return error_response(read_status(&e), e.to_string()).into_response(),
     };
     match query_response(read.rows, read.cut).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => error_response(read_status(&e), e.to_string()).into_response(),
     }
 }
 
-fn read_level(
+/// A read that reached its deadline is 504 and one whose source could not be asked how far it
+/// has been written is 502, so a client can tell a retry from a bad request.
+pub(super) fn read_status(error: &laminar_db::DbError) -> StatusCode {
+    use laminar_db::{CommittedReadError, DbError};
+    match error {
+        DbError::CommittedRead(
+            CommittedReadError::NotRecent { .. }
+            | CommittedReadError::DeadlineExceeded { .. }
+            | CommittedReadError::NotCommitted {
+                requested: Some(_), ..
+            },
+        ) => StatusCode::GATEWAY_TIMEOUT,
+        DbError::CommittedRead(CommittedReadError::RecencyProbe { .. }) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+pub(super) fn read_level(
     db: &laminar_db::LaminarDB,
     req: &SqlRequest,
 ) -> Result<laminar_db::ReadLevel, String> {
@@ -241,14 +258,18 @@ fn read_level(
         None => db.default_read_level(),
         Some("latest") => ReadLevel::Latest,
         Some("committed") => ReadLevel::Committed(CommittedRead::Latest),
+        Some("recent") => ReadLevel::Committed(CommittedRead::Recent { at_least: 0 }),
         Some(other) => {
             return Err(format!(
-                "read_level must be 'latest' or 'committed', not '{other}'"
+                "read_level must be 'latest', 'committed' or 'recent', not '{other}'"
             ))
         }
     };
     match (level, req.min_epoch) {
         (level, None) => Ok(level),
+        (ReadLevel::Committed(CommittedRead::Recent { .. }), Some(at_least)) => {
+            Ok(ReadLevel::Committed(CommittedRead::Recent { at_least }))
+        }
         (ReadLevel::Committed(_), Some(epoch)) => {
             Ok(ReadLevel::Committed(CommittedRead::AtLeast(epoch)))
         }

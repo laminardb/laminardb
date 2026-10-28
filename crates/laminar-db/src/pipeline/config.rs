@@ -1,9 +1,11 @@
 //! Pipeline configuration.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_connectors::connector::DeliveryGuarantee;
 
+use crate::checkpoint_coordinator::committed_reads::CheckpointDemand;
 use crate::config::BackpressurePolicy;
 
 /// Checkpoint triggering configured for the running pipeline.
@@ -39,6 +41,14 @@ impl CheckpointSchedule {
     }
 }
 
+/// Periodic checkpoints that recent reads waiting for a newer committed cut bring forward.
+#[derive(Debug, Clone)]
+pub(crate) struct RecentReadCheckpoints {
+    /// Least time from the end of one checkpoint to the start of one a read asked for.
+    pub(crate) interval: Duration,
+    pub(crate) demand: Arc<CheckpointDemand>,
+}
+
 /// Configuration for the event-driven connector pipeline.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -58,6 +68,9 @@ pub struct PipelineConfig {
 
     /// Whether checkpoints are disabled, manual-only, or periodic.
     pub checkpoint_schedule: CheckpointSchedule,
+
+    /// Periodic checkpoints that waiting recent reads may bring forward.
+    pub(crate) recent_read_checkpoints: Option<RecentReadCheckpoints>,
 
     /// Sleep after the first event in a cycle to let more data accumulate.
     ///
@@ -111,6 +124,7 @@ impl Default for PipelineConfig {
             source_queue_max_bytes: crate::config::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Disabled,
+            recent_read_checkpoints: None,
             batch_window: Duration::from_millis(5),
             checkpoint_timeout: Duration::from_secs(30),
             delivery_guarantee: DeliveryGuarantee::default(),

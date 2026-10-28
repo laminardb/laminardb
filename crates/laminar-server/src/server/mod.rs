@@ -317,6 +317,9 @@ fn apply_checkpoint_settings(
         .map_err(CheckpointConfigurationError::NodeDataBudget)?;
     Ok(builder.checkpoint(StreamCheckpointConfig {
         interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
+        recent_read_interval_ms: checkpoint
+            .recent_read_interval
+            .map(|interval| u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)),
         timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
         data_dir: None,
         max_node_data_bytes: Some(max_node_data_bytes),

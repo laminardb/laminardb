@@ -773,6 +773,62 @@ seeds = ["x:1"]
 }
 
 #[test]
+fn recent_read_checkpoints_need_a_shorter_interval() {
+    let errors = |checkpoint: &str| {
+        let config: ServerConfig =
+            toml::from_str(&format!("[checkpoint]\ninterval = \"10s\"\n{checkpoint}")).unwrap();
+        match validate_config(&config) {
+            Ok(_) => Vec::new(),
+            Err(ConfigError::ValidationErrors { errors }) => errors,
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let config: ServerConfig =
+        toml::from_str("[checkpoint]\nrecent_read_interval = \"1s\"\n").unwrap();
+    assert_eq!(
+        config.checkpoint.recent_read_interval,
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        errors("recent_read_interval = \"1s\""),
+        Vec::<String>::new()
+    );
+    for interval in ["0s", "10s", "1m"] {
+        let errors = errors(&format!("recent_read_interval = \"{interval}\""));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("recent_read_interval must be > 0 and shorter")),
+            "{interval}: {errors:?}"
+        );
+    }
+
+    let toml = r#"
+node_id = "n1"
+
+[server]
+mode = "cluster"
+
+[checkpoint]
+recent_read_interval = "50ms"
+
+[discovery]
+strategy = "static"
+seeds = ["x:1"]
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    let Err(ConfigError::ValidationErrors { errors }) = validate_config(&config) else {
+        panic!("a 50ms recent-read interval must be refused in a cluster");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("checkpoint.recent_read_interval = 50ms is too tight")),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn test_validate_invalid_bind_address() {
     let toml = r#"
 [server]

@@ -98,6 +98,10 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # file:// until remote writer fencing lands. Startup verifies conditional puts.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
+# Optional: while a `recent` view read waits for a newer checkpoint, the next one starts this
+# long after the previous one ended instead of `interval` (shorter than `interval`; at least
+# 100ms in cluster mode). Each early checkpoint also commits exactly-once sinks.
+# recent_read_interval = "1s"
 timeout = "120s" # checkpoint deadline and per-phase cluster assignment-recovery bound
 
 # Provider features, accepted aliases, ambient identity, and native evidence:
@@ -217,7 +221,8 @@ including remote AI — runs normally.
 | GET | `/api/v1/streams` | List running streams |
 | GET | `/api/v1/streams/{name}` | Stream detail by name |
 | POST | `/api/v1/checkpoint` | Trigger immediate checkpoint |
-| POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "...", "read_level": "committed", "min_epoch": 42}`; both read fields optional) |
+| POST | `/api/v1/checkpoint/expedite` | Internal: a node forwards a waiting `recent` read's request to the cluster leader, which starts the next periodic checkpoint early under `recent_read_interval` (202) |
+| POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "...", "read_level": "committed", "min_epoch": 42}`; both read fields optional; `read_level` is `latest`, `committed` or `recent`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/api/v1/cluster/topology` | Durable catalog version and this process's activation evidence (console authorization) |
@@ -230,11 +235,18 @@ including remote AI — runs normally.
 `POST /api/v1/sql` returns at most 1000 result rows (and stops after a 5s collection budget). When the result is larger, the JSON response sets `"truncated": true` and `data` holds the first 1000 rows; the field is omitted when the result is complete. Use SUBSCRIBE (pgwire/WebSocket) to stream unbounded results.
 
 A query reads materialized views at `read_level`: `latest` (the latest completed cycle, which
-recovery may roll back) or `committed` (one committed checkpoint for every view in the query).
+recovery may roll back), `committed` (one committed checkpoint for every view in the query) or
+`recent` (a committed checkpoint holding every record written to the views' Kafka sources before
+the request arrived, waited for up to 30 seconds before the 5s collection budget starts; with
+`[checkpoint] recent_read_interval` the wait brings the next checkpoint forward).
 Omitted, it is `latest` locally and `committed` in cluster mode, where a node holds only part of
-each view. A committed response adds `epoch`, `checkpoint_id` and `taken_at_ms`; pass the epoch
-back as `min_epoch` to read no earlier checkpoint. `min_epoch` without a committed level is
-rejected. While a cluster node completes a coordinated recovery round, it keeps answering reads and
+each view. A committed or recent response adds `epoch`, `checkpoint_id` and `taken_at_ms`; pass
+the epoch back as `min_epoch` to read no earlier checkpoint. `min_epoch` without a committed or
+recent level is rejected. A read that passes its 30 second deadline (a `min_epoch` that never
+commits, or no checkpoint yet holding a recent read's records) answers 504; a recent read whose
+source cannot be asked how far it has been written answers 502; other read errors, including a
+recent read of a view over a source that cannot report it, answer 400. See
+[Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads). While a cluster node completes a coordinated recovery round, it keeps answering reads and
 keeps `/ws/{name}` subscriptions open; other statements and routes answer 503 until it ends.
 
 Supported cluster DDL returns an asynchronous migration receipt. See the main
@@ -244,7 +256,7 @@ README's [topology support and limits](../../README.md#change-a-running-clusters
 
 When `[server].pgwire_bind` is set, the server also listens for Postgres clients over the simple and extended query protocols. A cluster node opens the listener when it starts serving and closes it, with every session, when it stops. Like HTTP SQL reads and WebSocket subscriptions, it keeps answering committed reads while the node completes a coordinated recovery round (see [Delivery guarantees](../../docs/DELIVERY_GUARANTEES.md#materialized-view-reads)):
 
-- `SELECT` reads the database, with the same read levels as `POST /api/v1/sql`, chosen per connection: `SET laminar.read_level = 'latest' | 'committed' | 'default'` and `SET laminar.min_epoch = <n>`. `SHOW laminar.read_epoch` returns the epoch of the connection's last committed read, and later committed reads on the connection read no earlier epoch. Rows stream as the client reads them; statements with bind parameters are rejected (`0A000`).
+- `SELECT` reads the database, with the same read levels as `POST /api/v1/sql`, chosen per connection: `SET laminar.read_level = 'latest' | 'committed' | 'recent' | 'default'` and `SET laminar.min_epoch = <n>`. `SHOW laminar.read_epoch` returns the epoch of the connection's last committed or recent read, and later committed and recent reads on the connection read no earlier epoch. A recent read fails with `0A000` when a source behind its views cannot report how far it has been written, `58000` when one cannot be reached, and `57014` when no checkpoint holds every source within 30 seconds. Rows stream as the client reads them; statements with bind parameters are rejected (`0A000`).
 
 - `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for materialized views and certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
 - `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect. `SET` of names outside `laminar.*` changes database-wide session properties, not the connection's.

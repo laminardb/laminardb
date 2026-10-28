@@ -831,6 +831,19 @@ async fn test_auth_with_valid_bearer_returns_200() {
 }
 
 #[tokio::test]
+async fn a_forwarded_recent_read_checkpoint_request_is_accepted() {
+    let app = build_router(test_state_with_token("supersecret-token"));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/checkpoint/expedite")
+        .header("authorization", "Bearer supersecret-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn test_auth_with_wrong_bearer_returns_401() {
     let state = test_state_with_token("supersecret-token");
     let app = build_router(state);
@@ -860,6 +873,7 @@ async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protecte
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
         ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/checkpoint/expedite"),
         ("POST", "/api/v1/pipeline/start"),
         ("POST", "/api/v1/pipeline/stop"),
         ("GET", "/ws/events"),
@@ -1147,7 +1161,7 @@ async fn expired_process_deadline_rejects_serving_before_async_gate_fence() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn recovering_cluster_serves_only_committed_reads_and_subscriptions() {
+async fn recovering_cluster_serves_only_committed_reads_subscriptions_and_checkpoint_requests() {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
 
     let node = laminar_core::cluster::discovery::NodeId(43);
@@ -1212,6 +1226,7 @@ async fn recovering_cluster_serves_only_committed_reads_and_subscriptions() {
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("server is completing coordinated recovery"));
     let subscribe = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/ws/recovering")
@@ -1221,6 +1236,17 @@ async fn recovering_cluster_serves_only_committed_reads_and_subscriptions() {
         .await
         .unwrap();
     assert_ne!(subscribe.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let expedite = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/checkpoint/expedite")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(expedite.status(), StatusCode::ACCEPTED);
 }
 
 #[cfg(feature = "cluster")]
@@ -1753,8 +1779,61 @@ async fn post_sql(app: &Router, body: serde_json::Value) -> (StatusCode, serde_j
     (status, serde_json::from_slice(&body).unwrap())
 }
 
+#[test]
+fn read_errors_separate_deadlines_and_unreachable_sources_from_bad_requests() {
+    use super::catalog::read_status;
+    use laminar_db::{CommittedReadError, DbError};
+    for (error, status) in [
+        (
+            CommittedReadError::NotRecent {
+                latest: Some(3),
+                uncovered: vec!["orders".into()],
+            },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::DeadlineExceeded { epoch: 3 },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::NotCommitted {
+                requested: Some(4),
+                latest: Some(3),
+            },
+            StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (
+            CommittedReadError::RecencyProbe {
+                input: "orders".into(),
+                reason: "broker unreachable".into(),
+            },
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            CommittedReadError::RecencyUnsupported {
+                input: "orders".into(),
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            CommittedReadError::NotCommitted {
+                requested: None,
+                latest: None,
+            },
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            read_status(&DbError::CommittedRead(error.clone())),
+            status,
+            "{error}"
+        );
+    }
+}
+
 /// A query reads views at the request's level: latest by default, or the committed checkpoint,
-/// whose epoch, checkpoint and capture time the response reports.
+/// whose epoch, checkpoint and capture time the response reports. A recent read takes
+/// `min_epoch` as its floor, and refuses a view over a pushed source, which has no upstream to ask.
 #[tokio::test]
 async fn sql_queries_read_views_at_the_requested_level() {
     let dir = tempfile::tempdir().unwrap();
@@ -1850,6 +1929,23 @@ async fn sql_queries_read_views_at_the_requested_level() {
     ] {
         assert_eq!(read(invalid).await.0, StatusCode::BAD_REQUEST);
     }
+
+    let request: super::catalog::SqlRequest = serde_json::from_value(serde_json::json!({
+        "sql": query, "read_level": "recent", "min_epoch": epoch
+    }))
+    .unwrap();
+    assert_eq!(
+        super::catalog::read_level(&db, &request),
+        Ok(laminar_db::ReadLevel::Committed(
+            laminar_db::CommittedRead::Recent { at_least: epoch }
+        ))
+    );
+    let (status, recent) = read(serde_json::json!({ "read_level": "recent" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        recent["error"].as_str().unwrap().contains("'events'"),
+        "{recent}"
+    );
     db.shutdown().await.unwrap();
 }
 
@@ -2690,6 +2786,7 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/pipeline/status"),
         ("GET", "/ws/events"),
         ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/checkpoint/expedite"),
         ("POST", "/api/v1/sql"),
         ("POST", "/api/v1/reload"),
         ("POST", "/api/v1/pipeline/stop"),

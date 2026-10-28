@@ -13,25 +13,29 @@
 //! from the input prefix its own progress rows describe, the prefix must never shrink, the same
 //! epoch must read the same rows on every node, and every epoch must be at least the floor the
 //! session set. After each pgwire session the reader reads the same node over HTTP, checked by
-//! row counts and sums. Neither may be refused during coordinated recovery. A WebSocket
-//! subscriber folds `soak_view_keys`; its fold at each progress epoch must equal the reader's rows
-//! at that epoch, a subscription open on a node a fault spares must outlive the round, and a
-//! connection that ends resumes at its last progress epoch. After the input stops, every node must
-//! read every produced row at the final cut, over pgwire and HTTP.
+//! row counts and sums. Neither may be refused during coordinated recovery. A second reader does
+//! the same at the recent level, and each of its reads must also hold, on every partition, the
+//! highest id the broker had acknowledged to the producer before the read was sent
+//! (read-your-writes); both readers report how long their reads took. A WebSocket subscriber folds
+//! `soak_view_keys`; its fold at each progress epoch must equal the reader's rows at that epoch, a
+//! subscription open on a node a fault spares must outlive the round, and a connection that ends
+//! resumes at its last progress epoch. After the input stops, every node must read every produced
+//! row at the final cut, over pgwire and HTTP, and at the recent level without a floor.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{BuildHasher as _, RandomState};
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 
 use super::{
     connect_cluster_subscription_gateway, subscription_websocket_error_is_retryable, wait_for,
-    Node, ProducedPrefix, ZipfSampler, BASE_PORT, NODES, SOAK_CONSOLE_TOKEN,
+    AcknowledgedIds, Node, ProducedPrefix, ZipfSampler, BASE_PORT, NODES, SOAK_CONSOLE_TOKEN,
 };
 
 const PGWIRE_PORT_OFFSET: u16 = 200;
@@ -40,7 +44,7 @@ const APPEND_EVERY: u64 = 16;
 const READS_PER_SESSION: u32 = 3;
 const READ_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// A committed read with a floor waits up to 30 s for that epoch before failing with 57014.
+// A committed read with a floor, or a recent read, waits up to 30 s before failing with 57014.
 const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const READ_SQL: &str = "\
 SELECT 'p' AS kind, part AS a, n AS b, max_id AS c, id_sum AS d FROM soak_view_progress \
@@ -60,13 +64,11 @@ FROM soak_view_counts \
 UNION ALL SELECT 'r', COUNT(*) AS a, SUM(id) AS b, SUM(join_key) AS c, CAST(NULL AS BIGINT) AS d \
 FROM soak_view_rows";
 /// Committed-read errors HTTP answers with 400 while a node catches up, as pgwire's retryable
-/// SQLSTATEs below.
-const RETRYABLE_HTTP_ERRORS: [&str; 6] = [
-    "has not committed",
+/// SQLSTATEs below. A read that reaches its deadline answers 504.
+const RETRYABLE_HTTP_ERRORS: [&str; 4] = [
     "no checkpoint has committed",
     "is not retained",
     "hold checkpoints",
-    "passed its deadline",
     "has no committed state",
 ];
 /// SQLSTATEs a committed read can return while the cluster recovers: no committed cut yet or the
@@ -94,6 +96,88 @@ SELECT id, join_key, event_time FROM join_left WHERE join_key >= 0 AND id % {APP
 WITH (retention = '1 hour');
 """
 "#
+    )
+}
+
+/// The level a reader reads the views at.
+enum ReadLevel {
+    Committed,
+    /// Each read must hold every id the producer had acknowledged when the read was sent.
+    Recent {
+        acknowledged: Arc<AcknowledgedIds>,
+        checkpoint_interval: Duration,
+    },
+}
+
+impl ReadLevel {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Recent { .. } => "recent",
+        }
+    }
+
+    /// For a recent read about to be sent, each partition's highest acknowledged id.
+    fn acknowledged(&self) -> Option<Vec<Option<u64>>> {
+        match self {
+            Self::Committed => None,
+            Self::Recent { acknowledged, .. } => Some(acknowledged.snapshot()),
+        }
+    }
+
+    /// Whether the producer acknowledged nothing while a recent read was out. Once the input
+    /// stops, the newest cut already holds everything, so such reads time only the probe.
+    fn idle(&self, before: Option<&Vec<Option<u64>>>) -> bool {
+        before.is_some_and(|before| self.acknowledged().as_ref() == Some(before))
+    }
+
+    /// The pause before each read. A recent read returns as a checkpoint commits, so the next
+    /// one waits a random part of the interval to arrive anywhere in the checkpoint cycle, as a
+    /// client's write would; otherwise its wait measures only the cycle's worst case.
+    fn pause(&self) -> Duration {
+        match self {
+            Self::Committed => READ_INTERVAL,
+            Self::Recent {
+                checkpoint_interval,
+                ..
+            } => {
+                let random = RandomState::new().hash_one(()) >> 11;
+                checkpoint_interval.mul_f64(random as f64 / (1_u64 << 53) as f64)
+            }
+        }
+    }
+}
+
+/// A recent read's prefix must reach, on every partition, the highest id acknowledged before the
+/// read was sent.
+fn holds(acknowledged: &[Option<u64>], prefix: &[Option<u64>]) -> Result<(), String> {
+    let missed = acknowledged
+        .iter()
+        .zip(prefix)
+        .position(|(acknowledged, held)| acknowledged > held);
+    match missed {
+        None => Ok(()),
+        Some(part) => Err(format!(
+            "a recent read holds partition {part} up to id {:?}, but id {:?} was acknowledged \
+             before the read was sent",
+            prefix[part], acknowledged[part]
+        )),
+    }
+}
+
+/// How many reads, and how long they took.
+fn waits(waits: &[Duration]) -> String {
+    let mut sorted = waits.to_vec();
+    sorted.sort_unstable();
+    let Some(&max) = sorted.last() else {
+        return "none".to_owned();
+    };
+    let quantile = |percent: usize| sorted[(sorted.len() - 1) * percent / 100];
+    format!(
+        "{} reads, p50 {:.1?}, p95 {:.1?}, max {max:.1?}",
+        sorted.len(),
+        quantile(50),
+        quantile(95)
     )
 }
 
@@ -297,7 +381,7 @@ impl From<tokio_postgres::Error> for ReadFailure {
     }
 }
 
-async fn connect(node: usize) -> Result<tokio_postgres::Client, ReadFailure> {
+async fn connect(node: usize, level: &str) -> Result<tokio_postgres::Client, ReadFailure> {
     let mut config = tokio_postgres::Config::new();
     config
         .host("127.0.0.1")
@@ -312,7 +396,7 @@ async fn connect(node: usize) -> Result<tokio_postgres::Client, ReadFailure> {
         .map_err(|_| ReadFailure::Retryable("connect timeout".to_owned()))??;
     tokio::spawn(connection);
     client
-        .batch_execute("SET laminar.read_level = 'committed'")
+        .batch_execute(&format!("SET laminar.read_level = '{level}'"))
         .await?;
     Ok(client)
 }
@@ -363,17 +447,26 @@ fn view_sums(rows: &ViewRows) -> ViewSums {
     ]
 }
 
-/// One committed read over `POST /api/v1/sql`, checked like a pgwire read but by row counts and
-/// sums. Returns the epoch it read.
-fn http_read(node: usize, floor: u64, oracle: &mut ViewOracle) -> Result<u64, ReadFailure> {
+/// One read over `POST /api/v1/sql`, checked like a pgwire read but by row counts and sums.
+/// Returns the epoch it read, how long it took, and whether the input was idle meanwhile.
+fn http_read(
+    node: usize,
+    level: &ReadLevel,
+    floor: u64,
+    oracle: &mut ViewOracle,
+) -> Result<(u64, Duration, bool), ReadFailure> {
     let body = serde_json::json!({
         "sql": HTTP_READ_SQL,
-        "read_level": "committed",
+        "read_level": level.name(),
         "min_epoch": floor,
     })
     .to_string();
+    let acknowledged = level.acknowledged();
+    let started = Instant::now();
     let (status, response) = http_post(node, "/api/v1/sql", &body)
         .map_err(|_| ReadFailure::Retryable("http connection".to_owned()))?;
+    let wait = started.elapsed();
+    let idle = level.idle(acknowledged.as_ref());
     match status {
         200 => {}
         503 if response.contains("coordinated recovery") => {
@@ -382,6 +475,7 @@ fn http_read(node: usize, floor: u64, oracle: &mut ViewOracle) -> Result<u64, Re
             )))
         }
         503 => return Err(ReadFailure::Retryable("http 503".to_owned())),
+        504 => return Err(ReadFailure::Retryable("http 504".to_owned())),
         400 if RETRYABLE_HTTP_ERRORS
             .iter()
             .any(|error| response.contains(error)) =>
@@ -439,7 +533,10 @@ fn http_read(node: usize, floor: u64, oracle: &mut ViewOracle) -> Result<u64, Re
              {expected:?}"
         )));
     }
-    Ok(epoch)
+    if let Some(acknowledged) = acknowledged {
+        holds(&acknowledged, &prefix).map_err(|error| fatal(format!("epoch {epoch}: {error}")))?;
+    }
+    Ok((epoch, wait, idle))
 }
 
 fn http_post(node: usize, path: &str, body: &str) -> std::io::Result<(u16, String)> {
@@ -479,6 +576,10 @@ struct ReadEvidence {
     last_prefix: Option<(u64, Vec<Option<u64>>)>,
     read_digests: BTreeMap<u64, [u8; 32]>,
     key_digests: BTreeMap<u64, [u8; 32]>,
+    waits: Vec<Duration>,
+    http_waits: Vec<Duration>,
+    /// Recent reads over either surface while the producer acknowledged nothing.
+    idle_waits: Vec<Duration>,
 }
 
 impl ReadEvidence {
@@ -530,28 +631,42 @@ impl ReadEvidence {
 /// Reads on one node until the session's read budget or the first failure.
 async fn read_session(
     node: usize,
+    level: &ReadLevel,
     stop: &AtomicBool,
     evidence: &parking_lot::Mutex<ReadEvidence>,
     oracle: &mut ViewOracle,
 ) -> Result<(), ReadFailure> {
-    let client = connect(node).await?;
+    let client = connect(node, level.name()).await?;
     let floor = evidence.lock().floor;
     client
         .batch_execute(&format!("SET laminar.min_epoch = {floor}"))
         .await?;
     for _ in 0..READS_PER_SESSION {
+        tokio::time::sleep(level.pause()).await;
         if stop.load(Ordering::Acquire) {
             break;
         }
+        let acknowledged = level.acknowledged();
+        let started = Instant::now();
         let (epoch, rows) = read_once(&client).await?;
-        let prefix = oracle
-            .check(&rows)
-            .map_err(|error| ReadFailure::Fatal(format!("node{node} epoch {epoch}: {error}")))?;
-        evidence
-            .lock()
-            .record(node, epoch, &rows, prefix)
-            .map_err(ReadFailure::Fatal)?;
-        tokio::time::sleep(READ_INTERVAL).await;
+        let wait = started.elapsed();
+        let idle = level.idle(acknowledged.as_ref());
+        let fatal = |error| ReadFailure::Fatal(format!("node{node} epoch {epoch}: {error}"));
+        let prefix = oracle.check(&rows).map_err(fatal)?;
+        if let Some(acknowledged) = acknowledged {
+            holds(&acknowledged, &prefix).map_err(fatal)?;
+        }
+        {
+            let mut evidence = evidence.lock();
+            evidence
+                .record(node, epoch, &rows, prefix)
+                .map_err(ReadFailure::Fatal)?;
+            if idle {
+                evidence.idle_waits.push(wait);
+            } else {
+                evidence.waits.push(wait);
+            }
+        }
     }
     Ok(())
 }
@@ -560,6 +675,7 @@ fn run_reader(
     stop: &AtomicBool,
     evidence: &parking_lot::Mutex<ReadEvidence>,
     mut oracle: ViewOracle,
+    level: &ReadLevel,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -569,10 +685,18 @@ fn run_reader(
     while !stop.load(Ordering::Acquire) {
         let node = sessions % NODES;
         sessions += 1;
-        let pgwire = runtime.block_on(read_session(node, stop, evidence, &mut oracle));
+        let pgwire = runtime.block_on(read_session(node, level, stop, evidence, &mut oracle));
+        std::thread::sleep(level.pause());
         let floor = evidence.lock().floor;
-        let http = http_read(node, floor, &mut oracle).map(|_| {
-            evidence.lock().http_reads_by_node[node] += 1;
+        let http = http_read(node, level, floor, &mut oracle).map(|(epoch, wait, idle)| {
+            let mut evidence = evidence.lock();
+            evidence.floor = evidence.floor.max(epoch);
+            evidence.http_reads_by_node[node] += 1;
+            if idle {
+                evidence.idle_waits.push(wait);
+            } else {
+                evidence.http_waits.push(wait);
+            }
         });
         for result in [pgwire, http] {
             match result {
@@ -892,43 +1016,68 @@ impl<S> Drop for Observer<S> {
     }
 }
 
-/// The view reader and subscriber of one soak run.
+/// The view readers and subscriber of one soak run.
 pub(super) struct ViewSoak {
     partitions: i32,
     key_count: u64,
     zipf_milli: u64,
     reader: Observer<ReadEvidence>,
+    recent: Observer<ReadEvidence>,
     subscriber: Observer<SubscriptionEvidence>,
     /// The subscription connection open on a node the current round's fault spares.
     spared: Option<u64>,
     /// Rounds whose spared subscription delivered the recovered checkpoint.
     spanned: u64,
+    /// With `recent_read_interval` set, the median recent read with the input live must wait
+    /// less than this, half the checkpoint interval; at the cadence alone it waits about that.
+    expedited_median: Option<Duration>,
 }
 
 impl ViewSoak {
-    /// Start reading once the cluster has committed its first checkpoint.
+    /// Start reading once the cluster has committed its first checkpoint. `acknowledged` is the
+    /// producer's, so recent reads can check they hold what it wrote.
     pub(super) fn start(
         partitions: i32,
         key_count: u64,
         zipf_milli: u64,
+        acknowledged: Arc<AcknowledgedIds>,
+        checkpoint_interval: Duration,
+        recent_read_interval: Option<Duration>,
         window: Duration,
     ) -> Self {
         let oracle = ViewOracle::new(partitions, key_count, zipf_milli);
+        let recent_oracle = ViewOracle::new(partitions, key_count, zipf_milli);
         let mut soak = Self {
             partitions,
             key_count,
             zipf_milli,
             reader: Observer::spawn("view-soak-reader", move |stop, evidence| {
-                run_reader(stop, evidence, oracle)
+                run_reader(stop, evidence, oracle, &ReadLevel::Committed)
+            }),
+            recent: Observer::spawn("view-soak-recent-reader", move |stop, evidence| {
+                run_reader(
+                    stop,
+                    evidence,
+                    recent_oracle,
+                    &ReadLevel::Recent {
+                        acknowledged,
+                        checkpoint_interval,
+                    },
+                )
             }),
             subscriber: Observer::spawn("view-soak-subscriber", run_subscriber),
             spared: None,
             spanned: 0,
+            expedited_median: recent_read_interval.map(|_| checkpoint_interval / 2),
         };
-        soak.reader
-            .wait_until("a first committed view read", window, |evidence| {
+        for (reader, what) in [
+            (&mut soak.reader, "a first committed view read"),
+            (&mut soak.recent, "a first recent view read"),
+        ] {
+            reader.wait_until(what, window, |evidence| {
                 evidence.reads_by_node.iter().any(|reads| *reads > 0)
             });
+        }
         soak.subscriber
             .wait_until("a first view subscription progress", window, |evidence| {
                 !evidence.progress.is_empty()
@@ -948,15 +1097,16 @@ impl ViewSoak {
             .map(|(connection, _)| connection);
     }
 
-    /// After a fault round: both observers are healthy and have reached the recovered cut, and a
+    /// After a fault round: every observer is healthy and has reached the recovered cut, and a
     /// subscription that was open on a spared node delivered it. The subscription then moves to
-    /// the next gateway.
+    /// the next gateway before this returns.
     pub(super) fn after_round(&mut self, epoch: u64, window: Duration) {
-        self.reader.wait_until(
-            "a committed view read after the round",
-            window,
-            |evidence| evidence.floor >= epoch,
-        );
+        for (reader, what) in [
+            (&mut self.reader, "a committed view read after the round"),
+            (&mut self.recent, "a recent view read after the round"),
+        ] {
+            reader.wait_until(what, window, |evidence| evidence.floor >= epoch);
+        }
         self.subscriber.wait_until(
             "view subscription progress after the round",
             window,
@@ -977,16 +1127,38 @@ impl ViewSoak {
             );
             self.spanned += 1;
         }
+        let rotated = subscription.connections;
         subscription.rotate = true;
-        let reads = self.reader.evidence.lock();
+        drop(subscription);
+        // The next fault may follow at once, and must not take the connection about to move as
+        // the one it spares.
+        self.subscriber.wait_until(
+            "the view subscription on the next gateway",
+            window,
+            |evidence| {
+                evidence
+                    .open
+                    .is_some_and(|(connection, _)| connection > rotated)
+            },
+        );
+        for (level, reader) in [("committed", &self.reader), ("recent", &self.recent)] {
+            let reads = reader.evidence.lock();
+            eprintln!(
+                "soak: {level} view reads through epoch {} (pgwire {:?}, HTTP {:?} per node; \
+                 pgwire {}; HTTP {}; input idle {}; retried {:?})",
+                reads.floor,
+                reads.reads_by_node,
+                reads.http_reads_by_node,
+                waits(&reads.waits),
+                waits(&reads.http_waits),
+                waits(&reads.idle_waits),
+                reads.retried,
+            );
+        }
+        let subscription = self.subscriber.evidence.lock();
         eprintln!(
-            "soak: view reads through epoch {} (pgwire {:?}, HTTP {:?} per node; retried {:?}); \
-             subscription connections {} ({} kept open through a fault, {} resumed, {} resumes \
-             lost; retried {:?})",
-            reads.floor,
-            reads.reads_by_node,
-            reads.http_reads_by_node,
-            reads.retried,
+            "soak: view subscription connections {} ({} kept open through a fault, {} resumed, {} \
+             resumes lost; retried {:?})",
             subscription.connections,
             self.spanned,
             subscription.resumed,
@@ -1006,8 +1178,10 @@ impl ViewSoak {
     ) {
         self.after_round(epoch, window);
         let reads = self.reader.stop();
+        let recent = self.recent.stop();
         let subscription = self.subscriber.stop();
         let reads = reads.lock();
+        let recent = recent.lock();
         let subscription = subscription.lock();
 
         let mut oracle = ViewOracle::new(self.partitions, self.key_count, self.zipf_milli);
@@ -1033,22 +1207,51 @@ impl ViewSoak {
             Some(&digest(&complete.keys)),
             "the view subscription did not fold every produced row at the final epoch {epoch}"
         );
+        let differing = recent
+            .read_digests
+            .iter()
+            .filter(|(epoch, recent)| {
+                reads
+                    .read_digests
+                    .get(epoch)
+                    .is_some_and(|read| read != *recent)
+            })
+            .map(|(epoch, _)| *epoch)
+            .collect::<Vec<_>>();
         assert!(
-            reads.reads_by_node.iter().all(|reads| *reads > 0),
-            "every node must serve committed view reads: {:?}",
-            reads.reads_by_node
+            differing.is_empty(),
+            "recent and committed reads of the same epochs read different rows: {differing:?}"
         );
+        if let Some(bound) = self.expedited_median {
+            let mut live: Vec<Duration> = recent
+                .waits
+                .iter()
+                .chain(&recent.http_waits)
+                .copied()
+                .collect();
+            live.sort_unstable();
+            let median = live.get(live.len() / 2).copied();
+            assert!(
+                median.is_some_and(|median| median < bound),
+                "with recent_read_interval set, the median recent read with the input live waited \
+                 {median:?}, not under {bound:?}: waiting reads did not bring checkpoints forward"
+            );
+        }
+        for (level, reads) in [("committed", &reads), ("recent", &recent)] {
+            assert!(
+                reads.reads_by_node.iter().all(|reads| *reads > 0)
+                    && reads.http_reads_by_node.iter().all(|reads| *reads > 0),
+                "every node must serve {level} view reads over pgwire and HTTP: {:?}, {:?}",
+                reads.reads_by_node,
+                reads.http_reads_by_node
+            );
+        }
         assert!(
             subscription.resumed > 0 && self.spanned > 0,
             "the view subscription must resume at its last progress epoch and stay open through \
              a fault on another node: {} resumed, {} kept open",
             subscription.resumed,
             self.spanned
-        );
-        assert!(
-            reads.http_reads_by_node.iter().all(|reads| *reads > 0),
-            "every node must serve HTTP committed view reads: {:?}",
-            reads.http_reads_by_node
         );
         assert!(
             shared.len() >= 2 && subscription.gateways.len() == NODES,
@@ -1059,22 +1262,45 @@ impl ViewSoak {
         );
         for node in nodes {
             let committed_reads = node.metric("laminardb_mv_reads_total").unwrap_or(0.0);
+            let recent_reads = node
+                .metric("laminardb_mv_recent_read_wait_seconds_count")
+                .unwrap_or(0.0);
             assert!(
-                committed_reads > 0.0,
-                "node{} exported no view reads",
+                committed_reads > 0.0 && recent_reads > 0.0,
+                "node{} exported {committed_reads} view reads, {recent_reads} recent",
                 node.id
+            );
+            let waited = node
+                .metric("laminardb_mv_recent_read_wait_seconds_sum")
+                .unwrap_or(0.0);
+            eprintln!(
+                "soak: node{} waited {:.1}s on average for {recent_reads} recent reads since its \
+                 last start",
+                node.id,
+                waited / recent_reads
             );
         }
         eprintln!(
-            "soak: view oracle verified through epoch {epoch}: {} committed reads across {} \
-             epochs ({:?} per node, {:?} HTTP reads, retried {:?}); subscription folded {} epochs \
-             over {} connections ({} kept open through a fault, {} resumed, {} resumes lost, \
-             retried {:?}), {} epochs shared with the reader",
+            "soak: view oracle verified through epoch {epoch}: {} committed pgwire reads across \
+             {} epochs ({:?} per node, {:?} HTTP reads, pgwire {}, HTTP {}, retried {:?}); {} \
+             recent pgwire reads across {} epochs ({:?} per node, {:?} HTTP reads; with the input \
+             live: pgwire {}, HTTP {}; input idle {}; retried {:?}); subscription folded {} epochs over {} connections ({} kept open through a \
+             fault, {} resumed, {} resumes lost, retried {:?}), {} epochs shared with the reader",
             reads.reads_by_node.iter().sum::<u64>(),
             reads.read_digests.len(),
             reads.reads_by_node,
             reads.http_reads_by_node,
+            waits(&reads.waits),
+            waits(&reads.http_waits),
             reads.retried,
+            recent.reads_by_node.iter().sum::<u64>(),
+            recent.read_digests.len(),
+            recent.reads_by_node,
+            recent.http_reads_by_node,
+            waits(&recent.waits),
+            waits(&recent.http_waits),
+            waits(&recent.idle_waits),
+            recent.retried,
             subscription.progress.len(),
             subscription.connections,
             self.spanned,
@@ -1086,37 +1312,52 @@ impl ViewSoak {
     }
 }
 
+/// Every node reads every produced row at a committed floor of `epoch`, then at the recent level
+/// without one: the producer had every row acknowledged before the read was sent.
 fn assert_final_pgwire_reads(nodes: &[Node], epoch: u64, complete: &ViewRows) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("final view read runtime");
-    for node in nodes {
-        let read = runtime.block_on(async {
-            let client = connect(node.id).await?;
-            client
-                .batch_execute(&format!("SET laminar.min_epoch = {epoch}"))
-                .await?;
-            read_once(&client).await
-        });
-        let (read_epoch, rows) = match read {
-            Ok(read) => read,
-            Err(ReadFailure::Retryable(reason) | ReadFailure::Fatal(reason)) => {
-                panic!("node{} final committed view read failed: {reason}", node.id)
-            }
-        };
-        assert!(
-            read_epoch >= epoch,
-            "node{} read epoch {read_epoch}",
-            node.id
-        );
-        assert!(
-            rows == *complete,
-            "node{} final committed read differs from every produced row: {}",
-            node.id,
-            first_difference(&rows, complete)
-        );
+    for (level, floor) in [("committed", epoch), ("recent", 0)] {
+        for node in nodes {
+            assert_final_pgwire_read(&runtime, node, level, floor, epoch, complete);
+        }
     }
+}
+
+fn assert_final_pgwire_read(
+    runtime: &tokio::runtime::Runtime,
+    node: &Node,
+    level: &str,
+    floor: u64,
+    epoch: u64,
+    complete: &ViewRows,
+) {
+    let read = runtime.block_on(async {
+        let client = connect(node.id, level).await?;
+        client
+            .batch_execute(&format!("SET laminar.min_epoch = {floor}"))
+            .await?;
+        read_once(&client).await
+    });
+    let (read_epoch, rows) = match read {
+        Ok(read) => read,
+        Err(ReadFailure::Retryable(reason) | ReadFailure::Fatal(reason)) => {
+            panic!("node{} final {level} view read failed: {reason}", node.id)
+        }
+    };
+    assert!(
+        read_epoch >= epoch,
+        "node{} final {level} read epoch {read_epoch} is below {epoch}",
+        node.id
+    );
+    assert!(
+        rows == *complete,
+        "node{} final {level} read differs from every produced row: {}",
+        node.id,
+        first_difference(&rows, complete)
+    );
 }
 
 fn assert_final_http_reads(nodes: &[Node], epoch: u64, complete: &ViewRows) {
@@ -1208,6 +1449,24 @@ mod tests {
             .record(2, 8, &early, oracle.produced(10))
             .unwrap_err()
             .contains("less of partition"));
+    }
+
+    #[test]
+    fn recent_reads_must_hold_the_highest_acknowledged_id_of_each_partition() {
+        let acknowledged = AcknowledgedIds::new(3);
+        acknowledged.record(1, 7);
+        acknowledged.record(1, 4);
+        acknowledged.record(2, 2);
+        let acknowledged = acknowledged.snapshot();
+        assert_eq!(acknowledged, vec![None, Some(7), Some(2)]);
+        holds(&acknowledged, &[None, Some(7), Some(5)]).unwrap();
+        holds(&acknowledged, &[Some(3), Some(10), Some(2)]).unwrap();
+        assert!(holds(&acknowledged, &[Some(3), Some(4), Some(5)])
+            .unwrap_err()
+            .contains("partition 1 up to id Some(4), but id Some(7)"));
+        assert!(holds(&acknowledged, &[None, Some(7), None])
+            .unwrap_err()
+            .contains("partition 2"));
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod assignment_authority;
 #[cfg(feature = "cluster")]
 mod catalog_bootstrap;
 mod checkpoint_namespace;
+mod checkpoint_requests;
 #[cfg(feature = "cluster")]
 mod cluster_subscription;
 pub(crate) mod committed_read;
@@ -5208,48 +5209,26 @@ impl LaminarDB {
 
         #[cfg(feature = "cluster")]
         if self.is_cluster_runtime() {
-            let leader_rpc: Result<Option<String>, DbError> = {
-                let cc_guard = self.cluster_controller.lock();
-                let cc = cc_guard.as_ref().ok_or_else(|| {
-                    DbError::Checkpoint("cluster runtime has no cluster controller".into())
-                })?;
-                match cc {
-                    cc if cc.is_leader() => Ok(None),
-                    _ if !allow_forwarding => Err(DbError::Checkpoint(
+            let leader = self.cluster_leader_http_address().map_err(|reason| {
+                DbError::Checkpoint(format!("cannot route checkpoint: {reason}"))
+            })?;
+            match leader {
+                None => {}
+                Some(_) if !allow_forwarding => {
+                    return Err(DbError::Checkpoint(
                         "forwarded checkpoint reached a node that is no longer the cluster leader"
                             .into(),
-                    )),
-                    cc => {
-                        let leader_id = cc.current_leader().ok_or_else(|| {
-                            DbError::Checkpoint(
-                                "cannot route checkpoint: cluster leader is unresolved".into(),
-                            )
-                        })?;
-                        let watch = cc.members_watch();
-                        let members = watch.borrow();
-                        let address = members
-                            .iter()
-                            .find(|member| member.id == leader_id)
-                            .map(|member| member.rpc_address.trim())
-                            .filter(|address| !address.is_empty())
-                            .ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "cannot route checkpoint: RPC address for cluster leader \
-                                     {leader_id} is unresolved"
-                                ))
-                            })?;
-                        Ok(Some(address.to_owned()))
-                    }
+                    ))
                 }
-            };
-            if let Some(leader_rpc) = leader_rpc? {
-                tracing::info!(
-                    "Forwarding checkpoint request to leader node at HTTP address {}",
-                    leader_rpc
-                );
-                return self
-                    .forward_checkpoint_to_leader(&leader_rpc, deadline)
-                    .await;
+                Some(leader_rpc) => {
+                    tracing::info!(
+                        "Forwarding checkpoint request to leader node at HTTP address {}",
+                        leader_rpc
+                    );
+                    return self
+                        .forward_checkpoint_to_leader(&leader_rpc, deadline)
+                        .await;
+                }
             }
         }
 

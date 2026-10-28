@@ -54,6 +54,7 @@ mod metadata;
 mod polling;
 mod progress;
 mod reader;
+mod recency;
 mod record_metadata;
 mod startup;
 

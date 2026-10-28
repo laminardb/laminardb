@@ -10,7 +10,7 @@ use arrow::datatypes::SchemaRef;
 use laminar_core::changelog::WEIGHT_COLUMN;
 use laminar_core::state::KeyGroupCount;
 
-use crate::checkpoint_coordinator::committed_reads::CommittedCuts;
+use crate::checkpoint_coordinator::committed_reads::{CheckpointDemand, CommittedCuts};
 use crate::error::DbError;
 use crate::operator::capability::OperatorStateClass;
 use crate::operator_graph::InputFrontier;
@@ -32,10 +32,10 @@ mod upsert;
 use admission::{MvLimits, PreparedUpdate};
 pub(crate) use append_log::{spawn_compactor as spawn_log_compactor, LogRead, ViewRetention};
 use append_log::{AppendLogState, LogHorizon};
-pub(crate) use committed::CommittedViews;
-pub use committed::{CommittedRead, CommittedReadError};
 #[cfg(feature = "cluster")]
-pub(crate) use committed::{PinnedCut, ViewShape};
+pub(crate) use committed::ViewShape;
+pub use committed::{CommittedRead, CommittedReadError};
+pub(crate) use committed::{CommittedViews, PinnedCut, RecencyTargets};
 pub(crate) use frames::RestoredView;
 pub(crate) use freshness::{spawn_monitor as spawn_freshness_monitor, FreshnessContracts};
 use multiset::MultisetState;
@@ -215,6 +215,8 @@ pub(crate) struct MvStore {
     has_any: Arc<AtomicBool>,
     /// Reads committed checkpoints once checkpointing is configured.
     committed: Option<Arc<CommittedViews>>,
+    /// Recent reads waiting for a newer committed cut; the pipeline that runs checkpoints sees it.
+    checkpoint_demand: Arc<CheckpointDemand>,
     /// The checkpoint whose view logs the store last committed or restored.
     log_checkpoint: Option<u64>,
     /// The checkpoint attempt whose view-log capture awaits its outcome.
@@ -241,6 +243,7 @@ impl MvStore {
             },
             has_any: Arc::new(AtomicBool::new(false)),
             committed: None,
+            checkpoint_demand: Arc::default(),
             log_checkpoint: None,
             log_capture: None,
             horizon_cuts: None,
@@ -260,6 +263,10 @@ impl MvStore {
 
     pub(crate) fn committed_views(&self) -> Option<Arc<CommittedViews>> {
         self.committed.clone()
+    }
+
+    pub(crate) fn checkpoint_demand(&self) -> Arc<CheckpointDemand> {
+        Arc::clone(&self.checkpoint_demand)
     }
 
     /// Count on `counter` the rows append views drop behind their retention horizon.
@@ -513,6 +520,7 @@ impl MvStore {
             limits: self.limits,
             has_any: Arc::clone(&self.has_any),
             committed: self.committed.clone(),
+            checkpoint_demand: Arc::clone(&self.checkpoint_demand),
             log_checkpoint: None,
             log_capture: None,
             horizon_cuts: self.horizon_cuts.clone(),
