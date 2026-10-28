@@ -80,10 +80,18 @@ mod tests {
         assert!(text.contains("laminardb_events_ingested_total"));
         assert!(text.contains("laminardb_events_emitted_total"));
         assert!(text.contains("laminardb_cycles_total"));
-        // Scrape-time collectors take the prefix and constant labels like registered metrics.
-        assert!(text.contains(
-            r#"laminardb_intake_paused_seconds_total{reason="fence",instance="test",pipeline="smoke"}"#
-        ));
+        // Scrape-time collectors take the prefix and constant labels like registered metrics. The
+        // registry appends constant labels in hash-map order, so match each pair on its own.
+        assert!(text.lines().any(|line| {
+            line.starts_with("laminardb_intake_paused_seconds_total{")
+                && [
+                    r#"reason="fence""#,
+                    r#"instance="test""#,
+                    r#"pipeline="smoke""#,
+                ]
+                .iter()
+                .all(|pair| line.contains(pair))
+        }));
         assert!(text.contains("laminardb_source_queue_reserved_bytes"));
         assert!(text.contains("laminardb_subscription_log_bytes"));
     }
