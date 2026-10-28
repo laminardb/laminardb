@@ -2108,6 +2108,8 @@ fn session_frame_rejects_mismatched_interval_rosters() {
     let (vnode, checkpoint) = only_populated_vnode(checkpoint_all(&mut state));
     assert_eq!(checkpoint.group_session_ends, [2]);
     assert_eq!(checkpoint.session_starts, [1000, 9000]);
+    assert_eq!(checkpoint.session_starts.capacity(), 2);
+    assert_eq!(checkpoint.session_ends.capacity(), 2);
     assert!(checkpoint.window_starts.is_empty());
 
     for (edit, expected) in [

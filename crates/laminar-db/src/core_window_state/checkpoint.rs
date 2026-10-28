@@ -125,8 +125,11 @@ impl CoreWindowVnodeCheckpointCapture {
         let session_count = sessions().count();
         budget.retain_roster::<i64>(session_count, "session start roster")?;
         budget.retain_roster::<i64>(session_count, "session end roster")?;
-        let session_starts = sessions().map(|session| session.start).collect();
-        let session_ends = sessions().map(|session| session.end).collect();
+        // A flattened iterator gives `collect` no exact size; the rosters stay at the charged size.
+        let mut session_starts = Vec::with_capacity(session_count);
+        session_starts.extend(sessions().map(|session| session.start));
+        let mut session_ends = Vec::with_capacity(session_count);
+        session_ends.extend(sessions().map(|session| session.end));
 
         let window_groups = || self.windows.iter().flat_map(|window| window.groups.iter());
         let keys_ipc = encode_group_keys(
