@@ -44,6 +44,84 @@
       "crate": "webpki-roots",
       "version": "0.26.11",
       "reason": "Scanner match on a compatibility shim, not accepted residual risk: webpki-roots 0.26.11 bundles no certificates and re-exports TLS_SERVER_ROOTS from webpki-roots 1.x, locked at the patched 1.0.10. Only async-nats reaches it, through tokio-websockets 0.10, which every async-nats release up to 0.50 still requires."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0391",
+      "crate": "zstd",
+      "version": "0.13.3",
+      "reason": "Not reached: needs a context reused across streams through the with_context constructors; workspace code calls only zstd::bulk and upstream callers create a context per stream. Fixed only in zstd 0.14.3; DataFusion 55.2, iceberg 0.10.1, chitchat 0.13 and apache-avro 0.22 still require zstd ^0.13."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0395",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: CParameter::StableInBuffer requires the zstd-safe experimental feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0396",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: Seekable requires the zstd-safe seekable feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0397",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Accepted residual risk: async-compression (compression-codecs 0.4.38, through DataFusion compressed-file reads and writes) calls OutBuffer::around_pos with a position from its own buffer bookkeeping, not from input. Fixed only in zstd-safe 8.2.0; DataFusion 55.2, iceberg 0.10.1, chitchat 0.13 and apache-avro 0.22 still require zstd ^0.13."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0398",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: Seekable requires the zstd-safe seekable feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0399",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: init_using_cdict and init_using_ddict require the zstd-safe experimental feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0400",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: requires a zstd dictionary on a context with an open stream; workspace code uses no dictionaries and no upstream caller in the graph passes one."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0401",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: train_from_buffer is compiled through the default zdict_builder feature but nothing in the graph trains dictionaries."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0402",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: CCtx::try_clone requires the zstd-safe experimental feature and a multithreaded context requires zstdmt; no crate in the graph enables either."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0403",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Accepted residual risk: the default legacy feature is on, so a failed streaming decompression of a legacy frame from untrusted input (compressed files read through DataFusion, Iceberg and Avro data) can expose uninitialized memory in the decoder's output buffer. Fixed only in zstd-safe 8.2.0; DataFusion 55.2, iceberg 0.10.1, chitchat 0.13 and apache-avro 0.22 still require zstd ^0.13."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0404",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not compiled: DCtx::try_clone requires the zstd-safe experimental feature, which no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0405",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: needs an InBuffer position past its slice; callers in the graph build InBuffer::around at position zero and only zstd advances it."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0406",
+      "crate": "zstd-safe",
+      "version": "7.3.0",
+      "reason": "Not reached: requires a multithreaded context, which needs the zstdmt feature that no crate in the graph enables."
     }
   ],
   "packages": [
@@ -92,6 +170,18 @@
       "version": "1.0.10",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
+    },
+    {
+      "name": "zstd",
+      "version": "0.13.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
+    },
+    {
+      "name": "zstd-safe",
+      "version": "7.3.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "64d80649ab6db9d9f6f9c80a40becd948eda4714a0a5ac8c4d157a32231c7882"
     }
   ],
   "publication": {

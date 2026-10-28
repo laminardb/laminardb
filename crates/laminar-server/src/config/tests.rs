@@ -216,7 +216,6 @@ fn test_parse_minimal_config() {
     let config: ServerConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.server.mode, ServerMode::Single);
     assert_eq!(config.server.bind, "127.0.0.1:8080");
-    assert!(config.server.incremental_emit);
     assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
     assert!(config.sources.is_empty());
     assert!(config.pipelines.is_empty());
@@ -771,6 +770,62 @@ seeds = ["x:1"]
         }
         _ => panic!("expected ValidationErrors"),
     }
+}
+
+#[test]
+fn recent_read_checkpoints_need_a_shorter_interval() {
+    let errors = |checkpoint: &str| {
+        let config: ServerConfig =
+            toml::from_str(&format!("[checkpoint]\ninterval = \"10s\"\n{checkpoint}")).unwrap();
+        match validate_config(&config) {
+            Ok(_) => Vec::new(),
+            Err(ConfigError::ValidationErrors { errors }) => errors,
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let config: ServerConfig =
+        toml::from_str("[checkpoint]\nrecent_read_interval = \"1s\"\n").unwrap();
+    assert_eq!(
+        config.checkpoint.recent_read_interval,
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        errors("recent_read_interval = \"1s\""),
+        Vec::<String>::new()
+    );
+    for interval in ["0s", "10s", "1m"] {
+        let errors = errors(&format!("recent_read_interval = \"{interval}\""));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("recent_read_interval must be > 0 and shorter")),
+            "{interval}: {errors:?}"
+        );
+    }
+
+    let toml = r#"
+node_id = "n1"
+
+[server]
+mode = "cluster"
+
+[checkpoint]
+recent_read_interval = "50ms"
+
+[discovery]
+strategy = "static"
+seeds = ["x:1"]
+"#;
+    let config: ServerConfig = toml::from_str(toml).unwrap();
+    let Err(ConfigError::ValidationErrors { errors }) = validate_config(&config) else {
+        panic!("a 50ms recent-read interval must be refused in a cluster");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("checkpoint.recent_read_interval = 50ms is too tight")),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -1577,16 +1632,18 @@ interval = "500ms"
 }
 
 #[test]
-fn incremental_emit_is_server_execution_policy() {
-    let config: ServerConfig = toml::from_str(
+fn removed_incremental_emit_setting_is_rejected() {
+    let error = toml::from_str::<ServerConfig>(
         r#"
 [server]
 incremental_emit = false
 "#,
     )
-    .unwrap();
+    .unwrap_err();
 
-    assert!(!config.server.incremental_emit);
+    assert!(error
+        .to_string()
+        .contains("unknown field `incremental_emit`"));
 }
 
 #[test]
@@ -1916,13 +1973,19 @@ fn materialized_view_memory_limits_parse_and_validate() {
             .to_string()
             .contains("materialized_view"));
     }
+    assert_eq!(
+        default.server.materialized_view_read_cache_bytes,
+        laminar_db::DEFAULT_MATERIALIZED_VIEW_READ_CACHE_BYTES
+    );
     let configured: ServerConfig = toml::from_str(
-        "[server]\nmaterialized_view_max_rows = 42\nmaterialized_view_max_bytes = 8192",
+        "[server]\nmaterialized_view_max_rows = 42\nmaterialized_view_max_bytes = 8192\n\
+         materialized_view_read_cache_bytes = 0",
     )
     .unwrap();
     validate_config(&configured).unwrap();
     assert_eq!(configured.server.materialized_view_max_rows, 42);
     assert_eq!(configured.server.materialized_view_max_bytes, 8192);
+    assert_eq!(configured.server.materialized_view_read_cache_bytes, 0);
 }
 
 #[tokio::test]
@@ -1936,7 +1999,7 @@ async fn materialized_view_memory_limits_reach_server_database() {
         .await
         .unwrap();
     db.execute("CREATE SOURCE generated (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, value VARCHAR NOT NULL) FROM GENERATOR ('rows.per.second' = '1000', 'max.rows' = '1')").await.unwrap();
-    db.execute("CREATE MATERIALIZED VIEW stored AS SELECT seq FROM generated")
+    db.execute("CREATE MATERIALIZED VIEW stored AS SELECT seq FROM generated WITH (retention = '1000 rows')")
         .await
         .unwrap();
     db.start().await.unwrap();

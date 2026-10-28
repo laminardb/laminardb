@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use laminar_core::checkpoint::{
-    AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, PipelineIdentity,
-    StateFrameKey,
+    AdoptedViewLog, AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant,
+    PipelineIdentity, StateFrameKey,
 };
 use laminar_core::state::NodeId;
 
@@ -89,6 +89,8 @@ pub(crate) struct PendingVnodeTransition {
     revoked_vnodes: Box<[u32]>,
     acquired_vnodes: Box<[u32]>,
     state_frames: Box<[RecoveredStateFrame]>,
+    /// Append-view logs this process adopts from participants the target lacks.
+    adopted_view_logs: Box<[AdoptedViewLog]>,
     requires_predecessor_binding: bool,
 }
 
@@ -101,6 +103,7 @@ impl PendingVnodeTransition {
         participant: CheckpointParticipant,
         pipeline_identity: PipelineIdentity,
         state_frames: Vec<RecoveredStateFrame>,
+        adopted_view_logs: Vec<AdoptedViewLog>,
         final_owner_exit: Option<AuditedCommittedDrainTransition>,
     ) -> Result<Self, DbError> {
         Self::validate_fence_owners("predecessor", &predecessor, predecessor_owners)?;
@@ -164,6 +167,7 @@ impl PendingVnodeTransition {
             revoked_vnodes: revoked_vnodes.into_boxed_slice(),
             acquired_vnodes: acquired.into_boxed_slice(),
             state_frames: state_frames.into_boxed_slice(),
+            adopted_view_logs: adopted_view_logs.into_boxed_slice(),
             requires_predecessor_binding,
         })
     }
@@ -234,6 +238,11 @@ impl PendingVnodeTransition {
     #[must_use]
     pub(crate) fn state_frames(&self) -> &[RecoveredStateFrame] {
         &self.state_frames
+    }
+
+    #[must_use]
+    pub(crate) fn adopted_view_logs(&self) -> &[AdoptedViewLog] {
+        &self.adopted_view_logs
     }
 
     #[must_use]
@@ -353,6 +362,7 @@ mod tests {
             local,
             PipelineIdentity::empty(),
             Vec::new(),
+            Vec::new(),
             None,
         )
         .unwrap();
@@ -377,6 +387,7 @@ mod tests {
             local,
             PipelineIdentity::empty(),
             vec![frame],
+            Vec::new(),
             None,
         )
         .unwrap();
@@ -396,6 +407,7 @@ mod tests {
             &[NodeId(1), NodeId(3)],
             local,
             PipelineIdentity::empty(),
+            Vec::new(),
             Vec::new(),
             None,
         )
@@ -419,6 +431,7 @@ mod tests {
             &[NodeId(2)],
             local,
             PipelineIdentity::empty(),
+            Vec::new(),
             Vec::new(),
             None,
         )
@@ -451,6 +464,7 @@ mod tests {
             &[NodeId(2)],
             local,
             PipelineIdentity::empty(),
+            Vec::new(),
             Vec::new(),
             Some(authority),
         )

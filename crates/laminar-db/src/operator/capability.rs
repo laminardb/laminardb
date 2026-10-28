@@ -39,8 +39,19 @@ pub(crate) enum ManagedStateContract {
     TemporalJoinV1,
     /// Process-function state and event-time timers, partitioned by canonical key.
     ProcessFunctionV1,
+    /// Materialized-view result slices, one sorted frame per vnode.
+    ViewResultV1,
     #[cfg(test)]
     TestVnodeStateV1,
+}
+
+#[cfg(feature = "cluster")]
+impl ManagedStateContract {
+    /// Whether the operator checkpoints a whole frame of channel and frontier state beside its
+    /// vnode frames. A view's result node keeps only its vnode slices.
+    pub(crate) const fn has_whole_frame(self) -> bool {
+        !matches!(self, Self::ViewResultV1)
+    }
 }
 
 /// Current relationship between this inventory entry and cluster DDL admission.
@@ -94,6 +105,7 @@ pub(crate) enum OperatorImplementation {
     TemporalJoin,
     WindowFrame,
     ProcessFunction,
+    ViewResult,
     #[cfg(test)]
     TestProbe,
 }
@@ -224,6 +236,7 @@ impl OperatorCapability {
                 State::LocalOnly,
                 "SQL execution shape has not been classified",
             ),
+            Implementation::ViewResult => Self::ddl_guarded(implementation, State::VnodeKeyed),
             #[cfg(test)]
             Implementation::TestProbe => Self::internal(implementation, State::LocalOnly),
         }
@@ -300,6 +313,13 @@ impl OperatorCapability {
             OperatorStateClass::VnodeKeyed,
             "windowed keyed state has no qualified vnode-scoped timer, watermark eviction, output, and checkpoint/rebalance lifecycle",
         )
+    }
+
+    /// A materialized view's result slices, placed like the view key. `CREATE` admits only the
+    /// placements a cluster keeps on the producing node.
+    pub(crate) const fn view_result(state_class: OperatorStateClass) -> Self {
+        Self::ddl_guarded(OperatorImplementation::ViewResult, state_class)
+            .with_managed_state(ManagedStateContract::ViewResultV1)
     }
 
     /// Fail-closed descriptor for SQL whose retained-state shape is ambiguous.

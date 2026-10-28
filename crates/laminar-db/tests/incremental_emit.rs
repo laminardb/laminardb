@@ -1,13 +1,14 @@
 #![allow(clippy::disallowed_types)]
-//! Incremental running-state aggregate integration tests.
+//! Changelog materialized-view integration tests.
 //!
-//! Validates that a terminal non-windowed `GROUP BY` MV under `incremental_emit`:
+//! Validates that a non-windowed `GROUP BY` MV, which always emits its changelog:
 //! 1. serves `SELECT * FROM mv` snapshots equal to a full recompute (the upsert store is
 //!    maintained from the operator's dirty-only changelog), and
 //! 2. survives checkpoint → restart with a correct snapshot, and
 //! 3. feeds downstream consumers of its changelog — chained agg/projection MVs, capability-aware
-//!    sinks (upsert/changelog-capable), and SUBSCRIBE (plain consolidated snapshots) — while still
-//!    rejecting shapes it can't net (e.g. an arbitrary join, a non-capable sink).
+//!    sinks (upsert/changelog-capable), and SUBSCRIBE (its rows, then weighted changes) — while still
+//!    rejecting shapes it can't net (e.g. an arbitrary join, a non-capable sink), and
+//! 4. serves `SELECT` from the latest cycle, which a restart can roll back.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,10 +17,9 @@ use arrow::array::{Array, Int64Array, RecordBatch};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{ExecuteResult, LaminarConfig, LaminarDB};
 
-fn config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
+fn config(dir: &std::path::Path) -> LaminarConfig {
     LaminarConfig {
         storage_dir: Some(dir.to_path_buf()),
-        incremental_emit: incremental,
         checkpoint: Some(StreamCheckpointConfig {
             interval_ms: None, // manual checkpoints only
             ..StreamCheckpointConfig::default()
@@ -28,8 +28,8 @@ fn config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
     }
 }
 
-fn non_recoverable_config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
-    let mut config = config(dir, incremental);
+fn non_recoverable_config(dir: &std::path::Path) -> LaminarConfig {
+    let mut config = config(dir);
     config.checkpoint = None;
     config
 }
@@ -48,19 +48,14 @@ async fn read_mv(db: &LaminarDB, mv: &str) -> Vec<(i64, i64, i64)> {
     let ExecuteResult::Query(mut q) = result else {
         panic!("expected Query result");
     };
-    let mut sub = q.subscribe_raw().unwrap();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(30), sub.recv_async())
-        .await
-        .expect("materialized-view query did not produce its snapshot within 30 seconds")
-        .expect("materialized-view query disconnected before producing its snapshot");
-    let mut rows = Vec::new();
-    rows.extend(rows_of(&first));
-    for _ in 0..1024 {
-        match sub.poll() {
-            Some(batch) => rows.extend(rows_of(&batch)),
-            None => break,
-        }
-    }
+    let batches = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        q.subscribe_raw().unwrap().read_all(),
+    )
+    .await
+    .expect("materialized-view query did not produce its snapshot within 30 seconds")
+    .unwrap();
+    let mut rows: Vec<_> = batches.iter().flat_map(rows_of).collect();
     rows.sort_unstable();
     rows
 }
@@ -71,18 +66,16 @@ async fn read_query(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<i64>> {
     let ExecuteResult::Query(mut q) = result else {
         panic!("expected Query result");
     };
-    let mut sub = q.subscribe_raw().unwrap();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(30), sub.recv_async())
-        .await
-        .expect("query did not produce its snapshot within 30 seconds")
-        .expect("query disconnected before producing its snapshot");
+    let batches = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        q.subscribe_raw().unwrap().read_all(),
+    )
+    .await
+    .expect("query did not produce its snapshot within 30 seconds")
+    .unwrap();
     let mut rows = Vec::new();
-    append_i64_rows(&first, ncols, &mut rows);
-    for _ in 0..4096 {
-        match sub.poll() {
-            Some(batch) => append_i64_rows(&batch, ncols, &mut rows),
-            None => break,
-        }
+    for batch in &batches {
+        append_i64_rows(batch, ncols, &mut rows);
     }
     rows.sort();
     rows
@@ -123,7 +116,7 @@ const MV: &str = "CREATE MATERIALIZED VIEW agg AS \
 #[tokio::test]
 async fn incremental_emit_snapshot_matches_full_recompute() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.start().await.unwrap();
@@ -161,7 +154,7 @@ async fn incremental_emit_survives_checkpoint_restart() {
 
     let expected;
     {
-        let db = LaminarDB::open_with_config(config(&storage, true)).unwrap();
+        let db = LaminarDB::open_with_config(config(&storage)).unwrap();
         db.execute(SRC).await.unwrap();
         db.execute(MV).await.unwrap();
         db.start().await.unwrap();
@@ -185,7 +178,7 @@ async fn incremental_emit_survives_checkpoint_restart() {
 
     // Reopen from checkpoint — the upsert snapshot recovers from the manifest.
     {
-        let db = LaminarDB::open_with_config(config(&storage, true)).unwrap();
+        let db = LaminarDB::open_with_config(config(&storage)).unwrap();
         db.execute(SRC).await.unwrap();
         db.execute(MV).await.unwrap();
         db.start().await.unwrap();
@@ -200,12 +193,44 @@ async fn incremental_emit_survives_checkpoint_restart() {
     }
 }
 
+/// A `SELECT` reads the latest completed cycle, not a committed checkpoint. A restart restores
+/// the committed cut, so a row a reader already saw can disappear; an in-memory source cannot
+/// replay it.
+#[tokio::test]
+async fn view_read_can_observe_state_that_a_restart_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().to_path_buf();
+    {
+        let db = LaminarDB::open_with_config(config(&storage)).unwrap();
+        db.execute(SRC).await.unwrap();
+        db.execute(MV).await.unwrap();
+        db.start().await.unwrap();
+        let source = db.source_untyped("events").unwrap();
+
+        source.push_arrow(batch(&[1], &[10])).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(db.checkpoint().await.unwrap().success);
+        source.push_arrow(batch(&[2], &[20])).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
+        db.shutdown().await.unwrap();
+    }
+
+    let db = LaminarDB::open_with_config(config(&storage)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.start().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1)]);
+    db.shutdown().await.unwrap();
+}
+
 /// A counted multiset MV must preserve duplicate rows at the durable cut. After restart, changing
 /// one upstream group retracts exactly one copy of the duplicate rather than both copies.
 #[tokio::test]
 async fn counted_multiset_survives_coordinator_checkpoint_restart_and_retraction() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.execute("CREATE MATERIALIZED VIEW totals AS SELECT total FROM agg")
@@ -256,7 +281,7 @@ async fn counted_multiset_survives_coordinator_checkpoint_restart_and_retraction
 #[tokio::test]
 async fn chained_dim_enrich_join_is_correct_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     // Static dimension table (keyed reference table).
@@ -294,7 +319,7 @@ async fn chained_dim_enrich_join_is_correct_under_updates() {
 #[tokio::test]
 async fn state_backed_left_dim_enrich_preserves_unmatched_rows_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.execute("CREATE TABLE dim (k BIGINT PRIMARY KEY, label BIGINT)")
@@ -333,7 +358,7 @@ async fn state_backed_left_dim_enrich_preserves_unmatched_rows_under_updates() {
 #[tokio::test]
 async fn chained_aggregate_over_incremental_nets_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     // Global roll-up and a keyed roll-up, both over the incremental MV's changelog.
@@ -370,7 +395,7 @@ async fn chained_aggregate_over_incremental_nets_under_updates() {
 #[tokio::test]
 async fn chained_projection_over_incremental_is_correct_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.execute("CREATE MATERIALIZED VIEW proj AS SELECT k, total FROM agg")
@@ -406,7 +431,7 @@ async fn chained_projection_over_incremental_is_correct_under_updates() {
 #[tokio::test]
 async fn terminality_guard_allows_agg_and_projection_rejects_join() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
 
@@ -445,7 +470,7 @@ async fn sink_from_incremental_mv_rejects_noncapable_sink_at_ddl() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     let error = db
@@ -465,29 +490,6 @@ async fn sink_from_incremental_mv_rejects_noncapable_sink_at_ddl() {
     db.shutdown().await.unwrap();
 }
 
-/// The capability check fires ONLY for incremental MVs: a full-emit (non-incremental) aggregate
-/// still feeds a plain append-only files sink, so the check does not over-reject.
-#[cfg(feature = "files")]
-#[tokio::test]
-async fn sink_from_nonincremental_mv_allows_noncapable_sink() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = dir.path().join("out");
-    std::fs::create_dir_all(&out).unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), false)).unwrap();
-    db.execute(SRC).await.unwrap();
-    db.execute(MV).await.unwrap();
-    db.execute(&format!(
-        "CREATE SINK f FROM agg INTO FILES (path = '{}') FORMAT JSON",
-        out.display().to_string().replace('\\', "/")
-    ))
-    .await
-    .expect("CREATE SINK");
-    db.start()
-        .await
-        .expect("a full-emit aggregate feeding a plain sink must start fine");
-    db.shutdown().await.ok();
-}
-
 /// Startup follows retractions through a stream and requires full changelog sink support.
 #[cfg(feature = "files")]
 #[tokio::test]
@@ -495,7 +497,7 @@ async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("out");
     std::fs::create_dir_all(&out).unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.execute("CREATE STREAM s AS SELECT k, total FROM agg")
@@ -523,7 +525,7 @@ async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
 #[tokio::test]
 async fn changelog_joins_are_rejected_at_ddl() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
         .await
         .unwrap();
@@ -550,13 +552,14 @@ async fn changelog_joins_are_rejected_at_ddl() {
     }
 }
 
-/// SUBSCRIBE to an incremental MV delivers plain consolidated snapshots for updates emitted after
-/// a Tail subscriber attaches, never the raw `__weight` changelog.
+/// SUBSCRIBE to an incremental MV delivers the view's rows at attach, then each cycle's change:
+/// an update retracts the key's old row and inserts its new one, and untouched keys are not
+/// repeated.
 #[tokio::test]
-async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
+async fn subscribe_to_incremental_mv_delivers_changes() {
     use laminar_db::subscription::{PortalFrame, SubscribeStart};
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.start().await.unwrap();
@@ -565,54 +568,177 @@ async fn subscribe_to_incremental_mv_delivers_plain_snapshot() {
     let mut portal = db
         .open_subscription("agg", None, SubscribeStart::Tail)
         .await
-        .expect("SUBSCRIBE to an incremental MV is now allowed");
-    // The wire schema is the plain MV schema — no `__weight`.
-    assert!(
-        portal.schema().index_of("__weight").is_err(),
-        "SUBSCRIBE wire schema must be plain rows"
-    );
+        .unwrap();
+    assert!(portal.schema().index_of("__weight").is_ok());
+
+    let mut next_change = async || loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), portal.next_frame())
+            .await
+            .expect("a frame within the deadline")
+            .expect("a portal frame");
+        match frame {
+            PortalFrame::Batch { batch, .. } => {
+                let weights = batch
+                    .column_by_name("__weight")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone();
+                let mut rows: Vec<_> = rows_of(&batch)
+                    .into_iter()
+                    .zip(weights.values().iter().copied())
+                    .collect();
+                rows.sort_unstable();
+                return rows;
+            }
+            PortalFrame::Barrier { .. } => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    };
 
     source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), portal.next_frame())
-        .await
-        .expect("a frame within the deadline")
-        .expect("a portal frame");
-    let PortalFrame::Batch { batch: b, .. } = frame else {
-        panic!("expected a Batch frame, got {frame:?}");
-    };
+    let mut inserted = next_change().await;
+    inserted.sort_unstable();
+    assert_eq!(inserted, vec![((1, 10, 1), 1), ((2, 20, 1), 1)]);
+
+    source.push_arrow(batch(&[1], &[5])).unwrap();
+    assert_eq!(next_change().await, vec![((1, 10, 1), -1), ((1, 15, 2), 1)]);
+    portal.close();
+    db.shutdown().await.unwrap();
+}
+
+/// Stop the pipeline after a checkpoint, start it again from the committed cut, and return
+/// `sql`'s rows.
+async fn restart_and_read(db: &Arc<LaminarDB>, sql: &str, ncols: usize) -> Vec<Vec<i64>> {
     assert!(
-        b.schema().index_of("__weight").is_err(),
-        "snapshot batch must be plain rows (no __weight)"
+        db.checkpoint().await.unwrap().success,
+        "checkpoint must succeed"
     );
+    db.stop_pipeline().await.unwrap();
+    db.start().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    read_query(db, sql, ncols).await
+}
+
+/// A global aggregate view emits its changelog, keeps one row on vnode 0, and restores it from
+/// the committed vnode frame.
+#[tokio::test]
+async fn global_view_survives_checkpoint_restart_and_keeps_updating() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW overall AS \
+         SELECT SUM(v) AS total, COUNT(*) AS n, MAX(v) AS peak FROM events",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    source.push_arrow(batch(&[3], &[5])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let sql = "SELECT total, n, peak FROM overall";
+    assert_eq!(read_query(&db, sql, 3).await, vec![vec![35, 3, 20]]);
+
+    assert_eq!(restart_and_read(&db, sql, 3).await, vec![vec![35, 3, 20]]);
+    db.source_untyped("events")
+        .unwrap()
+        .push_arrow(batch(&[1], &[1]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(read_query(&db, sql, 3).await, vec![vec![36, 4, 20]]);
+    db.shutdown().await.unwrap();
+}
+
+/// A filter over a keyed view keeps the key, so its rows are placed by that key. They survive a
+/// restart, and an update that leaves the filter retracts the row.
+#[tokio::test]
+async fn keyed_filter_view_survives_restart_and_retracts_rows_leaving_the_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path())).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.execute("CREATE MATERIALIZED VIEW big AS SELECT k, total FROM agg WHERE total >= 10")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    db.source_untyped("events")
+        .unwrap()
+        .push_arrow(batch(&[1, 2, 3], &[10, 5, 30]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let sql = "SELECT k, total FROM big";
     assert_eq!(
-        rows_of(&b),
-        vec![(1, 10, 1), (2, 20, 1)],
-        "post-attach snapshot"
+        read_query(&db, sql, 2).await,
+        vec![vec![1, 10], vec![3, 30]]
     );
 
-    // A change arrives as a fresh consolidated snapshot (k1: 10 -> 15).
-    source.push_arrow(batch(&[1], &[5])).unwrap();
-    let mut saw_update = false;
-    for _ in 0..20 {
-        match tokio::time::timeout(std::time::Duration::from_secs(3), portal.next_frame()).await {
-            Ok(Some(PortalFrame::Batch { batch: b, .. })) => {
-                if rows_of(&b).iter().any(|&(k, t, _)| k == 1 && t == 15) {
-                    saw_update = true;
-                    break;
-                }
-            }
-            Ok(Some(PortalFrame::Barrier { .. })) => {}
-            Ok(Some(PortalFrame::Lagged(n))) => panic!("subscriber lagged by {n} messages"),
-            Ok(Some(PortalFrame::Error { message })) => {
-                panic!("subscription failed: {message}")
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    assert!(
-        saw_update,
-        "subscriber must receive the updated snapshot k1=15"
+    assert_eq!(
+        restart_and_read(&db, sql, 2).await,
+        vec![vec![1, 10], vec![3, 30]]
     );
-    portal.close();
+    db.source_untyped("events")
+        .unwrap()
+        .push_arrow(batch(&[2, 3], &[5, -25]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        read_query(&db, sql, 2).await,
+        vec![vec![1, 10], vec![2, 10]]
+    );
+    db.shutdown().await.unwrap();
+}
+
+/// A running pipeline without checkpoints drops a changelog view with its result node and admits
+/// a new view under the same name, which starts empty.
+#[tokio::test]
+async fn a_dropped_changelog_view_can_be_created_again_while_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path())).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.start().await.unwrap();
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
+
+    db.execute("DROP MATERIALIZED VIEW agg").await.unwrap();
+    db.execute(MV).await.unwrap();
+    source.push_arrow(batch(&[3], &[30])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(read_mv(&db, "agg").await, vec![(3, 30, 1)]);
+    db.shutdown().await.unwrap();
+}
+
+/// View slices take the configured vnode count, and restore checks frames against it.
+#[tokio::test]
+async fn views_restore_under_a_non_default_vnode_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::builder()
+        .storage_dir(dir.path())
+        .checkpoint(StreamCheckpointConfig {
+            interval_ms: None,
+            ..StreamCheckpointConfig::default()
+        })
+        .key_groups(laminar_core::state::KeyGroupCount::try_from(16u16).unwrap())
+        .build()
+        .await
+        .unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.start().await.unwrap();
+    db.source_untyped("events")
+        .unwrap()
+        .push_arrow(batch(&[1, 2, 3, 1], &[10, 20, 30, 5]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let sql = "SELECT k, total, cnt FROM agg";
+    let expected = vec![vec![1, 15, 2], vec![2, 20, 1], vec![3, 30, 1]];
+    assert_eq!(read_query(&db, sql, 3).await, expected);
+    assert_eq!(restart_and_read(&db, sql, 3).await, expected);
     db.shutdown().await.unwrap();
 }

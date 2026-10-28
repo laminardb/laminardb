@@ -2,24 +2,23 @@ use super::*;
 
 #[tokio::test]
 async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metrics() {
-    use crate::mv_store::{MvStorageMode, MvStore};
+    use crate::mv_store::{MvStorageMode, MvStore, ViewKey};
     use crate::pipeline::PipelineCallback;
     use crate::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 
     for mode in [
-        MvStorageMode::Aggregate,
-        MvStorageMode::append_default(),
-        MvStorageMode::Upsert { key_cols: vec![0] },
-        MvStorageMode::Multiset,
+        MvStorageMode::append_rows(1_000),
+        MvStorageMode::changelog(ViewKey::Keyed(vec![0])),
+        MvStorageMode::changelog(ViewKey::MultisetByRow),
     ] {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let input = |ids: Vec<i64>| {
             let rows = ids.len();
             let mut fields = schema.fields().to_vec();
             let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(Int64Array::from(ids))];
-            if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset) {
+            if matches!(mode, MvStorageMode::Changelog { .. }) {
                 fields.push(Arc::new(Field::new("__weight", DataType::Int64, false)));
                 columns.push(Arc::new(Int64Array::from(vec![1; rows])));
             }
@@ -59,7 +58,7 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
             matches!(error, crate::pipeline::CycleError::Recovery(ref reason) if reason.contains("quota exceeded"))
         );
         assert!(callback.checkpoint_fault.lock().is_some());
-        assert_eq!(callback.prom.mv_updates.get(), 0);
+        assert_eq!(callback.prom.views.updates.get(), 0);
         assert_eq!(callback.mv_store.read().total_bytes(), before_bytes);
         for name in ["a", "b"] {
             let snapshot = callback
@@ -84,19 +83,23 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
             .all(|portal| portal.try_next_frame().is_none()));
         *results.get_mut(&second).unwrap() = vec![input(vec![2])];
         callback.update_mv_stores(&results).unwrap();
-        assert_eq!(callback.prom.mv_updates.get(), 2);
+        assert_eq!(callback.prom.views.updates.get(), 2);
         for portal in &mut portals {
             let Some(PortalFrame::Batch { batch, .. }) = portal.try_next_frame() else {
-                panic!("successful cycle must publish plain rows")
+                panic!("successful cycle must publish its change")
             };
-            assert_eq!(batch.num_columns(), 1);
-            let expected = if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset)
-            {
+            let weighted = matches!(mode, MvStorageMode::Changelog { .. });
+            assert_eq!(batch.num_columns(), 1 + usize::from(weighted));
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
                 2
-            } else {
-                1
-            };
-            assert_eq!(batch.num_rows(), expected);
+            );
         }
     }
 }
@@ -4231,7 +4234,10 @@ async fn terminal_operator_capture_populates_halt_without_recovery_fault() {
         .push_test_node("terminal-capture", Box::new(TerminalCaptureFailureOperator));
 
     let error = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .err()
         .expect("terminal operator capture must reject the checkpoint");
 
@@ -4291,7 +4297,10 @@ async fn unchanged_vnode_capture_does_not_arm_the_mutable_capture_guard() {
         .push_test_node("unchanged-vnodes", Box::new(UnchangedVnodeCaptureOperator));
 
     let capture = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .unwrap();
     drop(capture);
 
@@ -4314,9 +4323,10 @@ async fn busy_serialization_gate_rejects_synchronously_before_mutating_operator_
         .await
         .unwrap();
 
-    let error = match callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(10))
-    {
+    let error = match callback.capture_operator_state_until(
+        CheckpointAttempt::new(1, 1),
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    ) {
         Ok(_) => panic!("a busy serialization gate must reject synchronously"),
         Err(error) => error,
     };
@@ -4358,7 +4368,8 @@ async fn busy_serialization_gate_does_not_hold_assignment_writer_until_timeout()
         .unwrap()
         .expect("configured callback must acquire its rotation token");
 
-    let error = match callback.capture_operator_state_until(deadline) {
+    let error = match callback.capture_operator_state_until(CheckpointAttempt::new(1, 1), deadline)
+    {
         Ok(_) => panic!("serialization contention must not wait under the rotation token"),
         Err(error) => error,
     };
@@ -4413,7 +4424,9 @@ async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
         }),
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let capture = callback.capture_operator_state_until(deadline).unwrap();
+    let capture = callback
+        .capture_operator_state_until(CheckpointAttempt::new(1, 1), deadline)
+        .unwrap();
     let serialized = capture
         .serialize_until(
             callback.checkpoint_state_cap_bytes,
@@ -4446,7 +4459,10 @@ async fn destructive_vnode_capture_failure_faults_runtime() {
     );
 
     let error = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .capture_operator_state_until(
+            CheckpointAttempt::new(1, 1),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
         .err()
         .expect("vnode capture failure must reject the checkpoint");
 
@@ -5426,6 +5442,7 @@ async fn cold_empty_successor_rehydrates_the_callback_source_pin() {
         }],
         source_watermarks: BTreeMap::from([("orders".into(), 900)]),
         checkpoint_watermark: Some(900),
+        view_frontiers: Default::default(),
     };
     let predecessor_ref = warm_store
         .create_committed_checkpoint(&predecessor)
@@ -7052,6 +7069,7 @@ async fn gate_committed_checkpoint(
         channel_progress,
         source_watermarks: std::collections::BTreeMap::from([("source".into(), 42)]),
         checkpoint_watermark: Some(42),
+        view_frontiers: Default::default(),
     }
 }
 

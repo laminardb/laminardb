@@ -100,5 +100,41 @@ pub(super) async fn predecessor_admits_drain(
         );
         return Ok(false);
     }
+    view_logs_admit_drain(db, transition, deadline).await?;
     Ok(true)
+}
+
+/// Refuse a rotation whose survivors could not adopt the leavers' append-view logs within their
+/// share of the segment budget, judged from the newest committed cut. Refusing before the
+/// drain avoids a committed drain whose target can never be published.
+async fn view_logs_admit_drain(
+    db: &LaminarDB,
+    transition: &AssignmentDrainTransition,
+    deadline: Instant,
+) -> Result<(), String> {
+    let departs = transition
+        .predecessor
+        .participant_ids()
+        .into_iter()
+        .any(|participant| !transition.target.contains(participant));
+    let views = {
+        let store = db.mv_store.read();
+        (departs && store.has_append_views())
+            .then(|| store.committed_views())
+            .flatten()
+    };
+    let Some(views) = views else {
+        return Ok(());
+    };
+    let manifests = tokio::time::timeout_at(deadline, views.latest_manifests())
+        .await
+        .map_err(|_| "graceful rotation timed out reading the committed view logs".to_owned())?
+        .map_err(|error| error.to_string())?;
+    match manifests {
+        Some(manifests) => {
+            laminar_core::checkpoint::check_view_log_adoption(&manifests, &transition.target)
+                .map_err(|error| format!("graceful rotation refused: {error}"))
+        }
+        None => Ok(()),
+    }
 }

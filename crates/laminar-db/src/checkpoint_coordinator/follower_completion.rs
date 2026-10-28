@@ -79,9 +79,7 @@ impl CheckpointCoordinator {
         let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
             DbError::Checkpoint("follower Commit has no committed checkpoint reference".into())
         })?;
-        let source_watermarks = index
-            .effective_source_watermarks()
-            .map_err(DbError::Checkpoint)?;
+        let frontiers = super::CommittedFrontiers::of(&index)?;
         let participant = index
             .participants
             .iter()
@@ -92,8 +90,14 @@ impl CheckpointCoordinator {
         participant
             .verify_manifest(manifest.as_ref(), &manifest_bytes)
             .map_err(DbError::Checkpoint)?;
+        self.publish_committed_cut(Some(super::committed_reads::CommittedCut::new(
+            index,
+            reference.clone(),
+            [manifest.as_ref()],
+        )));
         self.last_committed_ref = Some(reference.clone());
-        self.last_committed_source_watermarks = Some((reference, source_watermarks));
+        self.last_committed_frontiers = Some((reference, frontiers));
+        self.view_log_predecessor = Some(std::sync::Arc::clone(&manifest));
         self.last_committed_manifest = Some(manifest);
         self.prepared.remove(&attempt);
         Ok(())
@@ -175,7 +179,7 @@ impl CheckpointCoordinator {
         let checkpoint_bytes = if committed {
             self.last_committed_manifest
                 .as_ref()
-                .map(|manifest| manifest.node_data.object_length)
+                .map(|manifest| super::data_object_bytes(manifest))
         } else {
             None
         };

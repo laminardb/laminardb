@@ -148,9 +148,6 @@ pub struct ServerSection {
     /// End-to-end pipeline delivery contract. Connector protocols are derived from this value.
     #[serde(default = "default_delivery")]
     pub delivery: DeliveryGuarantee,
-    /// Query execution policy for keyed running aggregates; independent of checkpoint storage.
-    #[serde(default = "default_incremental_emit")]
-    pub incremental_emit: bool,
     /// Per-DB/node limit for participating `DataFusion` reservations; excludes process RSS.
     /// DB-owned contexts disable disk spilling. Must be greater than zero.
     #[serde(default = "default_datafusion_memory_limit_bytes")]
@@ -170,6 +167,10 @@ pub struct ServerSection {
     /// Retained-memory charge limit per local MV; must be nonzero.
     #[serde(default = "default_materialized_view_max_bytes")]
     pub materialized_view_max_bytes: usize,
+    /// Byte budget of committed view state decoded for reads and cached by digest; zero
+    /// disables the cache.
+    #[serde(default = "default_materialized_view_read_cache_bytes")]
+    pub materialized_view_read_cache_bytes: usize,
     /// Pipeline-wide charged-byte budget for managed operator state (keyed aggregates, windows,
     /// joins). `None` uses 256 MiB; configured budgets must be greater than zero.
     #[serde(default)]
@@ -256,13 +257,13 @@ impl Default for ServerSection {
             key_groups: None,
             bind: default_bind(),
             delivery: default_delivery(),
-            incremental_emit: default_incremental_emit(),
             datafusion_memory_limit_bytes: default_datafusion_memory_limit_bytes(),
             source_queue_max_bytes: default_source_queue_max_bytes(),
             reference_table_max_rows: default_reference_table_max_rows(),
             reference_table_max_bytes: default_reference_table_max_bytes(),
             materialized_view_max_rows: default_materialized_view_max_rows(),
             materialized_view_max_bytes: default_materialized_view_max_bytes(),
+            materialized_view_read_cache_bytes: default_materialized_view_read_cache_bytes(),
             pipeline_max_managed_state_bytes: None,
             pipeline_max_input_buf_batches: None,
             pipeline_max_input_buf_bytes: None,
@@ -296,6 +297,7 @@ impl ServerSection {
             .reference_table_max_bytes(self.reference_table_max_bytes)
             .materialized_view_max_rows(self.materialized_view_max_rows)
             .materialized_view_max_bytes(self.materialized_view_max_bytes)
+            .materialized_view_read_cache_bytes(self.materialized_view_read_cache_bytes)
             .datafusion_memory_limit_bytes(self.datafusion_memory_limit_bytes)
             .source_queue_max_bytes(self.source_queue_max_bytes);
         if let Some(bytes) = self.pipeline_max_managed_state_bytes {
@@ -402,6 +404,10 @@ fn default_materialized_view_max_bytes() -> usize {
     laminar_db::DEFAULT_MATERIALIZED_VIEW_MAX_BYTES
 }
 
+fn default_materialized_view_read_cache_bytes() -> usize {
+    laminar_db::DEFAULT_MATERIALIZED_VIEW_READ_CACHE_BYTES
+}
+
 fn default_reference_table_max_bytes() -> usize {
     laminar_db::DEFAULT_REFERENCE_TABLE_MAX_BYTES
 }
@@ -474,6 +480,10 @@ pub struct CheckpointSection {
     pub url: String,
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
+    /// While a `recent` view read waits for a newer checkpoint, the next one starts this long
+    /// after the previous one ended instead of `interval`. Unset: recent reads wait for `interval`.
+    #[serde(default, with = "humantime_serde")]
+    pub recent_read_interval: Option<Duration>,
     /// One checkpoint-attempt deadline; cluster assignment recovery phases use the same bound.
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
@@ -491,6 +501,7 @@ impl Default for CheckpointSection {
         Self {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
+            recent_read_interval: None,
             timeout: default_checkpoint_timeout(),
             storage: std::collections::HashMap::new(),
             max_node_data_bytes: None,
@@ -504,6 +515,7 @@ impl std::fmt::Debug for CheckpointSection {
         f.debug_struct("CheckpointSection")
             .field("url", &self.url)
             .field("interval", &self.interval)
+            .field("recent_read_interval", &self.recent_read_interval)
             .field("timeout", &self.timeout)
             .field(
                 "storage",
@@ -914,9 +926,6 @@ fn default_checkpoint_url() -> String {
     } else {
         format!("file:///{path_str}")
     }
-}
-fn default_incremental_emit() -> bool {
-    true
 }
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)

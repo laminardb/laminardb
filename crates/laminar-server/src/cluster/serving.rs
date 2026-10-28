@@ -23,6 +23,7 @@ use super::activation::{PostActiveFailure, PostActiveRebalance};
 use super::assignment::wait_for_startup_leader_authority;
 use super::bootstrap::{ConstructedClusterRuntime, LeaderGate};
 use super::discovery::spawn_membership_watcher;
+use super::leases::ProcessLeaseRuntime;
 use super::startup::{AcquiredClusterIdentity, FormedCluster};
 use super::{
     wait_for_cluster_task_exit, wait_for_rebalance_task_exit, ClusterHandle, ClusterStartupError,
@@ -296,6 +297,8 @@ pub(super) struct ServingLaunch {
     pub(super) active: laminar_core::cluster::discovery::NodeInfo,
     pub(super) api_handle: tokio::task::JoinHandle<()>,
     pub(super) app_state: Arc<crate::http::AppState>,
+    /// Started when the serving gate opens, and stopped when it fences.
+    pub(super) pgwire: Option<crate::pgwire::Listener>,
     pub(super) leader_authority_timeout: std::time::Duration,
     pub(super) drain_timeout: std::time::Duration,
 }
@@ -390,6 +393,34 @@ async fn wait_for_coordinated_recovery_release(
     Ok(())
 }
 
+/// Why serving authority must not open, checked in order; `None` once the HTTP gate opened.
+fn serving_gate_failure(
+    api_handle: &tokio::task::JoinHandle<()>,
+    process_lease: &ProcessLeaseRuntime,
+    #[cfg(feature = "process-remote")]
+    workers: &[laminar_db::process_function::remote::LocalPythonWorker],
+    pgwire: &Result<Option<tokio::task::JoinHandle<()>>, server::ServerError>,
+    app_state: &crate::http::AppState,
+) -> Option<String> {
+    #[cfg(feature = "process-remote")]
+    let process_worker_exited = workers.iter().any(|worker| !worker.is_alive());
+    #[cfg(not(feature = "process-remote"))]
+    let process_worker_exited = false;
+    if api_handle.is_finished() {
+        Some("HTTP API server exited before serving authority opened".into())
+    } else if !process_lease.is_live() {
+        Some("stable node identity lease was lost before HTTP serving authority opened".into())
+    } else if process_worker_exited {
+        Some("process worker exited before HTTP serving authority opened".into())
+    } else if let Err(error) = pgwire {
+        Some(format!("PostgreSQL wire listener could not start: {error}"))
+    } else if !app_state.open_startup_gate() {
+        Some("HTTP serving gate could not be opened".into())
+    } else {
+        None
+    }
+}
+
 pub(super) async fn open_cluster_serving(
     config_path: PathBuf,
     mut formed: FormedCluster,
@@ -442,24 +473,30 @@ pub(super) async fn open_cluster_serving(
         active,
         mut api_handle,
         app_state,
+        pgwire,
         leader_authority_timeout: _,
         drain_timeout,
     } = launch;
     let FormedCluster { mut discovery, .. } = formed;
+    let pgwire = match pgwire {
+        Some(listener) => listener.serve(Arc::clone(db)).await.map(Some),
+        None => Ok(None),
+    };
 
     // An idle worker serves control-plane readiness while its data plane remains fenced until the
     // watcher grants ownership.
-    let api_exited_before_serving = api_handle.is_finished();
-    let process_lease_lost_before_serving = !process_lease.is_live();
-    #[cfg(feature = "process-remote")]
-    let process_worker_exited = workers.iter().any(|worker| !worker.is_alive());
-    #[cfg(not(feature = "process-remote"))]
-    let process_worker_exited = false;
-    if api_exited_before_serving
-        || process_lease_lost_before_serving
-        || process_worker_exited
-        || !app_state.open_startup_gate()
-    {
+    let serving_failure = serving_gate_failure(
+        &api_handle,
+        process_lease,
+        #[cfg(feature = "process-remote")]
+        workers,
+        &pgwire,
+        &app_state,
+    );
+    if let Some(reason) = serving_failure {
+        if let Ok(Some(pgwire)) = &pgwire {
+            pgwire.abort();
+        }
         PostActiveFailure::new(
             &mut discovery,
             db,
@@ -480,16 +517,7 @@ pub(super) async fn open_cluster_serving(
             },
         )
         .await;
-        let reason = if api_exited_before_serving {
-            "HTTP API server exited before serving authority opened"
-        } else if process_lease_lost_before_serving {
-            "stable node identity lease was lost before HTTP serving authority opened"
-        } else if process_worker_exited {
-            "process worker exited before HTTP serving authority opened"
-        } else {
-            "HTTP serving gate could not be opened"
-        };
-        return Err(ClusterStartupError::EngineConstruction(reason.into()));
+        return Err(ClusterStartupError::EngineConstruction(reason));
     }
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
     let membership_handle = spawn_membership_watcher(&node_id_str, discovery.membership_watch());
@@ -503,6 +531,7 @@ pub(super) async fn open_cluster_serving(
         discovery,
         serving_gate: gate.serving_gate,
         api_handle,
+        pgwire_handle: pgwire.ok().flatten(),
         watcher_handle,
         membership_handle,
         local_node: active,

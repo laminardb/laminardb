@@ -114,6 +114,7 @@ mod pipeline_lifecycle;
 pub mod process_function;
 /// Deployment profiles.
 pub mod profile;
+mod query_rows;
 /// Dynamic vnode rebalance control plane.
 #[cfg(feature = "cluster")]
 pub mod rebalance;
@@ -181,9 +182,12 @@ pub use config::{
     validate_reference_table_limits, validate_source_queue_max_bytes, BackpressurePolicy,
     LaminarConfig, RestartPolicy, DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES,
     DEFAULT_MATERIALIZED_VIEW_MAX_BYTES, DEFAULT_MATERIALIZED_VIEW_MAX_ROWS,
-    DEFAULT_MAX_MANAGED_STATE_BYTES, DEFAULT_REFERENCE_TABLE_MAX_BYTES,
-    DEFAULT_REFERENCE_TABLE_MAX_ROWS, DEFAULT_SOURCE_QUEUE_MAX_BYTES, MAX_SOURCE_QUEUE_BYTES,
+    DEFAULT_MATERIALIZED_VIEW_READ_CACHE_BYTES, DEFAULT_MAX_MANAGED_STATE_BYTES,
+    DEFAULT_REFERENCE_TABLE_MAX_BYTES, DEFAULT_REFERENCE_TABLE_MAX_ROWS,
+    DEFAULT_SOURCE_QUEUE_MAX_BYTES, MAX_SOURCE_QUEUE_BYTES,
 };
+pub use db::committed_read::CommittedQuery;
+pub use db::read_level::{ReadLevel, ReadResult};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;
@@ -195,7 +199,9 @@ pub use handle::{
 };
 pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
+pub use mv_store::{CommittedRead, CommittedReadError, ReadCut};
 pub use profile::{Profile, ProfileError};
+pub use query_rows::QueryRows;
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 pub use subscription::ClusterSubscriptionError;
 

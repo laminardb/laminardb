@@ -439,6 +439,7 @@ async fn committed_checkpoint_with_predecessor(
         channel_progress: Vec::new(),
         source_watermarks: std::collections::BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     decisions.create_committed_checkpoint(&index).await.unwrap()
 }

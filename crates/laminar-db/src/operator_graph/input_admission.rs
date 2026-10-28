@@ -139,7 +139,7 @@ impl OperatorGraph {
         )
     }
 
-    fn require_port_capacity(
+    pub(super) fn require_port_capacity(
         &self,
         target: usize,
         port: u8,

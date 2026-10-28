@@ -191,6 +191,7 @@ impl LaminarDB {
         // Seed changelog producers and stream schemas up front so consumer admission and
         // stream-fed operators are independent of build order.
         graph.set_changelog_tables(resolved.changelog_carrying.clone());
+        graph.set_view_store(Arc::clone(&self.mv_store));
         #[cfg(feature = "cluster")]
         graph.set_colocated_aggregates(resolved.exchange_plan.colocated_aggregates());
         #[cfg(feature = "cluster")]

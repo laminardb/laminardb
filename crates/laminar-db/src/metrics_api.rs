@@ -189,8 +189,8 @@ impl LaminarDB {
                     m.events_dropped.get(),
                     m.cycles.get(),
                     m.batches.get(),
-                    m.mv_updates.get(),
-                    m.mv_bytes_stored.get() as u64,
+                    m.views.updates.get(),
+                    m.views.bytes_stored.get() as u64,
                 )
             } else {
                 (0, 0, 0, 0, 0, 0, 0)

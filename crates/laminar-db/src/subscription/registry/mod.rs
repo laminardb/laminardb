@@ -136,7 +136,7 @@ pub enum SubscribeStart {
     AfterSequence(u64),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum SubscriptionOpenError {
     ReplayPruned {
         /// Earliest barrier epoch eligible for replay; `0` if none is retained.

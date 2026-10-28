@@ -70,7 +70,7 @@ pub(super) fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
     }
     if let Some(owner) = crate::sql_analysis::stage_owner(name) {
         return Err(DbError::InvalidOperation(format!(
-            "'{name}' is reserved for an internal stage of stream '{owner}'"
+            "'{name}' is reserved for an internal stage of '{owner}'"
         )));
     }
     Ok(())
@@ -86,7 +86,7 @@ pub(super) fn reject_stage_reads(query_sql: &str) -> Result<(), DbError> {
 pub(super) fn reject_stage_read(input: &str) -> Result<(), DbError> {
     match crate::sql_analysis::stage_owner(input) {
         Some(owner) => Err(DbError::InvalidOperation(format!(
-            "'{input}' is an internal stage of stream '{owner}'; read '{owner}' instead"
+            "'{input}' is an internal stage of '{owner}'; read '{owner}' instead"
         ))),
         None => Ok(()),
     }

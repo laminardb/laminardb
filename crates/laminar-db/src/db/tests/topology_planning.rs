@@ -540,6 +540,16 @@ async fn preparation_fixture_with_generation(
     Fixture,
     laminar_core::cluster::control::AssignmentSnapshotStore,
 ) {
+    preparation_fixture_with_bootstrap(stream_generation, Vec::new()).await
+}
+
+async fn preparation_fixture_with_bootstrap(
+    stream_generation: u64,
+    extra: Vec<String>,
+) -> (
+    Fixture,
+    laminar_core::cluster::control::AssignmentSnapshotStore,
+) {
     use laminar_core::cluster::control::{
         AssignmentSnapshot, AssignmentSnapshotStore, ClusterController, ClusterKv, InMemoryKv,
         LeaseDeadline, ProcessLeaseAuthority, ProcessLeaseOutcome,
@@ -619,7 +629,7 @@ async fn preparation_fixture_with_generation(
         .unwrap();
     authority.controller = controller;
     authority.lease_tx = lease_tx;
-    let mut fixture = Fixture::with_authority_and_generation(authority, stream_generation).await;
+    let mut fixture = Fixture::with_bootstrap(authority, stream_generation, extra).await;
     fixture.process_lease = Some(process);
     fixture.adopt().await;
     (fixture, AssignmentSnapshotStore::new(objects))
@@ -938,6 +948,7 @@ async fn assert_root_staging(add_source: bool) {
         channel_progress: Vec::new(),
         source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
+        view_frontiers: Default::default(),
     };
     let reference = CheckpointDecisionStore::new(fixture.authority.checkpoint_store.clone())
         .create_committed_checkpoint(&index)
@@ -1303,7 +1314,9 @@ async fn topology_validation_rejects_implicit_reset_unsafe_removal_and_unsupport
         "DROP STREAM totals",
         "CREATE STREAM new_state AS SELECT id, ROW_NUMBER() OVER (ORDER BY ts) AS n FROM trades",
         "CREATE STREAM unseeded_retractions AS SELECT id, SUM(total) AS total FROM totals GROUP BY id",
-        "CREATE MATERIALIZED VIEW new_mv AS SELECT * FROM trades",
+        "CREATE OR REPLACE MATERIALIZED VIEW new_mv AS SELECT * FROM trades",
+        "DROP MATERIALIZED VIEW absent_view",
+        "DROP MATERIALIZED VIEW totals",
         "CREATE SOURCE plain_ingress (id BIGINT)",
         "CREATE STREAM bad_schema AS SELECT missing_column FROM trades",
         "CREATE STREAM bad_dependency AS SELECT * FROM not_created",
@@ -1810,5 +1823,35 @@ async fn topology_validation_preserves_a_split_stream_with_its_stages() {
         .objects
         .iter()
         .all(|object| crate::sql_analysis::stage_owner(&object.name).is_none()));
+    fixture.assert_no_effects();
+}
+
+#[tokio::test]
+async fn topology_validation_preserves_a_materialized_view_with_its_result_node() {
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let authority = test_catalog_authority_with_ttl(objects, 60_000).await;
+    let fixture = Fixture::with_bootstrap(
+        authority,
+        1,
+        vec![
+            "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
+                .into(),
+        ],
+    )
+    .await;
+    fixture.adopt().await;
+    let report = fixture.validate(&independent_pipeline()).await.unwrap();
+    let view = report
+        .objects
+        .iter()
+        .find(|object| object.name == "counts")
+        .unwrap();
+    assert_eq!(view.kind, CatalogObjectKind::MaterializedView);
+    assert_eq!(view.transition, ClusterTopologyObjectTransition::Preserve);
+    assert_eq!(
+        view.initialization,
+        TopologyInitialization::PreserveExactCut
+    );
+    assert_eq!(view.dependencies, ["trades"]);
     fixture.assert_no_effects();
 }

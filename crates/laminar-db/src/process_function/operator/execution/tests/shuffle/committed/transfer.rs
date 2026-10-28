@@ -112,6 +112,7 @@ async fn live_graph_transfer_publishes_committed_donor_state_and_replaces_execut
             },
             PipelineIdentity::empty(),
             frames,
+            Vec::new(),
             None,
         )
         .unwrap();

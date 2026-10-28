@@ -1,4 +1,5 @@
-//! Planner-certified cluster subscription admission and gateway construction.
+//! Cluster subscription admission and gateway construction: planner-certified streams read
+//! their committed output segments, and materialized views read their committed artifacts.
 
 use std::sync::Arc;
 
@@ -48,6 +49,14 @@ impl LaminarDB {
         start: SubscribeStart,
         metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     ) -> Result<SubscriptionPortal, DbError> {
+        let shape = self.mv_store.read().view_shape(name);
+        if let Some(shape) = shape {
+            let store = Arc::clone(&self.mv_store);
+            let reader = ClusterSubscriptionReader::open_view(store, shape, start, metrics).await?;
+            return Ok(SubscriptionPortal::open_cluster(
+                name, schema, reader, filter,
+            ));
+        }
         let registration = self
             .connector_manager
             .lock()

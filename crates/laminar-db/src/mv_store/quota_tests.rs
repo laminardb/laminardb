@@ -16,11 +16,26 @@ fn batch(ids: &[i64], width: usize) -> RecordBatch {
     .unwrap()
 }
 
-fn input(batch: &RecordBatch, mode: &MvStorageMode, weight: i64) -> RecordBatch {
-    if matches!(
+fn keyed(column: usize) -> MvStorageMode {
+    MvStorageMode::changelog(ViewKey::Keyed(vec![column]))
+}
+
+fn multiset() -> MvStorageMode {
+    MvStorageMode::changelog(ViewKey::MultisetByRow)
+}
+
+fn is_multiset(mode: &MvStorageMode) -> bool {
+    matches!(
         mode,
-        MvStorageMode::Aggregate | MvStorageMode::Append { .. }
-    ) {
+        MvStorageMode::Changelog {
+            key: ViewKey::MultisetByRow,
+            ..
+        }
+    )
+}
+
+fn input(batch: &RecordBatch, mode: &MvStorageMode, weight: i64) -> RecordBatch {
+    if matches!(mode, MvStorageMode::AppendLog { .. }) {
         return batch.clone();
     }
     let mut fields = batch.schema().fields().to_vec();
@@ -30,13 +45,13 @@ fn input(batch: &RecordBatch, mode: &MvStorageMode, weight: i64) -> RecordBatch 
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
 }
 
-fn modes() -> [MvStorageMode; 4] {
-    [
-        MvStorageMode::Aggregate,
-        MvStorageMode::append_default(),
-        MvStorageMode::Upsert { key_cols: vec![0] },
-        MvStorageMode::Multiset,
-    ]
+fn modes() -> [MvStorageMode; 3] {
+    [MvStorageMode::append_rows(1_000), keyed(0), multiset()]
+}
+
+/// A recovery image of `target` holding `source`'s committed slices for changelog view `v`.
+fn restored_image(source: &mut MvStore, target: &MvStore) -> Result<MvStore, DbError> {
+    target.image_from_view_frames("v", &source.full_view_frames("v"))
 }
 
 #[test]
@@ -65,13 +80,14 @@ fn schema_mismatches_are_rejected_before_any_view_changes() {
         .unwrap(),
         RecordBatch::new_empty(Arc::new(Schema::empty())),
     ];
-    for mode in modes()
-        .into_iter()
-        .chain([MvStorageMode::Upsert { key_cols: vec![1] }])
-    {
+    for mode in modes().into_iter().chain([keyed(1)]) {
         let mut store = store(64, 64 * 1024);
         store
-            .create_mv("first", original.schema(), MvStorageMode::Aggregate)
+            .create_mv(
+                "first",
+                original.schema(),
+                MvStorageMode::append_rows(1_000),
+            )
             .unwrap();
         store
             .create_mv("second", original.schema(), mode.clone())
@@ -87,7 +103,11 @@ fn schema_mismatches_are_rejected_before_any_view_changes() {
             let first = [batch(&[7], 1)];
             let second = [input(invalid, &mode, 1)];
             assert!(matches!(
-                store.update_views([("first", first.as_slice()), ("second", second.as_slice())]),
+                store.update_views(
+                    [("first", first.as_slice()), ("second", second.as_slice())],
+                    false,
+                    |_| false
+                ),
                 Err(DbError::MaterializedView(_))
             ));
             assert_eq!(ids(&store, "first"), [1]);
@@ -99,7 +119,7 @@ fn schema_mismatches_are_rejected_before_any_view_changes() {
 
 #[test]
 fn upsert_keys_follow_plain_columns_when_weight_is_first() {
-    let mode = MvStorageMode::Upsert { key_cols: vec![0] };
+    let mode = keyed(0);
     let data = batch(&[2, 3], 1);
     let weighted = input(&data, &mode, 1);
     let reordered = weighted.project(&[2, 0, 1]).unwrap();
@@ -111,15 +131,16 @@ fn upsert_keys_follow_plain_columns_when_weight_is_first() {
 
 #[test]
 fn keyed_staging_is_bounded_across_batches_even_when_final_state_would_fit() {
-    for mode in [
-        MvStorageMode::Upsert { key_cols: vec![0] },
-        MvStorageMode::Multiset,
-    ] {
+    for mode in [keyed(0), multiset()] {
         for (rows, bytes, width, count) in [(2, 65536, 1, 5), (64, 1024, 512, 12)] {
             let original = batch(&[0], 1);
             let mut store = store(rows, bytes);
             store
-                .create_mv("first", original.schema(), MvStorageMode::Aggregate)
+                .create_mv(
+                    "first",
+                    original.schema(),
+                    MvStorageMode::append_rows(1_000),
+                )
                 .unwrap();
             store
                 .create_mv("second", original.schema(), mode.clone())
@@ -140,10 +161,11 @@ fn keyed_staging_is_bounded_across_batches_even_when_final_state_would_fit() {
             let first = [batch(&[9], 1)];
             assert!(
                 matches!(
-                    store.update_views([
-                        ("first", first.as_slice()),
-                        ("second", updates.as_slice())
-                    ]),
+                    store.update_views(
+                        [("first", first.as_slice()), ("second", updates.as_slice())],
+                        false,
+                        |_| false
+                    ),
                     Err(DbError::MaterializedViewQuotaExceeded { .. })
                 ),
                 "{mode:?}"
@@ -172,10 +194,7 @@ fn repeated_dictionary_and_view_values_are_bounded_before_row_encoding() {
     );
     for payload in [Arc::new(array) as ArrayRef, Arc::new(views)] {
         let data = RecordBatch::try_from_iter(vec![("value", payload)]).unwrap();
-        for mode in [
-            MvStorageMode::Upsert { key_cols: vec![0] },
-            MvStorageMode::Multiset,
-        ] {
+        for mode in [keyed(0), multiset()] {
             let mut store = store(1024, 64 * 1024);
             store.create_mv("v", data.schema(), mode.clone()).unwrap();
             assert!(matches!(
@@ -207,18 +226,16 @@ fn ordinary_dictionary_and_view_batches_fit_staging_budget() {
             ("value", payload),
         ])
         .unwrap();
-        for mode in [
-            MvStorageMode::Upsert { key_cols: vec![0] },
-            MvStorageMode::Multiset,
-        ] {
+        for mode in [keyed(0), multiset()] {
             let mut store = store(32_768, 64 * 1024 * 1024);
             store.create_mv("v", data.schema(), mode.clone()).unwrap();
             store.update_cycle("v", &[input(&data, &mode, 1)]).unwrap();
             let entry = &store.entries["v"];
             let retained = if let Some(upsert) = &entry.upsert {
-                upsert.rows.len()
+                upsert.rows
             } else {
-                entry.multiset.as_ref().unwrap().counts.len()
+                let slices = &entry.multiset.as_ref().unwrap().slices;
+                slices.slots().map(|(_, slice)| slice.len()).sum()
             };
             assert_eq!(retained, 16_384);
             let snapshot = store.to_record_batch("v").unwrap().unwrap();
@@ -231,7 +248,7 @@ fn ordinary_dictionary_and_view_batches_fit_staging_budget() {
 #[test]
 fn keyed_staging_releases_replaced_values_and_cancelled_deltas() {
     let plain = batch(&[1], 64);
-    let upsert = MvStorageMode::Upsert { key_cols: vec![0] };
+    let upsert = keyed(0);
     let mut keyed = store(1, 1024);
     keyed
         .create_mv("v", plain.schema(), upsert.clone())
@@ -243,13 +260,11 @@ fn keyed_staging_releases_replaced_values_and_cancelled_deltas() {
     assert_eq!(ids(&keyed, "v"), [1]);
 
     let mut counted = store(1, 1024);
-    counted
-        .create_mv("v", plain.schema(), MvStorageMode::Multiset)
-        .unwrap();
+    counted.create_mv("v", plain.schema(), multiset()).unwrap();
     let updates: Vec<_> = (1..=20)
         .flat_map(|id| {
             let data = batch(&[id], 64);
-            [1, -1].map(|weight| input(&data, &MvStorageMode::Multiset, weight))
+            [1, -1].map(|weight| input(&data, &multiset(), weight))
         })
         .collect();
     counted.update_cycle("v", &updates).unwrap();
@@ -279,7 +294,7 @@ fn ids(store: &MvStore, name: &str) -> Vec<i64> {
 }
 
 #[test]
-fn default_aggregate_quota_rejects_oversized_snapshot() {
+fn default_quota_rejects_an_oversized_batch() {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
         vec![Arc::new(Int64Array::from_iter_values(0..1_000_001))],
@@ -287,7 +302,7 @@ fn default_aggregate_quota_rejects_oversized_snapshot() {
     .unwrap();
     let mut store = MvStore::new();
     store
-        .create_mv("v", batch.schema(), MvStorageMode::Aggregate)
+        .create_mv("v", batch.schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     assert!(
         store.update_cycle("v", &[batch]).is_err(),
@@ -322,33 +337,10 @@ fn all_modes_reject_single_oversized_updates_without_changing_state() {
 }
 
 #[test]
-fn aggregate_replacement_counts_every_batch_and_preserves_empty_cycle() {
-    let small = batch(&[1], 1);
-    let mut store = store(2, 16384);
-    store
-        .create_mv("v", small.schema(), MvStorageMode::Aggregate)
-        .unwrap();
-    store.update_cycle("v", &[small]).unwrap();
-    assert!(store
-        .update_cycle("v", &[batch(&[2, 3], 1), batch(&[4], 1)])
-        .is_err());
-    assert_eq!(ids(&store, "v"), [1]);
-    store
-        .update_cycle("v", &[batch(&[2], 1), batch(&[3], 1)])
-        .unwrap();
-    store.update_cycle("v", &[batch(&[], 1)]).unwrap();
-    assert_eq!(ids(&store, "v"), [2, 3]);
-}
-
-#[test]
-fn append_retains_newest_complete_batches_and_rejects_later_oversized_batch_atomically() {
+fn append_row_retention_evicts_leading_batches_and_rejects_an_oversized_stage_atomically() {
     let mut store = store(3, 16384);
     store
-        .create_mv(
-            "v",
-            batch(&[], 1).schema(),
-            MvStorageMode::Append { max_batches: 2 },
-        )
+        .create_mv("v", batch(&[], 1).schema(), MvStorageMode::append_rows(2))
         .unwrap();
     store
         .update_cycle("v", &[batch(&[1], 1), batch(&[2], 1)])
@@ -362,17 +354,14 @@ fn append_retains_newest_complete_batches_and_rejects_later_oversized_batch_atom
     store
         .update_cycle("v", &[batch(&[], 1), batch(&[3], 1), batch(&[4, 5], 1)])
         .unwrap();
-    assert_eq!(ids(&store, "v"), [3, 4, 5]);
+    assert_eq!(ids(&store, "v"), [4, 5]);
     store.update_cycle("v", &[batch(&[6, 7], 1)]).unwrap();
     assert_eq!(ids(&store, "v"), [6, 7]);
 }
 
 #[test]
 fn keyed_deletes_release_memory_and_replacements_use_final_state_quota() {
-    for mode in [
-        MvStorageMode::Upsert { key_cols: vec![0] },
-        MvStorageMode::Multiset,
-    ] {
+    for mode in [keyed(0), multiset()] {
         let original = batch(&[1], 1024);
         let replacement = batch(&[2], 1024);
         let mut probe = MvStore::new();
@@ -408,8 +397,8 @@ fn keyed_deletes_release_memory_and_replacements_use_final_state_quota() {
 }
 
 #[test]
-fn all_modes_reject_over_limit_restore_and_recovery_images_atomically() {
-    for mode in modes() {
+fn changelog_views_reject_over_limit_recovery_images_atomically() {
+    for mode in [keyed(0), multiset()] {
         let mut source = MvStore::new();
         source
             .create_mv("v", batch(&[], 1).schema(), mode.clone())
@@ -417,8 +406,6 @@ fn all_modes_reject_over_limit_restore_and_recovery_images_atomically() {
         source
             .update_cycle("v", &[input(&batch(&[1, 2, 3], 1), &mode, 1)])
             .unwrap();
-        let encoded = source.checkpoint_states().unwrap();
-        let bytes = &encoded["mv:v"];
         let mut target = store(2, 16384);
         target
             .create_mv("v", batch(&[], 1).schema(), mode.clone())
@@ -427,21 +414,15 @@ fn all_modes_reject_over_limit_restore_and_recovery_images_atomically() {
             .update_cycle("v", &[input(&batch(&[9], 1), &mode, 1)])
             .unwrap();
         let before_bytes = target.total_bytes();
-        assert!(matches!(
-            target.restore_from_ipc("v", bytes),
-            Err(DbError::MaterializedViewQuotaExceeded { .. })
-        ));
-        assert!(target
-            .recovery_image(&HashMap::from([("v".to_owned(), bytes.to_vec())]))
-            .is_err());
+        assert!(restored_image(&mut source, &target).is_err());
         assert_eq!(ids(&target, "v"), [9]);
         assert_eq!(target.total_bytes(), before_bytes);
     }
 }
 
 #[test]
-fn all_modes_reject_over_byte_limit_restore_without_losing_old_rows() {
-    for mode in modes() {
+fn changelog_views_reject_over_byte_limit_restore_without_losing_old_rows() {
+    for mode in [keyed(0), multiset()] {
         let mut source = MvStore::new();
         source
             .create_mv("v", batch(&[], 1).schema(), mode.clone())
@@ -449,7 +430,6 @@ fn all_modes_reject_over_byte_limit_restore_without_losing_old_rows() {
         source
             .update_cycle("v", &[input(&batch(&[1], 8192), &mode, 1)])
             .unwrap();
-        let encoded = source.checkpoint_states().unwrap();
         let mut target = store(10, 4096);
         target
             .create_mv("v", batch(&[], 1).schema(), mode.clone())
@@ -458,11 +438,9 @@ fn all_modes_reject_over_byte_limit_restore_without_losing_old_rows() {
             .update_cycle("v", &[input(&batch(&[9], 1), &mode, 1)])
             .unwrap();
         let bytes = target.total_bytes();
+        let error = restored_image(&mut source, &target).err().unwrap();
         assert!(
-            matches!(
-                target.restore_from_ipc("v", &encoded["mv:v"]),
-                Err(DbError::MaterializedViewQuotaExceeded { .. })
-            ),
+            matches!(error, DbError::MaterializedViewQuotaExceeded { .. }),
             "{mode:?}"
         );
         assert_eq!(ids(&target, "v"), [9]);
@@ -471,8 +449,8 @@ fn all_modes_reject_over_byte_limit_restore_without_losing_old_rows() {
 }
 
 #[test]
-fn append_byte_eviction_and_shorter_keyed_replacements_release_live_charge() {
-    let mode = MvStorageMode::Append { max_batches: 100 };
+fn append_stages_fail_at_the_byte_limit_and_shorter_keyed_replacements_release_charge() {
+    let mode = MvStorageMode::append_rows(1_000);
     let original = batch(&[1], 1024);
     let mut probe = MvStore::new();
     probe
@@ -486,11 +464,19 @@ fn append_byte_eviction_and_shorter_keyed_replacements_release_live_charge() {
     append
         .update_cycle("v", std::slice::from_ref(&original))
         .unwrap();
+    // A stage over the limit fails rather than silently dropping retained rows.
+    assert!(matches!(
+        append.update_cycle("v", &[batch(&[2], 1024)]),
+        Err(DbError::MaterializedViewQuotaExceeded { .. })
+    ));
+    assert_eq!(ids(&append, "v"), [1]);
+    // A committed checkpoint moves the stage out of memory, so the next row fits.
+    append.capture_view_logs(1, u64::MAX).unwrap();
+    append.commit_view_logs(1);
     append.update_cycle("v", &[batch(&[2], 1024)]).unwrap();
-    assert_eq!(ids(&append, "v"), [2]);
     assert_eq!(append.total_bytes(), probe.total_bytes());
 
-    let mode = MvStorageMode::Upsert { key_cols: vec![0] };
+    let mode = keyed(0);
     let mut upsert = store(10, 4096);
     upsert
         .create_mv("v", original.schema(), mode.clone())
@@ -530,14 +516,14 @@ fn sliced_arrow_and_view_backing_storage_count_toward_live_quota() {
     )
     .unwrap();
     for data in [original.slice(0, 1), views.slice(0, 1)] {
-        for mode in [MvStorageMode::Aggregate, MvStorageMode::append_default()] {
-            let mut store = store(4, 4096);
-            store.create_mv("v", data.schema(), mode).unwrap();
-            assert!(store
-                .update_cycle("v", std::slice::from_ref(&data))
-                .is_err());
-            assert!(ids(&store, "v").is_empty());
-        }
+        let mut store = store(4, 4096);
+        store
+            .create_mv("v", data.schema(), MvStorageMode::append_rows(1_000))
+            .unwrap();
+        assert!(store
+            .update_cycle("v", std::slice::from_ref(&data))
+            .is_err());
+        assert!(ids(&store, "v").is_empty());
     }
 }
 
@@ -590,20 +576,17 @@ fn nested_and_dictionary_arrow_payloads_are_charged() {
 fn encoded_upsert_keys_and_multiset_rows_are_included_in_byte_quota() {
     let plain = batch(&[1], 3000);
     // A keyed scalar row fits below 4 KiB; its separate encoded string key does not.
-    for mode in [
-        MvStorageMode::Upsert { key_cols: vec![1] },
-        MvStorageMode::Multiset,
-    ] {
+    for mode in [keyed(1), multiset()] {
         let mut store = store(1, 4096);
         store.create_mv("v", plain.schema(), mode.clone()).unwrap();
-        if matches!(mode, MvStorageMode::Upsert { .. }) {
+        if is_multiset(&mode) {
+            store.update_cycle("v", &[input(&plain, &mode, 1)]).unwrap();
+            assert!(store.total_bytes() >= 3000);
+        } else {
             assert!(matches!(
                 store.update_cycle("v", &[input(&plain, &mode, 1)]),
                 Err(DbError::MaterializedViewQuotaExceeded { .. })
             ));
-        } else {
-            store.update_cycle("v", &[input(&plain, &mode, 1)]).unwrap();
-            assert!(store.total_bytes() >= 3000);
         }
     }
 }
@@ -611,17 +594,17 @@ fn encoded_upsert_keys_and_multiset_rows_are_included_in_byte_quota() {
 proptest::proptest! {
     #[test]
     fn keyed_quota_updates_match_an_independent_row_oracle(operations in proptest::collection::vec((0i64..6, proptest::bool::ANY), 0..60)) {
-        for mode in [MvStorageMode::Upsert { key_cols: vec![0] }, MvStorageMode::Multiset] {
+        for mode in [keyed(0), multiset()] {
             let mut store = store(3, 1024 * 1024);
             store.create_mv("v", batch(&[], 1).schema(), mode.clone()).unwrap();
             let mut expected = std::collections::BTreeMap::<i64, usize>::new();
             for &(key, insert) in &operations {
                 let mut candidate = expected.clone();
                 let old = candidate.get(&key).copied().unwrap_or(0);
-                let invalid_retraction = matches!(mode, MvStorageMode::Multiset) && !insert && old == 0;
-                match (&mode, insert) {
-                    (MvStorageMode::Multiset, true) => { candidate.insert(key, old + 1); }
-                    (MvStorageMode::Multiset, false) if old > 1 => { candidate.insert(key, old - 1); }
+                let invalid_retraction = is_multiset(&mode) && !insert && old == 0;
+                match (is_multiset(&mode), insert) {
+                    (true, true) => { candidate.insert(key, old + 1); }
+                    (true, false) if old > 1 => { candidate.insert(key, old - 1); }
                     (_, true) => { candidate.insert(key, 1); }
                     (_, false) => { candidate.remove(&key); }
                 }
@@ -644,15 +627,19 @@ fn publication_preflight_rejects_multiset_expansion_before_applying_other_view()
     let plain = batch(&[1], 1);
     let mut store = MvStore::new();
     store
-        .create_mv("first", plain.schema(), MvStorageMode::Aggregate)
+        .create_mv("first", plain.schema(), MvStorageMode::append_rows(1_000))
         .unwrap();
     store
-        .create_mv("second", plain.schema(), MvStorageMode::Multiset)
+        .create_mv("second", plain.schema(), multiset())
         .unwrap();
     let first = [plain.clone()];
-    let second = [input(&plain, &MvStorageMode::Multiset, i64::MAX)];
+    let second = [input(&plain, &multiset(), i64::MAX)];
     assert!(store
-        .update_views([("first", first.as_slice()), ("second", second.as_slice())])
+        .update_views(
+            [("first", first.as_slice()), ("second", second.as_slice())],
+            false,
+            |_| false
+        )
         .is_err());
     assert!(ids(&store, "first").is_empty());
     assert!(ids(&store, "second").is_empty());

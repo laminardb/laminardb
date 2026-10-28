@@ -1,8 +1,8 @@
 //! Preflight live MV quotas without cloning complete retained state.
 
 use arrow::array::RecordBatch;
-use laminar_core::streaming::retained_arrow_bytes;
 
+use super::append_log::LogUpdate;
 use super::multiset::MultisetDelta;
 use super::upsert::UpsertDelta;
 use super::{MvEntry, MvStorageMode};
@@ -34,12 +34,7 @@ impl MvLimits {
 
 pub(super) enum PreparedUpdate<'a> {
     Unchanged,
-    Batches {
-        evicted: usize,
-        incoming: &'a [RecordBatch],
-        rows: usize,
-        bytes: usize,
-    },
+    Log(LogUpdate<'a>),
     Upsert(UpsertDelta),
     Multiset(MultisetDelta),
 }
@@ -50,10 +45,7 @@ pub(super) fn size_overflow() -> DbError {
 
 impl MvEntry {
     fn validate_input_schema(&self, name: &str, batch: &RecordBatch) -> Result<(), DbError> {
-        let weighted = matches!(
-            self.mode,
-            MvStorageMode::Upsert { .. } | MvStorageMode::Multiset
-        );
+        let weighted = matches!(self.mode, MvStorageMode::Changelog { .. });
         let schema = batch.schema_ref();
         if !weighted && std::sync::Arc::ptr_eq(&self.schema, schema) {
             return Ok(());
@@ -100,6 +92,7 @@ impl MvEntry {
         batches: &'a [RecordBatch],
         limits: MvLimits,
         snapshot: bool,
+        horizon_drops: Option<&prometheus::IntCounter>,
     ) -> Result<PreparedUpdate<'a>, DbError> {
         for batch in batches {
             self.validate_input_schema(name, batch)?;
@@ -107,98 +100,32 @@ impl MvEntry {
         if batches.iter().all(|batch| batch.num_rows() == 0) {
             return Ok(PreparedUpdate::Unchanged);
         }
-        match &self.mode {
-            MvStorageMode::Aggregate => {
-                let (rows, bytes) = batch_usage(batches.iter())?;
-                limits.validate(name, rows, bytes)?;
-                Ok(PreparedUpdate::Batches {
-                    evicted: self.batches.len(),
-                    incoming: batches,
-                    rows,
-                    bytes,
-                })
-            }
-            MvStorageMode::Append { max_batches } => {
-                self.prepare_append(name, batches, limits, *max_batches)
-            }
-            MvStorageMode::Upsert { .. } => self
-                .upsert
-                .as_ref()
-                .ok_or_else(|| DbError::Storage("MV is missing its upsert state".into()))?
+        if let Some(log) = &self.log {
+            return log
+                .prepare(name, batches, limits, horizon_drops)
+                .map(PreparedUpdate::Log);
+        }
+        match (&self.upsert, &self.multiset) {
+            (Some(upsert), None) => upsert
                 .prepare_cycle(name, batches, limits)
                 .map(PreparedUpdate::Upsert),
-            MvStorageMode::Multiset => self
-                .multiset
-                .as_ref()
-                .ok_or_else(|| DbError::Storage("MV is missing its multiset state".into()))?
+            (None, Some(multiset)) => multiset
                 .prepare_cycle(name, batches, limits, snapshot)
                 .map(PreparedUpdate::Multiset),
+            _ => Err(DbError::Storage(format!(
+                "MV '{name}' is missing its changelog state"
+            ))),
         }
-    }
-
-    fn prepare_append<'a>(
-        &self,
-        name: &str,
-        batches: &'a [RecordBatch],
-        limits: MvLimits,
-        max_batches: usize,
-    ) -> Result<PreparedUpdate<'a>, DbError> {
-        let (mut rows, mut bytes) = (self.rows, self.approx_bytes);
-        let (mut evicted, mut first_new, mut count) = (0, 0, self.batches.len());
-        for batch in batches.iter().filter(|batch| batch.num_rows() > 0) {
-            let charge = retained_arrow_bytes(batch);
-            // A single oversized batch must not bypass retention by being the last batch.
-            limits.validate(name, batch.num_rows(), charge)?;
-            rows = rows
-                .checked_add(batch.num_rows())
-                .ok_or_else(size_overflow)?;
-            bytes = bytes.checked_add(charge).ok_or_else(size_overflow)?;
-            count = count.checked_add(1).ok_or_else(size_overflow)?;
-            while count > max_batches.max(1) || rows > limits.rows || bytes > limits.bytes {
-                // INVARIANT: each incoming batch fits alone; evictions stop before it.
-                // Both cursors advance through bounded retained/input batch sequences.
-                let old = if let Some(old) = self.batches.get(evicted) {
-                    evicted += 1;
-                    old
-                } else {
-                    while batches[first_new].num_rows() == 0 {
-                        first_new += 1;
-                    }
-                    let old = &batches[first_new];
-                    first_new += 1;
-                    old
-                };
-                rows -= old.num_rows();
-                bytes -= retained_arrow_bytes(old);
-                count -= 1;
-            }
-        }
-        Ok(PreparedUpdate::Batches {
-            evicted,
-            incoming: &batches[first_new..],
-            rows,
-            bytes,
-        })
     }
 
     pub(super) fn apply_prepared(&mut self, update: PreparedUpdate<'_>) {
         match update {
             PreparedUpdate::Unchanged => {}
-            PreparedUpdate::Batches {
-                evicted,
-                incoming,
-                rows,
-                bytes,
-            } => {
-                self.batches.drain(..evicted);
-                self.batches.extend(
-                    incoming
-                        .iter()
-                        .filter(|batch| batch.num_rows() > 0)
-                        .cloned(),
-                );
-                self.rows = rows;
-                self.approx_bytes = bytes;
+            PreparedUpdate::Log(update) => {
+                if let Some(log) = self.log.as_mut() {
+                    log.apply(update);
+                    self.approx_bytes = log.bytes;
+                }
             }
             PreparedUpdate::Upsert(delta) => {
                 if let Some(state) = self.upsert.as_mut() {
@@ -214,21 +141,4 @@ impl MvEntry {
             }
         }
     }
-}
-
-pub(super) fn batch_usage<'a>(
-    batches: impl Iterator<Item = &'a RecordBatch>,
-) -> Result<(usize, usize), DbError> {
-    batches.filter(|batch| batch.num_rows() > 0).try_fold(
-        (0usize, 0usize),
-        |(rows, bytes), batch| {
-            Ok((
-                rows.checked_add(batch.num_rows())
-                    .ok_or_else(size_overflow)?,
-                bytes
-                    .checked_add(retained_arrow_bytes(batch))
-                    .ok_or_else(size_overflow)?,
-            ))
-        },
-    )
 }

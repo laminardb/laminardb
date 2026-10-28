@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use laminar_core::streaming::StreamCheckpointConfig;
 
@@ -16,22 +17,18 @@ async fn install_generator_mvs(db: &Arc<LaminarDB>, max_rows: u64) {
     ))
     .await
     .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW committed AS SELECT seq FROM generated")
+    for view in ["committed", "empty_at_cut"] {
+        db.execute(&format!(
+            "CREATE MATERIALIZED VIEW {view} AS SELECT seq FROM generated \
+             WITH (retention = '1000 rows')"
+        ))
         .await
         .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW empty_at_cut AS SELECT seq FROM generated")
-        .await
-        .unwrap();
+    }
 }
 
 fn update_mv(db: &LaminarDB, name: &str, values: Vec<i64>) {
-    let schema = db
-        .mv_store
-        .read()
-        .to_record_batch(name)
-        .unwrap()
-        .unwrap()
-        .schema();
+    let schema = Arc::new(Schema::new(vec![Field::new("seq", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
         .expect("test MV batch");
     db.mv_store
@@ -40,8 +37,12 @@ fn update_mv(db: &LaminarDB, name: &str, values: Vec<i64>) {
         .expect("test MV update");
 }
 
-fn mv_values(db: &LaminarDB, name: &str) -> Vec<i64> {
-    let batch = db.mv_store.read().to_record_batch(name).unwrap().unwrap();
+async fn mv_values(db: &LaminarDB, name: &str) -> Vec<i64> {
+    let batch = crate::mv_store::read_views(&db.mv_store, &[name.to_owned()])
+        .await
+        .unwrap()
+        .remove(name)
+        .unwrap();
     batch
         .column(0)
         .as_any()
@@ -94,8 +95,8 @@ async fn restart_installs_the_exact_committed_mv_image() {
     db.stop_pipeline().await.unwrap();
     db.start().await.unwrap();
 
-    assert_eq!(mv_values(&db, "committed"), [1]);
-    assert!(mv_values(&db, "empty_at_cut").is_empty());
+    assert_eq!(mv_values(&db, "committed").await, [1]);
+    assert!(mv_values(&db, "empty_at_cut").await.is_empty());
     db.shutdown().await.unwrap();
 }
 
@@ -110,7 +111,7 @@ async fn restart_with_no_checkpoint_installs_an_empty_mv_image() {
     db.stop_pipeline().await.unwrap();
     db.start().await.unwrap();
 
-    assert!(mv_values(&db, "committed").is_empty());
+    assert!(mv_values(&db, "committed").await.is_empty());
     db.shutdown().await.unwrap();
 }
 
@@ -127,14 +128,16 @@ async fn restart_without_a_coordinator_installs_an_empty_mv_image() {
     db.stop_pipeline().await.unwrap();
     db.start().await.unwrap();
 
-    assert!(mv_values(&db, "committed").is_empty());
+    assert!(mv_values(&db, "committed").await.is_empty());
     assert_eq!(db.pipeline_watermark.load(Ordering::Acquire), i64::MIN);
     assert_eq!(source.source.current_watermark(), i64::MIN);
     db.shutdown().await.unwrap();
 }
 
+/// Committed append-log rows stay in the checkpoint store, so a restart under a memory limit
+/// they would exceed reads them back without loading them into memory.
 #[tokio::test]
-async fn over_quota_mv_recovery_preserves_previous_stores_before_intake() {
+async fn committed_append_rows_restore_without_counting_against_memory_limits() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = LaminarDB::open_with_config(checkpoint_config(dir.path())).unwrap();
@@ -149,15 +152,9 @@ async fn over_quota_mv_recovery_preserves_previous_stores_before_intake() {
     config.materialized_view_max_rows = 1;
     let db = LaminarDB::open_with_config(config).unwrap();
     install_generator_mvs(&db, 0).await;
-    update_mv(&db, "committed", vec![9]);
-    update_mv(&db, "empty_at_cut", vec![7]);
-    let error = db
-        .start()
-        .await
-        .expect_err("selected checkpoint must fail quota validation");
-    assert!(error.to_string().contains("quota exceeded"), "{error}");
-    assert_ne!(db.pipeline_state(), "Running");
-    assert_eq!(mv_values(&db, "committed"), [9]);
-    assert_eq!(mv_values(&db, "empty_at_cut"), [7]);
+    db.start().await.unwrap();
+    assert_eq!(mv_values(&db, "committed").await, [10, 20]);
+    assert!(mv_values(&db, "empty_at_cut").await.is_empty());
+    assert_eq!(db.mv_store.read().total_bytes(), 0);
     db.shutdown().await.unwrap();
 }

@@ -338,6 +338,7 @@ impl CheckpointWriter {
                 .collect(),
             source_watermarks: BTreeMap::from([("events".into(), 105)]),
             checkpoint_watermark: Some(105),
+            view_frontiers: Default::default(),
         };
         index
             .validate_participant_manifests(

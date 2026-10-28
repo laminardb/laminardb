@@ -1,5 +1,6 @@
-//! Checkpoint endpoints: manual trigger with optional forwarded budget, and
-//! latest checkpoint metadata (`/api/v1/cluster/checkpoints`, both modes).
+//! Checkpoint endpoints: manual trigger with optional forwarded budget, a recent read's request
+//! to start the next periodic checkpoint early, and latest checkpoint metadata
+//! (`/api/v1/cluster/checkpoints`, both modes).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,6 +77,14 @@ pub(super) async fn trigger_checkpoint(
         }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// `POST /api/v1/checkpoint/expedite` — start the next periodic checkpoint early for a recent read
+/// waiting on another cluster node. It takes effect on the leader with
+/// `[checkpoint] recent_read_interval` set, and is ignored elsewhere.
+pub(super) async fn expedite_checkpoint(State(state): State<Arc<AppState>>) -> StatusCode {
+    state.db.expedite_forwarded_checkpoint();
+    StatusCode::ACCEPTED
 }
 
 /// `GET /api/v1/cluster/checkpoints` — latest checkpoint metadata. Available

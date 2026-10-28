@@ -34,13 +34,15 @@ mod keys;
 #[cfg(feature = "cluster")]
 mod output_sequence;
 mod scalar_ipc;
+#[cfg(feature = "cluster")]
+mod seeding;
 mod vnode_state;
 pub(crate) use checkpoints::AggStateArchiveRestoreProfile;
 #[cfg(feature = "cluster")]
 pub(crate) use checkpoints::AggStateRestorePreflight;
 pub(crate) use checkpoints::{
-    query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,
-    GroupCheckpoint, WindowCheckpoint,
+    query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, GroupCheckpoint,
+    WindowCheckpoint,
 };
 #[cfg(test)]
 pub(crate) use compile::expr_to_sql;
@@ -286,6 +288,7 @@ fn arrays_to_ipc_bounded(arrays: &[ArrayRef], max_bytes: usize) -> Result<Vec<u8
 struct CapturedAggregateGroup {
     key: arrow::row::OwnedRow,
     accumulator_states: Vec<Vec<ScalarValue>>,
+    last_emitted: Option<Vec<ScalarValue>>,
     input_weight: i64,
     last_updated_ms: i64,
 }
@@ -296,7 +299,6 @@ pub(crate) struct AggregateVnodeCheckpointCapture {
     group_types: Arc<[DataType]>,
     row_converter: Arc<arrow::row::RowConverter>,
     groups: Vec<CapturedAggregateGroup>,
-    last_emitted: Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>,
     retained_bytes: u64,
 }
 
@@ -306,7 +308,7 @@ impl AggregateVnodeCheckpointCapture {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.next_output_sequence == 0 && self.groups.is_empty() && self.last_emitted.is_empty()
+        self.next_output_sequence == 0 && self.groups.is_empty()
     }
 
     fn calculate_retained_bytes(&self) -> u64 {
@@ -348,27 +350,52 @@ impl AggregateVnodeCheckpointCapture {
                         .saturating_mul(std::mem::size_of::<ScalarValue>()),
                 );
             }
-        }
-        add(
-            &mut retained,
-            self.last_emitted
-                .capacity()
-                .saturating_mul(std::mem::size_of::<(arrow::row::OwnedRow, Vec<ScalarValue>)>()),
-        );
-        for (key, values) in &self.last_emitted {
-            add(&mut retained, key.as_ref().len());
-            for value in values {
-                add(&mut retained, value.size());
+            if let Some(values) = &group.last_emitted {
+                for value in values {
+                    add(&mut retained, value.size());
+                }
+                add(
+                    &mut retained,
+                    values
+                        .capacity()
+                        .saturating_sub(values.len())
+                        .saturating_mul(std::mem::size_of::<ScalarValue>()),
+                );
             }
-            add(
-                &mut retained,
-                values
-                    .capacity()
-                    .saturating_sub(values.len())
-                    .saturating_mul(std::mem::size_of::<ScalarValue>()),
-            );
         }
         retained
+    }
+
+    /// The rows of the groups holding last emitted values, and those values as columns.
+    fn emitted_columns(&self, arity: usize) -> Result<(Vec<u32>, Vec<ArrayRef>), DbError> {
+        let mut rows = Vec::new();
+        for (row, group) in self.groups.iter().enumerate() {
+            let Some(values) = &group.last_emitted else {
+                continue;
+            };
+            if values.len() != arity {
+                return Err(DbError::Checkpoint(
+                    "aggregate checkpoint capture has inconsistent changelog arity".into(),
+                ));
+            }
+            rows.push(u32::try_from(row).map_err(|_| {
+                DbError::Checkpoint(format!("aggregate checkpoint group row {row} exceeds u32"))
+            })?);
+        }
+        let columns = (0..arity)
+            .map(|column| {
+                ScalarValue::iter_to_array(
+                    self.groups
+                        .iter()
+                        .filter_map(|group| group.last_emitted.as_ref())
+                        .map(|values| values[column].clone()),
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("aggregate changelog value array build: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((rows, columns))
     }
 
     pub(crate) fn encode(self, max_working_bytes: usize) -> Result<AggStateCheckpoint, DbError> {
@@ -573,30 +600,25 @@ impl AggregateVnodeCheckpointCapture {
             .map(|group| group.last_updated_ms)
             .collect::<Vec<_>>();
 
-        retain_roster::<EmittedCheckpoint>(
-            &mut remaining,
-            self.last_emitted.len(),
-            "changelog roster",
+        let emitted = || {
+            self.groups
+                .iter()
+                .filter_map(|group| group.last_emitted.as_ref())
+        };
+        let emitted_count = emitted().count();
+        let emitted_arity = emitted().next().map_or(0, Vec::len);
+        retain_roster::<u32>(&mut remaining, emitted_count, "changelog roster")?;
+        let scratch = array_scratch_bytes(
+            emitted().flatten(),
+            emitted_count,
+            emitted_arity,
+            "changelog values",
         )?;
-        let mut last_emitted = Vec::with_capacity(self.last_emitted.len());
-        for (key, values) in self.last_emitted {
-            let key_scratch = row_scratch_bytes(
-                key.as_ref().len(),
-                1,
-                self.group_types.len(),
-                "changelog key",
-            )?;
-            let key_limit = transient_limit(remaining, key_scratch, "changelog key")?;
-            let key = row_to_scalar_key_with_types(&self.row_converter, &key, &self.group_types)?;
-            let key = scalars_to_ipc_bounded(&key, key_limit)?;
-            let key = retain_encoded(&mut remaining, key, "changelog key")?;
-            let value_scratch =
-                array_scratch_bytes(values.iter(), 1, values.len(), "changelog values")?;
-            let value_limit = transient_limit(remaining, value_scratch, "changelog values")?;
-            let values = scalars_to_ipc_bounded(&values, value_limit)?;
-            let values = retain_encoded(&mut remaining, values, "changelog values")?;
-            last_emitted.push(EmittedCheckpoint { key, values });
-        }
+        let encode_limit = transient_limit(remaining, scratch, "changelog values")?;
+        let (emitted_groups, emitted_columns) = self.emitted_columns(emitted_arity)?;
+        let emitted_values_ipc = arrays_to_ipc_bounded(&emitted_columns, encode_limit)?;
+        let emitted_values_ipc =
+            retain_encoded(&mut remaining, emitted_values_ipc, "changelog values")?;
 
         let checkpoint = AggStateCheckpoint {
             fingerprint: self.fingerprint,
@@ -605,7 +627,8 @@ impl AggregateVnodeCheckpointCapture {
             acc_state_ipc,
             input_weights,
             last_updated_ms,
-            last_emitted,
+            emitted_groups,
+            emitted_values_ipc,
         };
         debug_assert_checkpoint_within(&checkpoint, max_working_bytes);
         Ok(checkpoint)
@@ -767,7 +790,8 @@ fn validate_columnar_acc_shape(
         if !checkpoint.keys_ipc.is_empty()
             || !checkpoint.acc_state_ipc.is_empty()
             || !checkpoint.input_weights.is_empty()
-            || !checkpoint.last_emitted.is_empty()
+            || !checkpoint.emitted_groups.is_empty()
+            || !checkpoint.emitted_values_ipc.is_empty()
         {
             return Err(DbError::Pipeline(
                 "non-canonical empty aggregate checkpoint contains state payloads".into(),
@@ -2022,47 +2046,62 @@ impl IncrementalAggState {
             .cached_usage_matches_structural_recompute()
     }
 
-    /// Decode the per-entry changelog `last_emitted` checkpoint into the live map.
+    /// Pair each changelog entry with its group's key. `groups` must still be in encoded order.
     fn decode_last_emitted(
         &self,
-        entries: &[EmittedCheckpoint],
+        checkpoint: &AggStateCheckpoint,
+        groups: &[DecodedGroupState],
     ) -> Result<Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>, DbError> {
+        let rows = &checkpoint.emitted_groups;
+        if rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows
+                .last()
+                .is_some_and(|&last| last as usize >= groups.len())
+        {
+            return Err(DbError::Pipeline(
+                "aggregate checkpoint changelog groups are not strictly ascending group rows"
+                    .into(),
+            ));
+        }
+        let values = (!checkpoint.emitted_values_ipc.is_empty())
+            .then(|| {
+                laminar_core::serialization::deserialize_batch_stream(
+                    &checkpoint.emitted_values_ipc,
+                )
+            })
+            .transpose()
+            .map_err(|e| DbError::Pipeline(format!("changelog values IPC decode: {e}")))?;
+        let value_rows = values.as_ref().map_or(rows.len(), RecordBatch::num_rows);
+        let saved_types = values.as_ref().map_or_else(Vec::new, |batch| {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect()
+        });
+        let query_types = self.agg_specs.iter().map(|spec| &spec.return_type);
+        if value_rows != rows.len() || (!rows.is_empty() && !saved_types.iter().eq(query_types)) {
+            return Err(DbError::Pipeline(format!(
+                "aggregate checkpoint changelog holds {value_rows} rows of {saved_types:?} for {} groups",
+                rows.len()
+            )));
+        }
+
         let mut out = Vec::new();
-        out.try_reserve_exact(entries.len()).map_err(|error| {
+        out.try_reserve_exact(rows.len()).map_err(|error| {
             DbError::Pipeline(format!(
                 "aggregate checkpoint could not reserve changelog decode roster: {error}"
             ))
         })?;
-        for ec in entries {
-            let sv_key = ipc_to_scalars(&ec.key)?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
-            let vals = ipc_to_scalars(&ec.values)?;
-            if vals.len() != self.agg_specs.len() {
-                return Err(DbError::Pipeline(format!(
-                    "aggregate checkpoint changelog arity mismatch: saved={}, expected={}",
-                    vals.len(),
-                    self.agg_specs.len()
-                )));
-            }
-            for (index, (value, spec)) in vals.iter().zip(&self.agg_specs).enumerate() {
-                let saved_type = value.data_type();
-                if saved_type != spec.return_type {
-                    return Err(DbError::Pipeline(format!(
-                        "aggregate checkpoint changelog type mismatch at {index}: saved={saved_type}, expected={}",
-                        spec.return_type
-                    )));
-                }
-            }
-            out.push((row_key, vals));
-        }
-        out.sort_unstable_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
-        if out
-            .windows(2)
-            .any(|pair| pair[0].0.as_ref() == pair[1].0.as_ref())
-        {
-            return Err(DbError::Pipeline(
-                "aggregate checkpoint contains a duplicate changelog key".into(),
-            ));
+        for (value_row, &group_row) in rows.iter().enumerate() {
+            let emitted = values
+                .iter()
+                .flat_map(RecordBatch::columns)
+                .map(|column| ScalarValue::try_from_array(column, value_row))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| DbError::Pipeline(format!("changelog value scalar: {e}")))?;
+            out.push((groups[group_row as usize].0.clone(), emitted));
         }
         Ok(out)
     }
@@ -2075,7 +2114,6 @@ impl IncrementalAggState {
         row_converter: Arc<arrow::row::RowConverter>,
     ) -> Result<AggregateVnodeCheckpointCapture, DbError> {
         let mut groups = Vec::new();
-        let mut last_emitted = Vec::new();
         let mut next_output_sequence = 0;
         if let Some(state) = self.vnode_states.get(vnode) {
             next_output_sequence = state.next_output_sequence;
@@ -2091,27 +2129,26 @@ impl IncrementalAggState {
                 for aggregate in &entry.accs {
                     accumulator_states.push(aggregate.checkpoint_state()?);
                 }
+                let last_emitted = self
+                    .emit_changelog
+                    .then(|| state.last_emitted.get(key).cloned())
+                    .flatten();
                 groups.push(CapturedAggregateGroup {
                     key: key.clone(),
                     accumulator_states,
+                    last_emitted,
                     input_weight: entry.input_weight,
                     last_updated_ms: entry.last_updated_ms,
                 });
             }
-            if self.emit_changelog {
-                last_emitted
-                    .try_reserve_exact(state.last_emitted.len())
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "aggregate vnode {vnode} checkpoint changelog roster: {error}"
-                        ))
-                    })?;
-                last_emitted.extend(
-                    state
-                        .last_emitted
-                        .iter()
-                        .map(|(key, values)| (key.clone(), values.clone())),
-                );
+            let emitted = groups
+                .iter()
+                .filter(|group| group.last_emitted.is_some())
+                .count();
+            if self.emit_changelog && emitted != state.last_emitted.len() {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate vnode {vnode} holds changelog state for a missing group"
+                )));
             }
         }
         let mut capture = AggregateVnodeCheckpointCapture {
@@ -2120,7 +2157,6 @@ impl IncrementalAggState {
             group_types,
             row_converter,
             groups,
-            last_emitted,
             retained_bytes: 0,
         };
         capture.retained_bytes = capture.calculate_retained_bytes();
@@ -2269,7 +2305,6 @@ impl IncrementalAggState {
             )));
         }
         validate_columnar_acc_shape(checkpoint, &self.agg_specs)?;
-        let last_emitted = self.decode_last_emitted(&checkpoint.last_emitted)?;
         let mut groups = decode_columnar_state_scalars(
             &self.row_converter,
             self.num_group_cols,
@@ -2278,6 +2313,7 @@ impl IncrementalAggState {
             &checkpoint.input_weights,
             &checkpoint.last_updated_ms,
         )?;
+        let last_emitted = self.decode_last_emitted(checkpoint, &groups)?;
         canonicalize_decoded_group_keys(&mut groups)?;
         Ok(DecodedAggMutation {
             groups,
@@ -2304,18 +2340,7 @@ impl IncrementalAggState {
                 ));
             }
         }
-        for (row_key, values) in mutation.last_emitted {
-            if !staged.groups.contains_key(&row_key) {
-                return Err(DbError::Pipeline(
-                    "aggregate checkpoint contains changelog state for a missing group".into(),
-                ));
-            }
-            if staged.last_emitted.insert(row_key, values).is_some() {
-                return Err(DbError::Pipeline(
-                    "aggregate checkpoint contains a duplicate changelog key".into(),
-                ));
-            }
-        }
+        staged.last_emitted.extend(mutation.last_emitted);
         Ok(next_output_sequence)
     }
 
@@ -2391,7 +2416,7 @@ impl IncrementalAggState {
                 .map_err(|error| reserve_error("staged groups", error))?;
             let mut staged_last_emitted = FxHashMap::default();
             staged_last_emitted
-                .try_reserve(state.last_emitted.len().min(self.max_groups))
+                .try_reserve(state.emitted_groups.len().min(self.max_groups))
                 .map_err(|error| reserve_error("staged changelog state", error))?;
             let mut staged = StagedAggMutation {
                 groups: staged_groups,
@@ -2407,26 +2432,12 @@ impl IncrementalAggState {
                 .groups
                 .iter()
                 .any(|(key, _, _, _)| !belongs_to_vnode(key))
-                || decoded
-                    .last_emitted
-                    .iter()
-                    .any(|(key, _)| !belongs_to_vnode(key))
             {
                 return Err(DbError::Pipeline(format!(
                     "authoritative vnode {vnode} checkpoint contains a key for another vnode"
                 )));
             }
             let next_output_sequence = self.stage_recovery_base(&mut staged, decoded)?;
-            if staged
-                .last_emitted
-                .keys()
-                .any(|key| !staged.groups.contains_key(key))
-            {
-                return Err(DbError::Pipeline(
-                    "aggregate vnode transition contains changelog state for a missing group"
-                        .into(),
-                ));
-            }
 
             replacement_group_count =
                 checked_vnode_transition_capacity(replacement_group_count, staged.groups.len())?;

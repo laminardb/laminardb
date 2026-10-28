@@ -5,6 +5,10 @@
 pub struct StreamCheckpointConfig {
     /// Checkpoint interval in milliseconds. `None` = manual only.
     pub interval_ms: Option<u64>,
+    /// While a recent committed read waits for a newer checkpoint, the next periodic checkpoint
+    /// starts this long after the previous one ended instead of `interval_ms`. Must be shorter
+    /// than `interval_ms`. `None` = recent reads wait for the periodic cadence.
+    pub recent_read_interval_ms: Option<u64>,
     /// One end-to-end attempt deadline in milliseconds, spanning sink fencing, alignment,
     /// capture, durable publication, and completion delivery. `None` = default (`120_000`).
     pub timeout_ms: Option<u64>,

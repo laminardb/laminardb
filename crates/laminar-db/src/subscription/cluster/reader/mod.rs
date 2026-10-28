@@ -3,6 +3,7 @@
 mod authority;
 mod gateway;
 mod pin;
+mod view;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +51,20 @@ pub(crate) enum ClusterReaderFrame {
         delivery_sequence: u64,
         through_sequence: u64,
         stream_generation: StreamGeneration,
+        epoch: u64,
+        checkpoint_id: u64,
+    },
+    /// Rows of a view committed at `epoch`: its rows there in a snapshot, otherwise its change
+    /// since the committed cut before.
+    ViewRows {
+        batch: RecordBatch,
+        delivery_sequence: u64,
+        epoch: u64,
+        snapshot: bool,
+        permit: Arc<OwnedSemaphorePermit>,
+    },
+    ViewProgress {
+        delivery_sequence: u64,
         epoch: u64,
         checkpoint_id: u64,
     },
@@ -197,7 +212,7 @@ fn spawn_reader(
     let terminal = Arc::new(Mutex::new(None));
     let task_terminal = Arc::clone(&terminal);
     let generation = certificate.stream_generation;
-    let active_reader = ActiveReaderGuard::new(metrics.clone(), generation);
+    let active_reader = ActiveReaderGuard::new(metrics.clone(), generation.to_string());
     let task = tokio::spawn(async move {
         let _active_reader = active_reader;
         let mut replay_pin = replay_pin.map(GatewayReplayPin::new);
@@ -242,17 +257,18 @@ fn take_terminal(terminal: &Mutex<Option<ClusterSubscriptionError>>) -> ClusterS
 
 struct ActiveReaderGuard {
     metrics: Option<Arc<EngineMetrics>>,
-    generation: StreamGeneration,
+    /// The stream generation or view read.
+    subscribed: String,
 }
 
 impl ActiveReaderGuard {
-    fn new(metrics: Option<Arc<EngineMetrics>>, generation: StreamGeneration) -> Self {
+    fn new(metrics: Option<Arc<EngineMetrics>>, subscribed: String) -> Self {
         if let Some(metrics) = metrics.as_ref() {
             metrics.cluster_subscription.active_readers.inc();
         }
         Self {
             metrics,
-            generation,
+            subscribed,
         }
     }
 }
@@ -263,7 +279,7 @@ impl Drop for ActiveReaderGuard {
             metrics.cluster_subscription.active_readers.dec();
         }
         tracing::info!(
-            stream_generation = %self.generation,
+            subscribed = %self.subscribed,
             "closed committed cluster subscription"
         );
     }

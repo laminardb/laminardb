@@ -57,15 +57,18 @@ impl FixtureSource {
     }
 }
 
-/// Register every fixture source for one node; `polled` counts batches that node delivered.
+/// Register every fixture source for one node; `polled` counts batches that node delivered, and
+/// the node delivers no more than `allowance` of them.
 pub(super) fn register(
     sources: Vec<FixtureSource>,
     polled: Arc<AtomicU64>,
+    allowance: Arc<AtomicU64>,
 ) -> impl FnOnce(&ConnectorRegistry) -> Result<(), ConnectorError> + Send + 'static {
     move |registry| {
         for source in sources {
             let name = source.connector_type();
             let polled = Arc::clone(&polled);
+            let allowance = Arc::clone(&allowance);
             registry.register_source(
                 &name,
                 ConnectorInfo {
@@ -87,6 +90,7 @@ pub(super) fn register(
                         next: 0,
                         assignment: 0,
                         polled: Arc::clone(&polled),
+                        allowance: Arc::clone(&allowance),
                     }))
                 }),
             )?;
@@ -104,6 +108,7 @@ struct PartitionedSource {
     next: usize,
     assignment: u64,
     polled: Arc<AtomicU64>,
+    allowance: Arc<AtomicU64>,
 }
 
 fn channel(partition: usize) -> Vec<u8> {
@@ -147,6 +152,9 @@ impl SourceConnector for PartitionedSource {
     }
 
     async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+        if self.polled.load(Ordering::Acquire) >= self.allowance.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         for offset in 0..self.owned.len() {
             let slot = (self.next + offset) % self.owned.len();
             let partition = self.owned[slot];

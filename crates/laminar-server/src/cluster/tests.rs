@@ -804,7 +804,7 @@ struct TestClusterHandle {
     process_terminal: tokio_util::sync::CancellationToken,
     process_deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
     live_tx: watch::Sender<bool>,
-    tasks: [tokio::task::AbortHandle; 7],
+    tasks: [tokio::task::AbortHandle; 8],
 }
 
 async fn test_cluster_handle(drain_timeout: std::time::Duration) -> TestClusterHandle {
@@ -879,6 +879,8 @@ async fn test_cluster_handle(drain_timeout: std::time::Duration) -> TestClusterH
     let api_abort = api_handle.abort_handle();
     let watcher_handle = pending_task();
     let watcher_abort = watcher_handle.abort_handle();
+    let pgwire_handle = pending_task();
+    let pgwire_abort = pgwire_handle.abort_handle();
     let membership_handle = pending_task();
     let membership_abort = membership_handle.abort_handle();
     let rebalance_task = pending_task();
@@ -921,6 +923,7 @@ async fn test_cluster_handle(drain_timeout: std::time::Duration) -> TestClusterH
         discovery,
         serving_gate: Arc::clone(&serving_gate),
         api_handle,
+        pgwire_handle: Some(pgwire_handle),
         watcher_handle: Some(watcher_handle),
         membership_handle,
         local_node,
@@ -948,6 +951,7 @@ async fn test_cluster_handle(drain_timeout: std::time::Duration) -> TestClusterH
         tasks: [
             api_abort,
             watcher_abort,
+            pgwire_abort,
             membership_abort,
             rebalance_abort,
             leader_abort,

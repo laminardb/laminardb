@@ -2284,6 +2284,7 @@ mod shared_checkpoint {
             channel_progress: manifest.channel_progress.clone(),
             source_watermarks: BTreeMap::from([("events".into(), 105)]),
             checkpoint_watermark: Some(105),
+            view_frontiers: Default::default(),
         };
         let (_, reference) = committed.encode_and_reference().unwrap();
         let fixture = Fixture {

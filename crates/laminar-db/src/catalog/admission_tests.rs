@@ -213,9 +213,10 @@ async fn query_output_has_separate_ownership_from_push_input() {
         .unwrap()
         .into_query()
         .unwrap();
-    let mut subscription = query.subscribe_raw().unwrap();
-    let batch = tokio::time::timeout(Duration::from_secs(5), subscription.recv_async())
+    let mut rows = query.subscribe_raw().unwrap();
+    let batch = tokio::time::timeout(Duration::from_secs(5), rows.next_batch())
         .await
+        .unwrap()
         .unwrap()
         .unwrap();
     assert!(retained_arrow_bytes(&batch) > streaming::DEFAULT_SOURCE_MAX_QUEUED_BYTES);

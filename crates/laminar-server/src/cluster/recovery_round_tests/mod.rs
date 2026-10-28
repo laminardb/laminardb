@@ -198,7 +198,7 @@ impl Peer {
             NodeId(node),
             Arc::clone(&kv),
             Arc::clone(&kv),
-            None,
+            Some(Arc::new(AssignmentSnapshotStore::new(Arc::clone(&objects)))),
             members_rx,
             boot,
         ));

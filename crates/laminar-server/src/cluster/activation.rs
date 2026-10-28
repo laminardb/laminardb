@@ -814,6 +814,7 @@ pub(super) async fn activate_cluster_serving(
         .effective_drain_timeout(config.checkpoint.timeout);
     let leader_authority_timeout =
         verify_catalog_and_authority_budget(&runtime, &mut gate, &identity, &mut formed).await?;
+    let pgwire = crate::pgwire::Listener::from_config(&config.server);
 
     let (app_state, mut api_handle) = bind_http_and_announce_active(
         config,
@@ -850,6 +851,7 @@ pub(super) async fn activate_cluster_serving(
             active,
             api_handle,
             app_state,
+            pgwire,
             leader_authority_timeout,
             drain_timeout,
         },

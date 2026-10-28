@@ -397,6 +397,16 @@ fn group_key(expr: &Expr, field: &Field) -> KeyColumn {
     }
 }
 
+/// The output column of a windowed aggregate that forwards its window bound unchanged.
+pub(crate) fn window_output_column(logical: &LogicalPlan) -> Option<usize> {
+    let aggregate = crate::aggregate_state::find_aggregate(logical)?;
+    let group = aggregate.group_exprs.iter().position(is_window_marker)?;
+    match crate::aggregate_state::find_post_aggregate_projection(logical).ok()? {
+        None => Some(group),
+        Some(projection) => forwarding_output(projection, group),
+    }
+}
+
 /// The output columns that forward each group unchanged, or `None` when any group is not
 /// projected as a bare column.
 fn aggregate_output_key(logical: &LogicalPlan, groups: &[usize]) -> Option<PartitionKey> {

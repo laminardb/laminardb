@@ -2,6 +2,7 @@
 
 mod contracts;
 mod coordinated_commit;
+mod recency;
 mod sink;
 mod source;
 mod source_batch;
@@ -19,6 +20,7 @@ pub use coordinated_commit::{
     CoordinatedCommitter, MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
+pub use recency::{RecencyTarget, SourceRecency};
 pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
 pub use source::{
     SourceCheckpointUnavailablePolicy, SourceConnector, SourceDrainOutcome, SourceDrainRequest,

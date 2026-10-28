@@ -100,7 +100,8 @@ fn one_group() -> AggStateCheckpoint {
         acc_state_ipc: vec![ipc(vec![Arc::new(Int64Array::from(vec![1]))])],
         input_weights: vec![1],
         last_updated_ms: vec![i64::MIN],
-        last_emitted: Vec::new(),
+        emitted_groups: Vec::new(),
+        emitted_values_ipc: Vec::new(),
     }
 }
 
@@ -123,7 +124,8 @@ fn aggregate_archive_preflight_accepts_canonical_boundaries() {
         acc_state_ipc: Vec::new(),
         input_weights: Vec::new(),
         last_updated_ms: Vec::new(),
-        last_emitted: Vec::new(),
+        emitted_groups: Vec::new(),
+        emitted_values_ipc: Vec::new(),
     };
     let encoded = encode(&empty);
     assert_eq!(
@@ -179,10 +181,8 @@ fn aggregate_archive_preflight_rejects_shape_before_owned_decode() {
     cases.push((noncanonical_empty, "non-canonical empty"));
 
     let mut unexpected_changelog = one_group();
-    unexpected_changelog.last_emitted.push(EmittedCheckpoint {
-        key: vec![1],
-        values: vec![1],
-    });
+    unexpected_changelog.emitted_groups.push(0);
+    unexpected_changelog.emitted_values_ipc = ipc(vec![Arc::new(Int64Array::from(vec![1]))]);
     cases.push((unexpected_changelog, "non-changelog query"));
 
     let mut too_many_groups = one_group();
@@ -220,6 +220,60 @@ fn aggregate_archive_preflight_rejects_invalid_global_shapes() {
         .err()
         .expect("multiple global rows must fail preflight");
     assert!(error.to_string().contains("contains 2 groups"), "{error}");
+}
+
+#[test]
+fn aggregate_archive_preflight_checks_the_changelog_roster_against_the_groups() {
+    let changelog_profile = AggStateArchiveRestoreProfile::new(FINGERPRINT, 1, 2, 1, 1, true);
+    let two_groups = AggStateCheckpoint {
+        keys_ipc: ipc(vec![Arc::new(StringArray::from(vec!["a", "b"]))]),
+        acc_state_ipc: vec![ipc(vec![Arc::new(Int64Array::from(vec![1, 2]))])],
+        input_weights: vec![1, 1],
+        last_updated_ms: vec![0, 0],
+        ..one_group()
+    };
+    let emitted = |groups: Vec<u32>, values: Vec<i64>| {
+        let mut checkpoint = two_groups.clone();
+        checkpoint.emitted_groups = groups;
+        if !values.is_empty() {
+            checkpoint.emitted_values_ipc = ipc(vec![Arc::new(Int64Array::from(values))]);
+        }
+        checkpoint
+    };
+
+    for checkpoint in [
+        two_groups.clone(),
+        emitted(vec![1], vec![2]),
+        emitted(vec![0, 1], vec![1, 2]),
+    ] {
+        let encoded = encode(&checkpoint);
+        let preflighted = changelog_profile
+            .preflight(&encoded, format_args!("changelog"))
+            .unwrap();
+        assert_eq!(preflighted.group_count(), 2);
+    }
+
+    for (checkpoint, expected) in [
+        (emitted(vec![2], vec![1]), "strictly ascending group rows"),
+        (
+            emitted(vec![1, 0], vec![1, 2]),
+            "strictly ascending group rows",
+        ),
+        (
+            emitted(vec![0, 0], vec![1, 2]),
+            "strictly ascending group rows",
+        ),
+        (emitted(vec![0], Vec::new()), "changelog value bytes"),
+        (emitted(Vec::new(), vec![1]), "changelog value bytes"),
+        (emitted(vec![0, 1], vec![1]), "rows; expected"),
+    ] {
+        let encoded = encode(&checkpoint);
+        let error = changelog_profile
+            .preflight(&encoded, format_args!("changelog"))
+            .err()
+            .expect("a malformed changelog roster must fail preflight");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 #[test]

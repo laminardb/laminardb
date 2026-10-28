@@ -1,6 +1,7 @@
 # Temporary dependency exceptions
 
-Status: approved 2026-09-21, re-approved 2026-10-21, expires at 2026-11-20 UTC (CI fails on that date).
+Status: approved 2026-09-21, re-approved 2026-10-21, zstd exceptions added 2026-10-27; all expire
+at 2026-11-20 UTC (CI fails on that date).
 Owner: LaminarDB maintainers responsible for [PR #600](https://github.com/laminardb/laminardb/pull/600).
 The four residual exceptions below were re-reviewed and accepted for this interval under S4.
 Machine-readable versions, sources, checksums and reasons are in `dependency-exceptions.json`.
@@ -19,6 +20,23 @@ re-exports `TLS_SERVER_ROOTS` from webpki-roots 1.x, which the lockfile pins at 
 tokio-websockets 0.10; every async-nats release up to 0.50 still requires it, and building
 without its `websockets` feature would remove `ws://` NATS server URLs. Remove this exception
 when async-nats moves to tokio-websockets 0.12 or later.
+
+Thirteen zstd advisories published in October 2026 were excepted on 2026-10-27 ([PR #637](https://github.com/laminardb/laminardb/pull/637)),
+with the same deadline. They are fixed only in zstd 0.14.3 and zstd-safe 8.2.0, but DataFusion
+55.2, iceberg 0.10.1, chitchat 0.13 and apache-avro 0.22 still require zstd `^0.13` (arrow,
+parquet and async-compression's latest releases already accept 0.14), so the lockfile pins zstd
+0.13.3 and zstd-safe 7.3.0. zstd-sys was updated to 2.1.2, which fixes RUSTSEC-2026-0410. The
+graph enables only zstd's default features (`legacy`, `arrays`, `zdict_builder`) and none of
+zstd-safe's `experimental`, `seekable` or `zstdmt`:
+
+| Advisories | Status |
+| --- | --- |
+| [0395](https://rustsec.org/advisories/RUSTSEC-2026-0395.html), [0396](https://rustsec.org/advisories/RUSTSEC-2026-0396.html), [0398](https://rustsec.org/advisories/RUSTSEC-2026-0398.html), [0399](https://rustsec.org/advisories/RUSTSEC-2026-0399.html), [0402](https://rustsec.org/advisories/RUSTSEC-2026-0402.html), [0404](https://rustsec.org/advisories/RUSTSEC-2026-0404.html), [0406](https://rustsec.org/advisories/RUSTSEC-2026-0406.html) | Not compiled or not reachable: the APIs need `experimental`, `seekable` or a `zstdmt` multithreaded context. |
+| [0391](https://rustsec.org/advisories/RUSTSEC-2026-0391.html), [0400](https://rustsec.org/advisories/RUSTSEC-2026-0400.html), [0401](https://rustsec.org/advisories/RUSTSEC-2026-0401.html), [0405](https://rustsec.org/advisories/RUSTSEC-2026-0405.html) | No caller found: context reuse across streams, dictionaries, dictionary training and an out-of-range `InBuffer` position are not used. Workspace code calls only `zstd::bulk`. |
+| [0397](https://rustsec.org/advisories/RUSTSEC-2026-0397.html) | Accepted residual risk: async-compression calls `OutBuffer::around_pos` with a position from its own buffer bookkeeping. |
+| [0403](https://rustsec.org/advisories/RUSTSEC-2026-0403.html) | Accepted residual risk: with `legacy` on, a failed streaming decompression of a legacy frame from untrusted input (compressed files through DataFusion, Iceberg and Avro data) can expose uninitialized memory in the decoder's output buffer. |
+
+Remove these exceptions when DataFusion, iceberg, chitchat and apache-avro accept zstd 0.14.
 
 Two additional exceptions cover RUSTSEC-2026-0194 and RUSTSEC-2026-0195, with the same deadline.
 Workspace builds still require the verified quick-xml backport. Registry publication now has
