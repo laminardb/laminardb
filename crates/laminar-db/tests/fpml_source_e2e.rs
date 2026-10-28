@@ -407,9 +407,9 @@ async fn fpml_kafka_messages_feed_sql() {
     let dir = tempfile::tempdir().expect("dir");
     let ddl = [
         format!(
-            "CREATE SOURCE messages (
-                WATERMARK FOR creation_time_utc AS creation_time_utc - INTERVAL '1' SECOND
-             ) FROM KAFKA (
+            // No watermark: the corpus documents are years out of creation order, so one that
+            // arrives in a later poll than a newer one would be dropped as late.
+            "CREATE SOURCE messages FROM KAFKA (
                 'bootstrap.servers' = '{}',
                 'topic' = 'fpml',
                 'group.id' = 'fpml-sql',
