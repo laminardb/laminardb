@@ -7,8 +7,9 @@ use super::accounting::{
     owned_row_payload_usage, retained_changelog_vector_element_usage, topology_element_usage,
     vnode_inline_usage, AggregateStateUsage,
 };
-use super::GroupEntry;
+use super::{GroupEntry, IncrementalAggState};
 use crate::error::DbError;
+use crate::operator_graph::VnodeLoad;
 
 /// Complete mutable working set owned by one aggregate vnode.
 ///
@@ -415,5 +416,16 @@ impl AggregateVnodeSlots {
     #[cfg(test)]
     pub(super) fn active_vnodes_for_test(&self) -> &[u32] {
         &self.active_vnodes
+    }
+}
+
+impl IncrementalAggState {
+    /// Per-vnode spread of live groups, from each vnode's cached usage.
+    pub(crate) fn vnode_load(&self) -> VnodeLoad {
+        VnodeLoad::from_vnodes(
+            self.vnode_states
+                .iter()
+                .map(|(vnode, state)| (vnode, state.usage().accounted_bytes(), state.groups.len())),
+        )
     }
 }

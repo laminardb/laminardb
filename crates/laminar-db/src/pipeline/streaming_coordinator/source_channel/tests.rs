@@ -1,3 +1,4 @@
+use super::super::flow_metrics::CoordinatorFlowMetrics;
 use super::*;
 use arrow_array::{ArrayRef, BinaryArray, Int64Array, StringViewArray};
 use laminar_connectors::{checkpoint::SourceCheckpoint, connector::SourceBatchCursor};
@@ -21,13 +22,30 @@ fn charged_bytes() -> usize {
     tx.batch_bytes(&batch()).unwrap() as usize
 }
 
+fn scraped(registry: &prometheus::Registry, name: &str) -> Vec<prometheus::proto::Metric> {
+    registry
+        .gather()
+        .into_iter()
+        .find(|family| family.name() == name)
+        .map(|family| family.get_metric().to_vec())
+        .unwrap_or_default()
+}
+
+fn source_wait_seconds(registry: &prometheus::Registry, source: &str) -> Option<f64> {
+    scraped(registry, "source_queue_wait_seconds_total")
+        .into_iter()
+        .find(|metric| metric.get_label()[0].value() == source)
+        .map(|metric| metric.get_counter().value())
+}
+
 #[tokio::test]
 async fn scrape_tracks_parked_and_partial_reservations_then_replacement() {
     let registry = prometheus::Registry::new();
-    let metrics = metrics::SourceQueueMetrics::register(&registry).unwrap();
+    let metrics = CoordinatorFlowMetrics::register(&registry).unwrap();
     let reserved = || {
-        let families = registry.gather();
-        families[0].get_metric()[0].get_gauge().value()
+        scraped(&registry, "source_queue_reserved_bytes")[0]
+            .get_gauge()
+            .value()
     };
     assert_eq!(reserved(), 0.0);
     let bytes = charged_bytes();
@@ -35,7 +53,7 @@ async fn scrape_tracks_parked_and_partial_reservations_then_replacement() {
     let charged = f64::from(u32::try_from(bytes).unwrap());
     let full = f64::from(u32::try_from(limit).unwrap());
     let (tx, rx) = channel(8, limit);
-    metrics.observe(&rx, limit);
+    metrics.observe(rx.observation(limit), Arc::default());
     tx.send(message(0)).await.unwrap();
     let parked = rx.recv().await.unwrap();
     assert_eq!(reserved(), charged);
@@ -54,13 +72,57 @@ async fn scrape_tracks_parked_and_partial_reservations_then_replacement() {
     assert_eq!(reserved(), 0.0);
     tx.send(message(0)).await.unwrap();
     let (replacement_tx, replacement_rx) = channel(8, limit);
-    metrics.observe(&replacement_rx, limit);
+    metrics.observe(replacement_rx.observation(limit), Arc::default());
     assert_eq!(reserved(), 0.0);
     replacement_tx.send(message(1)).await.unwrap();
     assert_eq!(reserved(), charged);
     drop(replacement_tx);
     drop(replacement_rx);
     assert_eq!(reserved(), 0.0);
+}
+
+#[tokio::test]
+async fn waits_are_timed_per_source_including_cancelled_sends_and_survive_restart() {
+    let registry = prometheus::Registry::new();
+    let metrics = CoordinatorFlowMetrics::register(&registry).unwrap();
+    let bytes = charged_bytes();
+    let (tx, rx) = channel(8, bytes);
+    metrics.observe(rx.observation(bytes), Arc::default());
+    let hot = tx.for_source("hot");
+    let cold = tx.for_source("cold");
+    hot.send(message(0)).await.unwrap();
+    assert_eq!(source_wait_seconds(&registry, "hot"), Some(0.0));
+    {
+        let waiting = cold.send(message(1));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+    }
+    let waited = source_wait_seconds(&registry, "cold").unwrap();
+    assert!(
+        waited >= 0.01,
+        "a cancelled byte wait still counts: {waited}"
+    );
+    assert_eq!(source_wait_seconds(&registry, "hot"), Some(0.0));
+    let same_source = tx.for_source("cold");
+    assert!(Arc::ptr_eq(
+        same_source.waited_ns.as_ref().unwrap(),
+        cold.waited_ns.as_ref().unwrap()
+    ));
+
+    let (_replacement_tx, replacement_rx) = channel(8, bytes);
+    metrics.observe(replacement_rx.observation(bytes), Arc::default());
+    assert_eq!(source_wait_seconds(&registry, "cold"), Some(waited));
+    assert_eq!(
+        scraped(&registry, "source_queue_messages")[0]
+            .get_gauge()
+            .value(),
+        0.0
+    );
+    assert_eq!(scraped(&registry, "intake_paused_seconds_total").len(), 3);
 }
 
 #[tokio::test]

@@ -60,7 +60,7 @@ impl SourceActorSpawner<'_> {
         let terminal_tasks = task_fence.tracker();
         let task_shutdown = Arc::new(tokio::sync::Notify::new());
         let task_shutdown_clone = Arc::clone(&task_shutdown);
-        let task_tx = self.tx.clone();
+        let task_tx = self.tx.for_source(&src.name);
         let task_fault_tx = self.source_fault_tx.clone();
         let task_gate = Arc::clone(self.source_gate);
         #[cfg(feature = "cluster")]

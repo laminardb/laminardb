@@ -405,7 +405,7 @@ fn register_subscription_histogram(registry: &Registry, name: &str, help: &str) 
 /// Constructed once at startup, `Arc`-shared into `PipelineCallback`,
 /// `CheckpointCoordinator`, and `OperatorGraph`.
 pub struct EngineMetrics {
-    pub(crate) source_queue: crate::pipeline::streaming_coordinator::SourceQueueMetrics,
+    pub(crate) flow: crate::flow_metrics::FlowMetrics,
     /// Committed cluster-subscription metrics without per-stream or per-reader labels.
     #[cfg(feature = "cluster")]
     pub cluster_subscription: ClusterSubscriptionMetrics,
@@ -554,8 +554,7 @@ impl EngineMetrics {
         let (events_ingested, events_emitted) = register_event_counters(registry);
 
         Self {
-            source_queue: crate::pipeline::streaming_coordinator::SourceQueueMetrics::register(registry)
-                .unwrap(),
+            flow: crate::flow_metrics::FlowMetrics::new(registry),
             #[cfg(feature = "cluster")]
             cluster_subscription: ClusterSubscriptionMetrics::new(registry),
             events_ingested,

@@ -164,6 +164,9 @@ impl LaminarDB {
                     #[cfg(feature = "cluster")]
                     process_authority: sink_process_authority.clone(),
                 });
+            if let Some(metrics) = self.engine_metrics() {
+                handle.install_flow_metrics(metrics.flow.sink(&name));
+            }
             {
                 let mut owned = self.owned_sink_handles.lock();
                 debug_assert!(!owned.iter().any(|known| known.same_actor(&handle)));

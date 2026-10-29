@@ -441,7 +441,12 @@ managed-state charge, checkpoint size and checkpoint duration during normal load
 recovery. The `/metrics` endpoint exposes `laminardb_cycles_backpressured_total`,
 `laminardb_input_buf_bytes`, `laminardb_managed_state_accounted_bytes`,
 `laminardb_checkpoint_size_bytes`, and checkpoint duration/failure metrics. The managed-state
-metric is a lower-bound charge, so use OS/container RSS for memory sizing.
+metric is a lower-bound charge, so use OS/container RSS for memory sizing. Where input waits
+is exported too: `laminardb_source_queue_wait_seconds_total`,
+`laminardb_intake_paused_seconds_total`, `laminardb_sink_epoch_gate_wait_seconds`,
+`laminardb_managed_state_budget_ratio`, and the per-operator `laminardb_vnode_*` skew gauges.
+The [flow-control table](../laminar-db/README.md#flow-control-and-backpressure) lists every
+bounded buffer, what happens when it is full, and its metrics.
 
 Set the container memory limit above the measured peak with room for connector decoding, Arrow
 buffers, operator scratch, query results, simultaneous old/new state during restore, checkpoint

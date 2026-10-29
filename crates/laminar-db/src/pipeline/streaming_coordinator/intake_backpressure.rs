@@ -1,5 +1,6 @@
 #[cfg(feature = "cluster")]
 use super::drain_ownership::source_drain_awaits_intake;
+use super::flow_metrics::IntakePause;
 use super::{
     CoordinatorGates, CoordinatorRunState, CycleError, PipelineCallback, QueuedSourceMsg,
     StreamingCoordinator,
@@ -36,6 +37,33 @@ impl StreamingCoordinator {
             intake_paused,
             external_output_backpressured,
         }
+    }
+
+    pub(super) fn observe_intake_gates(
+        &mut self,
+        state: &mut CoordinatorRunState,
+        gates: &CoordinatorGates,
+        intake_blocked: bool,
+    ) {
+        self.observe_intake_gate_for_checkpoint_cadence(state, intake_blocked);
+        self.intake_stats.observe_queue(self.rx.len());
+        let output_backpressured = !intake_blocked && gates.external_output_backpressured;
+        self.intake_stats
+            .observe(IntakePause::Fence, intake_blocked);
+        self.intake_stats
+            .observe(IntakePause::Output, output_backpressured);
+        if intake_blocked || output_backpressured {
+            self.intake_stats
+                .observe(IntakePause::PortBackpressure, false);
+        }
+    }
+
+    pub(super) fn observe_port_backpressure(&self, backpressured: bool) {
+        if backpressured {
+            tracing::debug!("operator graph backpressured — skipping drain");
+        }
+        self.intake_stats
+            .observe(IntakePause::PortBackpressure, backpressured);
     }
 
     pub(super) async fn service_paused_intake(

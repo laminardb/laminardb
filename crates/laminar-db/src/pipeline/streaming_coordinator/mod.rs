@@ -49,7 +49,7 @@ use crate::catalog::{schema_has_reserved_mutation_columns, validate_source_batch
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
 
-pub(crate) use source_channel::metrics::SourceQueueMetrics;
+pub(crate) use flow_metrics::CoordinatorFlowMetrics;
 use source_channel::{QueuedSourceMsg, SourceMsgRx, SourceMsgTx};
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 type ForceCheckpointRequest = crate::db::ForceCheckpointRequest;
@@ -67,6 +67,7 @@ mod construction;
 mod cycle;
 mod drain_ownership;
 mod execution;
+mod flow_metrics;
 mod intake_backpressure;
 mod shutdown;
 mod source_actor;
@@ -426,6 +427,7 @@ pub struct StreamingCoordinator {
     #[cfg(feature = "cluster")]
     process_authority: Option<Arc<SourceProcessAuthority>>,
     public_generation: Option<StreamingCoordinatorGeneration>,
+    intake_stats: Arc<flow_metrics::IntakeStats>,
 }
 
 // These flags describe independent protocol state and cannot be combined without obscuring the
@@ -510,6 +512,7 @@ impl Drop for StreamingCoordinator {
         for handle in &self.source_handles {
             handle.task.request_shutdown();
         }
+        self.intake_stats.close();
         // Release public construction ownership only after every source has observed shutdown.
         drop(self.public_generation.take());
     }

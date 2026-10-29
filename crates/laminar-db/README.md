@@ -260,6 +260,45 @@ checkpoint batches and private quota-checked replacement stores together. Query/
 materialization and pinned checkpoint captures
 need additional headroom and retain their existing separate guards.
 
+## Flow control and backpressure
+
+Every buffer between a source and a sink or subscriber is bounded, and each one has a single
+response when it is full. A slow consumer makes its producer wait. Rows are shed only under
+best-effort delivery and are counted. State budgets fail closed, and external readers are
+disconnected. Accepted input is never dropped silently. Metric names below are as registered;
+the server's `/metrics` endpoint adds the `laminardb_` prefix.
+
+| Boundary | Modes | Bound (default) | When full | Metrics |
+|---|---|---|---|---|
+| In-process push queue (`insert`, source handles, writers) | embedded, single-node | per source: `default_buffer_size` messages (65,536) and `push_source_max_bytes` (64 MiB) | the push returns `ChannelFull` | `SourceMetrics::is_backpressured` |
+| Connector-to-coordinator FIFO | all | shared: 64 messages and `source_queue_max_bytes` (64 MiB) | the source task waits | `source_queue_wait_seconds_total{source}`, `source_queue_messages`, `source_queue_reserved_bytes` |
+| Coordinator drain | all | 10,000 messages or 1 ms per cycle | while a graph port is above 80% full, a cycle stages one message | `intake_paused_seconds_total{reason="port_backpressure"}`, `cycles_backpressured_total` |
+| Intake fences (recovery, vnode transition, handoff) | all | — | intake waits | `intake_paused_seconds_total{reason="fence"}` |
+| Graph input ports | all | `pipeline_max_input_buf_batches` (256); `pipeline_max_input_buf_bytes` (unset) | operator output follows `BackpressurePolicy`; source input that does not fit halts the pipeline (see [graph input limits](#graph-input-limits)) | `input_buf_bytes{stream}`, `shed_records_total{stream}` |
+| Managed operator state | all | `pipeline_max_managed_state_bytes` (256 MiB, a lower-bound charge); 1,000,000 groups per aggregate | the budget halts the pipeline; the group cap fails the cycle | `managed_state_accounted_bytes`, `managed_state_budget_ratio`, `vnode_state_bytes_max`, `vnode_state_bytes_mean`, `vnode_groups_max`, `vnode_hottest` |
+| Shuffle between nodes | cluster | 256 frames, 32 MiB per peer and 128 MiB per node, each direction | the sending operator waits; gRPC flow control pushes back | `aggregate_shuffle_rows_total{operator,form}` |
+| Materialized views | all | 1,000,000 rows and 256 MiB per view | the cycle fails and faults the pipeline, leaving source cursors uncommitted (see [materialized-view memory limits](#materialized-view-memory-limits)) | — |
+| Sink command queue and epoch gate | all | 32 commands per sink; a checkpoint-committable sink accepts writes only in an open epoch | the coordinator waits; the write timeout starts once the epoch is open | `sink_command_queue_depth{sink}`, `sink_epoch_gate_wait_seconds{sink}` |
+| Local subscriptions | embedded, single-node | per-log byte caps; 256 MiB per process | a slow reader gets `Lagged` and is closed | `subscription_log_bytes` |
+| Cluster subscription output | cluster | 256 MiB pending per node | at half, a checkpoint is requested; at three quarters, intake pauses | `cluster_subscription_pending_bytes`, `intake_paused_seconds_total{reason="output"}` |
+
+Waits have no default deadline: under load or skew a slow peer or sink is expected to make its
+producer wait, and a deadline would turn that wait into a recovery round.
+
+`intake_paused_seconds_total` reasons are exclusive: a fence takes precedence over output
+pressure, and both over port pressure. `source_queue_messages` is sampled at each coordinator
+wake. `sink_epoch_gate_wait_seconds` observes only waits; a write into an open epoch is not
+recorded.
+
+Aggregates and managed windows report the `vnode_*` gauges. Each summarises one operator's
+accounted state over the vnodes this node holds state for, refreshed every 32 cycles. `vnode_state_bytes_max` against `vnode_state_bytes_mean`
+shows imbalance within a node. Comparing `sum by (instance)` of `managed_state_accounted_bytes`
+across nodes shows imbalance between nodes. `vnode_hottest` is the id of the largest vnode, with
+ties going to the lowest id. Window operators count a key once per open window or session.
+`aggregate_shuffle_rows_total` counts, per aggregate, the rows owned by another node
+(`form="input"`) and the rows sent for them (`form="sent"`). They are equal for keyed
+aggregates; a global aggregate sends one partial row per batch.
+
 ## Feature Flags
 
 | Flag | Purpose |

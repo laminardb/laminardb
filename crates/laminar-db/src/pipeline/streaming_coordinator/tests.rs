@@ -2201,6 +2201,7 @@ fn test_coordinator(
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     }
@@ -10190,6 +10191,7 @@ async fn test_coordinator_direct_channel() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -10650,6 +10652,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -10943,6 +10946,7 @@ async fn test_barrier_excludes_post_barrier_data() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -11137,6 +11141,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -11574,6 +11579,7 @@ async fn test_drain_skip_under_backpressure() {
         checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
         last_published_checkpoint: None,
         public_generation: None,
+        intake_stats: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
     };

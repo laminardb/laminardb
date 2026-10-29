@@ -1,15 +1,17 @@
 //! Byte admission for the shared connector FIFO, including parked messages and shutdown tails.
 
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_array::RecordBatch;
 use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use laminar_core::streaming::StreamingError;
+use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::SourceMsg;
-
-pub(super) mod metrics;
 
 pub(super) struct QueuedSourceMsg {
     pub(super) message: SourceMsg,
@@ -27,32 +29,119 @@ pub(super) enum SourceQueueError {
     Closed,
 }
 
+/// Nanoseconds each source spent waiting for queue bytes or a queue slot, by source name.
+#[derive(Default)]
+pub(super) struct SourceQueueWaits {
+    sources: Mutex<Vec<(Arc<str>, Arc<AtomicU64>)>>,
+}
+
+impl SourceQueueWaits {
+    fn counter(&self, source: &str) -> Arc<AtomicU64> {
+        let mut sources = self.sources.lock();
+        if let Some((_, waited)) = sources.iter().find(|(name, _)| &**name == source) {
+            return Arc::clone(waited);
+        }
+        let waited = Arc::new(AtomicU64::new(0));
+        sources.push((Arc::from(source), Arc::clone(&waited)));
+        waited
+    }
+
+    pub(super) fn totals(&self) -> Vec<(Arc<str>, u64)> {
+        self.sources
+            .lock()
+            .iter()
+            .map(|(name, waited)| (Arc::clone(name), waited.load(Ordering::Relaxed)))
+            .collect()
+    }
+}
+
+/// Adds the time since the first wait began, also when the send is cancelled mid-wait.
+struct QueueWait<'a> {
+    waited_ns: Option<&'a AtomicU64>,
+    started: Option<Instant>,
+}
+
+impl QueueWait<'_> {
+    /// Await `operation`, reading the clock only if its first poll is pending; admission that
+    /// is immediate stays untimed.
+    async fn time<F: Future>(&mut self, operation: F) -> F::Output {
+        let mut operation = std::pin::pin!(operation);
+        std::future::poll_fn(|cx| {
+            let poll = operation.as_mut().poll(cx);
+            if poll.is_pending() && self.waited_ns.is_some() && self.started.is_none() {
+                self.started = Some(Instant::now());
+            }
+            poll
+        })
+        .await
+    }
+}
+
+impl Drop for QueueWait<'_> {
+    fn drop(&mut self) {
+        if let (Some(waited_ns), Some(started)) = (self.waited_ns, self.started) {
+            let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            waited_ns.fetch_add(elapsed, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct SourceMsgTx {
     tx: MAsyncTx<mpsc::Array<QueuedSourceMsg>>,
     budget: Arc<Semaphore>,
     max_bytes: usize,
+    waits: Arc<SourceQueueWaits>,
+    waited_ns: Option<Arc<AtomicU64>>,
 }
 
 pub(super) struct SourceMsgRx {
     rx: AsyncRx<mpsc::Array<QueuedSourceMsg>>,
     budget: Arc<Semaphore>,
+    waits: Arc<SourceQueueWaits>,
+}
+
+/// Scrape-time view of one queue. It never keeps a stopped queue alive; the wait counters
+/// outlive it so totals survive a pipeline restart.
+pub(super) struct QueueObservation {
+    max_bytes: usize,
+    budget: std::sync::Weak<Semaphore>,
+    pub(super) waits: Arc<SourceQueueWaits>,
+}
+
+impl QueueObservation {
+    pub(super) fn reserved_bytes(&self) -> usize {
+        self.budget.upgrade().map_or(0, |budget| {
+            self.max_bytes.saturating_sub(budget.available_permits())
+        })
+    }
 }
 
 pub(super) fn channel(capacity: usize, max_bytes: usize) -> (SourceMsgTx, SourceMsgRx) {
     let (tx, rx) = mpsc::bounded_async(capacity);
     let budget = Arc::new(Semaphore::new(max_bytes));
+    let waits = Arc::new(SourceQueueWaits::default());
     (
         SourceMsgTx {
             tx,
             budget: Arc::clone(&budget),
             max_bytes,
+            waits: Arc::clone(&waits),
+            waited_ns: None,
         },
-        SourceMsgRx { rx, budget },
+        SourceMsgRx { rx, budget, waits },
     )
 }
 
 impl SourceMsgTx {
+    /// A producer handle whose waits are recorded under `source`.
+    pub(super) fn for_source(&self, source: &str) -> Self {
+        Self {
+            waited_ns: Some(self.waits.counter(source)),
+            ..self.clone()
+        }
+    }
+
     fn batch_bytes(&self, batch: &RecordBatch) -> Result<u32, SourceQueueError> {
         // Arrow reports retained capacities, including backing storage for slices, nested arrays
         // and views. Charge aliases independently; deduplicating would add hot-path bookkeeping.
@@ -78,12 +167,16 @@ impl SourceMsgTx {
     }
 
     pub(super) async fn send(&self, message: SourceMsg) -> Result<(), SourceQueueError> {
+        let mut wait = QueueWait {
+            waited_ns: self.waited_ns.as_deref(),
+            started: None,
+        };
         let permit = match &message {
             SourceMsg::Batch { batch, .. } => {
                 let bytes = self.batch_bytes(batch)?;
+                let acquire = Arc::clone(&self.budget).acquire_many_owned(bytes);
                 Some(
-                    Arc::clone(&self.budget)
-                        .acquire_many_owned(bytes)
+                    wait.time(acquire)
                         .await
                         .map_err(|_| SourceQueueError::Closed)?,
                 )
@@ -92,13 +185,11 @@ impl SourceMsgTx {
             // behind another source's byte waiter. Count saturation retains existing backpressure.
             SourceMsg::Barrier { .. } => None,
         };
-        self.tx
-            .send(QueuedSourceMsg {
-                message,
-                _permit: permit,
-            })
-            .await
-            .map_err(|_| SourceQueueError::Closed)
+        let send = self.tx.send(QueuedSourceMsg {
+            message,
+            _permit: permit,
+        });
+        wait.time(send).await.map_err(|_| SourceQueueError::Closed)
     }
 
     pub(super) fn try_send(&self, message: SourceMsg) -> Result<(), SourceQueueError> {
@@ -129,6 +220,18 @@ impl SourceMsgTx {
 }
 
 impl SourceMsgRx {
+    pub(super) fn observation(&self, max_bytes: usize) -> QueueObservation {
+        QueueObservation {
+            max_bytes,
+            budget: Arc::downgrade(&self.budget),
+            waits: Arc::clone(&self.waits),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.rx.len()
+    }
+
     pub(super) fn recv(
         &self,
     ) -> impl std::future::Future<Output = Result<QueuedSourceMsg, crossfire::RecvError>> + Send + '_

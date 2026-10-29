@@ -7586,3 +7586,41 @@ async fn interval_output_admission_preserves_weighted_and_oversized_boundaries()
         assert!(graph.execution_poison_reason().is_some());
     }
 }
+
+#[tokio::test]
+async fn cold_metrics_publish_budget_ratio_and_vnode_spread_of_a_keyed_aggregate() {
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    let mut graph = test_graph();
+    graph.add_query(
+        "agg".to_string(),
+        "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let limit = 1 << 30;
+    graph.set_max_managed_state_bytes(limit);
+    graph.set_metrics(Arc::clone(&prom));
+    graph
+        .execute_cycle(&trades_source(), i64::MAX, None)
+        .await
+        .unwrap();
+    graph.publish_buffer_stats();
+
+    let flow = &prom.flow;
+    #[allow(clippy::cast_precision_loss)]
+    let expected_ratio = graph.managed_state_accounted_bytes() as f64 / limit as f64;
+    assert!(expected_ratio > 0.0);
+    assert!((flow.managed_state_budget_ratio.get() - expected_ratio).abs() < f64::EPSILON);
+    let max = flow.vnode_state_bytes_max.with_label_values(&["agg"]).get();
+    let mean = flow
+        .vnode_state_bytes_mean
+        .with_label_values(&["agg"])
+        .get();
+    assert!(max > 0 && mean > 0 && mean <= max, "max={max} mean={mean}");
+    assert!((1..=2).contains(&flow.vnode_groups_max.with_label_values(&["agg"]).get()));
+    assert!((0..256).contains(&flow.vnode_hottest.with_label_values(&["agg"]).get()));
+}
