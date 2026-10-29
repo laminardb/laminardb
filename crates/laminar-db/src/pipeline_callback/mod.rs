@@ -6149,8 +6149,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         apply_control_to_graph(&mut self.graph, msg);
     }
 
-    fn is_backpressured(&self) -> bool {
-        self.graph_backpressured()
+    fn source_port_headroom(&self, source: &str) -> crate::pipeline::callback::PortHeadroom {
+        self.graph.source_port_headroom(source)
+    }
+
+    fn note_source_backpressure(&self) {
+        self.prom.cycles_backpressured.inc();
     }
 
     fn external_output_pressure(&self) -> crate::pipeline::callback::ExternalOutputPressure {

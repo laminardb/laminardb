@@ -19,7 +19,7 @@ fn test_source_channel(capacity: usize) -> (SourceMsgTx, SourceMsgRx) {
 }
 
 #[tokio::test]
-async fn source_queue_charge_follows_parked_input_until_staging() {
+async fn source_queue_charge_follows_parked_and_staged_input_until_admission() {
     let (tx, rx) = source_channel::channel(8, 4096);
     let payload = vec![0; 3000];
     let batch = RecordBatch::try_from_iter([(
@@ -60,7 +60,12 @@ async fn source_queue_charge_follows_parked_input_until_staging() {
     assert_eq!(events, 1);
     assert!(coordinator.committed_offsets[0].is_none());
     assert_eq!(coordinator.source_batches_buf["test_source"].len(), 1);
-    // Staging transferred ownership: graph/cycle retention does not retain a queue reservation.
+    assert!(matches!(
+        tx.try_send(message()),
+        Err(source_channel::SourceQueueError::Full)
+    ));
+    // The cycle's graph admission releases the staged batch's queue reservation.
+    coordinator.release_staged_permits();
     tx.try_send(message()).unwrap();
 }
 
@@ -2187,6 +2192,7 @@ fn test_coordinator(
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -10177,6 +10183,7 @@ async fn test_coordinator_direct_channel() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -10638,6 +10645,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -10932,6 +10940,7 @@ async fn test_barrier_excludes_post_barrier_data() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None, None],
@@ -11124,6 +11133,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None, None],
@@ -11366,26 +11376,29 @@ async fn deferred_replay_drains_before_admitting_queued_source_input() {
     }
 }
 
-struct BackpressuredCallback {
+struct HeadroomCallback {
     inner: MockCallback,
+    headroom: usize,
     cycle_count: Arc<std::sync::atomic::AtomicU32>,
     events_per_cycle: Arc<Mutex<Vec<u64>>>,
 }
 
-impl BackpressuredCallback {
+impl HeadroomCallback {
     fn new(
+        headroom: usize,
         cycle_count: Arc<std::sync::atomic::AtomicU32>,
         events_per_cycle: Arc<Mutex<Vec<u64>>>,
     ) -> Self {
         Self {
             inner: MockCallback::new(),
+            headroom,
             cycle_count,
             events_per_cycle,
         }
     }
 }
 
-impl PipelineCallback for BackpressuredCallback {
+impl PipelineCallback for HeadroomCallback {
     async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -11517,17 +11530,18 @@ impl PipelineCallback for BackpressuredCallback {
         self.inner.apply_control(msg);
     }
 
-    fn is_backpressured(&self) -> bool {
-        true // Always backpressured — drain loop should never fire.
+    fn source_port_headroom(&self, _source: &str) -> PortHeadroom {
+        PortHeadroom {
+            batches: self.headroom,
+            bytes: None,
+            empty: false,
+        }
     }
 }
 
-/// With `is_backpressured() == true`, the coordinator processes only
-/// the first wakeup message per cycle (no drain coalescing). With 5
-/// messages pre-loaded and `batch_window=0`, each cycle should see
-/// exactly 1 event, spread across multiple cycles.
-#[tokio::test]
-async fn test_drain_skip_under_backpressure() {
+/// Run a coordinator over five queued one-row messages whose source port takes `headroom`
+/// batches per cycle, for 300 ms. Returns the exit, the cycle count and the rows per cycle.
+async fn run_with_source_headroom(headroom: usize) -> (ExitReason, u32, Vec<u64>) {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
@@ -11565,6 +11579,7 @@ async fn test_drain_skip_under_backpressure() {
         checkpoint_retry_backoff: Duration::ZERO,
         source_batches_buf: FxHashMap::default(),
         parked_source_msg: None,
+        source_admission: SourceAdmission::default(),
         pending_watermark_batches: Vec::new(),
         barrier_seen: FxHashSet::default(),
         committed_offsets: vec![None],
@@ -11610,30 +11625,40 @@ async fn test_drain_skip_under_backpressure() {
 
     let cycle_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let events_per_cycle = Arc::new(Mutex::new(Vec::new()));
-    let callback =
-        BackpressuredCallback::new(Arc::clone(&cycle_count), Arc::clone(&events_per_cycle));
-    coordinator.run(callback).await;
-
-    let cycles = cycle_count.load(std::sync::atomic::Ordering::SeqCst);
-    let epc = events_per_cycle.lock();
-    let total: u64 = epc.iter().sum();
-
-    // All 5 events must be processed (no data loss).
-    assert_eq!(total, 5, "all events must be processed, got {total}");
-    // Under backpressure each cycle gets only the wakeup message (1
-    // event), so we need at least 5 cycles for 5 messages. Without
-    // backpressure, cycle 1 would drain all 5 in one shot.
-    assert!(
-        cycles >= 5,
-        "expected >=5 cycles (1 event each), got {cycles} cycles with events/cycle: {epc:?}"
+    let callback = HeadroomCallback::new(
+        headroom,
+        Arc::clone(&cycle_count),
+        Arc::clone(&events_per_cycle),
     );
-    // Each cycle sees at most 1 event (the wakeup message; drain skipped).
-    for (i, &events) in epc.iter().enumerate() {
-        assert!(
-            events <= 1,
-            "cycle {i} saw {events} events, expected <=1 under backpressure"
-        );
-    }
+    let exit = coordinator.run(callback).await;
+    let cycles = cycle_count.load(std::sync::atomic::Ordering::SeqCst);
+    let events = events_per_cycle.lock().clone();
+    (exit, cycles, events)
+}
+
+/// The third message of each cycle is parked and starts the next cycle, in FIFO order.
+#[tokio::test]
+async fn test_drain_stages_only_what_source_ports_can_take() {
+    let (exit, cycles, epc) = run_with_source_headroom(2).await;
+    assert!(matches!(exit, ExitReason::Shutdown));
+    let total: u64 = epc.iter().sum();
+    assert_eq!(total, 5, "all events must be processed, got {total}");
+    let staged: Vec<u64> = epc.iter().copied().filter(|&events| events > 0).collect();
+    assert_eq!(
+        staged,
+        [2, 2, 1],
+        "{cycles} cycles with events/cycle: {epc:?}"
+    );
+}
+
+/// A parked message that cannot fit and has no runnable graph work behind it waits for a wake.
+/// On this current-thread runtime a spinning coordinator would starve the shutdown timer. The
+/// shutdown drain drops the parked message and everything behind it instead of halting.
+#[tokio::test]
+async fn parked_message_without_headroom_waits_and_is_dropped_at_shutdown() {
+    let (exit, cycles, epc) = run_with_source_headroom(0).await;
+    assert!(matches!(exit, ExitReason::Shutdown), "{exit:?}");
+    assert_eq!(cycles, 0, "{epc:?}");
 }
 
 #[tokio::test]

@@ -2,6 +2,8 @@
 
 use laminar_core::streaming::retained_arrow_bytes;
 
+use crate::pipeline::callback::PortHeadroom;
+
 use super::{
     Arc, BackpressurePolicy, DbError, FxHashMap, GateDecision, InputFrontier, OperatorGraph,
     OperatorImplementation, Ordering, RecordBatch, SourceBatchView,
@@ -173,12 +175,49 @@ impl OperatorGraph {
         batches: usize,
         bytes: usize,
     ) -> Result<(), DbError> {
+        // The output already exists and the producer's state has moved past it, and the gate ran
+        // the producer only while every target port was below its bound. Under `Backpressure`
+        // the port takes the whole output and the gate holds the producer until the consumer
+        // drains it, so a port exceeds its bound by at most one producer run.
+        if self.backpressure_policy != BackpressurePolicy::Fail {
+            return Ok(());
+        }
         // Each destination owns its full charge even when Arrow backing storage is shared.
         // Duplicate edge registration is normalized when topology is built.
         for &(target, port) in &self.nodes[node].output_routes {
             self.require_port_capacity(target, port, batches, bytes)?;
         }
         Ok(())
+    }
+
+    /// Room left on the ports a source's staged batches are primed into. The coordinator's drain
+    /// stages a source message only when it fits, so source intake waits on a full port.
+    pub(crate) fn source_port_headroom(&self, source: &str) -> PortHeadroom {
+        let mut headroom = PortHeadroom::UNBOUNDED;
+        if self.backpressure_policy == BackpressurePolicy::ShedOldest {
+            return headroom;
+        }
+        let views = [
+            self.source_map.get(source),
+            self.positioned_source_map.get(source),
+        ];
+        for &node in views.into_iter().flatten() {
+            let (batches, bytes) = (
+                self.input_bufs[node][0].len(),
+                self.input_buf_bytes[node][0],
+            );
+            if self.max_input_buf_batches > 0 {
+                headroom.batches = headroom
+                    .batches
+                    .min(self.max_input_buf_batches.saturating_sub(batches));
+            }
+            if let Some(max) = self.max_input_buf_bytes {
+                let left = max.saturating_sub(bytes);
+                headroom.bytes = Some(headroom.bytes.map_or(left, |bytes| bytes.min(left)));
+            }
+            headroom.empty &= batches == 0;
+        }
+        headroom
     }
 
     pub(super) fn is_downstream_at_capacity(&self, node_id: usize) -> bool {

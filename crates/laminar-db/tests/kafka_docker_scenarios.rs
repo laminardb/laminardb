@@ -432,11 +432,27 @@ async fn durable_graph_overflow_and_restart_ledger() {
         drop(db);
 
         // Input fits; the intermediate 128 KiB column cannot fit the 64 KiB graph port.
-        // Both lossless policies must reject this indivisible output before publication.
+        // `Backpressure` admits the output of a run whole, so the port exceeds its bound by that
+        // run and the producer waits; `Fail` rejects it before publication.
         config.pipeline_max_input_buf_bytes = Some(64 * 1024);
         let (db, metrics) = pressure_database(config.clone(), brokers, &input, &output).await;
         db.start().await.unwrap();
         produce_json_range(brokers, &input, 20..40).await;
+        if policy == BackpressurePolicy::Backpressure {
+            wait_for_required_ids(
+                brokers,
+                &output,
+                &unique("admitted"),
+                0..40,
+                Duration::from_secs(30),
+            )
+            .await;
+            assert_eq!(db.last_fault(), None);
+            assert_eq!(metrics.events_dropped.get(), 0);
+            assert!(db.checkpoint().await.unwrap().success);
+            db.shutdown().await.unwrap();
+            continue;
+        }
         tokio::time::timeout(Duration::from_secs(30), async {
             while db.last_fault().is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;

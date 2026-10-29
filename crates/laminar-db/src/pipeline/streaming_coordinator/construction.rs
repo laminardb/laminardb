@@ -8,10 +8,10 @@ use super::{
     start_source_once, Arc, AtomicU64, CheckpointAttempt, CheckpointBarrier,
     ConnectorCancellationPolicy, ControlMsgRx, DbError, DeliveryGuarantee, Duration, FxHashMap,
     FxHashSet, Instant, OwnedSourceTasks, PendingBarrier, PipelineConfig, PreparedSourceGeneration,
-    SourceCheckpoint, SourceConsistency, SourceInputMode, SourceOperationOutcome, SourcePosition,
-    SourceRegistration, SourceRowPositionCapability, SourceStart, SourceStartFailure,
-    SourceStartOutcome, SourceTaskLease, StreamingCoordinator, StreamingCoordinatorRuntime,
-    TrackedSourceRegistration,
+    SourceAdmission, SourceCheckpoint, SourceConsistency, SourceInputMode, SourceOperationOutcome,
+    SourcePosition, SourceRegistration, SourceRowPositionCapability, SourceStart,
+    SourceStartFailure, SourceStartOutcome, SourceTaskLease, StreamingCoordinator,
+    StreamingCoordinatorRuntime, TrackedSourceRegistration,
 };
 #[cfg(feature = "cluster")]
 use super::{
@@ -735,6 +735,7 @@ impl StreamingCoordinator {
             checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
+            source_admission: SourceAdmission::default(),
             pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
             pending_offsets: vec![None; committed_offsets.len()],

@@ -77,7 +77,7 @@ impl StreamingCoordinator {
         }
 
         let intake_fenced = callback.intake_paused();
-        self.source_batches_buf.clear();
+        self.begin_source_staging(&*callback);
         self.pending_watermark_batches.clear();
         self.barrier_seen.clear();
         if intake_fenced || !self.replay_pending {

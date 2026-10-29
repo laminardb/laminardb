@@ -6155,69 +6155,64 @@ async fn test_og_reverse_order_cascading() {
 }
 
 #[test]
-fn test_pressure_zero_when_cap_disabled() {
+fn source_port_headroom_takes_the_fullest_port_of_each_source_view() {
+    use crate::pipeline::callback::PortHeadroom;
+
     let mut graph = test_graph();
-    graph.set_max_input_buf_batches(0); // unlimited
-    graph.add_query(
-        "q1".to_string(),
-        "SELECT * FROM trades".to_string(),
-        None,
-        None,
-        None,
-        None,
-        false,
+    let visible = graph.ensure_source_node("trades");
+    let positioned = graph.ensure_positioned_source_node("trades");
+    graph.compute_topo_order().unwrap();
+    assert_eq!(
+        graph.source_port_headroom("trades"),
+        PortHeadroom::UNBOUNDED
     );
-    // Push some data into the source buffer
-    if let Some(&node_id) = graph.source_map.get("trades") {
-        prefill_port(&mut graph, node_id, 0, vec![test_batch(); 10]);
-    }
-    assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
+
+    let batch = test_batch();
+    let bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
+    graph.set_max_input_buf_batches(4);
+    graph.set_max_input_buf_bytes(Some(bytes * 3));
+    prefill_port(&mut graph, visible, 0, vec![batch.clone()]);
+    prefill_port(&mut graph, positioned, 0, vec![batch.clone(), batch]);
+    assert_eq!(
+        graph.source_port_headroom("trades"),
+        PortHeadroom {
+            batches: 2,
+            bytes: Some(bytes),
+            empty: false,
+        }
+    );
+    assert_eq!(graph.source_port_headroom("other"), PortHeadroom::UNBOUNDED);
+
+    graph.set_backpressure_policy(BackpressurePolicy::ShedOldest);
+    assert_eq!(
+        graph.source_port_headroom("trades"),
+        PortHeadroom::UNBOUNDED
+    );
 }
 
 #[test]
-fn test_pressure_reflects_fill_ratio() {
-    let mut graph = test_graph();
-    graph.set_max_input_buf_batches(100);
-    graph.add_query(
-        "q1".to_string(),
-        "SELECT * FROM trades".to_string(),
-        None,
-        None,
-        None,
-        None,
-        false,
-    );
-    // Fill source buffer to 50% of cap
-    if let Some(&node_id) = graph.source_map.get("trades") {
-        prefill_port(&mut graph, node_id, 0, vec![test_batch(); 50]);
-    }
-    assert!((graph.input_buf_pressure() - 0.5).abs() < f64::EPSILON);
-}
+fn port_headroom_admits_one_message_on_empty_ports_and_then_charges_each_batch() {
+    use crate::pipeline::callback::PortHeadroom;
 
-#[test]
-fn test_pressure_clamped_at_one() {
-    let mut graph = test_graph();
-    graph.set_max_input_buf_batches(10);
-    graph.add_query(
-        "q1".to_string(),
-        "SELECT * FROM trades".to_string(),
-        None,
-        None,
-        None,
-        None,
-        false,
-    );
-    // Overfill the buffer beyond cap — pressure clamps at 1.0.
-    if let Some(&node_id) = graph.source_map.get("trades") {
-        prefill_port(&mut graph, node_id, 0, vec![test_batch(); 20]);
-    }
-    assert!((graph.input_buf_pressure() - 1.0).abs() < f64::EPSILON);
-}
+    let batch = test_batch();
+    let bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
+    let mut empty = PortHeadroom {
+        batches: 0,
+        bytes: Some(0),
+        empty: true,
+    };
+    assert!(empty.try_charge(&batch));
+    assert!(!empty.try_charge(&batch));
 
-#[test]
-fn test_pressure_empty_graph() {
-    let graph = test_graph();
-    assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
+    let mut room = PortHeadroom {
+        batches: 2,
+        bytes: Some(bytes + 1),
+        empty: false,
+    };
+    assert!(room.try_charge(&batch));
+    assert_eq!(room.bytes, Some(1));
+    assert!(!room.try_charge(&batch));
+    assert_eq!(room.batches, 1);
 }
 
 #[tokio::test]
@@ -6531,8 +6526,9 @@ async fn source_priming_rejects_an_oversized_batch_before_retaining_it() {
 }
 
 #[test]
-fn output_admission_rejects_near_full_fanout_before_any_publication() {
+fn output_admission_under_fail_rejects_near_full_fanout_before_any_publication() {
     let mut graph = test_graph();
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     let producer = graph
         .place_operator_node("producer", Box::new(SourcePassthrough), 1)
         .unwrap();
@@ -6643,7 +6639,7 @@ fn graph_output_admission_charges_each_fanout_port_at_the_exact_limit() {
 }
 
 #[test]
-fn graph_output_admission_enforces_prospective_count_limits() {
+fn graph_output_admission_enforces_prospective_count_limits_under_fail() {
     for byte_limit in [None, Some(usize::MAX)] {
         let mut graph = test_graph();
         let producer = graph.ensure_source_node("input");
@@ -6651,6 +6647,7 @@ fn graph_output_admission_enforces_prospective_count_limits() {
             .place_operator_node("target", Box::new(SourcePassthrough), 1)
             .unwrap();
         graph.add_edge(producer, target, 0);
+        graph.set_backpressure_policy(BackpressurePolicy::Fail);
         graph.set_max_input_buf_batches(1);
         graph.set_max_input_buf_bytes(byte_limit);
         let error = graph
@@ -6669,29 +6666,52 @@ fn graph_output_admission_enforces_prospective_count_limits() {
 }
 
 #[test]
-fn graph_output_admission_rejects_oversized_output_even_on_an_empty_port() {
-    for policy in [BackpressurePolicy::Backpressure, BackpressurePolicy::Fail] {
+fn graph_output_admission_rejects_oversized_output_even_on_an_empty_port_under_fail() {
+    let mut graph = test_graph();
+    let producer = graph.ensure_source_node("input");
+    let target = graph
+        .place_operator_node("target", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(producer, target, 0);
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
+    graph.set_max_input_buf_bytes(Some(1));
+    let error = graph
+        .route_output(producer, vec![test_batch()], &mut FxHashMap::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        DbError::GraphBufferBudgetExceeded {
+            max_bytes: Some(1),
+            ..
+        }
+    ));
+    assert!(error.requires_pipeline_halt());
+    assert!(!error.requires_pipeline_recovery());
+    assert!(graph.input_bufs[target][0].is_empty());
+}
+
+#[test]
+fn graph_output_under_backpressure_overshoots_by_one_run_and_holds_the_producer() {
+    for byte_limit in [None, Some(1)] {
         let mut graph = test_graph();
-        let producer = graph.ensure_source_node("input");
+        let producer = graph
+            .place_operator_node("producer", Box::new(SourcePassthrough), 1)
+            .unwrap();
         let target = graph
             .place_operator_node("target", Box::new(SourcePassthrough), 1)
             .unwrap();
         graph.add_edge(producer, target, 0);
-        graph.set_backpressure_policy(policy);
-        graph.set_max_input_buf_bytes(Some(1));
-        let error = graph
-            .route_output(producer, vec![test_batch()], &mut FxHashMap::default())
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            DbError::GraphBufferBudgetExceeded {
-                max_bytes: Some(1),
-                ..
-            }
-        ));
-        assert!(error.requires_pipeline_halt());
-        assert!(!error.requires_pipeline_recovery());
-        assert!(graph.input_bufs[target][0].is_empty());
+        graph.set_max_input_buf_batches(2);
+        graph.set_max_input_buf_bytes(byte_limit);
+        prefill_port(&mut graph, target, 0, vec![test_batch()]);
+        graph
+            .route_output(producer, vec![test_batch(); 3], &mut FxHashMap::default())
+            .unwrap();
+        assert_eq!(graph.input_bufs[target][0].len(), 4);
+        assert!(graph.execution_poison_reason().is_none());
+        assert!(matches!(graph.gate_decision(producer), GateDecision::Skip));
+        #[cfg(debug_assertions)]
+        graph.debug_assert_byte_sums();
     }
 }
 
@@ -6966,7 +6986,7 @@ async fn graph_admission_sum_graph() -> OperatorGraph {
 }
 
 #[tokio::test]
-async fn graph_post_mutation_admission_failure_fences_retry_and_restores_prior_cut() {
+async fn graph_post_mutation_admission_failure_under_fail_fences_retry_and_restores_prior_cut() {
     let mut graph = graph_admission_sum_graph().await;
     graph
         .execute_cycle(&trades_source(), 0, None)
@@ -6984,6 +7004,7 @@ async fn graph_post_mutation_admission_failure_fences_retry_and_restores_prior_c
     let source_bytes = laminar_core::streaming::retained_arrow_bytes(&test_batch());
     let count = source_bytes / pending_bytes + 1;
     let limit = pending_bytes * count + 1;
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     graph.set_max_input_buf_bytes(Some(limit));
     prefill_port(&mut graph, target, 0, vec![pending; count]);
     let error = graph
@@ -7014,6 +7035,7 @@ async fn graph_post_mutation_admission_failure_fences_retry_and_restores_prior_c
             u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()),
         )
         .unwrap();
+    restored.set_backpressure_policy(BackpressurePolicy::Fail);
     restored.set_max_input_buf_bytes(Some(limit));
     let result = restored
         .execute_cycle(&trades_source(), 0, None)
@@ -7451,7 +7473,44 @@ async fn interval_output_admission_compacts_273_batches_without_changing_aggrega
 }
 
 #[tokio::test]
-async fn interval_output_admission_preserves_terminal_rejection_for_boundary_sensitive_plans() {
+async fn interval_output_that_compaction_cannot_fit_waits_on_a_nearly_full_aggregate_port() {
+    let query =
+        "SELECT symbol, COUNT(*) AS matches, MAX(price) AS high FROM joined GROUP BY symbol";
+    let (mut graph, producer, consumers) =
+        interval_aggregate_admission_graph(test_schema(), &[query]).await;
+    let consumer = consumers[0];
+    prefill_port(&mut graph, consumer, 0, vec![test_batch(); 255]);
+    let oversized =
+        arrow::compute::concat_batches(&test_schema(), vec![test_batch(); 513].iter()).unwrap();
+    let mut incoming = vec![test_batch(); 3];
+    incoming.push(oversized);
+    incoming.extend(vec![test_batch(); 3]);
+    graph
+        .route_output(producer, incoming, &mut FxHashMap::default())
+        .unwrap();
+    assert_eq!(graph.input_bufs[consumer][0].len(), 258);
+    assert!(graph.execution_poison_reason().is_none());
+    assert!(matches!(graph.gate_decision(producer), GateDecision::Skip));
+
+    let results = graph
+        .execute_cycle(&FxHashMap::default(), 0, None)
+        .await
+        .unwrap();
+    let aggregate = &results["aggregate_0"][0];
+    let counts = aggregate
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(aggregate.num_rows(), 2);
+    assert!((0..2).all(|row| counts.value(row) == 255 + 6 + 513));
+    assert!(graph.input_bufs[consumer][0].is_empty());
+    assert!(matches!(graph.gate_decision(producer), GateDecision::Run));
+}
+
+#[tokio::test]
+async fn interval_output_admission_under_fail_preserves_terminal_rejection_for_boundary_sensitive_plans(
+) {
     for query in [
         "SELECT SUM(price) FROM joined",
         "SELECT AVG(price) FROM joined",
@@ -7462,6 +7521,7 @@ async fn interval_output_admission_preserves_terminal_rejection_for_boundary_sen
     ] {
         let (mut graph, producer, consumers) =
             interval_aggregate_admission_graph(test_schema(), &[query]).await;
+        graph.set_backpressure_policy(BackpressurePolicy::Fail);
         assert!(
             !graph.nodes[consumers[0]]
                 .operator
@@ -7501,13 +7561,14 @@ async fn interval_output_admission_preserves_terminal_rejection_for_boundary_sen
 }
 
 #[tokio::test]
-async fn interval_output_admission_rejects_unsafe_fanout_atomically() {
+async fn interval_output_admission_under_fail_rejects_unsafe_fanout_atomically() {
     let queries = [
         "SELECT COUNT(*) FROM joined",
         "SELECT SUM(price) FROM joined",
     ];
     let (mut graph, producer, consumers) =
         interval_aggregate_admission_graph(test_schema(), &queries).await;
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     assert!(graph.nodes[consumers[0]]
         .operator
         .certifies_input_batch_coalescing());
@@ -7528,9 +7589,10 @@ async fn interval_output_admission_rejects_unsafe_fanout_atomically() {
 }
 
 #[tokio::test]
-async fn interval_output_admission_still_enforces_retained_bytes_after_compaction() {
+async fn interval_output_admission_under_fail_still_enforces_retained_bytes_after_compaction() {
     let (mut graph, producer, consumers) =
         interval_aggregate_admission_graph(test_schema(), &["SELECT COUNT(*) FROM joined"]).await;
+    graph.set_backpressure_policy(BackpressurePolicy::Fail);
     graph.set_max_input_buf_bytes(Some(1));
     let mut results = FxHashMap::default();
     let error = graph
@@ -7551,7 +7613,7 @@ async fn interval_output_admission_still_enforces_retained_bytes_after_compactio
 }
 
 #[tokio::test]
-async fn interval_output_admission_preserves_weighted_and_oversized_boundaries() {
+async fn interval_output_admission_under_fail_preserves_weighted_and_oversized_boundaries() {
     let batch = test_batch();
     let mut fields: Vec<_> = batch
         .schema()
@@ -7573,6 +7635,7 @@ async fn interval_output_admission_preserves_weighted_and_oversized_boundaries()
         let (mut graph, producer, consumers) =
             interval_aggregate_admission_graph(batch.schema(), &["SELECT COUNT(*) FROM joined"])
                 .await;
+        graph.set_backpressure_policy(BackpressurePolicy::Fail);
         let mut results = FxHashMap::default();
         let error = graph
             .route_output(producer, vec![batch; 273], &mut results)

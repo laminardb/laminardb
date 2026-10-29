@@ -20,6 +20,51 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const CHECKPOINT_CONTROL_DIRECT_FALLBACK: Duration = Duration::from_millis(250);
 const CHECKPOINT_CONTROL_POLL_FALLBACK: Duration = Duration::from_millis(25);
 
+/// Room left on the graph input ports a source's batches are primed into.
+///
+/// The coordinator stages a source message only when it fits, so a full port makes source
+/// intake wait instead of halting the pipeline.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortHeadroom {
+    /// Batches the fullest port can still take.
+    pub batches: usize,
+    /// Retained Arrow bytes the fullest port can still take, when ports have a byte bound.
+    pub bytes: Option<usize>,
+    /// Every port is empty. One message is then staged whatever its size, so the graph rejects a
+    /// batch no port could ever hold instead of the drain waiting for it forever.
+    pub empty: bool,
+}
+
+impl PortHeadroom {
+    /// Ports without a bound, or ports that shed instead of waiting.
+    pub const UNBOUNDED: Self = Self {
+        batches: usize::MAX,
+        bytes: None,
+        empty: true,
+    };
+
+    /// Charge one source message's batch if it fits, leaving the headroom unchanged otherwise.
+    pub(crate) fn try_charge(&mut self, batch: &RecordBatch) -> bool {
+        let bytes = self
+            .bytes
+            .map(|_| laminar_core::streaming::retained_arrow_bytes(batch));
+        let fits = self.empty
+            || (self.batches > 0
+                && bytes
+                    .zip(self.bytes)
+                    .is_none_or(|(bytes, left)| bytes <= left));
+        if fits {
+            self.empty = false;
+            self.batches = self.batches.saturating_sub(1);
+            if let (Some(left), Some(bytes)) = (self.bytes.as_mut(), bytes) {
+                *left = left.saturating_sub(bytes);
+            }
+        }
+        fits
+    }
+}
+
 /// Bounded-output pressure reported to the pipeline coordinator.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -802,10 +847,13 @@ pub trait PipelineCallback: Send + 'static {
     /// Apply a DDL control message (add/drop stream) to the running pipeline.
     fn apply_control(&mut self, msg: super::ControlMsg);
 
-    /// `true` when internal buffers are near capacity.
-    fn is_backpressured(&self) -> bool {
-        false
+    /// Room left on the graph ports that `source`'s batches are primed into.
+    fn source_port_headroom(&self, _source: &str) -> PortHeadroom {
+        PortHeadroom::UNBOUNDED
     }
+
+    /// Count a cycle whose source intake waited for graph port headroom.
+    fn note_source_backpressure(&self) {}
 
     /// Pressure from bounded checkpoint-committable output. A due checkpoint accelerates the next
     /// periodic cut without stopping compute. Checkpoint and commit backpressure keep checkpoint
