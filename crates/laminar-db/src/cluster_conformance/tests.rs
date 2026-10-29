@@ -238,6 +238,44 @@ async fn nested_aggregate_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// The hot-key remedy: key 0 holds 20 of the 23 keys' rows. The salted stage spreads it over the
+/// salt's owners, and the outer stage adds the per-salt counts and sums back up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn salted_two_stage_count_and_sum_are_equal() {
+    let case = case(
+        "salted_two_stage_count_and_sum",
+        &[
+            "CREATE STREAM salted AS SELECT k / 20 AS k, v % 8 AS salt, COUNT(*) AS n, \
+             SUM(v) AS s FROM events GROUP BY k / 20, v % 8 EMIT CHANGES",
+            "CREATE STREAM out AS SELECT k, SUM(n) AS n, SUM(s) AS s FROM salted GROUP BY k \
+             EMIT CHANGES",
+        ],
+        OutputForm::Changelog,
+        Some("SELECT k / 20 AS k, COUNT(*) AS n, SUM(v) AS s FROM events GROUP BY k / 20"),
+    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// The outer stage sees the salted stage's retractions, which MIN and MAX cannot take back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn salted_two_stage_min_max_is_unsupported_everywhere() {
+    let case = case(
+        "salted_two_stage_min_max",
+        &[
+            "CREATE STREAM salted AS SELECT k / 20 AS k, v % 8 AS salt, MIN(v) AS lo, \
+             MAX(v) AS hi FROM events GROUP BY k / 20, v % 8 EMIT CHANGES",
+            "CREATE STREAM out AS SELECT k, MIN(lo) AS lo, MAX(hi) AS hi FROM salted GROUP BY k \
+             EMIT CHANGES",
+        ],
+        OutputForm::Changelog,
+        Some("SELECT k / 20 AS k, MIN(v) AS lo, MAX(v) AS hi FROM events GROUP BY k / 20"),
+    );
+    assert!(matches!(
+        verdict(case).await,
+        Verdict::UnsupportedEverywhere(reason) if reason.contains("require append-only input")
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn union_all_is_rejected_in_cluster() {
     let case = Case {

@@ -7518,6 +7518,49 @@ async fn aligned_resume_gate_releases_on_newer_epoch() {
     );
 }
 
+/// A follower that misses the transient Aligned resumes on the same leader's next Prepare over the
+/// same assignment: that leader prepares only after its own gate has passed.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn same_leader_newer_prepare_releases_the_resume_gate() {
+    use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+    let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+    let (fence, identity) = resume_identity(3, 3);
+    kv.seed(
+        leader_id,
+        ANNOUNCEMENT_KEY,
+        serde_json::to_string(&BarrierAnnouncement {
+            epoch: 4,
+            checkpoint_id: 4,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(identity.leader_proof.clone()),
+            phase: Phase::Prepare,
+            flags: 0,
+        })
+        .unwrap(),
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ConnectorPipelineCallback::wait_for_aligned_resume(
+            true,
+            &controller,
+            identity,
+            &fence,
+            Duration::from_secs(3),
+        ),
+    )
+    .await
+    .expect("the same leader's newer Prepare must release the gate")
+    .expect("the awaited assignment is already certified");
+    assert_eq!(
+        controller.cluster_min_watermark(),
+        None,
+        "a newer Prepare says nothing about the awaited attempt's outcome"
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn newer_reversible_phase_requires_successor_alignment_authority() {
@@ -7528,6 +7571,22 @@ async fn newer_reversible_phase_requires_successor_alignment_authority() {
             epoch: 4,
             checkpoint_id: 4,
             assignment_fence: Some(assignment_fence(2, &[1, 7])),
+            leader_proof: Some(leader_proof(1)),
+            phase: Phase::Prepare,
+            flags: 0,
+        },
+        BarrierAnnouncement {
+            epoch: 4,
+            checkpoint_id: 4,
+            assignment_fence: Some(assignment_fence(1, &[1, 7])),
+            leader_proof: Some(leader_proof(2)),
+            phase: Phase::Prepare,
+            flags: 0,
+        },
+        BarrierAnnouncement {
+            epoch: 4,
+            checkpoint_id: 4,
+            assignment_fence: None,
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Prepare,
             flags: 0,
