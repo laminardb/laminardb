@@ -5,6 +5,9 @@
 //! labelled by vnode or key.
 
 #[cfg(feature = "cluster")]
+mod shuffle;
+
+#[cfg(feature = "cluster")]
 use prometheus::IntCounterVec;
 use prometheus::{
     Gauge, Histogram, HistogramOpts, HistogramTimer, HistogramVec, IntGauge, IntGaugeVec, Opts,
@@ -27,6 +30,8 @@ pub(crate) struct FlowMetrics {
     /// wire for them (`sent`). Labels: `operator`, `form`.
     #[cfg(feature = "cluster")]
     pub(crate) aggregate_shuffle_rows_total: IntCounterVec,
+    #[cfg(feature = "cluster")]
+    pub(crate) shuffle: shuffle::ShuffleFlowMetrics,
     /// Accounted state bytes of this node's largest vnode. Label: `operator`.
     pub(crate) vnode_state_bytes_max: IntGaugeVec,
     /// Mean accounted state bytes over the vnodes this node holds state for. Label: `operator`.
@@ -131,6 +136,8 @@ impl FlowMetrics {
                 )
                 .unwrap(),
             ),
+            #[cfg(feature = "cluster")]
+            shuffle: shuffle::ShuffleFlowMetrics::register(registry).unwrap(),
             vnode_state_bytes_max: labelled_gauge(
                 registry,
                 "vnode_state_bytes_max",

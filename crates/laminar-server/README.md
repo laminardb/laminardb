@@ -444,7 +444,9 @@ recovery. The `/metrics` endpoint exposes `laminardb_cycles_backpressured_total`
 metric is a lower-bound charge, so use OS/container RSS for memory sizing. Where input waits
 is exported too: `laminardb_source_queue_wait_seconds_total`,
 `laminardb_intake_paused_seconds_total`, `laminardb_sink_epoch_gate_wait_seconds`,
-`laminardb_managed_state_budget_ratio`, and the per-operator `laminardb_vnode_*` skew gauges.
+`laminardb_managed_state_budget_ratio`, the per-operator `laminardb_vnode_*` skew gauges, and in
+a cluster the per-peer `laminardb_shuffle_send_wait_seconds_total` and
+`laminardb_shuffle_budget_used_bytes`.
 The [flow-control table](../laminar-db/README.md#flow-control-and-backpressure) lists every
 bounded buffer, what happens when it is full, and its metrics.
 

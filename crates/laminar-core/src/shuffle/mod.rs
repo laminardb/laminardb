@@ -22,4 +22,4 @@ pub use transport::{
     ShufflePeerId, ShuffleReceiver, ShuffleSender,
 };
 #[cfg(feature = "cluster")]
-pub use transport::{shuffle_send_may_have_been_admitted, SHUFFLE_ADDR_KEY};
+pub use transport::{shuffle_send_may_have_been_admitted, ShufflePeerFlow, SHUFFLE_ADDR_KEY};

@@ -15,7 +15,17 @@ impl LaminarDB {
     }
 
     /// Inject prometheus engine metrics. Called once at startup before `start()`.
+    ///
+    /// A cluster database also reports the shuffle endpoints its builder installed.
     pub fn set_engine_metrics(&self, metrics: Arc<crate::engine_metrics::EngineMetrics>) {
+        #[cfg(feature = "cluster")]
+        {
+            let sender = self.shuffle_sender.lock().clone();
+            let receiver = self.shuffle_receiver.lock().clone();
+            if let (Some(sender), Some(receiver)) = (sender, receiver) {
+                metrics.flow.shuffle.observe(&sender, &receiver);
+            }
+        }
         *self.engine_metrics.lock() = Some(metrics);
     }
 
