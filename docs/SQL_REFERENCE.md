@@ -384,6 +384,36 @@ GROUP BY trade_count;
 - A join of three or more inputs still needs named two-way stages: a join's output carries no
   event time, so an interval join cannot read it.
 
+### Spreading a hot key
+
+In cluster mode every row of a group key goes to the node that owns the key's vnode, so one very
+frequent key loads one node. Aggregate in two stages with a salt: the first stage groups by the
+key and the salt, which spreads the key's rows over the nodes that own the salted groups; the
+second adds the per-salt results back up.
+
+```sql
+CREATE STREAM symbol_volume_salted AS
+SELECT symbol, account_id % 8 AS salt, COUNT(*) AS trades, SUM(volume) AS volume
+FROM trades
+GROUP BY symbol, account_id % 8
+EMIT CHANGES;
+
+CREATE STREAM symbol_volume AS
+SELECT symbol, SUM(trades) AS trades, SUM(volume) AS volume
+FROM symbol_volume_salted
+GROUP BY symbol
+EMIT CHANGES;
+```
+
+- The salt must vary within the hot key; a column that is constant per key spreads nothing.
+- The second stage reads changes: at most two rows per salted group per cycle instead of every row
+  of the key.
+- `COUNT` becomes a `SUM` of counts and `SUM` a `SUM` of sums. For an average, keep both and
+  divide when reading, because an aggregate stage cannot compute `SUM(volume) / SUM(trades)`.
+  `MIN` and `MAX` cannot be salted, because the second stage reads changes.
+- The salted stage is one more remote exchange (a pipeline may have three below its sources) and
+  adds one cycle of latency.
+
 ### Streaming UDFs
 
 | Function | Returns | Use |
