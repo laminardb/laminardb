@@ -2484,6 +2484,56 @@ impl ConnectorPipelineCallback {
         }
     }
 
+    /// Whether `announcement` releases the shuffle resume gate of the awaited attempt.
+    #[cfg(feature = "cluster")]
+    fn releases_aligned_resume(
+        announcement: &laminar_core::cluster::control::BarrierAnnouncement,
+        identity: &CertifiedCheckpointAttempt,
+        assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
+    ) -> bool {
+        use laminar_core::cluster::control::Phase;
+
+        let candidate = CheckpointAttempt::new(announcement.epoch, announcement.checkpoint_id);
+        match candidate.relation_to(identity.attempt) {
+            CheckpointAttemptRelation::Newer => match announcement.phase {
+                Phase::Aligned => announcement
+                    .assignment_fence
+                    .as_ref()
+                    .zip(announcement.leader_proof.as_ref())
+                    .is_some_and(|(fence, proof)| {
+                        fence.is_canonical()
+                            && proof.is_canonical()
+                            && fence.participant_incarnation(proof.owner.node_id)
+                                == Some(proof.owner.boot_id)
+                    }),
+                Phase::Commit | Phase::Abort => true,
+                // The leader prepares a newer attempt only once this one is aligned or durably
+                // aborted. The merged hint keeps only the newest attempt, so a busy follower can
+                // miss this one's Aligned or terminal phase entirely.
+                Phase::Prepare => {
+                    announcement.leader_proof.as_ref() == Some(&identity.leader_proof)
+                        && announcement.assignment_fence.as_ref() == Some(assignment_fence)
+                }
+            },
+            CheckpointAttemptRelation::Exact => match announcement.phase {
+                // A successor may abort an old leader's attempt. The terminal record
+                // only wakes the follower; durable outcome validation owns rollback.
+                Phase::Abort => announcement.flags == identity.flags,
+                Phase::Aligned => {
+                    announcement.flags == identity.flags
+                        && announcement.assignment_fence.as_ref() == Some(assignment_fence)
+                        && announcement.leader_proof.as_ref() == Some(&identity.leader_proof)
+                }
+                Phase::Commit => {
+                    announcement.flags == identity.flags
+                        && announcement.assignment_fence.as_ref() == Some(assignment_fence)
+                }
+                Phase::Prepare => false,
+            },
+            CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => false,
+        }
+    }
+
     #[cfg(feature = "cluster")]
     async fn wait_for_aligned_resume(
         has_cluster_shuffle: bool,
@@ -2517,43 +2567,7 @@ impl ConnectorPipelineCallback {
         }
         let released = controller
             .wait_for_barrier(
-                |a| {
-                    let candidate = CheckpointAttempt::new(a.epoch, a.checkpoint_id);
-                    match candidate.relation_to(identity.attempt) {
-                        CheckpointAttemptRelation::Newer => match a.phase {
-                            Phase::Aligned => a
-                                .assignment_fence
-                                .as_ref()
-                                .zip(a.leader_proof.as_ref())
-                                .is_some_and(|(fence, proof)| {
-                                    fence.is_canonical()
-                                        && proof.is_canonical()
-                                        && fence.participant_incarnation(proof.owner.node_id)
-                                            == Some(proof.owner.boot_id)
-                                }),
-                            Phase::Commit | Phase::Abort => true,
-                            Phase::Prepare => false,
-                        },
-                        CheckpointAttemptRelation::Exact => match a.phase {
-                            // A successor may abort an old leader's attempt. The terminal record
-                            // only wakes the follower; durable outcome validation owns rollback.
-                            Phase::Abort => a.flags == identity.flags,
-                            Phase::Aligned => {
-                                a.flags == identity.flags
-                                    && a.assignment_fence.as_ref() == Some(assignment_fence)
-                                    && a.leader_proof.as_ref() == Some(&identity.leader_proof)
-                            }
-                            Phase::Commit => {
-                                a.flags == identity.flags
-                                    && a.assignment_fence.as_ref() == Some(assignment_fence)
-                            }
-                            Phase::Prepare => false,
-                        },
-                        CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
-                            false
-                        }
-                    }
-                },
+                |a| Self::releases_aligned_resume(a, &identity, assignment_fence),
                 resume_gate_timeout,
             )
             .await
