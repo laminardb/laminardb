@@ -60,6 +60,8 @@ pub(crate) struct SinkTaskHandle {
     /// Checkpoint-committable sinks remain non-writable until the whole sink group has begun the
     /// same allocator-owned epoch. Every clone observes the same transition stream.
     pub(super) epoch_gate: Option<tokio::sync::watch::Sender<SinkEpochGateState>>,
+    /// A wait without a caller deadline fails once the gate stays in one state this long.
+    pub(super) epoch_gate_stall_timeout: Option<Duration>,
     pub(super) flow: Arc<OnceLock<SinkFlowMetrics>>,
     #[cfg(feature = "cluster")]
     pub(super) process_authority: Option<Arc<ClusterController>>,
@@ -152,10 +154,20 @@ impl SinkTaskHandle {
             event_tx,
             epoch_poisoned,
             epoch_gate,
+            epoch_gate_stall_timeout: None,
             flow,
             #[cfg(feature = "cluster")]
             process_authority,
         }
+    }
+
+    /// Fail a write's wait for a writable epoch when the gate stays in one state for `timeout`.
+    /// Checkpoint and assignment waits keep their own deadlines. Unset, a write waits for as
+    /// long as the epoch stays closed.
+    #[must_use]
+    pub(crate) fn with_epoch_gate_stall_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.epoch_gate_stall_timeout = timeout;
+        self
     }
 
     /// Publish this sink's queue depth and epoch-gate waits. The first installation wins.

@@ -487,6 +487,33 @@ fn collect_runtime_limit_errors(config: &ServerConfig, errors: &mut Vec<String>)
     if config.checkpoint.max_node_data_bytes == Some(0) {
         errors.push("checkpoint.max_node_data_bytes must be > 0".to_string());
     }
+    // WHY: a healthy epoch can stay closed for one interval plus one attempt.
+    let stall_floor = config
+        .checkpoint
+        .interval
+        .saturating_add(config.checkpoint.timeout);
+    let stall_timeouts = [
+        (
+            "server.shuffle_send_stall_timeout",
+            config.server.shuffle_send_stall_timeout,
+        ),
+        (
+            "checkpoint.sink_epoch_gate_stall_timeout",
+            config.checkpoint.sink_epoch_gate_stall_timeout,
+        ),
+    ];
+    for (name, stall) in stall_timeouts {
+        if stall.is_some_and(|stall| stall <= stall_floor) {
+            errors.push(format!(
+                "{name} must exceed checkpoint.interval + checkpoint.timeout ({stall_floor:?})"
+            ));
+        }
+    }
+    if config.server.mode != ServerMode::Cluster
+        && config.server.shuffle_send_stall_timeout.is_some()
+    {
+        errors.push("server.shuffle_send_stall_timeout requires mode = \"cluster\"".to_string());
+    }
     if let Err(error) = config
         .server
         .validated_temporal_join_idle_history_retention()

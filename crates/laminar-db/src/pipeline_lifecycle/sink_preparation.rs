@@ -163,7 +163,8 @@ impl LaminarDB {
                     terminal_tasks,
                     #[cfg(feature = "cluster")]
                     process_authority: sink_process_authority.clone(),
-                });
+                })
+                .with_epoch_gate_stall_timeout(epoch_gate_stall_timeout(&self.config));
             if let Some(metrics) = self.engine_metrics() {
                 handle.install_flow_metrics(metrics.flow.sink(&name));
             }
@@ -219,6 +220,14 @@ impl LaminarDB {
             callback_controller,
         })
     }
+}
+
+fn epoch_gate_stall_timeout(config: &crate::config::LaminarConfig) -> Option<std::time::Duration> {
+    config
+        .checkpoint
+        .as_ref()?
+        .sink_epoch_gate_stall_timeout_ms
+        .map(std::time::Duration::from_millis)
 }
 
 /// Validated write deadline and periodic flush interval of one sink.

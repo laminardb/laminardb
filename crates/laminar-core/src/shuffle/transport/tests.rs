@@ -878,6 +878,53 @@ async fn peer_flow_counts_admission_waits_and_sent_data_and_budgets_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_fails_as_stalled_only_when_its_budget_wait_lasts_the_stall_timeout() {
+    let stall = std::time::Duration::from_millis(200);
+    let receiver = bind_on_loopback(2).await;
+    let sender = sender(1).with_send_stall_timeout(Some(stall));
+    sender.register_peer(2, receiver.local_addr());
+    let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
+
+    let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
+    let mut granted = Box::pin(sender.send_to(2, &message));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut granted)
+            .await
+            .is_err()
+    );
+    drop(held_budget);
+    granted
+        .await
+        .expect("a wait granted before the stall timeout sends");
+    drop(receiver.recv().await.unwrap());
+    wait_until(|| sender.outbound_budget_used_bytes() == 0).await;
+
+    let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sender.send_to(2, &message),
+    )
+    .await
+    .expect("a stalled send stays blocked")
+    .unwrap_err();
+    assert!(started.elapsed() >= stall);
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(is_shuffle_send_stalled(&error), "{error}");
+    assert!(!is_scope_cancelled(&error));
+    assert_eq!(
+        sender.peer_flow()[0].sent_rows,
+        1,
+        "the stalled frame is not sent"
+    );
+
+    send_barrier(&sender, &[2], CheckpointBarrier::new(1, 1))
+        .await
+        .expect("a barrier does not use the held data budget");
+    drop(held_budget);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_scope_cancellation_releases_idle_inbound_stream_slot() {
     use std::sync::atomic::Ordering as O;
 

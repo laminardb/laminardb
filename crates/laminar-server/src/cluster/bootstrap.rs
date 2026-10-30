@@ -423,7 +423,11 @@ async fn build_leased_database(
     formed: &mut FormedCluster,
     mut builder: laminar_db::LaminarDbBuilder,
 ) -> Result<Arc<LaminarDB>, ClusterStartupError> {
-    let PreparedClusterBootstrap { node_id, .. } = prepared;
+    let PreparedClusterBootstrap {
+        node_id,
+        shuffle_send_stall_timeout,
+        ..
+    } = prepared;
     let node_id = *node_id;
     let AcquiredClusterIdentity {
         process_incarnation,
@@ -448,6 +452,7 @@ async fn build_leased_database(
             shuffle_advertise.clone(),
             discovery.membership_watch(),
             process_incarnation,
+            *shuffle_send_stall_timeout,
         ) => Some(sender),
     };
     let Some(shuffle_sender) = shuffle_sender else {

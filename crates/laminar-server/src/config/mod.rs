@@ -199,6 +199,11 @@ pub struct ServerSection {
     /// vnodes. `None` uses `checkpoint.timeout` plus 30 seconds of handoff headroom.
     #[serde(default, with = "humantime_serde")]
     pub drain_timeout: Option<Duration>,
+    /// Cluster only: a shuffle send that waits this long for its peer's or the node's byte
+    /// budget, or for its peer's stream queue, fails as a recoverable fault. Must exceed
+    /// `checkpoint.interval` plus `checkpoint.timeout`. Unset: sends wait for slow peers.
+    #[serde(default, with = "humantime_serde")]
+    pub shuffle_send_stall_timeout: Option<Duration>,
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
@@ -271,6 +276,7 @@ impl Default for ServerSection {
             source_idle_timeout: None,
             event_time_max_future_skew: default_event_time_max_future_skew(),
             drain_timeout: None,
+            shuffle_send_stall_timeout: None,
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
@@ -487,6 +493,11 @@ pub struct CheckpointSection {
     /// One checkpoint-attempt deadline; cluster assignment recovery phases use the same bound.
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
+    /// A cycle waiting to write into an exactly-once sink fails as a recoverable fault when the
+    /// sink's epoch stays in one state this long. Must exceed `interval` plus `timeout`. Unset:
+    /// writes wait for the epoch to open.
+    #[serde(default, with = "humantime_serde")]
+    pub sink_epoch_gate_stall_timeout: Option<Duration>,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
@@ -503,6 +514,7 @@ impl Default for CheckpointSection {
             interval: default_checkpoint_interval(),
             recent_read_interval: None,
             timeout: default_checkpoint_timeout(),
+            sink_epoch_gate_stall_timeout: None,
             storage: std::collections::HashMap::new(),
             max_node_data_bytes: None,
         }
@@ -517,6 +529,10 @@ impl std::fmt::Debug for CheckpointSection {
             .field("interval", &self.interval)
             .field("recent_read_interval", &self.recent_read_interval)
             .field("timeout", &self.timeout)
+            .field(
+                "sink_epoch_gate_stall_timeout",
+                &self.sink_epoch_gate_stall_timeout,
+            )
             .field(
                 "storage",
                 &self

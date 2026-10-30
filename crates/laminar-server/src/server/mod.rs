@@ -323,6 +323,9 @@ fn apply_checkpoint_settings(
         timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
         data_dir: None,
         max_node_data_bytes: Some(max_node_data_bytes),
+        sink_epoch_gate_stall_timeout_ms: checkpoint
+            .sink_epoch_gate_stall_timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
     }))
 }
 

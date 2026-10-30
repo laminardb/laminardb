@@ -27,6 +27,23 @@ pub(super) fn validate_checkpoint_timing(
             "checkpoint.interval_ms must be greater than zero; use None for manual-only".into(),
         ));
     }
+    if let Some(stall_ms) = config.sink_epoch_gate_stall_timeout_ms {
+        // A healthy epoch can stay closed for one interval plus one attempt.
+        let timeout = config.timeout_ms.map_or(
+            crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+            std::time::Duration::from_millis,
+        );
+        let floor = config
+            .interval_ms
+            .map(|interval_ms| std::time::Duration::from_millis(interval_ms) + timeout);
+        if floor.is_none_or(|floor| std::time::Duration::from_millis(stall_ms) <= floor) {
+            return Err(DbError::Config(
+                "checkpoint.sink_epoch_gate_stall_timeout_ms needs periodic checkpoints and must \
+                 exceed interval_ms plus the checkpoint timeout"
+                    .into(),
+            ));
+        }
+    }
     let Some(timeout_ms) = config.timeout_ms else {
         return Ok(());
     };

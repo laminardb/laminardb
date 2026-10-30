@@ -293,7 +293,13 @@ the server's `/metrics` endpoint adds the `laminardb_` prefix.
 | Cluster subscription output | cluster | 256 MiB pending per node | at half, a checkpoint is requested; at three quarters, intake pauses | `cluster_subscription_pending_bytes`, `intake_paused_seconds_total{reason="output"}` |
 
 Waits have no default deadline: under load or skew a slow peer or sink is expected to make its
-producer wait, and a deadline would turn that wait into a recovery round.
+producer wait, and a deadline would turn that wait into a recovery round. Two opt-in limits fail
+a wait that stops making progress as a recoverable fault instead, recovering from the last
+checkpoint. `StreamCheckpointConfig::sink_epoch_gate_stall_timeout_ms` applies in every mode to a
+write waiting for a checkpoint-committable sink's epoch, and fires when the epoch stays in one
+state that long. The server's `[server] shuffle_send_stall_timeout` applies to a cluster shuffle
+send waiting for a byte budget or a stream queue slot. Each must exceed the checkpoint interval
+plus the checkpoint timeout, since a healthy epoch can stay closed for that long.
 
 `intake_paused_seconds_total` reasons are exclusive: a fence takes precedence over output
 pressure, and both over port pressure. `source_queue_messages` is sampled at each coordinator

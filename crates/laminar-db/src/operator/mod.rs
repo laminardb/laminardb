@@ -161,6 +161,9 @@ pub(crate) fn shuffle_send_error(
             "{context}: send to peer {peer} failed after a frame was or may have been admitted: {error}"
         ));
     }
+    if laminar_core::shuffle::is_shuffle_send_stalled(error) {
+        return DbError::ShuffleSendStalled(format!("{context}: {error}"));
+    }
     if matches!(
         error.kind(),
         std::io::ErrorKind::InvalidInput
@@ -298,7 +301,8 @@ async fn send_shuffle_plan_inner(
                     | std::io::ErrorKind::InvalidData
                     | std::io::ErrorKind::Unsupported
             );
-            (!terminal, *index)
+            let stalled = laminar_core::shuffle::is_shuffle_send_stalled(error);
+            (!terminal, !stalled, *index)
         })
     };
 
@@ -686,6 +690,58 @@ mod shuffle_tests {
         let error = result.unwrap_err();
 
         assert!(matches!(error, DbError::ShuffleTerminal(_)));
+        assert!(retry_plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_plan_reports_a_stalled_peer_for_recovery_ahead_of_an_unready_one() {
+        let (sender, _receiver) = sender_with_reachable_peer_two().await;
+        let sender = sender.with_send_stall_timeout(Some(std::time::Duration::from_secs(1)));
+        // The receiver never reads, so its inbound budget, the stream window and then the
+        // sender's outbound budget fill.
+        let wide = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )])),
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                "x".repeat(
+                    4096
+                );
+                1024
+            ]))],
+        )
+        .unwrap();
+        let wide = ShuffleMessage::checkpointed("stage".into(), 1, wide);
+        let mut sends = 0;
+        let stalled = loop {
+            assert!(sends < 64, "an unread peer never stalled a send");
+            sends += 1;
+            if let Err(error) = sender.send_to(2, &wide).await {
+                break error;
+            }
+        };
+        assert!(
+            laminar_core::shuffle::is_shuffle_send_stalled(&stalled),
+            "{stalled}"
+        );
+
+        let (result, retry_plan) = send_shuffle_plan_retaining(
+            &sender,
+            None,
+            1,
+            vec![
+                (3, ShuffleMessage::checkpointed("stage".into(), 2, batch(1))),
+                (2, wide),
+            ],
+            "test shuffle",
+        )
+        .await;
+        let error = result.unwrap_err();
+
+        assert!(matches!(error, DbError::ShuffleSendStalled(_)), "{error}");
+        assert!(error.requires_pipeline_recovery());
         assert!(retry_plan.is_none());
     }
 

@@ -829,6 +829,66 @@ seeds = ["x:1"]
 }
 
 #[test]
+fn stall_timeouts_must_exceed_one_checkpoint_interval_and_attempt() {
+    let errors = |mode: &str, settings: &str| {
+        let config: ServerConfig = toml::from_str(&format!(
+            "node_id = \"n1\"\n[server]\nmode = \"{mode}\"\n{settings}\n\
+             [checkpoint]\ninterval = \"30s\"\ntimeout = \"60s\"\n\
+             sink_epoch_gate_stall_timeout = \"91s\"\n\
+             [discovery]\nstrategy = \"static\"\nseeds = [\"x:1\"]\n"
+        ))
+        .unwrap();
+        match validate_config(&config) {
+            Ok(_) => Vec::new(),
+            Err(ConfigError::ValidationErrors { errors }) => errors,
+            Err(error) => panic!("{error}"),
+        }
+    };
+    let stall_errors = |mode: &str, settings: &str| {
+        errors(mode, settings)
+            .into_iter()
+            .filter(|error| error.contains("stall_timeout"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        stall_errors("cluster", "shuffle_send_stall_timeout = \"91s\""),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        stall_errors("single", ""),
+        Vec::<String>::new(),
+        "the sink stall applies in every mode"
+    );
+    assert_eq!(
+        stall_errors("cluster", "shuffle_send_stall_timeout = \"90s\""),
+        vec![
+            "server.shuffle_send_stall_timeout must exceed checkpoint.interval + \
+             checkpoint.timeout (90s)"
+                .to_string()
+        ]
+    );
+    assert_eq!(
+        stall_errors("single", "shuffle_send_stall_timeout = \"91s\""),
+        vec!["server.shuffle_send_stall_timeout requires mode = \"cluster\"".to_string()]
+    );
+
+    let config: ServerConfig = toml::from_str(
+        "[checkpoint]\ninterval = \"30s\"\ntimeout = \"60s\"\n\
+         sink_epoch_gate_stall_timeout = \"1m\"\n",
+    )
+    .unwrap();
+    let Err(ConfigError::ValidationErrors { errors }) = validate_config(&config) else {
+        panic!("a sink stall timeout below interval + timeout must be refused");
+    };
+    assert!(
+        errors.iter().any(|error| error.starts_with(
+            "checkpoint.sink_epoch_gate_stall_timeout must exceed checkpoint.interval"
+        )),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn test_validate_invalid_bind_address() {
     let toml = r#"
 [server]

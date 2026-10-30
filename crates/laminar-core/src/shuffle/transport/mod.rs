@@ -682,8 +682,8 @@ mod grpc {
     mod handshake;
     mod pipeline_identity;
     mod topology;
-    pub use flow::ShufflePeerFlow;
-    use flow::{OutboundReservation, PeerSendCounters};
+    pub use flow::{is_shuffle_send_stalled, ShufflePeerFlow};
+    use flow::{OutboundReservation, PeerSendCounters, SendFlow};
     use std::collections::hash_map::Entry;
     use std::collections::VecDeque;
     use std::io;
@@ -2088,8 +2088,9 @@ mod grpc {
         /// Ordered data/frontier frames enqueued per peer. Lives here, not on `PeerConn`, so it
         /// survives a reconnect that discards a queue and leaves a detectable gap.
         seqs: Mutex<FxHashMap<ShufflePeerId, u64>>,
-        /// Flow totals per peer, kept here for the same reason so they survive reconnects.
-        peer_counters: Mutex<FxHashMap<ShufflePeerId, Arc<PeerSendCounters>>>,
+        /// Flow totals per peer, kept here for the same reason so they survive reconnects, and
+        /// the send stall timeout.
+        flow: SendFlow,
         checkpointed_control_node_budget: Arc<Semaphore>,
         node_budget: Arc<Semaphore>,
         #[cfg(test)]
@@ -2133,7 +2134,7 @@ mod grpc {
                 topology_version: Arc::new(AtomicU64::new(0)),
                 pipeline_identity: RwLock::new(None),
                 seqs: Mutex::new(FxHashMap::default()),
-                peer_counters: Mutex::new(FxHashMap::default()),
+                flow: SendFlow::default(),
                 checkpointed_control_node_budget: Arc::new(Semaphore::new(
                     CHECKPOINTED_CONTROL_NODE_BUDGET_BYTES,
                 )),
@@ -2530,7 +2531,7 @@ mod grpc {
                 ));
             }
             let budget = self
-                .reserve_outbound(&conn, msg, admission_bytes, &scope.cancel)
+                .reserve_outbound(&conn, peer, msg, admission_bytes, &scope.cancel)
                 .await?;
             let (prepared, budget) = prepare_outbound_message(msg, budget).await?;
             self.validate_scope(&scope, expected_assignment_version)?;
@@ -5299,7 +5300,7 @@ mod grpc {
 }
 
 #[cfg(feature = "cluster")]
-pub use grpc::{ShufflePeerFlow, ShuffleReceiver, ShuffleSender};
+pub use grpc::{is_shuffle_send_stalled, ShufflePeerFlow, ShuffleReceiver, ShuffleSender};
 
 #[cfg(not(feature = "cluster"))]
 mod shim {
