@@ -666,6 +666,21 @@ impl IncrementalAggState {
         self.num_group_cols
     }
 
+    fn admit_group_count(
+        &self,
+        groups: usize,
+        context: impl FnOnce() -> String,
+    ) -> Result<(), DbError> {
+        if groups > self.max_groups {
+            return Err(DbError::GroupLimitExceeded {
+                context: context(),
+                groups,
+                limit: self.max_groups,
+            });
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn set_max_groups_for_test(&mut self, max_groups: usize) {
         self.max_groups = max_groups;
@@ -746,13 +761,9 @@ impl IncrementalAggState {
         )?;
         let final_lower_bound =
             checked_vnode_transition_capacity(retained_group_count, replacement_lower_bound)?;
-        if final_lower_bound > self.max_groups {
-            return Err(DbError::Pipeline(format!(
-                "aggregate group limit exceeded during vnode transition preflight: retained={retained_group_count}, replacement_lower_bound={replacement_lower_bound}, limit={}",
-                self.max_groups
-            )));
-        }
-        Ok(())
+        self.admit_group_count(final_lower_bound, || {
+            format!("aggregate vnode transition preflight (retained={retained_group_count}, replacement_lower_bound={replacement_lower_bound})")
+        })
     }
 
     /// Deterministic inline roster bytes allocated while one all-vnode replacement is prepared.
@@ -1532,12 +1543,9 @@ impl IncrementalAggState {
         }
         let current_groups = self.vnode_states.resident_group_count();
         let required_groups = current_groups.saturating_add(incoming_new_groups);
-        if required_groups > self.max_groups {
-            return Err(DbError::Pipeline(format!(
-                "aggregate group limit exceeded: current={}, incoming_new={}, limit={}",
-                current_groups, incoming_new_groups, self.max_groups
-            )));
-        }
+        self.admit_group_count(required_groups, || {
+            format!("aggregate record processing (current={current_groups}, incoming_new={incoming_new_groups})")
+        })?;
 
         let agg_specs = &self.agg_specs;
         let aggregate_templates = &self.aggregate_templates;
@@ -2241,12 +2249,9 @@ impl IncrementalAggState {
 
             replacement_group_count =
                 checked_vnode_transition_capacity(replacement_group_count, staged.groups.len())?;
-            if replacement_group_count > self.max_groups {
-                return Err(DbError::Pipeline(format!(
-                    "aggregate replacement group limit exceeded during vnode transition: replacement={}, limit={}",
-                    replacement_group_count, self.max_groups
-                )));
-            }
+            self.admit_group_count(replacement_group_count, || {
+                "aggregate vnode transition replacement".into()
+            })?;
             let replacement = AggregateVnodeState::try_from_recovered(
                 staged.groups,
                 staged.last_emitted,
@@ -2280,13 +2285,9 @@ impl IncrementalAggState {
         )?;
         let final_group_count =
             checked_vnode_transition_capacity(retained_group_count, replacement_group_count)?;
-        if final_group_count > self.max_groups {
-            return Err(DbError::Pipeline(format!(
-                "aggregate group limit exceeded during vnode transition: retained={retained_group_count}, replacement={}, limit={}",
-                replacement_group_count,
-                self.max_groups
-            )));
-        }
+        self.admit_group_count(final_group_count, || {
+            format!("aggregate vnode transition (retained={retained_group_count}, replacement={replacement_group_count})")
+        })?;
 
         let mut replacements = Vec::new();
         replacements

@@ -7687,3 +7687,40 @@ async fn cold_metrics_publish_budget_ratio_and_vnode_spread_of_a_keyed_aggregate
     assert!((1..=2).contains(&flow.vnode_groups_max.with_label_values(&["agg"]).get()));
     assert!((0..256).contains(&flow.vnode_hottest.with_label_values(&["agg"]).get()));
 }
+
+#[tokio::test]
+async fn temporal_filter_rows_count_against_the_managed_state_budget() {
+    use laminar_sql::parser::EmitClause;
+    let mut graph = test_graph();
+    graph.set_max_managed_state_bytes(4 * 1024);
+    graph.add_query(
+        "recent".into(),
+        "SELECT * FROM trades WHERE ts > now() - INTERVAL '10' SECOND".into(),
+        Some(EmitClause::Changes),
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut src = FxHashMap::default();
+    src.insert(Arc::from("trades"), vec![test_batch()]);
+
+    let mut halted = None;
+    for _ in 0..64 {
+        if let Err(error) = graph.execute_cycle(&src, 5_000, None).await {
+            halted = Some(error);
+            break;
+        }
+    }
+
+    let error = halted.expect("buffered temporal-filter rows must reach the budget");
+    assert!(
+        matches!(
+            &error,
+            DbError::ManagedStateBudgetExceeded { context, limit_bytes: 4096, .. }
+                if context.contains("recent")
+        ),
+        "{error}"
+    );
+    assert!(error.requires_pipeline_halt());
+}

@@ -1348,18 +1348,11 @@ impl CoreWindowState {
                     .and_then(|state| state.windows.get(window_start));
                 if window_groups.is_some_and(|groups| groups.contains_key(row_key)) {
                     false
-                } else if self
-                    .window_group_counts
-                    .get(window_start)
-                    .copied()
-                    .unwrap_or(0)
-                    >= self.max_groups_per_window
-                {
-                    return Err(DbError::Pipeline(format!(
-                        "Core window {window_start} group cardinality limit {} reached",
-                        self.max_groups_per_window
-                    )));
                 } else {
+                    let groups = self.window_group_counts.get(window_start).copied();
+                    self.admit_group_count(groups.unwrap_or(0).saturating_add(1), || {
+                        format!("window {window_start} record processing")
+                    })?;
                     true
                 }
             };
@@ -1512,11 +1505,10 @@ impl CoreWindowState {
         let new_group = self.vnode_states[vnode as usize]
             .as_ref()
             .is_none_or(|state| !state.session_groups.contains_key(key));
-        if new_group && self.session_group_count >= self.max_groups_per_window {
-            return Err(DbError::Pipeline(format!(
-                "Core window session group cardinality limit {} reached",
-                self.max_groups_per_window
-            )));
+        if new_group {
+            self.admit_group_count(self.session_group_count.saturating_add(1), || {
+                "session window record processing".into()
+            })?;
         }
 
         match overlapping.len() {
@@ -2833,6 +2825,21 @@ impl CoreWindowState {
         Ok(prepared)
     }
 
+    fn admit_group_count(
+        &self,
+        groups: usize,
+        context: impl FnOnce() -> String,
+    ) -> Result<(), DbError> {
+        if groups > self.max_groups_per_window {
+            return Err(DbError::GroupLimitExceeded {
+                context: context(),
+                groups,
+                limit: self.max_groups_per_window,
+            });
+        }
+        Ok(())
+    }
+
     fn subtract_vnode_cardinality(
         window_group_counts: &mut FxHashMap<i64, usize>,
         session_group_count: &mut usize,
@@ -2870,15 +2877,10 @@ impl CoreWindowState {
     ) -> Result<(), DbError> {
         match &self.assigner {
             CoreWindowAssigner::Session { .. } => {
-                *session_group_count = session_group_count
-                    .checked_add(checkpoint.group_session_ends.len())
-                    .filter(|count| *count <= self.max_groups_per_window)
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "Core window session group cardinality exceeds limit {}",
-                            self.max_groups_per_window
-                        ))
-                    })?;
+                let groups =
+                    session_group_count.saturating_add(checkpoint.group_session_ends.len());
+                self.admit_group_count(groups, || "session window vnode transition".into())?;
+                *session_group_count = groups;
             }
             CoreWindowAssigner::Tumbling(_) | CoreWindowAssigner::Hopping(_) => {
                 let mut first = 0_u32;
@@ -2887,22 +2889,19 @@ impl CoreWindowState {
                     .iter()
                     .zip(&checkpoint.window_group_ends)
                 {
-                    let count = end
-                        .checked_sub(first)
-                        .and_then(|groups| {
-                            window_group_counts
-                                .get(&window_start)
-                                .copied()
-                                .unwrap_or(0)
-                                .checked_add(groups as usize)
-                        })
-                        .filter(|count| *count <= self.max_groups_per_window)
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(format!(
-                                "Core window {window_start} group cardinality exceeds limit {}",
-                                self.max_groups_per_window
-                            ))
-                        })?;
+                    let groups = end.checked_sub(first).ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "Core window {window_start} group roster is not monotonic"
+                        ))
+                    })?;
+                    let count = window_group_counts
+                        .get(&window_start)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(groups as usize);
+                    self.admit_group_count(count, || {
+                        format!("window {window_start} vnode transition")
+                    })?;
                     window_group_counts.insert(window_start, count);
                     first = end;
                 }

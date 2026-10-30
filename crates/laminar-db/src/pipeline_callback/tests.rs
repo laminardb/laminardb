@@ -55,9 +55,9 @@ async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metri
         let before_bytes = callback.mv_store.read().total_bytes();
         let error = callback.update_mv_stores(&results).unwrap_err();
         assert!(
-            matches!(error, crate::pipeline::CycleError::Recovery(ref reason) if reason.contains("quota exceeded"))
+            matches!(error, crate::pipeline::CycleError::Halt(ref reason) if reason.contains("quota exceeded"))
         );
-        assert!(callback.checkpoint_fault.lock().is_some());
+        assert!(callback.checkpoint_fault.lock().is_none());
         assert_eq!(callback.prom.views.updates.get(), 0);
         assert_eq!(callback.mv_store.read().total_bytes(), before_bytes);
         for name in ["a", "b"] {
@@ -4723,6 +4723,29 @@ async fn managed_state_budget_exhaustion_halts_and_notifies_shutdown() {
     tokio::time::timeout(Duration::from_millis(50), notify.notified())
         .await
         .expect("managed-state exhaustion must notify shutdown");
+}
+
+#[tokio::test]
+async fn group_limit_halts_and_notifies_shutdown() {
+    use crate::pipeline::CycleError;
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let error = DbError::GroupLimitExceeded {
+        context: "aggregate record processing".into(),
+        groups: 1_000_001,
+        limit: 1_000_000,
+    };
+
+    let mapped = ConnectorPipelineCallback::map_graph_error(&error, &notify);
+
+    assert!(matches!(
+        &mapped,
+        CycleError::Halt(message)
+            if message.contains(laminar_core::error_codes::MANAGED_STATE_BUDGET_EXCEEDED)
+                && message.contains("groups=1000001")
+    ));
+    tokio::time::timeout(Duration::from_millis(50), notify.notified())
+        .await
+        .expect("group-limit exhaustion must notify shutdown");
 }
 
 #[tokio::test]

@@ -1520,7 +1520,17 @@ fn test_session_group_cardinality_cap_fails_closed() {
 
     let batch2 = make_pre_agg_batch(vec!["C", "A"], vec![999, 20], vec![1500, 1500]);
     let error = state.update_batch(&batch2).unwrap_err();
-    assert!(error.to_string().contains("cardinality limit"));
+    assert!(
+        matches!(
+            error,
+            crate::DbError::GroupLimitExceeded {
+                groups: 3,
+                limit: 2,
+                ..
+            }
+        ),
+        "{error}"
+    );
     assert_eq!(session_group_count(&state), 2);
 
     let batches = state.close_windows(10_000).unwrap();

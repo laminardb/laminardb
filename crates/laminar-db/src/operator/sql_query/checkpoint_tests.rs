@@ -2772,7 +2772,7 @@ fn aggregate_shuffle_wrappers_preserve_terminal_disposition() {
 }
 
 #[tokio::test]
-async fn later_aggregate_batch_failure_requires_recovery_after_prior_mutation() {
+async fn later_aggregate_batch_over_the_group_cap_halts_after_prior_mutation() {
     let (context, seed) = context_and_batch();
     let schema = seed.schema();
     let first = RecordBatch::try_new(
@@ -2809,12 +2809,18 @@ async fn later_aggregate_batch_failure_requires_recovery_after_prior_mutation() 
         .await
         .expect_err("the later batch must exceed the aggregate group limit");
 
-    assert!(matches!(
-        &error,
-        DbError::StatefulOperatorPartialApply(message)
-            if message.contains("state update") && message.contains("outcome is unknown")
-    ));
-    assert!(error.requires_pipeline_recovery());
+    assert!(
+        matches!(
+            &error,
+            DbError::GroupLimitExceeded {
+                groups: 3,
+                limit: 2,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.requires_pipeline_halt());
 }
 
 #[test]

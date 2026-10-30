@@ -68,6 +68,11 @@ impl ConnectorPipelineCallback {
         if let Err(error) = <Self as PipelineCallback>::update_mv_stores(self, results) {
             #[cfg(feature = "cluster")]
             self.abort_prepared_subscription_output_cycle();
+            if let CycleError::Halt(reason) = error {
+                return Err(CycleError::Halt(format!(
+                    "checkpoint graph drain halted: {reason}"
+                )));
+            }
             let reason = format!(
                 "checkpoint graph drain could not publish materialized-view output: {error}"
             );

@@ -298,3 +298,37 @@ async fn source_burst_above_the_port_bound_waits_and_delivers_every_row() {
     assert_eq!(delivered, 200 * 1024);
     assert_eq!(db.pipeline_state(), "Running", "{:?}", db.last_fault());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_quota_halt_remains_terminal_across_public_stop_and_start() {
+    let db = LaminarDB::builder()
+        .materialized_view_max_rows(1)
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE input (payload VARCHAR)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW counts AS SELECT payload, COUNT(*) AS n FROM input GROUP BY payload",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+    let source = db.source::<Payload>("input").unwrap();
+    source.push(Payload("a".into())).unwrap();
+    source.push(Payload("b".into())).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while db.pipeline_state() != "Faulted" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a view over its quota must halt the running pipeline");
+    db.stop_pipeline().await.unwrap();
+    let reason = db.last_fault().expect("terminal reason");
+    assert!(reason.contains("quota exceeded"), "{reason}");
+    let error = db.start().await.unwrap_err();
+    assert!(error.requires_pipeline_halt(), "{error}");
+    assert_eq!(db.last_fault().as_deref(), Some(reason.as_str()));
+}

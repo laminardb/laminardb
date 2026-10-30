@@ -1894,6 +1894,26 @@ impl OperatorGraph {
             })
     }
 
+    fn validate_post_process_state_budget(&mut self, node_id: usize) -> Result<(), DbError> {
+        if self.nodes[node_id]
+            .operator
+            .managed_state_accounting()
+            .is_none()
+        {
+            return Ok(());
+        }
+        let context = format!("operator '{}' record processing", self.nodes[node_id].name);
+        self.validate_managed_state_budget(context).map_err(|error| {
+            if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+                error
+            } else {
+                DbError::StatefulOperatorPartialApply(format!(
+                    "managed state changed before the post-process budget check; recovery from the committed checkpoint is required: {error}"
+                ))
+            }
+        })
+    }
+
     fn validate_managed_state_budget(&mut self, context: impl Into<String>) -> Result<(), DbError> {
         let mut accounted_bytes = self.managed_state_accounted_bytes();
         if accounted_bytes > self.max_managed_state_bytes {
@@ -3106,25 +3126,10 @@ impl OperatorGraph {
             .process_with_frontiers(if accept { inputs.as_slice() } else { &[][..] }, &frontiers)
             .await;
         drop(process_timer);
-        let output_result = match output_result {
-            Ok(batches) if self.nodes[node_id].capability.managed_state.is_some() => {
-                let budget_context =
-                    format!("operator '{}' record processing", self.nodes[node_id].name);
-                self.validate_managed_state_budget(budget_context)
-                    .map_err(|error| {
-                        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
-                            error
-                        } else {
-                            DbError::StatefulOperatorPartialApply(format!(
-                                "managed state changed before the post-process budget check; recovery from the committed checkpoint is required: {error}"
-                            ))
-                        }
-                    })
-                    .map(|()| batches)
-            }
-            Ok(batches) => Ok(batches),
-            Err(error) => Err(error),
-        };
+        let output_result = output_result.and_then(|batches| {
+            self.validate_post_process_state_budget(node_id)
+                .map(|()| batches)
+        });
 
         let batches = match output_result {
             Ok(b) => {
