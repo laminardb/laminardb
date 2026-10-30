@@ -54,10 +54,16 @@ impl LaminarDB {
     /// Start the streaming pipeline. Idempotent if already running. On failure
     /// (or recovering from `Faulted`) it rebuilds from the surviving catalog.
     ///
+    /// The first start logs a warning when the per-node memory budgets add up to more than the
+    /// process's cgroup memory limit.
+    ///
     /// # Errors
     ///
     /// Returns an error if the pipeline cannot be started.
     pub async fn start(self: &Arc<Self>) -> Result<(), DbError> {
+        if DbState::load(&self.state) == DbState::Created {
+            crate::memory_budget::warn_if_over_cgroup_limit(&self.config, self.runtime_mode());
+        }
         self.start_with_lifecycle_authority(PipelineLifecycleAuthority::Public)
             .await
     }

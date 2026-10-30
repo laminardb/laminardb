@@ -23,3 +23,7 @@ pub use transport::{
 };
 #[cfg(feature = "cluster")]
 pub use transport::{shuffle_send_may_have_been_admitted, ShufflePeerFlow, SHUFFLE_ADDR_KEY};
+
+/// Data bytes a node's shuffle endpoints hold in each direction, summed over its peers.
+#[cfg(feature = "cluster")]
+pub const SHUFFLE_NODE_BUDGET_BYTES: usize = 128 * 1024 * 1024;

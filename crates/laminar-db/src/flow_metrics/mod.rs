@@ -1,5 +1,5 @@
-//! Flow and skew series: where accepted input waits, how full the shared budgets are, and how
-//! evenly managed state spreads over this node's vnodes.
+//! Flow and skew series: where accepted input waits, how large and how full the shared budgets
+//! are, and how evenly managed state spreads over this node's vnodes.
 //!
 //! Labels are bounded by the catalog (source, sink, operator) or by fixed literals; no series is
 //! labelled by vnode or key.
@@ -26,6 +26,8 @@ pub(crate) struct FlowMetrics {
     sink_command_queue_depth: IntGaugeVec,
     /// Accounted managed state over `pipeline_max_managed_state_bytes`; 1.0 halts the pipeline.
     pub(crate) managed_state_budget_ratio: Gauge,
+    /// Each per-node byte budget of the database the metrics are attached to. Label: `area`.
+    memory_budget_bytes: IntGaugeVec,
     /// Rows of an aggregate's input owned by another node (`input`) and the rows it put on the
     /// wire for them (`sent`). Labels: `operator`, `form`.
     #[cfg(feature = "cluster")]
@@ -76,6 +78,14 @@ fn labelled_gauge(registry: &Registry, name: &str, help: &str, label: &str) -> I
 }
 
 impl FlowMetrics {
+    pub(crate) fn observe_memory_budgets(&self, budgets: &[(&str, u64)]) {
+        for (area, bytes) in budgets {
+            self.memory_budget_bytes
+                .with_label_values(&[area])
+                .set(i64::try_from(*bytes).unwrap_or(i64::MAX));
+        }
+    }
+
     pub(crate) fn sink(&self, name: &str) -> SinkFlowMetrics {
         SinkFlowMetrics {
             epoch_gate_wait: self.sink_epoch_gate_wait_seconds.with_label_values(&[name]),
@@ -98,6 +108,17 @@ impl FlowMetrics {
         )
         .unwrap();
         registry.register(Box::new(subscription_log_bytes)).unwrap();
+        if let Some(limit) = crate::memory_budget::cgroup_memory_max_bytes() {
+            let cgroup_memory_max_bytes = IntGauge::new(
+                "cgroup_memory_max_bytes",
+                "Memory limit of this process's cgroup, read when the metrics were registered",
+            )
+            .unwrap();
+            cgroup_memory_max_bytes.set(i64::try_from(limit).unwrap_or(i64::MAX));
+            registry
+                .register(Box::new(cgroup_memory_max_bytes))
+                .unwrap();
+        }
         Self {
             coordinator: CoordinatorFlowMetrics::register(registry).unwrap(),
             sink_epoch_gate_wait_seconds: register(
@@ -126,6 +147,12 @@ impl FlowMetrics {
                     "Accounted managed state over pipeline_max_managed_state_bytes; 1 halts the pipeline",
                 )
                 .unwrap(),
+            ),
+            memory_budget_bytes: labelled_gauge(
+                registry,
+                "memory_budget_bytes",
+                "Per-node byte budgets by area; per-view, per-table and per-source limits are not included",
+                "area",
             ),
             #[cfg(feature = "cluster")]
             aggregate_shuffle_rows_total: register(
@@ -181,6 +208,7 @@ mod tests {
         let sink = flow.sink("out");
         sink.observe_command_queue(0);
         drop(sink.time_epoch_gate_wait());
+        flow.observe_memory_budgets(&[("managed_state", 1)]);
         for gauge in [
             &flow.vnode_state_bytes_max,
             &flow.vnode_state_bytes_mean,
@@ -205,6 +233,7 @@ mod tests {
             "sink_epoch_gate_wait_seconds",
             "sink_command_queue_depth",
             "managed_state_budget_ratio",
+            "memory_budget_bytes",
             "subscription_log_bytes",
             #[cfg(feature = "cluster")]
             "aggregate_shuffle_rows_total",

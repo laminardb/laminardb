@@ -16,7 +16,9 @@ use tokio::sync::watch;
 mod lifecycle;
 mod reader;
 
-pub(crate) use lifecycle::{process_subscription_log_bytes, SubscriptionRegistry};
+pub(crate) use lifecycle::{
+    process_subscription_log_bytes, SubscriptionRegistry, PROCESS_SUBSCRIPTION_BYTES,
+};
 pub(super) use reader::SubscriptionRead;
 pub(crate) use reader::SubscriptionReader;
 #[cfg(test)]
