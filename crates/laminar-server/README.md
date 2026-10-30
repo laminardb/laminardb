@@ -491,6 +491,25 @@ largest expected participant artifact, then validate with fault/restart testing.
 `checkpoint.interval` for acceptable replay work and storage traffic, and keep
 `checkpoint.timeout` above observed checkpoint duration (defaults: 10s and 120s).
 
+When the database first starts, it adds up its per-node budgets and compares the total with the
+process's cgroup memory limit. That limit is `memory.max`, or `memory.limit_in_bytes` under
+cgroup v1, and the lowest value from the process's cgroup up to the mount is used. If the
+budgets add up to more than the limit, it logs a warning naming each budget. The process can
+then be killed for memory before any budget fails closed. The check runs in every mode, never
+stops startup, and derives no default from the limit. The per-node budgets are:
+
+- managed state, `server.datafusion_memory_limit_bytes`, the source queue and the view read
+  cache;
+- `checkpoint.max_node_data_bytes`;
+- on a single node, local subscription logs (256 MiB);
+- on a cluster node, subscription output (256 MiB) and shuffle (128 MiB in each direction).
+
+With the defaults that is 1,600 MiB on a single node and 1,856 MiB on a cluster node. Per-view,
+per-table and per-source limits come on top.
+`/metrics` exports each per-node budget as `laminardb_memory_budget_bytes{area}`. When the
+process has a cgroup limit, it also exports `laminardb_cgroup_memory_max_bytes`, read once at
+startup.
+
 `server.datafusion_memory_limit_bytes` bounds participating fallible DataFusion reservations in both
 server modes and requires a restart to change. DB-owned contexts share the limit and disable
 disk spilling. It does not cap process RSS, queues, managed state or connector I/O allocations;

@@ -102,6 +102,7 @@ mod handle;
 mod interval_join;
 mod key_column;
 mod log_throttle;
+mod memory_budget;
 mod metrics;
 mod metrics_api;
 mod mv_store;

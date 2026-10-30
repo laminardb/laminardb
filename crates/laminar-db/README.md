@@ -295,6 +295,13 @@ the server's `/metrics` endpoint adds the `laminardb_` prefix.
 Waits have no default deadline: under load or skew a slow peer or sink is expected to make its
 producer wait, and a deadline would turn that wait into a recovery round.
 
+None of these budgets bounds process memory. On its first `start`, a database logs a warning if
+its per-node budgets add up to more than the process's cgroup memory limit. Attached engine
+metrics export each budget as `memory_budget_bytes{area}`, and the limit as
+`cgroup_memory_max_bytes`. A process without a cgroup memory limit is not checked. An embedded
+database's default per-node budgets add up to 1,088 MiB, or 1,600 MiB with checkpointing. The
+server README's "Memory limits and production tuning" section lists the areas.
+
 `intake_paused_seconds_total` reasons are exclusive: a fence takes precedence over output
 pressure, and both over port pressure. `source_queue_messages` is sampled at each coordinator
 wake. `sink_epoch_gate_wait_seconds` observes only waits; a write into an open epoch is not
