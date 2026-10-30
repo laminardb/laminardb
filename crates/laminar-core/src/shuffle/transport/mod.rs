@@ -728,9 +728,9 @@ mod grpc {
     const OUTBOUND_PEER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
     const CHECKPOINTED_CONTROL_PEER_BUDGET_BYTES: usize = 256 * 1024;
     const CHECKPOINTED_CONTROL_NODE_BUDGET_BYTES: usize = 4 * 1024 * 1024;
-    const OUTBOUND_NODE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    const OUTBOUND_NODE_BUDGET_BYTES: usize = crate::shuffle::SHUFFLE_NODE_BUDGET_BYTES;
     const INBOUND_PEER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
-    const INBOUND_NODE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+    const INBOUND_NODE_BUDGET_BYTES: usize = crate::shuffle::SHUFFLE_NODE_BUDGET_BYTES;
     const MAX_SOURCE_SCHEMA_MEMORY_BYTES: usize = 256 * 1024;
     /// The encoded schema is the canonical protocol bound. It must fit entirely in fragment zero
     /// so a receiver can verify it before allocating an Arrow decoder.
