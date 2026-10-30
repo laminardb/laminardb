@@ -3,8 +3,8 @@
 use super::{
     strip_source_row_positions, AlignedCheckpointContext, Arc, BarrierOutcome, CheckpointAttempt,
     CheckpointBarrier, CheckpointCleanupOwner, CycleError, CycleOutcome, CyclePublicationDurations,
-    FxHashMap, FxHashSet, Instant, PendingWatermarkBatch, PipelineCallback, QueuedSourceMsg,
-    RecordBatch, SourceBatchCursor, SourceCheckpoint, SourceInputMode, SourceMsg,
+    Duration, FxHashMap, FxHashSet, Instant, PendingWatermarkBatch, PipelineCallback,
+    QueuedSourceMsg, RecordBatch, SourceBatchCursor, SourceCheckpoint, SourceInputMode, SourceMsg,
     StreamingCoordinator, SOURCE_MUTATION_COLUMN,
 };
 
@@ -118,6 +118,44 @@ impl StreamingCoordinator {
         Ok(())
     }
 
+    /// Stage the woken message, then drain the source FIFO for up to 10,000 messages or the drain
+    /// budget. A message that does not fit its source's graph ports is parked and ends staging,
+    /// so source intake waits for room instead of overflowing a port. Replay keeps its pinned
+    /// frontiers and cursors; newer input stays in the FIFO.
+    pub(super) fn stage_source_input(
+        &mut self,
+        first: Option<QueuedSourceMsg>,
+        callback: &mut impl PipelineCallback,
+        barriers: &mut Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
+        cycle_events: &mut u64,
+        cycle_start: Instant,
+    ) -> Result<(), CycleError> {
+        const MAX_DRAIN_PER_CYCLE: usize = 10_000;
+        let drain_budget = Duration::from_nanos(self.config.drain_budget_ns);
+        let mut next = first;
+        if next.is_none() && !self.replay_pending && self.parked_source_msg.is_none() {
+            next = self.rx.try_recv().ok();
+        }
+        let mut drained = 0;
+        while let Some(message) = next.take() {
+            if !self.charge_source_headroom(&message.message) {
+                self.park_for_headroom(message, callback);
+                break;
+            }
+            self.process_msg(message, callback, barriers, cycle_events)?;
+            if self.replay_pending
+                || drained == MAX_DRAIN_PER_CYCLE
+                || cycle_start.elapsed() >= drain_budget
+            {
+                break;
+            }
+            next = self.rx.try_recv().ok();
+            drained += 1;
+        }
+        self.observe_port_backpressure();
+        Ok(())
+    }
+
     /// Process one source message under the exact source-barrier ordering invariant.
     pub(super) fn process_msg(
         &mut self,
@@ -126,7 +164,9 @@ impl StreamingCoordinator {
         barriers: &mut Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
         cycle_events: &mut u64,
     ) -> Result<(), CycleError> {
-        match msg.message {
+        let (message, permit) = msg.into_parts();
+        self.hold_staged_permit(permit);
+        match message {
             SourceMsg::Batch {
                 source_idx,
                 batch,
@@ -174,13 +214,19 @@ impl StreamingCoordinator {
     ///
     /// No shutdown checkpoint exists, so every remaining batch belongs to an uncommitted open
     /// epoch. Barriers are control records for attempts that have already been cancelled and are
-    /// ignored; they must never affect later open-epoch data.
+    /// ignored; they must never affect later open-epoch data. The shutdown drain runs one cycle,
+    /// so a batch that does not fit its ports, and every message after it, is dropped with its
+    /// cursor instead of halting the pipeline; recovery replays it from the committed cursor.
     pub(super) fn process_shutdown_msg(
         &mut self,
         msg: QueuedSourceMsg,
         callback: &mut impl PipelineCallback,
         cycle_events: &mut u64,
     ) -> Option<String> {
+        if !self.charge_source_headroom(&msg.message) {
+            self.close_shutdown_staging();
+            return None;
+        }
         match msg.message {
             SourceMsg::Batch {
                 source_idx,

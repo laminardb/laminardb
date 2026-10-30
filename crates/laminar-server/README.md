@@ -476,7 +476,7 @@ for producer scratch, parked messages and downstream retention.
 `server.pipeline_max_input_buf_batches` and `server.pipeline_max_input_buf_bytes` configure
 prospective graph-port limits in both server modes. The count default is 256; the byte cap is
 unset by default and must be greater than zero when supplied. Fan-out charges each port
-independently. Output that cannot fit after execution halts before routing; see the
+independently. A full port makes its producer wait; see the
 [graph input contract](../laminar-db/README.md#graph-input-limits). These startup settings are
 not hot-reloaded and do not bound total process RSS.
 

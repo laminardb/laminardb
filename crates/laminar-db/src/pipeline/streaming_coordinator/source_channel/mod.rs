@@ -15,8 +15,15 @@ use super::SourceMsg;
 
 pub(super) struct QueuedSourceMsg {
     pub(super) message: SourceMsg,
-    // Retained through dequeue/parking; staging transfers Arrow ownership to the cycle/graph.
-    _permit: Option<OwnedSemaphorePermit>,
+    // Retained through dequeue and parking; the coordinator keeps it until a graph port admits
+    // the staged batch.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedSourceMsg {
+    pub(super) fn into_parts(self) -> (SourceMsg, Option<OwnedSemaphorePermit>) {
+        (self.message, self.permit)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -185,10 +192,7 @@ impl SourceMsgTx {
             // behind another source's byte waiter. Count saturation retains existing backpressure.
             SourceMsg::Barrier { .. } => None,
         };
-        let send = self.tx.send(QueuedSourceMsg {
-            message,
-            _permit: permit,
-        });
+        let send = self.tx.send(QueuedSourceMsg { message, permit });
         wait.time(send).await.map_err(|_| SourceQueueError::Closed)
     }
 
@@ -208,10 +212,7 @@ impl SourceMsgTx {
             SourceMsg::Barrier { .. } => None,
         };
         self.tx
-            .try_send(QueuedSourceMsg {
-                message,
-                _permit: permit,
-            })
+            .try_send(QueuedSourceMsg { message, permit })
             .map_err(|error| match error {
                 crossfire::TrySendError::Full(_) => SourceQueueError::Full,
                 crossfire::TrySendError::Disconnected(_) => SourceQueueError::Closed,
@@ -257,7 +258,7 @@ impl From<SourceMsg> for QueuedSourceMsg {
     fn from(message: SourceMsg) -> Self {
         Self {
             message,
-            _permit: None,
+            permit: None,
         }
     }
 }

@@ -106,8 +106,9 @@ users set `PipelineConfig::source_queue_max_bytes`. Zero and values above
 
 Admission charges retained Arrow array capacity and batch/column descriptors, including
 backing buffers of slices, nested arrays and views. Shared buffers are charged independently
-for each queued batch/column. A message retains its charge while parked by an intake fence;
-staging or discard releases it. A single oversized batch faults the source without settling
+for each queued batch/column. A message retains its charge while parked and while staged, until
+its graph port admits it or the cycle discards it; the shutdown drain releases it at staging.
+A single oversized batch faults the source without settling
 its cursor. Full queues backpressure producers; shutdown-tail sends use the same byte limit.
 Barriers share the ordered FIFO but do not consume data-byte capacity.
 
@@ -167,17 +168,26 @@ including aliases. These conservative per-port charges are not a process-wide me
 Caller/staged inputs, operator execution scratch, result/subscription ownership, schema metadata,
 allocator overhead and vector spare capacity remain separate owners.
 
+Source input waits for room: the coordinator stages a source message only when it fits the
+ports of that source, counting what the cycle has already staged. The first message that does not
+fit waits in the coordinator's single parked slot and every later message waits behind it in the
+FIFO, so one full source port holds intake for all sources. A source batch that cannot fit even
+an empty port raises `GraphBufferBudgetExceeded`.
+
 `Backpressure` retains input and withholds source progress when a producer can be deferred before
 execution. Cached SQL retries read that retained input. Multiple streaming inputs have distinct
 ports and provider bindings, with at most 256 dynamic inputs per query; reference/lookup tables
-remain separate providers. An oversized source admission, or an already-executed result that
-cannot fit, raises `GraphBufferBudgetExceeded`. The pipeline halts before publishing the rejected
-admission to graph destinations, and its possibly mutated graph cannot run or checkpoint again.
-Reduce batch size or raise
-the configured limit and resolve the terminal fault before restoring a committed cut. Ordinary
-retry/stop/start cannot reuse that graph; cluster terminal fault authority survives process restarts.
-`Fail` also halts at the existing
-pre-execution capacity gate. Best-effort `ShedOldest` evicts the oldest existing/incoming batches
+remain separate providers. An operator runs only while each port it feeds is below its limit, and
+its output, which exists once it has run, is admitted whole: a port can exceed its limit by one
+run's output, and the gate holds the producer until the consumer drains it.
+
+Source intake waits under both `Backpressure` and `Fail`. `Fail` keeps operator ports exact: it
+halts at the pre-execution capacity gate, and an already-executed result that cannot fit raises
+`GraphBufferBudgetExceeded`. The pipeline halts before publishing the
+rejected admission to graph destinations, and its possibly mutated graph cannot run or checkpoint
+again. Reduce batch size or raise the configured limit and resolve the terminal fault before
+restoring a committed cut. Ordinary retry/stop/start cannot reuse that graph; cluster terminal
+fault authority survives process restarts. Best-effort `ShedOldest` evicts the oldest existing/incoming batches
 before admitting the retained suffix, including dropping a batch that cannot fit by itself;
 `shed_records_total` records discarded rows. Durable delivery still rejects `ShedOldest`.
 
@@ -272,9 +282,9 @@ the server's `/metrics` endpoint adds the `laminardb_` prefix.
 |---|---|---|---|---|
 | In-process push queue (`insert`, source handles, writers) | embedded, single-node | per source: `default_buffer_size` messages (65,536) and `push_source_max_bytes` (64 MiB) | the push returns `ChannelFull` | `SourceMetrics::is_backpressured` |
 | Connector-to-coordinator FIFO | all | shared: 64 messages and `source_queue_max_bytes` (64 MiB) | the source task waits | `source_queue_wait_seconds_total{source}`, `source_queue_messages`, `source_queue_reserved_bytes` |
-| Coordinator drain | all | 10,000 messages or 1 ms per cycle | while a graph port is above 80% full, a cycle stages one message | `intake_paused_seconds_total{reason="port_backpressure"}`, `cycles_backpressured_total` |
+| Coordinator drain | all | 10,000 messages or 1 ms per cycle, and the room left on each source's graph ports | the first message that does not fit waits in a parked slot and the FIFO waits behind it | `intake_paused_seconds_total{reason="port_backpressure"}`, `cycles_backpressured_total` |
 | Intake fences (recovery, vnode transition, handoff) | all | — | intake waits | `intake_paused_seconds_total{reason="fence"}` |
-| Graph input ports | all | `pipeline_max_input_buf_batches` (256); `pipeline_max_input_buf_bytes` (unset) | operator output follows `BackpressurePolicy`; source input that does not fit halts the pipeline (see [graph input limits](#graph-input-limits)) | `input_buf_bytes{stream}`, `shed_records_total{stream}` |
+| Graph input ports | all | `pipeline_max_input_buf_batches` (256); `pipeline_max_input_buf_bytes` (unset) | the producer waits; under the default `Backpressure` policy one run's output may exceed the limit, and a source batch larger than an empty port halts the pipeline (see [graph input limits](#graph-input-limits)) | `input_buf_bytes{stream}`, `shed_records_total{stream}` |
 | Operator state | all | `pipeline_max_managed_state_bytes` (256 MiB, a lower-bound charge) over aggregates, windows, joins, process functions, temporal filters and analytic window frames; 1,000,000 groups per aggregate or window | the budget and the group cap halt the pipeline (LDB-4008) | `managed_state_accounted_bytes`, `managed_state_budget_ratio`, `vnode_state_bytes_max`, `vnode_state_bytes_mean`, `vnode_groups_max`, `vnode_hottest` |
 | Shuffle between nodes | cluster | 256 frames, 32 MiB per peer and 128 MiB per node, each direction | the sending operator waits; gRPC flow control pushes back | `shuffle_send_wait_seconds_total{peer}`, `shuffle_sent_bytes_total{peer}`, `shuffle_sent_rows_total{peer}`, `shuffle_budget_used_bytes{direction}`, `aggregate_shuffle_rows_total{operator,form}` |
 | Materialized views | all | 1,000,000 rows and 256 MiB per view | the pipeline halts (LDB-8003), leaving source cursors uncommitted (see [materialized-view memory limits](#materialized-view-memory-limits)) | — |
