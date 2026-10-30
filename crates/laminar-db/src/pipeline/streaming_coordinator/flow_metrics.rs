@@ -20,7 +20,7 @@ pub(super) enum IntakePause {
     Fence,
     /// Cluster subscription output is above its pause threshold.
     Output,
-    /// A graph input port is above 80%, so a cycle stages one message instead of draining.
+    /// A source message waits in the parked slot for room on its source's graph ports.
     PortBackpressure,
 }
 

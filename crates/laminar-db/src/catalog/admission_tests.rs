@@ -241,3 +241,60 @@ async fn writer_flush_and_close_do_not_release_queued_input_early() {
     assert_eq!(entry.source.queued_arrow_bytes(), 0);
     assert_eq!(entry.snapshot().len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_burst_above_the_port_bound_waits_and_delivers_every_row() {
+    struct Row;
+    impl crate::handle::FromBatch for Row {
+        fn from_batch(_batch: &RecordBatch, _row: usize) -> Self {
+            Self
+        }
+
+        fn from_batch_all(batch: &RecordBatch) -> Vec<Self> {
+            (0..batch.num_rows()).map(|_| Self).collect()
+        }
+    }
+
+    // The bridge coalesces small pushes, so each 1,024-row batch is one FIFO message; the
+    // 64-message FIFO then holds four times what the 16-batch source port can take.
+    let db = LaminarDB::builder()
+        .pipeline_max_input_buf_batches(16)
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE input (payload VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM output AS SELECT payload FROM input")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    let mut output = db.subscribe::<Row>("output").await.unwrap();
+    let rows: Vec<String> = (0..1024).map(|i| format!("row {i}")).collect();
+    let batch =
+        RecordBatch::try_new(Payload::schema(), vec![Arc::new(StringArray::from(rows))]).unwrap();
+    let source = db.source::<Payload>("input").unwrap();
+    for _ in 0..200 {
+        source.push_arrow(batch.clone()).unwrap();
+    }
+
+    let mut delivered = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while delivered < 200 * 1024 {
+            match output.next_frame().await.unwrap() {
+                Some(crate::handle::TypedSubscriptionFrame::Rows { rows, .. }) => {
+                    delivered += rows.len();
+                }
+                Some(_) => {}
+                None => panic!(
+                    "output closed after {delivered} rows: {:?}",
+                    db.last_fault()
+                ),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{delivered} rows delivered: {:?}", db.last_fault()));
+    assert_eq!(delivered, 200 * 1024);
+    assert_eq!(db.pipeline_state(), "Running", "{:?}", db.last_fault());
+}

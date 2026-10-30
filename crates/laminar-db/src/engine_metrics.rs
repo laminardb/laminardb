@@ -423,7 +423,7 @@ pub struct EngineMetrics {
     pub queries_compiled: IntCounter,
     /// Queries using cached logical plan.
     pub queries_cached_plan: IntCounter,
-    /// Cycles skipped by backpressure.
+    /// Cycles whose source intake waited for graph port room.
     pub cycles_backpressured: IntCounter,
     /// Materialized view results and committed reads.
     pub views: ViewMetrics,
@@ -578,7 +578,7 @@ impl EngineMetrics {
             .unwrap()),
             cycles_backpressured: reg!(IntCounter::new(
                 "cycles_backpressured_total",
-                "Cycles skipped by backpressure"
+                "Cycles whose source intake waited for graph port room"
             )
             .unwrap()),
             views: ViewMetrics::new(registry),

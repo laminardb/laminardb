@@ -2,7 +2,7 @@
 
 use super::{
     wait_coordinator_delay, CheckpointCompletion, CheckpointControlWake, CoordinatorRunState,
-    CoordinatorWait, CoordinatorWaitAction, CoordinatorWake, CycleError, Duration, ExitReason,
+    CoordinatorWait, CoordinatorWaitAction, CoordinatorWake, CycleError, ExitReason,
     ForceCheckpointRequest, Instant, PipelineCallback, SourceHandle, StreamingCoordinator,
     IDLE_TIMEOUT,
 };
@@ -44,8 +44,10 @@ impl StreamingCoordinator {
         let replay_ready = self.replay_pending
             && gates.compute_admitted()
             && (self.manual_handoff_required || callback.has_runnable_deferred_input());
-        let parked_ready =
-            !self.replay_pending && gates.compute_admitted() && self.parked_source_msg.is_some();
+        let intake_open = !self.replay_pending && gates.compute_admitted();
+        let parked_ready = intake_open && self.parked_message_ready(&*callback);
+        let fifo_open =
+            intake_open && state.source_channel_expected && self.parked_source_msg.is_none();
         let mut checkpoint_control_due = false;
 
         let message = tokio::select! {
@@ -116,11 +118,7 @@ impl StreamingCoordinator {
             },
             () = std::future::ready(()), if replay_ready => None,
             () = std::future::ready(()), if parked_ready => self.parked_source_msg.take(),
-            msg = self.rx.recv(),
-                if state.source_channel_expected
-                    && !self.replay_pending
-                    && gates.compute_admitted() =>
-            {
+            msg = self.rx.recv(), if fifo_open => {
                 if let Ok(message) = msg {
                     if !state.batch_window.is_zero() {
                         let authority_lost = wait_coordinator_delay(
@@ -345,9 +343,6 @@ impl StreamingCoordinator {
         mut callback: C,
         ready: Option<crossfire::oneshot::TxOneshot<Result<(), String>>>,
     ) -> ExitReason {
-        /// Maximum messages to drain per cycle before yielding for background work.
-        const MAX_DRAIN_PER_CYCLE: usize = 10_000;
-
         let injectors = self
             .source_handles
             .iter()
@@ -442,7 +437,7 @@ impl StreamingCoordinator {
                 }
             }
 
-            self.source_batches_buf.clear();
+            self.begin_source_staging(&callback);
             self.reset_barrier_seen_for_cycle();
             if !self.replay_pending {
                 self.discard_pending_offsets();
@@ -451,64 +446,21 @@ impl StreamingCoordinator {
             let mut cycle_events: u64 = 0;
             let cycle_start = Instant::now();
 
-            let had_data = msg.is_some();
-            if let Some(first_msg) = msg {
-                if let Err(error) = self.process_msg(
-                    first_msg,
-                    &mut callback,
-                    &mut state.barriers,
-                    &mut cycle_events,
-                ) {
-                    match error {
-                        CycleError::Halt(reason) => {
-                            tracing::warn!(%reason, "[LDB-3022] source staging halted");
-                            state.halt(reason);
-                        }
-                        CycleError::Fatal(reason) | CycleError::Recovery(reason) => {
-                            state.fault = Some(reason);
-                        }
+            if let Err(error) = self.stage_source_input(
+                msg,
+                &mut callback,
+                &mut state.barriers,
+                &mut cycle_events,
+                cycle_start,
+            ) {
+                match error {
+                    CycleError::Halt(reason) => {
+                        tracing::warn!(%reason, "[LDB-3022] source staging halted");
+                        state.halt(reason);
                     }
-                }
-            }
-            if state.halted || state.fault.is_some() {
-                self.discard_pending_offsets();
-                break;
-            }
-
-            // Replay keeps its pinned frontiers and cursors; newer input stays in the source FIFO.
-            let mut drain_count = 0;
-            let drain_budget = Duration::from_nanos(self.config.drain_budget_ns);
-            // `is_backpressured()` bumps a counter, so call it only on active wakeups rather than
-            // idle timeouts.
-            let backpressured = had_data && callback.is_backpressured();
-            self.observe_port_backpressure(backpressured);
-            while !self.replay_pending
-                && !backpressured
-                && drain_count < MAX_DRAIN_PER_CYCLE
-                && cycle_start.elapsed() < drain_budget
-            {
-                match self.rx.try_recv() {
-                    Ok(msg) => {
-                        if let Err(error) = self.process_msg(
-                            msg,
-                            &mut callback,
-                            &mut state.barriers,
-                            &mut cycle_events,
-                        ) {
-                            match error {
-                                CycleError::Halt(reason) => {
-                                    tracing::warn!(%reason, "[LDB-3022] source staging halted");
-                                    state.halt(reason);
-                                }
-                                CycleError::Fatal(reason) | CycleError::Recovery(reason) => {
-                                    state.fault = Some(reason);
-                                }
-                            }
-                            break;
-                        }
-                        drain_count += 1;
+                    CycleError::Fatal(reason) | CycleError::Recovery(reason) => {
+                        state.fault = Some(reason);
                     }
-                    Err(_) => break,
                 }
             }
             if let Ok(source_fault) = self.source_fault_rx.try_recv() {
@@ -577,6 +529,7 @@ impl StreamingCoordinator {
                 }
                 let execute_started = Instant::now();
                 let execute_result = callback.execute_cycle(&self.source_batches_buf, wm).await;
+                self.release_staged_permits();
                 let execute_ns =
                     u64::try_from(execute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 match execute_result {

@@ -1403,39 +1403,6 @@ impl OperatorGraph {
         self.publish_buffer_stats();
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    pub fn input_buf_pressure(&self) -> f64 {
-        let cap = self.max_input_buf_batches;
-        let max_bytes = self.max_input_buf_bytes;
-
-        let count_ratio = if cap > 0 {
-            let max_len = self
-                .input_bufs
-                .iter()
-                .flat_map(|ports| ports.iter())
-                .map(Vec::len)
-                .max()
-                .unwrap_or(0);
-            max_len as f64 / cap as f64
-        } else {
-            0.0
-        };
-
-        let bytes_ratio = if let Some(max) = max_bytes {
-            let max_bytes_used = self
-                .input_buf_bytes
-                .iter()
-                .flat_map(|ports| ports.iter().copied())
-                .max()
-                .unwrap_or(0);
-            max_bytes_used as f64 / max as f64
-        } else {
-            0.0
-        };
-
-        count_ratio.max(bytes_ratio).min(1.0)
-    }
-
     pub(crate) fn has_deferred_work(&self) -> bool {
         self.nodes
             .iter()
