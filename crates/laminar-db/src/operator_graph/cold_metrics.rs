@@ -3,35 +3,44 @@
 
 use super::{ManagedStateAccountingSnapshot, OperatorGraph, STATS_SAMPLE_INTERVAL};
 
+/// One vnode's share of an operator's state on this node, from cached counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VnodeStateLoad {
+    pub(crate) vnode: u32,
+    pub(crate) state_bytes: usize,
+    pub(crate) groups: usize,
+    /// Input rows this operator applied to the vnode since it was built; a row counts once per
+    /// window it falls in.
+    pub(crate) applied_rows: u64,
+}
+
 /// How one operator's accounted state spreads over the vnodes this node holds state for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct VnodeLoad {
-    pub(crate) max_bytes: usize,
-    pub(crate) mean_bytes: usize,
-    pub(crate) max_groups: usize,
+struct VnodeLoad {
+    max_bytes: usize,
+    mean_bytes: usize,
+    max_groups: usize,
     /// The vnode holding `max_bytes`, lowest id on ties.
-    pub(crate) hottest_vnode: u32,
+    hottest_vnode: u32,
 }
 
 impl VnodeLoad {
-    /// Summarise `(vnode, accounted bytes, groups)` triples; no vnodes gives all zeros.
-    pub(crate) fn from_vnodes(vnodes: impl IntoIterator<Item = (u32, usize, usize)>) -> Self {
+    /// Summarise per-vnode loads; no vnodes gives all zeros.
+    fn from_vnodes(vnodes: &[VnodeStateLoad]) -> Self {
         let mut load = Self::default();
-        let mut count = 0_usize;
         let mut total = 0_usize;
-        for (vnode, bytes, groups) in vnodes {
-            if count == 0
-                || bytes > load.max_bytes
-                || (bytes == load.max_bytes && vnode < load.hottest_vnode)
+        for (index, vnode) in vnodes.iter().enumerate() {
+            if index == 0
+                || vnode.state_bytes > load.max_bytes
+                || (vnode.state_bytes == load.max_bytes && vnode.vnode < load.hottest_vnode)
             {
-                load.max_bytes = bytes;
-                load.hottest_vnode = vnode;
+                load.max_bytes = vnode.state_bytes;
+                load.hottest_vnode = vnode.vnode;
             }
-            load.max_groups = load.max_groups.max(groups);
-            total = total.saturating_add(bytes);
-            count += 1;
+            load.max_groups = load.max_groups.max(vnode.groups);
+            total = total.saturating_add(vnode.state_bytes);
         }
-        load.mean_bytes = total.checked_div(count).unwrap_or(0);
+        load.mean_bytes = total.checked_div(vnodes.len()).unwrap_or(0);
         load
     }
 }
@@ -64,6 +73,8 @@ impl OperatorGraph {
         }
         let flow = &prom.flow;
         let mut accounted_bytes = 0_usize;
+        #[cfg(feature = "cluster")]
+        let mut vnode_sample = Vec::new();
         for (id, node) in self.nodes.iter().enumerate() {
             let name: &str = &node.name;
             if node.removed {
@@ -83,7 +94,8 @@ impl OperatorGraph {
                 self.managed_state_accounting_peaks[id] = ManagedStateAccountingSnapshot::default();
                 continue;
             }
-            if let Some(load) = node.operator.vnode_load() {
+            if let Some(vnodes) = node.operator.vnode_loads() {
+                let load = VnodeLoad::from_vnodes(&vnodes);
                 flow.vnode_state_bytes_max
                     .with_label_values(&[name])
                     .set(gauge_value(load.max_bytes));
@@ -96,6 +108,8 @@ impl OperatorGraph {
                 flow.vnode_hottest
                     .with_label_values(&[name])
                     .set(i64::from(load.hottest_vnode));
+                #[cfg(feature = "cluster")]
+                vnode_sample.push((std::sync::Arc::clone(&node.name), vnodes));
             }
             let Some(mut accounting) = node.operator.managed_state_accounting() else {
                 continue;
@@ -118,6 +132,8 @@ impl OperatorGraph {
         #[allow(clippy::cast_precision_loss)]
         let ratio = accounted_bytes as f64 / self.max_managed_state_bytes as f64;
         flow.managed_state_budget_ratio.set(ratio);
+        #[cfg(feature = "cluster")]
+        flow.vnode_loads.publish(vnode_sample);
     }
 
     /// Retain transient managed-state ownership until the next cold metrics sample.
@@ -139,12 +155,20 @@ impl OperatorGraph {
 
 #[cfg(test)]
 mod tests {
-    use super::VnodeLoad;
+    use super::{VnodeLoad, VnodeStateLoad};
 
     #[test]
     fn vnode_load_reports_the_largest_vnode_lowest_id_first() {
-        assert_eq!(VnodeLoad::from_vnodes([]), VnodeLoad::default());
-        let load = VnodeLoad::from_vnodes([(9, 40, 1), (3, 40, 7), (5, 10, 2)]);
+        assert_eq!(VnodeLoad::from_vnodes(&[]), VnodeLoad::default());
+        let vnodes = [(9, 40, 1), (3, 40, 7), (5, 10, 2)].map(|(vnode, state_bytes, groups)| {
+            VnodeStateLoad {
+                vnode,
+                state_bytes,
+                groups,
+                applied_rows: 0,
+            }
+        });
+        let load = VnodeLoad::from_vnodes(&vnodes);
         assert_eq!(
             load,
             VnodeLoad {

@@ -53,7 +53,7 @@ mod subscription_output;
 #[cfg(feature = "cluster")]
 mod vnode_transition;
 
-pub(crate) use cold_metrics::VnodeLoad;
+pub(crate) use cold_metrics::VnodeStateLoad;
 
 /// Cached retained managed-state accounting reported by one operator.
 ///
@@ -349,9 +349,9 @@ pub(crate) trait GraphOperator: Send {
         None
     }
 
-    /// Spread of the operator's accounted state over its vnodes, from cached counters, under
-    /// the same rule as [`Self::managed_state_accounting`]. `None` means no per-vnode state.
-    fn vnode_load(&self) -> Option<VnodeLoad> {
+    /// The operator's accounted state per vnode, from cached counters under the same rule as
+    /// [`Self::managed_state_accounting`]. `None` means no per-vnode state.
+    fn vnode_loads(&self) -> Option<Vec<VnodeStateLoad>> {
         None
     }
 

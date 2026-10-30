@@ -44,7 +44,7 @@ use crate::operator_graph::{
 };
 use crate::operator_graph::{
     try_evaluate_compiled, CapturedVnodeState, EncodedStateFrame, GraphOperator, InputFrontier,
-    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture, VnodeLoad,
+    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture, VnodeStateLoad,
 };
 use crate::sql_analysis::{
     extract_projection_filter, projection_sql_preserving_weight, single_source_table,
@@ -2515,9 +2515,9 @@ impl GraphOperator for SqlQueryOperator {
         self.retained_state_accounting()
     }
 
-    fn vnode_load(&self) -> Option<VnodeLoad> {
+    fn vnode_loads(&self) -> Option<Vec<VnodeStateLoad>> {
         match &self.state {
-            QueryState::Agg(aggregate) => Some(aggregate.vnode_load()),
+            QueryState::Agg(aggregate) => Some(aggregate.vnode_loads()),
             _ => None,
         }
     }

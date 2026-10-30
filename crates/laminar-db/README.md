@@ -304,7 +304,9 @@ Aggregates and managed windows report the `vnode_*` gauges. Each summarises one 
 accounted state over the vnodes this node holds state for, refreshed every 32 cycles. `vnode_state_bytes_max` against `vnode_state_bytes_mean`
 shows imbalance within a node. Comparing `sum by (instance)` of `managed_state_accounted_bytes`
 across nodes shows imbalance between nodes. `vnode_hottest` is the id of the largest vnode, with
-ties going to the lowest id. Window operators count a key once per open window or session.
+ties going to the lowest id. Window operators count a key once per open window or session. In a
+cluster, `GET /api/v1/cluster/vnodes/load` lists each vnode's live state, applied rows and
+committed frame bytes (see the server README, "Reading skew").
 `aggregate_shuffle_rows_total` counts, per aggregate, the rows owned by another node
 (`form="input"`) and the rows sent for them (`form="sent"`). They are equal for keyed
 aggregates; a global aggregate sends one partial row per batch.

@@ -9,7 +9,7 @@ use super::accounting::{
 };
 use super::{GroupEntry, IncrementalAggState};
 use crate::error::DbError;
-use crate::operator_graph::VnodeLoad;
+use crate::operator_graph::VnodeStateLoad;
 
 /// Complete mutable working set owned by one aggregate vnode.
 ///
@@ -29,6 +29,8 @@ pub(super) struct AggregateVnodeSlots {
     slots: Box<[Option<Box<AggregateVnodeState>>]>,
     active_vnodes: Vec<u32>,
     resident_group_count: usize,
+    /// Input rows applied per vnode. Not state: it survives vnode moves and is never captured.
+    applied_rows: Box<[u64]>,
     fixed_topology_usage: AggregateStateUsage,
 }
 
@@ -298,15 +300,24 @@ impl AggregateVnodeSlots {
                     "aggregate active vnode roster could not reserve {slot_count} entries: {error}"
                 ))
             })?;
-        let fixed_topology_usage = topology_element_usage::<AggregateVnodeSlots>(1).saturating_add(
-            topology_element_usage::<Option<Box<AggregateVnodeState>>>(slots.len()),
-        );
+        let fixed_topology_usage = topology_element_usage::<AggregateVnodeSlots>(1)
+            .saturating_add(topology_element_usage::<Option<Box<AggregateVnodeState>>>(
+                slots.len(),
+            ))
+            .saturating_add(topology_element_usage::<u64>(slot_count));
         Ok(Self {
             slots: slots.into_boxed_slice(),
             active_vnodes,
             resident_group_count: 0,
+            applied_rows: vec![0; slot_count].into_boxed_slice(),
             fixed_topology_usage,
         })
+    }
+
+    #[inline]
+    pub(super) fn count_applied_rows(&mut self, vnode: u32, rows: usize) {
+        let applied = &mut self.applied_rows[vnode as usize];
+        *applied = applied.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
     }
 
     #[inline]
@@ -420,12 +431,16 @@ impl AggregateVnodeSlots {
 }
 
 impl IncrementalAggState {
-    /// Per-vnode spread of live groups, from each vnode's cached usage.
-    pub(crate) fn vnode_load(&self) -> VnodeLoad {
-        VnodeLoad::from_vnodes(
-            self.vnode_states
-                .iter()
-                .map(|(vnode, state)| (vnode, state.usage().accounted_bytes(), state.groups.len())),
-        )
+    /// Each resident vnode's live groups, from its cached usage.
+    pub(crate) fn vnode_loads(&self) -> Vec<VnodeStateLoad> {
+        self.vnode_states
+            .iter()
+            .map(|(vnode, state)| VnodeStateLoad {
+                vnode,
+                state_bytes: state.usage().accounted_bytes(),
+                groups: state.groups.len(),
+                applied_rows: self.vnode_states.applied_rows[vnode as usize],
+            })
+            .collect()
     }
 }

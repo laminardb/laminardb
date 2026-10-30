@@ -237,6 +237,39 @@ pub(super) async fn cluster_vnodes(State(state): State<Arc<AppState>>) -> impl I
     }
 }
 
+/// `GET /api/v1/cluster/vnodes/load` — how each keyed operator's state spreads over vnodes:
+/// this node's live state, and every participant's frame bytes at the committed checkpoint.
+pub(super) async fn cluster_vnode_load(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        #[derive(Serialize)]
+        struct VnodeLoadResponse {
+            node_id: u64,
+            #[serde(flatten)]
+            report: laminar_db::VnodeLoadReport,
+        }
+
+        let Some(cluster) = state.cluster.as_ref() else {
+            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+        };
+        match state.db.cluster_vnode_load().await {
+            Ok(report) => Json(VnodeLoadResponse {
+                node_id: cluster.controller.instance_id().0,
+                report,
+            })
+            .into_response(),
+            Err(error) => {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
+        }
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = state;
+        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+    }
+}
+
 /// `GET /api/v1/cluster/leader` — the current leader's `NodeInfo` (if known)
 /// and whether this node is the leader.
 pub(super) async fn cluster_leader(State(state): State<Arc<AppState>>) -> impl IntoResponse {

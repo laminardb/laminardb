@@ -154,6 +154,8 @@ mod temporal_join_state;
 #[cfg(test)]
 mod temporal_test_source;
 #[cfg(feature = "cluster")]
+mod vnode_load;
+#[cfg(feature = "cluster")]
 mod vnode_transition_staging;
 
 // End-to-end tests for the crypto-sentiment demo pipeline, backed by wiremock.
@@ -225,6 +227,12 @@ pub use db::{
 pub use db::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
+/// Per-vnode state of keyed operators, live and at the committed checkpoint.
+#[cfg(feature = "cluster")]
+pub use vnode_load::{
+    CommittedVnodeFrame, LiveVnodeLoad, OperatorVnodeLoad, VnodeLoadCheckpoint, VnodeLoadEntry,
+    VnodeLoadReport,
 };
 
 /// Re-export the connector registry for custom connector registration.

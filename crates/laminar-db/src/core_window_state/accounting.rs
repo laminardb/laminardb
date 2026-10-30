@@ -4,7 +4,7 @@
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use super::{CoreWindowState, CoreWindowVnodeState};
-use crate::operator_graph::VnodeLoad;
+use crate::operator_graph::VnodeStateLoad;
 
 impl CoreWindowState {
     fn scratch_nogroup_bytes(scratch: &FxHashMap<i64, Vec<u32>>) -> usize {
@@ -80,20 +80,38 @@ impl CoreWindowState {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<u32>()),
             )
+            .saturating_add(
+                self.vnode_applied_rows
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
     }
 
-    /// Per-vnode spread of window state. Groups count each key once per open window or session.
-    pub(crate) fn vnode_load(&self) -> VnodeLoad {
-        VnodeLoad::from_vnodes(self.active_vnodes.iter().filter_map(|&vnode| {
-            let state = self.vnode_states[vnode as usize].as_deref()?;
-            let groups = state
-                .windows
-                .values()
-                .map(FxHashMap::len)
-                .fold(state.session_groups.len(), usize::saturating_add);
-            let bytes = std::mem::size_of::<CoreWindowVnodeState>()
-                .saturating_add(state.accounted_state_bytes);
-            Some((vnode, bytes, groups))
-        }))
+    /// Each resident vnode's window state. Groups count each key once per open window or
+    /// session.
+    pub(crate) fn vnode_loads(&self) -> Vec<VnodeStateLoad> {
+        self.active_vnodes
+            .iter()
+            .filter_map(|&vnode| {
+                let state = self.vnode_states[vnode as usize].as_deref()?;
+                let groups = state
+                    .windows
+                    .values()
+                    .map(FxHashMap::len)
+                    .fold(state.session_groups.len(), usize::saturating_add);
+                Some(VnodeStateLoad {
+                    vnode,
+                    state_bytes: std::mem::size_of::<CoreWindowVnodeState>()
+                        .saturating_add(state.accounted_state_bytes),
+                    groups,
+                    applied_rows: self.vnode_applied_rows[vnode as usize],
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn count_applied_rows(&mut self, vnode: u32, rows: usize) {
+        let applied = &mut self.vnode_applied_rows[vnode as usize];
+        *applied = applied.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
     }
 }

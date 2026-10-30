@@ -375,6 +375,8 @@ pub(crate) struct CoreWindowState {
     vnode_states: Box<[Option<Box<CoreWindowVnodeState>>]>,
     active_vnodes: Vec<u32>,
     active_vnode_positions: Box<[usize]>,
+    /// Input rows applied per vnode. Not state: it survives vnode moves and is never captured.
+    vnode_applied_rows: Box<[u64]>,
     window_group_counts: FxHashMap<i64, usize>,
     session_group_count: usize,
     row_converter: Arc<arrow::row::RowConverter>,
@@ -846,6 +848,7 @@ impl CoreWindowState {
             vnode_states,
             active_vnodes,
             active_vnode_positions,
+            vnode_applied_rows: vec![0; vnode_count].into_boxed_slice(),
             window_group_counts: FxHashMap::default(),
             session_group_count: 0,
             row_converter,
@@ -1232,6 +1235,7 @@ impl CoreWindowState {
             }
         }
         for (window_start, indices) in &grouped {
+            self.count_applied_rows(0, indices.len());
             let needs_insert = self.vnode_states[0]
                 .as_ref()
                 .and_then(|state| state.windows.get(window_start))
@@ -1339,6 +1343,7 @@ impl CoreWindowState {
         }
 
         for ((vnode, window_start, gid), indices) in &grouped {
+            self.count_applied_rows(*vnode, indices.len());
             let row_key = group_keys
                 .get_index(*gid as usize)
                 .expect("gid was just produced by insert_full");
@@ -1431,6 +1436,7 @@ impl CoreWindowState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
+            self.count_applied_rows(vnodes[row], 1);
             #[allow(clippy::cast_possible_truncation)]
             let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
             self.update_session_window(
