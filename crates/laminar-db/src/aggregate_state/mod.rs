@@ -50,7 +50,7 @@ pub(crate) use compile::{
     find_aggregate, find_post_aggregate_projection,
     post_aggregate_projection_is_positional_identity, CompiledProjection, PreAggBuilder,
 };
-pub(crate) use concrete::{ConcreteAggregateState, ConcreteInputMode};
+pub(crate) use concrete::{AggregateInput, ConcreteAggregateState, ConcreteInputMode};
 #[cfg(feature = "cluster")]
 pub(crate) use emission::PreparedAggregateEmission;
 pub(crate) use keys::global_aggregate_key;
@@ -1502,6 +1502,7 @@ impl IncrementalAggState {
         // One OwnedRow alloc per unique group, not per row.
         let estimated_groups = (batch.num_rows() / 4).max(16);
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
+        let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
         let mut group_indices: FxHashMap<arrow::row::Row<'_>, (Vec<u32>, i64)> =
             FxHashMap::with_capacity_and_hasher(estimated_groups, rustc_hash::FxBuildHasher);
         for row_idx in 0..batch.num_rows() {
@@ -1547,21 +1548,13 @@ impl IncrementalAggState {
             format!("aggregate record processing (current={current_groups}, incoming_new={incoming_new_groups})")
         })?;
 
-        let agg_specs = &self.agg_specs;
         let aggregate_templates = &self.aggregate_templates;
-        let weight_col_idx = self.weight_col_idx;
         let emit_changelog = self.emit_changelog;
         for (vnode, owned_key, indices, input_weight, is_new) in grouped_rows {
             self.vnode_states.count_applied_rows(vnode, indices.len());
             if is_new {
                 let mut entry = GroupEntry::new(aggregate_templates.clone(), 0, watermark_ms);
-                Self::update_concrete_accumulators(
-                    &mut entry.accs,
-                    batch,
-                    &indices,
-                    agg_specs,
-                    weight_col_idx,
-                )?;
+                Self::update_concrete_accumulators(&mut entry.accs, &inputs, &indices)?;
                 entry.input_weight = input_weight;
                 entry.last_updated_ms = watermark_ms;
                 entry.refresh_accumulator_usage();
@@ -1590,13 +1583,8 @@ impl IncrementalAggState {
                     .groups
                     .get_mut(&owned_key)
                     .expect("preflighted aggregate group must remain resident");
-                let update_result = Self::update_concrete_accumulators(
-                    &mut entry.accs,
-                    batch,
-                    &indices,
-                    agg_specs,
-                    weight_col_idx,
-                );
+                let update_result =
+                    Self::update_concrete_accumulators(&mut entry.accs, &inputs, &indices);
                 if update_result.is_ok() {
                     entry.input_weight = input_weight;
                     entry.last_updated_ms = watermark_ms;
@@ -1662,25 +1650,20 @@ impl IncrementalAggState {
 
     fn update_concrete_accumulators(
         states: &mut [ConcreteAggregateState],
-        batch: &RecordBatch,
-        indices: &[u32],
-        agg_specs: &[AggFuncSpec],
-        weight_col_idx: Option<usize>,
+        inputs: &[AggregateInput<'_>],
+        rows: &[u32],
     ) -> Result<(), DbError> {
-        if states.len() != agg_specs.len() {
+        if states.len() != inputs.len() {
             return Err(DbError::Pipeline(format!(
-                "aggregate state arity mismatch: {} states vs {} specifications",
+                "aggregate state arity mismatch: {} states vs {} inputs",
                 states.len(),
-                agg_specs.len()
+                inputs.len()
             )));
         }
-        Self::for_each_aggregate_input(
-            batch,
-            indices,
-            agg_specs,
-            weight_col_idx,
-            |index, values| states[index].update_batch(values),
-        )
+        states
+            .iter_mut()
+            .zip(inputs)
+            .try_for_each(|(state, input)| state.update_rows(input, rows))
     }
 
     /// Temporary adapter for window state until it adopts the concrete vnode representation.

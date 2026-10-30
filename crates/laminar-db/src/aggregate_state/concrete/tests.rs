@@ -1,8 +1,37 @@
 use std::sync::Arc;
 
 use super::*;
-use arrow::array::{Decimal128Array, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+};
+use arrow::datatypes::Int64Type;
 use datafusion_expr::{AggregateUDF, AggregateUDFImpl};
+
+/// Every row of a value array and, in weighted mode, a weight array.
+fn whole(values: &[ArrayRef]) -> (AggregateInput<'_>, Vec<u32>) {
+    let weights = values.get(1).map(AsArray::as_primitive::<Int64Type>);
+    let rows = (0..u32::try_from(values[0].len()).unwrap()).collect();
+    (AggregateInput::new(&values[0], None, weights), rows)
+}
+
+trait WholeArrays {
+    fn update_all(&mut self, values: &[ArrayRef]) -> Result<(), DbError>;
+    #[cfg(feature = "cluster")]
+    fn delta_all(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError>;
+}
+
+impl WholeArrays for ConcreteAggregateState {
+    fn update_all(&mut self, values: &[ArrayRef]) -> Result<(), DbError> {
+        let (input, rows) = whole(values);
+        self.update_rows(&input, &rows)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn delta_all(&self, values: &[ArrayRef]) -> Result<Vec<ScalarValue>, DbError> {
+        let (input, rows) = whole(values);
+        self.batch_delta(&input, &rows)
+    }
+}
 
 fn spec<T: AggregateUDFImpl + 'static>(
     implementation: T,
@@ -25,11 +54,11 @@ fn spec<T: AggregateUDFImpl + 'static>(
 fn cloned_append_sum_is_an_exact_cut() {
     let spec = spec(Sum::new(), DataType::Int64, DataType::Int64, false);
     let mut live = ConcreteAggregateState::try_new(&spec, ConcreteInputMode::AppendOnly).unwrap();
-    live.update_batch(&[Arc::new(Int64Array::from(vec![1, 2, 3]))])
+    live.update_all(&[Arc::new(Int64Array::from(vec![1, 2, 3]))])
         .unwrap();
     let captured = live.clone();
 
-    live.update_batch(&[Arc::new(Int64Array::from(vec![4]))])
+    live.update_all(&[Arc::new(Int64Array::from(vec![4]))])
         .unwrap();
 
     assert_eq!(
@@ -58,7 +87,7 @@ fn decimal_avg_widens_running_sum_and_preserves_scale() {
     let values = Decimal128Array::from(vec![Some(9_999_999_999), Some(9_999_999_999), None])
         .with_precision_and_scale(10, 2)
         .unwrap();
-    state.update_batch(&[Arc::new(values)]).unwrap();
+    state.update_all(&[Arc::new(values)]).unwrap();
 
     let checkpoint = state.checkpoint_state().unwrap();
     assert_eq!(
@@ -83,12 +112,12 @@ fn decimal_avg_widens_running_sum_and_preserves_scale() {
 fn weighted_arithmetic_uses_existing_checkpoint_shapes() {
     let sum_spec = spec(Sum::new(), DataType::Int64, DataType::Int64, false);
     let mut sum = ConcreteAggregateState::try_new(&sum_spec, ConcreteInputMode::Weighted).unwrap();
-    sum.update_batch(&[
+    sum.update_all(&[
         Arc::new(Int64Array::from(vec![10, 20])),
         Arc::new(Int64Array::from(vec![1, 1])),
     ])
     .unwrap();
-    sum.update_batch(&[
+    sum.update_all(&[
         Arc::new(Int64Array::from(vec![10, 30])),
         Arc::new(Int64Array::from(vec![-1, 1])),
     ])
@@ -104,12 +133,12 @@ fn weighted_arithmetic_uses_existing_checkpoint_shapes() {
 
     let avg_spec = spec(Avg::new(), DataType::Float64, DataType::Float64, false);
     let mut avg = ConcreteAggregateState::try_new(&avg_spec, ConcreteInputMode::Weighted).unwrap();
-    avg.update_batch(&[
+    avg.update_all(&[
         Arc::new(Float64Array::from(vec![10.0, 20.0])),
         Arc::new(Int64Array::from(vec![1, 1])),
     ])
     .unwrap();
-    avg.update_batch(&[
+    avg.update_all(&[
         Arc::new(Float64Array::from(vec![10.0, 30.0])),
         Arc::new(Int64Array::from(vec![-1, 1])),
     ])
@@ -130,14 +159,14 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
     let mut append_sum =
         ConcreteAggregateState::try_new(&sum_spec, ConcreteInputMode::AppendOnly).unwrap();
     assert!(append_sum
-        .update_batch(&[Arc::new(Int64Array::from(vec![i64::MAX, 1]))])
+        .update_all(&[Arc::new(Int64Array::from(vec![i64::MAX, 1]))])
         .is_err());
     assert_eq!(append_sum.evaluate().unwrap(), ScalarValue::Int64(None));
 
     let mut weighted_sum =
         ConcreteAggregateState::try_new(&sum_spec, ConcreteInputMode::Weighted).unwrap();
     assert!(weighted_sum
-        .update_batch(&[
+        .update_all(&[
             Arc::new(Int64Array::from(vec![i64::MAX, 1])),
             Arc::new(Int64Array::from(vec![1, 1])),
         ])
@@ -155,7 +184,7 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
     let mut weighted_count =
         ConcreteAggregateState::try_new(&count_spec, ConcreteInputMode::Weighted).unwrap();
     assert!(weighted_count
-        .update_batch(&[
+        .update_all(&[
             Arc::new(Int64Array::from(vec![0])),
             Arc::new(Int64Array::from(vec![-1])),
         ])
@@ -169,7 +198,7 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
     let mut weighted_avg =
         ConcreteAggregateState::try_new(&avg_spec, ConcreteInputMode::Weighted).unwrap();
     assert!(weighted_avg
-        .update_batch(&[
+        .update_all(&[
             Arc::new(Float64Array::from(vec![f64::INFINITY])),
             Arc::new(Int64Array::from(vec![1])),
         ])
@@ -182,7 +211,7 @@ fn extrema_are_append_only_and_use_datafusion_ordering() {
     let min_spec = spec(Min::new(), DataType::Utf8, DataType::Utf8, false);
     let mut min =
         ConcreteAggregateState::try_new(&min_spec, ConcreteInputMode::AppendOnly).unwrap();
-    min.update_batch(&[Arc::new(StringArray::from(vec![
+    min.update_all(&[Arc::new(StringArray::from(vec![
         Some("pear"),
         None,
         Some("apple"),
@@ -201,7 +230,7 @@ fn extrema_are_append_only_and_use_datafusion_ordering() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn batch_delta_merges_like_update_batch() {
+fn batch_delta_merges_like_update_rows() {
     use ConcreteInputMode::{AppendOnly, Weighted};
 
     let ints = |values: &[Option<i64>]| -> ArrayRef { Arc::new(Int64Array::from(values.to_vec())) };
@@ -292,15 +321,81 @@ fn batch_delta_merges_like_update_batch() {
         let mut updated = template.clone();
         let mut merged = template.clone();
         for values in &batches {
-            updated.update_batch(values).unwrap();
+            updated.update_all(values).unwrap();
             merged
-                .merge_checkpoint_state(&template.batch_delta(values).unwrap())
+                .merge_checkpoint_state(&template.delta_all(values).unwrap())
                 .unwrap();
         }
         assert_eq!(
             merged.checkpoint_state().unwrap(),
             updated.checkpoint_state().unwrap(),
             "{} {mode:?}",
+            spec.udf.name()
+        );
+    }
+}
+
+#[test]
+fn row_updates_read_only_admitted_rows_in_place() {
+    let values: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(1.5),
+        Some(100.0),
+        None,
+        Some(2.25),
+        Some(-4.0),
+    ]));
+    let weights = Int64Array::from(vec![2, 9, 1, -1, 3]);
+    let filter = BooleanArray::from(vec![Some(true), Some(true), Some(true), None, Some(true)]);
+    let rows = [0, 2, 3, 4];
+    let admitted: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.5), None, Some(-4.0)]));
+    let admitted_weights: ArrayRef = Arc::new(Int64Array::from(vec![2, 1, 3]));
+
+    for (implementation, weighted) in [
+        (Arc::new(Count::new()) as Arc<dyn AggregateUDFImpl>, false),
+        (Arc::new(Count::new()), true),
+        (Arc::new(Sum::new()), false),
+        (Arc::new(Sum::new()), true),
+        (Arc::new(Avg::new()), false),
+        (Arc::new(Avg::new()), true),
+        (Arc::new(Min::new()), false),
+        (Arc::new(Max::new()), false),
+    ] {
+        let return_type = if implementation.name() == "count" {
+            DataType::Int64
+        } else {
+            DataType::Float64
+        };
+        let spec = AggFuncSpec {
+            udf: Arc::new(AggregateUDF::new_from_shared_impl(implementation)),
+            input_types: vec![DataType::Float64],
+            input_col_indices: vec![0],
+            output_name: "value".into(),
+            return_type,
+            is_count_star: false,
+            filter_col_index: None,
+        };
+        let mode = if weighted {
+            ConcreteInputMode::Weighted
+        } else {
+            ConcreteInputMode::AppendOnly
+        };
+        let mut in_place = ConcreteAggregateState::try_new(&spec, mode).unwrap();
+        let weights = weighted.then_some(&weights);
+        in_place
+            .update_rows(&AggregateInput::new(&values, Some(&filter), weights), &rows)
+            .unwrap();
+
+        let mut copied = ConcreteAggregateState::try_new(&spec, mode).unwrap();
+        let copied_values = if weighted {
+            vec![Arc::clone(&admitted), Arc::clone(&admitted_weights)]
+        } else {
+            vec![Arc::clone(&admitted)]
+        };
+        copied.update_all(&copied_values).unwrap();
+        assert_eq!(
+            in_place.checkpoint_state().unwrap(),
+            copied.checkpoint_state().unwrap(),
+            "{} weighted={weighted}",
             spec.udf.name()
         );
     }
