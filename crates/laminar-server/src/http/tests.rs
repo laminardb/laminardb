@@ -2775,6 +2775,7 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/cluster"),
         ("GET", "/api/v1/cluster/nodes"),
         ("GET", "/api/v1/cluster/vnodes"),
+        ("GET", "/api/v1/cluster/vnodes/load"),
         ("GET", "/api/v1/cluster/leader"),
         ("GET", "/api/v1/cluster/checkpoints"),
         ("GET", "/api/v1/cluster/topology"),
@@ -3752,6 +3753,71 @@ async fn test_cluster_vnodes_404_when_not_cluster() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_cluster_vnode_load_404_when_not_cluster() {
+    let app = build_router(test_state());
+
+    let req = Request::builder()
+        .uri("/api/v1/cluster/vnodes/load")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn test_cluster_vnode_load_names_the_node_before_a_sample_or_a_commit() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+    let node = laminar_core::cluster::discovery::NodeId(52);
+    let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let snapshot_store = Arc::new(
+        laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )),
+    );
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(
+        node,
+        control,
+        Some(Arc::clone(&snapshot_store)),
+        members_rx.clone(),
+    ));
+    let mut state = test_state();
+    Arc::get_mut(&mut state).unwrap().cluster = Some(ClusterComponents {
+        controller,
+        snapshot_store,
+        membership_rx: members_rx,
+    });
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/vnodes/load")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "node_id": 52,
+            "live_sample_age_ms": null,
+            "committed": null,
+            "operators": [],
+        })
+    );
 }
 
 #[cfg(feature = "cluster")]

@@ -7686,6 +7686,19 @@ async fn cold_metrics_publish_budget_ratio_and_vnode_spread_of_a_keyed_aggregate
     assert!(max > 0 && mean > 0 && mean <= max, "max={max} mean={mean}");
     assert!((1..=2).contains(&flow.vnode_groups_max.with_label_values(&["agg"]).get()));
     assert!((0..256).contains(&flow.vnode_hottest.with_label_values(&["agg"]).get()));
+
+    #[cfg(feature = "cluster")]
+    {
+        let vnodes = flow.vnode_loads.latest_for_test("agg");
+        assert_eq!(
+            vnodes.iter().map(|load| load.applied_rows).sum::<u64>(),
+            u64::try_from(test_batch().num_rows()).unwrap()
+        );
+        assert_eq!(
+            vnodes.iter().map(|load| load.state_bytes).max(),
+            usize::try_from(max).ok()
+        );
+    }
 }
 
 #[tokio::test]

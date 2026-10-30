@@ -40,6 +40,9 @@ pub(crate) struct FlowMetrics {
     pub(crate) vnode_groups_max: IntGaugeVec,
     /// Id of this node's largest vnode by state bytes (lowest id on ties). Label: `operator`.
     pub(crate) vnode_hottest: IntGaugeVec,
+    /// Each keyed operator's state per vnode at the last sample, for the vnode-load endpoint.
+    #[cfg(feature = "cluster")]
+    pub(crate) vnode_loads: crate::vnode_load::VnodeLoadBoard,
 }
 
 /// The flow series of one sink, resolved once when its task starts.
@@ -162,6 +165,8 @@ impl FlowMetrics {
                 "Id of this node's largest vnode by state bytes, lowest id on ties",
                 "operator",
             ),
+            #[cfg(feature = "cluster")]
+            vnode_loads: crate::vnode_load::VnodeLoadBoard::default(),
         }
     }
 }

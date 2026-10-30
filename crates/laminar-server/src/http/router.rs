@@ -27,8 +27,8 @@ use super::catalog::{
 };
 use super::checkpoints::{cluster_checkpoints, expedite_checkpoint, trigger_checkpoint};
 use super::cluster_admin::{
-    cluster_leader, cluster_nodes, cluster_status, cluster_vnodes, pipeline_status, start_pipeline,
-    stop_pipeline,
+    cluster_leader, cluster_nodes, cluster_status, cluster_vnode_load, cluster_vnodes,
+    pipeline_status, start_pipeline, stop_pipeline,
 };
 use super::cluster_evidence::{cluster_local_checkpoint_barrier_timings, cluster_local_evidence};
 use super::error_response;
@@ -71,6 +71,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/cluster", get(cluster_status))
         .route("/api/v1/cluster/nodes", get(cluster_nodes))
         .route("/api/v1/cluster/vnodes", get(cluster_vnodes))
+        .route("/api/v1/cluster/vnodes/load", get(cluster_vnode_load))
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/api/v1/cluster/topology", get(cluster_topology))

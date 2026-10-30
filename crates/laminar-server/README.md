@@ -225,6 +225,7 @@ including remote AI — runs normally.
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "...", "read_level": "committed", "min_epoch": 42}`; both read fields optional; `read_level` is `latest`, `committed` or `recent`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
+| GET | `/api/v1/cluster/vnodes/load` | Per-vnode state of each keyed operator: this node's live state and every participant's committed frame bytes ([Reading skew](#reading-skew)) |
 | GET | `/api/v1/cluster/topology` | Durable catalog version and this process's activation evidence (console authorization) |
 | POST | `/api/v1/cluster/topology/adopt` | Explicitly adopt an existing legacy catalog after a coordinated upgrade |
 | POST | `/api/v1/cluster/topology/validate` | Validate a topology candidate without applying it |
@@ -380,6 +381,33 @@ The topology request journal keeps every admitted request identity, including fi
 a retried request returns its original outcome. It holds 64 requests and does not compact yet.
 `GET /api/v1/cluster/topology` reports `journal.retained` and `journal.capacity`. Once it is full,
 new topology requests are rejected; retries of existing identities still work.
+
+### Reading skew
+
+Start from the per-operator gauges on `/metrics`. `laminardb_vnode_state_bytes_max` well above
+`laminardb_vnode_state_bytes_mean` means one vnode of that operator holds more state than the
+others on that node, and `laminardb_vnode_hottest` names the vnode. Imbalance between nodes is
+the spread of each node's total, for example
+`max(sum by (instance) (laminardb_managed_state_accounted_bytes{phase="live"})) / avg(sum by (instance) (laminardb_managed_state_accounted_bytes{phase="live"}))`.
+
+`GET /api/v1/cluster/vnodes/load` (console authorization) then lists every vnode of every keyed
+operator:
+
+- `live`: this node's `state_bytes`, `groups` and `applied_rows` for each vnode it holds state
+  for, from the last sample (every 32 cycles; `live_sample_age_ms` is its age). `applied_rows`
+  counts the input rows applied to the vnode since the operator was built on this node, so the
+  difference between two reads is its input rate while the vnode holds state; a vnode without
+  state, such as a window vnode between windows, has no `live` entry. A window row counts once
+  per window it falls in.
+- `committed_frames`: the state frame bytes each participant wrote for the vnode in the newest
+  committed checkpoint (`committed`), read from the checkpoint manifests. Any node shows the
+  committed spread of the whole cluster.
+
+A vnode with a high input rate and few groups is a hot key: spread it with a salted two-stage
+aggregate ([Spreading a hot key](../../docs/SQL_REFERENCE.md#spreading-a-hot-key)). A vnode with
+many groups and bytes holds many warm keys; more owners do not split it, and placement does not
+move a vnode by load. A global aggregate or keyless window keeps all its state on vnode 0; a
+global aggregate counts no `applied_rows`, because other nodes send it partial rows.
 
 ## Cluster Control-Plane TLS (mTLS)
 

@@ -38,7 +38,7 @@ use crate::operator::sql_query::ClusterShuffleConfig;
 use crate::operator_graph::merge_input_frontier_iter;
 use crate::operator_graph::{
     try_evaluate_compiled, EncodedStateFrame, GraphOperator, InputFrontier,
-    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture, VnodeLoad,
+    ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture, VnodeStateLoad,
 };
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
@@ -2849,8 +2849,9 @@ impl GraphOperator for EowcQueryOperator {
         self.retained_state_accounting()
     }
 
-    fn vnode_load(&self) -> Option<VnodeLoad> {
-        self.managed_window_state().map(CoreWindowState::vnode_load)
+    fn vnode_loads(&self) -> Option<Vec<VnodeStateLoad>> {
+        self.managed_window_state()
+            .map(CoreWindowState::vnode_loads)
     }
 
     fn set_managed_state_budget(&mut self, bytes: usize) {

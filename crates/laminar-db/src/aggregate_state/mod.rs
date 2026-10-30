@@ -1552,6 +1552,7 @@ impl IncrementalAggState {
         let weight_col_idx = self.weight_col_idx;
         let emit_changelog = self.emit_changelog;
         for (vnode, owned_key, indices, input_weight, is_new) in grouped_rows {
+            self.vnode_states.count_applied_rows(vnode, indices.len());
             if is_new {
                 let mut entry = GroupEntry::new(aggregate_templates.clone(), 0, watermark_ms);
                 Self::update_concrete_accumulators(

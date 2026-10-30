@@ -218,6 +218,7 @@ fn make_core_window_state(size_ms: i64) -> CoreWindowState {
             .into_boxed_slice(),
         active_vnodes: Vec::with_capacity(1),
         active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+        vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
         agg_specs,
@@ -297,6 +298,7 @@ fn make_core_window_state_multi_agg(size_ms: i64) -> CoreWindowState {
             .into_boxed_slice(),
         active_vnodes: Vec::with_capacity(1),
         active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+        vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
         agg_specs,
@@ -365,6 +367,7 @@ fn make_hopping_core_window_state(size_ms: i64, slide_ms: i64) -> CoreWindowStat
             .into_boxed_slice(),
         active_vnodes: Vec::with_capacity(1),
         active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+        vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
         agg_specs,
@@ -431,6 +434,7 @@ fn make_session_core_window_state(gap_ms: i64) -> CoreWindowState {
             .into_boxed_slice(),
         active_vnodes: Vec::with_capacity(1),
         active_vnode_positions: vec![usize::MAX; 1].into_boxed_slice(),
+        vnode_applied_rows: vec![0; 1].into_boxed_slice(),
         window_group_counts: FxHashMap::default(),
         session_group_count: 0,
         agg_specs,
@@ -767,6 +771,36 @@ fn test_core_window_tumbling_sum() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(total.value(0), 60);
+}
+
+#[test]
+fn applied_rows_count_each_row_once_per_window_and_skip_late_rows() {
+    let applied = |state: &CoreWindowState| {
+        state
+            .vnode_loads()
+            .iter()
+            .map(|load| load.applied_rows)
+            .sum::<u64>()
+    };
+    let batch = make_pre_agg_batch(vec!["A", "A", "B"], vec![1, 2, 3], vec![100, 500, 1500]);
+
+    let mut tumbling = make_core_window_state(1000);
+    tumbling.update_batch(&batch).unwrap();
+    assert_eq!(applied(&tumbling), 3);
+    // Window 1000 stays open, so the one vnode keeps state and stays in the loads.
+    tumbling.close_windows(1000).unwrap();
+    tumbling
+        .update_batch(&make_pre_agg_batch(vec!["A"], vec![4], vec![200]))
+        .unwrap();
+    assert_eq!(applied(&tumbling), 3, "a late row is not applied");
+
+    let mut hopping = make_hopping_core_window_state(1000, 500);
+    hopping.update_batch(&batch).unwrap();
+    assert_eq!(applied(&hopping), 6);
+
+    let mut session = make_session_core_window_state(1000);
+    session.update_batch(&batch).unwrap();
+    assert_eq!(applied(&session), 3);
 }
 
 #[test]
