@@ -312,9 +312,14 @@ impl StreamingCoordinator {
             #[cfg(feature = "cluster")]
             callback.abort_subscription_output();
             self.discard_pending_offsets();
-            return Err(CycleError::Recovery(format!(
-                "materialized-view publication failed: {error}"
-            )));
+            return Err(match error {
+                CycleError::Halt(reason) => {
+                    CycleError::Halt(format!("materialized-view publication halted: {reason}"))
+                }
+                error => {
+                    CycleError::Recovery(format!("materialized-view publication failed: {error}"))
+                }
+            });
         }
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("stream publication") {

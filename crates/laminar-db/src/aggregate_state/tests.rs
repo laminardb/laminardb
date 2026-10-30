@@ -1723,6 +1723,31 @@ async fn test_group_by_simple_column_still_works() {
     );
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn vnode_transition_over_the_group_cap_halts() {
+    let (_, mut state) =
+        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
+    state.set_max_groups_for_test(2);
+    state
+        .process_batch(&sum_pre_agg_batch(&["a", "b"], &[10.0, 20.0]), 1)
+        .unwrap();
+
+    let error = state
+        .preflight_vnode_transition_cardinality(
+            u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()),
+            &[(0, 2)],
+            &rustc_hash::FxHashSet::default(),
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, crate::DbError::GroupLimitExceeded { limit: 2, .. }),
+        "{error}"
+    );
+    assert!(error.requires_pipeline_halt());
+}
+
 #[tokio::test]
 async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
     let (_, mut state) =
@@ -1737,7 +1762,18 @@ async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
     let over_limit = sum_pre_agg_batch(&["a", "c"], &[5.0, 100.0]);
     for _ in 0..2 {
         let error = state.process_batch(&over_limit, 2).unwrap_err();
-        assert!(error.to_string().contains("group limit exceeded"));
+        assert!(
+            matches!(
+                error,
+                crate::DbError::GroupLimitExceeded {
+                    groups: 3,
+                    limit: 2,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(error.requires_pipeline_halt());
         assert_eq!(checkpoint_bytes(&mut state), before);
     }
 }

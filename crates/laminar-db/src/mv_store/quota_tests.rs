@@ -645,3 +645,28 @@ fn publication_preflight_rejects_multiset_expansion_before_applying_other_view()
     assert!(ids(&store, "second").is_empty());
     assert_eq!(store.total_bytes(), 0);
 }
+
+#[test]
+fn replaying_a_rejected_cycle_on_the_recovered_image_trips_the_same_quota() {
+    for mode in [keyed(0), multiset()] {
+        let schema = batch(&[], 1).schema();
+        let mut live = store(2, 16384);
+        live.create_mv("v", Arc::clone(&schema), mode.clone())
+            .unwrap();
+        live.update_cycle("v", &[input(&batch(&[1], 1), &mode, 1)])
+            .unwrap();
+        let mut empty = store(2, 16384);
+        empty.create_mv("v", schema, mode.clone()).unwrap();
+        let mut recovered = restored_image(&mut live, &empty).unwrap();
+
+        let rejected = input(&batch(&[2, 3], 1), &mode, 1);
+        let quota_rows =
+            |store: &mut MvStore| match store.update_cycle("v", std::slice::from_ref(&rejected)) {
+                Err(DbError::MaterializedViewQuotaExceeded { rows, .. }) => rows,
+                other => panic!("{mode:?}: expected a quota error, got {other:?}"),
+            };
+        assert_eq!(quota_rows(&mut live), 3, "{mode:?}");
+        assert_eq!(quota_rows(&mut recovered), 3, "{mode:?}");
+        assert_eq!(ids(&recovered, "v"), [1], "{mode:?}");
+    }
+}

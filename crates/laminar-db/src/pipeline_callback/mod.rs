@@ -1247,6 +1247,14 @@ impl ConnectorPipelineCallback {
                     limit_bytes,
                     "managed working-state budget exceeded; halting pipeline"
                 ),
+                crate::error::DbError::GroupLimitExceeded { .. } => tracing::error!(
+                    reason = %err,
+                    "group limit exceeded; halting pipeline"
+                ),
+                crate::error::DbError::MaterializedViewQuotaExceeded { .. } => tracing::error!(
+                    reason = %err,
+                    "materialized-view quota exceeded; halting pipeline"
+                ),
                 _ => unreachable!("requires_pipeline_halt returned true for a non-terminal error"),
             }
             shutdown.notify_one();
@@ -5098,7 +5106,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 self.graph.routes_views_by_row(),
                 |view| self.subscription_registry.subscriber_count(view) > 0,
             )
-            .map_err(|error| fault(format!("materialized-view cycle preflight failed: {error}")))?;
+            .map_err(|error| {
+                if error.requires_pipeline_halt() {
+                    return Self::map_graph_error(&error, &self.shutdown_signal);
+                }
+                fault(format!("materialized-view cycle preflight failed: {error}"))
+            })?;
         // Published under the write guard: a subscriber captures its snapshot under the read
         // guard, so each change is in its snapshot or after its cursor, never both.
         for (view, change) in changes {

@@ -418,7 +418,7 @@ bytes in `laminardb.toml`; the example under [Configuration](#configuration) sho
 |---|---:|---|
 | `server.datafusion_memory_limit_bytes` | 256 MiB | Shared participating DataFusion reservations; DB-owned contexts do not spill to disk. |
 | `server.source_queue_max_bytes` | 64 MiB | Shared connector-to-coordinator Arrow queue, including parked input; each source's waiting batch must also fit. Must be positive and at most `MAX_SOURCE_QUEUE_BYTES`. |
-| `server.pipeline_max_managed_state_bytes` | 256 MiB | Charged bytes of managed operator state (keyed aggregates, windows, joins) per pipeline; must be positive. Lower bound, not RSS. |
+| `server.pipeline_max_managed_state_bytes` | 256 MiB | Charged bytes of operator state (keyed aggregates, windows, joins, process functions, temporal filters, analytic window frames) per pipeline; must be positive. Lower bound, not RSS. |
 | `server.pipeline_max_input_buf_batches` | 256 | Each graph input port; `0` disables the count limit. |
 | `server.pipeline_max_input_buf_bytes` | unset | Each graph input port; a configured value must be positive. |
 | `server.reference_table_max_rows` / `server.reference_table_max_bytes` | 1,000,000 / 256 MiB | Each local reference table; both values must be positive. |
@@ -428,7 +428,9 @@ bytes in `laminardb.toml`; the example under [Configuration](#configuration) sho
 
 `server.pipeline_max_managed_state_bytes` is the same budget embedded users set through
 `LaminarConfig` or the builder. Exceeding it fails with a typed managed-state budget error at
-startup, restore or during a cycle; its accounting is a lower bound and is not RSS. In a cluster,
+startup, restore or during a cycle; its accounting is a lower bound and is not RSS. A cycle that
+fails it, or that would give an aggregate or window more than 1,000,000 groups, halts the
+pipeline with LDB-4008 instead of recovering, since replay would rebuild the same state. In a cluster,
 each node charges only the vnodes it owns, so rescaling changes per-node state but a single hot
 key still lands on one owner. Recovery and reassignment stage restored frames against the same
 budget, so leave headroom for restore. Shuffle queues have fixed per-peer and per-node byte
