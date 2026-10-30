@@ -1153,6 +1153,57 @@ async fn sealed_write_waits_through_begin_until_successor_group_publication() {
     handle.close().await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_sealed_write_fails_once_the_gate_stays_in_one_state_for_the_stall_timeout() {
+    let (sink, writes, _flushes) = CountingSink::new();
+    let (event_tx, _event_rx) =
+        laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+        name: "stalled-gate".into(),
+        sink_id: Arc::from("stalled-gate"),
+        connector: Box::new(sink),
+        contract: checkpoint_committable_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_millis(25),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    })
+    .with_epoch_gate_stall_timeout(Some(Duration::from_secs(10)));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    handle.begin_epoch_until(7, deadline).await.unwrap();
+    let initial = handle.begun_epoch_admission(7).unwrap();
+    handle.publish_open_epoch(initial).unwrap();
+    handle.seal_epoch_until(initial, deadline).await.unwrap();
+    let pending = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.write_batch(test_batch()).await }
+    });
+    tokio::time::advance(Duration::from_secs(9)).await;
+    tokio::task::yield_now().await;
+    assert!(!pending.is_finished());
+
+    handle
+        .begin_epoch_until(19, Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(9)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !pending.is_finished(),
+        "a gate transition restarts the stall timeout"
+    );
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let error = pending.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("epoch-gate stall timeout"), "{error}");
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+}
+
 fn sink_metric(registry: &prometheus::Registry, name: &str) -> prometheus::proto::Metric {
     registry
         .gather()
@@ -2256,6 +2307,7 @@ async fn write_enqueue_timeout_poison_rejects_checkpoint_flush() {
         event_tx,
         epoch_poisoned: Arc::clone(&epoch_poisoned),
         epoch_gate: None,
+        epoch_gate_stall_timeout: None,
         flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -2338,6 +2390,7 @@ async fn cancelled_actor_is_retained_until_uncooperative_join_is_terminal() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        epoch_gate_stall_timeout: None,
         flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -2409,6 +2462,7 @@ async fn connector_child_task_holds_replacement_fence_after_actor_exit() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        epoch_gate_stall_timeout: None,
         flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -2535,6 +2589,7 @@ async fn cancelled_terminal_supervisor_cannot_publish_false_terminal() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        epoch_gate_stall_timeout: None,
         flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -2607,6 +2662,7 @@ async fn close_driver_panic_is_sticky_but_terminal_proof_remains_observable() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        epoch_gate_stall_timeout: None,
         flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,
@@ -2699,6 +2755,7 @@ async fn test_sink_task_channel_closed_emits_event() {
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
         epoch_gate: None,
+        epoch_gate_stall_timeout: None,
         flow: Arc::default(),
         #[cfg(feature = "cluster")]
         process_authority: None,

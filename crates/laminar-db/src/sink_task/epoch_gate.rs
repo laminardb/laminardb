@@ -55,26 +55,37 @@ impl SinkTaskHandle {
             if self.actor_state.finished.load(Ordering::Acquire) {
                 return Err(self.closed_err());
             }
-            match deadline {
-                Some(deadline) => {
-                    tokio::select! {
-                        biased;
-                        result = &mut changed => result.map_err(|_| self.closed_err())?,
-                        () = actor_finished.as_mut() => return Err(self.closed_err()),
-                        () = tokio::time::sleep_until(deadline) => {
-                            return Err(command_deadline_error(
-                                &self.name,
-                                "sink epoch gate",
-                                deadline.saturating_duration_since(Instant::now()),
-                            ));
-                        }
+            if let Some(deadline) = deadline {
+                tokio::select! {
+                    biased;
+                    result = &mut changed => result.map_err(|_| self.closed_err())?,
+                    () = actor_finished.as_mut() => return Err(self.closed_err()),
+                    () = tokio::time::sleep_until(deadline) => {
+                        return Err(command_deadline_error(
+                            &self.name,
+                            "sink epoch gate",
+                            deadline.saturating_duration_since(Instant::now()),
+                        ));
                     }
                 }
-                None => {
-                    tokio::select! {
-                        biased;
-                        result = &mut changed => result.map_err(|_| self.closed_err())?,
-                        () = actor_finished.as_mut() => return Err(self.closed_err()),
+            } else {
+                let stalled = async {
+                    let Some(timeout) = self.epoch_gate_stall_timeout else {
+                        return std::future::pending().await;
+                    };
+                    tokio::time::sleep(timeout).await;
+                    timeout
+                };
+                tokio::select! {
+                    biased;
+                    result = &mut changed => result.map_err(|_| self.closed_err())?,
+                    () = actor_finished.as_mut() => return Err(self.closed_err()),
+                    timeout = stalled => {
+                        return Err(ConnectorError::Internal(format!(
+                            "sink '{}' epoch gate stayed {observed:?} for the {timeout:?} \
+                             epoch-gate stall timeout",
+                            self.name
+                        )));
                     }
                 }
             }

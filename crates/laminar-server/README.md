@@ -79,6 +79,7 @@ materialized_view_read_cache_bytes = 268435456 # decoded committed view state ca
 # pipeline_max_input_buf_batches = 256 # per graph input port; 0 disables count limit
 # pipeline_max_input_buf_bytes = 33554432 # optional per-port Arrow bytes; unset disables
 # drain_timeout = "150s" # cluster SIGTERM handoff allowance; default checkpoint.timeout + 30s
+# shuffle_send_stall_timeout = "10m" # cluster: fail a stuck shuffle send for recovery; unset waits
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SELECT and SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -103,6 +104,9 @@ interval = "30s"
 # 100ms in cluster mode). Each early checkpoint also commits exactly-once sinks.
 # recent_read_interval = "1s"
 timeout = "120s" # checkpoint deadline and per-phase cluster assignment-recovery bound
+# Optional: fail an exactly-once sink write for recovery when the sink's epoch stays in one state
+# this long. Must exceed interval + timeout. Unset: the write waits for the epoch to open.
+# sink_epoch_gate_stall_timeout = "10m"
 
 # Provider features, accepted aliases, ambient identity, and native evidence:
 # ../../docs/cloud-object-store-support.md
@@ -479,6 +483,18 @@ a cluster the per-peer `laminardb_shuffle_send_wait_seconds_total` and
 `laminardb_shuffle_budget_used_bytes`.
 The [flow-control table](../laminar-db/README.md#flow-control-and-backpressure) lists every
 bounded buffer, what happens when it is full, and its metrics.
+
+Waits have no deadline by default, since under load a slow peer or sink is expected to hold its
+producer. Two opt-in settings fail a wait that stops making progress as a recoverable fault, which
+recovers from the last checkpoint:
+
+- `server.shuffle_send_stall_timeout` (cluster only) fails a shuffle send when one wait, for its
+  peer's or the node's byte budget or for a slot in the peer's stream queue, lasts that long;
+- `checkpoint.sink_epoch_gate_stall_timeout` fails a cycle's write into an exactly-once sink when
+  the sink's epoch stays in one state that long.
+
+Each must exceed `checkpoint.interval` plus `checkpoint.timeout`, since a healthy epoch can stay
+closed for one interval and one attempt; startup refuses a shorter value.
 
 Set the container memory limit above the measured peak with room for connector decoding, Arrow
 buffers, operator scratch, query results, simultaneous old/new state during restore, checkpoint

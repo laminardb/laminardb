@@ -1,5 +1,6 @@
 //! Outbound byte reservation and enqueue, and what they report: how long sends to each peer
-//! waited, what they carried, and how much of each node byte budget is held.
+//! waited, what they carried, and how much of each node byte budget is held. An optional stall
+//! timeout fails a data send whose wait makes no progress.
 
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,67 @@ impl PeerSendCounters {
     }
 }
 
+#[derive(Default)]
+pub(super) struct SendFlow {
+    peers: Mutex<FxHashMap<ShufflePeerId, Arc<PeerSendCounters>>>,
+    stall_timeout: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct SendStalled {
+    peer: ShufflePeerId,
+    waiting_for: &'static str,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for SendStalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shuffle send to peer {} waited {:?} for {} without progress",
+            self.peer, self.timeout, self.waiting_for
+        )
+    }
+}
+
+impl std::error::Error for SendStalled {}
+
+/// Whether a send failed because one of its waits lasted the stall timeout set with
+/// [`ShuffleSender::with_send_stall_timeout`].
+#[must_use]
+pub fn is_shuffle_send_stalled(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<SendStalled>())
+        .is_some()
+}
+
+/// What one wait of a send is for, and how long it may last.
+#[derive(Clone, Copy)]
+struct StallLimit {
+    peer: ShufflePeerId,
+    waiting_for: &'static str,
+    timeout: Option<Duration>,
+}
+
+impl StallLimit {
+    /// Resolves with the stall error once the timeout passes, and never without one.
+    async fn elapsed(self) -> io::Error {
+        let Some(timeout) = self.timeout else {
+            return std::future::pending().await;
+        };
+        tokio::time::sleep(timeout).await;
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            SendStalled {
+                peer: self.peer,
+                waiting_for: self.waiting_for,
+                timeout,
+            },
+        )
+    }
+}
+
 pub(super) struct OutboundReservation {
     pub(super) peer: OwnedSemaphorePermit,
     pub(super) node: OwnedSemaphorePermit,
@@ -89,6 +151,7 @@ async fn acquire(
     permits: u32,
     cancel: &CancellationToken,
     counters: &PeerSendCounters,
+    stall: StallLimit,
     closed: &'static str,
 ) -> io::Result<OwnedSemaphorePermit> {
     if cancel.is_cancelled() {
@@ -108,15 +171,45 @@ async fn acquire(
         permit = Arc::clone(budget).acquire_many_owned(permits) => {
             permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, closed))
         }
+        error = stall.elapsed() => Err(error),
     }
 }
 
 impl ShuffleSender {
+    /// Fail a data or frontier send when one of its waits lasts `timeout`: the wait for the
+    /// peer's or the node's outbound byte budget, or for a slot in the peer's stream queue. A
+    /// wait ends once the streams have drained room for one frame, so a wait that long means
+    /// they stopped draining. [`is_shuffle_send_stalled`] recognises the error. Checkpoint
+    /// barriers are bounded by their checkpoint deadline instead. Unset, a send waits for as
+    /// long as its peer stays slow.
+    #[must_use]
+    pub fn with_send_stall_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.flow.stall_timeout = timeout;
+        self
+    }
+
+    fn stall_limit(
+        &self,
+        peer: ShufflePeerId,
+        msg: &ShuffleMessage,
+        waiting_for: &'static str,
+    ) -> StallLimit {
+        StallLimit {
+            peer,
+            waiting_for,
+            timeout: self
+                .flow
+                .stall_timeout
+                .filter(|_| !matches!(msg, ShuffleMessage::Barrier(_))),
+        }
+    }
+
     /// Per-peer totals, ascending by peer.
     #[must_use]
     pub fn peer_flow(&self) -> Vec<ShufflePeerFlow> {
         let mut flows = self
-            .peer_counters
+            .flow
+            .peers
             .lock()
             .iter()
             .map(|(&peer, counters)| ShufflePeerFlow {
@@ -139,7 +232,7 @@ impl ShuffleSender {
     }
 
     pub(super) fn counters_for(&self, peer: ShufflePeerId) -> Arc<PeerSendCounters> {
-        Arc::clone(self.peer_counters.lock().entry(peer).or_default())
+        Arc::clone(self.flow.peers.lock().entry(peer).or_default())
     }
 
     /// Reserve the peer's and then the node's byte budget: the control budgets for a barrier,
@@ -147,6 +240,7 @@ impl ShuffleSender {
     pub(super) async fn reserve_outbound(
         &self,
         conn: &PeerConn,
+        peer: ShufflePeerId,
         msg: &ShuffleMessage,
         admission_bytes: usize,
         cancel: &CancellationToken,
@@ -166,23 +260,28 @@ impl ShuffleSender {
             (&conn.byte_budget, &self.node_budget)
         };
         let counters = &conn.counters;
-        let peer = acquire(
+        let peer_permit = acquire(
             peer_budget,
             permits,
             cancel,
             counters,
+            self.stall_limit(peer, msg, "its outbound byte budget"),
             "shuffle byte budget closed",
         )
         .await?;
-        let node = acquire(
+        let node_permit = acquire(
             node_budget,
             permits,
             cancel,
             counters,
+            self.stall_limit(peer, msg, "the node's outbound byte budget"),
             "shuffle node byte budget closed",
         )
         .await?;
-        Ok(OutboundReservation { peer, node })
+        Ok(OutboundReservation {
+            peer: peer_permit,
+            node: node_permit,
+        })
     }
 
     /// Queue `out` on the peer's ordered stream, then count what it carried.
@@ -212,6 +311,9 @@ impl ShuffleSender {
                         io::ErrorKind::BrokenPipe,
                         format!("shuffle stream to peer {peer} closed"),
                     ))?,
+                    error = self.stall_limit(peer, msg, "a slot in its stream queue").elapsed() => {
+                        return Err(error);
+                    }
                 }
             }
             Err(crossfire::TrySendError::Disconnected(_)) => {

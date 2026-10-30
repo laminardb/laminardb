@@ -184,6 +184,11 @@ pub enum DbError {
     /// durable cut before replay.
     ShufflePartialSend(String),
 
+    /// A cross-node shuffle send waited the configured stall timeout without progress, so its
+    /// peer's stream stopped draining. Retrying would wait again; recovery rewinds the failure
+    /// domain to a durable cut.
+    ShuffleSendStalled(String),
+
     /// A stateful operator may have changed local state before the attempt failed. This denotes an
     /// indeterminate apply outcome, not proof that exactly a prefix was applied. The graph must not
     /// replay that input against the possibly changed state; recovery rewinds the failure domain to
@@ -342,6 +347,7 @@ impl DbError {
             | Self::ShuffleNotReady(_)
             | Self::ShuffleTerminal(_)
             | Self::ShufflePartialSend(_)
+            | Self::ShuffleSendStalled(_)
             | Self::StatefulOperatorPartialApply(_) => error_codes::PIPELINE_ERROR,
             Self::ManagedStateBudgetExceeded { .. } | Self::GroupLimitExceeded { .. } => {
                 error_codes::MANAGED_STATE_BUDGET_EXCEEDED
@@ -383,6 +389,7 @@ impl DbError {
             self,
             Self::Checkpoint(_)
                 | Self::ShufflePartialSend(_)
+                | Self::ShuffleSendStalled(_)
                 | Self::StatefulOperatorPartialApply(_)
         )
     }
@@ -482,6 +489,7 @@ impl std::fmt::Display for DbError {
             | Self::ShuffleNotReady(_)
             | Self::ShuffleTerminal(_)
             | Self::ShufflePartialSend(_)
+            | Self::ShuffleSendStalled(_)
             | Self::StatefulOperatorPartialApply(_)
             | Self::ReferenceTableQuotaExceeded { .. }
             | Self::MaterializedViewQuotaExceeded { .. }
@@ -593,6 +601,9 @@ impl DbError {
             }
             Self::ShufflePartialSend(msg) => {
                 write!(f, "[{}] Shuffle partial send: {msg}", self.code())
+            }
+            Self::ShuffleSendStalled(msg) => {
+                write!(f, "[{}] Shuffle send stalled: {msg}", self.code())
             }
             Self::StatefulOperatorPartialApply(msg) => {
                 write!(

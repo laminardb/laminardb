@@ -2379,6 +2379,47 @@ async fn recent_read_checkpoints_need_a_shorter_periodic_interval() {
     }
 }
 
+#[tokio::test]
+async fn sink_epoch_gate_stall_timeout_must_exceed_one_interval_and_attempt() {
+    for (interval_ms, stall_ms, accepted) in [
+        (None, 3_600_000, false),
+        (Some(1_000), 2_000, false),
+        (Some(1_000), 2_001, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LaminarDB::open_with_config(LaminarConfig {
+            storage_dir: Some(dir.path().to_path_buf()),
+            checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms,
+                timeout_ms: Some(1_000),
+                sink_epoch_gate_stall_timeout_ms: Some(stall_ms),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        for statement in [
+            "CREATE SOURCE events (k BIGINT)",
+            "CREATE STREAM keys AS SELECT k FROM events",
+        ] {
+            db.execute(statement).await.unwrap();
+        }
+        match db.start().await {
+            Ok(()) if accepted => db.shutdown().await.unwrap(),
+            Ok(()) => panic!("{interval_ms:?}/{stall_ms} was accepted"),
+            Err(error) => {
+                assert!(!accepted, "{interval_ms:?}/{stall_ms}: {error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("sink_epoch_gate_stall_timeout_ms needs periodic checkpoints"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn admitted_manual_checkpoint_wait_is_bounded_until_exact_attempt_reservation() {
     let db = LaminarDB::open_with_config(LaminarConfig {

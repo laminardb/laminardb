@@ -18,6 +18,11 @@ pub struct StreamCheckpointConfig {
     /// Maximum bytes admitted for one participant's checkpoint node-data object.
     /// `None` uses `DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES`.
     pub max_node_data_bytes: Option<u64>,
+    /// A cycle waiting to write into a checkpoint-committable sink fails as a recoverable fault
+    /// when the sink's epoch gate stays in one state this long, in milliseconds. Must exceed
+    /// `interval_ms` plus the checkpoint timeout, so it needs periodic checkpoints. `None` =
+    /// the write waits for as long as the epoch stays closed.
+    pub sink_epoch_gate_stall_timeout_ms: Option<u64>,
 }
 
 #[cfg(test)]
