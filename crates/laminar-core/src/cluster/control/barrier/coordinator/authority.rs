@@ -207,6 +207,7 @@ impl BarrierCoordinator {
                 crate::checkpoint::CheckpointAttempt::new(ann.epoch, ann.checkpoint_id),
                 ann.assignment_fence.as_ref(),
                 ann.flags,
+                ann.phase,
             )
             .await
             .map_err(|error| {

@@ -60,6 +60,20 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev protobuf-compiler
 
+      # Testcontainers pulls on first use inside the test run, where one dropped registry
+      # stream fails that test ("bytes remaining on stream"); pull up front with retries.
+      # Only images of tests that run by default: an `#[ignore]` test's image is never pulled.
+      - name: Pre-pull integration test images
+        run: |
+          for image in mongo:8.0 postgres:11-alpine postgres:18 \
+              redpandadata/redpanda:v24.3.1; do
+            for attempt in 1 2 3; do
+              docker pull --quiet "$image" && break
+              [ "$attempt" -eq 3 ] && exit 1
+              sleep $((attempt * 10))
+            done
+          done
+
       - name: Generate coverage
         run: |
           cargo llvm-cov --workspace --all-features \
