@@ -5,6 +5,8 @@ use crate::checkpoint::{CheckpointAttempt, CheckpointParticipant};
 use crate::cluster::control::topology::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionStatus, TopologyError,
 };
+#[cfg(feature = "cluster")]
+use crate::cluster::control::Phase;
 
 async fn bound_fixture(
     authority: &LeaderLeaseStore,
@@ -103,7 +105,8 @@ async fn exact_cut_binding_precedes_barriers_and_is_payload_bound() {
             &lease.proof(),
             inventory.attempt,
             None,
-            flags::TOPOLOGY_CUT
+            flags::TOPOLOGY_CUT,
+            Phase::Prepare,
         )
         .await
         .is_err());
@@ -139,6 +142,7 @@ async fn exact_cut_binding_precedes_barriers_and_is_payload_bound() {
                 inventory.attempt,
                 Some(fence),
                 flags::TOPOLOGY_CUT,
+                Phase::Prepare,
             )
             .await
             .unwrap();
@@ -152,7 +156,8 @@ async fn exact_cut_binding_precedes_barriers_and_is_payload_bound() {
                     &lease.proof(),
                     inventory.attempt,
                     Some(fence),
-                    barrier_flags
+                    barrier_flags,
+                    Phase::Prepare,
                 )
                 .await
                 .is_err());
@@ -277,6 +282,74 @@ async fn commit_requires_every_exact_process_completion_before_cut_prepared() {
     assert_eq!(
         reopened.load().await.unwrap().unwrap().catalog_manifest,
         lease.catalog_manifest
+    );
+}
+
+#[cfg(feature = "cluster")]
+async fn cut_barrier_valid(
+    authority: &LeaderLeaseStore,
+    proof: &LeaderProof,
+    inventory: &CheckpointArtifactInventory,
+    attempt: CheckpointAttempt,
+    phase: Phase,
+) -> bool {
+    authority
+        .validate_topology_checkpoint_barrier(
+            proof,
+            attempt,
+            inventory.assignment_fence.as_ref(),
+            flags::TOPOLOGY_CUT,
+            phase,
+        )
+        .await
+        .is_ok()
+}
+
+/// A resume gate can read the cut's Aligned after the leader records its Commit and after the
+/// cut completes; only that exact Aligned stays valid, and an aborted cut keeps none.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn aligned_cut_barrier_stays_valid_after_its_recorded_commit() {
+    let authority = store(30_000);
+    let (lease, _, _, inventory) = bound_fixture(&authority, false).await;
+    let proof = lease.proof();
+    let attempt = inventory.attempt;
+    commit_cut(&authority, &proof, &inventory).await;
+    assert!(cut_barrier_valid(&authority, &proof, &inventory, attempt, Phase::Aligned).await);
+    assert!(!cut_barrier_valid(&authority, &proof, &inventory, attempt, Phase::Prepare).await);
+    let other = CheckpointAttempt::canonical(2);
+    assert!(!cut_barrier_valid(&authority, &proof, &inventory, other, Phase::Aligned).await);
+    let participant = inventory.assignment_fence.as_ref().unwrap().participants[0];
+    let prepared = authority
+        .complete_topology_checkpoint_cut(&proof, attempt, participant)
+        .await
+        .unwrap();
+    assert_eq!(prepared.phase, TopologyAdmissionPhase::CutPrepared);
+    assert!(cut_barrier_valid(&authority, &proof, &inventory, attempt, Phase::Aligned).await);
+    assert!(!cut_barrier_valid(&authority, &proof, &inventory, attempt, Phase::Prepare).await);
+
+    let aborted = store(30_000);
+    let (lease, _, _, inventory) = bound_fixture(&aborted, false).await;
+    aborted
+        .record_cluster_outcome(
+            &lease.proof(),
+            inventory.attempt.epoch,
+            inventory.attempt.checkpoint_id,
+            inventory.assignment_fence.clone().unwrap(),
+            CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !cut_barrier_valid(
+            &aborted,
+            &lease.proof(),
+            &inventory,
+            inventory.attempt,
+            Phase::Aligned
+        )
+        .await
     );
 }
 
