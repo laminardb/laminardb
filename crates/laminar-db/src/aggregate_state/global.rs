@@ -13,7 +13,9 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::ScalarValue;
 
 use super::IncrementalAggState;
-use super::{global_aggregate_key, AggFuncSpec, ConcreteAggregateState, GroupEntry};
+use super::{
+    global_aggregate_key, AggFuncSpec, AggregateInput, ConcreteAggregateState, GroupEntry,
+};
 use crate::error::DbError;
 
 /// What one update applies to the global group.
@@ -62,23 +64,19 @@ impl IncrementalAggState {
         let mut states = vec![Vec::with_capacity(batches.len()); schema.fields().len() - 1];
         for batch in batches {
             weights.push(Self::batch_input_weight(batch, self.weight_col_idx)?);
+            let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
+            let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
+            let rows = all_row_indices(batch);
             let mut column = 0;
-            Self::for_each_aggregate_input(
-                batch,
-                &all_row_indices(batch),
-                &self.agg_specs,
-                self.weight_col_idx,
-                |index, values| {
-                    for scalar in self.aggregate_templates[index].batch_delta(values)? {
-                        states
-                            .get_mut(column)
-                            .ok_or_else(|| partial_shape_error("delta has extra state"))?
-                            .push(scalar);
-                        column += 1;
-                    }
-                    Ok(())
-                },
-            )?;
+            for (template, input) in self.aggregate_templates.iter().zip(&inputs) {
+                for scalar in template.batch_delta(input, &rows)? {
+                    states
+                        .get_mut(column)
+                        .ok_or_else(|| partial_shape_error("delta has extra state"))?
+                        .push(scalar);
+                    column += 1;
+                }
+            }
         }
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
         columns.push(Arc::new(Int64Array::from(weights)));
@@ -217,10 +215,12 @@ fn apply_global_input(
     match input {
         GlobalInput::Rows(batch) => IncrementalAggState::update_concrete_accumulators(
             accs,
-            batch,
+            &AggregateInput::resolve_all(
+                batch,
+                agg_specs,
+                IncrementalAggState::validated_input_weights(batch, weight_col_idx)?,
+            )?,
             &all_row_indices(batch),
-            agg_specs,
-            weight_col_idx,
         ),
         #[cfg(feature = "cluster")]
         GlobalInput::Partial(partial) => {
