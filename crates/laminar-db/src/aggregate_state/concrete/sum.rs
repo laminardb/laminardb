@@ -55,8 +55,7 @@ impl SumState {
         match &mut self.mode {
             SumMode::AppendOnly => {
                 require_array_type(input.value, &self.input_type, "SUM")?;
-                let delta = sum_rows(input, rows, &self.output_type)?;
-                merge_sum_scalar(&mut self.sum, &delta)
+                add_rows_sum(&mut self.sum, input, rows)
             }
             SumMode::Weighted { non_null_weight } => {
                 require_array_type(input.value, &self.input_type, "weighted SUM")?;
@@ -232,43 +231,48 @@ fn checked_rows_sum<T: ArrowPrimitiveType>(
     Ok(any.then_some(sum))
 }
 
+/// Adds the admitted rows' sum to `total`. The rows are summed from zero first, so a batch
+/// overflows and rounds exactly as its delta row would.
+pub(super) fn add_rows_sum(
+    total: &mut ScalarValue,
+    input: &AggregateInput<'_>,
+    rows: &[u32],
+) -> Result<(), DbError> {
+    match (input.value.data_type(), total) {
+        (DataType::Int64, ScalarValue::Int64(total)) => {
+            add_sum(total, checked_rows_sum::<Int64Type>(input, rows)?)
+        }
+        (DataType::UInt64, ScalarValue::UInt64(total)) => {
+            add_sum(total, checked_rows_sum::<UInt64Type>(input, rows)?)
+        }
+        (DataType::Float64, ScalarValue::Float64(total)) => {
+            add_sum(total, checked_rows_sum::<Float64Type>(input, rows)?)
+        }
+        (DataType::Decimal128(_, _), ScalarValue::Decimal128(total, precision, scale)) => {
+            add_decimal_sum(
+                total,
+                checked_rows_sum::<Decimal128Type>(input, rows)?,
+                *precision,
+                *scale,
+                "SUM batch precision",
+            )
+        }
+        (input_type, total) => Err(DbError::Pipeline(format!(
+            "SUM cannot combine input {input_type:?} with state {:?}",
+            total.data_type()
+        ))),
+    }
+}
+
+#[cfg(feature = "cluster")]
 pub(super) fn sum_rows(
     input: &AggregateInput<'_>,
     rows: &[u32],
     output_type: &DataType,
 ) -> Result<ScalarValue, DbError> {
-    macro_rules! primitive_sum {
-        ($arrow_type:ty, $scalar:ident) => {
-            ScalarValue::$scalar(checked_rows_sum::<$arrow_type>(input, rows)?)
-        };
-        ($arrow_type:ty, $scalar:ident, $precision:expr, $scale:expr) => {
-            ScalarValue::$scalar(
-                checked_rows_sum::<$arrow_type>(input, rows)?,
-                $precision,
-                $scale,
-            )
-        };
-    }
-
-    let array = input.value;
-    let sum = match (array.data_type(), output_type) {
-        (DataType::Int64, DataType::Int64) => primitive_sum!(Int64Type, Int64),
-        (DataType::UInt64, DataType::UInt64) => primitive_sum!(UInt64Type, UInt64),
-        (DataType::Float64, DataType::Float64) => primitive_sum!(Float64Type, Float64),
-        (DataType::Decimal128(_, _), DataType::Decimal128(precision, scale)) => {
-            primitive_sum!(Decimal128Type, Decimal128, *precision, *scale)
-        }
-        _ => {
-            return Err(DbError::Pipeline(format!(
-                "SUM cannot combine input {:?} with state {output_type:?}",
-                array.data_type()
-            )))
-        }
-    };
-    if let ScalarValue::Decimal128(Some(value), precision, scale) = &sum {
-        Decimal128Type::validate_decimal_precision(*value, *precision, *scale)
-            .map_err(|error| aggregate_error("SUM batch precision", error))?;
-    }
+    let mut sum = ScalarValue::try_from(output_type)
+        .map_err(|error| aggregate_error("SUM state type", error))?;
+    add_rows_sum(&mut sum, input, rows)?;
     Ok(sum)
 }
 
@@ -276,57 +280,62 @@ pub(super) fn merge_sum_scalar(
     total: &mut ScalarValue,
     delta: &ScalarValue,
 ) -> Result<(), DbError> {
-    if total.data_type() != delta.data_type() {
-        return Err(sum_state_type_error(total, delta));
-    }
-    if let ScalarValue::Decimal128(Some(value), precision, scale) = delta {
-        Decimal128Type::validate_decimal_precision(*value, *precision, *scale)
-            .map_err(|error| aggregate_error("SUM checkpoint precision", error))?;
-    }
-    if delta.is_null() {
-        return Ok(());
-    }
-    if total.is_null() {
-        *total = delta.clone();
-        return Ok(());
-    }
-
     match (total, delta) {
-        (ScalarValue::Int64(left), ScalarValue::Int64(right)) => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            *left = Some(next);
-        }
-        (ScalarValue::UInt64(left), ScalarValue::UInt64(right)) => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            *left = Some(next);
-        }
-        (ScalarValue::Float64(left), ScalarValue::Float64(right)) => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            *left = Some(next);
-        }
+        (ScalarValue::Int64(total), ScalarValue::Int64(delta)) => add_sum(total, *delta),
+        (ScalarValue::UInt64(total), ScalarValue::UInt64(delta)) => add_sum(total, *delta),
+        (ScalarValue::Float64(total), ScalarValue::Float64(delta)) => add_sum(total, *delta),
         (
-            ScalarValue::Decimal128(left, left_precision, left_scale),
-            ScalarValue::Decimal128(right, right_precision, right_scale),
-        ) if left_precision == right_precision && left_scale == right_scale => {
-            let next = left
-                .unwrap()
-                .add_checked(right.unwrap())
-                .map_err(|error| aggregate_error("SUM state overflow", error))?;
-            Decimal128Type::validate_decimal_precision(next, *left_precision, *left_scale)
-                .map_err(|error| aggregate_error("SUM state precision", error))?;
-            *left = Some(next);
-        }
-        (left, right) => return Err(sum_state_type_error(left, right)),
+            ScalarValue::Decimal128(total, precision, scale),
+            ScalarValue::Decimal128(delta, delta_precision, delta_scale),
+        ) if *precision == *delta_precision && *scale == *delta_scale => add_decimal_sum(
+            total,
+            *delta,
+            *precision,
+            *scale,
+            "SUM checkpoint precision",
+        ),
+        (total, delta) => Err(sum_state_type_error(total, delta)),
     }
+}
+
+fn add_sum<T: ArrowNativeTypeOp>(total: &mut Option<T>, delta: Option<T>) -> Result<(), DbError> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    let next = match *total {
+        None => delta,
+        Some(total) => total
+            .add_checked(delta)
+            .map_err(|error| aggregate_error("SUM state overflow", error))?,
+    };
+    *total = Some(next);
+    Ok(())
+}
+
+fn add_decimal_sum(
+    total: &mut Option<i128>,
+    delta: Option<i128>,
+    precision: u8,
+    scale: i8,
+    delta_context: &str,
+) -> Result<(), DbError> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    Decimal128Type::validate_decimal_precision(delta, precision, scale)
+        .map_err(|error| aggregate_error(delta_context, error))?;
+    let next = match *total {
+        None => delta,
+        Some(total) => {
+            let next = total
+                .add_checked(delta)
+                .map_err(|error| aggregate_error("SUM state overflow", error))?;
+            Decimal128Type::validate_decimal_precision(next, precision, scale)
+                .map_err(|error| aggregate_error("SUM state precision", error))?;
+            next
+        }
+    };
+    *total = Some(next);
     Ok(())
 }
 
