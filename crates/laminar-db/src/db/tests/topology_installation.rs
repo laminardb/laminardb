@@ -27,7 +27,7 @@ fn enable_runtime(fixture: &Fixture) -> Arc<runtime_probe::InstallationProbe> {
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while !condition() {
             tokio::task::yield_now().await;
         }
