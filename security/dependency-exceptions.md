@@ -1,7 +1,7 @@
 # Temporary dependency exceptions
 
-Status: approved 2026-09-21, re-approved 2026-10-21, zstd exceptions added 2026-10-27; all expire
-at 2026-11-20 UTC (CI fails on that date).
+Status: approved 2026-09-21, re-approved 2026-10-21, zstd exceptions added 2026-10-27,
+re-approved 2026-10-31; all expire at 2026-11-30 UTC (CI fails on that date).
 Owner: LaminarDB maintainers responsible for [PR #600](https://github.com/laminardb/laminardb/pull/600).
 The four residual exceptions below were re-reviewed and accepted for this interval under S4.
 Machine-readable versions, sources, checksums and reasons are in `dependency-exceptions.json`.
@@ -13,30 +13,23 @@ Machine-readable versions, sources, checksums and reasons are in `dependency-exc
 | [RUSTSEC-2026-0173](https://rustsec.org/advisories/RUSTSEC-2026-0173.html) | proc-macro-error2 2.0.1 | Unmaintained compile-time dependency through validator_derive in Delta Lake. |
 | [RUSTSEC-2024-0384](https://rustsec.org/advisories/RUSTSEC-2024-0384.html) | instant 0.1.13 | Unmaintained dependency in the wider lockfile, including reqwest-retry/wasm-timer and old parking_lot. |
 
-[RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html) (webpki-roots 0.26.11)
-is excepted as a scanner match, not an accepted risk. That release bundles no certificates: it
-re-exports `TLS_SERVER_ROOTS` from webpki-roots 1.x, which the lockfile pins at the patched
-1.0.10 (both versions are pinned by checksum). Only async-nats reaches 0.26, through
-tokio-websockets 0.10; every async-nats release up to 0.50 still requires it, and building
-without its `websockets` feature would remove `ws://` NATS server URLs. Remove this exception
-when async-nats moves to tokio-websockets 0.12 or later.
-
 Thirteen zstd advisories published in October 2026 were excepted on 2026-10-27 ([PR #637](https://github.com/laminardb/laminardb/pull/637)),
 with the same deadline. They are fixed only in zstd 0.14.3 and zstd-safe 8.2.0, but DataFusion
-55.2, iceberg 0.10.1, chitchat 0.13 and apache-avro 0.22 still require zstd `^0.13` (arrow,
-parquet and async-compression's latest releases already accept 0.14), so the lockfile pins zstd
-0.13.3 and zstd-safe 7.3.0. zstd-sys was updated to 2.1.2, which fixes RUSTSEC-2026-0410. The
-graph enables only zstd's default features (`legacy`, `arrays`, `zdict_builder`) and none of
-zstd-safe's `experimental`, `seekable` or `zstdmt`:
+55.2, Arrow and Parquet 58.4, iceberg 0.10.1, chitchat 0.13 and apache-avro 0.22 still require
+zstd `^0.13`, so the lockfile pins zstd 0.13.3 and zstd-safe 7.3.0 for them. async-compression
+0.4.51 (through compression-codecs 0.4.46) resolves the patched zstd 0.14.3 and zstd-safe 8.2.0,
+which share the locked zstd-sys 2.1.2 (it fixes RUSTSEC-2026-0410); all four zstd identities are
+pinned by checksum. The graph enables only zstd's default features (`legacy`, `arrays`,
+`zdict_builder`) and none of zstd-safe's `experimental`, `seekable` or `zstdmt`:
 
 | Advisories | Status |
 | --- | --- |
 | [0395](https://rustsec.org/advisories/RUSTSEC-2026-0395.html), [0396](https://rustsec.org/advisories/RUSTSEC-2026-0396.html), [0398](https://rustsec.org/advisories/RUSTSEC-2026-0398.html), [0399](https://rustsec.org/advisories/RUSTSEC-2026-0399.html), [0402](https://rustsec.org/advisories/RUSTSEC-2026-0402.html), [0404](https://rustsec.org/advisories/RUSTSEC-2026-0404.html), [0406](https://rustsec.org/advisories/RUSTSEC-2026-0406.html) | Not compiled or not reachable: the APIs need `experimental`, `seekable` or a `zstdmt` multithreaded context. |
-| [0391](https://rustsec.org/advisories/RUSTSEC-2026-0391.html), [0400](https://rustsec.org/advisories/RUSTSEC-2026-0400.html), [0401](https://rustsec.org/advisories/RUSTSEC-2026-0401.html), [0405](https://rustsec.org/advisories/RUSTSEC-2026-0405.html) | No caller found: context reuse across streams, dictionaries, dictionary training and an out-of-range `InBuffer` position are not used. Workspace code calls only `zstd::bulk`. |
-| [0397](https://rustsec.org/advisories/RUSTSEC-2026-0397.html) | Accepted residual risk: async-compression calls `OutBuffer::around_pos` with a position from its own buffer bookkeeping. |
-| [0403](https://rustsec.org/advisories/RUSTSEC-2026-0403.html) | Accepted residual risk: with `legacy` on, a failed streaming decompression of a legacy frame from untrusted input (compressed files through DataFusion, Iceberg and Avro data) can expose uninitialized memory in the decoder's output buffer. |
+| [0391](https://rustsec.org/advisories/RUSTSEC-2026-0391.html), [0397](https://rustsec.org/advisories/RUSTSEC-2026-0397.html), [0400](https://rustsec.org/advisories/RUSTSEC-2026-0400.html), [0401](https://rustsec.org/advisories/RUSTSEC-2026-0401.html), [0405](https://rustsec.org/advisories/RUSTSEC-2026-0405.html) | No caller found: context reuse across streams, `OutBuffer::around_pos` (whose only caller, compression-codecs, now uses zstd-safe 8.2.0), dictionaries, dictionary training and an out-of-range `InBuffer` position are not used on zstd-safe 7.3.0. Workspace code calls only `zstd::bulk`. |
+| [0403](https://rustsec.org/advisories/RUSTSEC-2026-0403.html) | Accepted residual risk: with `legacy` on, a failed streaming decompression of a legacy frame from untrusted input (DataFusion's synchronous compressed-file reads, Parquet, Iceberg and Avro data) can expose uninitialized memory in the decoder's output buffer. |
 
-Remove these exceptions when DataFusion, iceberg, chitchat and apache-avro accept zstd 0.14.
+Remove these exceptions when DataFusion, Arrow, Parquet, iceberg, chitchat and apache-avro accept
+zstd 0.14 in the pinned analytical generation.
 
 Two additional exceptions cover RUSTSEC-2026-0194 and RUSTSEC-2026-0195, with the same deadline.
 Workspace builds still require the verified quick-xml backport. Registry publication now has
@@ -85,4 +78,15 @@ current DataFusion 55.2.0 and Delta Lake 1.1.2 still require object_store `^0.13
 iceberg-storage-opendal 0.10.1 still requires OpenDAL `^0.57` (latest 0.59.5), so the patch and
 XML exceptions remain until the analytical dependency migration. The backport's only change in
 this review is its due date, so its reviewed digest was recomputed.
-Keep these exceptions under review before **2026-11-20**, which is the hard CI deadline.
+Re-review on 2026-10-31: RUSTSEC-2026-0381 is no longer excepted, because the advisory now lists
+the webpki-roots 0.26.11 compatibility package as unaffected and neither scanner reports it.
+No other exception has a fix the graph can take. rsa 0.10 is still at 0.10.0-rc.19, and
+reqsign-google and reqsign-azure-storage (OpenDAL's GCS and Azure services) enable it. paste,
+proc-macro-error2 and instant have no new release. Even the latest DataFusion 55.2.0 and Delta Lake
+1.1.3 still require object_store `^0.13.2` (so quick-xml `^0.39`), Delta Lake still requires
+validator `^0.19` (whose derive uses proc-macro-error2), and iceberg-storage-opendal 0.10.1 still
+requires OpenDAL `^0.57`. instant comes only through parking_lot 0.11, which wasm-timer requires
+through reqwest-retry 0.7 in deltalake-catalog-unity 0.16; unity 1.0 moves to reqwest-retry 0.9
+but needs the Delta Lake 1.x generation. The quick-xml backport's only change in this review is
+its due date, so its reviewed digest was recomputed.
+Keep these exceptions under review before **2026-11-30**, which is the hard CI deadline.
