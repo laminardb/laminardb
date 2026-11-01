@@ -16,7 +16,7 @@ jobs:
     outputs:
       has_updates: ${{ steps.check.outputs.has_updates }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     if: needs.check.outputs.has_updates == 'true'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -101,7 +101,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Verify dependency exception policy and security backport
         run: python3 tools/check_dependency_exceptions.py
       - uses: taiki-e/install-action@cargo-audit
