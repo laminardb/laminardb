@@ -1,6 +1,6 @@
 use datafusion_common::ScalarValue;
 use laminar_core::state::KeyGroupCount;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use super::accounting::{
     logical_collection_element_usage, logical_collection_spare_capacity_usage,
@@ -11,13 +11,17 @@ use super::{GroupEntry, IncrementalAggState};
 use crate::error::DbError;
 use crate::operator_graph::VnodeStateLoad;
 
+/// Resident groups of one vnode. A `hashbrown` map so a batch looks groups up by borrowed key
+/// (`EncodedKey`) without allocating an `OwnedRow`.
+pub(super) type GroupMap = hashbrown::HashMap<arrow::row::OwnedRow, GroupEntry, FxBuildHasher>;
+
 /// Complete mutable working set owned by one aggregate vnode.
 ///
 /// The box containing this value is the unit of rebalance publication. Keeping logical state,
 /// changelog state, and accounting under the same owner prevents a vnode transition from
 /// publishing only part of a group's state.
 pub(super) struct AggregateVnodeState {
-    pub(super) groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+    pub(super) groups: GroupMap,
     pub(super) last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     pub(super) emit_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
     pub(super) next_output_sequence: u64,
@@ -37,7 +41,7 @@ pub(super) struct AggregateVnodeSlots {
 impl Default for AggregateVnodeState {
     fn default() -> Self {
         Self {
-            groups: FxHashMap::default(),
+            groups: GroupMap::default(),
             last_emitted: FxHashMap::default(),
             emit_dirty_keys: FxHashSet::default(),
             next_output_sequence: 0,
@@ -76,7 +80,7 @@ impl AggregateVnodeState {
     }
 
     pub(super) fn try_from_recovered(
-        groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+        groups: GroupMap,
         last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
         next_output_sequence: u64,
         mark_emit_dirty: bool,
