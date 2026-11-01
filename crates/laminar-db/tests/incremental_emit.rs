@@ -703,15 +703,30 @@ async fn a_dropped_changelog_view_can_be_created_again_while_running() {
     db.start().await.unwrap();
     let source = db.source_untyped("events").unwrap();
     source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(read_mv(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
+    assert_eq!(first_rows(&db, "agg").await, vec![(1, 10, 1), (2, 20, 1)]);
 
     db.execute("DROP MATERIALIZED VIEW agg").await.unwrap();
     db.execute(MV).await.unwrap();
     source.push_arrow(batch(&[3], &[30])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(read_mv(&db, "agg").await, vec![(3, 30, 1)]);
+    assert_eq!(first_rows(&db, "agg").await, vec![(3, 30, 1)]);
     db.shutdown().await.unwrap();
+}
+
+/// Poll `mv` until it has rows and return them. A read at the latest level is empty until the
+/// cycle that applies the view's first batch has run.
+async fn first_rows(db: &LaminarDB, mv: &str) -> Vec<(i64, i64, i64)> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let rows = read_mv(db, mv).await;
+        if !rows.is_empty() {
+            return rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{mv} had no rows within 30 seconds"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// View slices take the configured vnode count, and restore checks frames against it.
