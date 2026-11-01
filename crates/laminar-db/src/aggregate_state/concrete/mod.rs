@@ -14,8 +14,10 @@ mod input;
 mod sum;
 
 pub(crate) use input::AggregateInput;
+#[cfg(feature = "cluster")]
+use sum::sum_rows;
 pub(crate) use sum::SumState;
-use sum::{merge_sum_scalar, require_array_type, sum_rows, weighted_f64_delta};
+use sum::{add_rows_sum, merge_sum_scalar, require_array_type, weighted_f64_delta};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConcreteInputMode {
@@ -328,8 +330,7 @@ impl AvgState {
                 let next_count = count
                     .checked_add(non_null_rows(input, rows)?)
                     .ok_or_else(|| DbError::Pipeline("AVG count overflow".into()))?;
-                let delta = sum_rows(input, rows, &self.sum.data_type())?;
-                merge_sum_scalar(&mut self.sum, &delta)?;
+                add_rows_sum(&mut self.sum, input, rows)?;
                 *count = next_count;
                 Ok(())
             }

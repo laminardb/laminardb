@@ -207,6 +207,48 @@ fn invalid_arithmetic_is_rejected_without_mutating_state() {
 }
 
 #[test]
+fn append_sum_adds_each_batch_sum_to_its_total() {
+    let int_spec = spec(Sum::new(), DataType::Int64, DataType::Int64, false);
+    let ints = |values: Vec<Option<i64>>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
+    let mut sum =
+        ConcreteAggregateState::try_new(&int_spec, ConcreteInputMode::AppendOnly).unwrap();
+    sum.update_all(&[ints(vec![None])]).unwrap();
+    assert_eq!(sum.evaluate().unwrap(), ScalarValue::Int64(None));
+    sum.update_all(&[ints(vec![Some(i64::MAX - 1)])]).unwrap();
+    // Added row by row this batch would pass i64::MAX; its own sum is zero.
+    sum.update_all(&[ints(vec![Some(5), Some(-5)])]).unwrap();
+    let error = sum.update_all(&[ints(vec![Some(2)])]).unwrap_err();
+    assert!(error.to_string().contains("SUM state overflow"), "{error}");
+    assert_eq!(
+        sum.evaluate().unwrap(),
+        ScalarValue::Int64(Some(i64::MAX - 1))
+    );
+
+    let decimal = DataType::Decimal128(10, 2);
+    let decimal_spec = spec(Sum::new(), decimal.clone(), decimal, false);
+    let decimals = |values: Vec<i128>| -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        )
+    };
+    let mut sum =
+        ConcreteAggregateState::try_new(&decimal_spec, ConcreteInputMode::AppendOnly).unwrap();
+    let error = sum
+        .update_all(&[decimals(vec![9_999_999_999, 1])])
+        .unwrap_err();
+    assert!(error.to_string().contains("SUM batch precision"), "{error}");
+    sum.update_all(&[decimals(vec![9_999_999_999])]).unwrap();
+    let error = sum.update_all(&[decimals(vec![1])]).unwrap_err();
+    assert!(error.to_string().contains("SUM state precision"), "{error}");
+    assert_eq!(
+        sum.evaluate().unwrap(),
+        ScalarValue::Decimal128(Some(9_999_999_999), 10, 2)
+    );
+}
+
+#[test]
 fn extrema_are_append_only_and_use_datafusion_ordering() {
     let min_spec = spec(Min::new(), DataType::Utf8, DataType::Utf8, false);
     let mut min =
