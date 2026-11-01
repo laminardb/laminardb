@@ -38,6 +38,10 @@ jobs:
        github.event.workflow_run.event == 'push' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
+    env:
+      # nightly-2026-11-01 fails to compile DataFusion and Arrow with E0391 ("cycle detected when
+      # computing when ... needs async drop"). Move forward once a later nightly builds the docs.
+      DOCS_TOOLCHAIN: nightly-2026-10-31
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
@@ -45,14 +49,16 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
           df -h /
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.DOCS_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libclang-dev libudev-dev mold protobuf-compiler
 
       - name: Build API documentation
-        run: cargo +nightly doc --workspace --no-deps --all-features
+        run: cargo "+$DOCS_TOOLCHAIN" doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: "--cfg docsrs -D warnings"
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
