@@ -30,6 +30,7 @@ mod compile;
 mod concrete;
 mod emission;
 mod global;
+mod grouping;
 mod keys;
 #[cfg(feature = "cluster")]
 mod output_sequence;
@@ -53,8 +54,9 @@ pub(crate) use compile::{
 pub(crate) use concrete::{AggregateInput, ConcreteAggregateState, ConcreteInputMode};
 #[cfg(feature = "cluster")]
 pub(crate) use emission::PreparedAggregateEmission;
+use grouping::{BatchGroups, EncodedKey};
 pub(crate) use keys::global_aggregate_key;
-use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
+use vnode_state::{AggregateVnodeSlots, AggregateVnodeState, GroupMap};
 
 /// Builds the per-window result batch for one closed window.
 /// Output schema: `[group_cols..., agg_outputs...]`.
@@ -452,7 +454,7 @@ struct DecodedAggMutation {
 
 /// A decoded vnode image built off-side before publication.
 struct StagedAggMutation {
-    groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
+    groups: GroupMap,
     last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
 }
 
@@ -1357,15 +1359,11 @@ impl IncrementalAggState {
     /// The aggregate hot path already owns these bytes, so this deliberately uses the
     /// codec's static mapping rather than constructing another codec or re-encoding the key.
     /// Global aggregate state is pinned to vnode zero.
-    fn vnode_for_group_key(
-        num_group_cols: usize,
-        key: &arrow::row::OwnedRow,
-        vnode_count: NonZeroU32,
-    ) -> u32 {
+    fn vnode_for_group_key(num_group_cols: usize, key: &[u8], vnode_count: NonZeroU32) -> u32 {
         if num_group_cols == 0 || vnode_count.get() == 1 {
             0
         } else {
-            PartitionKeyCodecV1::vnode_for_encoded(key.as_ref(), vnode_count)
+            PartitionKeyCodecV1::vnode_for_encoded(key, vnode_count)
         }
     }
 
@@ -1499,39 +1497,23 @@ impl IncrementalAggState {
             .convert_columns(&group_cols)
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
-        // One OwnedRow alloc per unique group, not per row.
-        let estimated_groups = (batch.num_rows() / 4).max(16);
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
         let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
-        let mut group_indices: FxHashMap<arrow::row::Row<'_>, (Vec<u32>, i64)> =
-            FxHashMap::with_capacity_and_hasher(estimated_groups, rustc_hash::FxBuildHasher);
-        for row_idx in 0..batch.num_rows() {
-            let row_weight = input_weights.map_or(1, |weights| weights.value(row_idx));
-            let grouped = group_indices
-                .entry(rows.row(row_idx))
-                .or_insert_with(|| (Vec::new(), 0));
-            #[allow(clippy::cast_possible_truncation)]
-            grouped.0.push(row_idx as u32);
-            grouped.1 = grouped
-                .1
-                .checked_add(row_weight)
-                .ok_or_else(|| DbError::Pipeline("aggregate input weight overflow".into()))?;
-        }
+        let batch_groups = BatchGroups::try_new(&rows, input_weights)?;
 
-        // Allocate each unique key once, then reject the whole batch before touching an
-        // accumulator if its new keys would exceed the cardinality bound. Partial application is
-        // not retry-safe: an existing group updated before the error would be counted twice.
-        let mut grouped_rows = Vec::with_capacity(group_indices.len());
+        // Reject the whole batch before touching an accumulator if its new keys would exceed the
+        // cardinality bound. Partial application is not retry-safe: an existing group updated
+        // before the error would be counted twice. Only new groups allocate an owned key.
+        let mut grouped_rows = Vec::with_capacity(batch_groups.len());
         let mut incoming_new_groups = 0usize;
-        for (row_ref, (indices, input_weight_delta)) in group_indices {
-            let key = row_ref.owned();
+        for (key, indices, input_weight_delta) in batch_groups.iter() {
             let vnode = uniform_vnode.unwrap_or_else(|| {
-                Self::vnode_for_group_key(self.num_group_cols, &key, vnode_count)
+                Self::vnode_for_group_key(self.num_group_cols, key.data(), vnode_count)
             });
             let existing = self
                 .vnode_states
                 .get(vnode)
-                .and_then(|state| state.groups.get(&key));
+                .and_then(|state| state.groups.get(&EncodedKey(key.data())));
             let input_weight = Self::next_group_input_weight(
                 existing.map_or(0, |entry| entry.input_weight),
                 input_weight_delta,
@@ -1550,15 +1532,16 @@ impl IncrementalAggState {
 
         let aggregate_templates = &self.aggregate_templates;
         let emit_changelog = self.emit_changelog;
-        for (vnode, owned_key, indices, input_weight, is_new) in grouped_rows {
+        for (vnode, key, indices, input_weight, is_new) in grouped_rows {
             self.vnode_states.count_applied_rows(vnode, indices.len());
             if is_new {
                 let mut entry = GroupEntry::new(aggregate_templates.clone(), 0, watermark_ms);
-                Self::update_concrete_accumulators(&mut entry.accs, &inputs, &indices)?;
+                Self::update_concrete_accumulators(&mut entry.accs, &inputs, indices)?;
                 entry.input_weight = input_weight;
                 entry.last_updated_ms = watermark_ms;
                 entry.refresh_accumulator_usage();
 
+                let owned_key = key.owned();
                 let emit_key = emit_changelog.then(|| owned_key.clone());
                 let vnode_state = self.vnode_states.get_or_insert(vnode);
                 vnode_state.insert_new_group(owned_key, entry);
@@ -1581,10 +1564,10 @@ impl IncrementalAggState {
             let (update_result, previous_usage, current_usage) = {
                 let entry = vnode_state
                     .groups
-                    .get_mut(&owned_key)
+                    .get_mut(&EncodedKey(key.data()))
                     .expect("preflighted aggregate group must remain resident");
                 let update_result =
-                    Self::update_concrete_accumulators(&mut entry.accs, &inputs, &indices);
+                    Self::update_concrete_accumulators(&mut entry.accs, &inputs, indices);
                 if update_result.is_ok() {
                     entry.input_weight = input_weight;
                     entry.last_updated_ms = watermark_ms;
@@ -1594,7 +1577,7 @@ impl IncrementalAggState {
             };
             vnode_state.reconcile_accumulator_usage(previous_usage, current_usage);
             if update_result.is_ok() && emit_changelog {
-                vnode_state.insert_emit_dirty_key(owned_key.clone());
+                vnode_state.insert_emit_dirty_key(key.owned());
             }
             update_result?;
             Self::mark_checkpoint_vnode_dirty_parts(
@@ -2202,10 +2185,14 @@ impl IncrementalAggState {
                 transitioned_vnodes.insert(position, vnode);
             }
 
-            let mut staged_groups = FxHashMap::default();
+            let mut staged_groups = GroupMap::default();
             staged_groups
                 .try_reserve(state.last_updated_ms.len().min(self.max_groups))
-                .map_err(|error| reserve_error("staged groups", error))?;
+                .map_err(|error| {
+                    DbError::Pipeline(format!(
+                        "aggregate vnode transition could not reserve staged groups: {error:?}"
+                    ))
+                })?;
             let mut staged_last_emitted = FxHashMap::default();
             staged_last_emitted
                 .try_reserve(state.emitted_groups.len().min(self.max_groups))
@@ -2215,7 +2202,7 @@ impl IncrementalAggState {
                 last_emitted: staged_last_emitted,
             };
             let belongs_to_vnode = |key: &arrow::row::OwnedRow| {
-                Self::vnode_for_group_key(self.num_group_cols, key, vnode_count) == vnode
+                Self::vnode_for_group_key(self.num_group_cols, key.as_ref(), vnode_count) == vnode
             };
 
             let decoded = self.decode_recovery_mutation(&state, "vnode transition", current_fp)?;
