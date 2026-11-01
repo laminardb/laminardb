@@ -449,9 +449,14 @@ fn engine_reset_persists_through_the_store_and_adopts_its_creation_time() {
     let store = MemoryStore::new(None);
     let client = Client::start(venue.port(), callbacks.clone(), store.clone());
     venue.wait_logged_on();
+    // Session creation already reset the store from its stale initial creation time.
+    let startup_resets = store.resets.lock().len();
     reset_session(&callbacks.key).expect("reset");
-    wait_until("reset persisted", || !store.resets.lock().is_empty());
-    let (now, created) = store.resets.lock()[0];
+    let (now, created) = *store
+        .resets
+        .lock()
+        .get(startup_resets)
+        .expect("explicit reset persisted");
     assert!(created >= now);
     let engine = session_state(&callbacks.key).expect("state");
     assert_eq!(engine.creation_unix_seconds, created / 1_000_000);
