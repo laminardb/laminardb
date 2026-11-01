@@ -5625,6 +5625,7 @@ dependencies = [
  "futures",
  "futures-util",
  "governor",
+ "hashbrown 0.16.1",
  "hf-hub",
  "indexmap 2.14.2",
  "laminar-connectors",
