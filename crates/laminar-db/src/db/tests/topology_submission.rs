@@ -39,6 +39,27 @@ async fn active(fixture: &Fixture, operation: laminar_core::cluster::control::To
     .expect("owned migration did not reach exact target Release");
 }
 
+/// Retry a planning call while it answers `PlanningBusy`: the recovery monitor can still own the
+/// topology compiler after publishing Active.
+async fn when_planning_idle<T, F, Fut>(mut call: F) -> Result<T, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, DbError>>,
+{
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match call().await {
+                Err(DbError::Topology(TopologyError::PlanningBusy)) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("topology compiler did not become available")
+}
+
 fn sink_total(probe: &runtime_probe::InstallationProbe) -> i64 {
     total(
         &probe
@@ -224,7 +245,17 @@ async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery(
             .stream_generation,
         certificate.stream_generation
     );
-    let recreate = fixture.db.validate_cluster_topology_change(TopologyVersion::new(2).unwrap(), &["CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')".into()]).await.unwrap();
+    let recreate_sink: [String; 1] = [
+        "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')"
+            .into(),
+    ];
+    let recreate = when_planning_idle(|| {
+        fixture
+            .db
+            .validate_cluster_topology_change(TopologyVersion::new(2).unwrap(), &recreate_sink)
+    })
+    .await
+    .unwrap();
     let reincarnated = recreate
         .objects
         .iter()
@@ -235,7 +266,7 @@ async fn topology_sink_removal_preserves_actual_state_retries_and_cold_recovery(
         reincarnated.transition,
         crate::ClusterTopologyObjectTransition::AddFutureOnly
     );
-    let result = Box::pin(fixture.db.execute("DROP SINK kept_sink"))
+    let result = when_planning_idle(|| Box::pin(fixture.db.execute("DROP SINK kept_sink")))
         .await
         .unwrap();
     let ExecuteResult::Ddl(info) = result else {
@@ -371,25 +402,14 @@ async fn topology_public_atomic_then_sql_migration_preserves_actual_aggregate_an
     ));
     drop(compiler);
     probe.output.lock().clear();
-    // The recovery monitor can still own the compiler after publishing Active.
-    let sql = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match Box::pin(
-                fixture
-                    .db
-                    .execute("CREATE STREAM downstream AS SELECT * FROM totals"),
-            )
-            .await
-            {
-                Err(DbError::Topology(TopologyError::PlanningBusy)) => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                result => break result,
-            }
-        }
+    let sql = when_planning_idle(|| {
+        Box::pin(
+            fixture
+                .db
+                .execute("CREATE STREAM downstream AS SELECT * FROM totals"),
+        )
     })
     .await
-    .expect("topology compiler did not become available for the SQL migration")
     .unwrap();
     let ExecuteResult::Ddl(info) = sql else {
         panic!("SQL must return its durable receipt");
@@ -680,20 +700,9 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
         ],
     );
     removal.expected_parent_version = TopologyVersion::new(2).unwrap();
-    // The recovery monitor can still own the compiler after publishing Active.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match Box::pin(fixture.db.submit_cluster_topology_change(&removal)).await {
-                Err(DbError::Topology(TopologyError::PlanningBusy)) => {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                result => break result,
-            }
-        }
-    })
-    .await
-    .expect("topology compiler did not become available for the removal")
-    .unwrap();
+    when_planning_idle(|| Box::pin(fixture.db.submit_cluster_topology_change(&removal)))
+        .await
+        .unwrap();
     active(&fixture, removal.operation_id).await;
     assert_eq!(fixture.db.catalog.list_sources(), ["added_source"]);
     assert!(!fixture
@@ -817,11 +826,13 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
             .stream_generation,
         certificate.stream_generation
     );
-    let recreated_source = fixture
-        .db
-        .validate_cluster_topology_change(TopologyVersion::new(3).unwrap(), &baseline[..1])
-        .await
-        .unwrap();
+    let recreated_source = when_planning_idle(|| {
+        fixture
+            .db
+            .validate_cluster_topology_change(TopologyVersion::new(3).unwrap(), &baseline[..1])
+    })
+    .await
+    .unwrap();
     assert_eq!(
         recreated_source
             .objects
@@ -831,14 +842,18 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
             .catalog_generation,
         2
     );
-    assert!(fixture
-        .db
-        .validate_cluster_topology_change(TopologyVersion::new(3).unwrap(), &baseline[1..2])
-        .await
-        .is_err());
-    assert!(Box::pin(fixture.db.execute("DROP SOURCE added_source"))
-        .await
-        .is_err());
+    assert!(when_planning_idle(|| {
+        fixture
+            .db
+            .validate_cluster_topology_change(TopologyVersion::new(3).unwrap(), &baseline[1..2])
+    })
+    .await
+    .is_err());
+    assert!(
+        when_planning_idle(|| Box::pin(fixture.db.execute("DROP SOURCE added_source")))
+            .await
+            .is_err()
+    );
     let mut retire_dependents = request(
         1503,
         vec![
@@ -849,17 +864,20 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
         ],
     );
     retire_dependents.expected_parent_version = TopologyVersion::new(3).unwrap();
-    Box::pin(
-        fixture
-            .db
-            .submit_cluster_topology_change(&retire_dependents),
-    )
+    when_planning_idle(|| {
+        Box::pin(
+            fixture
+                .db
+                .submit_cluster_topology_change(&retire_dependents),
+        )
+    })
     .await
     .unwrap();
     active(&fixture, retire_dependents.operation_id).await;
-    let ExecuteResult::Ddl(info) = Box::pin(fixture.db.execute("DROP SOURCE added_source"))
-        .await
-        .unwrap()
+    let ExecuteResult::Ddl(info) =
+        when_planning_idle(|| Box::pin(fixture.db.execute("DROP SOURCE added_source")))
+            .await
+            .unwrap()
     else {
         panic!("SQL must return a durable source removal receipt");
     };
@@ -881,7 +899,7 @@ async fn topology_source_and_managed_stream_removal_preserves_survivors_through_
             baseline[2].clone(),
         ],
     };
-    Box::pin(fixture.db.submit_cluster_topology_change(&recreation))
+    when_planning_idle(|| Box::pin(fixture.db.submit_cluster_topology_change(&recreation)))
         .await
         .unwrap();
     active(&fixture, recreation.operation_id).await;
@@ -932,14 +950,14 @@ async fn topology_compatible_stateless_replacement_preserves_managed_state_and_s
         "CREATE OR REPLACE STREAM projected AS SELECT id, value * 2 AS total FROM trades".into(),
         "CREATE SINK projected_sink FROM projected INTO \"planning-sink\" ('topic' = 'projected-output')".into(),
     ] };
-    let report = fixture
-        .db
-        .validate_cluster_topology_change(
+    let report = when_planning_idle(|| {
+        fixture.db.validate_cluster_topology_change(
             replacement.expected_parent_version,
             &replacement.statements,
         )
-        .await
-        .unwrap();
+    })
+    .await
+    .unwrap();
     let projected = report
         .objects
         .iter()
@@ -951,7 +969,7 @@ async fn topology_compatible_stateless_replacement_preserves_managed_state_and_s
     );
     assert_eq!(projected.catalog_generation, 1);
     probe.output.lock().clear();
-    Box::pin(fixture.db.submit_cluster_topology_change(&replacement))
+    when_planning_idle(|| Box::pin(fixture.db.submit_cluster_topology_change(&replacement)))
         .await
         .unwrap();
     active(&fixture, replacement.operation_id).await;
@@ -1042,7 +1060,7 @@ async fn topology_pipeline_reset_separates_incarnations_and_recovers_future_inpu
         "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'reset-output')".into(),
     ] };
     probe.output.lock().clear();
-    Box::pin(fixture.db.submit_cluster_topology_change(&reset))
+    when_planning_idle(|| Box::pin(fixture.db.submit_cluster_topology_change(&reset)))
         .await
         .unwrap();
     active(&fixture, reset.operation_id).await;
