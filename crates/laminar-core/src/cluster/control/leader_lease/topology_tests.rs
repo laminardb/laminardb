@@ -322,3 +322,41 @@ async fn topology_baseline_record_is_retained_and_format_cannot_downgrade() {
     );
     assert_eq!(sealed_baseline(&authority).await, baseline);
 }
+
+#[tokio::test]
+async fn namespace_adopted_before_seal_time_baselines_still_reads_as_topology_one() {
+    let (raw, authority) = blocking_once_at(30_000, OsPath::from("control/never-block"));
+    let leader = owner(1, 1, 1);
+    let (encoded, reference) = catalog("events").encode_and_reference().unwrap();
+    authority
+        .ensure_catalog_manifest_blob(&encoded, &reference)
+        .await
+        .unwrap();
+    let deployment_id = CheckpointDecisionStore::new(authority.store.clone())
+        .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    let baseline = TopologyBaseline {
+        protocol_version: crate::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
+        topology_version: crate::cluster::control::TopologyVersion::BASELINE,
+        manifest: reference.clone(),
+        deployment_id,
+        operation_id: Uuid::from_u128(40).try_into().unwrap(),
+        authority_sequence: 3,
+    };
+    // Unsealed, sealed without a baseline, adopted, then renewed.
+    for sequence in 1..=4 {
+        let mut record = bare_authority_record(&leader, sequence);
+        if sequence >= 2 {
+            record.lease.catalog_manifest = Some(reference.clone());
+        }
+        if sequence >= 3 {
+            record.version = TOPOLOGY_AUTHORITY_RECORD_VERSION;
+            record.topology_baseline = Some(baseline.clone());
+        }
+        seed_authority_record(&raw, &record).await;
+    }
+    seed_authority_head(&raw, 4).await;
+    let restarted = LeaderLeaseStore::new(raw.clone(), 30_000);
+    assert_eq!(sealed_baseline(&restarted).await, baseline);
+}
