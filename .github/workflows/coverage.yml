@@ -32,9 +32,9 @@ jobs:
       RUST_MIN_STACK: 4194304
     steps:
       - uses: actions/checkout@v6
-      # The --all-features build under -C instrument-coverage (run 3x in this
-      # job) overflowed the runner disk ("No space left on device" -> ld bus
-      # error). Use the same aggressive cleanup + swap as the CI Test job.
+      # The --all-features build under -C instrument-coverage overflowed the
+      # runner disk ("No space left on device" -> ld bus error). Use the same
+      # aggressive cleanup + swap as the CI Test job.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
@@ -74,15 +74,22 @@ jobs:
             done
           done
 
-      - name: Generate coverage
+      # One instrumented test run; every report below reads its profile data. `--no-report`
+      # skips the automatic clean, so stale profiles are removed first.
+      - name: Run tests with coverage
         run: |
-          cargo llvm-cov --workspace --all-features \
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --all-features --no-report
+
+      - name: Generate LCOV report
+        run: |
+          cargo llvm-cov report \
             --ignore-filename-regex 'tests?\.rs$|benches?/' \
             --lcov --output-path lcov.info
 
       - name: Generate HTML report
         run: |
-          cargo llvm-cov --workspace --all-features \
+          cargo llvm-cov report \
             --ignore-filename-regex 'tests?\.rs$|benches?/' \
             --html --output-dir coverage-html
 
@@ -104,6 +111,6 @@ jobs:
         run: |
           echo "## Code Coverage" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          cargo llvm-cov --workspace --all-features \
+          cargo llvm-cov report \
             --ignore-filename-regex 'tests?\.rs$|benches?/' \
             2>&1 | tail -30 >> $GITHUB_STEP_SUMMARY || true
