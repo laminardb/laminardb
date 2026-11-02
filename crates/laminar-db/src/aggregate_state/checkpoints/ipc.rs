@@ -408,10 +408,7 @@ where
         ));
     }
 
-    let validity_len = rows
-        .checked_add(7)
-        .ok_or_else(|| invalid_ipc_shape(context, "validity-buffer length overflows"))?
-        / 8;
+    let validity_len = rows.div_ceil(8);
     let buffer_len = |index: usize| -> Result<usize, DbError> {
         if index >= buffers.len() {
             return Err(invalid_ipc_shape(
@@ -458,7 +455,11 @@ where
                 }
             }
             shape => {
-                expect_len(buffer_index, validity_len)?;
+                // A column without nulls may carry an empty validity buffer instead of a bitmap.
+                // Arrow 58.4.0 wrote the bitmap and later writers write the empty buffer, and
+                // checkpoints from both must restore.
+                let omitted = null_count == 0 && buffer_len(buffer_index)? == 0;
+                expect_len(buffer_index, if omitted { 0 } else { validity_len })?;
                 buffer_index += 1;
                 match shape {
                     IpcPhysicalShape::Bits => {

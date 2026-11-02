@@ -25,7 +25,7 @@ quick-xml = { path = "vendor/quick-xml" }
 rdkafka-sys = { path = "vendor/rdkafka-sys" }
 
 [workspace.package]
-version = "0.33.0"
+version = "0.34.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"
@@ -83,17 +83,17 @@ globset = "0.4"
 
 # Arrow row encoding participates in the partitioning ABI. Upgrade these exact
 # pins only with an ABI version bump and updated golden vectors.
-arrow = { version = "=58.4.0", default-features = true }
-arrow-array = "=58.4.0"
-arrow-avro = "=58.4.0"
-arrow-schema = { version = "=58.4.0", features = ["serde"] }
-arrow-cast = "=58.4.0"
-arrow-csv = "=58.4.0"
-arrow-ipc = { version = "=58.4.0", features = ["lz4"] }
-arrow-json = "=58.4.0"
-arrow-row = "=58.4.0"
-arrow-select = "=58.4.0"
-parquet = { version = "=58.4.0", default-features = false }
+arrow = { version = "=58.4.1", default-features = true }
+arrow-array = "=58.4.1"
+arrow-avro = "=58.4.1"
+arrow-schema = { version = "=58.4.1", features = ["serde"] }
+arrow-cast = "=58.4.1"
+arrow-csv = "=58.4.1"
+arrow-ipc = { version = "=58.4.1", features = ["lz4"] }
+arrow-json = "=58.4.1"
+arrow-row = "=58.4.1"
+arrow-select = "=58.4.1"
+parquet = { version = "=58.4.1", default-features = false }
 datafusion = "=53.1.0"
 datafusion-common = "=53.1.0"
 datafusion-expr = "=53.1.0"
