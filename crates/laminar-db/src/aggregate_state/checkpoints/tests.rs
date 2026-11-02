@@ -12,6 +12,17 @@ use super::*;
 
 const FINGERPRINT: u64 = 7;
 
+// `one_group`'s key and accumulator streams as Arrow 58.4.0 wrote them, with an all-valid bitmap
+// for each column without nulls.
+const ARROW_58_4_0_KEYS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/checkpoint_ipc/arrow-58.4.0-utf8.arrows"
+));
+const ARROW_58_4_0_ACCUMULATOR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/checkpoint_ipc/arrow-58.4.0-int64.arrows"
+));
+
 fn grouped_profile() -> AggStateArchiveRestoreProfile {
     AggStateArchiveRestoreProfile::new(FINGERPRINT, 1, 1, 1, 1, false)
 }
@@ -57,6 +68,25 @@ fn record_buffer_descriptor_start(bytes: &[u8]) -> usize {
         .unwrap()
         .bytes();
     metadata_start + descriptors.as_ptr() as usize - metadata.as_ptr() as usize
+}
+
+fn record_field_node_start(bytes: &[u8]) -> usize {
+    let (metadata, metadata_start) = message_metadata(bytes, arrow_ipc::MessageHeader::RecordBatch);
+    let message = arrow_ipc::root_as_message(metadata).unwrap();
+    let nodes = message
+        .header_as_record_batch()
+        .unwrap()
+        .nodes()
+        .unwrap()
+        .bytes();
+    metadata_start + nodes.as_ptr() as usize - metadata.as_ptr() as usize
+}
+
+fn first_buffer_len(bytes: &[u8]) -> i64 {
+    let (metadata, _) = message_metadata(bytes, arrow_ipc::MessageHeader::RecordBatch);
+    let message = arrow_ipc::root_as_message(metadata).unwrap();
+    let buffers = message.header_as_record_batch().unwrap().buffers().unwrap();
+    buffers.get(0).length()
 }
 
 fn record_variadic_count_start(bytes: &[u8]) -> usize {
@@ -146,6 +176,38 @@ fn aggregate_archive_preflight_accepts_canonical_boundaries() {
             .group_count(),
         1
     );
+}
+
+#[test]
+fn aggregate_archive_preflight_accepts_materialized_and_empty_validity_buffers() {
+    let current = one_group();
+    let materialized = AggStateCheckpoint {
+        keys_ipc: ARROW_58_4_0_KEYS.to_vec(),
+        acc_state_ipc: vec![ARROW_58_4_0_ACCUMULATOR.to_vec()],
+        ..one_group()
+    };
+    for (bitmap, empty) in [
+        (&materialized.keys_ipc, &current.keys_ipc),
+        (&materialized.acc_state_ipc[0], &current.acc_state_ipc[0]),
+    ] {
+        assert_eq!(first_buffer_len(bitmap), 1);
+        assert_eq!(first_buffer_len(empty), 0);
+        assert_eq!(
+            laminar_core::serialization::deserialize_batch_stream(bitmap).unwrap(),
+            laminar_core::serialization::deserialize_batch_stream(empty).unwrap()
+        );
+    }
+
+    for checkpoint in [materialized, current] {
+        let encoded = encode(&checkpoint);
+        let preflighted = grouped_profile()
+            .preflight(&encoded, format_args!("validity layout"))
+            .unwrap();
+        assert_eq!(preflighted.group_count(), 1);
+        preflighted
+            .deserialize(format_args!("validity layout"))
+            .unwrap();
+    }
 }
 
 #[test]
@@ -399,9 +461,13 @@ fn scalar_ipc_preflight_rejects_corrupt_nested_layouts() {
     let descriptor = record_buffer_descriptor_start(&oversized);
     oversized[descriptor + 8..descriptor + 16].copy_from_slice(&i64::MAX.to_le_bytes());
 
-    let mut overlapping = ipc(vec![Arc::new(Int64Array::from(vec![1]))]);
+    let mut overlapping = ipc(vec![Arc::new(Int64Array::from(vec![None::<i64>]))]);
     let descriptor = record_buffer_descriptor_start(&overlapping);
     overlapping[descriptor + 16..descriptor + 24].copy_from_slice(&0_i64.to_le_bytes());
+
+    let mut missing_validity = ipc(vec![Arc::new(Int64Array::from(vec![1]))]);
+    let node = record_field_node_start(&missing_validity);
+    missing_validity[node + 8..node + 16].copy_from_slice(&1_i64.to_le_bytes());
 
     let mut view = ipc(vec![Arc::new(StringViewArray::from(vec![
         "a View payload longer than twelve bytes",
@@ -418,6 +484,7 @@ fn scalar_ipc_preflight_rejects_corrupt_nested_layouts() {
     for (bytes, columns, expected) in [
         (oversized, 1, "buffer exceeds"),
         (overlapping, 1, "overlap"),
+        (missing_validity, 1, "canonical field shape"),
         (view, 1, "variadic count exceeds"),
         (dictionary, 2, "dictionary roster"),
     ] {
