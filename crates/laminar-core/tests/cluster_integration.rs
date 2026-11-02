@@ -142,7 +142,10 @@ async fn wait_for_certified_prepare(
     node: &laminar_core::cluster::testing::NodeHandle,
     expected: &BarrierAnnouncement,
 ) {
-    tokio::time::timeout(Duration::from_secs(4), async {
+    // The MiniCluster's failure detector can mark a live peer Suspected under load, and the
+    // follower rejects the Prepare until its next membership tick sees that peer Active again.
+    let mut rejection = None;
+    let observed = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
             match node.controller.observe_checkpoint_prepare().await {
                 Ok(Some(CheckpointPrepareObservation::AssignmentReady(observed)))
@@ -151,14 +154,20 @@ async fn wait_for_certified_prepare(
                     return;
                 }
                 Ok(Some(CheckpointPrepareObservation::AssignmentRejected { error, .. })) => {
-                    panic!("certified Prepare rejected: {error}");
+                    rejection = Some(error);
                 }
-                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+                _ => {}
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("node {} did not observe Prepare", node.instance_id.0));
+    .await;
+    if observed.is_err() {
+        match rejection {
+            Some(error) => panic!("certified Prepare rejected: {error}"),
+            None => panic!("node {} did not observe Prepare", node.instance_id.0),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
