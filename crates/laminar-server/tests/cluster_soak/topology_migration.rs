@@ -486,7 +486,7 @@ pub(super) fn exercise(
     probe.expected.clear();
     probe.input_started.clear();
     let request = laminar_db::ClusterTopologyRequest {
-        operation_id: uuid::Uuid::new_v4().try_into().unwrap(), expected_parent_version: TopologyVersion::LEGACY_BASELINE,
+        operation_id: uuid::Uuid::new_v4().try_into().unwrap(), expected_parent_version: TopologyVersion::BASELINE,
         statements: vec![
             format!("CREATE SOURCE topology_live_source (id BIGINT NOT NULL, value BIGINT NOT NULL) FROM KAFKA ('bootstrap.servers' = '{brokers}', 'group.id' = 'topology-live-{id}', 'topic' = '{}', 'startup.mode' = 'latest')", probe.input_topic),
             "CREATE STREAM topology_live_stream AS SELECT id AS left_id, value AS right_id FROM topology_live_source".into(),

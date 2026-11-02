@@ -4064,7 +4064,7 @@ async fn topology_status_reads_uninitialized_and_sealed_baseline_without_activat
     let plan = laminar_core::cluster::control::TopologyAdmissionPlan {
         protocol_version: laminar_core::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::from_u128(43).try_into().unwrap(),
-        expected_parent: laminar_core::cluster::control::TopologyVersion::LEGACY_BASELINE,
+        expected_parent: laminar_core::cluster::control::TopologyVersion::BASELINE,
         parent_manifest: reference.clone(),
         target_manifest: target.reference().unwrap(),
         assignment: seed.assignment_fence().unwrap(),

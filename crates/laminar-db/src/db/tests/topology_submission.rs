@@ -9,7 +9,7 @@ use laminar_core::cluster::control::{
 fn request(value: u128, statements: Vec<String>) -> ClusterTopologyRequest {
     ClusterTopologyRequest {
         operation_id: uuid::Uuid::from_u128(value).try_into().unwrap(),
-        expected_parent_version: TopologyVersion::LEGACY_BASELINE,
+        expected_parent_version: TopologyVersion::BASELINE,
         statements,
     }
 }
@@ -1506,7 +1506,7 @@ async fn topology_sql_migration_adds_and_drops_materialized_views() {
     let recreate = fixture
         .db
         .validate_cluster_topology_change(
-            TopologyVersion::LEGACY_BASELINE,
+            TopologyVersion::BASELINE,
             &[
                 "DROP MATERIALIZED VIEW counts".into(),
                 "CREATE MATERIALIZED VIEW counts AS SELECT id, COUNT(*) AS n FROM trades GROUP BY id"
@@ -1677,7 +1677,7 @@ async fn seeded_views_after_migration(recover_from_root: bool) {
     let unseedable = fixture
         .db
         .validate_cluster_topology_change(
-            TopologyVersion::LEGACY_BASELINE,
+            TopologyVersion::BASELINE,
             &["CREATE MATERIALIZED VIEW over_relay AS SELECT id, total FROM relay".into()],
         )
         .await

@@ -16,7 +16,7 @@ struct Fixture {
     authority: Arc<LeaderLeaseStore>,
     catalog: CatalogManifestStore,
     proof: crate::checkpoint::LeaderProof,
-    baseline: LegacyTopologyBaseline,
+    baseline: TopologyBaseline,
 }
 
 fn operation(value: u128) -> TopologyOperationId {
@@ -79,10 +79,7 @@ async fn fixture() -> Fixture {
 fn identifiers_reject_zero_and_overflow_on_decode_and_allocation() {
     assert!(TopologyVersion::new(0).is_err());
     assert!(serde_json::from_str::<TopologyVersion>("0").is_err());
-    assert_eq!(
-        TopologyVersion::LEGACY_BASELINE.successor().unwrap().get(),
-        2
-    );
+    assert_eq!(TopologyVersion::BASELINE.successor().unwrap().get(), 2);
     assert!(TopologyVersion::new(u64::MAX).unwrap().successor().is_err());
     assert!(TopologyOperationId::try_from(Uuid::nil()).is_err());
     assert!(serde_json::from_str::<TopologyOperationId>(
@@ -117,10 +114,7 @@ async fn fresh_namespace_is_uninitialized_until_the_seal_writes_topology_one() {
 
     catalog.seal(&inventory("events"), &proof).await.unwrap();
     let state = catalog.topology_state().await.unwrap();
-    assert_eq!(
-        state.committed_version(),
-        Some(TopologyVersion::LEGACY_BASELINE)
-    );
+    assert_eq!(state.committed_version(), Some(TopologyVersion::BASELINE));
     let TopologyCatalogState::Versioned { baseline, .. } = state else {
         panic!("the seal must write topology one");
     };

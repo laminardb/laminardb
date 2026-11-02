@@ -169,7 +169,7 @@ async fn fixture_with_changes(authority: &LeaderLeaseStore, change: FixtureChang
         validation_format_version: 3,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
-        parent_version: TopologyVersion::LEGACY_BASELINE,
+        parent_version: TopologyVersion::BASELINE,
         target_version: TopologyVersion::new(2).unwrap(),
         parent_manifest: parent.reference().unwrap(),
         target_manifest: target.reference().unwrap(),

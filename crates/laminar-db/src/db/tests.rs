@@ -10778,10 +10778,7 @@ async fn topology_status_distinguishes_sealed_baseline_replay_and_runtime_releas
             ..
         }
     ));
-    assert_eq!(
-        sealed.committed_version,
-        Some(TopologyVersion::LEGACY_BASELINE)
-    );
+    assert_eq!(sealed.committed_version, Some(TopologyVersion::BASELINE));
     assert_eq!(sealed.locally_active_version, None);
     db.restore_catalog_from_manifest().await.unwrap();
     assert_eq!(
@@ -10809,7 +10806,7 @@ async fn topology_status_distinguishes_sealed_baseline_replay_and_runtime_releas
             .await
             .unwrap()
             .locally_active_version,
-        Some(TopologyVersion::LEGACY_BASELINE)
+        Some(TopologyVersion::BASELINE)
     );
     // The real capture helper and assignment/source release share the existing authority lock.
     // A still-current assignment must not reopen a held topology cut or report it active.
@@ -10849,10 +10846,7 @@ async fn topology_status_distinguishes_sealed_baseline_replay_and_runtime_releas
     authority.controller.set_recovering(false);
     authority.controller.fence_process_lease();
     let fenced = db.cluster_topology_status().await.unwrap();
-    assert_eq!(
-        fenced.committed_version,
-        Some(TopologyVersion::LEGACY_BASELINE)
-    );
+    assert_eq!(fenced.committed_version, Some(TopologyVersion::BASELINE));
     assert_eq!(fenced.locally_active_version, None);
     DbState::Faulted.store(&db.state);
     assert_eq!(

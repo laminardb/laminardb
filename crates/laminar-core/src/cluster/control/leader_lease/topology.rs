@@ -17,9 +17,8 @@ use super::{
 };
 use crate::cluster::control::catalog_manifest::CatalogSealOutcome;
 use crate::cluster::control::topology::{
-    LegacyTopologyBaseline, TopologyCatalogState, TopologyCommit, TopologyError,
-    TopologyJournalUsage, TopologyOperationId, TopologyVersion, MAX_TOPOLOGY_OPERATIONS,
-    TOPOLOGY_PROTOCOL_VERSION,
+    TopologyBaseline, TopologyCatalogState, TopologyCommit, TopologyError, TopologyJournalUsage,
+    TopologyOperationId, TopologyVersion, MAX_TOPOLOGY_OPERATIONS, TOPOLOGY_PROTOCOL_VERSION,
 };
 
 const TOPOLOGY_READ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -229,7 +228,7 @@ impl LeaderLeaseStore {
 
     pub(super) async fn audit_topology_baseline(
         &self,
-        baseline: &LegacyTopologyBaseline,
+        baseline: &TopologyBaseline,
     ) -> Result<(), LeaseError> {
         let record = super::read_authority_record(self.store.as_ref(), baseline.authority_sequence)
             .await?
@@ -340,9 +339,9 @@ impl LeaderLeaseStore {
             };
             let mut candidate = current.preserve_with_lease(candidate_lease);
             candidate.version = candidate.version.max(TOPOLOGY_AUTHORITY_RECORD_VERSION);
-            let baseline = LegacyTopologyBaseline {
+            let baseline = TopologyBaseline {
                 protocol_version: TOPOLOGY_PROTOCOL_VERSION,
-                topology_version: TopologyVersion::LEGACY_BASELINE,
+                topology_version: TopologyVersion::BASELINE,
                 manifest: reference.clone(),
                 deployment_id: deployment_id.clone(),
                 operation_id,

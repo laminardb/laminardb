@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use laminar_core::cluster::control::{
-    CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, LegacyTopologyBaseline,
+    CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, TopologyBaseline,
     TopologyCatalogState,
 };
 
@@ -13,7 +13,7 @@ pub(super) fn sealed_inventory(
     checkpoint_url: &str,
     nodes: &mut [Node],
     recovery_ceiling: Duration,
-) -> LegacyTopologyBaseline {
+) -> TopologyBaseline {
     let objects = objects_for_namespace(checkpoint_url);
     let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
     let catalog = CatalogManifestStore::new(Arc::clone(&authority));
@@ -71,7 +71,7 @@ pub(super) fn objects_for_namespace(checkpoint_url: &str) -> Arc<dyn object_stor
 
 fn wait_for_status(
     nodes: &mut [Node],
-    baseline: &LegacyTopologyBaseline,
+    baseline: &TopologyBaseline,
     require_active: bool,
     recovery_ceiling: Duration,
 ) {
@@ -116,7 +116,7 @@ fn wait_for_status(
 
 pub(super) fn restart_all(
     nodes: &mut [Node],
-    baseline: &LegacyTopologyBaseline,
+    baseline: &TopologyBaseline,
     recovery_ceiling: Duration,
 ) {
     let started = Instant::now();

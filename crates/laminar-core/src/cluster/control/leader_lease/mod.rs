@@ -1087,7 +1087,7 @@ struct LeaderAuthorityRecord {
     recovery_release_head: Option<RecoveryReleaseLink>,
     /// Topology one bound to the sealed inventory, preserved by every later append.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    topology_baseline: Option<super::topology::LegacyTopologyBaseline>,
+    topology_baseline: Option<super::topology::TopologyBaseline>,
     /// Frozen drain intent, admitted before any assignment snapshot publication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     assignment_drain_reservation: Option<AssignmentDrainReservation>,

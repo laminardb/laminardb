@@ -483,7 +483,7 @@ impl Fixture {
         statements: &[String],
     ) -> Result<crate::ClusterTopologyValidation, DbError> {
         self.db
-            .validate_cluster_topology_change(TopologyVersion::LEGACY_BASELINE, statements)
+            .validate_cluster_topology_change(TopologyVersion::BASELINE, statements)
             .await
     }
 
@@ -648,7 +648,7 @@ async fn admit_preparation_statements(
     };
     let (descriptor, target) = fixture
         .db
-        .plan_cluster_topology_change(TopologyVersion::LEGACY_BASELINE, &statements)
+        .plan_cluster_topology_change(TopologyVersion::BASELINE, &statements)
         .await
         .unwrap();
     let compatibility = fixture
@@ -1294,7 +1294,7 @@ async fn topology_explicit_reset_maps_both_incarnations_and_preserves_the_live_p
         let statements = vec!["DROP SINK existing_sink".into(), "DROP STREAM totals".into(),
             format!("CREATE STREAM totals AS {query}"),
             "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'changed-output')".into()];
-        let (report, target) = fixture.db.plan_cluster_topology_change(TopologyVersion::LEGACY_BASELINE, &statements).await.unwrap();
+        let (report, target) = fixture.db.plan_cluster_topology_change(TopologyVersion::BASELINE, &statements).await.unwrap();
         assert_eq!(report.statements, statements);
         assert_eq!(target.entries[1].catalog_generation, 8);
         assert_eq!(target.entries[2].catalog_generation, 2);
@@ -1426,11 +1426,8 @@ async fn topology_validation_cancellation_and_concurrency_do_not_leak_candidate_
     let catalog_lock = fixture.db.topology_ddl_lock.write().await;
     let db = Arc::clone(&fixture.db);
     let task = tokio::spawn(async move {
-        db.validate_cluster_topology_change(
-            TopologyVersion::LEGACY_BASELINE,
-            &independent_pipeline(),
-        )
-        .await
+        db.validate_cluster_topology_change(TopologyVersion::BASELINE, &independent_pipeline())
+            .await
     });
     tokio::task::yield_now().await;
     assert!(matches!(
@@ -1450,11 +1447,8 @@ async fn topology_validation_deadline_includes_waiting_for_catalog_snapshot() {
     let catalog_lock = fixture.db.topology_ddl_lock.write().await;
     let db = Arc::clone(&fixture.db);
     let task = tokio::spawn(async move {
-        db.validate_cluster_topology_change(
-            TopologyVersion::LEGACY_BASELINE,
-            &independent_pipeline(),
-        )
-        .await
+        db.validate_cluster_topology_change(TopologyVersion::BASELINE, &independent_pipeline())
+            .await
     });
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(31)).await;
@@ -1589,7 +1583,7 @@ mod removal {
         let statements = vec!["DROP SINK IF EXISTS existing_sink".into()];
         let (report, target) = fixture
             .db
-            .plan_cluster_topology_change(TopologyVersion::LEGACY_BASELINE, &statements)
+            .plan_cluster_topology_change(TopologyVersion::BASELINE, &statements)
             .await
             .unwrap();
         assert_eq!(report.statements, statements);

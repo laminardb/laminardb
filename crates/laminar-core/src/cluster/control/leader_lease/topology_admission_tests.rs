@@ -37,7 +37,7 @@ pub(super) async fn fixture(
     let plan = TopologyAdmissionPlan {
         protocol_version: TOPOLOGY_PROTOCOL_VERSION,
         operation_id: operation(41),
-        expected_parent: TopologyVersion::LEGACY_BASELINE,
+        expected_parent: TopologyVersion::BASELINE,
         parent_manifest,
         target_manifest,
         assignment: fence,

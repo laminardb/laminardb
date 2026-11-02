@@ -1,5 +1,5 @@
 use super::*;
-use crate::cluster::control::topology::LegacyTopologyBaseline;
+use crate::cluster::control::topology::TopologyBaseline;
 use crate::cluster::control::{TopologyCatalogState, TopologyError};
 
 async fn acquire(store: &LeaderLeaseStore) -> LeaderLease {
@@ -10,7 +10,7 @@ async fn acquire(store: &LeaderLeaseStore) -> LeaderLease {
     lease
 }
 
-async fn sealed_baseline(store: &LeaderLeaseStore) -> LegacyTopologyBaseline {
+async fn sealed_baseline(store: &LeaderLeaseStore) -> TopologyBaseline {
     let TopologyCatalogState::Versioned {
         baseline,
         committed: None,
@@ -23,7 +23,7 @@ async fn sealed_baseline(store: &LeaderLeaseStore) -> LegacyTopologyBaseline {
 
 pub(super) async fn sealed_topology_fixture(
     store: &LeaderLeaseStore,
-) -> (LeaderLease, LegacyTopologyBaseline) {
+) -> (LeaderLease, TopologyBaseline) {
     let lease = acquire(store).await;
     store
         .seal_catalog(&lease.proof(), &catalog("events"))
@@ -234,9 +234,9 @@ async fn unsealed_to_sealed_append_requires_baseline_but_history_stays_readable(
         ..unversioned.lease.clone()
     });
     late_baseline.version = TOPOLOGY_AUTHORITY_RECORD_VERSION;
-    late_baseline.topology_baseline = Some(LegacyTopologyBaseline {
+    late_baseline.topology_baseline = Some(TopologyBaseline {
         protocol_version: crate::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
-        topology_version: crate::cluster::control::TopologyVersion::LEGACY_BASELINE,
+        topology_version: crate::cluster::control::TopologyVersion::BASELINE,
         manifest: reference.clone(),
         deployment_id: Uuid::from_u128(7).to_string(),
         operation_id: Uuid::from_u128(8).try_into().unwrap(),

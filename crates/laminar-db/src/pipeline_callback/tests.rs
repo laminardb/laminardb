@@ -1037,7 +1037,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         validation_format_version: 3,
         scope: TopologyValidationScope::LocalCandidatePlan,
         deployment_id: deployment.clone(),
-        parent_version: TopologyVersion::LEGACY_BASELINE,
+        parent_version: TopologyVersion::BASELINE,
         target_version: TopologyVersion::new(2).unwrap(),
         parent_manifest: parent.reference().unwrap(),
         target_manifest: target.reference().unwrap(),
@@ -1072,7 +1072,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     let plan = TopologyAdmissionPlan {
         protocol_version: TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::from_u128(41).try_into().unwrap(),
-        expected_parent: TopologyVersion::LEGACY_BASELINE,
+        expected_parent: TopologyVersion::BASELINE,
         parent_manifest: parent.reference().unwrap(),
         target_manifest: target.reference().unwrap(),
         assignment: leader.fence.clone(),

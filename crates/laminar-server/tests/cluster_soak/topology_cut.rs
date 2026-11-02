@@ -16,9 +16,9 @@ use laminar_core::checkpoint::{CheckpointStore, ConnectorCheckpoint, ObjectStore
 use laminar_core::checkpoint_decision::CheckpointDecisionStore;
 use laminar_core::cluster::control::{
     AssignmentSnapshotStore, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
-    CheckpointAssignmentFence, ClusterTopologyValidation, LeaderLeaseStore, LegacyTopologyBaseline,
-    ProcessLeaseAuthority, TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan,
-    TopologyAdmissionStatus, TopologyError, TopologySourceInitialization,
+    CheckpointAssignmentFence, ClusterTopologyValidation, LeaderLeaseStore, ProcessLeaseAuthority,
+    TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
+    TopologyBaseline, TopologyError, TopologySourceInitialization,
     TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
 
@@ -27,7 +27,7 @@ pub(super) fn prepare_old_cut(
     checkpoint_url: &str,
     brokers: &str,
     nodes: &mut [Node],
-    baseline: &LegacyTopologyBaseline,
+    baseline: &TopologyBaseline,
     assignment: &CheckpointAssignmentFence,
     ceiling: Duration,
     evidence_dir: &Path,

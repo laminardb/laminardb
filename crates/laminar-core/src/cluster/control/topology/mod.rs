@@ -67,7 +67,7 @@ pub struct TopologyVersion(NonZeroU64);
 
 impl TopologyVersion {
     /// The sealed bootstrap inventory is topology one.
-    pub const LEGACY_BASELINE: Self = Self(NonZeroU64::MIN);
+    pub const BASELINE: Self = Self(NonZeroU64::MIN);
 
     /// Construct a nonzero logical version.
     ///
@@ -129,7 +129,7 @@ impl TopologyOperationId {
 /// current catalog separately, retaining this exact baseline and all historical identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LegacyTopologyBaseline {
+pub struct TopologyBaseline {
     /// Protocol the reading binary must understand.
     pub protocol_version: u16,
     /// Baseline version, always one.
@@ -144,7 +144,7 @@ pub struct LegacyTopologyBaseline {
     pub authority_sequence: u64,
 }
 
-impl LegacyTopologyBaseline {
+impl TopologyBaseline {
     pub(super) fn validate(&self) -> Result<(), TopologyError> {
         if self.protocol_version != TOPOLOGY_PROTOCOL_VERSION {
             return Err(TopologyError::Protocol(format!(
@@ -152,8 +152,7 @@ impl LegacyTopologyBaseline {
                 self.protocol_version
             )));
         }
-        if self.topology_version != TopologyVersion::LEGACY_BASELINE || self.authority_sequence == 0
-        {
+        if self.topology_version != TopologyVersion::BASELINE || self.authority_sequence == 0 {
             return Err(TopologyError::Invalid(
                 "the topology baseline must bind topology one to a nonzero authority sequence"
                     .into(),
@@ -181,7 +180,7 @@ pub enum TopologyCatalogState {
     /// Sealed inventory and its topology baseline. Runtime activation is separate evidence.
     Versioned {
         /// Durable baseline identity.
-        baseline: LegacyTopologyBaseline,
+        baseline: TopologyBaseline,
         /// Latest irreversible catalog decision, absent while topology one remains committed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         committed: Option<TopologyCommit>,

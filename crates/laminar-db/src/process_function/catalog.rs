@@ -162,7 +162,7 @@ mod tests {
         assert!(db.process_function_bootstrap_sql("unknown").is_err());
         assert!(db
             .validate_cluster_topology_change(
-                laminar_core::cluster::control::TopologyVersion::LEGACY_BASELINE,
+                laminar_core::cluster::control::TopologyVersion::BASELINE,
                 &["DROP STREAM activity".into()],
             )
             .await

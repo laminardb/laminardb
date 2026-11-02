@@ -41,8 +41,8 @@ pub(crate) struct ReplayedTopology {
 }
 
 impl ReplayedTopology {
-    pub(crate) const LEGACY_BASELINE: Self = Self {
-        version: TopologyVersion::LEGACY_BASELINE,
+    pub(crate) const BASELINE: Self = Self {
+        version: TopologyVersion::BASELINE,
         fence: None,
     };
 
@@ -51,7 +51,7 @@ impl ReplayedTopology {
             return Ok(None);
         };
         let Some(commit) = committed else {
-            return Ok(Some(Self::LEGACY_BASELINE));
+            return Ok(Some(Self::BASELINE));
         };
         let fence = laminar_core::shuffle::ShuffleTopologyFence::from_manifest(
             commit.topology_version,

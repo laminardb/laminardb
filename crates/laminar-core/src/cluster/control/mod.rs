@@ -63,8 +63,8 @@ pub use snapshot::{
     SnapshotError,
 };
 pub use topology::{
-    ClusterTopologyValidation, LegacyTopologyBaseline, TopologyAbortReason, TopologyActivation,
-    TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus, TopologyCatalogState,
+    ClusterTopologyValidation, TopologyAbortReason, TopologyActivation, TopologyAdmissionPhase,
+    TopologyAdmissionPlan, TopologyAdmissionStatus, TopologyBaseline, TopologyCatalogState,
     TopologyCheckpointCut, TopologyCommit, TopologyCompatibilityRef, TopologyCutCommit,
     TopologyError, TopologyInstallationReceipt, TopologyJournalUsage, TopologyMigrationRoot,
     TopologyMigrationRootBinding, TopologyMigrationRootRef, TopologyOperationId,
