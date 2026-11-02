@@ -570,7 +570,7 @@ async fn group_vnode_matches_shuffle_row_vnode() {
     let vnode_count = NonZeroU32::new(u32::from(key_groups.get())).unwrap();
     let rows = state.row_converter.convert_columns(keys.columns()).unwrap();
     let group_vnodes: Vec<u32> = (0..keys.num_rows())
-        .map(|row| IncrementalAggState::vnode_for_group_key(2, &rows.row(row).owned(), vnode_count))
+        .map(|row| IncrementalAggState::vnode_for_group_key(2, rows.row(row).data(), vnode_count))
         .collect();
     let routed =
         crate::operator::sql_query::hash_rows_to_vnodes(&keys, 2, vnode_count.get()).unwrap();
@@ -1109,7 +1109,7 @@ async fn local_keyed_state_routes_across_common_vnodes() {
         .map(|row| {
             IncrementalAggState::vnode_for_group_key(
                 state.num_group_cols,
-                &rows.row(row).owned(),
+                rows.row(row).data(),
                 state.routing_vnode_count(),
             )
         })
