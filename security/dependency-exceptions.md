@@ -1,7 +1,8 @@
 # Temporary dependency exceptions
 
 Status: approved 2026-09-21, re-approved 2026-10-21, zstd exceptions added 2026-10-27,
-re-approved 2026-10-31; all expire at 2026-11-30 UTC (CI fails on that date).
+re-approved 2026-10-31, thrift exception added 2026-11-02; all expire at 2026-11-30 UTC (CI fails
+on that date).
 Owner: LaminarDB maintainers responsible for [PR #600](https://github.com/laminardb/laminardb/pull/600).
 The four residual exceptions below were re-reviewed and accepted for this interval under S4.
 Machine-readable versions, sources, checksums and reasons are in `dependency-exceptions.json`.
@@ -30,6 +31,16 @@ pinned by checksum. The graph enables only zstd's default features (`legacy`, `a
 
 Remove these exceptions when DataFusion, Arrow, Parquet, iceberg, chitchat and apache-avro accept
 zstd 0.14 in the pinned analytical generation.
+
+[RUSTSEC-2026-0435](https://rustsec.org/advisories/RUSTSEC-2026-0435.html) (thrift 0.17.0,
+unbounded allocation in the binary protocol's `read_bytes`) was excepted on 2026-11-02 with the
+same deadline. It is not reached: thrift's only dependent, parquet 58.4.0, decodes metadata with
+its own `parquet_thrift` reader, and thrift's input protocols are used only by the `parquet-layout`
+binary behind parquet's `cli` feature, which the graph does not enable. The fix is parquet 58.4.1
+(thrift `^0.23`), which requires Arrow 58.4.1. Its IPC writer writes a zero-length validity buffer
+for columns without nulls, and the checkpoint IPC preflight rejects those frames, so restoring an
+aggregate checkpoint written after that upgrade fails. Remove this exception with the Arrow 58.4.1
+upgrade once the preflight accepts both validity layouts.
 
 Two additional exceptions cover RUSTSEC-2026-0194 and RUSTSEC-2026-0195, with the same deadline.
 Workspace builds still require the verified quick-xml backport. Registry publication now has

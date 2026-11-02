@@ -116,6 +116,12 @@
       "crate": "zstd-safe",
       "version": "7.3.0",
       "reason": "Not reached: requires a multithreaded context, which needs the zstdmt feature that no crate in the graph enables."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0435",
+      "crate": "thrift",
+      "version": "0.17.0",
+      "reason": "Not reached: parquet 58.4.0, the only dependent, decodes metadata with its own parquet_thrift reader; thrift's input protocols are used only by the parquet-layout binary behind the cli feature, which the graph does not enable. The fix (parquet 58.4.1, thrift 0.23) requires Arrow 58.4.1, whose IPC writer omits validity bitmaps the checkpoint preflight requires."
     }
   ],
   "packages": [
@@ -152,6 +158,12 @@
       "version": "0.9.10",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
+    },
+    {
+      "name": "thrift",
+      "version": "0.17.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
     },
     {
       "name": "zstd",
