@@ -22,7 +22,7 @@ mod recovery_runtime;
 mod restore;
 mod retirement;
 mod submission;
-pub use submission::{ClusterTopologyAdoptionRequest, ClusterTopologyRequest};
+pub use submission::ClusterTopologyRequest;
 mod target_preparation;
 mod transport;
 pub use planning::{
@@ -41,8 +41,8 @@ pub(crate) struct ReplayedTopology {
 }
 
 impl ReplayedTopology {
-    pub(crate) const LEGACY_BASELINE: Self = Self {
-        version: TopologyVersion::LEGACY_BASELINE,
+    pub(crate) const BASELINE: Self = Self {
+        version: TopologyVersion::BASELINE,
         fence: None,
     };
 
@@ -51,7 +51,7 @@ impl ReplayedTopology {
             return Ok(None);
         };
         let Some(commit) = committed else {
-            return Ok(Some(Self::LEGACY_BASELINE));
+            return Ok(Some(Self::BASELINE));
         };
         let fence = laminar_core::shuffle::ShuffleTopologyFence::from_manifest(
             commit.topology_version,
@@ -70,9 +70,9 @@ impl ReplayedTopology {
 /// Durable catalog version and this process's independently observed runtime activation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClusterTopologyStatus {
-    /// Authority state, including an explicit unversioned legacy state.
+    /// Authority state: uninitialized, or sealed with its topology baseline.
     pub catalog: TopologyCatalogState,
-    /// Committed logical version, absent for an unadopted or uninitialized catalog.
+    /// Committed logical version, absent for an uninitialized catalog.
     pub committed_version: Option<TopologyVersion>,
     /// Version replayed by this process and running with live authority and intake released.
     /// A persisted inventory alone never sets this field.
@@ -243,7 +243,7 @@ impl LaminarDB {
                 .await?;
             if !original.as_ref().is_some_and(matches) {
                 return Err(DbError::Pipeline(format!(
-                    "configured cluster catalog must exactly match the complete ordered sealed inventory or its original adopted bootstrap (configured entries: {}, sealed entries: {})",
+                    "configured cluster catalog must exactly match the complete ordered sealed inventory or its original sealed bootstrap (configured entries: {}, sealed entries: {})",
                     parsed.len(), manifest.entries.len()
                 )));
             }

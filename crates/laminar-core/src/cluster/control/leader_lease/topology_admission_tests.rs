@@ -16,11 +16,12 @@ pub(super) async fn fixture(
     TopologyAdmissionPlan,
     CatalogManifest,
 ) {
-    let (lease, parent_manifest, deployment) = topology::topology_adoption_fixture(authority).await;
+    let (lease, baseline) = topology::sealed_topology_fixture(authority).await;
     authority
-        .adopt_legacy_topology(&lease.proof(), operation(40), &parent_manifest, &deployment)
+        .renew_exact(&lease.owner, lease.token, 1)
         .await
         .unwrap();
+    let parent_manifest = baseline.manifest;
     let assignments = AssignmentSnapshotStore::new(authority.store.clone());
     let fence = assignment_fence(&lease.owner);
     let seed = AssignmentSnapshot::empty()
@@ -36,7 +37,7 @@ pub(super) async fn fixture(
     let plan = TopologyAdmissionPlan {
         protocol_version: TOPOLOGY_PROTOCOL_VERSION,
         operation_id: operation(41),
-        expected_parent: TopologyVersion::LEGACY_BASELINE,
+        expected_parent: TopologyVersion::BASELINE,
         parent_manifest,
         target_manifest,
         assignment: fence,
@@ -124,11 +125,18 @@ async fn admission_retry_and_abort_keep_the_original_payload_and_catalog() {
             .await,
         Err(TopologyError::Conflict(_))
     ));
-    let mut reused_adoption = plan.clone();
-    reused_adoption.operation_id = operation(40);
+    let mut reused_baseline = plan.clone();
+    reused_baseline.operation_id = authority
+        .load_record()
+        .await
+        .unwrap()
+        .unwrap()
+        .topology_baseline
+        .unwrap()
+        .operation_id;
     assert!(matches!(
         authority
-            .admit_topology_plan(&lease.proof(), &assignments, &reused_adoption, &target)
+            .admit_topology_plan(&lease.proof(), &assignments, &reused_baseline, &target)
             .await,
         Err(TopologyError::Conflict(_))
     ));

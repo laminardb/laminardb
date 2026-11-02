@@ -26,13 +26,13 @@ pub(crate) use assignment_authority::{
 };
 #[cfg(feature = "cluster")]
 pub use topology::{
-    ClusterTopologyAdoptionRequest, ClusterTopologyRequest, ClusterTopologyStatus,
-    PreparedTopologyRestore, PreparedTopologySourcePosition,
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
 };
 #[cfg(feature = "cluster")]
 pub use topology::{
-    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
-    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+    ClusterTopologyRequest, ClusterTopologyStatus, PreparedTopologyRestore,
+    PreparedTopologySourcePosition,
 };
 #[cfg(feature = "cluster")]
 pub(crate) use topology::{InstalledTopologyRuntime, TopologyRuntimeMetadata};

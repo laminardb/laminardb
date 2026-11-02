@@ -50,7 +50,7 @@ impl LeaderLeaseStore {
                 != Some(index.deployment_id.as_str())
             {
                 return Err(certificate_error(
-                    "checkpoint deployment differs from the adopted baseline",
+                    "checkpoint deployment differs from the topology baseline",
                 ));
             }
             // Both certificates move forward along the same linear committed topology chain.

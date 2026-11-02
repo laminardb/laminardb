@@ -1,7 +1,6 @@
 use super::*;
 use arrow_array::{Array as _, Int64Array};
 use connectors::ReplayProbe;
-use laminar_core::cluster::control::{CheckpointDecisionStore, TopologyCatalogState};
 use laminar_db::CommittedRead;
 
 /// A view subscription and the rows it has folded so far, by their kept columns.
@@ -21,7 +20,6 @@ struct DatabasePeer {
     rebalance_shutdown: CancellationToken,
     rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
     runtime: Runtime,
-    objects: Arc<dyn object_store::ObjectStore>,
     #[cfg(feature = "process-remote")]
     worker: Option<tokio::task::JoinHandle<Result<(), laminar_db::DbError>>>,
 }
@@ -293,34 +291,13 @@ impl DatabasePeer {
         Ok(Response::Rows(rows))
     }
 
-    async fn adopt(&self) -> Result<()> {
-        let TopologyCatalogState::LegacySealed { manifest } =
-            self.peer.catalog.topology_state().await?
-        else {
-            return Err(anyhow!("fixture adopts only its sealed bootstrap catalog"));
-        };
-        let deployment = CheckpointDecisionStore::new(Arc::clone(&self.objects))
-            .load_deployment_id()
-            .await?
-            .ok_or_else(|| anyhow!("fixture deployment is absent"))?;
-        self.db()?
-            .adopt_cluster_topology(&laminar_db::ClusterTopologyAdoptionRequest {
-                operation_id: Uuid::new_v4().try_into()?,
-                expected_manifest: manifest,
-                expected_deployment_id: deployment,
-                coordinated_upgrade_complete: true,
-            })
-            .await?;
-        Ok(())
-    }
-
     async fn migrate(&self, operation: u128, statements: Vec<String>) -> Result<()> {
         let parent = self
             .db()?
             .cluster_topology_status()
             .await?
             .committed_version
-            .ok_or_else(|| anyhow!("fixture migrates only an adopted topology"))?;
+            .ok_or_else(|| anyhow!("fixture migrates only a sealed topology"))?;
         self.db()?
             .submit_cluster_topology_change(&laminar_db::ClusterTopologyRequest {
                 operation_id: Uuid::from_u128(operation).try_into()?,
@@ -469,7 +446,6 @@ impl DatabasePeer {
             Command::ReadSubscription(view, through) => {
                 return self.read_subscription(&view, through).await
             }
-            Command::Adopt => self.adopt().await?,
             Command::Migrate(operation, statements) => self.migrate(operation, statements).await?,
             Command::Topology(operation) => return self.topology(operation).await,
             Command::Release => self.probe.hold.store(false, Ordering::Release),
@@ -547,7 +523,6 @@ pub(super) async fn run(root: &Path) -> Result<()> {
         rebalance_shutdown: CancellationToken::new(),
         rebalance_tasks: Vec::new(),
         runtime: config.runtime,
-        objects: Arc::clone(&objects),
         #[cfg(feature = "process-remote")]
         worker: None,
     };

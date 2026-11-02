@@ -11,7 +11,7 @@ impl LaminarDB {
     /// A disconnect may leave a successful certificate; query status or retry the same operation.
     ///
     /// # Errors
-    /// Requires Running state, live process/assignment authority, an adopted exact parent and a
+    /// Requires Running state, live process/assignment authority, a sealed exact parent and a
     /// matching compiled candidate. One existing compiler slot and a 45 second end-to-end deadline
     /// bound read/compile/publication; publication retains the authority's 15 second/16-CAS bounds.
     pub async fn prepare_cluster_topology_operation(

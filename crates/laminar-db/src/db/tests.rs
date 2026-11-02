@@ -10754,7 +10754,7 @@ async fn startup_bootstrap_restores_before_config_and_requires_exact_ddl() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn topology_status_distinguishes_adoption_replay_and_runtime_release() {
+async fn topology_status_distinguishes_sealed_baseline_replay_and_runtime_release() {
     use laminar_core::cluster::control::{TopologyCatalogState, TopologyVersion};
     use object_store::ObjectStore;
 
@@ -10770,32 +10770,16 @@ async fn topology_status_distinguishes_adoption_replay_and_runtime_release() {
     db.execute_cluster_bootstrap("CREATE SOURCE existing (id INT)")
         .await
         .unwrap();
-    let before = db.cluster_topology_status().await.unwrap();
-    let TopologyCatalogState::LegacySealed { manifest } = before.catalog else {
-        panic!("sealed catalog has no implied logical version");
-    };
-    assert_eq!(before.committed_version, None);
-    assert_eq!(before.locally_active_version, None);
-    let deployment = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(objects)
-        .load_or_create_deployment_id()
-        .await
-        .unwrap();
-    authority
-        .manifest_store
-        .adopt_legacy_topology(
-            &authority.lease.proof(),
-            uuid::Uuid::from_u128(42).try_into().unwrap(),
-            &manifest,
-            &deployment,
-        )
-        .await
-        .unwrap();
-    let adopted = db.cluster_topology_status().await.unwrap();
-    assert_eq!(
-        adopted.committed_version,
-        Some(TopologyVersion::LEGACY_BASELINE)
-    );
-    assert_eq!(adopted.locally_active_version, None);
+    let sealed = db.cluster_topology_status().await.unwrap();
+    assert!(matches!(
+        sealed.catalog,
+        TopologyCatalogState::Versioned {
+            committed: None,
+            ..
+        }
+    ));
+    assert_eq!(sealed.committed_version, Some(TopologyVersion::BASELINE));
+    assert_eq!(sealed.locally_active_version, None);
     db.restore_catalog_from_manifest().await.unwrap();
     assert_eq!(
         db.cluster_topology_status()
@@ -10822,7 +10806,7 @@ async fn topology_status_distinguishes_adoption_replay_and_runtime_release() {
             .await
             .unwrap()
             .locally_active_version,
-        Some(TopologyVersion::LEGACY_BASELINE)
+        Some(TopologyVersion::BASELINE)
     );
     // The real capture helper and assignment/source release share the existing authority lock.
     // A still-current assignment must not reopen a held topology cut or report it active.
@@ -10862,10 +10846,7 @@ async fn topology_status_distinguishes_adoption_replay_and_runtime_release() {
     authority.controller.set_recovering(false);
     authority.controller.fence_process_lease();
     let fenced = db.cluster_topology_status().await.unwrap();
-    assert_eq!(
-        fenced.committed_version,
-        Some(TopologyVersion::LEGACY_BASELINE)
-    );
+    assert_eq!(fenced.committed_version, Some(TopologyVersion::BASELINE));
     assert_eq!(fenced.locally_active_version, None);
     DbState::Faulted.store(&db.state);
     assert_eq!(

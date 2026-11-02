@@ -348,7 +348,8 @@ impl CatalogManifestStore {
     /// Load the catalog and its topology metadata from one immutable authority snapshot.
     ///
     /// # Errors
-    /// Fails closed on missing/corrupt content or inconsistent adoption/deployment authority.
+    /// Fails closed on missing/corrupt content, an unversioned sealed catalog, or inconsistent
+    /// baseline/deployment authority.
     pub async fn load_with_topology(
         &self,
     ) -> Result<
@@ -371,7 +372,7 @@ impl CatalogManifestStore {
             .await
     }
 
-    /// Load the complete adopted startup catalog while checking the exact current inventory.
+    /// Load the complete original startup catalog while checking the exact current inventory.
     /// Removed objects remain startup assertions and are never recreated.
     ///
     /// # Errors
@@ -405,24 +406,6 @@ impl CatalogManifestStore {
         self.authority.retired_topology_generations().await
     }
 
-    /// Explicitly adopt a sealed legacy inventory without changing the processing graph.
-    ///
-    /// Requires a coordinated binary upgrade; this is not runtime migration admission.
-    ///
-    /// # Errors
-    /// Rejects stale leader proof, divergent reference/deployment, invalid data or authority I/O.
-    pub async fn adopt_legacy_topology(
-        &self,
-        proof: &LeaderProof,
-        operation_id: super::topology::TopologyOperationId,
-        expected_manifest: &CatalogManifestRef,
-        expected_deployment: &str,
-    ) -> Result<super::topology::TopologyAdoptionOutcome, super::topology::TopologyError> {
-        self.authority
-            .adopt_legacy_topology(proof, operation_id, expected_manifest, expected_deployment)
-            .await
-    }
-
     /// Load the sealed catalog, or `None` before the first successful seal.
     ///
     /// # Errors
@@ -440,7 +423,7 @@ impl CatalogManifestStore {
             })
     }
 
-    /// CAS-append the first inventory under an exact leader proof.
+    /// CAS-append the first inventory as topology one under an exact leader proof.
     ///
     /// A concurrent exact inventory is idempotent. Any different winner fails closed.
     ///

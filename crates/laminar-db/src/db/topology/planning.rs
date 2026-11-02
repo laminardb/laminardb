@@ -105,7 +105,9 @@ impl LaminarDB {
             )
         })?;
         let (parent, state) = store.load_with_topology().await?.ok_or_else(|| {
-            TopologyError::Conflict("no sealed parent catalog; initialize and explicitly adopt the legacy baseline first".into())
+            TopologyError::Conflict(
+                "no sealed parent catalog; seal the cluster catalog first".into(),
+            )
         })?;
         let TopologyCatalogState::Versioned {
             baseline,
@@ -113,7 +115,7 @@ impl LaminarDB {
         } = &state
         else {
             return Err(TopologyError::Protocol(
-                "legacy catalog must be explicitly adopted before topology validation".into(),
+                "the cluster catalog must be sealed before topology validation".into(),
             )
             .into());
         };

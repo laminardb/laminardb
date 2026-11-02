@@ -57,8 +57,6 @@ enum Command {
     Subscribe(String, Vec<String>),
     /// Everything a subscription received through this committed epoch, folded into rows.
     ReadSubscription(String, u64),
-    /// Adopt the sealed bootstrap catalog as topology one; leader only.
-    Adopt,
     /// Submit one migration of the committed topology; leader only.
     Migrate(u128, Vec<String>),
     Topology(u128),

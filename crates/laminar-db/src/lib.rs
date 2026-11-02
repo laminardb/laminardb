@@ -221,13 +221,13 @@ pub use subscription::cluster::benchmark::{
 pub use db::{ClusterStartupDisposition, SnapshotAdoption};
 #[cfg(feature = "cluster")]
 pub use db::{
-    ClusterTopologyAdoptionRequest, ClusterTopologyRequest, ClusterTopologyStatus,
-    PreparedTopologyRestore, PreparedTopologySourcePosition,
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
 };
 #[cfg(feature = "cluster")]
 pub use db::{
-    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
-    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+    ClusterTopologyRequest, ClusterTopologyStatus, PreparedTopologyRestore,
+    PreparedTopologySourcePosition,
 };
 /// Per-vnode state of keyed operators, live and at the committed checkpoint.
 #[cfg(feature = "cluster")]

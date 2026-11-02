@@ -4,9 +4,8 @@ use futures::TryStreamExt;
 use laminar_core::checkpoint::CheckpointParticipant;
 use laminar_core::cluster::control::{
     prove_shared_object_store_namespaces, AssignmentSnapshotStore, CatalogManifest,
-    CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind, CheckpointDecisionStore,
-    ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline,
-    LeaseOutcome,
+    CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind, ClusterController, ClusterKv,
+    InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
 };
 use laminar_core::cluster::discovery::NodeId;
 use laminar_core::state::VnodeRegistry;
@@ -79,19 +78,6 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
     .unwrap();
     catalog.seal(&manifest, &lease.proof()).await.unwrap();
     let reference = manifest.reference().unwrap();
-    let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
-        .load_or_create_deployment_id()
-        .await
-        .unwrap();
-    catalog
-        .adopt_legacy_topology(
-            &lease.proof(),
-            uuid::Uuid::from_u128(53).try_into().unwrap(),
-            &reference,
-            &deployment,
-        )
-        .await
-        .unwrap();
     let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
     let participant = CheckpointParticipant {
         node_id: node.0,

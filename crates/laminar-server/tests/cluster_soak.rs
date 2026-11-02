@@ -112,7 +112,7 @@ mod iceberg_table;
 mod paused_leader;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology.rs"]
-mod topology_adoption;
+mod topology_baseline;
 #[cfg(feature = "kafka")]
 #[path = "cluster_soak/topology_cut.rs"]
 mod topology_cut;
@@ -13915,10 +13915,10 @@ fn three_node_alo_join_kill9_soak() {
 }
 
 #[test]
-#[ignore = "spawns 3 real processes with Kafka/S3, adopts legacy authority, and restarts all nodes"]
+#[ignore = "spawns 3 real processes with Kafka/S3, checks the sealed topology baseline, and restarts all nodes"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
-fn three_node_alo_legacy_topology_adoption_restart_soak() {
-    run_three_node_join_kill9_soak_with_adoption(
+fn three_node_alo_topology_baseline_restart_soak() {
+    run_three_node_join_kill9_soak_with_topology(
         JoinDelivery::AtLeastOnce,
         ReaderLeg::None,
         None,
@@ -13932,7 +13932,7 @@ fn three_node_alo_legacy_topology_adoption_restart_soak() {
 #[ignore = "spawns 3 real Kafka/S3 processes, prepares an old-graph cut, aborts by restart, and checks stateful output oracles"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
 fn three_node_alo_topology_cut_abort_restart_soak() {
-    run_three_node_join_kill9_soak_with_adoption(
+    run_three_node_join_kill9_soak_with_topology(
         JoinDelivery::AtLeastOnce,
         ReaderLeg::None,
         None,
@@ -13946,7 +13946,7 @@ fn three_node_alo_topology_cut_abort_restart_soak() {
 #[ignore = "spawns 3 real Kafka/S3 processes; public additions/replacement/reset, paused-input oracle, post-settlement kill resharding and rejoin, full namespace restart and a migration after rescaling"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
 fn three_node_alo_public_topology_migration_restart_soak() {
-    run_three_node_join_kill9_soak_with_adoption(
+    run_three_node_join_kill9_soak_with_topology(
         JoinDelivery::AtLeastOnce,
         ReaderLeg::None,
         None,
@@ -14005,7 +14005,7 @@ fn run_three_node_join_kill9_soak(
     reader: ReaderLeg,
     forced_fault_role: Option<&str>,
 ) {
-    run_three_node_join_kill9_soak_with_adoption(
+    run_three_node_join_kill9_soak_with_topology(
         delivery,
         reader,
         forced_fault_role,
@@ -14016,11 +14016,11 @@ fn run_three_node_join_kill9_soak(
 }
 
 #[cfg(feature = "kafka")]
-fn run_three_node_join_kill9_soak_with_adoption(
+fn run_three_node_join_kill9_soak_with_topology(
     delivery: JoinDelivery,
     reader: ReaderLeg,
     forced_fault_role: Option<&str>,
-    adopt_legacy: bool,
+    check_baseline: bool,
     prepare_topology_cut: bool,
     migrate_topology: bool,
 ) {
@@ -14391,12 +14391,8 @@ fn run_three_node_join_kill9_soak_with_adoption(
         cluster_metric(&nodes, "laminardb_events_ingested_total"),
         commit_oracle.committed_offset_sum().unwrap_or(0)
     );
-    let adopted_topology = adopt_legacy.then(|| {
-        if migrate_topology {
-            topology_migration::adopt_inventory(&checkpoint_url, &mut nodes)
-        } else {
-            topology_adoption::adopt_inventory(&checkpoint_url, &mut nodes, recovery_ceiling)
-        }
+    let sealed_topology = check_baseline.then(|| {
+        topology_baseline::sealed_inventory(&checkpoint_url, &mut nodes, recovery_ceiling)
     });
     exact_timing_evidence.capture_nodes_unbound(
         &nodes,
@@ -14953,7 +14949,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
         );
     }
 
-    if let Some(baseline) = adopted_topology.as_ref() {
+    if let Some(baseline) = sealed_topology.as_ref() {
         let restart_fence = local_convergence
             .snapshot
             .assignment_fence()
@@ -14996,7 +14992,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
             probe.restart_all(&mut nodes, recovery_ceiling);
             probe.change_after_rescale(&mut nodes, recovery_ceiling);
         } else {
-            topology_adoption::restart_all(&mut nodes, baseline, recovery_ceiling);
+            topology_baseline::restart_all(&mut nodes, baseline, recovery_ceiling);
         }
         if let Some(cut) = old_cut.as_ref() {
             topology_cut::assert_aborted_after_restart(
@@ -15012,20 +15008,20 @@ fn run_three_node_join_kill9_soak_with_adoption(
             Some(&mut producer),
             Some(&commit_oracle),
             recovery_ceiling,
-            "full restart after legacy topology adoption",
+            "full restart after the sealed topology baseline",
             Some(latest_checkpoint),
         );
         local_convergence = wait_for_local_assignment_convergence(
             &mut nodes,
             &all_live_nodes,
             Instant::now() + recovery_ceiling,
-            "local assignment after adopted-catalog full restart",
+            "local assignment after sealed-catalog full restart",
         );
         exact_timing_evidence.capture_nodes_bound(
             &nodes,
             &local_convergence,
             Instant::now() + Duration::from_secs(10),
-            "adopted-catalog full restart",
+            "sealed-catalog full restart",
         );
     }
     let steady_deadline = Instant::now() + Duration::from_secs(soak_secs);

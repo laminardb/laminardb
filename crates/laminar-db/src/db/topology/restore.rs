@@ -371,7 +371,7 @@ impl LaminarDB {
                 };
                 scope.topology = scope.sender.topology_fence();
                 scope.ensure_topology_current()?;
-                let parent_topology = if input.plan().expected_parent == TopologyVersion::LEGACY_BASELINE {
+                let parent_topology = if input.plan().expected_parent == TopologyVersion::BASELINE {
                     None
                 } else {
                     Some(laminar_core::shuffle::ShuffleTopologyFence::from_manifest(

@@ -9,9 +9,9 @@ use super::{
 use crate::checkpoint::LeaderProof;
 use crate::checkpoint_decision::DecisionError;
 use crate::cluster::control::{
-    CatalogManifestRef, LegacyTopologyBaseline, ProcessLeaseAuthority, TopologyAdmissionPhase,
-    TopologyAdmissionPlan, TopologyAdmissionStatus, TopologyCommit, TopologyError,
-    TopologyRestoreInput, TopologyVersion, TOPOLOGY_COMMIT_PROTOCOL_VERSION,
+    CatalogManifestRef, ProcessLeaseAuthority, TopologyAdmissionPhase, TopologyAdmissionPlan,
+    TopologyAdmissionStatus, TopologyBaseline, TopologyCommit, TopologyError, TopologyRestoreInput,
+    TopologyVersion, TOPOLOGY_COMMIT_PROTOCOL_VERSION,
 };
 
 impl LeaderAuthorityRecord {
@@ -52,7 +52,7 @@ impl LeaderAuthorityRecord {
 
     pub(super) fn validate_committed_topology_chain(
         &self,
-        baseline: &LegacyTopologyBaseline,
+        baseline: &TopologyBaseline,
     ) -> Result<(), LeaseError> {
         let mut version = baseline.topology_version;
         let mut manifest = &baseline.manifest;
@@ -97,7 +97,7 @@ impl LeaderAuthorityRecord {
             .committed_topology_operation()
             .and_then(|operation| operation.commit.as_ref());
         if prior == after {
-            // Initial legacy seal is the only inventory change without a topology Commit.
+            // The initial seal is the only inventory change without a topology Commit.
             if self.lease.catalog_manifest.is_some()
                 && self.lease.catalog_manifest != next.lease.catalog_manifest
             {

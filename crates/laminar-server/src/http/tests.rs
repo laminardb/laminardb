@@ -3913,7 +3913,7 @@ async fn topology_status_404_when_not_cluster_and_requires_console_authorization
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_activation() {
+async fn topology_status_reads_uninitialized_and_sealed_baseline_without_activation() {
     use laminar_core::cluster::control::{
         prove_shared_object_store_namespaces, CatalogManifest, CatalogManifestEntry,
         CatalogManifestStore, CatalogObjectKind, CheckpointDecisionStore, ClusterController,
@@ -4022,43 +4022,29 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     }])
     .unwrap();
     catalog.seal(&manifest, &lease.proof()).await.unwrap();
-    let TopologyCatalogState::LegacySealed {
-        manifest: reference,
+    let TopologyCatalogState::Versioned {
+        baseline,
+        committed: None,
     } = catalog.topology_state().await.unwrap()
     else {
-        panic!("sealed inventory must be explicitly unversioned");
+        panic!("the seal must write topology one");
     };
-    let legacy = read_status(app.clone(), &token).await;
-    assert_eq!(legacy["catalog"]["state"], "legacy_sealed");
+    let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
+        .load_deployment_id()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(baseline.deployment_id, deployment);
+    let sealed = read_status(app.clone(), &token).await;
+    assert_eq!(sealed["catalog"]["state"], "versioned");
+    assert_eq!(sealed["committed_version"], 1);
+    assert!(sealed["locally_active_version"].is_null());
+    let reference = baseline.manifest;
     assert_eq!(
-        legacy["catalog"]["manifest"],
+        sealed["catalog"]["baseline"]["manifest"],
         serde_json::to_value(&reference).unwrap()
     );
-    assert!(legacy["committed_version"].is_null());
-    assert!(legacy["locally_active_version"].is_null());
-
-    let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
-        .load_or_create_deployment_id()
-        .await
-        .unwrap();
-    catalog
-        .adopt_legacy_topology(
-            &lease.proof(),
-            uuid::Uuid::from_u128(42).try_into().unwrap(),
-            &reference,
-            &deployment,
-        )
-        .await
-        .unwrap();
-    let adopted = read_status(app.clone(), &token).await;
-    assert_eq!(adopted["catalog"]["state"], "versioned");
-    assert_eq!(adopted["committed_version"], 1);
-    assert!(adopted["locally_active_version"].is_null());
-    assert_eq!(
-        adopted["catalog"]["baseline"]["manifest"],
-        legacy["catalog"]["manifest"]
-    );
-    assert_eq!(adopted["catalog"]["baseline"]["deployment_id"], deployment);
+    assert_eq!(sealed["catalog"]["baseline"]["deployment_id"], deployment);
 
     let seed = laminar_core::cluster::control::AssignmentSnapshot::empty()
         .next_for_participants(
@@ -4078,7 +4064,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     let plan = laminar_core::cluster::control::TopologyAdmissionPlan {
         protocol_version: laminar_core::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::from_u128(43).try_into().unwrap(),
-        expected_parent: laminar_core::cluster::control::TopologyVersion::LEGACY_BASELINE,
+        expected_parent: laminar_core::cluster::control::TopologyVersion::BASELINE,
         parent_manifest: reference.clone(),
         target_manifest: target.reference().unwrap(),
         assignment: seed.assignment_fence().unwrap(),
