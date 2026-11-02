@@ -478,32 +478,6 @@ impl Fixture {
         }
     }
 
-    async fn adopt(&self) {
-        let reference = self
-            .authority
-            .manifest_store
-            .load()
-            .await
-            .unwrap()
-            .unwrap()
-            .reference()
-            .unwrap();
-        let deployment = CheckpointDecisionStore::new(Arc::clone(&self.authority.checkpoint_store))
-            .load_or_create_deployment_id()
-            .await
-            .unwrap();
-        self.authority
-            .manifest_store
-            .adopt_legacy_topology(
-                &self.authority.lease.proof(),
-                uuid::Uuid::from_u128(77).try_into().unwrap(),
-                &reference,
-                &deployment,
-            )
-            .await
-            .unwrap();
-    }
-
     async fn validate(
         &self,
         statements: &[String],
@@ -631,7 +605,6 @@ async fn preparation_fixture_with_bootstrap(
     authority.lease_tx = lease_tx;
     let mut fixture = Fixture::with_bootstrap(authority, stream_generation, extra).await;
     fixture.process_lease = Some(process);
-    fixture.adopt().await;
     (fixture, AssignmentSnapshotStore::new(objects))
 }
 
@@ -1074,7 +1047,6 @@ fn stateful_additions() -> Vec<laminar_core::cluster::control::CatalogManifestEn
 #[tokio::test]
 async fn topology_validation_certifies_new_managed_state_at_a_future_only_cut_without_effects() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let mut statements = independent_pipeline();
     statements.extend(stateful_additions().into_iter().map(|entry| entry.ddl));
     let report = fixture.validate(&statements).await.unwrap();
@@ -1123,7 +1095,6 @@ async fn object_paths(objects: &dyn ObjectStore) -> Vec<String> {
 #[tokio::test]
 async fn topology_validation_additive_plan_is_deterministic_preserves_state_and_has_no_effects() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let before_paths = object_paths(fixture.authority.checkpoint_store.as_ref()).await;
     let before_authority = fixture.authority.lease_store.load().await.unwrap();
     let before_inventory = fixture.db.catalog_manifest_inventory().unwrap();
@@ -1213,8 +1184,9 @@ async fn topology_validation_downstream_plan_binds_preserved_incarnation_and_dep
         .find(|entry| entry.canonical_name == "totals")
         .unwrap()
         .catalog_generation = 7;
-    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let authority = test_catalog_authority_with_ttl(Arc::clone(&objects), 60_000).await;
+    let authority =
+        test_catalog_authority_with_ttl(Arc::new(object_store::memory::InMemory::new()), 60_000)
+            .await;
     let manifest = laminar_core::cluster::control::CatalogManifest::new(entries).unwrap();
     authority
         .manifest_store
@@ -1225,20 +1197,6 @@ async fn topology_validation_downstream_plan_binds_preserved_incarnation_and_dep
     fixture
         .db
         .reconcile_catalog_manifest_inventory(&manifest)
-        .unwrap();
-    let deployment = CheckpointDecisionStore::new(objects)
-        .load_or_create_deployment_id()
-        .await
-        .unwrap();
-    authority
-        .manifest_store
-        .adopt_legacy_topology(
-            &authority.lease.proof(),
-            uuid::Uuid::from_u128(78).try_into().unwrap(),
-            &manifest.reference().unwrap(),
-            &deployment,
-        )
-        .await
         .unwrap();
     let a = fixture
         .validate(&["CREATE STREAM later AS SELECT id, total FROM totals WHERE total > 10".into()])
@@ -1272,14 +1230,8 @@ async fn topology_validation_downstream_plan_binds_preserved_incarnation_and_dep
 }
 
 #[tokio::test]
-async fn topology_validation_rejects_legacy_conflicting_parent_and_changed_resolved_definition() {
+async fn topology_validation_rejects_conflicting_parent_and_changed_resolved_definition() {
     let fixture = Fixture::new().await;
-    let error = fixture.validate(&independent_pipeline()).await.unwrap_err();
-    assert!(matches!(
-        error,
-        DbError::Topology(TopologyError::Protocol(_))
-    ));
-    fixture.adopt().await;
     let error = fixture
         .db
         .validate_cluster_topology_change(TopologyVersion::new(2).unwrap(), &independent_pipeline())
@@ -1306,7 +1258,6 @@ async fn topology_validation_rejects_legacy_conflicting_parent_and_changed_resol
 async fn topology_validation_rejects_implicit_reset_unsafe_removal_and_unsupported_state_before_live_mutation(
 ) {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let original = fixture.db.catalog_manifest_inventory().unwrap();
     for sql in [
         "CREATE OR REPLACE STREAM totals AS SELECT id, COUNT(*) AS total FROM trades GROUP BY id",
@@ -1400,7 +1351,6 @@ async fn topology_explicit_reset_maps_both_incarnations_and_preserves_the_live_p
 #[tokio::test]
 async fn topology_validation_reuses_cluster_source_sink_and_changelog_admission() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     for sql in [
         source_ddl("ephemeral", "'durability' = 'ephemeral'"),
         source_ddl("singleton", "'placement' = 'singleton'"),
@@ -1420,7 +1370,6 @@ async fn topology_validation_reuses_cluster_source_sink_and_changelog_admission(
 #[tokio::test]
 async fn topology_stateful_rejects_changelog_input_that_could_retract_the_unavailable_prefix() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let statements = vec![
         source_ddl("weighted", "'input' = 'changelog'")
             .replace("\"planning-source\"", "\"planning-changelog\"")
@@ -1445,7 +1394,6 @@ async fn topology_validation_is_read_only_even_when_all_authority_writes_fail() 
     let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let faulty = Arc::new(FaultyObjectStore::new(inner));
     let fixture = Fixture::with_objects(faulty.clone()).await;
-    fixture.adopt().await;
     let before = object_paths(fixture.authority.checkpoint_store.as_ref()).await;
     faulty.set_fault(ObjectStoreFault::FailWrites);
     fixture.validate(&independent_pipeline()).await.unwrap();
@@ -1459,7 +1407,6 @@ async fn topology_validation_is_read_only_even_when_all_authority_writes_fail() 
 #[tokio::test]
 async fn topology_validation_does_not_invent_missing_live_shuffle_scope() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let original = fixture.db.catalog_manifest_inventory().unwrap();
     let receiver = fixture.db.shuffle_receiver.lock().take().unwrap();
     let result = fixture.validate(&independent_pipeline()).await;
@@ -1476,7 +1423,6 @@ async fn topology_validation_does_not_invent_missing_live_shuffle_scope() {
 #[tokio::test]
 async fn topology_validation_cancellation_and_concurrency_do_not_leak_candidate_ownership() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let catalog_lock = fixture.db.topology_ddl_lock.write().await;
     let db = Arc::clone(&fixture.db);
     let task = tokio::spawn(async move {
@@ -1501,7 +1447,6 @@ async fn topology_validation_cancellation_and_concurrency_do_not_leak_candidate_
 #[tokio::test(start_paused = true)]
 async fn topology_validation_deadline_includes_waiting_for_catalog_snapshot() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let catalog_lock = fixture.db.topology_ddl_lock.write().await;
     let db = Arc::clone(&fixture.db);
     let task = tokio::spawn(async move {
@@ -1525,7 +1470,6 @@ async fn topology_validation_deadline_includes_waiting_for_catalog_snapshot() {
 #[tokio::test]
 async fn topology_validation_rejects_request_bounds_comments_and_schema_discovery() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     for statements in [
         vec![], vec!["CREATE SOURCE large (id INT)".repeat(16_384)],
         vec!["CREATE SOURCE each (id INT)".into(); 65],
@@ -1541,7 +1485,6 @@ async fn topology_validation_rejects_request_bounds_comments_and_schema_discover
 #[tokio::test]
 async fn topology_validation_missing_parent_blob_fails_closed() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let reference = fixture
         .authority
         .manifest_store
@@ -1572,7 +1515,6 @@ mod removal {
     #[tokio::test]
     async fn topology_pipeline_removal_requires_dependency_order_and_preserves_exact_request() {
         let fixture = Fixture::new().await;
-        fixture.adopt().await;
         let inventory = fixture.db.catalog_manifest_inventory().unwrap();
         let before = fixture.authority.lease_store.load().await.unwrap();
         let paths = object_paths(fixture.authority.checkpoint_store.as_ref()).await;
@@ -1635,7 +1577,6 @@ mod removal {
     #[tokio::test]
     async fn topology_sink_removal_validation_is_effect_free_and_preserves_upstream_contracts() {
         let fixture = Fixture::new().await;
-        fixture.adopt().await;
         let parent = fixture
             .authority
             .manifest_store
@@ -1752,7 +1693,6 @@ async fn cluster_planning_rejects_a_connector_sink_reading_a_source_directly() {
 #[tokio::test]
 async fn topology_validation_maps_split_stream_stages_to_their_owner() {
     let fixture = Fixture::new().await;
-    fixture.adopt().await;
     let mut statements = independent_pipeline();
     statements.extend([
         "CREATE STREAM key_counts AS SELECT n, COUNT(*) AS keys FROM \
@@ -1806,7 +1746,6 @@ async fn topology_validation_preserves_a_split_stream_with_its_stages() {
         ],
     )
     .await;
-    fixture.adopt().await;
     let report = fixture.validate(&independent_pipeline()).await.unwrap();
     let object = report
         .objects
@@ -1839,7 +1778,6 @@ async fn topology_validation_preserves_a_materialized_view_with_its_result_node(
         ],
     )
     .await;
-    fixture.adopt().await;
     let report = fixture.validate(&independent_pipeline()).await.unwrap();
     let view = report
         .objects

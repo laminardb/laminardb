@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_core::cluster::control::{
-    AssignmentSnapshotStore, CatalogManifest, CatalogManifestRef, ClusterController, LeaderProof,
-    LegacyTopologyBaseline, LocalProcessAuthorityIdentity, TopologyAdmissionPlan,
-    TopologyAdoptionOutcome, TopologyError, TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
+    AssignmentSnapshotStore, CatalogManifest, ClusterController, LeaderProof,
+    LocalProcessAuthorityIdentity, TopologyAdmissionPlan, TopologyError,
+    TOPOLOGY_SUBMISSION_PROTOCOL_VERSION,
 };
 use laminar_sql::parser::StreamingStatement;
 
@@ -24,20 +24,6 @@ pub struct ClusterTopologyRequest {
     pub expected_parent_version: TopologyVersion,
     /// Ordered individual DDL statements; the entire candidate is validated before admission.
     pub statements: Vec<String>,
-}
-
-/// Explicit adoption of an existing sealed inventory after a coordinated binary upgrade.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClusterTopologyAdoptionRequest {
-    /// Nonzero caller UUID, preserved by retries.
-    pub operation_id: TopologyOperationId,
-    /// Exact original manifest; its historical bytes and generations are preserved.
-    pub expected_manifest: CatalogManifestRef,
-    /// Existing checkpoint/control deployment UUID; adoption never initializes it.
-    pub expected_deployment_id: String,
-    /// Operator assertion that every process has completed the coordinated binary upgrade.
-    pub coordinated_upgrade_complete: bool,
 }
 
 impl LaminarDB {
@@ -118,7 +104,6 @@ impl LaminarDB {
                     }
                     return Ok(operation);
                 }
-                self.ensure_topology_submission_available()?;
                 if let Some(address) = self
                     .topology_submission_route(&controller, allow_forwarding)
                     .await?
@@ -139,6 +124,8 @@ impl LaminarDB {
                     }
                     return Ok(operation);
                 }
+                // Only the admitting leader needs released intake; a fenced follower still forwards.
+                self.ensure_topology_submission_available()?;
                 let before = controller
                     .try_live_local_process_authority_identity()
                     .map_err(|_| TopologyError::Fenced)?;
@@ -234,88 +221,6 @@ impl LaminarDB {
         }
     }
 
-    /// Explicitly adopt topology one without rewriting the existing catalog or checkpoint storage.
-    ///
-    /// # Errors
-    /// Requires the coordinated-upgrade assertion, exact existing deployment/manifest, live
-    /// leadership and the existing bounded adoption CAS. A follower forwards at most once.
-    pub async fn adopt_cluster_topology(
-        &self,
-        request: &ClusterTopologyAdoptionRequest,
-    ) -> Result<LegacyTopologyBaseline, DbError> {
-        self.adopt_cluster_topology_until(request, SUBMISSION_TIMEOUT, true)
-            .await
-    }
-
-    /// One-hop HTTP adoption receiver using the caller's remaining bounded budget.
-    ///
-    /// # Errors
-    /// Uses explicit adoption rules and rejects lost leadership or invalid evidence.
-    #[doc(hidden)]
-    pub async fn adopt_cluster_topology_forwarded(
-        &self,
-        request: &ClusterTopologyAdoptionRequest,
-        remaining: Duration,
-    ) -> Result<LegacyTopologyBaseline, DbError> {
-        self.adopt_cluster_topology_until(request, remaining.min(SUBMISSION_TIMEOUT), false)
-            .await
-    }
-
-    async fn adopt_cluster_topology_until(
-        &self,
-        request: &ClusterTopologyAdoptionRequest,
-        timeout: Duration,
-        allow_forwarding: bool,
-    ) -> Result<LegacyTopologyBaseline, DbError> {
-        if timeout.is_zero() {
-            return Err(TopologyError::Contended.into());
-        }
-        let deadline = tokio::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or(TopologyError::Contended)?;
-        tokio::time::timeout_at(deadline, async {
-            if !request.coordinated_upgrade_complete {
-                return Err(TopologyError::Protocol("complete the coordinated binary upgrade on every process before explicit legacy adoption".into()).into());
-            }
-            let deployment = uuid::Uuid::parse_str(&request.expected_deployment_id)
-                .map_err(|_| TopologyError::Invalid("deployment must be a canonical nonzero UUID".into()))?;
-            if deployment.is_nil() || deployment.to_string() != request.expected_deployment_id {
-                return Err(TopologyError::Invalid("deployment must be a canonical nonzero UUID".into()).into());
-            }
-            let controller = self.topology_submission_controller()?;
-            self.ensure_topology_preparation_available()?;
-            if let Some(address) = self.topology_submission_route(&controller, allow_forwarding).await? {
-                let baseline: LegacyTopologyBaseline = self.forward_topology_request(&address, "/api/v1/cluster/topology/adopt", request, deadline).await?;
-                if baseline.manifest != request.expected_manifest
-                    || baseline.deployment_id != request.expected_deployment_id {
-                    return Err(TopologyError::Invalid("leader adoption receipt differs from the exact request".into()).into());
-                }
-                return Ok(baseline);
-            }
-            let authority = controller.checkpoint_authority()
-                .map_err(|error| TopologyError::Protocol(error.to_string()))?;
-            let proof = controller.capture_leader_proof().ok_or(TopologyError::Fenced)?;
-            let catalog = self.catalog_manifest_store.lock().clone()
-                .ok_or_else(|| TopologyError::Protocol("adoption requires configured catalog authority".into()))?;
-            let (manifest, _) = catalog.load_with_topology().await?
-                .ok_or_else(|| TopologyError::Conflict("legacy catalog is not sealed".into()))?;
-            if manifest.reference().map_err(TopologyError::from)? != request.expected_manifest
-                || self.catalog_manifest_inventory()? != manifest.entries {
-                return Err(TopologyError::Conflict("adoption requires the exact sealed, replayed live catalog".into()).into());
-            }
-            let baseline = match authority.adopt_legacy_topology(&proof, request.operation_id,
-                &request.expected_manifest, &request.expected_deployment_id).await? {
-                TopologyAdoptionOutcome::Created(baseline) | TopologyAdoptionOutcome::Existing(baseline) => baseline,
-            };
-            self.ensure_topology_preparation_available()?;
-            if !controller.proof_is_live(&proof) {
-                return Err(TopologyError::Fenced.into());
-            }
-            *self.replayed_topology.lock() = Some(super::ReplayedTopology::LEGACY_BASELINE);
-            Ok(baseline)
-        }).await.map_err(|_| TopologyError::Contended)?
-    }
-
     pub(in crate::db) async fn submit_cluster_topology_sql(
         &self,
         sql: &str,
@@ -328,7 +233,7 @@ impl LaminarDB {
             .committed_version
             .ok_or_else(|| {
                 TopologyError::Protocol(
-                    "explicit legacy topology adoption is required before runtime DDL".into(),
+                    "the cluster catalog must be sealed before runtime DDL".into(),
                 )
             })?;
         let request = ClusterTopologyRequest {

@@ -1,4 +1,4 @@
-//! Console-authorized atomic topology admission and explicit legacy adoption.
+//! Console-authorized atomic topology admission.
 
 use std::sync::Arc;
 
@@ -14,10 +14,6 @@ use super::{error_response, AppState};
 pub(super) type SubmissionRequest = laminar_db::ClusterTopologyRequest;
 #[cfg(not(feature = "cluster"))]
 pub(super) type SubmissionRequest = serde_json::Value;
-#[cfg(feature = "cluster")]
-pub(super) type AdoptionRequest = laminar_db::ClusterTopologyAdoptionRequest;
-#[cfg(not(feature = "cluster"))]
-pub(super) type AdoptionRequest = serde_json::Value;
 
 pub(super) async fn submit_cluster_topology(
     State(state): State<Arc<AppState>>,
@@ -57,50 +53,6 @@ pub(super) async fn submit_cluster_topology(
         };
         let response = match result {
             Ok(operation) => (StatusCode::ACCEPTED, Json(operation)).into_response(),
-            Err(error) => topology_write_error(error),
-        };
-        operation_header(response, request.operation_id)
-    }
-    .await;
-    no_store(response)
-}
-
-pub(super) async fn adopt_cluster_topology(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    request: Result<Json<AdoptionRequest>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    #[cfg(not(feature = "cluster"))]
-    let response = {
-        let _ = (state, headers, request);
-        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
-    };
-    #[cfg(feature = "cluster")]
-    let response = async {
-        if state.cluster.is_none() {
-            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
-        }
-        let request = match request {
-            Ok(Json(request)) => request,
-            Err(error) => return error_response(error.status(), error.body_text()).into_response(),
-        };
-        let budget = match forwarded_budget(&headers) {
-            Ok(budget) => budget,
-            Err(message) => {
-                return error_response(StatusCode::BAD_REQUEST, message).into_response()
-            }
-        };
-        let result = match budget {
-            Some(remaining) => {
-                state
-                    .db
-                    .adopt_cluster_topology_forwarded(&request, remaining)
-                    .await
-            }
-            None => state.db.adopt_cluster_topology(&request).await,
-        };
-        let response = match result {
-            Ok(baseline) => Json(baseline).into_response(),
             Err(error) => topology_write_error(error),
         };
         operation_header(response, request.operation_id)

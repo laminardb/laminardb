@@ -1,4 +1,4 @@
-//! One bounded HTTP hop for durable topology submission and explicit adoption.
+//! One bounded HTTP hop for durable topology submission.
 
 use laminar_core::cluster::control::{LeaseError, TopologyError};
 use serde::{de::DeserializeOwned, Serialize};

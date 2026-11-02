@@ -231,7 +231,6 @@ including remote AI — runs normally.
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/api/v1/cluster/vnodes/load` | Per-vnode state of each keyed operator: this node's live state and every participant's committed frame bytes ([Reading skew](#reading-skew)) |
 | GET | `/api/v1/cluster/topology` | Durable catalog version and this process's activation evidence (console authorization) |
-| POST | `/api/v1/cluster/topology/adopt` | Explicitly adopt an existing legacy catalog after a coordinated upgrade |
 | POST | `/api/v1/cluster/topology/validate` | Validate a topology candidate without applying it |
 | POST | `/api/v1/cluster/topology/operations` | Submit one atomic migration with an operation UUID and expected parent version |
 | GET | `/api/v1/cluster/topology/operations/{operation_id}` | Audited migration status (console authorization) |

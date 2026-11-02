@@ -1004,7 +1004,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         <li><code>GET /api/v1/cluster/vnodes</code> &mdash; The durable key-group (vnode) assignment snapshot.</li>
         <li><code>GET /api/v1/cluster/leader</code> &mdash; The current leader's node record (if known) and whether this node is the leader.</li>
         <li><code>GET /api/v1/cluster/checkpoints</code> &mdash; Latest checkpoint status; also available in single-node mode.</li>
-        <li><code>GET /api/v1/cluster/topology</code> and <code>/api/v1/cluster/topology/*</code> &mdash; Durable catalog version, topology validation, migration submission, preparation, status and legacy-catalog adoption (see the REST table below).</li>
+        <li><code>GET /api/v1/cluster/topology</code> and <code>/api/v1/cluster/topology/*</code> &mdash; Durable catalog version, topology validation, migration submission, preparation and status (see the REST table below).</li>
       </ul>
       <p><code>/api/v1/cluster</code>, <code>/nodes</code>, <code>/vnodes</code> and <code>/leader</code> return <code>404</code> when the server is not in cluster mode.</p>
 
@@ -1169,11 +1169,6 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/cluster/topology/operations/{operation_id}/prepare</span>
           <span class="endpoint-desc">Prepare an admitted migration on this participant</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="endpoint-method method-post">POST</span>
-          <span class="endpoint-path">/api/v1/cluster/topology/adopt</span>
-          <span class="endpoint-desc">Adopt an existing legacy catalog after a coordinated upgrade</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-get">GET</span>

@@ -1,7 +1,7 @@
 //! Real old-graph cut and pre-commit abort. Candidate admission uses the core API because SQL
 //! migration submission remains guarded. This never installs or activates the reserved candidate.
 
-use super::{topology_adoption, wait_for, Node};
+use super::{topology_baseline, wait_for, Node};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ pub(super) fn prepare_old_cut(
     ceiling: Duration,
     evidence_dir: &Path,
 ) -> TopologyAdmissionStatus {
-    let objects = topology_adoption::objects_for_namespace(checkpoint_url);
+    let objects = topology_baseline::objects_for_namespace(checkpoint_url);
     let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
     // This harness configures one shared namespace for process, checkpoint and catalog storage.
     let processes =
@@ -555,7 +555,7 @@ pub(super) fn assert_aborted_after_restart(
     evidence_dir: &Path,
 ) {
     let authority = LeaderLeaseStore::new(
-        topology_adoption::objects_for_namespace(checkpoint_url),
+        topology_baseline::objects_for_namespace(checkpoint_url),
         30_000,
     );
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -37,7 +37,6 @@ pub(super) async fn qualify(processes: &mut [Process; 2]) -> Result<()> {
     }
     wait_totals(processes, &BTreeMap::from([(keys[0], 32), (keys[1], 30)])).await?;
     let leader = leader(processes).await?;
-    processes[leader].done(&Command::Adopt).await?;
     processes[leader]
         .done(&Command::Migrate(
             OPERATION,

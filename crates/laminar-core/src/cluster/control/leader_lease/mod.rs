@@ -57,9 +57,7 @@ use crate::checkpoint_decision::{
 };
 use crate::cluster::discovery::NodeId;
 
-use super::catalog_manifest::{
-    CatalogManifest, CatalogManifestError, CatalogManifestRef, CatalogSealOutcome,
-};
+use super::catalog_manifest::{CatalogManifest, CatalogManifestError, CatalogManifestRef};
 use super::controller::{
     RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement, RecoveryFault,
     RecoveryFaultDisposition, RecoveryFaultInventory, RecoveryFaultPublisher, RecoveryReleaseId,
@@ -1087,7 +1085,7 @@ struct LeaderAuthorityRecord {
     recovery_release_commit: Option<AuthorityRecoveryReleaseCommit>,
     /// Latest admitted recovery release, preserved by every later authority mutation.
     recovery_release_head: Option<RecoveryReleaseLink>,
-    /// Explicit baseline, present only after the coordinated authority-format upgrade.
+    /// Topology one bound to the sealed inventory, preserved by every later append.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     topology_baseline: Option<super::topology::LegacyTopologyBaseline>,
     /// Frozen drain intent, admitted before any assignment snapshot publication.
@@ -3585,105 +3583,6 @@ impl LeaderLeaseStore {
             Ok(AuthorityCreateOutcome::Created)
         } else {
             Ok(AuthorityCreateOutcome::ExistingIdentical)
-        }
-    }
-
-    /// Seal the complete catalog by appending it to the exact durable leader term.
-    ///
-    /// Renewals that race this operation are retried under the same proof. A takeover either
-    /// observes and preserves the seal or wins the next sequence and fences this writer.
-    ///
-    /// # Errors
-    /// Rejects malformed inventories, divergent existing inventories, stale proofs, and durable
-    /// storage failures.
-    pub(super) async fn seal_catalog(
-        &self,
-        proof: &LeaderProof,
-        manifest: &CatalogManifest,
-    ) -> Result<CatalogSealOutcome, CatalogManifestError> {
-        if !proof.is_canonical() {
-            return Err(CatalogManifestError::Fenced);
-        }
-        let (encoded, reference) = manifest.encode_and_reference()?;
-
-        let current = self
-            .load_record()
-            .await?
-            .ok_or(CatalogManifestError::Fenced)?;
-        if let Some(sealed) = &current.lease.catalog_manifest {
-            let durable = self.load_catalog_manifest(sealed).await?;
-            return if durable == *manifest {
-                Ok(CatalogSealOutcome::ExistingIdentical)
-            } else {
-                Err(CatalogManifestError::Conflict)
-            };
-        }
-        if !current.lease.matches_proof(proof) {
-            return Err(CatalogManifestError::Fenced);
-        }
-        self.ensure_catalog_manifest_blob(&encoded, &reference)
-            .await?;
-
-        loop {
-            let published = self
-                .load_published_authority_head()
-                .await?
-                .ok_or(CatalogManifestError::Fenced)?;
-            let current = &published.record;
-            if let Some(sealed) = &current.lease.catalog_manifest {
-                let durable = self.load_catalog_manifest(sealed).await?;
-                return if durable == *manifest {
-                    Ok(CatalogSealOutcome::ExistingIdentical)
-                } else {
-                    Err(CatalogManifestError::Conflict)
-                };
-            }
-            if !current.lease.matches_proof(proof) {
-                return Err(CatalogManifestError::Fenced);
-            }
-
-            let base_sequence = current.lease.seq;
-            let candidate_lease = LeaderLease {
-                seq: current.lease.seq.checked_add(1).ok_or_else(|| {
-                    CatalogManifestError::Authority(LeaseError::Invalid(
-                        "lease sequence exhausted".into(),
-                    ))
-                })?,
-                renewal_sequence: current.lease.renewal_sequence,
-                token: current.lease.token,
-                owner: current.lease.owner.clone(),
-                expires_at_ms: current.lease.expires_at_ms,
-                catalog_manifest: Some(reference.clone()),
-            };
-            let candidate = current.preserve_with_lease(candidate_lease);
-            match self
-                .create_authority_record(Some(&published), &candidate)
-                .await?
-            {
-                AuthorityCreateOutcome::Created => return Ok(CatalogSealOutcome::Created),
-                AuthorityCreateOutcome::ExistingIdentical => {
-                    return Ok(CatalogSealOutcome::ExistingIdentical);
-                }
-                AuthorityCreateOutcome::Contended(winner) => {
-                    if let Some(sealed) = &winner.lease.catalog_manifest {
-                        let durable = self.load_catalog_manifest(sealed).await?;
-                        return if durable == *manifest {
-                            Ok(CatalogSealOutcome::ExistingIdentical)
-                        } else {
-                            Err(CatalogManifestError::Conflict)
-                        };
-                    }
-                    if !winner.lease.matches_proof(proof) {
-                        return Err(CatalogManifestError::Fenced);
-                    }
-                    if winner.lease.seq <= base_sequence {
-                        return Err(CatalogManifestError::Authority(LeaseError::Invalid(
-                            "catalog seal contention did not advance the authority sequence".into(),
-                        )));
-                    }
-                    tokio::task::yield_now().await;
-                }
-            }
         }
     }
 

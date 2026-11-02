@@ -116,3 +116,64 @@ async fn topology_forwarding_keeps_typed_fences_and_rejects_response_bounds_and_
         ));
     }
 }
+
+#[tokio::test]
+async fn unstarted_follower_forwards_submission_before_local_intake_checks() {
+    use laminar_core::cluster::control::{
+        ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore,
+        LeaseDeadline, LeaseOutcome, TopologyVersion,
+    };
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+    use std::sync::Arc;
+
+    let objects: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
+    let leader = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: uuid::Uuid::from_u128(1),
+        process_term: 1,
+    };
+    let LeaseOutcome::Acquired(_) = authority.begin_new_term(&leader, 0).await.unwrap() else {
+        panic!("fresh authority must admit node 1");
+    };
+    let fenced = serde_json::json!({
+        "error": "stale receiver",
+        "code": laminar_core::error_codes::TOPOLOGY_FENCED,
+    })
+    .to_string();
+    let (address, peer) = peer("503 Service Unavailable", &fenced, None).await;
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![NodeInfo {
+        id: NodeId(1),
+        name: "leader".into(),
+        rpc_address: address,
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    }]);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(NodeId(2)));
+    let follower = Arc::new(ClusterController::new(NodeId(2), kv, None, members_rx));
+    follower
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(60),
+        )))
+        .unwrap();
+    follower.set_leader_lease_store(authority);
+    let db = LaminarDB::builder()
+        .cluster_controller(follower)
+        .cluster_checkpoint_object_store(objects)
+        .build()
+        .await
+        .unwrap();
+    let request = crate::ClusterTopologyRequest {
+        operation_id: uuid::Uuid::from_u128(1307).try_into().unwrap(),
+        expected_parent_version: TopologyVersion::new(1).unwrap(),
+        statements: vec!["CREATE SOURCE added (id BIGINT)".into()],
+    };
+    assert!(matches!(
+        db.submit_cluster_topology_change(&request).await,
+        Err(DbError::Topology(TopologyError::Fenced))
+    ));
+    let captured = peer.await.unwrap();
+    assert!(captured.starts_with(b"POST /api/v1/cluster/topology/operations HTTP/1.1\r\n"));
+}

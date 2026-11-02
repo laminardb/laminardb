@@ -15,26 +15,22 @@ fn post(path: &str, token: Option<&str>, body: String) -> Request<Body> {
 
 #[tokio::test]
 async fn topology_writes_require_console_authorization_and_report_noncluster() {
-    for path in [
-        "/api/v1/cluster/topology/operations",
-        "/api/v1/cluster/topology/adopt",
-    ] {
-        let app = build_router(test_state_with_token("topology-console"));
-        for token in [None, Some("wrong-token")] {
-            let response = app
-                .clone()
-                .oneshot(post(path, token, "{}".into()))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        }
+    let path = "/api/v1/cluster/topology/operations";
+    let app = build_router(test_state_with_token("topology-console"));
+    for token in [None, Some("wrong-token")] {
         let response = app
-            .oneshot(post(path, Some("topology-console"), "{}".into()))
+            .clone()
+            .oneshot(post(path, token, "{}".into()))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+    let response = app
+        .oneshot(post(path, Some("topology-console"), "{}".into()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()["cache-control"], "no-store");
 }
 
 #[cfg(feature = "cluster")]
@@ -83,17 +79,12 @@ async fn topology_writes_reject_malformed_identity_unknown_fields_and_oversized_
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(response.headers()["cache-control"], "no-store");
     }
-    for (path, limit) in [
-        (path, 512 * 1024),
-        ("/api/v1/cluster/topology/adopt", 16 * 1024),
-    ] {
-        let response = app
-            .clone()
-            .oneshot(post(path, Some(&console), " ".repeat(limit + 1)))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    }
+    let response = app
+        .clone()
+        .oneshot(post(path, Some(&console), " ".repeat(512 * 1024 + 1)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     for value in ["0", "45000000001", "invalid"] {
         let mut request = post(path, Some(&console), valid.to_string());
         request

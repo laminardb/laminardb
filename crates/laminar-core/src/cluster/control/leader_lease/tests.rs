@@ -1,3 +1,4 @@
+use super::super::catalog_manifest::CatalogSealOutcome;
 use super::super::controller::{RecoveryFault, RecoveryRound};
 use super::super::snapshot::AssignmentSnapshot;
 use super::*;

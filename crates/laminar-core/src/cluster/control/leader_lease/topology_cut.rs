@@ -193,7 +193,7 @@ impl LeaderLeaseStore {
                 if inventory.pipeline_identity != descriptor.parent_pipeline {
                     return Err(TopologyError::Conflict("cut pipeline differs from the certified parent".into()));
                 }
-                let baseline = current.topology_baseline.as_ref().ok_or_else(|| TopologyError::Invalid("cut has no adopted parent".into()))?;
+                let baseline = current.topology_baseline.as_ref().ok_or_else(|| TopologyError::Invalid("cut has no sealed parent".into()))?;
                 if inventory.deployment_id != baseline.deployment_id || inventory.assignment_fence.as_ref() != Some(&plan.assignment)
                     || current.committed_topology_identity() != Some((plan.expected_parent, &plan.parent_manifest))
                 {

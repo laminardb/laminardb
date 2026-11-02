@@ -995,16 +995,6 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     catalog.seal(&parent, &leader.proof).await.unwrap();
     let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&leader.objects)));
     let deployment = decisions.load_or_create_deployment_id().await.unwrap();
-    leader
-        .authority
-        .adopt_legacy_topology(
-            &leader.proof,
-            uuid::Uuid::from_u128(40).try_into().unwrap(),
-            &parent.reference().unwrap(),
-            &deployment,
-        )
-        .await
-        .unwrap();
     let mut target = parent.clone();
     target.entries.push(CatalogManifestEntry {
         schema_binding: None,

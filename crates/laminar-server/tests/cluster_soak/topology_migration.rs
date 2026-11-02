@@ -7,84 +7,18 @@ use std::time::{Duration, Instant};
 
 use laminar_core::cluster::control::topology::ClusterTopologyObjectTransition;
 use laminar_core::cluster::control::{
-    CatalogManifestStore, CheckpointDecisionStore, LeaderLeaseStore, LegacyTopologyBaseline,
-    RecoverPhase, RecoveryAnnouncement, TopologyAdmissionPhase, TopologyAdmissionStatus,
-    TopologyCatalogState, TopologyOperationId, TopologyVersion,
+    LeaderLeaseStore, RecoverPhase, RecoveryAnnouncement, TopologyAdmissionPhase,
+    TopologyAdmissionStatus, TopologyOperationId, TopologyVersion,
 };
 use object_store::ObjectStoreExt;
 
-use super::{topology_adoption, wait_for, DurableCheckpointStatus, KafkaOutputOracle, Node};
+use super::{topology_baseline, wait_for, DurableCheckpointStatus, KafkaOutputOracle, Node};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-}
-
-pub(super) fn adopt_inventory(namespace: &str, nodes: &mut [Node]) -> LegacyTopologyBaseline {
-    let objects = topology_adoption::objects_for_namespace(namespace);
-    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
-    let catalog = CatalogManifestStore::new(Arc::clone(&authority));
-    let runtime = runtime();
-    let baseline = runtime.block_on(async {
-        let TopologyCatalogState::LegacySealed { manifest } =
-            catalog.topology_state().await.unwrap()
-        else {
-            panic!("fresh soak must adopt its exact original sealed inventory");
-        };
-        let path = object_store::path::Path::from(format!(
-            "control/catalog-manifest/v1/{}.json",
-            manifest.sha256
-        ));
-        let before = objects.get(&path).await.unwrap().bytes().await.unwrap();
-        let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
-            .load_deployment_id()
-            .await
-            .unwrap()
-            .unwrap();
-        let request = laminar_db::ClusterTopologyAdoptionRequest {
-            operation_id: uuid::Uuid::new_v4().try_into().unwrap(),
-            expected_manifest: manifest.clone(),
-            expected_deployment_id: deployment.clone(),
-            coordinated_upgrade_complete: true,
-        };
-        let body = serde_json::to_string(&request).unwrap();
-        let response = nodes[0]
-            .http_request(
-                "POST",
-                "/api/v1/cluster/topology/adopt",
-                Some(&body),
-                Duration::from_secs(45),
-            )
-            .expect("public explicit adoption must return its receipt");
-        let baseline: LegacyTopologyBaseline = serde_json::from_str(&response).unwrap();
-        assert_eq!(baseline.manifest, manifest);
-        assert_eq!(baseline.deployment_id, deployment);
-        let retry: LegacyTopologyBaseline = serde_json::from_str(
-            &nodes[1]
-                .http_request(
-                    "POST",
-                    "/api/v1/cluster/topology/adopt",
-                    Some(&body),
-                    Duration::from_secs(45),
-                )
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(baseline, retry);
-        assert_eq!(
-            objects.get(&path).await.unwrap().bytes().await.unwrap(),
-            before
-        );
-        baseline
-    });
-    eprintln!(
-        "soak: public exact-inventory adoption {} at sequence {}",
-        baseline.operation_id.get(),
-        baseline.authority_sequence
-    );
-    baseline
 }
 
 pub(super) struct MigrationProbe {
@@ -532,9 +466,9 @@ pub(super) fn exercise(
     super::kafka_create_topic(brokers, &input_topic, 3);
     super::kafka_create_topic(brokers, &output_topic, 3);
     let mut probe = MigrationProbe {
-        objects: topology_adoption::objects_for_namespace(namespace),
+        objects: topology_baseline::objects_for_namespace(namespace),
         authority: Arc::new(LeaderLeaseStore::new(
-            topology_adoption::objects_for_namespace(namespace),
+            topology_baseline::objects_for_namespace(namespace),
             30_000,
         )),
         runtime: runtime(),
