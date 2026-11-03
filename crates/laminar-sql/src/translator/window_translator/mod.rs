@@ -276,8 +276,7 @@ impl WindowOperatorConfig {
     ) -> Result<Self, ParseError> {
         if late_data_clause.side_output.is_some() {
             return Err(ParseError::WindowError(
-                "LATE DATA SIDE OUTPUT is not yet supported in pipeline mode; \
-                 use ALLOWED LATENESS without a side output, or omit the clause"
+                "LATE DATA TO is not supported; use ALLOW LATENESS without a side output"
                     .to_string(),
             ));
         }

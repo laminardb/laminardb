@@ -7,7 +7,9 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema};
 
 use laminar_core::catalog::CatalogObjectKind;
-use laminar_sql::parser::{EmitClause, MaterializedViewRetention, StreamingStatement};
+use laminar_sql::parser::{
+    EmitClause, LateDataClause, MaterializedViewRetention, StreamingStatement,
+};
 
 use crate::db::{canonical_object_name, exact_table_reference, LaminarDB};
 use crate::error::DbError;
@@ -38,6 +40,7 @@ struct ViewDefinition<'a> {
     name: &'a sqlparser::ast::ObjectName,
     query: &'a StreamingStatement,
     emit_clause: Option<&'a EmitClause>,
+    late_data: Option<&'a LateDataClause>,
     query_sql: &'a str,
     /// The sources and views the statement reads, through its stages too.
     sources: Vec<String>,
@@ -82,6 +85,7 @@ impl LaminarDB {
             name,
             query,
             emit_clause,
+            late_data,
             or_replace,
             if_not_exists,
             query_sql,
@@ -138,6 +142,7 @@ impl LaminarDB {
             name,
             query: owner_query,
             emit_clause: emit_clause.as_ref(),
+            late_data: late_data.as_ref(),
             query_sql: owner_sql,
             sources: self.collect_mv_sources(query_sql, &name_str),
             retention: retention.as_ref(),
@@ -190,6 +195,7 @@ impl LaminarDB {
                 view.name,
                 view.query,
                 view.emit_clause.cloned(),
+                view.late_data.cloned(),
                 view.query_sql,
             )
             .await?;
@@ -228,12 +234,13 @@ impl LaminarDB {
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<laminar_sql::parser::EmitClause>,
+        late_data: Option<LateDataClause>,
         query_sql: &str,
     ) -> Result<(PlannedStreamingQuery, IntervalTopologyCandidate), DbError> {
         let name_str = canonical_object_name(name)?;
         self.validate_cluster_query_shape_before_plan("materialized view", &name_str, query_sql)?;
         let planned = self
-            .plan_streaming_query(name, query, emit_clause, query_sql)
+            .plan_streaming_query(name, query, emit_clause, late_data, query_sql)
             .await?;
         self.reject_stateful_consumer_of_running_state(
             "materialized view",

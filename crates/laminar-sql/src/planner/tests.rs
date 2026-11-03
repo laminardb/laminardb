@@ -164,6 +164,49 @@ fn test_plan_query_with_window() {
 }
 
 #[test]
+fn allow_lateness_applies_only_to_windows_that_emit_on_close() {
+    let plan = |sql: &str| {
+        let statements = StreamingParser::parse_sql(sql).unwrap();
+        StreamingPlanner::new().plan(&statements[0])
+    };
+    let window = "CREATE STREAM s AS SELECT COUNT(*) FROM events \
+                  GROUP BY TUMBLE(event_time, INTERVAL '1' MINUTE)";
+    let late = "ALLOW LATENESS INTERVAL '30' SECOND";
+    let Ok(StreamingPlan::Query(query)) = plan(&format!("{window} EMIT ON WINDOW CLOSE {late}"))
+    else {
+        panic!("expected a query plan");
+    };
+    assert_eq!(
+        query.window_config.unwrap().allowed_lateness,
+        std::time::Duration::from_secs(30)
+    );
+    for (sql, expected) in [
+        (
+            format!("{window} EMIT FINAL {late}"),
+            "requires EMIT ON WINDOW CLOSE",
+        ),
+        (
+            format!("{window} EMIT CHANGES {late}"),
+            "requires EMIT ON WINDOW CLOSE",
+        ),
+        (
+            format!("{window} EMIT ON WINDOW CLOSE {late} LATE DATA TO late_rows"),
+            "LATE DATA TO is not supported",
+        ),
+        (
+            format!(
+                "CREATE STREAM s AS SELECT k, COUNT(*) FROM events GROUP BY k \
+                 EMIT ON WINDOW CLOSE {late}"
+            ),
+            "requires a TUMBLE, HOP or SESSION window",
+        ),
+    ] {
+        let error = plan(&sql).unwrap_err().to_string();
+        assert!(error.contains(expected), "{sql}: {error}");
+    }
+}
+
+#[test]
 fn test_plan_query_with_join() {
     let mut planner = StreamingPlanner::new();
     let statements = StreamingParser::parse_sql(

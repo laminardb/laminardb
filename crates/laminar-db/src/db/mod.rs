@@ -4299,26 +4299,8 @@ impl LaminarDB {
                 }
                 Ok(result)
             }
-            StreamingStatement::CreateStream {
-                name,
-                query,
-                emit_clause,
-                if_not_exists,
-                query_sql,
-                retention_bytes,
-                ..
-            } => {
-                let result = self
-                    .handle_create_stream(
-                        sql,
-                        name,
-                        query,
-                        emit_clause.as_ref(),
-                        *if_not_exists,
-                        query_sql,
-                        *retention_bytes,
-                    )
-                    .await?;
+            StreamingStatement::CreateStream { .. } => {
+                let result = self.handle_create_stream(sql, statement).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
                     if info.applied {
                         self.connector_manager

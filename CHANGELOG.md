@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A window over another window's output no longer drops the upstream's rows. A window stream's
+  watermark now trails the watermark its windows close at: by the allowed lateness when it
+  projects `tumble_end` or `hop_end`, and by the lateness plus the window size otherwise.
+  Downstream windows, append-view retention and `stream_watermark_ms` see the held watermark.
+  Session windows are not held. This applies in every mode.
+- `ALLOW LATENESS` is applied. It used to be parsed after the `EMIT` clause and then ignored. It
+  now keeps windows open in embedded and single-node mode. It must follow `EMIT ON WINDOW CLOSE`,
+  and `CREATE` rejects it with `EMIT FINAL`, with other `EMIT` modes, on a query without a
+  window, and in cluster mode. Any other text after the `EMIT` clause is now a parse error.
+
+### Upgrade
+
+- A stream or view whose DDL already carried `ALLOW LATENESS` gets a new pipeline identity, so its
+  existing checkpoints fail closed; it restarts from its sources.
+
 ## [0.33.0]
 
 ### Added

@@ -319,8 +319,7 @@ fn check_window_errors(clean: &str) -> Option<TranslatedError> {
             code: codes::LATE_DATA_REJECTED,
             message: format!("Late data rejected: {clean}"),
             hint: Some(
-                "Increase the allowed lateness with ALLOWED LATENESS INTERVAL, \
-                 or route late data to a side output"
+                "Increase the allowed lateness with EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL"
                     .to_string(),
             ),
         });

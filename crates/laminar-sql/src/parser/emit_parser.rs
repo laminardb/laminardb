@@ -12,11 +12,40 @@
 
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::Token;
+use sqlparser::tokenizer::{Token, TokenWithSpan};
 
-use super::statements::EmitClause;
+use super::dialect::LaminarDialect;
+use super::late_data_parser::parse_late_data_clause;
+use super::statements::{EmitClause, LateDataClause};
 use super::tokenizer::try_parse_custom_keyword;
 use super::ParseError;
+
+/// Parse the clauses after a streaming query: `EMIT <strategy>`, then `ALLOW LATENESS <interval>`.
+/// Anything else is an error, so no clause is accepted and ignored.
+///
+/// # Errors
+///
+/// Returns `ParseError` for an unknown EMIT form, a malformed late-data clause, or other trailing
+/// tokens.
+pub(super) fn parse_emit_trailer(
+    tokens: Vec<TokenWithSpan>,
+) -> Result<(Option<EmitClause>, Option<LateDataClause>), ParseError> {
+    if tokens.is_empty() {
+        return Ok((None, None));
+    }
+    let dialect = LaminarDialect::default();
+    let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
+    let emit_clause = parse_emit_clause(&mut parser)?;
+    let late_data = parse_late_data_clause(&mut parser)?;
+    while parser.consume_token(&Token::SemiColon) {}
+    let trailing = parser.peek_token();
+    if trailing.token != Token::EOF {
+        return Err(ParseError::StreamingError(format!(
+            "unexpected {trailing} after the EMIT clause"
+        )));
+    }
+    Ok((emit_clause, late_data))
+}
 
 /// Parse an EMIT clause from the parser's current position.
 ///

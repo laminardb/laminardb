@@ -16,6 +16,41 @@ const MINUTE: i64 = 60 * SECOND;
 /// An hour-aligned epoch, so every window size below starts a bucket here.
 const T0: i64 = 1_699_999_200_000;
 
+async fn database(ddl: &[&str]) -> (Arc<LaminarDB>, Arc<EngineMetrics>) {
+    let db = LaminarDB::open().unwrap();
+    let prom = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
+    db.set_engine_metrics(Arc::clone(&prom));
+    for statement in ddl {
+        db.execute(statement).await.unwrap();
+    }
+    (db, prom)
+}
+
+/// A batch of `source` with each column's values given in milliseconds or as integers.
+fn source_batch(db: &LaminarDB, source: &str, columns: &[(&str, &[i64])]) -> RecordBatch {
+    let schema = db.catalog.get_source(source).unwrap().schema.clone();
+    let arrays = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let values = columns
+                .iter()
+                .find(|(name, _)| name == field.name())
+                .map(|(_, values)| values.to_vec())
+                .unwrap();
+            let array: Arc<dyn Array> = match field.data_type() {
+                DataType::Int64 => Arc::new(Int64Array::from(values)),
+                timestamp => {
+                    arrow::compute::cast(&TimestampMillisecondArray::from(values), timestamp)
+                        .unwrap()
+                }
+            };
+            array
+        })
+        .collect();
+    RecordBatch::try_new(schema, arrays).unwrap()
+}
+
 struct Pipeline {
     db: Arc<LaminarDB>,
     graph: OperatorGraph,
@@ -24,25 +59,8 @@ struct Pipeline {
 
 impl Pipeline {
     async fn new(ddl: &[&str]) -> Self {
-        Self::with_lateness(ddl, &[]).await
-    }
-
-    /// `lateness` stands in for `ALLOW LATENESS`, which the planner does not apply.
-    async fn with_lateness(ddl: &[&str], lateness: &[(&str, Duration)]) -> Self {
-        let db = LaminarDB::open().unwrap();
-        let prom = Arc::new(EngineMetrics::new(&prometheus::Registry::new()));
-        db.set_engine_metrics(Arc::clone(&prom));
-        for statement in ddl {
-            db.execute(statement).await.unwrap();
-        }
-        let mut streams = db.connector_manager.lock().streams().clone();
-        for (name, allowed) in lateness {
-            streams
-                .get_mut(*name)
-                .and_then(|stream| stream.window_config.as_mut())
-                .unwrap()
-                .allowed_lateness = *allowed;
-        }
+        let (db, prom) = database(ddl).await;
+        let streams = db.connector_manager.lock().streams().clone();
         let resolved = db
             .resolve_catalog_stream_outputs(std::iter::empty())
             .await
@@ -63,27 +81,7 @@ impl Pipeline {
     }
 
     fn batch(&self, source: &str, columns: &[(&str, &[i64])]) -> RecordBatch {
-        let schema = self.db.catalog.get_source(source).unwrap().schema.clone();
-        let arrays = schema
-            .fields()
-            .iter()
-            .map(|field| {
-                let values = columns
-                    .iter()
-                    .find(|(name, _)| name == field.name())
-                    .map(|(_, values)| values.to_vec())
-                    .unwrap();
-                let array: Arc<dyn Array> = match field.data_type() {
-                    DataType::Int64 => Arc::new(Int64Array::from(values)),
-                    timestamp => {
-                        arrow::compute::cast(&TimestampMillisecondArray::from(values), timestamp)
-                            .unwrap()
-                    }
-                };
-                array
-            })
-            .collect();
-        RecordBatch::try_new(schema, arrays).unwrap()
+        source_batch(&self.db, source, columns)
     }
 
     /// One cycle in which every source in `frontiers` advances to its watermark.
@@ -310,11 +308,8 @@ async fn window_over_hop_end_keeps_every_row() {
 #[tokio::test]
 async fn window_over_late_window_end_keeps_every_row() {
     let downstream = tumble_over_per_minute("'20' SECOND");
-    let mut pipeline = Pipeline::with_lateness(
-        &[SOURCE, PER_MINUTE_END, &downstream],
-        &[("per_minute", Duration::from_secs(30))],
-    )
-    .await;
+    let upstream = format!("{PER_MINUTE_END} ALLOW LATENESS INTERVAL '30' SECOND");
+    let mut pipeline = Pipeline::new(&[SOURCE, &upstream, &downstream]).await;
     run_cascade(&mut pipeline, 12, ("per_minute", "w"), ("rollup", "r"))
         .await
         .assert_lossless(12);
@@ -421,4 +416,80 @@ async fn window_over_interval_join_right_time_keeps_every_row() {
             "{stored} stored first"
         );
     }
+}
+
+/// A window emitted only after its lateness reaches an append view whose retention is shorter than
+/// that lateness: the view follows the window's held frontier, so the rows are not trimmed on
+/// arrival.
+#[tokio::test]
+async fn late_window_view_keeps_rows_emitted_after_its_retention() {
+    let (db, prom) = database(&[
+        SOURCE,
+        "CREATE MATERIALIZED VIEW per_ten AS \
+         SELECT tumble(ts, INTERVAL '10' SECOND) AS w, COUNT(*) AS n FROM src \
+         GROUP BY tumble(ts, INTERVAL '10' SECOND) \
+         EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '1' MINUTE \
+         WITH (retention = '5 seconds')",
+    ])
+    .await;
+    db.start().await.unwrap();
+    let source = db.source_untyped("src").unwrap();
+    let times = [T0 + SECOND, T0 + 2 * SECOND, T0 + 70 * SECOND];
+    source
+        .push_arrow(source_batch(&db, "src", &[("ts", &times)]))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let counts = loop {
+        let batches = db
+            .ctx
+            .sql("SELECT n FROM per_ten")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let counts = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                column.values().to_vec()
+            })
+            .collect::<Vec<_>>();
+        if !counts.is_empty() || std::time::Instant::now() > deadline {
+            break counts;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(counts, vec![2]);
+    assert_eq!(prom.window_late_dropped.get(), 0);
+}
+
+/// A statement that splits plans its owner with the statement's `ALLOW LATENESS`, so an owner that
+/// cannot apply it rejects the statement instead of dropping the clause.
+#[tokio::test]
+async fn split_statement_rejects_lateness_its_owner_cannot_apply() {
+    let (db, _) = database(&[
+        "CREATE SOURCE events (k BIGINT NOT NULL, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts)",
+    ])
+    .await;
+    let per_group = "CREATE STREAM per_group AS SELECT g, SUM(n) AS n FROM \
+                     (SELECT k % 4 AS g, COUNT(*) AS n FROM events GROUP BY k % 4) \
+                     GROUP BY g EMIT CHANGES";
+    let error = db
+        .execute(&format!("{per_group} ALLOW LATENESS INTERVAL '30' SECOND"))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("ALLOW LATENESS requires a TUMBLE"),
+        "{error}"
+    );
+    assert!(db.connector_manager.lock().streams().is_empty());
+    db.execute(per_group).await.unwrap();
+    assert!(db.connector_manager.lock().streams().len() > 1);
 }

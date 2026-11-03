@@ -7,7 +7,7 @@
 //! ```sql
 //! CREATE [OR REPLACE] CONTINUOUS QUERY name
 //! AS <select_query>
-//! [EMIT <strategy>]
+//! [EMIT <strategy> [ALLOW LATENESS <interval>]]
 //! ```
 
 use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
@@ -15,7 +15,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, TokenWithSpan};
 
-use super::emit_parser::parse_emit_clause;
+use super::emit_parser::parse_emit_trailer;
 use super::statements::StreamingStatement;
 use super::tokenizer::expect_custom_keyword;
 use super::ParseError;
@@ -78,18 +78,13 @@ pub fn parse_continuous_query(parser: &mut Parser) -> Result<StreamingStatement,
     let query_stmt =
         StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
 
-    // Parse optional EMIT clause from the remaining tokens
-    let emit_clause = if emit_tokens.is_empty() {
-        None
-    } else {
-        let mut emit_parser = Parser::new(&dialect).with_tokens_with_locations(emit_tokens);
-        parse_emit_clause(&mut emit_parser)?
-    };
+    let (emit_clause, late_data) = parse_emit_trailer(emit_tokens)?;
 
     Ok(StreamingStatement::CreateContinuousQuery {
         name,
         query: Box::new(query_stmt),
         emit_clause,
+        late_data,
     })
 }
 

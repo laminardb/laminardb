@@ -185,6 +185,38 @@ GROUP BY account_id, SESSION(ts, INTERVAL '2' SECOND)
 - Useful for detecting bursts/spikes in per-entity activity
 - Each entity (GROUP BY key) has independent sessions
 
+### Late rows and `ALLOW LATENESS`
+
+With `EMIT ON WINDOW CLOSE`, a window closes when the watermark reaches its end. A row that
+arrives for a closed window is dropped and counted in `window_late_dropped_total`.
+`ALLOW LATENESS` keeps each window open for longer:
+
+```sql
+CREATE STREAM per_minute AS
+SELECT symbol, tumble(ts, INTERVAL '1' MINUTE) AS window_start, COUNT(*) AS trades
+FROM trades
+GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '30' SECOND
+```
+
+- Each window is emitted once, when the watermark reaches its end plus the lateness.
+- The clause must follow `EMIT ON WINDOW CLOSE`. `CREATE` rejects it with `EMIT FINAL` (which
+  drops late rows), with any other `EMIT` mode, on a query without a window, and in cluster mode.
+  `LATE DATA TO` is rejected too.
+
+### Windows over windows
+
+A window's output watermark trails the watermark its windows close at, so a window over that
+output never receives a row after the window that row belongs to has closed:
+
+- When the upstream projects `tumble_end` or `hop_end`, its watermark trails by the allowed
+  lateness. Group the downstream window by that end column.
+- Otherwise, for example when it projects `tumble(...)`, its watermark also trails by the window
+  size.
+
+A session window's watermark is not held back, so a window over a session's start can still drop
+rows. Cluster mode rejects windows over windows.
+
 ---
 
 ## Joins
