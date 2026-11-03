@@ -397,7 +397,8 @@ fn parse_drop_materialized_view(
 
 /// Parse a CREATE STREAM statement.
 ///
-/// Syntax: `CREATE [OR REPLACE] STREAM [IF NOT EXISTS] name AS <select_query> [EMIT <strategy>]`
+/// Syntax: `CREATE [OR REPLACE] STREAM [IF NOT EXISTS] name AS <select_query>
+/// [EMIT <strategy> [ALLOW LATENESS <interval>]] [WITH (...)]`
 ///
 /// # Errors
 ///
@@ -470,13 +471,7 @@ fn parse_create_stream(
     };
     let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
-    let emit_clause = if emit_tokens.is_empty() {
-        None
-    } else {
-        let mut emit_parser =
-            sqlparser::parser::Parser::new(&stream_dialect).with_tokens_with_locations(emit_tokens);
-        emit_parser::parse_emit_clause(&mut emit_parser)?
-    };
+    let (emit_clause, late_data) = emit_parser::parse_emit_trailer(emit_tokens)?;
 
     let retention_bytes = match with_tokens {
         None => None,
@@ -492,6 +487,7 @@ fn parse_create_stream(
         name,
         query: Box::new(query_stmt),
         emit_clause,
+        late_data,
         or_replace,
         if_not_exists,
         query_sql,
@@ -821,7 +817,8 @@ fn parse_explain(
 /// ```sql
 /// CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] name
 /// AS <select_query>
-/// [EMIT <strategy>]
+/// [EMIT <strategy> [ALLOW LATENESS <interval>]]
+/// [WITH (...)]
 /// ```
 ///
 /// # Errors
@@ -902,18 +899,13 @@ fn parse_create_materialized_view(
     };
     let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
-    let emit_clause = if emit_tokens.is_empty() {
-        None
-    } else {
-        let mut emit_parser =
-            sqlparser::parser::Parser::new(&mv_dialect).with_tokens_with_locations(emit_tokens);
-        emit_parser::parse_emit_clause(&mut emit_parser)?
-    };
+    let (emit_clause, late_data) = emit_parser::parse_emit_trailer(emit_tokens)?;
 
     Ok(StreamingStatement::CreateMaterializedView {
         name,
         query: Box::new(query_stmt),
         emit_clause,
+        late_data,
         or_replace,
         if_not_exists,
         query_sql,

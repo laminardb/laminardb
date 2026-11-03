@@ -65,6 +65,8 @@ pub enum StreamingStatement {
         query: Box<StreamingStatement>,
         /// Optional output strategy.
         emit_clause: Option<EmitClause>,
+        /// `ALLOW LATENESS` after the EMIT clause.
+        late_data: Option<LateDataClause>,
     },
 
     /// `DROP SOURCE`.
@@ -124,6 +126,8 @@ pub enum StreamingStatement {
         query: Box<StreamingStatement>,
         /// Optional output strategy.
         emit_clause: Option<EmitClause>,
+        /// `ALLOW LATENESS` after the EMIT clause.
+        late_data: Option<LateDataClause>,
         /// Replace an existing view.
         or_replace: bool,
         /// Ignore an existing view.
@@ -145,6 +149,8 @@ pub enum StreamingStatement {
         query: Box<StreamingStatement>,
         /// Optional output strategy.
         emit_clause: Option<EmitClause>,
+        /// `ALLOW LATENESS` after the EMIT clause.
+        late_data: Option<LateDataClause>,
         /// Replace an existing stream.
         or_replace: bool,
         /// Ignore an existing stream.
@@ -381,6 +387,20 @@ impl LateDataClause {
     /// The configured side-output destination.
     pub fn get_side_output(&self) -> Option<&str> {
         self.side_output.as_deref()
+    }
+}
+
+impl std::fmt::Display for LateDataClause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut separator = "";
+        if let Some(lateness) = &self.allowed_lateness {
+            write!(f, "ALLOW LATENESS {lateness}")?;
+            separator = " ";
+        }
+        if let Some(side_output) = &self.side_output {
+            write!(f, "{separator}LATE DATA TO {side_output}")?;
+        }
+        Ok(())
     }
 }
 

@@ -1664,3 +1664,103 @@ async fn held_all_idle_frontier_round_trips_through_a_checkpoint() {
     restored.restore(checkpoint).unwrap();
     assert_eq!(restored.effective_frontier, idle_at(5_000));
 }
+
+/// The output frontier trails the input by the lateness for an end marker, and also by the
+/// window size for a start marker; a session's output frontier is not held.
+#[tokio::test]
+async fn output_frontier_holds_back_the_carried_window_boundary() {
+    use arrow::datatypes::TimeUnit;
+    const F: i64 = 600_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+    ]));
+    let minute = Duration::from_secs(60);
+    let late = |window: WindowOperatorConfig| WindowOperatorConfig {
+        allowed_lateness: Duration::from_secs(30),
+        ..window
+    };
+    let tumbling = WindowOperatorConfig::tumbling("ts".into(), minute);
+    let hopping = WindowOperatorConfig::sliding("ts".into(), minute, Duration::from_secs(20));
+    let start = "SELECT tumble(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS n FROM trades \
+                 GROUP BY tumble(ts, INTERVAL '1' MINUTE)";
+    let end = "SELECT tumble_end(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS n FROM trades \
+               GROUP BY tumble(ts, INTERVAL '1' MINUTE), tumble_end(ts, INTERVAL '1' MINUTE)";
+    let unprojected = "SELECT symbol, COUNT(*) AS n FROM trades \
+                       GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)";
+    let hop_end = "SELECT hop_end(ts, INTERVAL '20' SECOND, INTERVAL '1' MINUTE) AS w, \
+                   COUNT(*) AS n FROM trades \
+                   GROUP BY hop(ts, INTERVAL '20' SECOND, INTERVAL '1' MINUTE), \
+                   hop_end(ts, INTERVAL '20' SECOND, INTERVAL '1' MINUTE)";
+    let session = "SELECT symbol, session(ts, INTERVAL '1' MINUTE) AS s, COUNT(*) AS n \
+                   FROM trades GROUP BY symbol, session(ts, INTERVAL '1' MINUTE)";
+    let cases = [
+        (
+            start,
+            tumbling.clone(),
+            EmitClause::OnWindowClose,
+            F - 60_000,
+        ),
+        (
+            start,
+            late(tumbling.clone()),
+            EmitClause::OnWindowClose,
+            F - 90_000,
+        ),
+        (start, late(tumbling.clone()), EmitClause::Final, F - 60_000),
+        (end, tumbling.clone(), EmitClause::OnWindowClose, F),
+        (
+            end,
+            late(tumbling.clone()),
+            EmitClause::OnWindowClose,
+            F - 30_000,
+        ),
+        (end, late(tumbling.clone()), EmitClause::Final, F),
+        (unprojected, tumbling, EmitClause::OnWindowClose, F - 60_000),
+        (
+            hop_end,
+            late(hopping),
+            EmitClause::OnWindowClose,
+            F - 30_000,
+        ),
+        (
+            session,
+            late(WindowOperatorConfig::session("ts".into(), minute)),
+            EmitClause::OnWindowClose,
+            F,
+        ),
+    ];
+    for (sql, window, emit, expected) in cases {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let empty = MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+        ctx.register_table("trades", Arc::new(empty)).unwrap();
+        let mut operator = EowcQueryOperator::new(
+            "held",
+            sql,
+            Some(emit.clone()),
+            Some(window),
+            ctx,
+            key_groups(),
+            None,
+        );
+        let input = InputFrontier {
+            watermark: Some(F),
+            idle: true,
+        };
+        assert_eq!(operator.output_frontier(input).watermark, None);
+        operator.initialize_managed_state().await.unwrap();
+        assert_eq!(
+            operator.output_frontier(input),
+            InputFrontier {
+                watermark: Some(expected),
+                idle: true,
+            },
+            "{emit:?} {sql}"
+        );
+    }
+}

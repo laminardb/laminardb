@@ -6,7 +6,7 @@
 //! cancelled create and is dropped before the owner's name is created again.
 
 use laminar_core::catalog::CatalogObjectKind;
-use laminar_sql::parser::{EmitClause, StreamingStatement};
+use laminar_sql::parser::{EmitClause, LateDataClause, StreamingStatement};
 use sqlparser::ast::Ident;
 
 use crate::connector_manager::StreamRegistration;
@@ -70,7 +70,7 @@ impl LaminarDB {
         self.drop_stream_stages(owner).await?;
         for stage in &split.stages {
             let emit = stage.changelog.then_some(EmitClause::Changes);
-            let statement = parse_stage(&stage.name, &stage.sql, emit.as_ref())?;
+            let statement = parse_stage(&stage.name, &stage.sql, emit.as_ref(), None)?;
             let StreamingStatement::CreateStream {
                 name,
                 query,
@@ -88,6 +88,7 @@ impl LaminarDB {
                 name,
                 query,
                 emit_clause: emit_clause.as_ref(),
+                late_data: None,
                 query_sql,
                 retention_bytes: None,
             };
@@ -120,19 +121,26 @@ impl LaminarDB {
         owner: &str,
         split: &SplitQuery,
         owner_emit: Option<&EmitClause>,
+        owner_late: Option<&LateDataClause>,
     ) -> Result<Vec<StreamRegistration>, DbError> {
         let stages = split.stages.iter().map(|stage| {
             let emit = stage.changelog.then_some(EmitClause::Changes);
-            (stage.name.as_str(), stage.sql.as_str(), emit)
+            (stage.name.as_str(), stage.sql.as_str(), emit, None)
         });
-        let owner = (owner, split.query_sql.as_str(), owner_emit.cloned());
+        let owner = (
+            owner,
+            split.query_sql.as_str(),
+            owner_emit.cloned(),
+            owner_late,
+        );
         let mut candidates = Vec::with_capacity(split.stages.len() + 1);
-        for (name, sql, emit) in stages.chain(std::iter::once(owner)) {
-            let statement = parse_stage(name, sql, emit.as_ref())?;
+        for (name, sql, emit, late) in stages.chain(std::iter::once(owner)) {
+            let statement = parse_stage(name, sql, emit.as_ref(), late)?;
             let StreamingStatement::CreateStream {
                 name: object,
                 query,
                 emit_clause,
+                late_data,
                 query_sql,
                 ..
             } = &statement
@@ -140,7 +148,13 @@ impl LaminarDB {
                 return Err(stage_parse_error(name));
             };
             let planned = self
-                .plan_streaming_query(object, query, emit_clause.clone(), query_sql)
+                .plan_streaming_query(
+                    object,
+                    query,
+                    emit_clause.clone(),
+                    late_data.clone(),
+                    query_sql,
+                )
                 .await?;
             candidates.push(planned.candidate_registration(name, query_sql));
         }
@@ -180,7 +194,7 @@ pub(super) fn parse_split_owner(
     split: &SplitQuery,
     emit: Option<&EmitClause>,
 ) -> Result<(StreamingStatement, String), DbError> {
-    match parse_stage(owner, &split.query_sql, emit)? {
+    match parse_stage(owner, &split.query_sql, emit, None)? {
         StreamingStatement::CreateStream {
             query, query_sql, ..
         } => Ok((*query, query_sql)),
@@ -192,10 +206,12 @@ fn parse_stage(
     name: &str,
     sql: &str,
     emit: Option<&EmitClause>,
+    late_data: Option<&LateDataClause>,
 ) -> Result<StreamingStatement, DbError> {
     let emit = emit.map_or_else(String::new, |emit| format!(" {emit}"));
+    let late_data = late_data.map_or_else(String::new, |late_data| format!(" {late_data}"));
     let ddl = format!(
-        "CREATE STREAM {} AS {sql}{emit}",
+        "CREATE STREAM {} AS {sql}{emit}{late_data}",
         Ident::with_quote('"', name)
     );
     let mut statements = laminar_sql::parse_streaming_sql(&ddl)?;

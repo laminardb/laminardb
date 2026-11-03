@@ -31,6 +31,7 @@ use crate::error::DbError;
 
 mod accounting;
 mod checkpoint;
+mod frontier;
 
 use checkpoint::ArchivedCoreWindowVnodeCheckpoint;
 pub(crate) use checkpoint::CoreWindowVnodeCheckpoint;
@@ -1873,10 +1874,8 @@ impl CoreWindowState {
         if self.high_watermark_ms == i64::MIN {
             return false;
         }
-        let size_ms = match &self.assigner {
-            CoreWindowAssigner::Tumbling(a) => a.size_ms(),
-            CoreWindowAssigner::Hopping(a) => a.size_ms(),
-            CoreWindowAssigner::Session { .. } => return false,
+        let Some(size_ms) = self.fixed_size_ms() else {
+            return false;
         };
         window_start
             .saturating_add(size_ms)
@@ -1909,11 +1908,7 @@ impl CoreWindowState {
             return Ok(Vec::new());
         }
         self.high_watermark_ms = watermark_ms;
-        let fixed_size = match &self.assigner {
-            CoreWindowAssigner::Tumbling(assigner) => Some(assigner.size_ms()),
-            CoreWindowAssigner::Hopping(assigner) => Some(assigner.size_ms()),
-            CoreWindowAssigner::Session { .. } => None,
-        };
+        let fixed_size = self.fixed_size_ms();
         let mut batches = Vec::new();
         let mut active_index = 0;
         while active_index < self.active_vnodes.len() {
@@ -3176,10 +3171,8 @@ impl CoreWindowState {
     }
 
     fn is_window_closed_at(&self, window_start: i64, watermark_ms: i64) -> bool {
-        let size_ms = match &self.assigner {
-            CoreWindowAssigner::Tumbling(assigner) => assigner.size_ms(),
-            CoreWindowAssigner::Hopping(assigner) => assigner.size_ms(),
-            CoreWindowAssigner::Session { .. } => return false,
+        let Some(size_ms) = self.fixed_size_ms() else {
+            return false;
         };
         window_start
             .saturating_add(size_ms)

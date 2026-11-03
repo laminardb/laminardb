@@ -1,5 +1,5 @@
-//! Feature-gated access to local interval-join cycles and one-node cluster aggregate cycles for
-//! Criterion.
+//! Feature-gated access to local interval-join cycles, local EOWC window cycles, and one-node
+//! cluster aggregate cycles for Criterion.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,8 +10,10 @@ use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant}
 use laminar_core::cluster::control::LeaseDeadline;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
 use laminar_core::state::{NodeId, VnodeRegistry, DEFAULT_KEY_GROUP_COUNT};
-use laminar_sql::translator::StreamJoinConfig;
+use laminar_sql::parser::EmitClause;
+use laminar_sql::translator::{StreamJoinConfig, WindowOperatorConfig};
 
+use super::eowc_query::EowcQueryOperator;
 use super::interval_join::IntervalJoinOperator;
 use super::sql_query::{ClusterShuffleConfig, SqlQueryOperator};
 use crate::operator_graph::GraphOperator;
@@ -45,6 +47,47 @@ impl IntervalJoinBenchmark {
         watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
         self.0.process(inputs, &[watermark, watermark]).await
+    }
+}
+
+/// `EMIT ON WINDOW CLOSE` window aggregate over the default key-group topology, used only by the
+/// non-default benchmark feature.
+pub struct EowcWindowBenchmark(EowcQueryOperator);
+
+impl EowcWindowBenchmark {
+    /// Plan `sql` with `window` against tables registered in `ctx`.
+    ///
+    /// # Errors
+    /// Returns planning or window-state initialization errors.
+    pub async fn new(
+        ctx: SessionContext,
+        sql: &str,
+        window: WindowOperatorConfig,
+    ) -> Result<Self, DbError> {
+        let mut operator = EowcQueryOperator::new(
+            "eowc_window_bench",
+            sql,
+            Some(EmitClause::OnWindowClose),
+            Some(window),
+            ctx,
+            DEFAULT_KEY_GROUP_COUNT,
+            None,
+        );
+        operator.initialize_managed_state().await?;
+        Ok(Self(operator))
+    }
+
+    /// Run one cycle: pre-aggregate `batch`, apply it to each row's windows, then close and emit
+    /// every window that ends at or before `watermark`.
+    ///
+    /// # Errors
+    /// Returns pre-aggregation, accumulator, or output errors.
+    pub async fn process(
+        &mut self,
+        batch: RecordBatch,
+        watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.0.process(&[vec![batch]], &[watermark]).await
     }
 }
 

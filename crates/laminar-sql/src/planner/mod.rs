@@ -12,6 +12,7 @@ mod lookup_table;
 pub mod predicate_split;
 /// Physical optimizer rule for streaming plan validation.
 pub mod streaming_optimizer;
+mod window_config;
 
 #[allow(clippy::disallowed_types)] // cold path: query planning
 use std::collections::HashMap;
@@ -30,8 +31,8 @@ use crate::parser::join_parser::{analyze_joins, JoinAnalysis, JoinType, MultiJoi
 use crate::parser::lookup_table::LookupTableProperties;
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
-    CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom, StreamingStatement,
-    WindowFunction, WindowRewriter,
+    CreateSinkStatement, CreateSourceStatement, EmitClause, LateDataClause, SinkFrom,
+    StreamingStatement,
 };
 use crate::temporal::temporal_table_version_count;
 use crate::translator::{
@@ -285,14 +286,21 @@ impl StreamingPlanner {
                 name,
                 query,
                 emit_clause,
-                ..
+                late_data,
             }
             | StreamingStatement::CreateStream {
                 name,
                 query,
                 emit_clause,
+                late_data,
                 ..
-            } => self.plan_continuous_query(name, query, emit_clause.as_ref(), changelog_enrich),
+            } => self.plan_continuous_query(
+                name,
+                query,
+                emit_clause.as_ref(),
+                late_data.as_ref(),
+                changelog_enrich,
+            ),
             StreamingStatement::Standard(stmt) => self.plan_standard_statement(stmt, None),
             StreamingStatement::TemporalProbeQuery {
                 statement,
@@ -425,6 +433,7 @@ impl StreamingPlanner {
         name: &ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<&EmitClause>,
+        late_data: Option<&LateDataClause>,
         changelog_enrich: Option<&ChangelogEnrichAdmission>,
     ) -> Result<StreamingPlan, PlanningError> {
         // The query inside should be a standard SELECT
@@ -442,8 +451,13 @@ impl StreamingPlanner {
         };
 
         // Analyze the query for streaming features
-        let query_plan =
-            self.analyze_query(&stmt, emit_clause, changelog_enrich, temporal_probe)?;
+        let query_plan = self.analyze_query(
+            &stmt,
+            emit_clause,
+            late_data,
+            changelog_enrich,
+            temporal_probe,
+        )?;
 
         // Keep planner classification in sync with catalog rollback/drop. A windowed query is the
         // only query shape for which the planner retains classification after planning.
@@ -483,7 +497,7 @@ impl StreamingPlanner {
                     ));
                 }
                 // Check for window functions in GROUP BY
-                let window_function = Self::extract_window_from_select(select);
+                let window_function = window_config::window_function(select);
 
                 // Check for joins (multi-way)
                 let mut join_analysis = analyze_joins(select).map_err(|e| {
@@ -583,6 +597,7 @@ impl StreamingPlanner {
         &self,
         stmt: &Statement,
         emit_clause: Option<&EmitClause>,
+        late_data: Option<&LateDataClause>,
         changelog_enrich: Option<&ChangelogEnrichAdmission>,
         temporal_probe: Option<&JoinAnalysis>,
     ) -> Result<QueryAnalysis, PlanningError> {
@@ -597,20 +612,8 @@ impl StreamingPlanner {
                             .to_string(),
                     ));
                 }
-                // Extract window function
-                if let Some(window) = Self::extract_window_from_select(select) {
-                    let mut config = WindowOperatorConfig::from_window_function(&window)
-                        .map_err(|e| PlanningError::InvalidQuery(e.to_string()))?;
-
-                    // Apply emit clause if present
-                    if let Some(emit) = emit_clause {
-                        config = config
-                            .with_emit_clause(emit)
-                            .map_err(|e| PlanningError::InvalidQuery(e.to_string()))?;
-                    }
-
-                    analysis.window_config = Some(config);
-                }
+                analysis.window_config =
+                    window_config::plan_window_config(select, emit_clause, late_data)?;
 
                 // Extract join info (multi-way)
                 let join_analysis = analyze_joins(select).map_err(|e| {
@@ -635,6 +638,11 @@ impl StreamingPlanner {
             }
         }
 
+        if late_data.is_some() && analysis.window_config.is_none() {
+            return Err(PlanningError::InvalidQuery(
+                "ALLOW LATENESS requires a TUMBLE, HOP or SESSION window".to_string(),
+            ));
+        }
         validate_temporal_version_shape(stmt, recognized_temporal_versions)?;
 
         // Extract ORDER BY info
@@ -662,24 +670,6 @@ impl StreamingPlanner {
         }
 
         Ok(analysis)
-    }
-
-    /// Extracts window function from a SELECT.
-    fn extract_window_from_select(select: &sqlparser::ast::Select) -> Option<WindowFunction> {
-        // Check GROUP BY for window functions
-        use sqlparser::ast::GroupByExpr;
-        match &select.group_by {
-            GroupByExpr::Expressions(exprs, _modifiers) => {
-                for group_by_expr in exprs {
-                    if let Ok(Some(window)) = WindowRewriter::extract_window_function(group_by_expr)
-                    {
-                        return Some(window);
-                    }
-                }
-            }
-            GroupByExpr::All(_) => {}
-        }
-        None
     }
 
     /// Gets a registered source by name.

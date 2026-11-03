@@ -509,6 +509,54 @@ fn create_stream_with_retain_history_after_emit() {
 }
 
 #[test]
+fn create_stream_and_view_parse_allow_lateness_after_emit() {
+    for sql in [
+        "CREATE STREAM w AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE \
+         ALLOW LATENESS INTERVAL '30' SECOND WITH ('retain_history' = '8mb')",
+        "CREATE MATERIALIZED VIEW w AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE \
+         ALLOW LATENESS INTERVAL '30' SECOND;",
+    ] {
+        let (emit_clause, late_data) = match parse_one(sql) {
+            StreamingStatement::CreateStream {
+                emit_clause,
+                late_data,
+                ..
+            }
+            | StreamingStatement::CreateMaterializedView {
+                emit_clause,
+                late_data,
+                ..
+            } => (emit_clause, late_data),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
+        let late_data = late_data.unwrap();
+        assert_eq!(
+            late_data.to_allowed_lateness().unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(late_data.to_string(), "ALLOW LATENESS INTERVAL '30' SECOND");
+    }
+}
+
+#[test]
+fn create_stream_rejects_text_after_the_emit_clause() {
+    parse_one("CREATE STREAM s AS SELECT COUNT(*) FROM e EMIT CHANGES;");
+    for trailer in [
+        "GARBAGE",
+        "EMIT FINAL",
+        "ALLOW LATENESS INTERVAL '1' SECOND FOO",
+    ] {
+        let sql = format!("CREATE STREAM s AS SELECT COUNT(*) FROM e EMIT CHANGES {trailer}");
+        let error = parse_streaming_sql(&sql).expect_err(&sql);
+        assert!(
+            error.to_string().contains("after the EMIT clause"),
+            "{sql}: {error}"
+        );
+    }
+}
+
+#[test]
 fn create_stream_rejects_unknown_with_option() {
     let res = parse_streaming_sql("CREATE STREAM s AS SELECT * FROM e WITH ('bogus' = '1')");
     let err = res.expect_err("unknown WITH key must error");

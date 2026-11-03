@@ -10121,6 +10121,13 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                      FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
                      EMIT ON WINDOW CLOSE",
                 ),
+                (
+                    "rejected_late_eowc",
+                    "CREATE STREAM rejected_late_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '30' SECOND",
+                ),
             ] {
                 assert_cluster_rejection(&db, name, ddl).await;
             }

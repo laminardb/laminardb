@@ -263,6 +263,7 @@ fn test_create_materialized_view_statement() {
         name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("live_stats"))]),
         query: Box::new(query),
         emit_clause: Some(EmitClause::OnWindowClose),
+        late_data: None,
         or_replace: false,
         if_not_exists: true,
         query_sql: "SELECT COUNT(*) FROM events".to_string(),
