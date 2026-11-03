@@ -32,6 +32,8 @@ mod emission;
 mod global;
 mod group_map;
 mod grouping;
+#[cfg(all(feature = "cluster", any(test, feature = "benchmark-internals")))]
+pub(crate) mod keyed_partial;
 mod keys;
 #[cfg(feature = "cluster")]
 mod output_sequence;
@@ -1501,7 +1503,27 @@ impl IncrementalAggState {
 
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
         let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
-        let batch_groups = BatchGroups::try_new(&rows, input_weights)?;
+        self.apply_keyed_groups(
+            &rows,
+            input_weights,
+            |accs, indices| Self::update_concrete_accumulators(accs, &inputs, indices),
+            watermark_ms,
+            uniform_vnode,
+        )
+    }
+
+    /// Group `rows` by key, preflight the group limit, then fold each group's rows into its
+    /// accumulators with `update`.
+    fn apply_keyed_groups(
+        &mut self,
+        rows: &arrow::row::Rows,
+        input_weights: Option<&arrow::array::Int64Array>,
+        update: impl Fn(&mut [ConcreteAggregateState], &[u32]) -> Result<(), DbError>,
+        watermark_ms: i64,
+        uniform_vnode: Option<u32>,
+    ) -> Result<(), DbError> {
+        let vnode_count = self.routing_vnode_count();
+        let batch_groups = BatchGroups::try_new(rows, input_weights)?;
 
         // Reject the whole batch before touching an accumulator if its new keys would exceed the
         // cardinality bound. Partial application is not retry-safe: an existing group updated
@@ -1538,7 +1560,7 @@ impl IncrementalAggState {
             self.vnode_states.count_applied_rows(vnode, indices.len());
             if is_new {
                 let mut entry = GroupEntry::new(aggregate_templates.clone(), 0, watermark_ms);
-                Self::update_concrete_accumulators(&mut entry.accs, &inputs, indices)?;
+                update(&mut entry.accs, indices)?;
                 entry.input_weight = input_weight;
                 entry.last_updated_ms = watermark_ms;
                 entry.refresh_accumulator_usage();
@@ -1566,8 +1588,7 @@ impl IncrementalAggState {
                     .groups
                     .get_mut(key)
                     .expect("preflighted aggregate group must remain resident");
-                let update_result =
-                    Self::update_concrete_accumulators(&mut entry.accs, &inputs, indices);
+                let update_result = update(&mut entry.accs, indices);
                 if update_result.is_ok() {
                     entry.input_weight = input_weight;
                     entry.last_updated_ms = watermark_ms;
