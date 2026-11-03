@@ -30,6 +30,7 @@ mod compile;
 mod concrete;
 mod emission;
 mod global;
+mod group_map;
 mod grouping;
 mod keys;
 #[cfg(feature = "cluster")]
@@ -54,9 +55,10 @@ pub(crate) use compile::{
 pub(crate) use concrete::{AggregateInput, ConcreteAggregateState, ConcreteInputMode};
 #[cfg(feature = "cluster")]
 pub(crate) use emission::PreparedAggregateEmission;
-use grouping::{BatchGroups, EncodedKey};
+use group_map::{GroupKey, GroupMap};
+use grouping::BatchGroups;
 pub(crate) use keys::global_aggregate_key;
-use vnode_state::{AggregateVnodeSlots, AggregateVnodeState, GroupMap};
+use vnode_state::{AggregateVnodeSlots, AggregateVnodeState};
 
 /// Builds the per-window result batch for one closed window.
 /// Output schema: `[group_cols..., agg_outputs...]`.
@@ -1508,12 +1510,12 @@ impl IncrementalAggState {
         let mut incoming_new_groups = 0usize;
         for (key, indices, input_weight_delta) in batch_groups.iter() {
             let vnode = uniform_vnode.unwrap_or_else(|| {
-                Self::vnode_for_group_key(self.num_group_cols, key.data(), vnode_count)
+                Self::vnode_for_group_key(self.num_group_cols, key.bytes(), vnode_count)
             });
             let existing = self
                 .vnode_states
                 .get(vnode)
-                .and_then(|state| state.groups.get(&EncodedKey(key.data())));
+                .and_then(|state| state.groups.get(key));
             let input_weight = Self::next_group_input_weight(
                 existing.map_or(0, |entry| entry.input_weight),
                 input_weight_delta,
@@ -1541,12 +1543,10 @@ impl IncrementalAggState {
                 entry.last_updated_ms = watermark_ms;
                 entry.refresh_accumulator_usage();
 
-                let owned_key = key.owned();
-                let emit_key = emit_changelog.then(|| owned_key.clone());
                 let vnode_state = self.vnode_states.get_or_insert(vnode);
-                vnode_state.insert_new_group(owned_key, entry);
-                if let Some(emit_key) = emit_key {
-                    vnode_state.insert_emit_dirty_key(emit_key);
+                vnode_state.insert_new_group(key, entry);
+                if emit_changelog {
+                    vnode_state.insert_emit_dirty_key(key.owned());
                 }
                 self.vnode_states.increment_resident_groups();
                 Self::mark_checkpoint_vnode_dirty_parts(
@@ -1564,7 +1564,7 @@ impl IncrementalAggState {
             let (update_result, previous_usage, current_usage) = {
                 let entry = vnode_state
                     .groups
-                    .get_mut(&EncodedKey(key.data()))
+                    .get_mut(key)
                     .expect("preflighted aggregate group must remain resident");
                 let update_result =
                     Self::update_concrete_accumulators(&mut entry.accs, &inputs, indices);

@@ -1,19 +1,16 @@
 use datafusion_common::ScalarValue;
 use laminar_core::state::KeyGroupCount;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::accounting::{
     logical_collection_element_usage, logical_collection_spare_capacity_usage,
     owned_row_payload_usage, retained_changelog_vector_element_usage, topology_element_usage,
     vnode_inline_usage, AggregateStateUsage,
 };
+use super::group_map::{GroupKey, GroupMap};
 use super::{GroupEntry, IncrementalAggState};
 use crate::error::DbError;
 use crate::operator_graph::VnodeStateLoad;
-
-/// Resident groups of one vnode. A `hashbrown` map so a batch looks groups up by borrowed key
-/// (`EncodedKey`) without allocating an `OwnedRow`.
-pub(super) type GroupMap = hashbrown::HashMap<arrow::row::OwnedRow, GroupEntry, FxBuildHasher>;
 
 /// Complete mutable working set owned by one aggregate vnode.
 ///
@@ -127,11 +124,10 @@ impl AggregateVnodeState {
         self.usage = self.usage.saturating_add(usage);
     }
 
-    pub(super) fn insert_new_group(&mut self, key: arrow::row::OwnedRow, entry: GroupEntry) {
+    pub(super) fn insert_new_group(&mut self, key: GroupKey<'_>, entry: GroupEntry) {
         let previous_spare = self.collection_spare_usage();
-        let usage = Self::group_usage(&key, &entry);
-        let previous = self.groups.insert(key, entry);
-        debug_assert!(previous.is_none());
+        let (key, entry) = self.groups.insert_new(key, entry);
+        let usage = Self::group_usage(key, entry);
         self.add_usage(usage);
         self.reconcile_collection_spare_usage(previous_spare);
     }

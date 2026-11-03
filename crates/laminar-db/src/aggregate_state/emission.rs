@@ -17,7 +17,7 @@ use rustc_hash::FxHashSet;
 use super::apply_compiled_having;
 #[cfg(feature = "cluster")]
 use super::vnode_state::AggregateVnodeState;
-use super::{build_weighted_batch, ConcreteAggregateState, DbError, IncrementalAggState};
+use super::{build_weighted_batch, ConcreteAggregateState, DbError, GroupKey, IncrementalAggState};
 #[cfg(feature = "cluster")]
 use crate::subscription::PartitionedOutputBatch;
 
@@ -166,7 +166,7 @@ fn evaluate_changelog_vnode(
     let mut chunk_start = 0usize;
 
     for key in keys {
-        let Some(entry) = state.groups.get_mut(key) else {
+        let Some(entry) = state.groups.get_mut(GroupKey::new(key.row())) else {
             continue;
         };
         let previous_len = changes.len();
@@ -480,7 +480,10 @@ impl IncrementalAggState {
         let mut deletions = Vec::new();
         let mut chunk_start = 0usize;
         for key in keys {
-            let entry = state.groups.get_mut(&key).expect("sorted aggregate key");
+            let entry = state
+                .groups
+                .get_mut(GroupKey::new(key.row()))
+                .expect("sorted aggregate key");
             if self.num_group_cols != 0 && entry.input_weight == 0 {
                 deletions.push(key);
                 continue;
@@ -630,7 +633,7 @@ impl IncrementalAggState {
         debug_assert!(self.vnode_states.iter().all(|(_, state)| state
             .last_emitted
             .keys()
-            .all(|key| state.groups.contains_key(key))));
+            .all(|key| state.groups.get(GroupKey::new(key.row())).is_some())));
     }
 
     /// Restore dirty-key ownership when publication fails before bookkeeping commit.
@@ -723,7 +726,7 @@ impl IncrementalAggState {
                     .get_mut(*vnode)
                     .expect("dirty aggregate vnode must remain resident during emission");
                 for key in dirty {
-                    let Some(entry) = state.groups.get_mut(key) else {
+                    let Some(entry) = state.groups.get_mut(GroupKey::new(key.row())) else {
                         continue;
                     };
                     if entry.input_weight == 0 && self.num_group_cols > 0 {
