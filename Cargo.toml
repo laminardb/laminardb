@@ -66,7 +66,7 @@ mimalloc = { version = "0.1", default-features = false }  # mimalloc for Windows
 
 # Performance-critical
 rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
-hashbrown = "0.16"  # DataFusion's generation; `Equivalent` lookups by borrowed keys
+hashbrown = "0.16"  # DataFusion's generation; `HashTable` lookups by precomputed key hashes
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }  # Unique IDs

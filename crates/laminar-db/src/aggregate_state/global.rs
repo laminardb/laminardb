@@ -14,7 +14,7 @@ use datafusion_common::ScalarValue;
 
 use super::IncrementalAggState;
 use super::{
-    global_aggregate_key, AggFuncSpec, AggregateInput, ConcreteAggregateState, GroupEntry,
+    global_aggregate_key, AggFuncSpec, AggregateInput, ConcreteAggregateState, GroupEntry, GroupKey,
 };
 use crate::error::DbError;
 
@@ -140,10 +140,11 @@ impl IncrementalAggState {
         input: &GlobalInput<'_>,
     ) -> Result<(), DbError> {
         let empty_key = global_aggregate_key();
+        let key = GroupKey::new(empty_key.row());
         let (current_input_weight, is_new) = self
             .vnode_states
             .get(0)
-            .and_then(|state| state.groups.get(&empty_key))
+            .and_then(|state| state.groups.get(key))
             .map_or((0, true), |entry| (entry.input_weight, false));
         let input_weight = Self::next_group_input_weight(current_input_weight, input_weight_delta)?;
         if is_new {
@@ -154,9 +155,9 @@ impl IncrementalAggState {
             entry.refresh_accumulator_usage();
 
             let vnode_state = self.vnode_states.get_or_insert(0);
-            vnode_state.insert_new_group(empty_key.clone(), entry);
+            vnode_state.insert_new_group(key, entry);
             if self.emit_changelog {
-                vnode_state.insert_emit_dirty_key(empty_key);
+                vnode_state.insert_emit_dirty_key(key.owned());
             }
             self.vnode_states.increment_resident_groups();
             self.mark_checkpoint_vnode_dirty(0);
@@ -170,7 +171,7 @@ impl IncrementalAggState {
         let (update_result, previous_usage, current_usage) = {
             let entry = vnode_state
                 .groups
-                .get_mut(&empty_key)
+                .get_mut(key)
                 .expect("global aggregate group must remain resident");
             let update_result =
                 apply_global_input(&mut entry.accs, &self.agg_specs, self.weight_col_idx, input);
