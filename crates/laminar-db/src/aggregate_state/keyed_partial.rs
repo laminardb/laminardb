@@ -103,7 +103,10 @@ impl IncrementalAggState {
         let groups = BatchGroups::try_new(&keys, input_weights)?;
         let mut first_rows = Vec::with_capacity(groups.len());
         let mut group_weights = Vec::with_capacity(groups.len());
-        let mut states = vec![Vec::with_capacity(groups.len()); layout.arities.iter().sum()];
+        let mut states: Vec<Vec<ScalarValue>> =
+            std::iter::repeat_with(|| Vec::with_capacity(groups.len()))
+                .take(layout.arities.iter().sum())
+                .collect();
         for (_, rows, weight) in groups.iter() {
             first_rows.push(rows[0]);
             group_weights.push(weight);
