@@ -407,6 +407,46 @@ pub(crate) fn window_output_column(logical: &LogicalPlan) -> Option<usize> {
     }
 }
 
+/// The window boundary a windowed aggregate's output carries as its event time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowBoundary {
+    /// The start marker, or no boundary column: a later output row may hold any time inside a
+    /// window that is still open.
+    Start,
+    /// A `tumble_end` or `hop_end` marker projected as a bare column.
+    End,
+}
+
+pub(crate) fn carried_window_boundary(logical: &LogicalPlan) -> WindowBoundary {
+    let Some(aggregate) = crate::aggregate_state::find_aggregate(logical) else {
+        return WindowBoundary::Start;
+    };
+    let Ok(projection) = crate::aggregate_state::find_post_aggregate_projection(logical) else {
+        return WindowBoundary::Start;
+    };
+    let projects_end = aggregate
+        .group_exprs
+        .iter()
+        .enumerate()
+        .any(|(group, expr)| {
+            is_window_end(expr)
+                && projection
+                    .is_none_or(|projection| forwarding_output(projection, group).is_some())
+        });
+    if projects_end {
+        WindowBoundary::End
+    } else {
+        WindowBoundary::Start
+    }
+}
+
+fn is_window_end(expr: &Expr) -> bool {
+    matches!(
+        unaliased(expr),
+        Expr::ScalarFunction(function) if matches!(function.func.name(), "tumble_end" | "hop_end")
+    )
+}
+
 /// The output columns that forward each group unchanged, or `None` when any group is not
 /// projected as a bare column.
 fn aggregate_output_key(logical: &LogicalPlan, groups: &[usize]) -> Option<PartitionKey> {

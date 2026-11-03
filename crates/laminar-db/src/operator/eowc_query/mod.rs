@@ -2,6 +2,7 @@
 
 #[cfg(feature = "cluster")]
 mod cluster_frontiers;
+mod output_frontier;
 mod state_accounting;
 #[cfg(feature = "cluster")]
 mod transition_validation;
@@ -547,6 +548,8 @@ pub(crate) struct EowcQueryOperator {
     capability: OperatorCapability,
     state: Option<Box<CoreWindowState>>,
     whole_restore_applied: bool,
+    /// How far the output frontier trails the close frontier; `None` until initialized.
+    output_hold_ms: Option<i64>,
     max_managed_state_bytes: usize,
     prom: Option<Arc<EngineMetrics>>,
     #[cfg(feature = "cluster")]
@@ -606,6 +609,7 @@ impl EowcQueryOperator {
             capability: OperatorCapability::managed_core_window(),
             state: None,
             whole_restore_applied: false,
+            output_hold_ms: None,
             max_managed_state_bytes: crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
             prom,
             #[cfg(feature = "cluster")]
@@ -693,6 +697,7 @@ impl EowcQueryOperator {
         }
 
         window.attach_metrics(self.prom.clone());
+        self.output_hold_ms = Some(Self::plan_output_hold_ms(&self.ctx, &self.sql, &window).await?);
         tracing::info!(
             query = %self.op_name,
             window_type = ?cfg.window_type,
@@ -3100,26 +3105,16 @@ impl GraphOperator for EowcQueryOperator {
         self.cluster_scope.is_some()
     }
 
-    #[cfg(feature = "cluster")]
     fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
-        if self.cluster_scope.is_none() {
-            return input;
-        }
-        let mut output = self.effective_frontier;
-        if self.pending_cluster_input.is_some() || self.queued_remote_events != 0 {
-            output.idle = false;
-        }
-        output
+        #[cfg(feature = "cluster")]
+        let input = self.merged_output_frontier().unwrap_or(input);
+        self.held_output_frontier(input)
     }
 
     #[cfg(feature = "cluster")]
     fn restored_output_frontier(&self) -> Option<InputFrontier> {
-        self.cluster_scope.as_ref()?;
-        let mut frontier = self.effective_frontier;
-        if self.pending_cluster_input.is_some() || self.queued_remote_events != 0 {
-            frontier.idle = false;
-        }
-        Some(frontier)
+        self.merged_output_frontier()
+            .map(|frontier| self.held_output_frontier(frontier))
     }
 
     #[cfg(feature = "cluster")]

@@ -142,7 +142,9 @@ pub use aggregate_state::benchmark::AggregateBenchmark;
 
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]
-pub use operator::benchmark::{ClusterAggregateBenchmark, IntervalJoinBenchmark};
+pub use operator::benchmark::{
+    ClusterAggregateBenchmark, EowcWindowBenchmark, IntervalJoinBenchmark,
+};
 
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]

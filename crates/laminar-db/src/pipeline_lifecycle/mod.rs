@@ -390,3 +390,6 @@ mod reference_table_recovery_tests;
 
 #[cfg(test)]
 mod supervisor_tests;
+
+#[cfg(test)]
+mod window_frontier_tests;

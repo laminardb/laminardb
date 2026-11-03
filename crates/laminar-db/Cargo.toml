@@ -229,6 +229,11 @@ name = "interval_join_bench"
 harness = false
 required-features = ["benchmark-internals"]
 
+[[bench]]
+name = "eowc_window_bench"
+harness = false
+required-features = ["benchmark-internals"]
+
 [[example]]
 name = "fix_local"
 path = "examples/fix_local.rs"
