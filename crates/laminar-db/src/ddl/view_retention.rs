@@ -93,10 +93,11 @@ impl LaminarDB {
 
     /// The view's event-time column, and how much further than the interval it trails the view's
     /// frontier:
-    /// - a window view's first forwarded marker. A `TUMBLE` or `HOP` frontier is held back for the
-    ///   boundary the stream carries, so a start column trails a frontier held for the end by the
-    ///   window size. A session frontier is not held, so a session start trails it by the gap and
-    ///   the allowed lateness.
+    /// - a window view's first forwarded marker. A `TUMBLE` or `HOP` window that closes on
+    ///   `EMIT ON WINDOW CLOSE` or `EMIT FINAL` holds its frontier back for the boundary the stream
+    ///   carries, and any other window passes its input frontier on, so a start column trails by
+    ///   the window size unless the frontier is held for the start. A session frontier is not
+    ///   held, so a session start trails it by the gap and the allowed lateness.
     /// - otherwise the stream's event-time column.
     async fn append_view_event_time(
         &self,
@@ -110,11 +111,12 @@ impl LaminarDB {
                 .sql(&candidate.query_sql)
                 .await?
                 .into_unoptimized_plan();
-            let carried = crate::exchange_plan::carried_window_boundary(&plan);
+            let held = crate::exchange_plan::closes_windows(candidate.emit_clause.as_ref())
+                .then(|| crate::exchange_plan::carried_window_boundary(&plan));
             crate::exchange_plan::window_retention_column(&plan).map(|(index, boundary)| {
                 (
                     plan.schema().field(index).name().clone(),
-                    window_trail(window, boundary, carried),
+                    window_trail(window, boundary, held),
                 )
             })
         } else {
@@ -133,23 +135,24 @@ impl LaminarDB {
     }
 }
 
+/// `held` is the boundary the window holds its frontier back for, or `None` when it passes its
+/// input frontier on.
 fn window_trail(
     window: &WindowOperatorConfig,
     column: WindowBoundary,
-    carried: WindowBoundary,
+    held: Option<WindowBoundary>,
 ) -> Duration {
     match window.window_type {
         WindowType::Session => window
             .gap
             .unwrap_or_default()
             .saturating_add(window.allowed_lateness),
-        WindowType::Tumbling | WindowType::Sliding | WindowType::Cumulate => {
-            match (column, carried) {
-                (WindowBoundary::Start, WindowBoundary::End) => window.size,
-                (WindowBoundary::Start | WindowBoundary::End, WindowBoundary::Start)
-                | (WindowBoundary::End, WindowBoundary::End) => Duration::ZERO,
+        WindowType::Tumbling | WindowType::Sliding | WindowType::Cumulate => match (column, held) {
+            (WindowBoundary::Start, None | Some(WindowBoundary::End)) => window.size,
+            (WindowBoundary::Start, Some(WindowBoundary::Start)) | (WindowBoundary::End, _) => {
+                Duration::ZERO
             }
-        }
+        },
     }
 }
 
@@ -159,8 +162,9 @@ mod tests {
     use crate::mv_store::{MvStorageMode, ViewRetention};
 
     /// A window view keeps a window while its end is within the interval of the frontier the window
-    /// closes at, less the allowed lateness, on its first forwarded marker column. A session keeps
-    /// a session while its start is within the interval plus the gap and the lateness.
+    /// closes at, less the allowed lateness, on its first forwarded marker column, whether or not
+    /// its `EMIT` clause holds its frontier back. A session keeps a session while its start is
+    /// within the interval plus the gap and the lateness.
     #[tokio::test]
     async fn window_views_keep_an_interval_on_their_first_marker() {
         const TUMBLE: &str = "tumble(ts, INTERVAL '10' SECOND)";
@@ -211,6 +215,22 @@ mod tests {
                 format!("{HOP} AS w"),
                 HOP.to_owned(),
                 "EMIT FINAL",
+                0,
+                60_000,
+            ),
+            (
+                "unheld_start",
+                format!("{TUMBLE} AS w"),
+                TUMBLE.to_owned(),
+                "",
+                0,
+                70_000,
+            ),
+            (
+                "unheld_end",
+                format!("{TUMBLE_END} AS we"),
+                format!("{TUMBLE}, {TUMBLE_END}"),
+                "",
                 0,
                 60_000,
             ),

@@ -264,7 +264,7 @@ fn stateless_output(
     )
 }
 
-const fn closes_windows(emit: Option<&EmitClause>) -> bool {
+pub(crate) const fn closes_windows(emit: Option<&EmitClause>) -> bool {
     matches!(emit, Some(EmitClause::OnWindowClose | EmitClause::Final))
 }
 

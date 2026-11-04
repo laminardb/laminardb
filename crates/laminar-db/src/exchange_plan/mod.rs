@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub(crate) use derivation::{carried_window_boundary, derive, window_retention_column};
+pub(crate) use derivation::{
+    carried_window_boundary, closes_windows, derive, window_retention_column,
+};
 pub(crate) use event_time::{EventTime, EventTimeOrigin, JoinSide, WindowBoundary};
 pub(crate) use properties::{
     ChangelogKind, Distribution, InputPort, KeyColumn, PartitionKey, PortExchange,
