@@ -12,8 +12,9 @@
   column.
 - An interval join can read another interval join's stream on that stream's event-time column,
   in every mode.
-- Cluster mode admits a window over an interval join stream and a window over a closed window
-  stream, on the event-time column the input carries.
+- Cluster mode admits a window over a closed window stream, on the event-time column the input
+  carries. A window over an interval join stream stays embedded and single-node only: across a
+  fault, a cluster window fed by a join stage can close a window before the join emits its rows.
 - An append-only view over an interval join keeps an interval on the join's event-time column, so
   it no longer has to declare `retention = '<n> rows'`.
 
