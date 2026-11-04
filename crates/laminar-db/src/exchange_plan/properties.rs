@@ -1,9 +1,10 @@
 //! Stream distribution, changelog kind, and the exchange each consumer input port uses.
 
 use std::fmt;
-use std::time::Duration;
 
 use arrow::datatypes::DataType;
+
+use super::EventTime;
 
 /// The only vnode that global aggregate state and output occupy; subscription certificates pin
 /// global aggregate output to partition zero.
@@ -38,14 +39,6 @@ pub(crate) enum ChangelogKind {
     Weighted,
     /// An aggregate re-emits touched groups without retracting the values they replace.
     RunningState,
-}
-
-/// The column whose source watermark orders a stream's rows: a source's declared event-time
-/// column, forwarded unchanged through stateless projections.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct EventTime {
-    pub(crate) column: String,
-    pub(crate) max_out_of_orderness: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

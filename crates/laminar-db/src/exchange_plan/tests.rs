@@ -145,7 +145,10 @@ async fn global_aggregate_gathers_to_the_global_vnode() {
                 "exchange.input.events",
                 "gather to vnode 0 from arbitrary, append-only, event time ts"
             ),
-            ("exchange.output", "singleton(vnode 0), append-only"),
+            (
+                "exchange.output",
+                "singleton(vnode 0), append-only, event time w"
+            ),
         ])
     );
 }
@@ -180,7 +183,10 @@ async fn computed_group_key_and_window_markers() {
                 "exchange.input.events",
                 "repartition on (k Int64) from arbitrary, append-only, event time ts"
             ),
-            ("exchange.output", "hash(k Int64), append-only"),
+            (
+                "exchange.output",
+                "hash(k Int64), append-only, event time w"
+            ),
         ])
     );
 }
@@ -268,6 +274,105 @@ async fn interval_join_output_is_hashed_on_the_side_every_row_carries() {
             rows.last(),
             Some(&("exchange.output".to_string(), output.to_string())),
             "{join} JOIN {projection}"
+        );
+    }
+}
+
+/// The output event time of each interval join kind: the time column of a side every row carries,
+/// left first, when it is projected unchanged.
+#[tokio::test]
+async fn interval_join_output_carries_the_time_of_a_side_every_row_carries() {
+    let db = db(&[ORDERS, PAYMENTS]).await;
+    for (join, projection, output) in [
+        (
+            "INNER",
+            "o.k AS k, o.ts AS ots, p.ts AS pts",
+            "hash(k Int64), append-only, event time ots",
+        ),
+        (
+            "INNER",
+            "o.k AS k, p.ts AS pts",
+            "hash(k Int64), append-only, event time pts",
+        ),
+        (
+            "LEFT",
+            "o.k AS k, p.ts AS pts",
+            "hash(k Int64), append-only",
+        ),
+        (
+            "RIGHT",
+            "p.k AS k, o.ts AS ots, p.ts AS pts",
+            "hash(k Int64), append-only, event time pts",
+        ),
+        (
+            "LEFT SEMI",
+            "o.k AS k, o.ts AS ots",
+            "hash(k Int64), append-only, event time ots",
+        ),
+        ("FULL", "o.ts AS ots, p.ts AS pts", "arbitrary, append-only"),
+    ] {
+        let rows = exchange(
+            &db,
+            &format!(
+                "CREATE STREAM joined AS SELECT {projection} FROM orders o \
+                 {join} JOIN payments p {JOIN_BOUND}"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows.last(),
+            Some(&("exchange.output".to_string(), output.to_string())),
+            "{join} JOIN {projection}"
+        );
+    }
+}
+
+/// A closed `TUMBLE` or `HOP` window carries its projected end marker, otherwise its start
+/// marker; a session window and an `EMIT CHANGES` window carry none.
+#[tokio::test]
+async fn closed_windows_carry_their_boundary_marker() {
+    let db = db(&[EVENTS]).await;
+    let tumble = "tumble(ts, INTERVAL '100' MILLISECOND)";
+    let tumble_end = "tumble_end(ts, INTERVAL '100' MILLISECOND)";
+    let session = "session(ts, INTERVAL '5' MILLISECOND)";
+    for (projection, groups, emit, output) in [
+        (
+            format!("{tumble} AS ws, {tumble_end} AS we"),
+            format!("{tumble}, {tumble_end}"),
+            "EMIT ON WINDOW CLOSE",
+            "singleton(vnode 0), append-only, event time we",
+        ),
+        (
+            format!("{tumble} AS ws"),
+            tumble.to_string(),
+            "EMIT FINAL",
+            "singleton(vnode 0), append-only, event time ws",
+        ),
+        (
+            format!("{session} AS s"),
+            session.to_string(),
+            "EMIT ON WINDOW CLOSE",
+            "singleton(vnode 0), append-only",
+        ),
+        (
+            format!("{tumble} AS ws"),
+            tumble.to_string(),
+            "EMIT CHANGES",
+            "hash(ws Timestamp(µs)), weighted changelog",
+        ),
+    ] {
+        let rows = exchange(
+            &db,
+            &format!(
+                "CREATE STREAM windows AS SELECT {projection}, COUNT(*) AS n FROM events \
+                 GROUP BY {groups} {emit}"
+            ),
+        )
+        .await;
+        assert_eq!(
+            rows.last(),
+            Some(&("exchange.output".to_string(), output.to_string())),
+            "{projection} {emit}"
         );
     }
 }

@@ -6,14 +6,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use arrow::datatypes::{Field, Schema};
 use datafusion::common::Column;
 use datafusion::prelude::SessionContext;
-use datafusion_expr::{Expr, LogicalPlan, Projection};
+use datafusion_expr::{Expr, Join, LogicalPlan, Projection};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::event_time::{interval_join_event_time, window_event_time};
 use super::{
-    ChangelogKind, Distribution, EventTime, ExchangePlan, ExchangePlanError, InputPort, KeyColumn,
-    PartitionKey, PortExchange, StreamPlan, StreamProperties, GLOBAL_VNODE,
+    ChangelogKind, Distribution, EventTime, ExchangePlan, ExchangePlanError, InputPort, JoinSide,
+    KeyColumn, PartitionKey, PortExchange, StreamPlan, StreamProperties, WindowBoundary,
+    GLOBAL_VNODE,
 };
 use crate::connector_manager::StreamRegistration;
 use crate::sql_analysis::ProjectionFilterInfo;
@@ -111,32 +113,9 @@ async fn plan_stream(
     let enrich = !changelog.is_empty()
         && crate::sql_analysis::detect_changelog_enrich_query(sql, changelog, reference_tables)
             .is_some();
-    let join = if let Some(config) = temporal_join(registration) {
-        Some((
-            join_ports(
-                ctx,
-                (&config.left_table, &config.left_key_columns),
-                (&config.right_table, &config.right_key_columns),
-            )
-            .await,
-            Distribution::Arbitrary,
-        ))
-    } else if let Some(config) = interval_join(registration, enrich) {
-        Some((
-            join_ports(
-                ctx,
-                (&config.left_table, &config.left_keys),
-                (&config.right_table, &config.right_keys),
-            )
-            .await,
-            logical.map_or(Distribution::Arbitrary, |logical| {
-                interval_join_output(logical, &config)
-            }),
-        ))
-    } else {
-        None
-    };
-    if let Some((inputs, distribution)) = join {
+    if let Some((inputs, distribution, event_time)) =
+        join_plan(ctx, registration, logical, enrich, changelog, upstream).await
+    {
         return Ok(StreamPlan {
             inputs: inputs.map_err(unplannable)?,
             output: StreamProperties {
@@ -146,7 +125,7 @@ async fn plan_stream(
                 } else {
                     ChangelogKind::AppendOnly
                 },
-                event_time: None,
+                event_time,
             },
         });
     }
@@ -172,13 +151,21 @@ async fn plan_stream(
         };
         // An EOWC aggregate without a window runs on its local unmanaged path.
         if !closes_windows || registration.window_config.is_some() {
+            let input_properties = input_properties(input);
+            let event_time = registration
+                .window_config
+                .as_ref()
+                .filter(|_| closes_windows)
+                .and_then(|window| {
+                    window_event_time(logical, window, input_properties.event_time.as_ref())
+                });
             return Ok(keyed_aggregate(
                 logical,
                 &aggregate.group_exprs,
                 &aggregate.schema,
-                (input, &input_properties(input).distribution),
+                (input, &input_properties.distribution),
                 closes_windows,
-                changelog,
+                (changelog, event_time),
             ));
         }
         return Ok(forwarding(
@@ -207,6 +194,57 @@ async fn plan_stream(
         _ => (Distribution::Arbitrary, None),
     };
     Ok(forwarding(&inputs, forwarded.0, changelog, forwarded.1))
+}
+
+/// A join's input ports, output distribution and event time: a planner-bound temporal join, or an
+/// interval join the graph detects from SQL.
+async fn join_plan(
+    ctx: &SessionContext,
+    registration: &StreamRegistration,
+    logical: Option<&LogicalPlan>,
+    enrich: bool,
+    changelog: &FxHashSet<String>,
+    upstream: &ExchangePlan,
+) -> Option<(
+    Result<BTreeMap<InputPort, PortExchange>, String>,
+    Distribution,
+    Option<EventTime>,
+)> {
+    if let Some(config) = temporal_join(registration) {
+        Some((
+            join_ports(
+                ctx,
+                (&config.left_table, &config.left_key_columns),
+                (&config.right_table, &config.right_key_columns),
+            )
+            .await,
+            Distribution::Arbitrary,
+            None,
+        ))
+    } else if let Some(config) = interval_join(registration, enrich) {
+        let side_event_time =
+            |input: &str| upstream.upstream_properties(input, changelog).event_time;
+        let (left, right) = (
+            side_event_time(&config.left_table),
+            side_event_time(&config.right_table),
+        );
+        Some((
+            join_ports(
+                ctx,
+                (&config.left_table, &config.left_keys),
+                (&config.right_table, &config.right_keys),
+            )
+            .await,
+            logical.map_or(Distribution::Arbitrary, |logical| {
+                interval_join_output(logical, &config)
+            }),
+            logical.and_then(|logical| {
+                interval_join_event_time(logical, &config, (left.as_ref(), right.as_ref()))
+            }),
+        ))
+    } else {
+        None
+    }
 }
 
 /// What a stateless projection keeps of its input: the hash key and the event-time column, when
@@ -325,7 +363,7 @@ fn keyed_aggregate(
     schema: &Schema,
     (input, upstream): (&str, &Distribution),
     window: bool,
-    changelog: ChangelogKind,
+    (changelog, event_time): (ChangelogKind, Option<EventTime>),
 ) -> StreamPlan {
     let groups: Vec<usize> = (0..group_exprs.len())
         .filter(|&group| !(window && is_window_marker(&group_exprs[group])))
@@ -363,7 +401,7 @@ fn keyed_aggregate(
         output: StreamProperties {
             distribution,
             changelog,
-            event_time: None,
+            event_time,
         },
     }
 }
@@ -407,44 +445,39 @@ pub(crate) fn window_output_column(logical: &LogicalPlan) -> Option<usize> {
     }
 }
 
-/// The window boundary a windowed aggregate's output carries as its event time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WindowBoundary {
-    /// The start marker, or no boundary column: a later output row may hold any time inside a
-    /// window that is still open.
-    Start,
-    /// A `tumble_end` or `hop_end` marker projected as a bare column.
-    End,
-}
-
 pub(crate) fn carried_window_boundary(logical: &LogicalPlan) -> WindowBoundary {
-    let Some(aggregate) = crate::aggregate_state::find_aggregate(logical) else {
-        return WindowBoundary::Start;
-    };
-    let Ok(projection) = crate::aggregate_state::find_post_aggregate_projection(logical) else {
-        return WindowBoundary::Start;
-    };
-    let projects_end = aggregate
-        .group_exprs
-        .iter()
-        .enumerate()
-        .any(|(group, expr)| {
-            is_window_end(expr)
-                && projection
-                    .is_none_or(|projection| forwarding_output(projection, group).is_some())
-        });
-    if projects_end {
-        WindowBoundary::End
-    } else {
-        WindowBoundary::Start
-    }
+    window_boundary_column(logical).map_or(WindowBoundary::Start, |(_, boundary)| boundary)
 }
 
-fn is_window_end(expr: &Expr) -> bool {
-    matches!(
-        unaliased(expr),
-        Expr::ScalarFunction(function) if matches!(function.func.name(), "tumble_end" | "hop_end")
-    )
+/// The output column of the first window end marker forwarded as a bare column, otherwise of the
+/// first start marker.
+pub(super) fn window_boundary_column(logical: &LogicalPlan) -> Option<(usize, WindowBoundary)> {
+    let aggregate = crate::aggregate_state::find_aggregate(logical)?;
+    let projection = crate::aggregate_state::find_post_aggregate_projection(logical).ok()?;
+    let forwarded = |boundary: WindowBoundary| {
+        aggregate
+            .group_exprs
+            .iter()
+            .enumerate()
+            .filter(|(_, expr)| window_boundary(expr) == Some(boundary))
+            .find_map(|(group, _)| match projection {
+                None => Some(group),
+                Some(projection) => forwarding_output(projection, group),
+            })
+            .map(|index| (index, boundary))
+    };
+    forwarded(WindowBoundary::End).or_else(|| forwarded(WindowBoundary::Start))
+}
+
+fn window_boundary(expr: &Expr) -> Option<WindowBoundary> {
+    let Expr::ScalarFunction(function) = unaliased(expr) else {
+        return None;
+    };
+    match function.func.name() {
+        "tumble_end" | "hop_end" => Some(WindowBoundary::End),
+        "tumble" | "hop" => Some(WindowBoundary::Start),
+        _ => None,
+    }
 }
 
 /// The output columns that forward each group unchanged, or `None` when any group is not
@@ -468,51 +501,64 @@ fn aggregate_output_key(logical: &LogicalPlan, groups: &[usize]) -> Option<Parti
 /// either side for inner matches, the preserved side for outer, semi and anti joins. A full outer
 /// join's unmatched rows carry only one side, so its output has no key.
 fn interval_join_output(logical: &LogicalPlan, config: &StreamJoinConfig) -> Distribution {
-    use laminar_sql::parser::join_parser::JoinType;
-
-    let left = (true, config.left_keys.as_slice());
-    let right = (false, config.right_keys.as_slice());
-    let sides: &[(bool, &[String])] = match config.join_type {
-        JoinType::Inner => &[left, right],
-        JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => &[left],
-        JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => &[right],
-        JoinType::Full => &[],
-    };
-    let LogicalPlan::Projection(projection) = logical else {
+    let Some((projection, join)) = interval_join_plan(logical) else {
         return Distribution::Arbitrary;
     };
-    let mut below = projection.input.as_ref();
-    while let LogicalPlan::Filter(filter) = below {
-        below = filter.input.as_ref();
-    }
-    let LogicalPlan::Join(join) = below else {
-        return Distribution::Arbitrary;
-    };
-    sides
+    JoinSide::present_on_every_row(config.join_type)
         .iter()
-        .find_map(|&(is_left, keys)| {
-            let side = if is_left { &join.left } else { &join.right };
+        .find_map(|&side| {
+            let keys = match side {
+                JoinSide::Left => &config.left_keys,
+                JoinSide::Right => &config.right_keys,
+            };
             keys.iter()
                 .map(|name| {
-                    let (qualifier, _) = side
-                        .schema()
-                        .qualified_field_with_unqualified_name(name)
-                        .ok()?;
-                    let input = projection
-                        .input
-                        .schema()
-                        .index_of_column(&Column::new(qualifier.cloned(), name))
-                        .ok()?;
-                    Some(output_column(
-                        logical,
-                        forwarding_output(projection, input)?,
-                    ))
+                    let index = projected_join_column(projection, join, side, name)?;
+                    Some(output_column(logical, index))
                 })
                 .collect::<Option<Vec<_>>>()
         })
         .map_or(Distribution::Arbitrary, |key| {
             Distribution::Hash(PartitionKey(key))
         })
+}
+
+/// The projection over an interval join statement's (filtered) join.
+pub(super) fn interval_join_plan(logical: &LogicalPlan) -> Option<(&Projection, &Join)> {
+    let LogicalPlan::Projection(projection) = logical else {
+        return None;
+    };
+    let mut below = projection.input.as_ref();
+    while let LogicalPlan::Filter(filter) = below {
+        below = filter.input.as_ref();
+    }
+    let LogicalPlan::Join(join) = below else {
+        return None;
+    };
+    Some((projection, join))
+}
+
+/// The output position that forwards `side`'s column `name` unchanged.
+pub(super) fn projected_join_column(
+    projection: &Projection,
+    join: &Join,
+    side: JoinSide,
+    name: &str,
+) -> Option<usize> {
+    let input = match side {
+        JoinSide::Left => &join.left,
+        JoinSide::Right => &join.right,
+    };
+    let (qualifier, _) = input
+        .schema()
+        .qualified_field_with_unqualified_name(name)
+        .ok()?;
+    let column = projection
+        .input
+        .schema()
+        .index_of_column(&Column::new(qualifier.cloned(), name))
+        .ok()?;
+    forwarding_output(projection, column)
 }
 
 /// The output position that forwards input column `input` of `projection` unchanged.

@@ -17,6 +17,7 @@ mod catalog;
 mod cluster_checks;
 mod control;
 mod drop;
+mod event_time_admission;
 pub(crate) mod lookup_schema;
 mod materialized_view;
 mod running_state_inputs;

@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- Event time flows through interval joins and closed windows, in every mode. An interval join's
+  output carries the time column of a side every output row has, when it projects that column
+  unchanged: the left one for `INNER` (else the right), the left one for `LEFT`, `LEFT SEMI` and
+  `LEFT ANTI`, the right one for the `RIGHT` kinds, and none for `FULL`. A closed `TUMBLE` or
+  `HOP` window carries its projected end marker, or else its start marker. `EXPLAIN` shows the
+  column.
+- An interval join can read another interval join's stream on that stream's event-time column,
+  in every mode.
+- Cluster mode admits a window over an interval join stream and a window over a closed window
+  stream, on the event-time column the input carries.
+- An append-only view over an interval join keeps an interval on the join's event-time column, so
+  it no longer has to declare `retention = '<n> rows'`.
+
+### Changed
+
+- `CREATE` rejects a window over a window stream that groups by any column other than the one the
+  upstream carries (for example its start when it projects its end), and a window over a session
+  window or over a window that projects no boundary. Such a window could close before the
+  upstream emitted into it. Streams created before this release are not rechecked.
+
 ### Fixed
 
 - A window over another window's output no longer drops the upstream's rows. A window stream's

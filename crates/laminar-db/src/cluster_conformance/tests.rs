@@ -575,6 +575,230 @@ async fn interval_join_over_append_only_streams_is_equal() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+const WINDOW_OVER_JOIN: [&str; 2] = [
+    "CREATE STREAM joined AS SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+     INNER JOIN payments p ON o.k = p.k \
+     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND",
+    "CREATE STREAM out AS SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, \
+     COUNT(*) AS n, SUM(pv) AS s FROM joined \
+     GROUP BY k % 4, tumble(ots, INTERVAL '20' MILLISECOND) EMIT ON WINDOW CLOSE",
+];
+
+/// A window over an interval join stream, on the join's left time column. The join's frontier
+/// trails the sources' final watermark (1.469 s) by its 50 ms bound, so 20 ms windows close only
+/// up to 1.400 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_over_interval_join_is_equal() {
+    let case = Case {
+        ground_truth: Some(
+            "SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n, \
+             SUM(pv) AS s FROM \
+             (SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+              INNER JOIN payments p ON o.k = p.k \
+              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND) \
+             WHERE ots < CAST(1400000 AS TIMESTAMP(6)) \
+             GROUP BY k % 4, tumble(ots, INTERVAL '20' MILLISECOND)",
+        ),
+        ..join_case(
+            "window_over_interval_join",
+            WINDOW_OVER_JOIN.map(String::from).into(),
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// Checkpoints taken while joined rows cross to their window owners.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loaded_window_over_interval_join_checkpoints_are_equal() {
+    const BATCHES: i64 = 200;
+    let case = Case {
+        sources: vec![
+            events_with("orders", 0, BATCHES),
+            events_with("payments", 3, BATCHES),
+        ],
+        checkpoint_under_load: true,
+        ..join_case(
+            "loaded_window_over_interval_join",
+            WINDOW_OVER_JOIN.map(String::from).into(),
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
+/// A window over each join kind's event-time column: the left time for left outer, semi and anti
+/// joins, the right time for the right kinds and for an inner join that projects only it.
+/// Differential only: unmatched rows near the final watermark stay open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_over_each_join_side_are_equal() {
+    for (name, keyword, projection, time) in [
+        ("inner_right_time", "INNER JOIN", "p.k AS k, p.ts AS t", "t"),
+        ("left_outer", "LEFT JOIN", "o.k AS k, o.ts AS t", "t"),
+        ("left_semi", "LEFT SEMI JOIN", "o.k AS k, o.ts AS t", "t"),
+        ("left_anti", "LEFT ANTI JOIN", "o.k AS k, o.ts AS t", "t"),
+        ("right_outer", "RIGHT JOIN", "p.k AS k, p.ts AS t", "t"),
+        ("right_semi", "RIGHT SEMI JOIN", "p.k AS k, p.ts AS t", "t"),
+        ("right_anti", "RIGHT ANTI JOIN", "p.k AS k, p.ts AS t", "t"),
+    ] {
+        let case = join_case(
+            name,
+            vec![
+                format!(
+                    "CREATE STREAM joined AS SELECT {projection} FROM orders o {keyword} \
+                     payments p ON o.k = p.k \
+                     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
+                ),
+                format!(
+                    "CREATE STREAM out AS SELECT k % 4 AS g, \
+                     tumble({time}, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n FROM joined \
+                     GROUP BY k % 4, tumble({time}, INTERVAL '20' MILLISECOND) \
+                     EMIT ON WINDOW CLOSE"
+                ),
+            ],
+            OutputForm::Rows,
+        );
+        assert_eq!(verdict(case).await, Verdict::Equal, "{name}");
+    }
+}
+
+/// A full outer join's unmatched rows carry only one side's time, so its output has no event
+/// time for a cluster window to close on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_over_full_outer_join_is_rejected_in_cluster() {
+    let case = join_case(
+        "window_over_full_outer_join",
+        vec![
+            "CREATE STREAM joined AS SELECT o.k AS k, o.ts AS t FROM orders o FULL JOIN \
+             payments p ON o.k = p.k AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND"
+                .into(),
+            "CREATE STREAM out AS SELECT tumble(t, INTERVAL '20' MILLISECOND) AS w, \
+             COUNT(*) AS n FROM joined GROUP BY tumble(t, INTERVAL '20' MILLISECOND) \
+             EMIT ON WINDOW CLOSE"
+                .into(),
+        ],
+        OutputForm::Rows,
+    );
+    assert_rejected(verdict(case).await, "bounded event-time watermark");
+}
+
+/// 100 ms windows rolled up into 200 ms windows. An upstream that carries its start holds its
+/// frontier back by its size, to 1.369 s, so the rollup closes only windows before 1.200 s; one
+/// that carries its end holds back by its lateness (zero), so the rollup closes windows before
+/// 1.400 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_over_windows_are_equal() {
+    let tumble = "tumble(ts, INTERVAL '100' MILLISECOND)";
+    let tumble_end = "tumble_end(ts, INTERVAL '100' MILLISECOND)";
+    for (name, upstream, groups, truth) in [
+        (
+            "window_over_window_start",
+            format!("{tumble} AS w"),
+            tumble.to_string(),
+            Some(
+                "SELECT g, tumble(w, INTERVAL '200' MILLISECOND) AS r, SUM(n) AS n FROM \
+                 (SELECT k % 4 AS g, tumble(ts, INTERVAL '100' MILLISECOND) AS w, COUNT(*) AS n \
+                  FROM events WHERE ts < CAST(1400000 AS TIMESTAMP(6)) \
+                  GROUP BY k % 4, tumble(ts, INTERVAL '100' MILLISECOND)) \
+                 WHERE w < CAST(1200000 AS TIMESTAMP(6)) \
+                 GROUP BY g, tumble(w, INTERVAL '200' MILLISECOND)",
+            ),
+        ),
+        (
+            "window_over_window_end",
+            format!("{tumble_end} AS w"),
+            format!("{tumble}, {tumble_end}"),
+            Some(
+                "SELECT g, tumble(w, INTERVAL '200' MILLISECOND) AS r, SUM(n) AS n FROM \
+                 (SELECT k % 4 AS g, tumble_end(ts, INTERVAL '100' MILLISECOND) AS w, \
+                  COUNT(*) AS n FROM events WHERE ts < CAST(1400000 AS TIMESTAMP(6)) \
+                  GROUP BY k % 4, tumble_end(ts, INTERVAL '100' MILLISECOND)) \
+                 WHERE w < CAST(1400000 AS TIMESTAMP(6)) \
+                 GROUP BY g, tumble(w, INTERVAL '200' MILLISECOND)",
+            ),
+        ),
+        (
+            "window_over_hop_start",
+            "hop(ts, INTERVAL '50' MILLISECOND, INTERVAL '100' MILLISECOND) AS w".to_string(),
+            "hop(ts, INTERVAL '50' MILLISECOND, INTERVAL '100' MILLISECOND)".to_string(),
+            None,
+        ),
+    ] {
+        let case = case(
+            name,
+            &[
+                &format!(
+                    "CREATE STREAM per_window AS SELECT k % 4 AS g, {upstream}, COUNT(*) AS n \
+                     FROM events GROUP BY k % 4, {groups} EMIT ON WINDOW CLOSE"
+                ),
+                "CREATE STREAM out AS SELECT g, tumble(w, INTERVAL '200' MILLISECOND) AS r, \
+                 SUM(n) AS n FROM per_window \
+                 GROUP BY g, tumble(w, INTERVAL '200' MILLISECOND) EMIT ON WINDOW CLOSE",
+            ],
+            OutputForm::Rows,
+            truth,
+        );
+        assert_eq!(verdict(case).await, Verdict::Equal, "{name}");
+    }
+}
+
+/// A session's start trails its close without bound, so no mode admits a window over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_over_session_is_unsupported_everywhere() {
+    let case = case(
+        "window_over_session",
+        &[
+            "CREATE STREAM sessions AS SELECT k % 4 AS g, \
+             SESSION(ts, INTERVAL '5' MILLISECOND) AS s, COUNT(*) AS n FROM events \
+             GROUP BY k % 4, SESSION(ts, INTERVAL '5' MILLISECOND) EMIT ON WINDOW CLOSE",
+            "CREATE STREAM out AS SELECT g, tumble(s, INTERVAL '200' MILLISECOND) AS r, \
+             SUM(n) AS n FROM sessions \
+             GROUP BY g, tumble(s, INTERVAL '200' MILLISECOND) EMIT ON WINDOW CLOSE",
+        ],
+        OutputForm::Rows,
+        None,
+    );
+    assert!(matches!(
+        verdict(case).await,
+        Verdict::UnsupportedEverywhere(reason) if reason.contains("carries no event-time column")
+    ));
+}
+
+/// An interval join over an interval join stream, on the stream's event-time column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interval_join_over_interval_join_is_equal() {
+    let joined = "SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+                  INNER JOIN payments p ON o.k = p.k \
+                  AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND";
+    let case = Case {
+        sources: vec![
+            events("orders", 0),
+            events("payments", 3),
+            events("refunds", 5),
+        ],
+        ground_truth: Some(
+            "SELECT j.k AS k, j.pv AS pv, r.v AS rv FROM \
+             (SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+              INNER JOIN payments p ON o.k = p.k \
+              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND) j \
+             INNER JOIN refunds r ON j.k = r.k \
+             AND r.ts BETWEEN j.ots AND j.ots + INTERVAL '30' MILLISECOND",
+        ),
+        ..join_case(
+            "interval_join_over_interval_join",
+            vec![
+                format!("CREATE STREAM joined AS {joined}"),
+                "CREATE STREAM out AS SELECT j.k AS k, j.pv AS pv, r.v AS rv FROM joined j \
+                 INNER JOIN refunds r ON j.k = r.k \
+                 AND r.ts BETWEEN j.ots AND j.ots + INTERVAL '30' MILLISECOND"
+                    .into(),
+            ],
+            OutputForm::Rows,
+        )
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Join kinds whose output distribution differs (null-extended rows are placed by the side that
 /// is present). Differential only: unmatched rows near the final watermark stay open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
