@@ -81,12 +81,6 @@ impl IncrementalAggState {
         })
     }
 
-    fn encode_keys(&self, batch: &RecordBatch) -> Result<arrow::row::Rows, DbError> {
-        self.row_converter
-            .convert_columns(&batch.columns()[..self.num_group_cols])
-            .map_err(|error| DbError::Pipeline(format!("row conversion: {error}")))
-    }
-
     /// Fold a routed pre-aggregate batch into one row per distinct group key, in first-appearance
     /// order.
     pub(crate) fn keyed_partial_batch(
@@ -97,7 +91,7 @@ impl IncrementalAggState {
         if batch.num_rows() == 0 {
             return Ok(RecordBatch::new_empty(Arc::clone(&layout.schema)));
         }
-        let keys = self.encode_keys(batch)?;
+        let keys = self.encode_group_keys(batch)?;
         let input_weights = Self::validated_input_weights(batch, self.weight_col_idx)?;
         let inputs = AggregateInput::resolve_all(batch, &self.agg_specs, input_weights)?;
         let groups = BatchGroups::try_new(&keys, input_weights)?;
@@ -168,10 +162,9 @@ impl IncrementalAggState {
             .as_primitive_opt::<Int64Type>()
             .filter(|weights| weights.null_count() == 0)
             .ok_or_else(|| partial_shape_error("input weight must be non-null Int64"))?;
-        let keys = self.encode_keys(batch)?;
+        let keys = self.encode_group_keys(batch)?;
         self.apply_keyed_groups(
-            &keys,
-            Some(weights),
+            &BatchGroups::try_new(&keys, Some(weights))?,
             |accs, rows| layout.merge_rows(accs, batch, rows),
             watermark_ms,
             uniform_vnode,
