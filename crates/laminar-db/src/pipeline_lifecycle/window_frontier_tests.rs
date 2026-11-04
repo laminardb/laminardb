@@ -477,54 +477,61 @@ async fn window_over_interval_join_right_time_keeps_every_row() {
     }
 }
 
-/// A window emitted only after its lateness reaches an append view whose retention is shorter than
-/// that lateness: the view follows the window's held frontier, so the rows are not trimmed on
-/// arrival.
+/// A window or session emitted only after its lateness reaches an append view whose retention is
+/// shorter than that lateness: the view's interval follows the frontier the window closes at, so the
+/// rows are not trimmed on arrival.
 #[tokio::test]
 async fn late_window_view_keeps_rows_emitted_after_its_retention() {
-    let (db, prom) = database(&[
-        SOURCE,
-        "CREATE MATERIALIZED VIEW per_ten AS \
-         SELECT tumble(ts, INTERVAL '10' SECOND) AS w, COUNT(*) AS n FROM src \
-         GROUP BY tumble(ts, INTERVAL '10' SECOND) \
-         EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '1' MINUTE \
-         WITH (retention = '5 seconds')",
-    ])
-    .await;
-    db.start().await.unwrap();
-    let source = db.source_untyped("src").unwrap();
-    let times = [T0 + SECOND, T0 + 2 * SECOND, T0 + 70 * SECOND];
-    source
-        .push_arrow(source_batch(&db, "src", &[("ts", &times)]))
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let counts = loop {
-        let batches = db
-            .ctx
-            .sql("SELECT n FROM per_ten")
-            .await
-            .unwrap()
-            .collect()
-            .await
+    for window in [
+        "tumble(ts, INTERVAL '10' SECOND)",
+        "session(ts, INTERVAL '5' SECOND)",
+    ] {
+        let (db, prom) = database(&[
+            SOURCE,
+            &format!(
+                "CREATE MATERIALIZED VIEW late_view AS \
+                 SELECT {window} AS w, COUNT(*) AS n FROM src GROUP BY {window} \
+                 EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '1' MINUTE \
+                 WITH (retention = '5 seconds')"
+            ),
+        ])
+        .await;
+        db.start().await.unwrap();
+        let source = db.source_untyped("src").unwrap();
+        let times = [T0 + SECOND, T0 + 2 * SECOND, T0 + 70 * SECOND];
+        source
+            .push_arrow(source_batch(&db, "src", &[("ts", &times)]))
             .unwrap();
-        let counts = batches
-            .iter()
-            .flat_map(|batch| {
-                let column = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap();
-                column.values().to_vec()
-            })
-            .collect::<Vec<_>>();
-        if !counts.is_empty() || std::time::Instant::now() > deadline {
-            break counts;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert_eq!(counts, vec![2]);
-    assert_eq!(prom.window_late_dropped.get(), 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let counts = loop {
+            let batches = db
+                .ctx
+                .sql("SELECT n FROM late_view")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let counts = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    column.values().to_vec()
+                })
+                .collect::<Vec<_>>();
+            if !counts.is_empty() || std::time::Instant::now() > deadline {
+                break counts;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(counts, vec![2], "{window}");
+        assert_eq!(prom.window_late_dropped.get(), 0, "{window}");
+        db.shutdown().await.unwrap();
+    }
 }
 
 /// A statement that splits plans its owner with the statement's `ALLOW LATENESS`, so an owner that

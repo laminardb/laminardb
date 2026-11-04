@@ -23,7 +23,9 @@
 - `CREATE` rejects a window over a window stream that groups by any column other than the one the
   upstream carries (for example its start when it projects its end), and a window over a session
   window or over a window that projects no boundary. Such a window could close before the
-  upstream emitted into it. Streams created before this release are not rechecked.
+  upstream emitted into it. The check runs whenever the DDL runs, so after upgrading, an embedded
+  or single-node pipeline with such a window fails to start until it windows on the carried
+  column. Cluster mode never admitted these windows.
 
 ### Fixed
 
@@ -32,6 +34,14 @@
   projects `tumble_end` or `hop_end`, and by the lateness plus the window size otherwise.
   Downstream windows, append-view retention and `stream_watermark_ms` see the held watermark.
   Session windows are not held. This applies in every mode.
+- An append-only view that projects a window's end but not its start (`tumble_end` or `hop_end`
+  grouped with `tumble` or `hop`) keeps an interval on the end column. `CREATE` used to fail for
+  lack of an event-time column. A `TUMBLE` or `HOP` view now keeps a window while the window's end
+  is within the interval of the watermark its windows close at, less the allowed lateness,
+  whichever boundary it projects.
+- An append-only session view keeps a session while its start is within the interval plus the gap
+  and the allowed lateness. A session view whose `ALLOW LATENESS` exceeded its retention used to
+  drop every session as it closed.
 - `ALLOW LATENESS` is applied. It used to be parsed after the `EMIT` clause and then ignored. It
   now keeps windows open in embedded and single-node mode. It must follow `EMIT ON WINDOW CLOSE`,
   and `CREATE` rejects it with `EMIT FINAL`, with other `EMIT` modes, on a query without a
