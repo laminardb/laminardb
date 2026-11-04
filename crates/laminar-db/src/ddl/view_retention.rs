@@ -4,20 +4,20 @@ use std::time::Duration;
 
 use arrow::datatypes::{DataType, Schema};
 use laminar_sql::parser::MaterializedViewRetention;
-use laminar_sql::translator::WindowType;
+use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::connector_manager::StreamRegistration;
 use crate::db::LaminarDB;
 use crate::error::DbError;
+use crate::exchange_plan::WindowBoundary;
 use crate::mv_store::ViewRetention;
 
 /// Retention of an append-only view with an event-time column that declares none.
 pub(crate) const DEFAULT_APPEND_VIEW_RETENTION: Duration = Duration::from_secs(3600);
 
 impl LaminarDB {
-    /// An interval keeps rows by the view's event-time column: the source column a projection
-    /// forwards unchanged, or a window's start, which keeps a window while its end is inside
-    /// the interval. A view without one must declare a row count.
+    /// An interval keeps rows by the view's event-time column. A view without one must declare a
+    /// row count.
     pub(super) async fn append_view_retention(
         &self,
         candidate: StreamRegistration,
@@ -33,14 +33,7 @@ impl LaminarDB {
             Some(MaterializedViewRetention::Interval(interval)) => *interval,
             None => DEFAULT_APPEND_VIEW_RETENTION,
         };
-        let interval = interval.saturating_add(candidate.window_config.as_ref().map_or(
-            Duration::ZERO,
-            |window| match window.window_type {
-                WindowType::Session => window.gap.unwrap_or_default(),
-                WindowType::Tumbling | WindowType::Sliding | WindowType::Cumulate => window.size,
-            },
-        ));
-        let column = self
+        let (column, trail) = self
             .append_view_event_time(candidate, schema)
             .await?
             .ok_or_else(|| {
@@ -49,11 +42,12 @@ impl LaminarDB {
                      an interval by; declare WITH (retention = '<n> rows')"
                 ))
             })?;
-        let interval_ms = i64::try_from(interval.as_millis()).map_err(|_| {
-            DbError::MaterializedView(format!(
-                "materialized view '{name}' retention exceeds the event-time range"
-            ))
-        })?;
+        let interval_ms =
+            i64::try_from(interval.saturating_add(trail).as_millis()).map_err(|_| {
+                DbError::MaterializedView(format!(
+                    "materialized view '{name}' retention exceeds the event-time range"
+                ))
+            })?;
         Ok(ViewRetention::EventTime {
             column,
             interval_ms,
@@ -75,7 +69,10 @@ impl LaminarDB {
                 candidate.name
             )));
         }
-        let column = self.append_view_event_time(candidate, schema).await?;
+        let column = self
+            .append_view_event_time(candidate, schema)
+            .await?
+            .map(|(column, _)| column);
         Ok(ViewRetention::Unbounded { column })
     }
 
@@ -94,30 +91,153 @@ impl LaminarDB {
         Ok(ViewRetention::Rows(rows))
     }
 
+    /// The view's event-time column, and how much further than the interval it trails the view's
+    /// frontier:
+    /// - a window view's first forwarded marker. A `TUMBLE` or `HOP` frontier is held back for the
+    ///   boundary the stream carries, so a start column trails a frontier held for the end by the
+    ///   window size. A session frontier is not held, so a session start trails it by the gap and
+    ///   the allowed lateness.
+    /// - otherwise the stream's event-time column.
     async fn append_view_event_time(
         &self,
         candidate: StreamRegistration,
         schema: &Schema,
-    ) -> Result<Option<usize>, DbError> {
+    ) -> Result<Option<(usize, Duration)>, DbError> {
         let name = candidate.name.clone();
-        let column = if candidate.window_config.is_some() {
+        let column = if let Some(window) = &candidate.window_config {
             let plan = self
                 .ctx
                 .sql(&candidate.query_sql)
                 .await?
                 .into_unoptimized_plan();
-            crate::exchange_plan::window_output_column(&plan)
-                .map(|index| plan.schema().field(index).name().clone())
+            let carried = crate::exchange_plan::carried_window_boundary(&plan);
+            crate::exchange_plan::window_retention_column(&plan).map(|(index, boundary)| {
+                (
+                    plan.schema().field(index).name().clone(),
+                    window_trail(window, boundary, carried),
+                )
+            })
         } else {
             let resolved = self.resolve_catalog_stream_outputs(Some(candidate)).await?;
             resolved
                 .exchange_plan
                 .stream(&name)
                 .and_then(|stream| stream.output.event_time.as_ref())
-                .map(|event_time| event_time.column.clone())
+                .map(|event_time| (event_time.column.clone(), Duration::ZERO))
         };
         Ok(column
-            .and_then(|column| schema.index_of(&column).ok())
-            .filter(|&index| matches!(schema.field(index).data_type(), DataType::Timestamp(_, _))))
+            .and_then(|(column, trail)| Some((schema.index_of(&column).ok()?, trail)))
+            .filter(|&(index, _)| {
+                matches!(schema.field(index).data_type(), DataType::Timestamp(_, _))
+            }))
+    }
+}
+
+fn window_trail(
+    window: &WindowOperatorConfig,
+    column: WindowBoundary,
+    carried: WindowBoundary,
+) -> Duration {
+    match window.window_type {
+        WindowType::Session => window
+            .gap
+            .unwrap_or_default()
+            .saturating_add(window.allowed_lateness),
+        WindowType::Tumbling | WindowType::Sliding | WindowType::Cumulate => {
+            match (column, carried) {
+                (WindowBoundary::Start, WindowBoundary::End) => window.size,
+                (WindowBoundary::Start | WindowBoundary::End, WindowBoundary::Start)
+                | (WindowBoundary::End, WindowBoundary::End) => Duration::ZERO,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::LaminarDB;
+    use crate::mv_store::{MvStorageMode, ViewRetention};
+
+    /// A window view keeps a window while its end is within the interval of the frontier the window
+    /// closes at, less the allowed lateness, on its first forwarded marker column. A session keeps
+    /// a session while its start is within the interval plus the gap and the lateness.
+    #[tokio::test]
+    async fn window_views_keep_an_interval_on_their_first_marker() {
+        const TUMBLE: &str = "tumble(ts, INTERVAL '10' SECOND)";
+        const TUMBLE_END: &str = "tumble_end(ts, INTERVAL '10' SECOND)";
+        const HOP: &str = "hop(ts, INTERVAL '5' SECOND, INTERVAL '10' SECOND)";
+        const SESSION: &str = "session(ts, INTERVAL '5' SECOND)";
+        const CLOSE: &str = "EMIT ON WINDOW CLOSE";
+        const LATE: &str = "EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '30' SECOND";
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE src (ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts)")
+            .await
+            .unwrap();
+        for (view, select, group, emit, column, interval_ms) in [
+            (
+                "start",
+                format!("{TUMBLE} AS w"),
+                TUMBLE.to_owned(),
+                CLOSE,
+                0,
+                60_000,
+            ),
+            (
+                "late_start",
+                format!("{TUMBLE} AS w"),
+                TUMBLE.to_owned(),
+                LATE,
+                0,
+                60_000,
+            ),
+            (
+                "both",
+                format!("{TUMBLE} AS ws, {TUMBLE_END} AS we"),
+                format!("{TUMBLE}, {TUMBLE_END}"),
+                CLOSE,
+                0,
+                70_000,
+            ),
+            (
+                "end",
+                format!("{TUMBLE_END} AS we"),
+                format!("{TUMBLE}, {TUMBLE_END}"),
+                CLOSE,
+                0,
+                60_000,
+            ),
+            (
+                "hop",
+                format!("{HOP} AS w"),
+                HOP.to_owned(),
+                "EMIT FINAL",
+                0,
+                60_000,
+            ),
+            (
+                "late_session",
+                format!("{SESSION} AS w"),
+                SESSION.to_owned(),
+                LATE,
+                0,
+                95_000,
+            ),
+        ] {
+            db.execute(&format!(
+                "CREATE MATERIALIZED VIEW {view} AS SELECT {select}, COUNT(*) AS n FROM src \
+                 GROUP BY {group} {emit} WITH (retention = '1 minute')"
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("{view}: {error}"));
+            let mode = db.mv_store.read().storage_mode_for_test(view);
+            assert!(
+                matches!(
+                    &mode,
+                    Some(MvStorageMode::AppendLog { retention })
+                        if *retention == ViewRetention::EventTime { column, interval_ms }
+                ),
+                "{view}: {mode:?}"
+            );
+        }
     }
 }

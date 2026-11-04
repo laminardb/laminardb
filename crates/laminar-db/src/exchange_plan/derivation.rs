@@ -366,7 +366,7 @@ fn keyed_aggregate(
     (changelog, event_time): (ChangelogKind, Option<EventTime>),
 ) -> StreamPlan {
     let groups: Vec<usize> = (0..group_exprs.len())
-        .filter(|&group| !(window && is_window_marker(&group_exprs[group])))
+        .filter(|&group| !(window && window_boundary(&group_exprs[group]).is_some()))
         .collect();
     let (exchange, distribution) = if groups.is_empty() {
         (
@@ -413,14 +413,6 @@ fn unaliased(mut expr: &Expr) -> &Expr {
     expr
 }
 
-fn is_window_marker(expr: &Expr) -> bool {
-    matches!(
-        unaliased(expr),
-        Expr::ScalarFunction(function)
-            if matches!(function.func.name(), "tumble" | "tumble_end" | "hop" | "hop_end" | "session")
-    )
-}
-
 fn group_key(expr: &Expr, field: &Field) -> KeyColumn {
     let data_type = field.data_type().clone();
     match unaliased(expr) {
@@ -435,16 +427,6 @@ fn group_key(expr: &Expr, field: &Field) -> KeyColumn {
     }
 }
 
-/// The output column of a windowed aggregate that forwards its window bound unchanged.
-pub(crate) fn window_output_column(logical: &LogicalPlan) -> Option<usize> {
-    let aggregate = crate::aggregate_state::find_aggregate(logical)?;
-    let group = aggregate.group_exprs.iter().position(is_window_marker)?;
-    match crate::aggregate_state::find_post_aggregate_projection(logical).ok()? {
-        None => Some(group),
-        Some(projection) => forwarding_output(projection, group),
-    }
-}
-
 pub(crate) fn carried_window_boundary(logical: &LogicalPlan) -> WindowBoundary {
     window_boundary_column(logical).map_or(WindowBoundary::Start, |(_, boundary)| boundary)
 }
@@ -452,21 +434,42 @@ pub(crate) fn carried_window_boundary(logical: &LogicalPlan) -> WindowBoundary {
 /// The output column of the first window end marker forwarded as a bare column, otherwise of the
 /// first start marker.
 pub(super) fn window_boundary_column(logical: &LogicalPlan) -> Option<(usize, WindowBoundary)> {
-    let aggregate = crate::aggregate_state::find_aggregate(logical)?;
-    let projection = crate::aggregate_state::find_post_aggregate_projection(logical).ok()?;
-    let forwarded = |boundary: WindowBoundary| {
-        aggregate
-            .group_exprs
-            .iter()
-            .enumerate()
-            .filter(|(_, expr)| window_boundary(expr) == Some(boundary))
-            .find_map(|(group, _)| match projection {
-                None => Some(group),
-                Some(projection) => forwarding_output(projection, group),
-            })
-            .map(|index| (index, boundary))
+    let forwarded = forwarded_window_boundaries(logical);
+    forwarded
+        .iter()
+        .find(|(_, boundary)| *boundary == WindowBoundary::End)
+        .or_else(|| forwarded.first())
+        .copied()
+}
+
+/// The output column of the first window marker group forwarded as a bare column. An append view
+/// records its segments' event-time bounds on this column, so it stays the view's retention column
+/// even when the stream carries the other boundary.
+pub(crate) fn window_retention_column(logical: &LogicalPlan) -> Option<(usize, WindowBoundary)> {
+    forwarded_window_boundaries(logical).first().copied()
+}
+
+/// Each window marker group forwarded as a bare column, in group order, with its output column.
+fn forwarded_window_boundaries(logical: &LogicalPlan) -> Vec<(usize, WindowBoundary)> {
+    let Some(aggregate) = crate::aggregate_state::find_aggregate(logical) else {
+        return Vec::new();
     };
-    forwarded(WindowBoundary::End).or_else(|| forwarded(WindowBoundary::Start))
+    let Ok(projection) = crate::aggregate_state::find_post_aggregate_projection(logical) else {
+        return Vec::new();
+    };
+    aggregate
+        .group_exprs
+        .iter()
+        .enumerate()
+        .filter_map(|(group, expr)| {
+            let boundary = window_boundary(expr)?;
+            let index = match projection {
+                None => group,
+                Some(projection) => forwarding_output(projection, group)?,
+            };
+            Some((index, boundary))
+        })
+        .collect()
 }
 
 fn window_boundary(expr: &Expr) -> Option<WindowBoundary> {
@@ -475,7 +478,7 @@ fn window_boundary(expr: &Expr) -> Option<WindowBoundary> {
     };
     match function.func.name() {
         "tumble_end" | "hop_end" => Some(WindowBoundary::End),
-        "tumble" | "hop" => Some(WindowBoundary::Start),
+        "tumble" | "hop" | "session" => Some(WindowBoundary::Start),
         _ => None,
     }
 }

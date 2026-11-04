@@ -913,9 +913,15 @@ checkpoints keep:
 
 - `WITH (retention = '<interval>')`, for example `'2 hours'`: rows whose event time is at or after
   the view's watermark minus the interval. The event-time column is the source's watermark column
-  when the query forwards it unchanged, an interval join's event-time column, or the window column
-  of a windowed view, which keeps a window while its end (start plus window size, or plus the gap
-  for a session) is inside the interval. A view that declares nothing keeps 1 hour.
+  when the query forwards it unchanged, or an interval join's event-time column. A windowed view
+  keeps rows by the first window column it projects, in `GROUP BY` order:
+  - a `TUMBLE` or `HOP` view keeps a window while the window's end is within the interval of the
+    watermark its windows close at, less the allowed lateness, whichever boundary it projects;
+  - a session view keeps a session while its start is within the interval plus the gap and the
+    allowed lateness. A session whose rows span longer than the interval can be behind that
+    horizon when it closes; it is then not kept.
+
+  A view that declares nothing keeps 1 hour.
 - `WITH (retention = '<n> rows')`: the latest `n` rows. A view without an event-time column (a
   `FULL` join, a join that projects neither time column, or a source without a watermark) must
   declare it.
