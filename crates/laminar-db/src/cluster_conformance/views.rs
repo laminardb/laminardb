@@ -468,6 +468,34 @@ async fn interval_join_view_matches_batch_sql_in_cluster() {
     assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
+/// A view over an interval join that projects its left time column keeps an interval on it. The
+/// view's watermark is the join's frontier, 50 ms behind the sources' final 1.469 s, so a 100 ms
+/// interval keeps the rows from 1.319 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interval_join_view_keeps_an_interval_on_its_time_column() {
+    let case = ViewCase {
+        name: "interval_join_view_interval",
+        sources: vec![events("orders", 0), events("payments", 3)],
+        views: vec![
+            "CREATE MATERIALIZED VIEW joined AS SELECT o.k AS k, o.ts AS ots, p.v AS pv \
+             FROM orders o INNER JOIN payments p ON o.k = p.k \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+             WITH (retention = '100 milliseconds')"
+                .into(),
+        ],
+        // Named columns: a subscription delivers every row, not only the retained ones.
+        reads: vec![(
+            "SELECT k, ots, pv FROM joined",
+            "SELECT o.k AS k, o.ts AS ots, p.v AS pv FROM orders o \
+             INNER JOIN payments p ON o.k = p.k \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '50' MILLISECOND \
+             WHERE o.ts >= CAST(1319000 AS TIMESTAMP(6))",
+        )],
+        same_cycle_invariants: vec![],
+    };
+    assert_eq!(verdict(case).await, Verdict::Equal);
+}
+
 /// Views that aggregate over an aggregating subquery or over an interval join split into internal
 /// stages that execute as streams; each view keeps only its outer aggregate's rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

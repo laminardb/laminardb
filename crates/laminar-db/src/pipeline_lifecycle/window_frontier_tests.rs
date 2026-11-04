@@ -315,6 +315,65 @@ async fn window_over_late_window_end_keeps_every_row() {
         .assert_lossless(12);
 }
 
+/// The upstream's frontier is held only for the boundary it carries: its end when it projects both,
+/// so a window on its start could close before the upstream emits into it.
+#[tokio::test]
+async fn window_over_the_other_boundary_of_a_window_is_rejected() {
+    let (db, _) = database(&[
+        SOURCE,
+        "CREATE STREAM per_minute AS \
+         SELECT tumble(ts, INTERVAL '1' MINUTE) AS ws, tumble_end(ts, INTERVAL '1' MINUTE) AS we, \
+         COUNT(*) AS n FROM src \
+         GROUP BY tumble(ts, INTERVAL '1' MINUTE), tumble_end(ts, INTERVAL '1' MINUTE) \
+         EMIT ON WINDOW CLOSE",
+    ])
+    .await;
+    let error = db
+        .execute(
+            "CREATE STREAM rollup AS SELECT tumble(ws, INTERVAL '30' SECOND) AS r, SUM(n) AS n \
+             FROM per_minute GROUP BY tumble(ws, INTERVAL '30' SECOND) EMIT ON WINDOW CLOSE",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "window 'rollup' over window stream 'per_minute' must window on 'we', the event-time \
+             column 'per_minute' carries, not 'ws'"
+        ),
+        "{error}"
+    );
+    db.execute(
+        "CREATE STREAM rollup AS SELECT tumble(we, INTERVAL '30' SECOND) AS r, SUM(n) AS n \
+         FROM per_minute GROUP BY tumble(we, INTERVAL '30' SECOND) EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+}
+
+/// A session's start trails its close without bound, so its output carries no event time.
+#[tokio::test]
+async fn window_over_a_session_is_rejected() {
+    let (db, _) = database(&[
+        SOURCE,
+        "CREATE STREAM sessions AS SELECT session(ts, INTERVAL '10' SECOND) AS s, \
+         COUNT(*) AS n FROM src GROUP BY session(ts, INTERVAL '10' SECOND) EMIT ON WINDOW CLOSE",
+    ])
+    .await;
+    let error = db
+        .execute(
+            "CREATE STREAM rollup AS SELECT tumble(s, INTERVAL '1' MINUTE) AS r, SUM(n) AS n \
+             FROM sessions GROUP BY tumble(s, INTERVAL '1' MINUTE) EMIT ON WINDOW CLOSE",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("window 'rollup' cannot window over 'sessions'"),
+        "{error}"
+    );
+}
+
 /// One frontier step closes the upstream window and the downstream window its row belongs to;
 /// the downstream applies the row before it closes.
 #[tokio::test]

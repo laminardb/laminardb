@@ -206,16 +206,17 @@ EMIT ON WINDOW CLOSE ALLOW LATENESS INTERVAL '30' SECOND
 
 ### Windows over windows
 
-A window's output watermark trails the watermark its windows close at, so a window over that
-output never receives a row after the window that row belongs to has closed:
+A closed `TUMBLE` or `HOP` window's output carries one event-time column, and its watermark
+trails the watermark its windows close at, so a window over that column never receives a row
+after the window that row belongs to has closed:
 
-- When the upstream projects `tumble_end` or `hop_end`, its watermark trails by the allowed
-  lateness. Group the downstream window by that end column.
-- Otherwise, for example when it projects `tumble(...)`, its watermark also trails by the window
-  size.
+- When the upstream projects `tumble_end` or `hop_end`, that end column is its event time, and its
+  watermark trails by the allowed lateness.
+- Otherwise, when it projects `tumble(...)` or `hop(...)`, that start column is its event time, and
+  its watermark also trails by the window size.
 
-A session window's watermark is not held back, so a window over a session's start can still drop
-rows. Cluster mode rejects windows over windows.
+`CREATE` rejects a window over a window stream that groups by any other column, and a window over a
+session window or over a window that projects no boundary, which carry no event time.
 
 ---
 
@@ -250,8 +251,8 @@ AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
 **Key points:**
 
 - Each input must carry a watermark on its `TIMESTAMP NOT NULL` event-time column: a source that
-  declares it, or an append-only stream that forwards that column unchanged through a projection
-  or filter. Append-only pairs use the ordinary path. If either input is a mutable connector, both
+  declares it, or an append-only stream that carries it (a projection or filter that forwards it
+  unchanged, another interval join, or a closed window). Append-only pairs use the ordinary path. If either input is a mutable connector, both
   connectors must expose ordered deterministic row positions and a replayable recovery contract.
 - Append-only bounded intervals retain live hot-add support in a running local checkpoint-disabled
   pipeline; their post-projection is initialized before the first cycle can route or retain input.
@@ -413,8 +414,14 @@ GROUP BY trade_count;
 - Stages belong to their stream or view. `SHOW STREAMS` and `SUBSCRIBE` see only the stream,
   `DROP STREAM` or `DROP MATERIALIZED VIEW` removes its stages, and no other statement may read,
   drop or create a `$stage` name. A failed `CREATE` removes the stages it created.
-- A join of three or more inputs still needs named two-way stages: a join's output carries no
-  event time, so an interval join cannot read it.
+- A join's output carries one event-time column, the time column of a side present on every
+  output row when the join projects it unchanged: for `INNER` the left one, otherwise the right
+  one; the left one for `LEFT`, `LEFT SEMI` and `LEFT ANTI`; the right one for `RIGHT`,
+  `RIGHT SEMI` and `RIGHT ANTI`. A `FULL` join's output carries none. Its watermark trails the
+  inputs' by the join bound, so a window or another interval join can read that column without
+  late rows.
+- A join of three or more inputs needs named two-way stages, each later join's time condition on
+  the previous stage's event-time column.
 
 ### Spreading a hot key
 
@@ -569,9 +576,11 @@ boundaries, poison-message handling, and tested behaviour.
 
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
 the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION`
-aggregates. A cluster window reads a source, or an append-only stream that forwards the source's
-event-time column unchanged; it requires a bounded watermark on that column and `EMIT ON WINDOW
-CLOSE` or `EMIT FINAL`. A join output may feed a keyed aggregate, either as a named stream or in
+aggregates. A cluster window reads a source, or an append-only stream that carries an event-time
+column: a projection that forwards a source's, an interval join other than `FULL`, or a closed
+`TUMBLE` or `HOP` window. It windows on that column, requires a bounded watermark on it, and needs
+`EMIT ON WINDOW CLOSE` or `EMIT FINAL`. An interval join may read another interval join's
+stream on that stream's event-time column. A join output may feed a keyed aggregate, either as a named stream or in
 one statement that is split into stages; windowed joins remain rejected. A stream may sit at most
 three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
 which checkpoint pauses are measured; a deeper pipeline is rejected with `[LDB-4007]`.
@@ -764,8 +773,10 @@ each other node sends one partial row per input batch instead of its rows), or `
 (a window without a group key). Join inputs are named
 `left:<input>` and `right:<input>`. The output is `hash(...)`, `singleton(...)`, or
 `arbitrary`, with its changelog kind: `append-only`, `weighted changelog`, or `running state`
-(an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry a source
-watermark on that column (a source's own, or one a projection forwards unchanged).
+(an aggregate without `EMIT CHANGES`), and `event time <column>` when the rows carry an
+event-time column: a source's watermark column, one a projection forwards unchanged, an interval
+join's time column, or a closed window's boundary (see [Windows over windows](#windows-over-windows)
+and [Bounded event-time join](#bounded-event-time-join)).
 
 For a statement that is split into stages, `EXPLAIN` lists each stage's SQL as a
 `stage.<name>` row, followed by that stage's `stage.<name>.exchange.*` rows. An aggregate that
@@ -902,11 +913,12 @@ checkpoints keep:
 
 - `WITH (retention = '<interval>')`, for example `'2 hours'`: rows whose event time is at or after
   the view's watermark minus the interval. The event-time column is the source's watermark column
-  when the query forwards it unchanged, or the window column of a windowed view, which keeps a
-  window while its end (start plus window size, or plus the gap for a session) is inside the
-  interval. A view that declares nothing keeps 1 hour.
-- `WITH (retention = '<n> rows')`: the latest `n` rows. A view without an event-time column (over
-  an interval join, or over a source without a watermark) must declare it.
+  when the query forwards it unchanged, an interval join's event-time column, or the window column
+  of a windowed view, which keeps a window while its end (start plus window size, or plus the gap
+  for a session) is inside the interval. A view that declares nothing keeps 1 hour.
+- `WITH (retention = '<n> rows')`: the latest `n` rows. A view without an event-time column (a
+  `FULL` join, a join that projects neither time column, or a source without a watermark) must
+  declare it.
 - `WITH (retention = 'unbounded')`: every row. It needs checkpointing, because without it the
   whole log stays in memory.
 - A changelog view rejects `retention`.

@@ -268,6 +268,8 @@ impl LaminarDB {
             .await?;
         self.validate_interval_join_schema(&name_str, query_sql, &planned)
             .await?;
+        self.validate_window_input_event_time(&name_str, query_sql, planned.window_config.as_ref())
+            .await?;
         let interval_topology = self
             .validate_interval_topology_candidate(
                 "materialized view",

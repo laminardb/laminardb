@@ -6,6 +6,7 @@
 //! one vnode (partial rows in cluster mode).
 
 mod derivation;
+mod event_time;
 mod properties;
 #[cfg(all(debug_assertions, feature = "cluster"))]
 mod shadow;
@@ -16,11 +17,10 @@ use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub(crate) use derivation::{
-    carried_window_boundary, derive, window_output_column, WindowBoundary,
-};
+pub(crate) use derivation::{carried_window_boundary, derive, window_output_column};
+pub(crate) use event_time::{EventTime, EventTimeOrigin, JoinSide, WindowBoundary};
 pub(crate) use properties::{
-    ChangelogKind, Distribution, EventTime, InputPort, KeyColumn, PartitionKey, PortExchange,
+    ChangelogKind, Distribution, InputPort, KeyColumn, PartitionKey, PortExchange,
     StreamProperties, GLOBAL_VNODE,
 };
 
@@ -164,6 +164,7 @@ pub(crate) fn source_event_time(source: &crate::catalog::SourceEntry) -> Option<
     Some(EventTime {
         column: source.watermark_column.clone()?,
         max_out_of_orderness: source.max_out_of_orderness,
+        origin: EventTimeOrigin::Source,
     })
 }
 

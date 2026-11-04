@@ -244,55 +244,6 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Certify that both interval-join inputs carry an event-time watermark on their time column.
-    async fn validate_interval_join_watermarks(
-        &self,
-        config: &laminar_sql::translator::StreamJoinConfig,
-    ) -> Result<(), DbError> {
-        for (side, input, time_column) in [
-            (
-                "left",
-                config.left_table.as_str(),
-                config.left_time_column.as_str(),
-            ),
-            (
-                "right",
-                config.right_table.as_str(),
-                config.right_time_column.as_str(),
-            ),
-        ] {
-            if self
-                .input_event_time(input)
-                .await?
-                .is_none_or(|event_time| event_time.column != time_column)
-            {
-                return Err(DbError::InvalidOperation(format!(
-                    "{side} interval join input '{input}' must carry an event-time watermark on '{time_column}': a source that declares it, or an append-only stream that forwards it unchanged"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// The event time an input carries for a consumer that orders by it: a source's declared
-    /// watermark, or the forwarded watermark of an append-only stream.
-    async fn input_event_time(
-        &self,
-        input: &str,
-    ) -> Result<Option<crate::exchange_plan::EventTime>, DbError> {
-        if let Some(source) = self.catalog.get_source(input) {
-            return Ok(crate::exchange_plan::source_event_time(&source));
-        }
-        let resolved = self.resolve_catalog_stream_outputs(None).await?;
-        Ok(resolved
-            .exchange_plan
-            .stream(input)
-            .filter(|stream| {
-                stream.output.changelog == crate::exchange_plan::ChangelogKind::AppendOnly
-            })
-            .and_then(|stream| stream.output.event_time.clone()))
-    }
-
     /// Reject a stream whose pipeline crosses more remote exchanges than cluster checkpoints are
     /// measured for; every flush wave moves rows one remote hop while sources are held. A stream
     /// that reads only sources crosses at most one; a materialized view is a stream input too.
@@ -512,7 +463,7 @@ impl LaminarDB {
             })
         {
             return Err(reject(
-                "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that forwards it unchanged",
+                "managed CoreWindow execution requires a bounded event-time watermark on its window time column, from a source or an append-only stream that carries it",
             ));
         }
         let managed = crate::core_window_state::CoreWindowState::try_from_sql(
