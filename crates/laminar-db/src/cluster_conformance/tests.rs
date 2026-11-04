@@ -586,10 +586,9 @@ const WINDOW_OVER_JOIN: [&str; 2] = [
 
 /// A window over an interval join stream, on the join's left time column. The join's frontier
 /// trails the sources' final watermark (1.469 s) by its 50 ms bound, so 20 ms windows close only
-/// up to 1.400 s in embedded. Cluster rejects it: across a fault its window can close before the
-/// join emits the window's rows.
+/// up to 1.400 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn window_over_interval_join_is_rejected_in_cluster() {
+async fn window_over_interval_join_is_equal() {
     let case = Case {
         ground_truth: Some(
             "SELECT k % 4 AS g, tumble(ots, INTERVAL '20' MILLISECOND) AS w, COUNT(*) AS n, \
@@ -606,15 +605,12 @@ async fn window_over_interval_join_is_rejected_in_cluster() {
             OutputForm::Rows,
         )
     };
-    assert_rejected(
-        verdict(case).await,
-        "not certified through cluster recovery",
-    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 /// Checkpoints taken while joined rows cross to their window owners.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn loaded_window_over_interval_join_is_rejected_in_cluster() {
+async fn loaded_window_over_interval_join_checkpoints_are_equal() {
     const BATCHES: i64 = 200;
     let case = Case {
         sources: vec![
@@ -628,17 +624,14 @@ async fn loaded_window_over_interval_join_is_rejected_in_cluster() {
             OutputForm::Rows,
         )
     };
-    assert_rejected(
-        verdict(case).await,
-        "not certified through cluster recovery",
-    );
+    assert_eq!(verdict(case).await, Verdict::Equal);
 }
 
 /// A window over each join kind's event-time column: the left time for left outer, semi and anti
 /// joins, the right time for the right kinds and for an inner join that projects only it.
-/// Embedded is checked; cluster rejects each.
+/// Differential only: unmatched rows near the final watermark stay open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn windows_over_each_join_side_are_rejected_in_cluster() {
+async fn windows_over_each_join_side_are_equal() {
     for (name, keyword, projection, time) in [
         ("inner_right_time", "INNER JOIN", "p.k AS k, p.ts AS t", "t"),
         ("left_outer", "LEFT JOIN", "o.k AS k, o.ts AS t", "t"),
@@ -665,10 +658,7 @@ async fn windows_over_each_join_side_are_rejected_in_cluster() {
             ],
             OutputForm::Rows,
         );
-        assert_rejected(
-            verdict(case).await,
-            "not certified through cluster recovery",
-        );
+        assert_eq!(verdict(case).await, Verdict::Equal, "{name}");
     }
 }
 

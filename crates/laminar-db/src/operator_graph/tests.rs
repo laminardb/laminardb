@@ -1340,6 +1340,87 @@ async fn alignment_harness() -> AlignmentHarness {
     }
 }
 
+/// An idle interval join stage can still emit rows below the frontier its peers merged to, so a
+/// cluster window or interval join reading it never sees it idle. Other consumers keep the bit.
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_windows_and_joins_wait_for_an_idle_managed_stage() {
+    let mut harness = alignment_harness().await;
+    let source = harness.graph.ensure_source_node("events");
+    let stage = harness
+        .graph
+        .place_operator_node(
+            "stage",
+            Box::new(ManagedFrontierProbe {
+                capability: OperatorCapability::bounded_interval_join(),
+                seen: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            }),
+            1,
+        )
+        .unwrap();
+    harness.graph.add_edge(source, stage, 0);
+    let consumers = [
+        (
+            "core_window",
+            OperatorCapability::managed_core_window(),
+            false,
+        ),
+        (
+            "interval_join",
+            OperatorCapability::bounded_interval_join(),
+            false,
+        ),
+        (
+            "sql_aggregate",
+            OperatorCapability::keyed_sql_aggregate(),
+            true,
+        ),
+    ]
+    .map(|(name, capability, idle)| {
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let node = harness
+            .graph
+            .place_operator_node(
+                name,
+                Box::new(ManagedFrontierProbe {
+                    capability,
+                    seen: Arc::clone(&seen),
+                }),
+                1,
+            )
+            .unwrap();
+        harness.graph.add_edge(stage, node, 0);
+        (name, idle, seen)
+    });
+    let idle = InputFrontier {
+        watermark: Some(900),
+        idle: true,
+    };
+    harness
+        .graph
+        .set_local_source_frontiers(&FxHashMap::from_iter([(Arc::from("events"), idle)]));
+    harness
+        .graph
+        .cap_join_source_frontiers(|name| (name == "events").then_some(900));
+    let committed = FxHashMap::from_iter([(Arc::from("events"), idle)]);
+    harness
+        .graph
+        .execute_cycle(&FxHashMap::default(), 900, Some(&committed))
+        .await
+        .unwrap();
+
+    for (name, idle, seen) in consumers {
+        assert_eq!(
+            *seen.lock(),
+            [InputFrontier {
+                watermark: Some(900),
+                idle,
+            }],
+            "{name}"
+        );
+    }
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn join_shuffles_use_the_committed_source_frontier() {

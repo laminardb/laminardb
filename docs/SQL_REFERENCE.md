@@ -577,10 +577,9 @@ boundaries, poison-message handling, and tested behaviour.
 Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
 the eight bounded join kinds described above, and managed `TUMBLE`, `HOP`, and `SESSION`
 aggregates. A cluster window reads a source, or an append-only stream that carries an event-time
-column: a projection that forwards a source's, or a closed `TUMBLE` or `HOP` window. It windows on
-that column, requires a bounded watermark on it, and needs `EMIT ON WINDOW CLOSE` or `EMIT FINAL`.
-A window over an interval join stream runs in embedded and single-node mode; cluster mode rejects
-it, because across a fault it can close a window before the join emits that window's rows. An interval join may read another interval join's
+column: a projection that forwards a source's, an interval join other than `FULL`, or a closed
+`TUMBLE` or `HOP` window. It windows on that column, requires a bounded watermark on it, and needs
+`EMIT ON WINDOW CLOSE` or `EMIT FINAL`. An interval join may read another interval join's
 stream on that stream's event-time column. A join output may feed a keyed aggregate, either as a named stream or in
 one statement that is split into stages; windowed joins remain rejected. A stream may sit at most
 three remote exchanges (joins, aggregates, or windows) downstream of its sources, the depth for
